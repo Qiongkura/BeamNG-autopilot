@@ -236,8 +236,15 @@ def _perception_worker(session, args, shared: dict, stop: threading.Event):
     geometry = None
     warmup = True
     while not stop.is_set():
+        with shared["lock"]:
+            # 心跳：主循环用它判断 worker 是否活着，避免把"首帧还没
+            # 算完（路网刷新 ~1.5s）"误判成断线后关连接掐死 worker。
+            shared["ts"] = time.time()
         t0 = time.time()
         try:
+            # 推进模拟：beamngpy 连接后游戏暂停，不 step 则 Camera 传感器
+            # 不再产生新帧（黑帧循环），快照永不产出。
+            conn.step(10)
             st = conn.get_state()
             img = camera_provider.grab()
             h, w = img.shape[:2]
@@ -435,11 +442,13 @@ def main() -> None:
                 with shared["lock"]:
                     res = shared["res"]
                     werr = shared["error"]
-                stale = res is None or time.time() - res["ts"] > \
-                    SNAPSHOT_STALE_S
+                    hb = float(shared.get("ts") or 0.0)
+                # 断线 = worker 心跳超时（含首帧未产出的情况，worker 每帧
+                # 都在跳心跳）或 worker 明确报连接级错误。
+                stale = time.time() - hb > SNAPSHOT_STALE_S
                 if werr is not None or stale:
                     print(f"[view] connection lost: "
-                          f"{werr or 'snapshot stale'}")
+                          f"{werr or 'worker heartbeat stale'}")
                     _close_session(session)
                     session = None
                     worker_stop.set()
@@ -447,6 +456,10 @@ def main() -> None:
                         worker.join(timeout=2.0)
                     worker = None
                     status = "reconnecting"
+                    continue
+                if res is None:
+                    # worker 活着但在算第一帧：保持上一帧画面，不重连
+                    time.sleep(0.05)
                     continue
                 try:
                     overlay = render_lane_overlay(
