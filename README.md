@@ -25,6 +25,18 @@ python -m venv --system-site-packages .venv
 .venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
+首次使用前建议跑一遍环境自检，输出依赖 / 游戏路径 / 资源 / 运行时状态清单：
+
+```powershell
+.venv\Scripts\python.exe scripts\m5_env_check.py
+```
+
+抓帧性能对比探针（可选，需游戏窗口位于主屏；dxcam 需自行 `pip install dxcam`）：
+
+```powershell
+.venv\Scripts\python.exe scripts\bench_grab_screen.py
+```
+
 ## 双运行时（Steam / Tech）可并行开发
 
 核心代码库保持 Steam 版兼容、可开源；BeamNG.tech 专属能力放在独立包
