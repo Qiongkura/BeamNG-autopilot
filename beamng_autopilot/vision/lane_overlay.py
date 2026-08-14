@@ -106,6 +106,21 @@ def road_lane_geometry(conn, pos, fwd) -> dict | None:
         return None
 
     _, rid, meta, i, t, edges, mids = best
+    # 方向一致性检查：车头必须大致沿着最近路段方向行驶，否则"车辆前向
+    # 的横向坐标"没有意义（路口中心/斜停时会把左边界算到车身上、车道
+    # 宽变成 0.5m 之类的荒谬值）。不一致时返回 None，调用方显示
+    # "off-direction" 而不是错误数值。
+    a0, b0 = mids[i], mids[i + 1]
+    edge_dir = (b0[:2] - a0[:2])[:2]
+    en = float(np.linalg.norm(edge_dir))
+    if en > 1e-9:
+        edge_dir = edge_dir / en
+        fwd2 = np.asarray(fwd[:2], dtype=float)
+        fn = float(np.linalg.norm(fwd2))
+        if fn > 1e-9:
+            align = abs(float(edge_dir @ (fwd2 / fn)))
+            if align < 0.5:  # 车头与道路方向夹角 > 60°
+                return None
     row_a, row_b = edges[i], edges[i + 1]
     left_pt = _interp_edge(row_a["left"], row_b["left"], t)
     mid_pt = _interp_edge(row_a["middle"], row_b["middle"], t)
