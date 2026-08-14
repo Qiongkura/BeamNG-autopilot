@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+
+# BeamNG autopilot runtime artifacts
+logs/
+.yolo/
+weights/
+probe_out.txt
+probe_route.json
+
+# Large or generated data files (keep the small sample track)
+data/*
+!data/track_smallgrid.npz
