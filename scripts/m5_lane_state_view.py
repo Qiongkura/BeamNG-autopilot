@@ -129,7 +129,11 @@ def _open_session(args) -> tuple:
         conn.set_front_camera()
     camera_provider, _ = build_camera_provider(conn, runtime_mode)
     detector = LaneDetector()
-    smoother = MarkingSmoother()
+    # 显示用途用宽松平滑参数（2 帧确认、匹配距离放宽），车道框架更连续；
+    # autopilot 的实例保持保守参数不受影响。
+    smoother = MarkingSmoother(min_frames=2, match_max_m=1.5,
+                               stale_s=3.0, stale_stop_s=8.0,
+                               stale_speed_mps=4.0)
     segmenter = _build_segmenter(args)
     print(f"[view] runtime={runtime_mode}")
     return conn, camera_provider, detector, smoother, segmenter
