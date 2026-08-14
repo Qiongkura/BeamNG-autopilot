@@ -166,6 +166,13 @@ python -m venv --system-site-packages .venv
 .venv\Scripts\python.exe scripts\m4_dashboard.py
 ```
 
+决策层实时可视化（读 autopilot 实际发布的遥测，显示感知融合 / planner
+模式 / 速度决策链 / 交通规则 / 控制输出 + 鸟瞰 + 速度时序图）：
+
+```powershell
+.venv\Scripts\python.exe scripts\m5_decision_view.py
+```
+
 ## M5 游戏内自动驾驶助手（可手动激活）
 
 在游戏里通过热键手动激活/关闭自动驾驶，车辆严格沿游戏内置导航路线（大地图里点选目的地生成的蓝色箭头路线）自己跑，并带特斯拉式视觉叠加和结束后的遥测图表。
