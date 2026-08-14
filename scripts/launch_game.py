@@ -47,8 +47,9 @@ def main() -> None:
     if runtime_user:
         cmd += ["-userpath", str(runtime_user)]
 
+    port = config.runtime_port(resolved)
     print(f"[launch] runtime={resolved} "
-          f"starting BeamNG with tcom port {config.PORT} ...")
+          f"starting BeamNG with tcom port {port} ...")
     print(f"[launch] {' '.join(cmd)}")
     subprocess.Popen(
         cmd,
@@ -63,13 +64,13 @@ def main() -> None:
     deadline = time.time() + 90.0
     while time.time() < deadline:
         try:
-            with socket.create_connection(("127.0.0.1", config.PORT), timeout=1):
-                print(f"[launch] port {config.PORT} is up - the autopilot "
+            with socket.create_connection(("127.0.0.1", port), timeout=1):
+                print(f"[launch] port {port} is up - the autopilot "
                       "can now attach")
                 return
         except OSError:
             time.sleep(1.0)
-    print(f"[launch] game started but port {config.PORT} did not open within "
+    print(f"[launch] game started but port {port} did not open within "
           "90s; check the game window and rerun m5_autopilot.py")
     sys.exit(2)
 
