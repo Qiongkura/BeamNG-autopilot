@@ -38,6 +38,7 @@ from beamng_autopilot.connector import BeamNGConnector
 from beamng_autopilot.lane import pair_lane_markings
 from beamng_autopilot.runtime import build_camera_provider, resolve_runtime
 from beamng_autopilot.vision.lane_overlay import (
+    draw_lane_frame,
     ego_extents,
     estimate_pavement_edges,
     merge_boundary_geometry,
@@ -216,6 +217,8 @@ def _render_frame(conn, camera_provider, detector, smoother, args, *,
         f"paired={frame.paired if frame is not None else None}")
     overlay = render_lane_overlay(
         img, st, geometry, markings, cam, half_w, vision_text=vision_text)
+    # 感知车道框架：pair_lane_markings 的配对结果（真实标线识别输出）
+    draw_lane_frame(overlay, frame, cam, st, heading)
     return {
         "state": st,
         "geometry": geometry,
@@ -471,6 +474,8 @@ def main() -> None:
                         res["img"], res["state"], res["geometry"],
                         res["markings"], res["cam"], res["half_w"],
                         vision_text=res["vision_text"])
+                    draw_lane_frame(overlay, res["frame"], res["cam"],
+                                    res["state"], float(res["state"].heading))
                     last_overlay = overlay
                     fps_frames += 1
                     now = time.time()

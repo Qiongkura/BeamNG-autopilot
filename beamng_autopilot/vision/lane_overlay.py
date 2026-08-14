@@ -20,6 +20,7 @@ CENTER_COLOR = (255, 255, 0)
 MARK_WHITE = (230, 230, 230)
 MARK_YELLOW = (0, 255, 255)
 ROADNET_LANE_COLOR = (150, 150, 160)
+LANE_FRAME_COLOR = (255, 140, 60)   # 感知配对车道边界（pair_lane_markings）
 PANEL_BG = (0, 0, 0)
 PANEL_TEXT = (255, 255, 255)
 LAT_BG = (16, 18, 24)
@@ -455,9 +456,12 @@ def merge_boundary_geometry(roadnet: dict | None,
                             vision: dict | None) -> dict | None:
     """Merge roadnet and vision pavement boundaries into one overlay dict.
 
-    Vision pavement edges win when available; the missing side falls back
-    to the roadnet lane edge so the diagnostic remains complete.  The
-    source of each side is kept for rendering and labels.
+    The lane boundaries are the ROADNET lane split (the map knows the lane
+    count and widths); the vision pavement edges are the *road* edge
+    (grass/asphalt transition), not lane lines - letting them override the
+    map lane split is exactly what made the "lane centre" sit on the road
+    centre.  Vision only fills in a side when the roadnet data is missing,
+    and the source of each side is kept for rendering and labels.
     """
     if roadnet is None and vision is None:
         return None
@@ -466,19 +470,21 @@ def merge_boundary_geometry(roadnet: dict | None,
     lane_right = None
     source_left = None
     source_right = None
-    if vision is not None:
-        if vision.get("left_lat") is not None:
-            lane_left = float(vision["left_lat"])
-            source_left = "vision"
-        if vision.get("right_lat") is not None:
-            lane_right = float(vision["right_lat"])
-            source_right = "vision"
-    if lane_left is None and roadnet is not None:
+    if roadnet is not None:
         lane_left = float(roadnet["lane_left_lat"])
         source_left = "roadnet"
-    if lane_right is None and roadnet is not None:
         lane_right = float(roadnet["lane_right_lat"])
         source_right = "roadnet"
+    # 只有 roadnet 缺失的侧才用 vision 路面边缘补位（语义不同：那是
+    # 道路物理边缘，不是车道分割线）
+    if lane_left is None and vision is not None \
+            and vision.get("left_lat") is not None:
+        lane_left = float(vision["left_lat"])
+        source_left = "vision"
+    if lane_right is None and vision is not None \
+            and vision.get("right_lat") is not None:
+        lane_right = float(vision["right_lat"])
+        source_right = "vision"
     if lane_left is None or lane_right is None:
         return None
 
@@ -534,6 +540,32 @@ def merge_boundary_geometry(roadnet: dict | None,
         merged["left_edge_lat"] = roadnet.get("left_edge_lat")
         merged["right_edge_lat"] = roadnet.get("right_edge_lat")
     return merged
+
+
+def draw_lane_frame(img, frame, cam, st, heading) -> None:
+    """Draw the perceived lane frame (pair_lane_markings result).
+
+    This is the real perception output - the lane boundaries paired from
+    detected markings - as opposed to the map/roadnet reference lines.
+    ``frame.left`` / ``frame.right`` are world polylines of the detected
+    lane edges; ``frame.center`` is their midpoint.
+    """
+    if frame is None or cam is None:
+        return
+    pos = np.asarray(st.pos, dtype=float)
+    for side, poly, tag in (
+            ("left", getattr(frame, "left", None), "lane left (vision)"),
+            ("right", getattr(frame, "right", None), "lane right (vision)")):
+        if poly is None or len(poly) < 2:
+            continue
+        pts = project_poly(cam, np.asarray(poly, dtype=float), pos, heading)
+        if pts is not None:
+            draw_poly(img, pts, LANE_FRAME_COLOR, 2, tag)
+    center = getattr(frame, "center", None)
+    if center is not None and len(center) >= 2:
+        pts = project_poly(cam, np.asarray(center, dtype=float), pos, heading)
+        if pts is not None:
+            draw_poly(img, pts, CENTER_COLOR, 2, "lane center (vision)")
 
 
 def project_poly(cam, wpts, pos3, heading, ground_z=None) -> np.ndarray | None:
@@ -683,6 +715,14 @@ def render_lane_overlay(img, st, geometry, markings, cam, half_w, *,
         for side, key in (("left", "lane_left_lat"),
                           ("right", "lane_right_lat")):
             if geometry.get(key) is None:
+                continue
+            # 外侧车道边界 = 道路边缘（最外侧车道的物理事实）：该侧由
+            # 橙色 road edge 线表示，灰色/绿色 boundary 线跳过，避免两线
+            # 重合让人误以为"车道线画在了道路边缘上"。
+            edge_key = ("left_edge_lat" if side == "left"
+                        else "right_edge_lat")
+            if geometry.get(edge_key) is not None and abs(
+                    float(geometry[key]) - float(geometry[edge_key])) < 0.3:
                 continue
             if geometry.get(f"source_{side}") == "vision":
                 color = LANE_COLOR
