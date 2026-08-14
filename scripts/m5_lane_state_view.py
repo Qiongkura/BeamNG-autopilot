@@ -11,12 +11,20 @@ r force a road-network refresh.
 
 ``--once`` renders a single frame and saves it under
 ``logs/m5_lane_state/`` without opening a window (used for smoke tests).
+
+Pipeline (since the async rework): a background perception thread does all
+the heavy work (grab, road-network geometry on a low cadence, pavement
+edges, marking detection, smoothing, pairing) and publishes the latest
+snapshot; the main loop only renders the newest snapshot at a fixed,
+smooth frame rate.  Connection-level failures are detected through a stale
+snapshot and trigger a reconnect; a failed single grab just skips a frame.
 """
 
 from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -41,6 +49,7 @@ from beamng_autopilot.vision.lanes import LaneDetector, MarkingSmoother
 
 WINDOW_NAME = "BeamNG Lane State Live"
 RECONNECT_DELAY_S = 2.0
+SNAPSHOT_STALE_S = 3.0  # 快照超过此时长未更新 -> 视为断线
 
 
 def _build_args() -> argparse.Namespace:
@@ -53,10 +62,12 @@ def _build_args() -> argparse.Namespace:
     ap.add_argument("--runtime", choices=("auto", "steam", "tech"),
                     default=config.RUNTIME_MODE)
     ap.add_argument("--rate", type=float, default=6.0,
-                    help="maximum refresh rate in Hz (default 6)")
+                    help="perception scan rate in Hz (default 6)")
+    ap.add_argument("--display-rate", type=float, default=20.0,
+                    help="render frame rate in Hz (default 20, smooth)")
     ap.add_argument("--road-refresh", type=float, default=30.0,
                     help="road-network geometry refresh interval in s "
-                         "(each refresh is ~1.5s, keep it rare)")
+                         "(each refresh is ~1.5s, runs in the worker)")
     ap.add_argument("--road-move", type=float, default=10.0,
                     help="refresh road geometry after this movement (m)")
     ap.add_argument("--once", action="store_true",
@@ -212,6 +223,102 @@ def _render_frame(conn, camera_provider, detector, smoother, args, *,
     }
 
 
+def _perception_worker(session, args, shared: dict, stop: threading.Event):
+    """Background perception: grab + detect, publish the latest snapshot.
+
+    The worker owns all the heavy work (road geometry, pavement edges,
+    marking detection, smoothing, pairing) so the render loop stays
+    smooth.  A failed single grab skips the frame; any connection-level
+    exception marks ``shared["error"]`` and the main loop reconnects.
+    """
+    conn, camera_provider, detector, smoother, segmenter = session
+    geo_cache = {"t": 0.0, "pos": np.zeros(2, dtype=float)}
+    geometry = None
+    warmup = True
+    while not stop.is_set():
+        t0 = time.time()
+        try:
+            st = conn.get_state()
+            img = camera_provider.grab()
+            h, w = img.shape[:2]
+            fwd = unit_fwd(st)
+            heading = float(st.heading)
+            now = time.time()
+
+            with shared["lock"]:
+                force_geo = bool(shared.get("force_geometry"))
+                shared["force_geometry"] = False
+
+            if geometry is None or force_geo:
+                geometry = road_lane_geometry(conn, st.pos, fwd)
+                geo_cache["t"] = now
+                geo_cache["pos"] = np.asarray(st.pos[:2], dtype=float).copy()
+            elif (now - geo_cache["t"] >= args.road_refresh
+                  or float(np.hypot(*(np.asarray(st.pos[:2])
+                                      - geo_cache["pos"])))
+                  >= args.road_move):
+                geometry = road_lane_geometry(conn, st.pos, fwd)
+                geo_cache["t"] = now
+                geo_cache["pos"] = np.asarray(st.pos[:2], dtype=float).copy()
+
+            half_w = geo_cache.get("half_w")
+            if half_w is None:
+                half_w = ego_extents(conn)[1]
+                geo_cache["half_w"] = half_w
+            cam = camera_provider.camera_model(st.pos, heading, w, h,
+                                               rotation=st.rotation)
+            ground_z = (float(st.pos[2]) if len(st.pos) > 2 else 0.0)
+            if segmenter is not None:
+                vision_geometry = estimate_pavement_edges(
+                    img, cam, st.pos, heading, ground_z=ground_z,
+                    offroad_mask=segmenter.offroad_mask(img))
+                raw_markings = segmenter.detect_lines(
+                    img, cam, st.pos, heading, ground_z=ground_z)
+            else:
+                vision_geometry = estimate_pavement_edges(
+                    img, cam, st.pos, heading, ground_z=ground_z)
+                raw_markings = detector.detect(
+                    img, cam, st.pos, heading, ground_z=ground_z)
+            merged = merge_boundary_geometry(geometry, vision_geometry)
+            markings = smoother.update(
+                raw_markings, cam, st.pos, heading, ground_z=ground_z,
+                warmup=warmup, speed=float(st.speed))
+            warmup = False
+            debug: dict = {}
+            frame = pair_lane_markings(
+                markings, st.pos, heading, fwd=st.dir, debug=debug)
+            vision_text = (
+                f"vision: {len(raw_markings)} raw / {len(markings)} stable "
+                f"mode={debug.get('mode')} "
+                f"paired={frame.paired if frame is not None else None}")
+
+            with shared["lock"]:
+                shared["res"] = {
+                    "state": st, "img": img, "cam": cam,
+                    "geometry": merged, "vision": vision_geometry,
+                    "half_w": half_w, "markings": markings,
+                    "frame": frame, "debug": debug,
+                    "vision_text": vision_text, "ts": time.time(),
+                }
+                shared["error"] = None
+        except Exception as exc:
+            # 单帧抓帧失败：降级跳过（不重连）；连接级异常：标记断线
+            msg = str(exc)
+            if "black frame" in msg or "no colour frame" in msg \
+                    or "grab" in msg.lower():
+                print(f"[view] grab failed (skipping frame): {msg}")
+                time.sleep(0.2)
+                continue
+            print(f"[view] worker error: {msg}")
+            with shared["lock"]:
+                shared["error"] = msg
+            return
+
+        rem = 1.0 / max(1.0, args.rate) - (time.time() - t0)
+        if rem > 0:
+            time.sleep(rem)
+
+
 def _save_frame(overlay, args, tag: str) -> Path:
     out_dir = config.LOGS_DIR / "m5_lane_state"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -284,8 +391,10 @@ def main() -> None:
     print("[view] persistent window open - q/ESC quit, space pause, "
           "s save, r refresh")
     session = None
-    geo_cache = {"t": 0.0, "pos": np.zeros(2, dtype=float)}
-    geometry = None
+    worker = None
+    worker_stop = threading.Event()
+    shared: dict = {"lock": threading.Lock(), "res": None, "error": None,
+                    "force_geometry": False}
     last_overlay = None
     paused = False
     status = "connecting"
@@ -293,14 +402,25 @@ def main() -> None:
     t0 = time.time()
     fps_frames = 0
     fps = 0.0
+
+    def start_worker():
+        nonlocal worker, worker_stop
+        worker_stop = threading.Event()
+        worker = threading.Thread(
+            target=_perception_worker,
+            args=(session, args, shared, worker_stop), daemon=True)
+        worker.start()
+
     try:
         while True:
             frame_start = time.time()
             if session is None:
                 try:
                     session = _open_session(args)
-                    geo_cache = {"t": 0.0, "pos": np.zeros(2, dtype=float)}
-                    geometry = None
+                    with shared["lock"]:
+                        shared["res"] = None
+                        shared["error"] = None
+                    start_worker()
                     status = "live"
                     errors = 0
                     print("[view] connected")
@@ -310,21 +430,30 @@ def main() -> None:
                         print(f"[view] {status}: {exc}")
                     errors += 1
                     time.sleep(RECONNECT_DELAY_S)
+                    continue
             elif not paused:
+                with shared["lock"]:
+                    res = shared["res"]
+                    werr = shared["error"]
+                stale = res is None or time.time() - res["ts"] > \
+                    SNAPSHOT_STALE_S
+                if werr is not None or stale:
+                    print(f"[view] connection lost: "
+                          f"{werr or 'snapshot stale'}")
+                    _close_session(session)
+                    session = None
+                    worker_stop.set()
+                    if worker is not None:
+                        worker.join(timeout=2.0)
+                    worker = None
+                    status = "reconnecting"
+                    continue
                 try:
-                    res = _render_frame(
-                        session[0], session[1], session[2], session[3],
-                        args,
-                        geometry=geometry, geo_cache=geo_cache,
-                        segmenter=session[4])
-                    if res is None:
-                        # Only the frame grab failed: keep the last overlay
-                        # and the session (sensor degradation, not a
-                        # connection loss).
-                        continue
-                    geometry = res["geometry"]
-                    last_overlay = res["overlay"]
-                    errors = 0
+                    overlay = render_lane_overlay(
+                        res["img"], res["state"], res["geometry"],
+                        res["markings"], res["cam"], res["half_w"],
+                        vision_text=res["vision_text"])
+                    last_overlay = overlay
                     fps_frames += 1
                     now = time.time()
                     if now - t0 >= 1.0:
@@ -332,11 +461,8 @@ def main() -> None:
                         fps_frames = 0
                         t0 = now
                 except Exception as exc:
-                    print(f"[view] connection lost: {exc}")
-                    _close_session(session)
-                    session = None
-                    status = "reconnecting"
-                    continue
+                    print(f"[view] render error: {exc}")
+                    time.sleep(0.1)
 
             if last_overlay is not None:
                 display_rgb = last_overlay.copy()
@@ -367,7 +493,8 @@ def main() -> None:
                 saved = _save_frame(last_overlay, args, "live_snapshot")
                 print(f"[view] snapshot -> {saved}")
             if key == ord("r"):
-                geo_cache["t"] = 0.0
+                with shared["lock"]:
+                    shared["force_geometry"] = True
                 print("[view] forcing road-network refresh")
 
             try:
@@ -378,8 +505,8 @@ def main() -> None:
             except cv2.error:
                 break
 
-            if session is not None and not paused and args.rate > 0:
-                rem = 1.0 / args.rate - (time.time() - frame_start)
+            if session is not None and not paused and args.display_rate > 0:
+                rem = 1.0 / args.display_rate - (time.time() - frame_start)
                 if rem > 0:
                     time.sleep(rem)
             else:
@@ -389,6 +516,9 @@ def main() -> None:
             cv2.destroyAllWindows()
         except cv2.error:
             pass
+        worker_stop.set()
+        if worker is not None:
+            worker.join(timeout=2.0)
         _close_session(session)
 
 
