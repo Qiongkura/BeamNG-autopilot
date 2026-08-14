@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import time
 
 import numpy as np
@@ -15,6 +16,14 @@ from beamng_autopilot.perception import (
 )
 from beamng_autopilot.runtime import CameraProvider, RangeProvider, RangeSample
 from beamng_autopilot.vision.projection import CameraModel
+
+# Sensor names must be unique per game instance: two Python processes
+# attaching to the same BeamNG.tech (e.g. the lane viewer and the autopilot,
+# or a stale viewer left running) would collide on a shared name and one of
+# them gets None/empty polls.  A per-process suffix makes cross-process
+# collisions impossible; within one process the name stays stable so
+# reconnects do not leak sensors.
+_PID = os.getpid()
 
 
 CAMERA_POS = (0.0, -1.216, 1.386)
@@ -69,7 +78,7 @@ class TechCameraProvider(CameraProvider):
         from beamngpy.sensors import Camera
 
         self.conn = conn
-        self.name = "autopilot_front"
+        self.name = f"autopilot_front_{_PID}"
         with conn.io_lock:
             self.camera = Camera(
                 self.name,
@@ -150,7 +159,7 @@ class TechRangeProvider(RangeProvider):
         from beamngpy.sensors import Lidar
 
         self.conn = conn
-        self.name = "autopilot_lidar"
+        self.name = f"autopilot_lidar_{_PID}"
         with conn.io_lock:
             self._ego_half_len, self._ego_half_w = self._ego_extents()
             self.lidar = Lidar(
