@@ -54,9 +54,10 @@ def _build_args() -> argparse.Namespace:
                     default=config.RUNTIME_MODE)
     ap.add_argument("--rate", type=float, default=6.0,
                     help="maximum refresh rate in Hz (default 6)")
-    ap.add_argument("--road-refresh", type=float, default=10.0,
-                    help="road-network geometry refresh interval in s")
-    ap.add_argument("--road-move", type=float, default=3.0,
+    ap.add_argument("--road-refresh", type=float, default=30.0,
+                    help="road-network geometry refresh interval in s "
+                         "(each refresh is ~1.5s, keep it rare)")
+    ap.add_argument("--road-move", type=float, default=10.0,
                     help="refresh road geometry after this movement (m)")
     ap.add_argument("--once", action="store_true",
                     help="render one frame to logs and exit (no window)")
@@ -164,7 +165,11 @@ def _render_frame(conn, camera_provider, detector, smoother, args, *,
         geo_cache["t"] = now
         geo_cache["pos"] = np.asarray(st.pos[:2], dtype=float).copy()
 
-    half_w = ego_extents(conn)[1]
+    half_w = geo_cache.get("half_w")
+    if half_w is None:
+        # get_bbox 是 Lua round-trip（~18ms）；车身尺寸不变，缓存一次即可
+        half_w = ego_extents(conn)[1]
+        geo_cache["half_w"] = half_w
     cam = camera_provider.camera_model(st.pos, heading, w, h,
                                        rotation=st.rotation)
     ground_z = (float(st.pos[2]) if len(st.pos) > 2 else 0.0)
