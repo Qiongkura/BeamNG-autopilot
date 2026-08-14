@@ -78,11 +78,16 @@ def _build_args() -> argparse.Namespace:
                     help="learned segmentation model path (default: "
                          "logs/m5_seg/seg_model/best.pt when present; "
                          "without it classic CV is used)")
+    ap.add_argument("--no-seg", action="store_true",
+                    help="force classic CV detection (skip the learned "
+                         "segmentation model)")
     return ap.parse_args()
 
 
 def _build_segmenter(args):
     """Load the learned segmenter, or None to keep classic CV."""
+    if args.no_seg:
+        return None
     if args.seg_model is None:
         try:
             from beamng_autopilot.vision.segmentation \
