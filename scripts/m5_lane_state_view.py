@@ -47,7 +47,9 @@ def _build_args() -> argparse.Namespace:
     ap = argparse.ArgumentParser(description="Live lane-state viewer")
     ap.add_argument("--map", default=config.DEFAULT_MAP)
     ap.add_argument("--vehicle", default=config.DEFAULT_VEHICLE)
-    ap.add_argument("--port", type=int, default=config.PORT)
+    ap.add_argument("--port", type=int, default=None,
+                    help="comms port (default: per-runtime - Steam 64256 / "
+                         "Tech 64257)")
     ap.add_argument("--runtime", choices=("auto", "steam", "tech"),
                     default=config.RUNTIME_MODE)
     ap.add_argument("--rate", type=float, default=6.0,
@@ -92,7 +94,8 @@ def _build_segmenter(args):
 def _open_session(args) -> tuple:
     """Connect to the running game and build the sensor providers."""
     conn = BeamNGConnector(
-        args.map, args.vehicle, port=args.port,
+        args.map, args.vehicle,
+        port=(args.port or config.runtime_port(args.runtime)),
         home=config.runtime_home(args.runtime))
     try:
         conn.open(launch=False)

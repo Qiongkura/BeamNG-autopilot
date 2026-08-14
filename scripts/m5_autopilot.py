@@ -237,7 +237,9 @@ def main() -> None:
                     help="vehicle id to attach to (default: first active)")
     ap.add_argument("--speed", type=float, default=20.0,
                     help="cruise speed in m/s")
-    ap.add_argument("--port", type=int, default=config.PORT)
+    ap.add_argument("--port", type=int, default=None,
+                    help="comms port (default: per-runtime - Steam 64256 / "
+                         "Tech 64257)")
     ap.add_argument("--runtime", choices=("auto", "steam", "tech"),
                     default=config.RUNTIME_MODE,
                     help="game runtime: auto detects Steam/tech after connect")
@@ -287,7 +289,8 @@ def main() -> None:
     cruise_speed = args.speed
 
     conn = BeamNGConnector(
-        args.map, args.vehicle, port=args.port,
+        args.map, args.vehicle,
+        port=(args.port or config.runtime_port(args.runtime)),
         home=config.runtime_home(args.runtime))
     vision_lock = threading.Lock()
     state_lock = threading.Lock()

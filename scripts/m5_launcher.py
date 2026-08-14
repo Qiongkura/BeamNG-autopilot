@@ -513,7 +513,8 @@ class LauncherApp:
         cmd = [str(binary)]
         if runtime_mode != "tech":
             cmd.append("-nosteam")
-        cmd += ["-tcom", "-tport", str(config.PORT), "-console"]
+        cmd += ["-tcom", "-tport",
+                str(config.runtime_port(runtime_mode)), "-console"]
         runtime_user = config.runtime_user(runtime_mode)
         if runtime_user:
             cmd += ["-userpath", str(runtime_user)]
@@ -564,7 +565,9 @@ class LauncherApp:
                 "--vehicle",
                 self.veh_var.get().strip() or config.DEFAULT_VEHICLE,
                 "--runtime",
-                self.runtime_var.get().strip() or config.RUNTIME_MODE]
+                self.runtime_var.get().strip() or config.RUNTIME_MODE,
+                "--port",
+                str(config.runtime_port(self.runtime_var.get()))]
         if self.attach_var.get():
             args.append("--attach")
         if not self.markers_var.get():

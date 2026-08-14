@@ -41,7 +41,8 @@ def main() -> None:
     cmd = [str(binary)]
     if resolved != "tech":
         cmd.append("-nosteam")
-    cmd += ["-tcom", "-tport", str(config.PORT), "-console"]
+    cmd += ["-tcom", "-tport", str(config.runtime_port(resolved)),
+            "-console"]
     runtime_user = config.runtime_user(resolved)
     if runtime_user:
         cmd += ["-userpath", str(runtime_user)]

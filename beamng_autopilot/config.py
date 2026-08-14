@@ -94,9 +94,13 @@ BEAMNG_PROCESS_NAMES = {
     "BeamNG.tech.x64.exe",
 }
 
-# BeamNGpy 通信
+# BeamNGpy 通信：端口与运行时绑定，Steam / Tech 可同时跑。
+# - Steam 用 PORT（默认 64256，可用 BEAMNG_PORT 覆盖）
+# - Tech 用 TECH_PORT（默认 64257，可用 BEAMNG_TECH_PORT 覆盖）
+# 用 config.runtime_port(mode) 取端口，不要直接用 PORT 连 Tech。
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("BEAMNG_PORT", "64256"))
+TECH_PORT = int(os.environ.get("BEAMNG_TECH_PORT", "64257"))
 
 # Road-network guards used before teleporting a freshly spawned car:
 # only reposition once the road graph is dense, and only when the car is
@@ -139,3 +143,14 @@ def resolve_launch_runtime(mode: str | None = None) -> str:
     if mode != "auto":
         return mode
     return "tech" if BEAMNG_TECH_HOME.is_dir() else "steam"
+
+
+def runtime_port(mode: str | None = None) -> int:
+    """Comms port bound to a runtime: Steam -> PORT, Tech -> TECH_PORT.
+
+    Pass this instead of ``PORT`` whenever the target runtime is known, so
+    the Steam and Tech instances can run side by side on fixed ports.
+    """
+    if resolve_launch_runtime(mode) == "tech":
+        return TECH_PORT
+    return PORT

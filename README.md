@@ -76,8 +76,10 @@ python -m venv --system-site-packages .venv
 - `BEAMNG_TECH_HOME` 指向 Tech 安装目录；Steam 仍使用 `BEAMNG_HOME`。
 - `BEAMNG_TECH_USER` 指向 Tech 用户目录，默认 `...\BeamNG.drive\0.38`，
   与 Steam 的 `0.39` 分开，避免两个版本互相污染存档/设置。
-- `BEAMNG_PORT` 可选，默认 `64256`；需要同时跑 Steam 和 Tech 两套实例
-  时改成不同端口即可。
+- `BEAMNG_PORT` 可选，默认 `64256`；Tech 固定用 `64257`
+  （`BEAMNG_TECH_PORT` 可覆盖）。**端口与运行时绑定**：Steam 始终
+  `64256`、Tech 始终 `64257`，两套实例可并行，启动器/助手/探针按所选
+  运行时自动对应端口（`config.runtime_port(mode)`），无需手动改端口。
 - 启动/主流程入口（`launch_game.py` / `m5_launcher.py` /
   `m5_autopilot.py` / `m5_e2e_test.py` / `m5_drive_test.py`）、M1-M3
   采集标定脚本（`m1_smoke_test.py` / `m1_record_track.py` /
