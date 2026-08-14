@@ -157,6 +157,114 @@ def _color_masks(frame_rgb):
     return [("white", white), ("yellow", yellow)]
 
 
+def _mask_to_markings(mask0, color, cam_model, pos, heading,
+                      ground_z: float | None = None,
+                      min_area: int = 30, min_height: int = 18,
+                      max_dist: float = 45.0, solid_len: float = 6.0
+                      ) -> list[LaneMarking]:
+    """Turn a binary mask into LaneMarking polylines (shared pipeline).
+
+    Used by the classic-CV detector (colour thresholds) and by the learned
+    segmentation (``Segmenter.detect_lines``): connected components ->
+    ground-plane back-projection -> dominant-axis ordering -> kind
+    classification.  ``mask0`` is a uint8 mask (0/255), ``color`` the
+    label ("white" / "yellow") attached to the resulting markings.
+    """
+    import cv2
+
+    from beamng_autopilot.vision.detection import back_project
+
+    if mask0 is None or cam_model is None:
+        return []
+    p = np.asarray(pos, dtype=float)
+    if ground_z is None:
+        ground_z = float(p[2]) if p.size > 2 else 0.0
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    markings: list[LaneMarking] = []
+
+    mask = cv2.morphologyEx(mask0, cv2.MORPH_OPEN, kernel)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
+    for i in range(1, n):
+        x, y, w, h, area = stats[i]
+        if area < min_area or h < min_height or w < 3:
+            continue
+        if w > max(8, h * 2.5):
+            continue
+        if w * h <= 0 or area / (w * h) < 0.10:
+            continue
+        ys, xs = np.where(labels == i)
+        order = np.argsort(ys)
+        xs = xs[order].astype(float)
+        ys = ys[order].astype(float)
+        step = max(1, int(len(xs) // 36))
+        world: list[tuple[float, float]] = []
+        pixels: list[tuple[float, float]] = []
+        for u, v in zip(xs[::step], ys[::step]):
+            wp = back_project(float(u), float(v), cam_model,
+                              pos, heading, ground_z=ground_z)
+            if wp is None:
+                continue
+            dist = math.hypot(wp[0] - p[0], wp[1] - p[1])
+            if dist < 2.0 or dist > max_dist:
+                continue
+            world.append(wp)
+            pixels.append((float(u), float(v)))
+        if len(world) < 4:
+            continue
+        wpts = np.asarray(world, dtype=float)
+        ppts = np.asarray(pixels, dtype=float)
+        # Sort along the dominant world direction so a diagonal
+        # line becomes a clean polyline instead of a zig-zag.
+        wpts, ppts, span, world_len, perp_span = \
+            _order_world_polyline(wpts, ppts)
+        kind = _kind_for(span, world_len, solid_len)
+        if perp_span > max(LANE_LINE_MAX_PERP_SPAN_M,
+                           LANE_LINE_MAX_PERP_FRAC * span):
+            # A real painted line is thin in world space even when
+            # its back-projected polyline is long.  A dark pavement
+            # patch / repair scar is a wide blob and must never be
+            # promoted to a solid no-cross boundary.
+            kind = "unknown"
+        if kind == "unknown" and span >= THIN_LINE_MIN_SPAN_M:
+            # The raw component is too wide in world space, but the
+            # median-x skeleton may still be a real painted line.
+            core, widths = _row_core_points(ys, xs)
+            core_world: list[tuple[float, float]] = []
+            core_pixels: list[tuple[float, float]] = []
+            for cu, cv in core:
+                wp = back_project(float(cu), float(cv), cam_model,
+                                  pos, heading, ground_z=ground_z)
+                if wp is None:
+                    continue
+                dist = math.hypot(wp[0] - p[0], wp[1] - p[1])
+                if dist < 2.0 or dist > max_dist:
+                    continue
+                core_world.append(wp)
+                core_pixels.append((float(cu), float(cv)))
+            if len(core_world) >= 4:
+                c_wpts, c_ppts, c_span, c_len, c_perp = \
+                    _order_world_polyline(
+                        np.asarray(core_world, dtype=float),
+                        np.asarray(core_pixels, dtype=float))
+                row_w_med = (float(np.median(widths))
+                             if len(widths) else 0.0)
+                row_w_p90 = (float(np.percentile(widths, 90.0))
+                             if len(widths) else 0.0)
+                if _thin_line_ok(c_span, c_len, c_perp,
+                                 row_w_med, row_w_p90):
+                    kind = "thin"
+                    wpts, ppts = c_wpts, c_ppts
+                    span, world_len, perp_span = \
+                        c_span, c_len, c_perp
+        conf = min(1.0, 0.35 + 0.25 * (area / 1500.0)
+                   + 0.4 * min(1.0, span / 40.0))
+        markings.append(LaneMarking(
+            world=wpts, pixels=ppts, color=color, kind=kind,
+            confidence=float(conf)))
+    return markings
+
+
 class LaneDetector:
     """Classic-CV lane-marking detector with ground-plane back-projection."""
 
@@ -170,99 +278,14 @@ class LaneDetector:
     def detect(self, frame_rgb, cam_model, pos, heading,
                ground_z: float | None = None) -> list[LaneMarking]:
         """Detect road markings in ``frame_rgb`` (RGB uint8)."""
-        import cv2
-
-        from beamng_autopilot.vision.detection import back_project
-
         if frame_rgb is None or cam_model is None:
             return []
-        p = np.asarray(pos, dtype=float)
-        if ground_z is None:
-            ground_z = float(p[2]) if p.size > 2 else 0.0
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         markings: list[LaneMarking] = []
-
         for color, mask0 in _color_masks(frame_rgb):
-            mask = cv2.morphologyEx(mask0, cv2.MORPH_OPEN, kernel)
-            mask = cv2.dilate(mask, kernel, iterations=1)
-            n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
-            for i in range(1, n):
-                x, y, w, h, area = stats[i]
-                if area < self.min_area or h < self.min_height or w < 3:
-                    continue
-                if w > max(8, h * 2.5):
-                    continue
-                if w * h <= 0 or area / (w * h) < 0.10:
-                    continue
-                ys, xs = np.where(labels == i)
-                order = np.argsort(ys)
-                xs = xs[order].astype(float)
-                ys = ys[order].astype(float)
-                step = max(1, int(len(xs) // 36))
-                world: list[tuple[float, float]] = []
-                pixels: list[tuple[float, float]] = []
-                for u, v in zip(xs[::step], ys[::step]):
-                    wp = back_project(float(u), float(v), cam_model,
-                                      pos, heading, ground_z=ground_z)
-                    if wp is None:
-                        continue
-                    dist = math.hypot(wp[0] - p[0], wp[1] - p[1])
-                    if dist < 2.0 or dist > self.max_dist:
-                        continue
-                    world.append(wp)
-                    pixels.append((float(u), float(v)))
-                if len(world) < 4:
-                    continue
-                wpts = np.asarray(world, dtype=float)
-                ppts = np.asarray(pixels, dtype=float)
-                # Sort along the dominant world direction so a diagonal
-                # line becomes a clean polyline instead of a zig-zag.
-                wpts, ppts, span, world_len, perp_span = \
-                    _order_world_polyline(wpts, ppts)
-                kind = _kind_for(span, world_len, self.solid_len)
-                if perp_span > max(LANE_LINE_MAX_PERP_SPAN_M,
-                                   LANE_LINE_MAX_PERP_FRAC * span):
-                    # A real painted line is thin in world space even when
-                    # its back-projected polyline is long.  A dark pavement
-                    # patch / repair scar is a wide blob and must never be
-                    # promoted to a solid no-cross boundary.
-                    kind = "unknown"
-                if kind == "unknown" and span >= THIN_LINE_MIN_SPAN_M:
-                    # The raw component is too wide in world space, but the
-                    # median-x skeleton may still be a real painted line.
-                    core, widths = _row_core_points(ys, xs)
-                    core_world: list[tuple[float, float]] = []
-                    core_pixels: list[tuple[float, float]] = []
-                    for cu, cv in core:
-                        wp = back_project(float(cu), float(cv), cam_model,
-                                          pos, heading, ground_z=ground_z)
-                        if wp is None:
-                            continue
-                        dist = math.hypot(wp[0] - p[0], wp[1] - p[1])
-                        if dist < 2.0 or dist > self.max_dist:
-                            continue
-                        core_world.append(wp)
-                        core_pixels.append((float(cu), float(cv)))
-                    if len(core_world) >= 4:
-                        c_wpts, c_ppts, c_span, c_len, c_perp = \
-                            _order_world_polyline(
-                                np.asarray(core_world, dtype=float),
-                                np.asarray(core_pixels, dtype=float))
-                        row_w_med = (float(np.median(widths))
-                                     if len(widths) else 0.0)
-                        row_w_p90 = (float(np.percentile(widths, 90.0))
-                                     if len(widths) else 0.0)
-                        if _thin_line_ok(c_span, c_len, c_perp,
-                                         row_w_med, row_w_p90):
-                            kind = "thin"
-                            wpts, ppts = c_wpts, c_ppts
-                            span, world_len, perp_span = \
-                                c_span, c_len, c_perp
-                conf = min(1.0, 0.35 + 0.25 * (area / 1500.0)
-                           + 0.4 * min(1.0, span / 40.0))
-                markings.append(LaneMarking(
-                    world=wpts, pixels=ppts, color=color, kind=kind,
-                    confidence=float(conf)))
+            markings.extend(_mask_to_markings(
+                mask0, color, cam_model, pos, heading, ground_z=ground_z,
+                min_area=self.min_area, min_height=self.min_height,
+                max_dist=self.max_dist, solid_len=self.solid_len))
         return markings
 
 

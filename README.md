@@ -37,6 +37,34 @@ python -m venv --system-site-packages .venv
 .venv\Scripts\python.exe scripts\bench_grab_screen.py
 ```
 
+## 学习式路面/标线分割（M5-B）
+
+传统 CV 颜色阈值在 Tech 真渲染帧上失效（实测标线 recall 1.5%、边界误差
+0.8-1.0m）。替代方案：用 BeamNG.tech 的 annotation 像素真值训练轻量 UNet
+（背景 / 路面 / 标线 3 类），推理只吃 RGB 帧，Steam / Tech 通用。
+
+```powershell
+# 1. 采集训练数据（Tech 实例运行中，AI 沿路行驶自动采集）
+.venv\Scripts\python.exe scripts\m5_collect_seg.py --frames 500
+
+# 2. 训练（可多个 run 一起训；增强 + 类别加权已内置）
+.venv\Scripts\python.exe scripts\m5_train_seg.py --runs logs\m5_seg\run_* `
+    --epochs 60 --lr 5e-4 --out logs\m5_seg\seg_model
+
+# 3. 离线评估（无需游戏，直接验证模型）
+.venv\Scripts\python.exe scripts\m5_eval_seg.py --runs logs\m5_seg\run_* `
+    --model logs\m5_seg\seg_model\best.pt --save
+
+# 4. 实车真值对比（CV vs 学习式，需 Tech 实例）
+.venv\Scripts\python.exe scripts\m5_lane_truth_probe.py --frames 60 --drive
+.venv\Scripts\python.exe scripts\m5_lane_truth_probe.py --frames 60 --drive `
+    --model logs\m5_seg\seg_model\best.pt
+```
+
+模型就绪后 `m5_autopilot.py` 和 `m5_lane_state_view.py` 会自动加载
+`logs/m5_seg/seg_model/best.pt`（或用 `--seg-model <路径>` 指定），
+加载失败自动回退经典 CV。
+
 ## 双运行时（Steam / Tech）可并行开发
 
 核心代码库保持 Steam 版兼容、可开源；BeamNG.tech 专属能力放在独立包
@@ -240,3 +268,43 @@ M5 自动驾驶默认开启视觉障碍物感知：后台线程预热 YOLOv8n，
 - `--max-dist 55`（探针）：忽略超过该距离的检测。
 
 注意：视觉检测依赖当前游戏镜头真实位姿（Lua 查询），玩家自由视角下同样自洽；`m5_autopilot.py --attach` 默认已开启视觉。
+
+## 开发日志
+
+按时间正序记录；2026-08-14 之前的条目由文件时间戳、README 与 docs 重建，之后以 git 提交为准。新增改动追加到本节末尾。
+
+### 2026-08-11
+
+- 项目起步与 M1 循迹闭环：搭建 venv 与 `requirements.txt`，实现轨迹录制/回放（`track.py`）、PID（`control/pid.py`）、Pure Pursuit（`control/pure_pursuit.py`），`m1_smoke_test.py` / `m1_record_track.py` / `m1_follow_track.py` 跑通闭环，并保存样例轨迹 `data/track_smallgrid.npz`。
+- M2 视觉感知起步：`vision/band.py` 轮胎印条带检测，`m2_capture.py` / `m2_calibrate_camera.py` 完成相机标定与低帧率采集；结论为 4m 条带 r=+0.93、12m r=+0.91，但纯视觉无先验在 2.4fps 下不可靠。
+- M3 模仿学习起步：`bc.py` + `m3_train_bc.py` 实现 DAVE-2 CNN 训练流程，用 M2 的 229 帧跑通 PoC（val MAE=0.048，R²≈0），确认低帧率、近零转向标签的数据没有训练价值。
+- 遥测可视化：`hud.py`、`telemetry_chart.py`、`m4_dashboard.py` 仪表盘雏形，M1/M3 驾驶可弹 HUD 实时查看油门/刹车/转向/速度。
+
+### 2026-08-12
+
+- 热键框架：`beamng_autopilot/hotkeys.py`，为 M5 游戏内 F8/F9/F10/F11/F12 控制打基础。
+- 控制链路诊断：`diag_parkingbrake.py` / `diag_disconnect.py` / `diag_r_latch_drive.py` / `diag_gear_map.py` / `diag_gearbox_info.py` / `diag_gearbox_list.py` / `diag_arcade_standstill.py` / `diag_arcade_neutral.py`，排查手刹、断开、倒挡自锁、挡位映射与 arcade 控制问题。
+- 感知探针：`m5_rayframe_probe.py` / `m5_rayground_probe.py` / `m5_castray_struct.py` / `m5_castray_compare.py` / `m5_live_blocker_probe.py` / `m5_watchdog_probe.py`，并新增 `watchdog.py` 看门狗；记录 twitch/park 场景，后续纳入 `m5_offline_validate.py` 回归。
+- 视觉检测：`vision/detection.py` 加入 YOLO 检测与地面反投影，下载 `weights/yolov8n.pt`；`control/speed.py` 速度控制；`m5_vision` 检测结果落地。
+
+### 2026-08-13
+
+- 墙体/路线/避障排障：`m5_wall_shape_probe.py` / `m5_wall_fan_probe.py` / `m5_wall_multi_probe.py` / `m5_live_wall_probe.py` / `m5_live_wall_probe2.py` / `m5_wall_route_probe.py` / `m5_live_route_probe.py` / `m5_live_planner_diag.py`，覆盖墙面形状、扇形/多墙、live 路线与 planner 诊断。
+- 挡位控制：`control/gearbox.py` + `m5_gearbox_diag.py`。
+- 感知与遥测：`perception.py` 场景/射线/视觉融合、`vision/tracking.py` 目标跟踪、`visionview.py` 前视叠加、`control/handover.py` 人机交接、`telemetry.py` 实时遥测，`m5_watchdog_beat_test.py` 心跳测试；lane debug run55-57 用于车道状态排障。
+
+### 2026-08-14
+
+- 双运行时：`beamng_autopilot_tech/providers.py` 惰性创建 Tech `Camera` / `Lidar`，`launch_game.py` / `runtime.py` / `download_beamng_tech.py` / `bridge.py` 与 `BEAMNG_RUNTIME` 系列环境变量；同日完成 Steam/Tech 多轮 e2e 验证。
+- M5 整合：`m5_e2e_test.py` / `m5_drive_test.py` 端到端/实车测试、`m5_launcher.py` + `m5_gui_smoke.py` 控制台界面、`traffic.py` 交通、`connector.py` 扩展，以及 `启动自动驾驶.vbs` / `启动车道状态窗口.vbs`。
+- 车道状态与局部规划：`lane.py` 车道几何/状态、`planner.py` 局部规划、`roadnet.py` 路网，配套 `m5_lane_state_probe.py` / `m5_lane_center_capture.py` / `m5_lane_state_annotate.py` / `m5_lane_state_view.py`，车道状态数据落到 `logs/m5_lane_state`。
+- 离线回归与 planner 基线：`m5_offline_validate.py` 大型离线回归；`docs/planner_baseline_20260814.md` 记录 Steam run 98（median_lat=1.76、centered_ratio=0.901），并明确“导航线只决定路线、不决定车道内横向基准”的改进方向。
+- M2 收尾分析：`m2_steering_signal.py` / `m2_steering_vision.py` / `m2_validate_projection.py` / `m2_visualize.py`，把转向信号/视觉相关性结论固化为可重跑脚本。
+- 工程落地：14:37 初始化 git 仓库与 `AGENTS.md` / `.gitignore` / README 首版，23:42 首次提交 `9702e71`（整仓快照，107 个文件、28981 行）。
+
+### 2026-08-15
+
+- `00:06 68cbfc0`：环境自检 `m5_env_check.py` 与抓帧性能探针 `bench_grab_screen.py`，README 补充用法。
+- `00:41 cf973d3`：`CameraModel.camera_pose` 支持车辆 6DOF 姿态（pitch/roll 参与反投影，BeamNG 四元数约定用真实 state 验证）；Tech 相机改为标定外参 + 姿态驱动，移除逐帧 GE 查询；`m5_lane_state_view.py` 抓帧失败降级。
+- `00:58 2481774`：`m5_lane_truth_probe.py` 对比经典 CV 与 BeamNG.tech 像素真值；italy AI 80 帧实测路面 IoU 0.734、标线 recall 0.015、边界误差 0.8-1.0m，量化确认传统 CV 在真渲染帧上不可用。
+- `01:01 起（当前未提交）`：学习式分割路线。新增 `vision/segmentation.py`（轻量 UNet，约 1.3M 参数，background/asphalt/line 三类）、`m5_collect_seg.py`（Tech colour + annotation 半分辨率采集）、`m5_train_seg.py`（时间序 80/20、中位频率加权、mIoU 监控）；`lanes.py` 抽取共享 `_mask_to_markings` 管线，`lane_overlay.py` 的 `estimate_pavement_edges` 支持学习式 off-road mask；`m5_lane_truth_probe.py --model` 与 `m5_autopilot.py --seg-model` 接入，无模型时回退经典 CV。

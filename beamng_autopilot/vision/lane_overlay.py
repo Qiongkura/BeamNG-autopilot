@@ -309,7 +309,8 @@ def _side_pavement_lat(mask, cam, pos, heading, fwd, left,
 
 
 def estimate_pavement_edges(frame_rgb, cam, pos, heading,
-                            ground_z: float | None = None) -> dict | None:
+                            ground_z: float | None = None,
+                            offroad_mask: np.ndarray | None = None) -> dict | None:
     """Vision-only paved edge from the pavement / dirt / grass boundary.
 
     The returned dict uses the same lateral-field names as
@@ -318,6 +319,10 @@ def estimate_pavement_edges(frame_rgb, cam, pos, heading,
     side is reported independently, so a one-sided boundary still works
     when the other edge is outside the camera frustum; ``left_lat`` and
     ``right_lat`` are ``None`` for sides that could not be found.
+
+    ``offroad_mask`` optionally replaces the classic-CV chroma classifier:
+    pass the learned segmentation's off-road mask (True = not asphalt) to
+    reuse this exact edge-extraction geometry with a neural input.
     """
     if frame_rgb is None or cam is None:
         return None
@@ -327,7 +332,10 @@ def estimate_pavement_edges(frame_rgb, cam, pos, heading,
     heading = float(heading)
     fwd = np.array([math.cos(heading), math.sin(heading)])
     left = np.array([-fwd[1], fwd[0]])
-    mask = _offroad_mask(frame_rgb)
+    if offroad_mask is not None:
+        mask = offroad_mask
+    else:
+        mask = _offroad_mask(frame_rgb)
 
     left_lats: list[float | None] = []
     right_lats: list[float | None] = []

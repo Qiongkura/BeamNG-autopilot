@@ -256,6 +256,10 @@ def main() -> None:
     ap.add_argument("--no-lanes", action="store_true",
                     help="disable front-camera lane-marking detection "
                          "(keeps raycast + vehicle sources)")
+    ap.add_argument("--seg-model", default=None,
+                    help="learned lane/road segmentation model path "
+                         "(default: logs/m5_seg/seg_model/best.pt when "
+                         "present; without it classic CV is used)")
     ap.add_argument("--no-markers", action="store_true",
                     help="do not draw the yellow start / red goal spheres "
                          "in the game world")
@@ -779,6 +783,7 @@ def main() -> None:
             nonlocal vision_clear_requested, vision_clear_generation
             lane_det_worker = None
             lane_smoother_worker = None
+            seg_worker = None
             vision_det_worker = None
             last_lanes_worker: list = []
             last_lanes_ts_worker = 0.0
@@ -814,15 +819,45 @@ def main() -> None:
                     lane_frame_worker = None
                     debug_lane: dict = {}
                     if not args.no_lanes:
-                        if lane_det_worker is None:
-                            lane_det_worker = LaneDetector()
+                        # 学习式分割优先（--seg-model 或默认模型存在时），
+                        # 否则回退经典 CV 颜色阈值检测。
+                        seg_model_path = args.seg_model
+                        if seg_model_path is None:
+                            try:
+                                from beamng_autopilot.vision.segmentation \
+                                    import default_model_path
+                                seg_model_path = default_model_path()
+                            except Exception:
+                                seg_model_path = None
+                        if seg_model_path is not None:
+                            if seg_worker is None:
+                                from beamng_autopilot.vision.segmentation \
+                                    import Segmenter
+                                try:
+                                    seg_worker = Segmenter(
+                                        model_path=seg_model_path)
+                                    print(f"[m5] 学习式分割就绪: "
+                                          f"{seg_model_path}")
+                                except Exception as exc:
+                                    seg_worker = False
+                                    print(f"[m5] WARNING: 分割模型加载失败"
+                                          f"（回退 CV）: {exc}")
+                        if seg_worker:
+                            raw_lanes_worker = seg_worker.detect_lines(
+                                img, vmodel_worker, st_worker.pos,
+                                st_worker.heading,
+                                ground_z=(float(st_worker.pos[2])
+                                          if len(st_worker.pos) > 2 else 0.0))
+                        else:
+                            if lane_det_worker is None:
+                                lane_det_worker = LaneDetector()
+                            raw_lanes_worker = lane_det_worker.detect(
+                                img, vmodel_worker, st_worker.pos,
+                                st_worker.heading,
+                                ground_z=(float(st_worker.pos[2])
+                                          if len(st_worker.pos) > 2 else 0.0))
                         if lane_smoother_worker is None:
                             lane_smoother_worker = MarkingSmoother()
-                        raw_lanes_worker = lane_det_worker.detect(
-                            img, vmodel_worker, st_worker.pos,
-                            st_worker.heading,
-                            ground_z=(float(st_worker.pos[2])
-                                      if len(st_worker.pos) > 2 else 0.0))
                         lanes_worker = lane_smoother_worker.update(
                             raw_lanes_worker, vmodel_worker, st_worker.pos,
                             st_worker.heading,

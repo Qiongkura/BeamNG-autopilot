@@ -99,6 +99,8 @@ def main() -> None:
     ap.add_argument("--save", action="store_true",
                     help="保存对比帧到 logs/m5_lane_truth/")
     ap.add_argument("--save-every", type=int, default=5)
+    ap.add_argument("--model", default=None,
+                    help="学习式分割模型路径（缺省用 CV 检测；传路径则对比模型）")
     args = ap.parse_args()
 
     try:
@@ -138,7 +140,16 @@ def main() -> None:
                  is_render_annotations=True, is_render_instance=False,
                  is_render_depth=False, is_visualised=False)
 
-    detector = LaneDetector()
+    if args.model:
+        from beamng_autopilot.vision.segmentation import Segmenter
+
+        segmenter = Segmenter(model_path=args.model)
+        detector = None
+        print(f"[probe] 使用学习式分割: {args.model}")
+    else:
+        segmenter = None
+        detector = LaneDetector()
+        print("[probe] 使用经典 CV 检测")
     out_dir = config.LOGS_DIR / "m5_lane_truth"
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -166,12 +177,20 @@ def main() -> None:
         from beamng_autopilot.vision.projection import default_camera
         cam_model = default_camera(w, h)  # 标定外参（与 Tech provider 等价）
 
-        # ---- CV 检测 ----
-        cv_markings = detector.detect(colour, cam_model, st.pos, heading,
-                                      ground_z=ground_z)
-        cv_edges = estimate_pavement_edges(colour, cam_model, st.pos, heading,
-                                           ground_z=ground_z)
-        cv_road = ~_offroad_mask(colour)
+        # ---- 检测（CV 或学习式）----
+        if segmenter is not None:
+            cv_markings = segmenter.detect_lines(
+                colour, cam_model, st.pos, heading, ground_z=ground_z)
+            cv_edges = estimate_pavement_edges(
+                colour, cam_model, st.pos, heading, ground_z=ground_z,
+                offroad_mask=segmenter.offroad_mask(colour))
+            cv_road = ~segmenter.offroad_mask(colour)
+        else:
+            cv_markings = detector.detect(colour, cam_model, st.pos, heading,
+                                          ground_z=ground_z)
+            cv_edges = estimate_pavement_edges(colour, cam_model, st.pos,
+                                               heading, ground_z=ground_z)
+            cv_road = ~_offroad_mask(colour)
 
         # ---- 真值 ----
         truth_road = _mask_for(ann, ANN_ASPHALT)

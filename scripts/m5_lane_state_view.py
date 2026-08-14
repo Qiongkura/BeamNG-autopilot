@@ -60,7 +60,33 @@ def _build_args() -> argparse.Namespace:
                     help="render one frame to logs and exit (no window)")
     ap.add_argument("--out", default=None,
                     help="output path for --once / snapshot")
+    ap.add_argument("--seg-model", default=None,
+                    help="learned segmentation model path (default: "
+                         "logs/m5_seg/seg_model/best.pt when present; "
+                         "without it classic CV is used)")
     return ap.parse_args()
+
+
+def _build_segmenter(args):
+    """Load the learned segmenter, or None to keep classic CV."""
+    if args.seg_model is None:
+        try:
+            from beamng_autopilot.vision.segmentation \
+                import default_model_path
+            args.seg_model = default_model_path()
+        except Exception:
+            args.seg_model = None
+    if args.seg_model is None:
+        return None
+    try:
+        from beamng_autopilot.vision.segmentation import Segmenter
+
+        seg = Segmenter(model_path=args.seg_model)
+        print(f"[view] 学习式分割: {args.seg_model}")
+        return seg
+    except Exception as exc:
+        print(f"[view] WARNING: 分割模型加载失败（回退 CV）: {exc}")
+        return None
 
 
 def _open_session(args) -> tuple:
@@ -83,14 +109,15 @@ def _open_session(args) -> tuple:
     camera_provider, _ = build_camera_provider(conn, runtime_mode)
     detector = LaneDetector()
     smoother = MarkingSmoother()
+    segmenter = _build_segmenter(args)
     print(f"[view] runtime={runtime_mode}")
-    return conn, camera_provider, detector, smoother
+    return conn, camera_provider, detector, smoother, segmenter
 
 
 def _close_session(session) -> None:
     if session is None:
         return
-    conn, camera_provider, _detector, _smoother = session
+    conn, camera_provider, _detector, _smoother, _segmenter = session
     if camera_provider is not None:
         try:
             camera_provider.close()
@@ -104,7 +131,7 @@ def _close_session(session) -> None:
 
 def _render_frame(conn, camera_provider, detector, smoother, args, *,
                   geometry, geo_cache: dict, force_refresh: bool = False,
-                  warmup: bool = False) -> dict | None:
+                  warmup: bool = False, segmenter=None) -> dict | None:
     """Grab state, camera and sensors, then render one annotated frame.
 
     Returns None when only the frame grab failed (black/stale frame): the
@@ -137,16 +164,23 @@ def _render_frame(conn, camera_provider, detector, smoother, args, *,
     half_w = ego_extents(conn)[1]
     cam = camera_provider.camera_model(st.pos, heading, w, h,
                                        rotation=st.rotation)
-    vision_geometry = estimate_pavement_edges(
-        img, cam, st.pos, heading,
-        ground_z=(float(st.pos[2]) if len(st.pos) > 2 else 0.0))
+    ground_z = (float(st.pos[2]) if len(st.pos) > 2 else 0.0)
+    if segmenter is not None:
+        # 学习式分割：路面边界与标线都来自 UNet 掩码
+        vision_geometry = estimate_pavement_edges(
+            img, cam, st.pos, heading, ground_z=ground_z,
+            offroad_mask=segmenter.offroad_mask(img))
+        raw_markings = segmenter.detect_lines(
+            img, cam, st.pos, heading, ground_z=ground_z)
+    else:
+        vision_geometry = estimate_pavement_edges(
+            img, cam, st.pos, heading, ground_z=ground_z)
+        raw_markings = detector.detect(
+            img, cam, st.pos, heading, ground_z=ground_z)
     geometry = merge_boundary_geometry(geometry, vision_geometry)
-    raw_markings = detector.detect(
-        img, cam, st.pos, heading,
-        ground_z=(float(st.pos[2]) if len(st.pos) > 2 else 0.0))
     markings = smoother.update(
         raw_markings, cam, st.pos, heading,
-        ground_z=(float(st.pos[2]) if len(st.pos) > 2 else 0.0),
+        ground_z=ground_z,
         warmup=warmup, speed=float(st.speed))
     debug: dict = {}
     frame = pair_lane_markings(
@@ -224,7 +258,8 @@ def _run_once(args) -> None:
         geo_cache = {"t": 0.0, "pos": np.zeros(2, dtype=float)}
         res = _render_frame(
             session[0], session[1], session[2], session[3], args,
-            geometry=None, geo_cache=geo_cache, warmup=True)
+            geometry=None, geo_cache=geo_cache, warmup=True,
+            segmenter=session[4])
         saved = _save_frame(res["overlay"], args, "live_smoke")
         _print_summary(res, saved)
     finally:
@@ -272,7 +307,8 @@ def main() -> None:
                     res = _render_frame(
                         session[0], session[1], session[2], session[3],
                         args,
-                        geometry=geometry, geo_cache=geo_cache)
+                        geometry=geometry, geo_cache=geo_cache,
+                        segmenter=session[4])
                     if res is None:
                         # Only the frame grab failed: keep the last overlay
                         # and the session (sensor degradation, not a
