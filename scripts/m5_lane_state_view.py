@@ -104,10 +104,20 @@ def _close_session(session) -> None:
 
 def _render_frame(conn, camera_provider, detector, smoother, args, *,
                   geometry, geo_cache: dict, force_refresh: bool = False,
-                  warmup: bool = False) -> dict:
-    """Grab state, camera and sensors, then render one annotated frame."""
+                  warmup: bool = False) -> dict | None:
+    """Grab state, camera and sensors, then render one annotated frame.
+
+    Returns None when only the frame grab failed (black/stale frame): the
+    caller keeps the last overlay and must NOT treat this as a connection
+    loss (real-vehicle sensor health logic: degrade a frame, never rebuild
+    the session).  Connection-level failures still raise.
+    """
     st = conn.get_state()
-    img = camera_provider.grab()
+    try:
+        img = camera_provider.grab()
+    except Exception as exc:
+        print(f"[view] grab failed (skipping frame): {exc}")
+        return None
     h, w = img.shape[:2]
     fwd = unit_fwd(st)
     heading = float(st.heading)
@@ -125,7 +135,8 @@ def _render_frame(conn, camera_provider, detector, smoother, args, *,
         geo_cache["pos"] = np.asarray(st.pos[:2], dtype=float).copy()
 
     half_w = ego_extents(conn)[1]
-    cam = camera_provider.camera_model(st.pos, heading, w, h)
+    cam = camera_provider.camera_model(st.pos, heading, w, h,
+                                       rotation=st.rotation)
     vision_geometry = estimate_pavement_edges(
         img, cam, st.pos, heading,
         ground_z=(float(st.pos[2]) if len(st.pos) > 2 else 0.0))
@@ -262,6 +273,11 @@ def main() -> None:
                         session[0], session[1], session[2], session[3],
                         args,
                         geometry=geometry, geo_cache=geo_cache)
+                    if res is None:
+                        # Only the frame grab failed: keep the last overlay
+                        # and the session (sensor degradation, not a
+                        # connection loss).
+                        continue
                     geometry = res["geometry"]
                     last_overlay = res["overlay"]
                     errors = 0

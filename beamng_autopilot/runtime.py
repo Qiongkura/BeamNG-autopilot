@@ -27,7 +27,15 @@ class CameraProvider:
         raise NotImplementedError
 
     def camera_model(self, pos, heading, width, height,
-                     fallback: CameraModel | None = None) -> CameraModel:
+                     fallback: CameraModel | None = None,
+                     rotation=None) -> CameraModel:
+        """Camera model for the latest frame.
+
+        ``rotation`` is the optional (x, y, z, w) vehicle quaternion: when
+        given, the calibrated extrinsics are rotated by the full 6-DOF
+        pose (real-vehicle sensor-fusion logic); without it the provider
+        falls back to its own pose source (yaw-only or live camera query).
+        """
         raise NotImplementedError
 
     def close(self) -> None:
@@ -54,7 +62,11 @@ class SteamCameraProvider(CameraProvider):
         return self.conn.grab_screen()
 
     def camera_model(self, pos, heading, width, height,
-                     fallback: CameraModel | None = None) -> CameraModel:
+                     fallback: CameraModel | None = None,
+                     rotation=None) -> CameraModel:
+        # Steam path: the frame shows whatever the player's camera sees
+        # (free-look included), so the live Lua camera query stays the
+        # pose source; ``rotation`` is ignored here on purpose.
         with self.conn.io_lock:
             return live_camera_model(
                 self.conn.bng, int(width), int(height), pos, heading,

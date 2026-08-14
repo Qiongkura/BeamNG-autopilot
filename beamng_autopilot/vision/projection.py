@@ -1,17 +1,47 @@
-"""Pinhole camera model calibrated for the Steam-edition front camera.
+"""Pinhole camera model calibrated for the front camera (Steam / Tech).
 
 The calibration run (scripts/m2_calibrate_camera.py) queried the in-game
 camera pose/FOV via Lua while the vehicle sat at known positions:
   * camera local offset: (0, 1.216, 1.386) in (right, forward, up)
   * camera looks forward with a slight downward pitch (~-0.011 on z)
   * vertical FOV 65 deg
+
+Real-vehicle logic (Tesla / Xpeng style): the sensor extrinsics are fixed
+by calibration, and at runtime only the vehicle's full 6-DOF pose (the
+rotation quaternion) is fed in.  ``CameraModel.camera_pose`` therefore
+accepts an optional ``rotation`` quaternion; when it is absent the legacy
+yaw-only path is used so old callers keep working unchanged.
 """
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
+
+
+def quat_to_rot(q) -> np.ndarray:
+    """(x, y, z, w) quaternion -> 3x3 world rotation matrix.
+
+    Columns of the returned matrix are the local (right, fwd, up) axes
+    expressed in world coordinates, matching the R built from yaw in the
+    legacy path.  BeamNG reports vehicle rotation as (x, y, z, w) with w
+    the real part.
+    """
+    x, y, z, w = (float(v) for v in q)
+    n = math.sqrt(x * x + y * y + z * z + w * w)
+    if n < 1e-12:
+        return np.eye(3)
+    x, y, z, w = x / n, y / n, z / n, w / n
+    return np.array([
+        [1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y - z * w),
+         2.0 * (x * z + y * w)],
+        [2.0 * (x * y + z * w), 1.0 - 2.0 * (x * x + z * z),
+         2.0 * (y * z - x * w)],
+        [2.0 * (x * z - y * w), 2.0 * (y * z + x * w),
+         1.0 - 2.0 * (x * x + y * y)],
+    ])
 
 
 @dataclass
@@ -39,19 +69,36 @@ class CameraModel:
     def cy(self) -> float:
         return self.height / 2.0
 
-    def camera_pose(self, pos, heading: float):
+    def camera_pose(self, pos, heading: float, rotation=None):
         """World-space camera pose from vehicle state.
 
         Returns (C, right, fwd, up) where right/fwd/up are the camera axes.
+
+        ``rotation`` is an optional (x, y, z, w) vehicle quaternion.  When
+        given, the full 6-DOF pose rotates the calibrated extrinsics, so
+        slopes (pitch/roll) are handled correctly; without it the legacy
+        yaw-only path is used (flat-ground assumption).
         """
-        h = float(heading)
-        right = np.array([np.sin(h), -np.cos(h), 0.0])
-        fwd = np.array([np.cos(h), np.sin(h), 0.0])
-        up = np.array([0.0, 0.0, 1.0])
         p = np.asarray(pos, dtype=float)
-        C = p + self.offset[0] * right + self.offset[1] * fwd + self.offset[2] * up
-        f = self.fwd_local[0] * right + self.fwd_local[1] * fwd + self.fwd_local[2] * up
-        u = self.up_local[0] * right + self.up_local[1] * fwd + self.up_local[2] * up
+        if rotation is None:
+            h = float(heading)
+            right = np.array([np.sin(h), -np.cos(h), 0.0])
+            fwd = np.array([np.cos(h), np.sin(h), 0.0])
+            up = np.array([0.0, 0.0, 1.0])
+            R = np.column_stack([right, fwd, up])
+        else:
+            # BeamNG rotation quaternions (x, y, z, w) follow the inverse
+            # (conjugate) convention and map the vehicle-local y axis to
+            # the *backward* direction.  Verified against live vehicle
+            # state: the CameraModel rotation is
+            #   quat_to_rot(x, y, z, -w) @ diag(1, -1, 1)
+            # whose columns are the world (right, fwd, up) axes.
+            q = np.asarray(rotation, dtype=float)
+            R = (quat_to_rot(np.array([q[0], q[1], q[2], -q[3]]))
+                 @ np.diag([1.0, -1.0, 1.0]))
+        C = p + R @ np.asarray(self.offset, dtype=float)
+        f = R @ np.asarray(self.fwd_local, dtype=float)
+        u = R @ np.asarray(self.up_local, dtype=float)
         f = f / np.linalg.norm(f)
         u = u / np.linalg.norm(u)
         r = np.cross(f, u)

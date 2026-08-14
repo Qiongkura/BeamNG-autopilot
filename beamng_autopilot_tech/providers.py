@@ -114,8 +114,20 @@ class TechCameraProvider(CameraProvider):
         raise last_error
 
     def camera_model(self, pos, heading, width, height,
-                     fallback: CameraModel | None = None) -> CameraModel:
-        # BeamNG vehicle-local forward is -Y; core CameraModel uses +Y.
+                     fallback: CameraModel | None = None,
+                     rotation=None) -> CameraModel:
+        # Real-vehicle logic (Tesla / Xpeng style): sensor extrinsics are
+        # fixed by calibration and only the vehicle's full 6-DOF pose (the
+        # rotation quaternion) is fed in at runtime.  The pose is applied
+        # inside CameraModel.camera_pose(), so slopes (pitch/roll) are
+        # handled correctly and no per-frame GE round-trips are needed.
+        # (The earlier get_position/get_direction approach cost two
+        # round-trips per frame and its 0.15 s cache could not survive the
+        # 6 Hz viewer loop, so it was replaced by this zero-query design.)
+        #
+        # CAMERA_* are in BeamNG vehicle-local axes (forward = -Y); the
+        # core CameraModel uses (right, fwd, up) local axes, so the y
+        # components are negated.
         return CameraModel(
             offset=np.array([CAMERA_POS[0], -CAMERA_POS[1], CAMERA_POS[2]]),
             fwd_local=np.array([CAMERA_DIR[0], -CAMERA_DIR[1],

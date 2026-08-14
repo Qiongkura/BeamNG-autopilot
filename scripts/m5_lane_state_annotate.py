@@ -72,7 +72,8 @@ def main() -> None:
 
         roadnet_geometry = road_lane_geometry(conn, st.pos, fwd)
         half_w = ego_extents(conn)[1]
-        cam = camera_provider.camera_model(st.pos, heading, w, h)
+        cam = camera_provider.camera_model(st.pos, heading, w, h,
+                                           rotation=st.rotation)
         vision_geometry = estimate_pavement_edges(
             img, cam, st.pos, heading,
             ground_z=(float(st.pos[2]) if len(st.pos) > 2 else 0.0))

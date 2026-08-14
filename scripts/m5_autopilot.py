@@ -667,7 +667,7 @@ def main() -> None:
         st0 = conn.get_state()
         cam_model = camera_provider.camera_model(
             st0.pos, st0.heading, CAM_W, CAM_H,
-            fallback=default_camera(CAM_W, CAM_H))
+            fallback=default_camera(CAM_W, CAM_H), rotation=st0.rotation)
         print(f"[m5] runtime={runtime_mode}")
     except Exception as exc:
         print(f"[m5] sensor state init failed: {exc}")
@@ -808,7 +808,8 @@ def main() -> None:
                     vw, vh = img.shape[1], img.shape[0]
                     vmodel_worker = camera_provider.camera_model(
                         st_worker.pos, st_worker.heading, vw, vh,
-                        fallback=default_camera(vw, vh))
+                        fallback=default_camera(vw, vh),
+                        rotation=st_worker.rotation)
                     lanes_worker: list = []
                     lane_frame_worker = None
                     debug_lane: dict = {}
