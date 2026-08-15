@@ -1157,6 +1157,7 @@ def main() -> None:
                             last_plan_rule = None
                             cached_drive_route = None
                             cached_blocked = False
+                            last_cross_solid = False
                             hdg_engaged = False
                             lead_vehicle = None
                             lead_dist = 999.0
@@ -1421,14 +1422,18 @@ def main() -> None:
                 # Overtake intent manager: sustained slow-lead request with
                 # hysteresis, cancelled by oncoming traffic or a solid left
                 # line.  Only "active" suppresses the ACC cap below.
+                # ``oncoming`` also gates cross_solid: with no oncoming
+                # traffic the planner may cross the centre line to pass a
+                # stopped car (it still never leaves the road surface).
+                oncoming = oncoming_vehicle_ahead(
+                    obstacles,
+                    route if (route is not None and len(route) >= 2)
+                    else None,
+                    st.pos, heading=st.heading)
                 ovk_state = ovk.update(
                     time.time(), lead_vehicle is not None, lead_speed,
                     lead_dist, cruise_speed, speed,
-                    oncoming=oncoming_vehicle_ahead(
-                        obstacles,
-                        route if (route is not None and len(route) >= 2)
-                        else None,
-                        st.pos, heading=st.heading),
+                    oncoming=oncoming,
                     solid_left=solid_marking_left(
                         last_lanes, st.pos, st.heading))
                 overtake_requested = ovk_state == "active"
@@ -1456,18 +1461,20 @@ def main() -> None:
                     if (drive_route is None
                             or route is not last_plan_route
                             or road_rule is not last_plan_rule
+                            or (not oncoming) != last_cross_solid
                             or now - last_plan_t >= PLAN_INTERVAL_S):
                         drive_route, blocked = planner.plan(
                             plan_route, obstacles, st.pos, st.heading,
                             plan_nearest,
                             solid_lines=last_lanes, sensor_lane=lane_frame,
-                            road_rule=road_rule)
+                            road_rule=road_rule, cross_solid=not oncoming)
                         plan_ran = True
                         drive_route = np.asarray(drive_route, dtype=float)
                         cached_drive_route = drive_route
                         cached_blocked = blocked
                         last_plan_route = plan_route
                         last_plan_rule = road_rule
+                        last_cross_solid = not oncoming
                         last_plan_t = time.time()
                     if blocked:
                         blk = getattr(planner, "last_blocker", None)

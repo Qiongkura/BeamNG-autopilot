@@ -820,6 +820,14 @@ def merge_obstacles(obstacles, merge_dist: float = 2.5) -> list[Obstacle]:
             target.velocity = ob.velocity
             target.heading = ob.heading
             target.vehicle_id = ob.vehicle_id
+        # Keep the oriented footprint (axis + extents) when a scene vehicle
+        # merges into a lidar/vision box: without it the planner sees the
+        # world-aligned AABB of a diagonally parked car, which can span the
+        # whole road and block every detour.
+        if target.axis is None and ob.axis is not None:
+            target.axis = ob.axis
+            target.half_len = ob.half_len
+            target.half_thick = ob.half_thick
     return merged
 
 
@@ -956,7 +964,9 @@ def scan_obstacles_vehicles(
                if np.isfinite(vx) and np.isfinite(vy) else None)
         out.append(Obstacle(x=x, y=y, half_w=hw, half_h=hh,
                             category="vehicle", heading=yaw,
-                            velocity=vel, vehicle_id=vid))
+                            velocity=vel, vehicle_id=vid,
+                            axis=np.array([math.cos(yaw), math.sin(yaw)]),
+                            half_len=half_h, half_thick=half_w))
     return out
 
 

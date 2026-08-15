@@ -57,6 +57,7 @@ from beamng_autopilot.runtime import (
 )
 from beamng_autopilot.telemetry import TelemetryBroadcaster
 from beamng_autopilot.telemetry_chart import plot_telemetry
+from beamng_autopilot.traffic import oncoming_vehicle_ahead
 from beamng_autopilot.vision.projection import default_camera
 from beamng_autopilot.visionview import (
     render_birdview,
@@ -292,6 +293,8 @@ def main() -> None:
         last_save = 0.0
         last_scan = 0.0
         last_status = 0.0
+        last_rule = 0.0
+        road_rule = None
         obstacles: list = []
         obs_dist = 999.0
         blocked = False
@@ -327,8 +330,24 @@ def main() -> None:
             if len(route) > 0:
                 d = np.linalg.norm(route[:, :2] - st.pos[:2], axis=1)
                 nearest = int(np.argmin(d))
+                # Map link snapshot for the road-width clamp (keeps the
+                # detour on the road surface).  Polled at ~2 Hz to limit
+                # RPC chatter.
+                if now - last_rule > 0.5:
+                    last_rule = now
+                    try:
+                        road_rule = conn.read_current_road_rule(
+                            st.pos, st.dir)
+                    except Exception:
+                        road_rule = None
+                # No oncoming traffic in this test scene: allow the detour
+                # to cross the centre line when passing the stopped car
+                # (the road-width clamp still keeps it on the asphalt).
                 drive_route, blocked = planner.plan(
-                    route, obstacles, st.pos, st.heading, nearest)
+                    route, obstacles, st.pos, st.heading, nearest,
+                    road_rule=road_rule,
+                    cross_solid=not oncoming_vehicle_ahead(
+                        obstacles, route, st.pos, heading=st.heading))
                 drive_route = np.asarray(drive_route, dtype=float)
                 if len(drive_route) >= 2:
                     d0 = np.linalg.norm(

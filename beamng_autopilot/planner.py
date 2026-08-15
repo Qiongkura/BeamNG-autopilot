@@ -29,7 +29,11 @@ from beamng_autopilot.lane import (
     LANE_WIDTH_DEFAULT_M,
     lane_frame_usable,
 )
-from beamng_autopilot.traffic import RoadRuleView, legal_lane_view
+from beamng_autopilot.traffic import (
+    RoadRuleView,
+    legal_lane_view,
+    road_width_m,
+)
 from beamng_autopilot.vision.lanes import marking_is_zigzag
 
 CAR_HALF_WIDTH = 1.0      # lateral half width of the ego car
@@ -512,6 +516,32 @@ def _points_to_polyline_lat(points, poly):
     """Signed lateral offset of every point from its nearest polyline seg."""
     _, _, lat, _ = _pts_to_segments(points, poly)
     return lat
+
+
+def _clamp_path_lateral(out, center, half_w: float):
+    """Pull path points back inside a lateral corridor around ``center``.
+
+    Detour / deform paths around an obstacle can drift onto the shoulder or
+    the roadside when the obstacle field is dense; real drivers stay on the
+    road surface.  Every point whose lateral offset from the reference
+    polyline exceeds ``half_w`` is pulled back along its segment normal so
+    the path stays inside the road (the corridor itself can still cross the
+    centre line when overtaking).
+    """
+    out = np.asarray(out, dtype=float)
+    if out.ndim != 2 or out.shape[1] < 2 or len(out) == 0:
+        return out
+    center = np.asarray(center, dtype=float)
+    if center.ndim != 2 or center.shape[1] < 2 or len(center) < 2:
+        return out
+    q, _, lat, normal = _pts_to_segments(out, center)
+    over = np.abs(lat) > half_w
+    if not np.any(over):
+        return out
+    clipped = np.clip(lat, -half_w, half_w)
+    out2 = out.copy()
+    out2[over] = q[over] + normal[over] * clipped[over][:, None]
+    return out2
 
 
 def is_sparse_raycast_speck(ob) -> bool:
@@ -1035,7 +1065,8 @@ class LocalPlanner:
     def plan(self, route: np.ndarray | None, obstacles, pos, heading: float,
              nearest: int, solid_lines=None,
              sensor_lane=None,
-             road_rule: RoadRuleView | None = None
+             road_rule: RoadRuleView | None = None,
+             cross_solid: bool = False,
              ) -> tuple[np.ndarray, bool]:
         """Return (drive_path, blocked).
 
@@ -1052,9 +1083,14 @@ class LocalPlanner:
         lane-level driving.  ``road_rule`` is an optional map snapshot
         used to keep the car on the legal side of the road and to block
         paths that would cross the map's opposing-lane boundary.
+        ``cross_solid`` permits a detour to cross the *detected* centre
+        line (overtaking a stopped car with no oncoming traffic); the
+        map's legal-lane boundary - wrong-way / off-road - always applies,
+        so the detour still cannot leave the road surface.
         """
         self.last_blocker = None
         self.last_plan_stages = {}
+        self._cross_solid = bool(cross_solid)
         _t0 = time.perf_counter()
 
         def _stage(name: str) -> None:
@@ -1290,6 +1326,13 @@ class LocalPlanner:
             # path into a phantom "solid line" stop.
             if map_boundaries and lane_mode is None:
                 boundaries.extend(map_boundaries)
+            if self._cross_solid and mode == "detour":
+                # Overtaking with no oncoming traffic: the centre line
+                # (visual or map - on a two-way link the map boundary IS
+                # the centre line) may be crossed.  Staying on the road
+                # surface is enforced by the road-width clamp below, so no
+                # solid boundary applies to the detour.
+                boundaries = []
             if boundaries:
                 _t1 = time.perf_counter()
                 # A detour deliberately leaves the current lane: if it
@@ -1324,6 +1367,16 @@ class LocalPlanner:
                         # following a path that crosses the boundary.
                         return pts[: max(2, hit + 2)], True
                     return out, True
+            # Stay on the road surface: detour/deform paths can drift onto
+            # the shoulder in dense obstacle scenes.  When the map knows
+            # the link width, pull every path point back inside the road
+            # (the corridor may still cross the centre line to overtake,
+            # it just never leaves the asphalt).
+            if lane_mode is None and road_rule is not None:
+                w = road_width_m(road_rule)
+                if w is not None and w > 2.0 * (CAR_HALF_WIDTH + 0.5):
+                    out = _clamp_path_lateral(
+                        out, raw_pts, w / 2.0 - CAR_HALF_WIDTH - 0.3)
             self.last_mode = mode
             return out, mode == "blocked"
 
