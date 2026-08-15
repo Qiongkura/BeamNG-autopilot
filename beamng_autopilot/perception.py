@@ -555,7 +555,10 @@ def lidar_obstacles(cloud: np.ndarray, pos, radius: float = 45.0,
         return []
     out: list[Obstacle] = []
     for sector in _split_raycast_sectors(pts2d, (ox, oy)):
-        out.extend(_cluster_points(sector, split_walls=True,
+        # Coarser flood-fill cell than the raycast fan: the lidar cloud is
+        # dense, so neighbouring poles/trunks/fence posts merge into one
+        # box instead of dozens of 0.9 m specks that clutter the planner.
+        out.extend(_cluster_points(sector, cell=3.0, split_walls=True,
                                    category="lidar"))
     return out
 

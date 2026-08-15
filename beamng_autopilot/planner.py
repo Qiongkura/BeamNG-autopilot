@@ -38,6 +38,10 @@ from beamng_autopilot.vision.lanes import marking_is_zigzag
 
 CAR_HALF_WIDTH = 1.0      # lateral half width of the ego car
 SAFETY_MARGIN = 1.7       # extra clearance kept around obstacles (m)
+# Path-planning gap for lidar clusters: car half width + 0.3 m.  Dense
+# town scenes otherwise inflate every roadside bush by SAFETY_MARGIN and
+# fill the A* grid; the speed planner still keeps the full clearance.
+LIDAR_PATH_CLEAR_M = 1.3
 MAX_LATERAL_DEV = 8.0     # how far the path may leave the nav corridor
 PLAN_HORIZON_M = 48.0     # how far ahead we re-plan the path
 CORRIDOR_HALF_W = 1.6     # pass-by slower than this gap from an obstacle
@@ -908,6 +912,19 @@ def _clamp_to_solid_lines(path, solid_lines, anchor,
     return out, False, 0.0
 
 
+def _path_clear_m(ob, half_w: float) -> float:
+    """Path-clearance gap for one obstacle.
+
+    Lidar clusters are voxel-quantised roadside noise: they get the tight
+    A* gap (car half width + 0.3 m) instead of the full safety margin, so
+    the generated detour is not rejected by its own collision check.  The
+    speed planner still applies the full clearance, so safety is kept.
+    """
+    if getattr(ob, "category", "") == "lidar":
+        return LIDAR_PATH_CLEAR_M
+    return half_w
+
+
 def _obstacle_aabb(ob, half_w: float):
     """Axis-aligned bounding box of an obstacle inflated by ``half_w``."""
     if _obstacle_oriented(ob):
@@ -935,7 +952,8 @@ def _path_hit_index(pts, i0: int, i1: int, obstacles, half_w: float) -> int:
     Returns -1 when no segment in the window is blocked.
     """
     n = len(pts)
-    boxes = [_obstacle_aabb(ob, half_w) for ob in obstacles]
+    boxes = [_obstacle_aabb(ob, _path_clear_m(ob, half_w))
+             for ob in obstacles]
     for i in range(i0, min(i1, n - 1)):
         ax, ay = pts[i]
         bx, by = pts[i + 1]
@@ -948,7 +966,8 @@ def _path_hit_index(pts, i0: int, i1: int, obstacles, half_w: float) -> int:
             if (seg_max_x < x0 or seg_min_x > x1
                     or seg_max_y < y0 or seg_min_y > y1):
                 continue
-            if _seg_hits_obstacle(ax, ay, bx, by, ob, half_w):
+            if _seg_hits_obstacle(ax, ay, bx, by, ob,
+                                  _path_clear_m(ob, half_w)):
                 return i
     return -1
 
@@ -956,7 +975,8 @@ def _path_hit_index(pts, i0: int, i1: int, obstacles, half_w: float) -> int:
 def _find_blocker(pts, i0: int, i1: int, obstacles, half_w: float):
     """First obstacle whose footprint intrudes into the planning window."""
     n = len(pts)
-    boxes = [_obstacle_aabb(ob, half_w) for ob in obstacles]
+    boxes = [_obstacle_aabb(ob, _path_clear_m(ob, half_w))
+             for ob in obstacles]
     for i in range(i0, min(i1, n - 1)):
         ax, ay = pts[i]
         bx, by = pts[i + 1]
@@ -969,7 +989,8 @@ def _find_blocker(pts, i0: int, i1: int, obstacles, half_w: float):
             if (seg_max_x < x0 or seg_min_x > x1
                     or seg_max_y < y0 or seg_min_y > y1):
                 continue
-            if _seg_hits_obstacle(ax, ay, bx, by, ob, half_w):
+            if _seg_hits_obstacle(ax, ay, bx, by, ob,
+                                  _path_clear_m(ob, half_w)):
                 return ob
     return None
 
@@ -1284,6 +1305,25 @@ class LocalPlanner:
         obstacles = [ob for ob in obstacles
                      if not is_sparse_raycast_speck(ob)
                      and not is_small_lidar_clutter(ob)]
+        # Lidar clusters far off the road corridor are roadside noise: in
+        # dense town scenes they inflate the 20 m-wide A* grid until no
+        # detour exists.  Only clusters that can actually reach the
+        # corridor (own lane + the opposite lane the detour may use) take
+        # part in path blocking; the speed planner still sees the full
+        # list, so the car keeps easing off near them.
+        if any(ob.category == "lidar" for ob in obstacles):
+            _ref = raw_pts if raw_path is not None else pts
+            _lats = _points_to_polyline_lat(
+                np.asarray([[float(o.x), float(o.y)] for o in obstacles]),
+                _ref)
+            _lim = 6.0
+            if road_rule is not None:
+                _w = road_width_m(road_rule)
+                if _w is not None and _w > 2.0:
+                    _lim = _w / 2.0 + 2.0
+            obstacles = [o for o, _la in zip(obstacles, _lats)
+                         if not (o.category == "lidar"
+                                 and abs(float(_la)) > _lim)]
         if lane_mode is not None:
             # The lane centre already keeps the car inside the detected
             # lane; a thin wall at the lane edge is the boundary itself,
@@ -1879,11 +1919,22 @@ class LocalPlanner:
         pad = int(math.ceil(CAR_HALF_WIDTH / res)) + 1
         anticipate_cells = int(math.ceil(GRID_ANTICIPATE / res))
         for ob in obstacles:
+            # Obstacle inflation = car half width (the pad below) plus a
+            # net clearance gap.  LIDAR_PATH_CLEAR_M already includes the
+            # car half width, so subtracting CAR_HALF_WIDTH avoids double
+            # counting - before this fix a lidar box in a 7 m street ate
+            # 4.4 m and left no drivable lane.  Raycast/vehicle obstacles
+            # keep the original SAFETY_MARGIN behaviour (the offline
+            # grove scenes are calibrated against it).
+            if ob.category == "lidar":
+                m = max(0.0, LIDAR_PATH_CLEAR_M - CAR_HALF_WIDTH)
+            else:
+                m = margin
             if _obstacle_oriented(ob):
                 ux, uy = float(ob.axis[0]), float(ob.axis[1])
                 vx, vy = -uy, ux
-                hu = ob.half_len + margin
-                hv = max(0.0, ob.half_thick) + margin
+                hu = ob.half_len + m
+                hv = max(0.0, ob.half_thick) + m
                 corners = [
                     to_local(ob.x + ux * hu + vx * hv,
                              ob.y + uy * hu + vy * hv),
@@ -1895,8 +1946,8 @@ class LocalPlanner:
                              ob.y - uy * hu - vy * hv),
                 ]
             else:
-                hw = ob.half_w + margin
-                hh = ob.half_h + margin
+                hw = ob.half_w + m
+                hh = ob.half_h + m
                 corners = [
                     to_local(ob.x - hw, ob.y - hh),
                     to_local(ob.x + hw, ob.y - hh),

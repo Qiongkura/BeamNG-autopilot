@@ -401,6 +401,25 @@ def main() -> None:
                 print(f"[obstacle] MODE -> {mode} at t={modes[-1][0]:.1f}s "
                       f"v={speed:.1f} obs={len(obstacles)} "
                       f"blocker={blk}")
+                if mode == "blocked":
+                    # dump obstacles ahead of the car to see what blocks
+                    fwd = np.asarray(st.dir[:2], dtype=float)
+                    p0 = np.asarray(st.pos[:2], dtype=float)
+                    ahead = []
+                    for o in obstacles:
+                        d = np.asarray([o.x - p0[0], o.y - p0[1]])
+                        lon = float(d @ fwd)
+                        if 0.0 < lon < 15.0:
+                            lat = float(d @ np.array([-fwd[1], fwd[0]]))
+                            ahead.append((round(lon, 1), round(lat, 1),
+                                         round(o.half_w, 1),
+                                         round(o.half_h, 1),
+                                         o.category, o.label))
+                    ahead.sort()
+                    for a in ahead[:14]:
+                        print(f"[obstacle]   ahead lon={a[0]:.1f} "
+                              f"lat={a[1]:.1f} half=({a[2]:.1f},{a[3]:.1f}) "
+                              f"{a[4]}:{a[5] or '-'}")
 
             dt = max(1e-3, now - last_ctrl)
             last_ctrl = now
