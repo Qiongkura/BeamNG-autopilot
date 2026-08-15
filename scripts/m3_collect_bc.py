@@ -39,7 +39,8 @@ def main() -> None:
     ap.add_argument("--track", required=True)
     ap.add_argument("--speed", type=float, default=8.0)
     ap.add_argument("--laps", type=int, default=2)
-    ap.add_argument("--port", type=int, default=config.PORT)
+    ap.add_argument("--port", type=int, default=None,
+                    help="game port (default: resolved from --runtime)")
     ap.add_argument("--duration", type=float, default=300.0)
     ap.add_argument("--resize", default="320x180",
                     help="downscale frames to WxH before saving")
@@ -49,6 +50,12 @@ def main() -> None:
     ap.add_argument("--runtime", choices=("auto", "steam", "tech"),
                     default=config.RUNTIME_MODE,
                     help="game runtime: auto detects after connecting")
+    ap.add_argument("--tech-annot", action="store_true",
+                    help="Tech only: enable annotation rendering and drop "
+                         "frames whose road share is below --min-road-share")
+    ap.add_argument("--min-road-share", type=float, default=0.15,
+                    help="min road pixel share in the lower frame for a "
+                         "frame to be kept (with --tech-annot)")
     args = ap.parse_args()
 
     w, h = (int(x) for x in args.resize.lower().split("x"))
@@ -70,20 +77,30 @@ def main() -> None:
     telemetry = TelemetryBroadcaster()
 
     with BeamNGConnector(
-            args.map, args.vehicle, port=args.port,
+            args.map, args.vehicle,
+            port=(args.port or config.runtime_port(args.runtime)),
             home=config.runtime_home(args.runtime)) as conn:
         conn.load_scenario(spawn_pos=(float(start[0]), float(start[1]), 0.0),
                            spawn_heading=heading0)
         runtime_mode = resolve_runtime(conn, args.runtime)
         if runtime_mode == "steam":
             conn.set_front_camera()
-        camera_provider, _ = build_camera_provider(conn, runtime_mode)
-        print(f"[bc-collect] scenario started; saving to {run_dir}")
+        use_annot = bool(args.tech_annot and runtime_mode == "tech")
+        if args.tech_annot and runtime_mode != "tech":
+            print("[bc-collect] WARNING: --tech-annot requires the tech "
+                  "runtime; falling back to plain frames")
+        camera_provider, _ = build_camera_provider(
+            conn, runtime_mode, annotations=use_annot)
+        if use_annot:
+            from beamng_autopilot_tech.annotations import road_share
+        print(f"[bc-collect] scenario started; saving to {run_dir} "
+              f"(annot={use_annot})")
 
         nearest, prev_nearest, lap, t0 = 0, 0, 0, time.time()
         last_status = 0.0
         stalled_since = None
         idx = 0
+        dropped = 0
 
         while time.time() - t0 < args.duration and lap < args.laps:
             st = conn.get_state()
@@ -91,7 +108,11 @@ def main() -> None:
 
             # grab the view BEFORE computing the command -> aligned (image, label)
             try:
-                img = camera_provider.grab()  # RGB (H, W, 3)
+                if use_annot:
+                    img, ann = camera_provider.grab_annotated()
+                else:
+                    img = camera_provider.grab()
+                    ann = None
             except Exception as exc:
                 print(f"[bc-collect] frame error: {exc}")
                 conn.step(1)
@@ -128,6 +149,17 @@ def main() -> None:
             )
 
             small = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+            road = None
+            if ann is not None:
+                # Annotation-based quality gate: an off-road / black frame
+                # (low road share) teaches the network the wrong label, so
+                # it is dropped at the source instead of poisoning the run.
+                road = float(road_share(ann))
+                if road < args.min_road_share:
+                    dropped += 1
+                    conn.control(throttle=throttle, steering=steer, brake=brake)
+                    conn.step(1)
+                    continue
             cv2.imwrite(str(run_dir / "frames" / f"frame_{idx:05d}.jpg"),
                         cv2.cvtColor(small, cv2.COLOR_RGB2BGR),
                         [cv2.IMWRITE_JPEG_QUALITY, args.quality])
@@ -142,6 +174,7 @@ def main() -> None:
                 "heading": round(float(st.heading), 4),
                 "nearest": int(nearest),
                 "lap": int(lap),
+                "road_share": None if road is None else round(road, 4),
             }) + "\n")
             idx += 1
             if args.max_frames and idx >= args.max_frames:
@@ -173,7 +206,8 @@ def main() -> None:
     meta_file.close()
     telemetry.close()
     dt = time.time() - t0
-    print(f"[bc-collect] done: {idx} frames, {lap} laps, {idx / dt:.1f} fps -> {run_dir}")
+    print(f"[bc-collect] done: {idx} frames ({dropped} dropped by quality "
+          f"gate), {lap} laps, {idx / dt:.1f} fps -> {run_dir}")
 
 
 if __name__ == "__main__":

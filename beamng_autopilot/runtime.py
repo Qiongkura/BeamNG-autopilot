@@ -102,13 +102,19 @@ def resolve_runtime(conn, mode: str | None = None) -> str:
     return "steam"
 
 
-def build_camera_provider(conn, mode, width: int = 1076, height: int = 806):
-    """Return (CameraProvider, resolved runtime) for the connected session."""
+def build_camera_provider(conn, mode, width: int = 1076, height: int = 806,
+                          annotations: bool = False):
+    """Return (CameraProvider, resolved runtime) for the connected session.
+
+    ``annotations`` enables Tech annotation rendering (pixel truth) on the
+    camera; it is ignored on Steam.
+    """
     mode = resolve_runtime(conn, mode)
     if mode == "tech":
         from beamng_autopilot_tech.providers import TechCameraProvider
 
-        return TechCameraProvider(conn, width, height), mode
+        return TechCameraProvider(conn, width, height,
+                                  annotations=annotations), mode
     return SteamCameraProvider(conn), mode
 
 

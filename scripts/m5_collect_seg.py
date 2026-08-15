@@ -28,25 +28,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from beamng_autopilot import config
 from beamng_autopilot.connector import BeamNGConnector
 from beamng_autopilot.roadnet import RoadNetwork
+from beamng_autopilot_tech.annotations import to_label
 
 W, H = 536, 403  # 半分辨率（原始 1076x806）
 
-ANN_ASPHALT = (128, 128, 128)
-ANN_SOLID_LINE = (255, 196, 128)
-ANN_DASHED_LINE = (196, 196, 255)
-ANN_ZEBRA = (255, 128, 128)
-_LINE_COLORS = {ANN_SOLID_LINE, ANN_DASHED_LINE, ANN_ZEBRA}
-
 MIN_SEGMENT_DIST_M = 200.0  # 新段起点至少离当前位置这么远
-
-
-def to_label(ann_rgb: np.ndarray) -> np.ndarray:
-    """annotation RGB 图 -> 3 类标签图 (H, W) uint8。"""
-    label = np.zeros(ann_rgb.shape[:2], dtype=np.uint8)
-    label[(ann_rgb == np.asarray(ANN_ASPHALT, dtype=np.uint8)).all(axis=2)] = 1
-    for c in _LINE_COLORS:
-        label[(ann_rgb == np.asarray(c, dtype=np.uint8)).all(axis=2)] = 2
-    return label
 
 
 def _random_road_point(roadnet: RoadNetwork, cur_xy, rng) -> tuple:

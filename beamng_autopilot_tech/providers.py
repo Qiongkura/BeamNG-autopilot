@@ -59,11 +59,13 @@ def _frame_is_black(frame, max_mean: float = BLACK_FRAME_MAX_MEAN) -> bool:
 class TechCameraProvider(CameraProvider):
     """Front camera attached to the ego vehicle on BeamNG.tech."""
 
-    def __init__(self, conn, width: int = 1076, height: int = 806) -> None:
+    def __init__(self, conn, width: int = 1076, height: int = 806,
+                 annotations: bool = False) -> None:
         from beamngpy.sensors import Camera
 
         self.conn = conn
         self.name = f"autopilot_front_{_PID}"
+        self.annotations = bool(annotations)
         with conn.io_lock:
             self.camera = Camera(
                 self.name,
@@ -78,7 +80,7 @@ class TechCameraProvider(CameraProvider):
                 near_far_planes=(0.05, 150.0),
                 is_using_shared_memory=True,
                 is_render_colours=True,
-                is_render_annotations=False,
+                is_render_annotations=self.annotations,
                 is_render_instance=False,
                 is_render_depth=False,
                 is_visualised=False,
@@ -86,8 +88,7 @@ class TechCameraProvider(CameraProvider):
         self.width = int(width)
         self.height = int(height)
 
-    def grab(self) -> np.ndarray:
-        frame = None
+    def _poll(self) -> dict:
         last_error: RuntimeError | None = None
         for attempt in range(BLACK_FRAME_RETRIES):
             with self.conn.io_lock:
@@ -100,12 +101,29 @@ class TechCameraProvider(CameraProvider):
                 frame = np.ascontiguousarray(
                     np.asarray(image), dtype=np.uint8).copy()
                 if not _frame_is_black(frame):
-                    return frame
+                    return data
                 last_error = RuntimeError(
                     "tech camera returned a black frame")
             if attempt + 1 < BLACK_FRAME_RETRIES:
                 time.sleep(BLACK_FRAME_RETRY_DELAY_S)
         raise last_error
+
+    def grab(self) -> np.ndarray:
+        data = self._poll()
+        return np.ascontiguousarray(
+            np.asarray(data.get("colour")), dtype=np.uint8).copy()
+
+    def grab_annotated(self) -> tuple[np.ndarray, np.ndarray]:
+        """Return (RGB frame, annotation frame); requires annotations=True."""
+        data = self._poll()
+        rgb = np.ascontiguousarray(
+            np.asarray(data.get("colour")), dtype=np.uint8).copy()
+        ann = data.get("annotation")
+        if ann is None:
+            raise RuntimeError("tech camera returned no annotation frame "
+                               "(annotations mode not enabled)")
+        return rgb, np.ascontiguousarray(
+            np.asarray(ann), dtype=np.uint8).copy()
 
     def camera_model(self, pos, heading, width, height,
                      fallback: CameraModel | None = None,
