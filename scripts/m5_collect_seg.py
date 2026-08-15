@@ -50,7 +50,8 @@ def _random_road_point(roadnet: RoadNetwork, cur_xy, rng) -> tuple:
     raise RuntimeError("roadnet 中找不到足够远的随机节点")
 
 
-def _teleport_to(conn, xyz, heading, lift: float = 0.6) -> None:
+def _teleport_to(conn, xyz, heading, lift: float = 0.6,
+                 no_step: bool = False) -> None:
     """把车 teleport 到路网节点并按道路方向摆正。"""
     from beamngpy.misc.quat import angle_to_quat
 
@@ -59,7 +60,10 @@ def _teleport_to(conn, xyz, heading, lift: float = 0.6) -> None:
     with conn.io_lock:
         conn.vehicle.teleport((float(xyz[0]), float(xyz[1]),
                                float(xyz[2]) + lift), rot_quat=quat)
-        conn.step(30)
+        if no_step:
+            time.sleep(1.0)  # 让持有 step 的客户端推进物理结算
+        else:
+            conn.step(30)
 
 
 def main() -> None:
@@ -76,6 +80,9 @@ def main() -> None:
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--run", default=None,
                     help="运行名（默认自动时间戳）")
+    ap.add_argument("--no-step", action="store_true",
+                    help="共享模式：不 blocking step（另一客户端如 "
+                         "lane_state_view 在推进 sim），只 poll 相机")
     args = ap.parse_args()
 
     try:
@@ -141,7 +148,7 @@ def main() -> None:
         if seg > 0 and roadnet is not None:
             st = conn.get_state()
             x, y, z, hdg = _random_road_point(roadnet, st.pos[:2], rng)
-            _teleport_to(conn, (x, y, z), hdg)
+            _teleport_to(conn, (x, y, z), hdg, no_step=args.no_step)
             print(f"[collect] segment {seg}: teleport -> "
                   f"({x:.0f}, {y:.0f})")
             meta["segment_starts"].append([round(x, 1), round(y, 1)])
@@ -159,7 +166,8 @@ def main() -> None:
         seg_frames = min(per_seg, total - frame_i)
         for k in range(seg_frames):
             t0 = time.time()
-            conn.step(10)
+            if not args.no_step:
+                conn.step(10)
             with conn.io_lock:
                 data = cam.poll()
             colour = np.ascontiguousarray(
