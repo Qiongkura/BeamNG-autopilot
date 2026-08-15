@@ -129,9 +129,11 @@ for _, veh in ipairs(getAllVehicles()) do
       if dx * dx + dy * dy < radius * radius then
         -- Vehicle heading so the planner gets a correctly oriented
         -- footprint: a car parked along the road is a slim box, not a
-        -- 9 m wide wall that blocks every detour.
+        -- 9 m wide wall that blocks every detour.  getHeadingVector is
+        -- not present on this Tech build's Vehicle objects, so the
+        -- direction vector is used (same atan2 world-heading convention).
         local yaw = 0.0
-        local okh, hv = pcall(function() return veh:getHeadingVector() end)
+        local okh, hv = pcall(function() return veh:getDirectionVector() end)
         if okh and hv then
           yaw = math.atan2(hv.y, hv.x)
         end

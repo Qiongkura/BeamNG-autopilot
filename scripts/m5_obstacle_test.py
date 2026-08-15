@@ -252,6 +252,13 @@ def main() -> None:
                 if math.cos(road_h - heading_at) < 0.0:
                     road_h += math.pi
                 heading_at = road_h
+        # Park IN the lane like a real stopped car (right-hand traffic):
+        # shift the blocker from the road centreline onto the right lane so
+        # the ego has to pass on the left, instead of a car sitting in the
+        # middle of the road.
+        lane_off = 1.75
+        right = np.array([math.sin(heading_at), -math.cos(heading_at)])
+        bp = bp + right * lane_off
 
         blocker = conn.scenario.get_vehicle("blocker")
         z = 0.4
@@ -264,7 +271,7 @@ def main() -> None:
         conn.step(30)
         print(f"[obstacle] blocker parked at ({bp[0]:.1f}, {bp[1]:.1f}) "
               f"heading {math.degrees(heading_at):.0f}deg, ~{BLOCK_DIST:.0f}m "
-              "along the route")
+              f"along the route, {lane_off:.2f}m right of the centreline")
 
         # ---- verify the perception actually sees the blocker ----
         st = conn.get_state()
