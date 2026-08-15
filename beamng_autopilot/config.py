@@ -113,9 +113,11 @@ ROADNET_REPOSITION_NEAR_M = 25.0
 DEFAULT_MAP = "italy"
 DEFAULT_VEHICLE = "etk800"
 
-# 意大利地图默认出生点：spawn_crossroads（十字路口）
-ITALY_SPAWN_CROSSROADS_POS = (729.62677, 763.914001, 177.753006)
-ITALY_SPAWN_CROSSROADS_HEADING = math.atan2(0.430445611, 0.902616739)
+# 意大利地图默认出生点：spawn_crossroads（十字路口）。
+# 2026-08-15 实测定点：以 tech 自动驾驶测试默认位置为准（车停在路面
+# 上，含当前朝向；z 为车辆 origin 高度，spawn 时 cling 会贴地）。
+ITALY_SPAWN_CROSSROADS_POS = (729.634694, 763.914991, 177.954548)
+ITALY_SPAWN_CROSSROADS_HEADING = 0.445966302
 
 # 车体 origin 离路面高度（etk800，2026-08-15 实测：st.pos[2] - 最近路网
 # 节点 z = 0.17m）。地面反投影必须用路面高度；用车辆 origin 的 z 会让
