@@ -67,6 +67,12 @@ python -m venv --system-site-packages .venv
 
 ## 双运行时（Steam / Tech）可并行开发
 
+**开发前提（2026-08 起）：优先基于 BeamNG.tech 研发**。感知以真传感器
+（Camera / LiDAR）与 annotation 像素真值为准，学习数据从 Tech 采集；
+Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反投影）只
+保底不坏、不再投入，统一留给后期下放适配。下面的双运行时机制保持不变，
+仅作为运行选择使用。
+
 核心代码库保持 Steam 版兼容、可开源；BeamNG.tech 专属能力放在独立包
 `beamng_autopilot_tech/`，只在检测到 Tech 时惰性导入，普通玩家直接使用
 开源仓库不会受到影响。

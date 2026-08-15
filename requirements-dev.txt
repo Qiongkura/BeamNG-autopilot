@@ -1,0 +1,2 @@
+# Dev/regression deps (not installed at runtime)
+pytest>=7

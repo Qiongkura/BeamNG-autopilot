@@ -6,10 +6,17 @@
 
 `README.md` 是当前权威说明，改动前先读它，并顺着相关里程碑（M1-M6）理解上下文。
 
+## 开发前提（Tech-first）
+
+1. 优先基于 BeamNG.tech 开发：感知以真传感器（Camera / LiDAR）与 annotation 像素真值为准，学习数据从 Tech 采集。
+2. Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反投影）只保底不坏：不为其新增功能、不做优化，统一留给后期下放适配。
+3. 涉及真实游戏的改动默认用 Tech 验证（`--runtime tech`）；纯逻辑改动跑离线回归（pytest + `m5_offline_validate.py`）。
+
 ## 目录职责
 
 - `beamng_autopilot/`：可复用库。核心模块包括 `config`、`connector`、`perception`、`planner`、`lane`、`control/`、`vision/`。
 - `scripts/`：按里程碑拆分的入口脚本、探针与测试。脚本保持薄，业务逻辑尽量放库。
+- `tests/`：pytest 纯逻辑回归（不依赖游戏），覆盖 traffic / planner / perception / lane 等库模块。
 - `data/`：轨迹等数据；只提交 `data/track_smallgrid.npz` 这个样例。
 - `logs/`：运行产物、遥测、训练输出，全部 gitignore，不提交。
 - `weights/`、`.yolo/`：模型与 YOLO 配置，属于运行时产物，不提交。
@@ -30,12 +37,13 @@
 1. 先读：README、受影响模块、调用链和相似脚本。
 2. 再方案：说明要改哪些文件、复用哪些组件、数据怎么流动、影响哪些现有功能、如何验证。
 3. 后实现：保持最小 diff，不夹带无关重构。
-4. 验证：纯逻辑改动至少跑 `scripts/m5_offline_validate.py`；涉及真实游戏的改动再跑对应探针或测试。
+4. 验证：纯逻辑改动至少跑 `pytest tests/` 与 `scripts/m5_offline_validate.py`；涉及真实游戏的改动默认用 Tech（`--runtime tech`）验证对应探针或测试，Steam 路径只需确认不回归。
 5. 收尾：报告实际改动与验证结果，不假装没跑过的测试通过。
 
 ## 常用验证
 
-- 离线（不需要游戏）：`.venv\Scripts\python.exe scripts\m5_offline_validate.py`
-- 端到端（需要游戏）：`.venv\Scripts\python.exe scripts\m5_e2e_test.py --attach`
-- 真实驾驶（需要游戏）：`.venv\Scripts\python.exe scripts\m5_drive_test.py --speed 6 --run 10`
+- 纯逻辑回归（不需要游戏）：`.venv\Scripts\python.exe -m pytest tests/ -q`
+- 深度离线回归（不需要游戏）：`.venv\Scripts\python.exe scripts\m5_offline_validate.py`
+- 端到端（需要 Tech 游戏）：`.venv\Scripts\python.exe scripts\m5_e2e_test.py --attach --runtime tech`
+- 真实驾驶（需要 Tech 游戏）：`.venv\Scripts\python.exe scripts\m5_drive_test.py --runtime tech --speed 6 --run 10`
 - GUI 冒烟：`.venv\Scripts\python.exe scripts\m5_gui_smoke.py`
