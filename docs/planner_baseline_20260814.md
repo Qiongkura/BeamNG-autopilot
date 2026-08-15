@@ -71,3 +71,22 @@
 - `last_lane_offset` 不再把 map 偏移记成 `plan_offset`。
 - 离线测试同步改成“导航线不因 map 被右移”。
 - 用 `m5_offline_validate.py` 和 Steam `m5_drive_test.py` 验证。
+
+## 现状更新（2026-08-16）
+
+上述横向基准改造已完成：
+
+- `plan()` 中 `map_offset` 恒为 `None`，`preferred_offset_m` 不再参与任何路径
+  生成（`traffic.legal_lane_view` 仍计算它，但只是 map 自身的车道信息，无
+  运行时消费者）。
+- 无感知/单边分支的横向基准改为固定 `RIGHT_OFFSET_M=1.5`（`_safe_right_offset`
+  会按障碍/边界收缩），不再随 map 车道宽度/节点半径变化；run 98 的
+  `plan_offset=1.75` 已成历史。
+- `last_lane_offset` 记录的是安全右偏量，不再是 map 偏移。
+- 离线 `sensor-plan` 系列用例断言的就是“导航线 + 1.5m 固定右偏”行为。
+- `_safe_lateral_offset`（map 偏移时代的“目标侧被堵则收缩”助手）已无运行时
+  调用方，仅被 `m5_offline_validate.py` 作为回归保留。
+- 新增超车意图管理（`traffic.OvertakeStateMachine`）：慢前车持续 1.5s 才进入
+  requested、再确认 0.4s 才 active；对向来车 / 左侧实线取消请求；active 期间
+  解除 ACC 跟车限速让 planner 的 detour/bypass 完成超车，前车提速或消失即回
+  落 none 恢复跟车。

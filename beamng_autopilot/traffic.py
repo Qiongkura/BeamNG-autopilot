@@ -386,6 +386,179 @@ def vehicle_along_speed(
     return max(0.0, float((ob.velocity[0] * dx + ob.velocity[1] * dy) / n))
 
 
+# ---- overtake intent management ---------------------------------------
+#
+# ACC follows a slow lead; passing it is a separate decision with its own
+# hysteresis.  ``OvertakeStateMachine`` turns a "lead is slow" sample into
+# a sustained request and only then into an active overtake, so a transient
+# slow reading never makes the car dart out.  Oncoming traffic or a solid
+# left line cancel the request; once the lead speeds up or disappears the
+# overtake ends and the ACC time-gap cap takes over again.
+
+OVERTAKE_REQUEST_HOLD_S = 1.5   # sustained slow-lead time before requesting
+OVERTAKE_CONFIRM_S = 0.4        # request must persist before going active
+OVERTAKE_MIN_LEAD_DIST_M = 8.0  # never start an overtake from bumper range
+OVERTAKE_MIN_EGO_MPS = 0.5      # never start from a standstill
+OVERTAKE_ABORT_SPEED_RATIO = 0.95  # lead >= cruise * this -> overtake done
+OVERTAKE_ONCOMING_WINDOW_M = 80.0
+OVERTAKE_ONCOMING_SPEED_MPS = -1.0
+OVERTAKE_SOLID_WINDOW_M = 25.0
+
+
+def oncoming_vehicle_ahead(
+    obstacles,
+    route,
+    pos,
+    heading: float | None = None,
+    window_m: float = OVERTAKE_ONCOMING_WINDOW_M,
+    min_speed: float = OVERTAKE_ONCOMING_SPEED_MPS,
+) -> bool:
+    """True when a vehicle is coming toward the ego in the corridor ahead.
+
+    An oncoming vehicle makes an overtake unsafe: the passing car would
+    drive on the wrong side right into it.  Only vehicles whose velocity
+    projects negative along the route (i.e. they travel against the ego
+    direction) inside ``window_m`` count.
+    """
+    if not obstacles:
+        return False
+    for ob in obstacles:
+        if ob.category != "vehicle" or ob.velocity is None:
+            continue
+        if route is not None and len(route) >= 2:
+            pts = np.asarray(route[:, :2], dtype=float)
+        else:
+            h = float(heading if heading is not None else 0.0)
+            fwd = np.array([math.cos(h), math.sin(h)])
+            p = (np.asarray(pos, dtype=float)[:2]
+                 if pos is not None else np.zeros(2))
+            pts = np.array([p, p + fwd * window_m])
+        if len(pts) < 2:
+            continue
+        i = int(np.argmin(np.linalg.norm(pts - np.asarray(
+            [ob.x, ob.y], dtype=float), axis=1)))
+        i0 = max(0, i - 1)
+        i1 = min(len(pts) - 1, i + 1)
+        dx = pts[i1, 0] - pts[i0, 0]
+        dy = pts[i1, 1] - pts[i0, 1]
+        n = math.hypot(dx, dy)
+        if n < 1e-9:
+            continue
+        # Signed along-route speed: an oncoming vehicle is negative (unlike
+        # vehicle_along_speed, which clamps to zero for ACC leads).
+        signed = float((ob.velocity[0] * dx + ob.velocity[1] * dy) / n)
+        if signed > min_speed:
+            continue
+        if route is not None and len(route) >= 2:
+            proj = _route_projection(float(ob.x), float(ob.y), route)
+        else:
+            proj = _route_projection(float(ob.x), float(ob.y), pts)
+        if proj is None:
+            continue
+        lon, lat = proj
+        if 0.0 < lon <= window_m and abs(lat) <= 4.0:
+            return True
+    return False
+
+
+def solid_marking_left(markings, pos, heading,
+                       window_m: float = OVERTAKE_SOLID_WINDOW_M) -> bool:
+    """True when a solid lane marking runs on the left of the ego.
+
+    Crossing a solid line to overtake is illegal and the planner refuses
+    the detour anyway; knowing it up front keeps the overtake request from
+    even starting.  A solid line on the right (or a dashed left line) does
+    not block an overtake.
+    """
+    if not markings:
+        return False
+    fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
+    left = np.array([-fwd[1], fwd[0]])
+    p = np.asarray(pos, dtype=float)[:2]
+    for mk in markings:
+        if getattr(mk, "kind", None) != "solid":
+            continue
+        world = getattr(mk, "world", None)
+        if world is None:
+            continue
+        w = np.asarray(world, dtype=float)
+        if w.ndim != 2 or w.shape[1] < 2 or len(w) == 0:
+            continue
+        rel = w[:, :2] - p
+        s = rel @ fwd
+        lat = rel @ left
+        sel = (s >= -2.0) & (s <= window_m)
+        if not np.any(sel):
+            continue
+        if float(np.median(lat[sel])) > 0.4:
+            return True
+    return False
+
+
+class OvertakeStateMachine:
+    """Overtake intent with hysteresis: none -> requested -> active.
+
+    ``update()`` returns the state name.  The autopilot treats "active" as
+    "suppress the ACC time-gap cap so the planner's detour / lateral
+    bypass can pass the lead".  The request only forms after the slow-lead
+    condition holds for ``request_hold_s`` seconds and only turns active
+    after a short ``confirm_s``; any oncoming vehicle or solid left line
+    cancels the request, and the overtake ends when the lead speeds up,
+    disappears, or a new hazard appears.
+    """
+
+    def __init__(self, request_hold_s: float = OVERTAKE_REQUEST_HOLD_S,
+                 confirm_s: float = OVERTAKE_CONFIRM_S,
+                 min_lead_dist: float = OVERTAKE_MIN_LEAD_DIST_M,
+                 min_ego_speed: float = OVERTAKE_MIN_EGO_MPS,
+                 abort_speed_ratio: float = OVERTAKE_ABORT_SPEED_RATIO) -> None:
+        self.request_hold_s = request_hold_s
+        self.confirm_s = confirm_s
+        self.min_lead_dist = min_lead_dist
+        self.min_ego_speed = min_ego_speed
+        self.abort_speed_ratio = abort_speed_ratio
+        self.state = "none"
+        self._since: float | None = None
+
+    def update(self, t: float, has_lead: bool, lead_speed: float,
+               lead_dist: float, cruise: float, ego_speed: float,
+               oncoming: bool = False, solid_left: bool = False) -> str:
+        cruise = max(0.0, float(cruise))
+        wants = (has_lead
+                 and float(lead_dist) >= self.min_lead_dist
+                 and float(ego_speed) >= self.min_ego_speed
+                 and should_overtake(float(lead_speed), cruise)
+                 and not oncoming and not solid_left)
+        if self.state == "none":
+            if wants:
+                if self._since is None:
+                    self._since = t
+                elif t - self._since >= self.request_hold_s:
+                    self.state = "requested"
+                    self._since = None
+            else:
+                self._since = None
+        elif self.state == "requested":
+            if wants:
+                if self._since is None:
+                    self._since = t
+                elif t - self._since >= self.confirm_s:
+                    self.state = "active"
+                    self._since = None
+            else:
+                self.state = "none"
+                self._since = None
+        else:  # active
+            aborted = (not has_lead
+                       or float(lead_speed)
+                       >= cruise * self.abort_speed_ratio
+                       or oncoming or solid_left)
+            if aborted:
+                self.state = "none"
+                self._since = None
+        return self.state
+
+
 def road_width_m(rule: RoadRuleView | None) -> float | None:
     """Link width used by the game's lane-offset math, or None."""
     if rule is None:

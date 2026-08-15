@@ -91,12 +91,14 @@ from beamng_autopilot.roadnet import RoadNetwork
 from beamng_autopilot.traffic import (
     RoadRuleView,
     SignalRule,
+    OvertakeStateMachine,
     apply_rule_speed,
     find_lead_vehicle,
     follow_speed,
+    oncoming_vehicle_ahead,
     select_signal_rule,
-    should_overtake,
     signal_action_label,
+    solid_marking_left,
     vehicle_along_speed,
     signal_distance,
     signal_requires_stop,
@@ -1161,6 +1163,8 @@ def main() -> None:
                             lead_speed = 0.0
                             follow_active = False
                             overtake_requested = False
+                            ovk_state = "none"
+                            ovk = OvertakeStateMachine()
                             hist = {"t": [], "throttle": [], "brake": [],
                                     "speed": []}
                             last_progress_pos = None
@@ -1414,9 +1418,20 @@ def main() -> None:
                 else:
                     lead_speed = 0.0
                 follow_active = lead_vehicle is not None
-                overtake_requested = bool(
-                    lead_vehicle is not None
-                    and should_overtake(lead_speed, cruise_speed))
+                # Overtake intent manager: sustained slow-lead request with
+                # hysteresis, cancelled by oncoming traffic or a solid left
+                # line.  Only "active" suppresses the ACC cap below.
+                ovk_state = ovk.update(
+                    time.time(), lead_vehicle is not None, lead_speed,
+                    lead_dist, cruise_speed, speed,
+                    oncoming=oncoming_vehicle_ahead(
+                        obstacles,
+                        route if (route is not None and len(route) >= 2)
+                        else None,
+                        st.pos, heading=st.heading),
+                    solid_left=solid_marking_left(
+                        last_lanes, st.pos, st.heading))
+                overtake_requested = ovk_state == "active"
                 desired_speed = cruise_speed
                 blocked = False
                 hdg_dev = 0.0
@@ -1941,6 +1956,7 @@ def main() -> None:
                         "lead_v": round(float(lead_speed), 1),
                         "follow": int(follow_active),
                         "overtake": int(overtake_requested),
+                        "ovk": ovk_state,
                         "goal_d": round(goal_dist, 1),
                         "rev": round(rev_total, 2),
                         "rev_route": round(route_rev_dist, 2),
