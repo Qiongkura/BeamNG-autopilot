@@ -34,6 +34,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from beamng_autopilot import config
 from beamng_autopilot.connector import BeamNGConnector
 from beamng_autopilot.control.gearbox import (
+    forward_gear_input,
     read_gearbox_mode,
     set_gearbox_mode,
 )
@@ -82,10 +83,14 @@ def main() -> None:
     ap.add_argument("--runtime", choices=("auto", "steam", "tech"),
                     default=config.RUNTIME_MODE,
                     help="game runtime: auto detects after connecting")
+    ap.add_argument("--port", type=int, default=None,
+                    help="game port (default: resolved from --runtime)")
     args = ap.parse_args()
 
     conn = BeamNGConnector(
-        "smallgrid", "etk800", home=config.runtime_home(args.runtime))
+        "smallgrid", "etk800",
+        port=(args.port or config.runtime_port(args.runtime)),
+        home=config.runtime_home(args.runtime))
     roadnet = RoadNetwork()
     telemetry = TelemetryBroadcaster()
     cam_model = default_camera(CAM_W, CAM_H)
@@ -130,8 +135,16 @@ def main() -> None:
         # force realistic so braking at a standstill can never latch R.
         saved_mode = read_gearbox_mode(conn.vehicle) or "arcade"
         set_gearbox_mode(conn.vehicle, "realistic")
+        # Engage a real forward gear (D/1st): a freshly spawned car sits in
+        # N, so full throttle in realistic mode never moves it.  The helper
+        # leaves the car stopped in D with the parking brake on; release
+        # the brake afterwards and keep gear+brake in every control call.
+        fwd_gear = forward_gear_input(conn)
+        conn.control(throttle=0.0, brake=0.0, steering=0.0,
+                     parkingbrake=0.0, gear=fwd_gear)
         conn.step(5)
-        print(f"[obstacle] gearbox: saved={saved_mode} -> realistic")
+        print(f"[obstacle] gearbox: saved={saved_mode} -> realistic, "
+              f"forward gear input={fwd_gear}, parking brake released")
 
         t0 = time.time()
         while not roadnet.ready and time.time() - t0 < 90.0:
@@ -273,8 +286,10 @@ def main() -> None:
                 steer = prev_steer + STEER_SMOOTH * (new_steer - prev_steer)
                 prev_steer = steer
 
-                # Lateral deviation of the car vs the nav route.
-                lat = 0.0
+                # Lateral deviation of the car vs the nav route: the
+                # distance from the car to the route polyline (min over
+                # segments), tracked as a max over the whole run.
+                lat = float("inf")
                 for k in range(len(route) - 1):
                     ax, ay = route[k, :2]
                     bx, by = route[k + 1, :2]
@@ -288,6 +303,8 @@ def main() -> None:
                     lat = min(lat, abs(((st.pos[0] - px) * aby
                                         - (st.pos[1] - py) * abx)
                                        / math.sqrt(l2)))
+                if not math.isfinite(lat):
+                    lat = 0.0
                 max_dev = max(max_dev, lat)
                 dist_to_bp = float(np.linalg.norm(st.pos[:2] - bp))
                 if dist_to_bp < 6.0:
@@ -327,14 +344,16 @@ def main() -> None:
             )
             if blocked and speed < 0.5:
                 brake = max(brake, 0.12)
-            conn.control(throttle=throttle, steering=steer, brake=brake)
+            conn.control(throttle=throttle, steering=steer, brake=brake,
+                         parkingbrake=0.0, gear=fwd_gear)
 
             if now - last_status > 1.0:
                 last_status = now
                 print(f"[obstacle] mode={mode} obs={len(obstacles)} "
                       f"nearest={obs_dist:.0f}m v={speed:.1f} "
                       f"target={target_speed:.1f} thr={throttle:.2f} "
-                      f"brk={brake:.2f} dev={lat:.2f}")
+                      f"brk={brake:.2f} dev={lat:.2f} "
+                      f"bp={dist_to_bp:.1f}m")
 
             if now - last_save >= 4.0:
                 last_save = now

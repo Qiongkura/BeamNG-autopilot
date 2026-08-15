@@ -86,9 +86,44 @@ class BeamNGConnector:
     def open(self, launch: bool = True):
         """Launch (or attach to) the simulator and prepare the connection."""
         with self.io_lock:
-            self.bng.open(launch=launch)
+            if launch and self._port_is_open(self.bng.host, self.bng.port):
+                # A game is already listening on the port.  beamngpy's
+                # open(launch=True) treats ONE failed hello as "no instance"
+                # and spawns a second game, which then cannot bind the port
+                # and the whole session dies.  Attach to the running
+                # instance instead, retrying the handshake a few times (the
+                # game can drop a hello while busy); only a genuinely closed
+                # port goes down the launch path.
+                last_exc: Exception | None = None
+                for _ in range(3):
+                    try:
+                        self.bng.open(launch=False)
+                        last_exc = None
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        time.sleep(1.0)
+                if last_exc is not None:
+                    raise RuntimeError(
+                        f"game at {self.bng.host}:{self.bng.port} is "
+                        "listening but not answering the RPC handshake "
+                        "(stale session or mid-load); restart the game "
+                        "and retry") from last_exc
+            else:
+                self.bng.open(launch=launch)
             self.bng.set_steps_per_second(self.sps)
         return self
+
+    @staticmethod
+    def _port_is_open(host: str, port: int, timeout: float = 0.5) -> bool:
+        """True when something is listening on the game port."""
+        import socket
+
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except OSError:
+            return False
 
     def close(self) -> None:
         try:
