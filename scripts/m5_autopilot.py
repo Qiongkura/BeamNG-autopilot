@@ -1263,7 +1263,7 @@ def main() -> None:
                     obstacles = filter_self_overlap(
                         obstacles, st.pos,
                         categories=("vision", "vehicle", "scenario",
-                                    "raycast"))
+                                    "raycast", "lidar"))
                     if errors_active():
                         sensor_ok = False
                         scan_failures += 1
@@ -1908,6 +1908,8 @@ def main() -> None:
                         "lane_span": round(lane_span, 1),
                         "lidar_conf": round(lidar_conf, 2),
                         "lidar_hits": len(last_lidar_hits),
+                        "lidar_obs": sum(
+                            1 for o in obstacles if o.category == "lidar"),
                         "lidar_dbg": {k: (round(float(v), 2) if
                                           isinstance(v, (int, float))
                                           else v)

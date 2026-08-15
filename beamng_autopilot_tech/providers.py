@@ -8,10 +8,14 @@ import time
 import numpy as np
 
 from beamng_autopilot.perception import (
+    LidarClusterTracker,
     Obstacle,
     _cluster_points,
     _split_raycast_sectors,
+    downsample_cloud,
     last_error,
+    lidar_obstacles,
+    merge_obstacles,
     scan_obstacles_all,
 )
 from beamng_autopilot.runtime import CameraProvider, RangeProvider, RangeSample
@@ -38,30 +42,11 @@ LIDAR_DENSITY = 12
 LIDAR_POLL_RETRIES = 3
 LIDAR_MAX_POINTS = 6000
 LIDAR_SELF_MARGIN = 0.3
+LIDAR_OBSTACLE_RADIUS = 45.0
 
 BLACK_FRAME_MAX_MEAN = 1.0
 BLACK_FRAME_RETRIES = 2
 BLACK_FRAME_RETRY_DELAY_S = 0.1
-
-
-def _downsample_points(points: np.ndarray,
-                       max_points: int = LIDAR_MAX_POINTS) -> np.ndarray:
-    """Cap a dense 360 LiDAR cloud before 2D obstacle clustering.
-
-    BeamNG.tech can return 150k+ hits in one poll; feeding all of them to
-    the 2m flood-fill turns roadside walls around the ego into one giant
-    connected box.  A 0.5m voxel grid keeps one representative hit per
-    cell, then a deterministic stride enforces the final cap.
-    """
-    if len(points) <= max_points:
-        return points
-    keys = np.floor(points[:, :2] / 0.5).astype(np.int64)
-    _, idx = np.unique(keys, axis=0, return_index=True)
-    sampled = points[idx]
-    if len(sampled) > max_points:
-        step = int(np.ceil(len(sampled) / max_points))
-        sampled = sampled[::step][:max_points]
-    return sampled
 
 
 def _frame_is_black(frame, max_mean: float = BLACK_FRAME_MAX_MEAN) -> bool:
@@ -177,6 +162,7 @@ class TechRangeProvider(RangeProvider):
                 is_using_shared_memory=True,
                 is_visualised=False,
             )
+        self._lidar_tracker = LidarClusterTracker()
 
     def _ego_extents(self) -> tuple[float, float]:
         """Approximate ego footprint from the current BeamNG bbox."""
@@ -207,8 +193,10 @@ class TechRangeProvider(RangeProvider):
         with self.conn.io_lock:
             obstacles: list[Obstacle] = []
             pts: list[tuple[float, float]] = []
+            ox, oy = float(pos[0]), float(pos[1])
+            cloud = np.empty((0, 3), dtype=float)
+            heading: float | None = None
             try:
-                cloud = np.empty((0, 3), dtype=float)
                 for _ in range(LIDAR_POLL_RETRIES):
                     data = self.lidar.poll()
                     cloud = np.asarray(data.get("pointCloud"), dtype=float)
@@ -218,11 +206,13 @@ class TechRangeProvider(RangeProvider):
                 if cloud.ndim != 2 or cloud.shape[1] < 3:
                     cloud = np.empty((0, 3), dtype=float)
                 cloud = cloud[np.isfinite(cloud).all(axis=1)]
-                ox, oy, oz = float(pos[0]), float(pos[1]), float(pos[2])
+                oz = float(pos[2])
+                heading = self._ego_heading()
+                # Lane-corridor hits (unchanged semantics): world z window
+                # around the ego, self footprint removed, voxel-capped.
                 dist = np.hypot(cloud[:, 0] - ox, cloud[:, 1] - oy)
                 keep = ((dist >= 2.5) & (dist <= radius)
                         & (np.abs(cloud[:, 2] - oz) <= 4.0))
-                heading = self._ego_heading()
                 if heading is not None:
                     uf = np.array([np.cos(heading), np.sin(heading)])
                     ur = np.array([-uf[1], uf[0]])
@@ -232,19 +222,18 @@ class TechRangeProvider(RangeProvider):
                               & (np.abs(local @ ur)
                                  <= self._ego_half_w + LIDAR_SELF_MARGIN))
                     keep = keep & ~on_car
-                kept = _downsample_points(cloud[keep])
+                kept = downsample_cloud(cloud[keep])
                 pts = [(float(x), float(y)) for x, y, _ in kept]
                 last_error["raycast"] = None
             except Exception as exc:
                 last_error["raycast"] = str(exc)
                 print(f"[tech] lidar scan failed: {exc}")
             try:
-                # BeamNG.tech LiDAR is dense enough to turn a full 360 fan
-                # into one giant false wall.  Obstacle boxes and the
-                # free-space corridor therefore both use the same clean Lua
-                # raycast/scenario/vehicle pipeline as Steam; the dense
-                # LiDAR cloud is only kept as a fallback if the Lua scan
-                # fails.
+                # Scenario / vehicle registry / raycast fan (shared with
+                # Steam).  The dense 360 LiDAR is now a first-class
+                # obstacle channel on top of this (lidar_obstacles below)
+                # instead of a fallback, so vehicles / pedestrians /
+                # unexpected objects stay covered even without the camera.
                 obstacles, ray_hits = scan_obstacles_all(
                     self.conn.bng, ego_vid, pos, radius=radius,
                     return_hits=True)
@@ -254,9 +243,30 @@ class TechRangeProvider(RangeProvider):
             except Exception as exc:
                 last_error["raycast"] = str(exc)
                 print(f"[tech] raycast scan failed: {exc}")
-                if pts:
-                    for sector in _split_raycast_sectors(pts, (ox, oy)):
-                        obstacles.extend(_cluster_points(sector, split_walls=True))
+            # Tech-native LiDAR obstacles: cluster the dense 360 cloud
+            # (with local ground removal) and fuse with the Lua sources.
+            # Lua boxes come first so a vehicle's registry velocity
+            # survives the merge; lidar-only clusters carry a tracker
+            # velocity estimate instead.
+            if len(cloud) >= 4:
+                try:
+                    boxes = lidar_obstacles(
+                        cloud, pos,
+                        radius=min(radius, LIDAR_OBSTACLE_RADIUS),
+                        self_rect=(self._ego_half_len + LIDAR_SELF_MARGIN,
+                                   self._ego_half_w + LIDAR_SELF_MARGIN,
+                                   float(heading if heading is not None
+                                         else 0.0)))
+                    self._lidar_tracker.update(boxes, time.time())
+                    obstacles = merge_obstacles(obstacles + boxes)
+                except Exception as exc:
+                    last_error["raycast"] = str(exc)
+                    print(f"[tech] lidar obstacle fusion failed: {exc}")
+            elif not obstacles and pts:
+                # Last-resort fallback when both the Lua scan and the fused
+                # lidar channel are unavailable: cluster the corridor hits.
+                for sector in _split_raycast_sectors(pts, (ox, oy)):
+                    obstacles.extend(_cluster_points(sector, split_walls=True))
             return RangeSample(obstacles=obstacles, ray_hits=pts)
 
     def close(self) -> None:

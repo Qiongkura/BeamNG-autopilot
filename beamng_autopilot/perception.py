@@ -258,7 +258,7 @@ def _principal_axis(points: list[tuple[float, float]]) -> np.ndarray:
 def _cluster_points(pts, cell: float = 2.0, min_size: float = 0.9,
                     max_dim: float = 6.0, max_len: float = 14.0,
                     thin: float = 2.5, _depth: int = 0,
-                    split_walls: bool = False):
+                    split_walls: bool = False, category: str = "raycast"):
     """Cluster 2D hit points into connected components -> obstacle boxes.
 
     Points are quantized onto a ``cell``-meter grid and connected with an
@@ -315,7 +315,8 @@ def _cluster_points(pts, cell: float = 2.0, min_size: float = 0.9,
             out.extend(_cluster_points(
                 comp, cell=max(0.5, cell / 2.0), min_size=min_size,
                 max_dim=max_dim, max_len=max_len, thin=thin,
-                _depth=_depth + 1, split_walls=split_walls))
+                _depth=_depth + 1, split_walls=split_walls,
+                category=category))
             continue
         cx = (min(xs) + max(xs)) / 2.0
         cy = (min(ys) + max(ys)) / 2.0
@@ -350,7 +351,8 @@ def _cluster_points(pts, cell: float = 2.0, min_size: float = 0.9,
                     out.extend(_cluster_points(
                         chunk, cell=cell, min_size=min_size,
                         max_dim=max_dim, max_len=max_len, thin=thin,
-                        _depth=_depth + 1, split_walls=split_walls))
+                        _depth=_depth + 1, split_walls=split_walls,
+                        category=category))
                 continue
             # A bend can also make one component wide instead of long:
             # two nearly parallel wall faces get fused into a short fat
@@ -376,10 +378,11 @@ def _cluster_points(pts, cell: float = 2.0, min_size: float = 0.9,
                                 chunk, cell=cell, min_size=min_size,
                                 max_dim=max_dim, max_len=max_len,
                                 thin=thin, _depth=_depth + 1,
-                                split_walls=split_walls))
+                                split_walls=split_walls,
+                                category=category))
                         continue
         out.append(Obstacle(x=cx, y=cy, half_w=hw, half_h=hh,
-                            category="raycast", label=label,
+                            category=category, label=label,
                             axis=_principal_axis(comp),
                             half_len=max(0.0, major / 2.0),
                             half_thick=max(0.0, minor / 2.0)))
@@ -423,6 +426,205 @@ def _split_raycast_sectors(pts, origin, max_gap_deg: float = 30.0):
         cur.append(rotated[i][1])
     sectors.append(cur)
     return sectors
+
+
+# ---- Tech LiDAR obstacle pipeline -------------------------------------
+#
+# The BeamNG.tech LiDAR is a dense 360-degree cloud (100k+ hits per poll)
+# that includes the road surface, roadside terrain and the ego vehicle
+# itself.  It cannot be clustered as-is: ground/terrain points chain into
+# one giant false wall around the car.  The pipeline below is therefore:
+#
+#   finite -> range window -> voxel downsample -> self-footprint removal
+#   -> local ground removal (per angular sector x range ring, so slopes
+#      keep working) -> angular sector split -> flood-fill clustering.
+#
+# The result are ``category="lidar"`` boxes that merge with the Lua
+# scenario/vehicle/raycast sources (and vision) through merge_obstacles().
+
+LIDAR_MIN_DIST_M = 2.5
+LIDAR_VOXEL_M = 0.5
+LIDAR_MAX_POINTS = 6000
+LIDAR_OBSTACLE_VOXEL_M = 0.75
+LIDAR_OBSTACLE_MAX_POINTS = 4000
+LIDAR_GROUND_CLEARANCE_M = 0.35
+LIDAR_MAX_HEIGHT_M = 4.5
+LIDAR_GROUND_ANG_CELLS = 72      # angular sectors for the local ground ref
+LIDAR_GROUND_RING_M = 5.0        # range rings for the local ground ref
+LIDAR_Z_SPAN_M = 15.0            # drop absurd outliers before anything else
+
+
+def downsample_cloud(points: np.ndarray,
+                     max_points: int = LIDAR_MAX_POINTS,
+                     voxel: float = LIDAR_VOXEL_M) -> np.ndarray:
+    """Cap a dense 360 LiDAR cloud with a voxel grid + deterministic stride.
+
+    BeamNG.tech can return 150k+ hits in one poll; feeding all of them to
+    the 2 m flood-fill turns roadside walls around the ego into one giant
+    connected box.  A ``voxel``-meter 2D grid keeps one representative hit
+    per cell, then a deterministic stride enforces the final cap.  The
+    grid keys are packed into one int64 (32 bits per axis) so the unique
+    pass stays fast on 200k+ point clouds.
+    """
+    if len(points) <= max_points:
+        return points
+    kx = np.floor(points[:, 0] / voxel).astype(np.int64)
+    ky = np.floor(points[:, 1] / voxel).astype(np.int64)
+    keys = (kx << 32) | (ky & 0xFFFFFFFF)
+    _, idx = np.unique(keys, return_index=True)
+    sampled = points[idx]
+    if len(sampled) > max_points:
+        step = int(np.ceil(len(sampled) / max_points))
+        sampled = sampled[::step][:max_points]
+    return sampled
+
+
+def _local_ground_z(cloud: np.ndarray, ox: float, oy: float,
+                    n_ang: int = LIDAR_GROUND_ANG_CELLS,
+                    ring: float = LIDAR_GROUND_RING_M) -> np.ndarray:
+    """Per-point local ground reference from sector x range ring percentiles.
+
+    A single global ground height fails on slopes (the road ahead can be
+    several meters below the ego).  Points are binned by direction (72
+    cells) and range (5 m rings); the 5th percentile of z inside each bin
+    is that bin's ground reference, which follows hills and valleys.
+    Returns one ground-z value per input point.
+    """
+    ang = np.degrees(np.arctan2(cloud[:, 1] - oy, cloud[:, 0] - ox)) % 360.0
+    ai = np.clip((ang / (360.0 / n_ang)).astype(np.int64), 0, n_ang - 1)
+    dist = np.hypot(cloud[:, 0] - ox, cloud[:, 1] - oy)
+    ri = np.clip((dist / ring).astype(np.int64), 0, 100000)
+    key = ai * 1000003 + ri
+    order = np.argsort(key, kind="stable")
+    ks = key[order]
+    zs = cloud[order, 2]
+    starts = np.r_[0, np.flatnonzero(np.diff(ks)) + 1]
+    ends = np.r_[starts[1:], len(ks)]
+    ground = np.empty(len(ks), dtype=float)
+    for s, e in zip(starts, ends):
+        ground[s:e] = np.percentile(zs[s:e], 5.0)
+    out = np.empty(len(cloud), dtype=float)
+    out[order] = ground
+    return out
+
+
+def lidar_obstacles(cloud: np.ndarray, pos, radius: float = 45.0,
+                    self_rect: tuple[float, float, float] | None = None,
+                    ground_clearance: float = LIDAR_GROUND_CLEARANCE_M,
+                    max_height: float = LIDAR_MAX_HEIGHT_M,
+                    max_points: int = LIDAR_OBSTACLE_MAX_POINTS,
+                    voxel: float = LIDAR_OBSTACLE_VOXEL_M) -> list[Obstacle]:
+    """Cluster a 360 LiDAR cloud into ``category="lidar"`` obstacle boxes.
+
+    ``pos`` is the ego world position; ``self_rect`` is
+    ``(half_len, half_w, heading)`` of the ego footprint (with margin) used
+    to remove self-hits.  Returns obstacle boxes in world coordinates; the
+    caller merges them with the Lua scenario/vehicle/raycast sources.
+    """
+    pts = np.asarray(cloud, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] < 3 or len(pts) < 4:
+        return []
+    pts = pts[np.isfinite(pts).all(axis=1)]
+    if len(pts) < 4:
+        return []
+    ox, oy, oz = float(pos[0]), float(pos[1]), float(pos[2])
+    dist = np.hypot(pts[:, 0] - ox, pts[:, 1] - oy)
+    keep = ((dist >= LIDAR_MIN_DIST_M) & (dist <= radius)
+            & (np.abs(pts[:, 2] - oz) <= LIDAR_Z_SPAN_M))
+    pts = pts[keep]
+    if len(pts) < 4:
+        return []
+    pts = downsample_cloud(pts, max_points=max_points, voxel=voxel)
+    if self_rect is not None:
+        half_len, half_w, heading = self_rect
+        uf = np.array([np.cos(heading), np.sin(heading)])
+        ur = np.array([-uf[1], uf[0]])
+        local = pts[:, :2] - np.array([ox, oy])
+        on_car = ((np.abs(local @ uf) <= half_len)
+                  & (np.abs(local @ ur) <= half_w))
+        pts = pts[~on_car]
+    if len(pts) < 4:
+        return []
+    ground = _local_ground_z(pts, ox, oy)
+    keep = ((pts[:, 2] - ground >= ground_clearance)
+            & (pts[:, 2] - ground <= max_height))
+    pts2d = [(float(x), float(y)) for x, y, _ in pts[keep]]
+    if len(pts2d) < 2:
+        return []
+    out: list[Obstacle] = []
+    for sector in _split_raycast_sectors(pts2d, (ox, oy)):
+        out.extend(_cluster_points(sector, split_walls=True,
+                                   category="lidar"))
+    return out
+
+
+class LidarClusterTracker:
+    """Tracks lidar cluster centroids across polls to estimate velocity.
+
+    Cluster centroids jitter every poll (voxel resampling shifts which
+    points land in each cell), so a velocity is only reported once the
+    cluster has been matched for ``min_matches`` polls, the smoothed speed
+    stays below ``max_speed`` (a "teleporting" centroid is a new object,
+    not a 60 m/s vehicle) and above ``min_speed`` (real traffic moves at
+    least a few m/s; anything slower is centroid jitter on a static
+    object).  Static clusters therefore keep ``velocity=None``; unmatched
+    / stale tracks are dropped.
+    """
+
+    def __init__(self, match_m: float = 3.0, ttl_s: float = 2.0,
+                 min_matches: int = 2, max_speed: float = 35.0,
+                 min_speed: float = 2.0) -> None:
+        self.match_m = match_m
+        self.ttl_s = ttl_s
+        self.min_matches = min_matches
+        self.max_speed = max_speed
+        self.min_speed = min_speed
+        self._tracks: list[dict] = []
+
+    def update(self, boxes: list[Obstacle], t: float) -> None:
+        """Attach ``velocity`` / ``heading`` / ``vehicle_id`` to boxes."""
+        if not boxes:
+            self._tracks = []
+            return
+        for tr in self._tracks:
+            tr["matched"] = False
+        for i, ob in enumerate(boxes):
+            best = None
+            best_d = self.match_m
+            for tr in self._tracks:
+                d = math.hypot(ob.x - tr["x"], ob.y - tr["y"])
+                if d < best_d:
+                    best_d = d
+                    best = tr
+            if best is not None and not best["matched"]:
+                dt = t - best["t"]
+                best["matched"] = True
+                best["t"] = t
+                # epsilon: 100.1 - 100.0 is 0.0999... in binary floats
+                if 0.1 - 1e-6 <= dt <= 1.0:
+                    vx = (ob.x - best["x"]) / dt
+                    vy = (ob.y - best["y"]) / dt
+                    k = 0.5
+                    best["vx"] = (1.0 - k) * best["vx"] + k * vx
+                    best["vy"] = (1.0 - k) * best["vy"] + k * vy
+                best["x"], best["y"] = ob.x, ob.y
+                best["matches"] += 1
+                if (best["matches"] >= self.min_matches
+                        and self.min_speed
+                        <= math.hypot(best["vx"], best["vy"])
+                        <= self.max_speed):
+                    ob.velocity = np.array([best["vx"], best["vy"]],
+                                           dtype=float)
+                    ob.heading = float(math.atan2(best["vy"], best["vx"]))
+                    ob.vehicle_id = f"lidar-{best['id']}"
+            else:
+                self._tracks.append({
+                    "id": len(self._tracks),
+                    "x": ob.x, "y": ob.y, "t": t,
+                    "vx": 0.0, "vy": 0.0, "matches": 1, "matched": True,
+                })
+        self._tracks = [tr for tr in self._tracks
+                        if tr["matched"] and t - tr["t"] <= self.ttl_s]
 
 
 def scan_obstacles_raycast(
@@ -576,19 +778,22 @@ def merge_obstacles(obstacles, merge_dist: float = 2.5) -> list[Obstacle]:
     """Merge boxes from different sensors that cover the same spot.
 
     The same vehicle is typically reported by both ``getAllVehicles()`` and
-    the vision detector at nearly the same position; without merging the
-    planner would see a double box.  Only compact box sources
-    (scenario / vehicle / vision) are merged with each other - raycast
-    walls keep their footprint so a car standing next to a wall does not
-    grow the wall box.
+    the vision detector / LiDAR clusterer at nearly the same position;
+    without merging the planner would see a double box.  Only compact box
+    sources (scenario / vehicle / vision / lidar) are merged with each
+    other.  Raycast walls keep their footprint so a car standing next to a
+    wall does not grow the wall box - but a LiDAR wall that sees the *same*
+    wall as the raycast fan (both ``label="wall"``) is merged so the two
+    channels do not double the wall.
     """
-    compact = {"scenario", "vehicle", "vision"}
+    compact = {"scenario", "vehicle", "vision", "lidar"}
     merged: list[Obstacle] = []
     for ob in obstacles:
         target = None
         for prev in merged:
+            same_wall = (prev.label == "wall" and ob.label == "wall")
             if (prev.category not in compact
-                    or ob.category not in compact):
+                    or ob.category not in compact) and not same_wall:
                 continue
             if math.hypot(ob.x - prev.x, ob.y - prev.y) <= merge_dist:
                 target = prev
