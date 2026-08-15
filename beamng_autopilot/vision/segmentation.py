@@ -120,6 +120,13 @@ class Segmenter:
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         line = cv2.morphologyEx(line.astype(np.uint8), cv2.MORPH_CLOSE,
                                 k).astype(bool)
+        # 物理约束：标线必须位于路面上。石头/护墙/草地边缘与标线视觉
+        # 特征相似，模型常把它们误检为线；这些物体不在沥青路面上，用
+        # 膨胀后的路面掩码约束即可滤掉（标线紧贴路面，边缘容忍 ~3px）。
+        road_d = cv2.dilate(road.astype(np.uint8),
+                            cv2.getStructuringElement(cv2.MORPH_RECT,
+                                                      (7, 7))).astype(bool)
+        line &= road_d
         return road, line
 
     def detect_lines(self, frame_rgb, cam_model, pos, heading,
