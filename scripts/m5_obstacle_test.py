@@ -397,8 +397,10 @@ def main() -> None:
             if mode != last_mode:
                 last_mode = mode
                 modes.append((round(time.time() - session_t0, 1), mode))
+                blk = getattr(planner, "last_blocker", None)
                 print(f"[obstacle] MODE -> {mode} at t={modes[-1][0]:.1f}s "
-                      f"v={speed:.1f} obs={len(obstacles)}")
+                      f"v={speed:.1f} obs={len(obstacles)} "
+                      f"blocker={blk}")
 
             dt = max(1e-3, now - last_ctrl)
             last_ctrl = now

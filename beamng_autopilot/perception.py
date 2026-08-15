@@ -966,7 +966,7 @@ def scan_obstacles_vehicles(
                             category="vehicle", heading=yaw,
                             velocity=vel, vehicle_id=vid,
                             axis=np.array([math.cos(yaw), math.sin(yaw)]),
-                            half_len=half_h, half_thick=half_w))
+                            half_len=half_h / 2.0, half_thick=half_w / 2.0))
     return out
 
 
