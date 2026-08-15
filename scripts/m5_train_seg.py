@@ -57,7 +57,11 @@ def median_freq_weights(labels: list[np.ndarray]) -> torch.Tensor:
 
 
 def _augment(frame, rng: np.random.Generator):
-    """在线数据增强（colour/label 同步变换），提升路段泛化。"""
+    """在线数据增强（colour/label 同步变换），提升路段泛化。
+
+    关键：色相/饱和度扰动 + 模糊，逼模型学"标线结构"而不是记住
+    特定路段的颜色纹理（旧模型过拟合训练路段：换路 recall 0%）。
+    """
     import cv2
 
     colour, label = frame
@@ -69,6 +73,15 @@ def _augment(frame, rng: np.random.Generator):
         b = float(-20.0 + 40.0 * rng.random())
         colour = np.clip(colour.astype(np.float32) * a + b,
                          0, 255).astype(np.uint8)
+    if rng.random() < 0.5:                      # 色相/饱和度扰动（换路面颜色）
+        hsv = cv2.cvtColor(colour, cv2.COLOR_RGB2HSV).astype(np.int16)
+        hsv[..., 0] = (hsv[..., 0] + int(rng.integers(-12, 13))) % 180
+        s_gain = float(0.75 + 0.5 * rng.random())
+        hsv[..., 1] = np.clip(hsv[..., 1] * s_gain, 0, 255)
+        colour = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
+    if rng.random() < 0.35:                     # 模糊（模拟行驶运动模糊）
+        k = int(rng.integers(3, 8)) | 1
+        colour = cv2.GaussianBlur(colour, (k, k), 0)
     if rng.random() < 0.7:                      # 随机裁剪后缩放回原尺寸
         h, w = colour.shape[:2]
         ch, cw = int(h * 0.85), int(w * 0.85)
