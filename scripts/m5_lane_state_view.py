@@ -193,7 +193,11 @@ def _render_frame(conn, camera_provider, detector, smoother, args, *,
         geo_cache["half_w"] = half_w
     cam = camera_provider.camera_model(st.pos, heading, w, h,
                                        rotation=st.rotation)
-    ground_z = (float(st.pos[2]) if len(st.pos) > 2 else 0.0)
+    # Back-projection uses the road height, not the vehicle-origin z (the
+    # origin sits ~0.17 m above the road; using it shifts projected
+    # markings by ~0.5 m at 5 m and ~2 m at 20 m).
+    ground_z = (float(st.pos[2]) - config.EGO_ORIGIN_GROUND_GAP_M
+                if len(st.pos) > 2 else 0.0)
     if segmenter is not None:
         # 学习式分割：路面边界与标线都来自 UNet 掩码
         vision_geometry = estimate_pavement_edges(
@@ -286,7 +290,8 @@ def _perception_worker(session, args, shared: dict, stop: threading.Event):
                 geo_cache["half_w"] = half_w
             cam = camera_provider.camera_model(st.pos, heading, w, h,
                                                rotation=st.rotation)
-            ground_z = (float(st.pos[2]) if len(st.pos) > 2 else 0.0)
+            ground_z = (float(st.pos[2]) - config.EGO_ORIGIN_GROUND_GAP_M
+                        if len(st.pos) > 2 else 0.0)
             if segmenter is not None:
                 vision_geometry = estimate_pavement_edges(
                     img, cam, st.pos, heading, ground_z=ground_z,

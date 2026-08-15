@@ -117,6 +117,11 @@ DEFAULT_VEHICLE = "etk800"
 ITALY_SPAWN_CROSSROADS_POS = (729.62677, 763.914001, 177.753006)
 ITALY_SPAWN_CROSSROADS_HEADING = math.atan2(0.430445611, 0.902616739)
 
+# 车体 origin 离路面高度（etk800，2026-08-15 实测：st.pos[2] - 最近路网
+# 节点 z = 0.17m）。地面反投影必须用路面高度；用车辆 origin 的 z 会让
+# 投影出的标线/边界在 5m 处偏约 0.5m、20m 处偏约 2m。
+EGO_ORIGIN_GROUND_GAP_M = 0.17
+
 
 def runtime_home(mode: str | None = None) -> Path:
     """Return the game install directory for the requested runtime."""

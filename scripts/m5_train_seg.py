@@ -68,16 +68,25 @@ def _augment(frame, rng: np.random.Generator):
     if rng.random() < 0.5:                      # 水平翻转
         colour = np.fliplr(colour).copy()
         label = np.fliplr(label).copy()
-    if rng.random() < 0.5:                      # 亮度/对比度扰动
-        a = float(0.8 + 0.4 * rng.random())
-        b = float(-20.0 + 40.0 * rng.random())
+    if rng.random() < 0.8:                      # 亮度/对比度扰动（光照鲁棒：
+        a = float(0.6 + 0.8 * rng.random())     # 覆盖晨/午/昏/夜差异）
+        b = float(-35.0 + 70.0 * rng.random())
         colour = np.clip(colour.astype(np.float32) * a + b,
                          0, 255).astype(np.uint8)
+    if rng.random() < 0.5:                      # 色温扰动：R/B 通道独立增益
+        rg = float(0.88 + 0.24 * rng.random())  # （模拟清晨偏红/黄昏偏橙）
+        bg = float(0.88 + 0.24 * rng.random())
+        c = colour.astype(np.float32)
+        c[..., 0] *= rg
+        c[..., 2] *= bg
+        colour = np.clip(c, 0, 255).astype(np.uint8)
     if rng.random() < 0.5:                      # 色相/饱和度扰动（换路面颜色）
         hsv = cv2.cvtColor(colour, cv2.COLOR_RGB2HSV).astype(np.int16)
-        hsv[..., 0] = (hsv[..., 0] + int(rng.integers(-12, 13))) % 180
-        s_gain = float(0.75 + 0.5 * rng.random())
+        hsv[..., 0] = (hsv[..., 0] + int(rng.integers(-20, 21))) % 180
+        s_gain = float(0.6 + 1.0 * rng.random())
         hsv[..., 1] = np.clip(hsv[..., 1] * s_gain, 0, 255)
+        v_gain = float(0.85 + 0.3 * rng.random())
+        hsv[..., 2] = np.clip(hsv[..., 2] * v_gain, 0, 255)
         colour = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2RGB)
     if rng.random() < 0.35:                     # 模糊（模拟行驶运动模糊）
         k = int(rng.integers(3, 8)) | 1

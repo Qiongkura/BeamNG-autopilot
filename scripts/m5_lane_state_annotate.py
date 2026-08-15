@@ -76,12 +76,12 @@ def main() -> None:
                                            rotation=st.rotation)
         vision_geometry = estimate_pavement_edges(
             img, cam, st.pos, heading,
-            ground_z=(float(st.pos[2]) if len(st.pos) > 2 else 0.0))
+            ground_z=(float(st.pos[2]) - config.EGO_ORIGIN_GROUND_GAP_M if len(st.pos) > 2 else 0.0))
         geometry = merge_boundary_geometry(
             roadnet_geometry, vision_geometry)
         markings = detector.detect(
             img, cam, st.pos, heading,
-            ground_z=(float(st.pos[2]) if len(st.pos) > 2 else 0.0))
+            ground_z=(float(st.pos[2]) - config.EGO_ORIGIN_GROUND_GAP_M if len(st.pos) > 2 else 0.0))
         debug: dict = {}
         frame = pair_lane_markings(
             markings, st.pos, heading, fwd=st.dir, debug=debug)

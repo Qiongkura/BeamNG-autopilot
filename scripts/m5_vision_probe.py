@@ -114,7 +114,7 @@ def main() -> None:
             if lane_det is not None:
                 lanes = lane_det.detect(
                     img, vmodel, st.pos, st.heading,
-                    ground_z=(float(st.pos[2])
+                    ground_z=(float(st.pos[2]) - config.EGO_ORIGIN_GROUND_GAP_M
                               if len(st.pos) > 2 else 0.0))
                 print(f"[probe] {len(lanes)} lane marking(s)")
                 for mk in lanes:

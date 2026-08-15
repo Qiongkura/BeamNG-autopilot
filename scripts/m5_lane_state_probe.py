@@ -77,7 +77,7 @@ def main() -> None:
                 st.pos, st.heading, w, h)
             markings = detector.detect(
                 img, vmodel, st.pos, st.heading,
-                ground_z=(float(st.pos[2]) if len(st.pos) > 2 else 0.0))
+                ground_z=(float(st.pos[2]) - config.EGO_ORIGIN_GROUND_GAP_M if len(st.pos) > 2 else 0.0))
             debug: dict = {}
             frame = pair_lane_markings(
                 markings, st.pos, st.heading, fwd=st.dir, debug=debug)
@@ -187,7 +187,7 @@ def main() -> None:
                 st.pos, st.heading, w, h)
             markings = detector.detect(
                 overlay, vmodel, st.pos, st.heading,
-                ground_z=(float(st.pos[2]) if len(st.pos) > 2 else 0.0))
+                ground_z=(float(st.pos[2]) - config.EGO_ORIGIN_GROUND_GAP_M if len(st.pos) > 2 else 0.0))
             for mk in markings:
                 pix = np.asarray(mk.pixels, dtype=np.int32)
                 color = (0, 255, 255) if mk.color == "yellow" \

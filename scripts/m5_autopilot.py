@@ -856,6 +856,7 @@ def main() -> None:
                                 img, vmodel_worker, st_worker.pos,
                                 st_worker.heading,
                                 ground_z=(float(st_worker.pos[2])
+                                          - config.EGO_ORIGIN_GROUND_GAP_M
                                           if len(st_worker.pos) > 2 else 0.0))
                         else:
                             if lane_det_worker is None:
@@ -864,6 +865,7 @@ def main() -> None:
                                 img, vmodel_worker, st_worker.pos,
                                 st_worker.heading,
                                 ground_z=(float(st_worker.pos[2])
+                                          - config.EGO_ORIGIN_GROUND_GAP_M
                                           if len(st_worker.pos) > 2 else 0.0))
                         if lane_smoother_worker is None:
                             lane_smoother_worker = MarkingSmoother()
@@ -871,6 +873,7 @@ def main() -> None:
                             raw_lanes_worker, vmodel_worker, st_worker.pos,
                             st_worker.heading,
                             ground_z=(float(st_worker.pos[2])
+                                      - config.EGO_ORIGIN_GROUND_GAP_M
                                       if len(st_worker.pos) > 2 else 0.0),
                             warmup=True, speed=float(st_worker.speed),
                             now=now)

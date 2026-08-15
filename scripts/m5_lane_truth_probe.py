@@ -172,7 +172,7 @@ def main() -> None:
         h, w = colour.shape[:2]
         fwd = unit_fwd(st)
         heading = float(st.heading)
-        ground_z = float(st.pos[2])
+        ground_z = float(st.pos[2]) - config.EGO_ORIGIN_GROUND_GAP_M
 
         from beamng_autopilot.vision.projection import default_camera
         cam_model = default_camera(w, h)  # 标定外参（与 Tech provider 等价）

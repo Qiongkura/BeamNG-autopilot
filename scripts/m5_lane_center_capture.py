@@ -175,7 +175,7 @@ def _visual_state(detector, camera_provider, img, state):
         state.pos, state.heading, w, h)
     markings = detector.detect(
         img, vmodel, state.pos, state.heading,
-        ground_z=(float(state.pos[2]) if len(state.pos) > 2 else 0.0))
+        ground_z=(float(state.pos[2]) - config.EGO_ORIGIN_GROUND_GAP_M if len(state.pos) > 2 else 0.0))
     debug: dict = {}
     frame = pair_lane_markings(
         markings, state.pos, state.heading, fwd=state.dir, debug=debug)
