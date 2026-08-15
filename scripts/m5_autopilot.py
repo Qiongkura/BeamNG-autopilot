@@ -92,8 +92,12 @@ from beamng_autopilot.traffic import (
     RoadRuleView,
     SignalRule,
     apply_rule_speed,
+    find_lead_vehicle,
+    follow_speed,
     select_signal_rule,
+    should_overtake,
     signal_action_label,
+    vehicle_along_speed,
     signal_distance,
     signal_requires_stop,
 )
@@ -1152,6 +1156,11 @@ def main() -> None:
                             cached_drive_route = None
                             cached_blocked = False
                             hdg_engaged = False
+                            lead_vehicle = None
+                            lead_dist = 999.0
+                            lead_speed = 0.0
+                            follow_active = False
+                            overtake_requested = False
                             hist = {"t": [], "throttle": [], "brake": [],
                                     "speed": []}
                             last_progress_pos = None
@@ -1390,6 +1399,24 @@ def main() -> None:
                         lane_frame.center[0], dtype=float)[:2]
                     lane_lat = float(
                         (c0 - np.asarray(st.pos[:2], dtype=float)) @ left2)
+                # Dynamic-traffic ACC: find the nearest vehicle ahead in the
+                # ego lane so we can follow it smoothly instead of treating
+                # every car as a static obstacle.
+                lead_vehicle, lead_dist, _lead_lat = find_lead_vehicle(
+                    obstacles,
+                    route if (route is not None and len(route) >= 2) else None,
+                    st.pos, heading=st.heading)
+                if lead_vehicle is not None and lead_vehicle.velocity is not None:
+                    lead_speed = vehicle_along_speed(
+                        lead_vehicle,
+                        route if (route is not None and len(route) >= 2) else None,
+                        st.pos, heading=st.heading)
+                else:
+                    lead_speed = 0.0
+                follow_active = lead_vehicle is not None
+                overtake_requested = bool(
+                    lead_vehicle is not None
+                    and should_overtake(lead_speed, cruise_speed))
                 desired_speed = cruise_speed
                 blocked = False
                 hdg_dev = 0.0
@@ -1450,7 +1477,32 @@ def main() -> None:
                             drive_route, obstacles, st.pos, st.heading,
                             0, cruise_speed)
                         if blocked:
-                            desired_speed = 0.0
+                            # A moving lead in the lane is not a wall: keep
+                            # the time-gap follow instead of parking (min()
+                            # still keeps the planner's kinematic limit for
+                            # any static blocker).  A stopped lead or a
+                            # non-vehicle blocker stops the car.
+                            if (lead_vehicle is not None
+                                    and lead_vehicle.velocity is not None
+                                    and lead_speed > 0.0):
+                                desired_speed = min(
+                                    desired_speed,
+                                    follow_speed(cruise_speed, lead_dist,
+                                                 lead_speed, speed))
+                            else:
+                                desired_speed = 0.0
+                        elif lead_vehicle is not None \
+                                and not overtake_requested:
+                            # ACC car-following: a lead ahead in the ego
+                            # lane caps the speed to keep a safe time gap -
+                            # the "follow slow traffic" part of realistic
+                            # driving.  The planner's kinematic limit, which
+                            # already knows the lead's speed, still applies
+                            # through the min().
+                            desired_speed = min(
+                                desired_speed,
+                                follow_speed(cruise_speed, lead_dist,
+                                             lead_speed, speed))
                         # Speed-planning diagnostics for the telemetry/GUI:
                         # corner = curvature limit only, obslim = kinematic
                         # obstacle limit, desired = final planner demand.
@@ -1882,6 +1934,11 @@ def main() -> None:
                             planner, "last_lane_offset", 0.0)), 2),
                         "obs": len(obstacles),
                         "obs_d": round(float(obs_dist), 1),
+                        "lead_d": (round(float(lead_dist), 1)
+                                   if lead_vehicle is not None else None),
+                        "lead_v": round(float(lead_speed), 1),
+                        "follow": int(follow_active),
+                        "overtake": int(overtake_requested),
                         "goal_d": round(goal_dist, 1),
                         "rev": round(rev_total, 2),
                         "rev_route": round(route_rev_dist, 2),

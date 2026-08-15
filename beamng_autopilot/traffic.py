@@ -11,6 +11,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
+
 
 SIGNAL_ACTION_GO = 0
 SIGNAL_ACTION_ALERT = 1
@@ -25,6 +27,16 @@ SIGNAL_STOP_MARGIN_M = 4.0
 SIGNAL_DECEL_MPS2 = 3.0
 SIGNAL_SLOW_CAP_MPS = 30.0 / 3.6
 SIGNAL_ALERT_FLOOR_MPS = 3.0
+
+# ACC / car-following defaults.  These are deliberately conservative so a
+# slow lead vehicle is followed smoothly instead of being treated as a
+# static wall until the planner finds a detour.
+ACC_TIME_GAP_S = 1.6
+ACC_MIN_GAP_M = 3.0
+ACC_MAX_DIST_M = 60.0
+ACC_LANE_HALF_WIDTH_M = 1.8
+ACC_OVERTAKE_SPEED_RATIO = 0.85   # overtake when lead speed < cruise * this
+ACC_OVERTAKE_MIN_SPEED_MPS = 3.0
 
 # Used only when a map link has lane strings but no node radii: the offset
 # math still works with a reasonable road width, and live Tech maps always
@@ -211,6 +223,167 @@ def one_way_from_lanes(lanes: str | None) -> bool | None:
     if not lanes:
         return None
     return ("+" not in lanes) or ("-" not in lanes)
+
+
+def _route_projection(px: float, py: float, route) -> tuple[float, float] | None:
+    """Project a point onto a 2D polyline.
+
+    Returns ``(arc_length_from_start, signed_lateral_offset)`` where
+    lateral is positive to the left of the travel direction.  This is a
+    small standalone helper so ``traffic.py`` does not depend on planner
+    internals (planner already imports traffic helpers).
+    """
+    pts = np.asarray(route[:, :2], dtype=float)
+    if len(pts) < 2:
+        return None
+    d = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(d)])
+    best_arc: float | None = None
+    best_lat = 0.0
+    best_dist = math.inf
+    for i in range(len(pts) - 1):
+        ax, ay = pts[i]
+        bx, by = pts[i + 1]
+        vx, vy = bx - ax, by - ay
+        seg_len = d[i]
+        if seg_len < 1e-9:
+            continue
+        t = ((px - ax) * vx + (py - ay) * vy) / (seg_len * seg_len)
+        t = max(0.0, min(1.0, t))
+        cx = ax + t * vx
+        cy = ay + t * vy
+        dist = math.hypot(px - cx, py - cy)
+        if dist < best_dist:
+            best_dist = dist
+            best_arc = cum[i] + t * seg_len
+            # left normal: (-vy/len, vx/len)
+            best_lat = ((px - cx) * (-vy / seg_len)
+                        + (py - cy) * (vx / seg_len))
+    if best_arc is None:
+        return None
+    return float(best_arc), float(best_lat)
+
+
+def find_lead_vehicle(
+    obstacles,
+    route,
+    pos,
+    heading: float | None = None,
+    max_dist: float = ACC_MAX_DIST_M,
+    lane_half_width: float = ACC_LANE_HALF_WIDTH_M,
+):
+    """Return the nearest moving/parked vehicle ahead in the ego lane.
+
+    ``route`` may be a 2D polyline (Nx2 or Nx3); when it is None or too
+    short, a straight corridor is built from ``pos`` and ``heading`` so the
+    helper still works for sensor-lane-only driving.
+
+    Returns ``(obstacle, longitudinal_distance, lateral_offset)``; when no
+    lead vehicle is found the obstacle is ``None`` and distance is ``inf``.
+    """
+    if not obstacles:
+        return None, math.inf, 0.0
+    p = np.asarray(pos, dtype=float)[:2]
+    if route is not None and len(route) >= 2:
+        pts = np.asarray(route[:, :2], dtype=float)
+    else:
+        h = float(heading if heading is not None else 0.0)
+        fwd = np.array([math.cos(h), math.sin(h)])
+        pts = np.array([p, p + fwd * max_dist])
+    best = None
+    best_lon = math.inf
+    best_lat = 0.0
+    for ob in obstacles:
+        if ob.category != "vehicle":
+            continue
+        proj = _route_projection(float(ob.x), float(ob.y), pts)
+        if proj is None:
+            continue
+        lon, lat = proj
+        if lon <= 0.5 or lon > max_dist:
+            continue
+        if abs(lat) > lane_half_width:
+            continue
+        if lon < best_lon:
+            best = ob
+            best_lon = lon
+            best_lat = lat
+    return best, best_lon, best_lat
+
+
+def follow_speed(
+    cruise: float,
+    lead_dist: float,
+    lead_speed: float,
+    ego_speed: float,
+    time_gap: float = ACC_TIME_GAP_S,
+    min_gap: float = ACC_MIN_GAP_M,
+) -> float:
+    """ACC-style target speed for a lead vehicle ahead.
+
+    The target keeps a ``min_gap + time_gap * ego_speed`` following gap.
+    It never exceeds the cruise speed and never goes negative.  This lets
+    the car follow a slow vehicle smoothly instead of waiting for the
+    planner to decide whether to stop or overtake.
+    """
+    cruise = max(0.0, float(cruise))
+    if lead_dist is None or not math.isfinite(float(lead_dist)):
+        return cruise
+    lead_dist = float(lead_dist)
+    if lead_dist <= min_gap:
+        return 0.0
+    desired_gap = min_gap + time_gap * max(0.0, float(ego_speed))
+    if lead_dist >= desired_gap and float(lead_speed) >= cruise - 0.5:
+        return cruise
+    error = lead_dist - desired_gap
+    target = float(lead_speed) + error / max(time_gap, 0.1)
+    return float(max(0.0, min(cruise, target)))
+
+
+def should_overtake(
+    lead_speed: float,
+    cruise: float,
+    ratio: float = ACC_OVERTAKE_SPEED_RATIO,
+    min_speed: float = ACC_OVERTAKE_MIN_SPEED_MPS,
+) -> bool:
+    """True when a lead vehicle is slow enough to justify an overtake."""
+    return (float(lead_speed) < float(cruise) * ratio
+            and float(cruise) >= min_speed)
+
+
+def vehicle_along_speed(
+    ob,
+    route,
+    pos=None,
+    heading: float | None = None,
+) -> float:
+    """Signed speed of a vehicle projected along the current route.
+
+    This is used for ACC so an oncoming vehicle in the same lane is not
+    mistaken for a slow lead moving in the ego direction.
+    """
+    if ob is None or ob.velocity is None:
+        return 0.0
+    if route is not None and len(route) >= 2:
+        pts = np.asarray(route[:, :2], dtype=float)
+    else:
+        h = float(heading if heading is not None else 0.0)
+        fwd = np.array([math.cos(h), math.sin(h)])
+        p = (np.asarray(pos, dtype=float)[:2]
+             if pos is not None else np.zeros(2))
+        pts = np.array([p, p + fwd * 100.0])
+    if len(pts) < 2:
+        return 0.0
+    i = int(np.argmin(np.linalg.norm(pts - np.asarray(
+        [ob.x, ob.y], dtype=float), axis=1)))
+    i0 = max(0, i - 1)
+    i1 = min(len(pts) - 1, i + 1)
+    dx = pts[i1, 0] - pts[i0, 0]
+    dy = pts[i1, 1] - pts[i0, 1]
+    n = math.hypot(dx, dy)
+    if n < 1e-9:
+        return 0.0
+    return max(0.0, float((ob.velocity[0] * dx + ob.velocity[1] * dy) / n))
 
 
 def road_width_m(rule: RoadRuleView | None) -> float | None:

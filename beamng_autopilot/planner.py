@@ -922,6 +922,25 @@ def _find_blocker(pts, i0: int, i1: int, obstacles, half_w: float):
     return None
 
 
+def _vehicle_speed_along(ob, seg_pts, seg_k: int) -> float:
+    """Signed speed of a dynamic vehicle along the local route segment.
+
+    Used by speed planning so a moving lead vehicle does not force the ego
+    to brake as hard as for a static wall.
+    """
+    if ob is None or ob.velocity is None or seg_pts is None:
+        return 0.0
+    if seg_k < 0 or seg_k >= len(seg_pts) - 1:
+        return 0.0
+    ax, ay = seg_pts[seg_k]
+    bx, by = seg_pts[seg_k + 1]
+    dx, dy = bx - ax, by - ay
+    n = math.hypot(dx, dy)
+    if n < 1e-9:
+        return 0.0
+    return max(0.0, float((ob.velocity[0] * dx + ob.velocity[1] * dy) / n))
+
+
 class LocalPlanner:
     """Plans a locally drivable path around obstacles and a safe speed."""
 
@@ -2166,6 +2185,7 @@ class LocalPlanner:
                 continue
             closest = 999.0
             lon = 0.0
+            seg_k = 0
             for k in range(len(seg_pts) - 1):
                 dd = _obstacle_seg_dist(
                     ob, seg_pts[k, 0], seg_pts[k, 1],
@@ -2173,6 +2193,7 @@ class LocalPlanner:
                 if dd < closest:
                     closest = dd
                     lon = cum[min(nearest, n - 1) + k] - base
+                    seg_k = k
                 if dd < 1e-6:
                     break
             if closest >= 999.0:
@@ -2200,7 +2221,8 @@ class LocalPlanner:
             in_lane = abs(lat_c) < CAR_HALF_WIDTH + 0.3
             if in_lane or closest < self.corridor_half_w:
                 v_max = math.sqrt(
-                    2.0 * DECEL_MPS2 * max(0.0, lon - STOP_MARGIN_M))
+                    _vehicle_speed_along(ob, seg_pts, seg_k) ** 2
+                    + 2.0 * DECEL_MPS2 * max(0.0, lon - STOP_MARGIN_M))
                 if not in_lane:
                     floor = (SPECK_PASS_BY_MIN_MPS
                              if is_sparse_raycast_speck(ob)

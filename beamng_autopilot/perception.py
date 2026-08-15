@@ -135,7 +135,17 @@ for _, veh in ipairs(getAllVehicles()) do
         if okh and hv then
           yaw = math.atan2(hv.y, hv.x)
         end
-        out[#out + 1] = { x = pos.x, y = pos.y, yaw = yaw }
+        -- Velocity for ACC / overtaking: the world-space speed of the
+        -- other vehicle lets us keep a time gap instead of treating every
+        -- car as a static obstacle.
+        local vx, vy = 0.0, 0.0
+        local okv, vel = pcall(function() return veh:getVelocity() end)
+        if okv and vel then
+          vx = vel.x or 0.0
+          vy = vel.y or 0.0
+        end
+        out[#out + 1] = { x = pos.x, y = pos.y, yaw = yaw,
+                          id = tostring(id), vx = vx, vy = vy }
       end
     end
   end
@@ -188,6 +198,12 @@ class Obstacle:
     axis: np.ndarray | None = None
     half_len: float = 0.0
     half_thick: float = 0.0
+    # Optional dynamic-vehicle state for ACC / overtaking.  ``velocity`` is
+    # the world velocity (m/s), ``heading`` the yaw (radians) and
+    # ``vehicle_id`` a stable id for tracking across frames.
+    velocity: np.ndarray | None = None
+    heading: float | None = None
+    vehicle_id: str | None = None
 
     @property
     def center(self) -> np.ndarray:
@@ -590,6 +606,13 @@ def merge_obstacles(obstacles, merge_dist: float = 2.5) -> list[Obstacle]:
         target.half_h = (y1 - y0) / 2.0
         if not target.label and ob.label:
             target.label = ob.label
+        # Keep the dynamic-vehicle state (velocity / heading / stable id)
+        # when a richer source (scene vehicle scan) merges into a
+        # vision-only box, so ACC still sees a moving lead after merging.
+        if target.velocity is None and ob.velocity is not None:
+            target.velocity = ob.velocity
+            target.heading = ob.heading
+            target.vehicle_id = ob.vehicle_id
     return merged
 
 
@@ -709,14 +732,24 @@ def scan_obstacles_vehicles(
             yaw = float(entry.get("yaw", 0.0))
         except (TypeError, ValueError):
             yaw = 0.0
+        try:
+            vx = float(entry.get("vx", 0.0))
+            vy = float(entry.get("vy", 0.0))
+        except (TypeError, ValueError):
+            vx = vy = 0.0
+        vid = entry.get("id")
+        vid = str(vid) if vid is not None else None
         ca, sa = abs(math.cos(yaw)), abs(math.sin(yaw))
         # World-axis-aligned bounding box of the oriented rectangle: the
         # vehicle's long side (2*half_h) points along its heading, the
         # short side (2*half_w) across it.
         hw = ca * half_h + sa * half_w
         hh = sa * half_h + ca * half_w
+        vel = (np.array([vx, vy], dtype=float)
+               if np.isfinite(vx) and np.isfinite(vy) else None)
         out.append(Obstacle(x=x, y=y, half_w=hw, half_h=hh,
-                            category="vehicle"))
+                            category="vehicle", heading=yaw,
+                            velocity=vel, vehicle_id=vid))
     return out
 
 
