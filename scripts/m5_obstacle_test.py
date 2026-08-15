@@ -74,8 +74,11 @@ BLOCK_DIST = 35.0     # blocker placed this far along the route
 
 
 def _yaw_deg_from_heading(heading: float) -> float:
-    # Same world-heading -> BeamNG yaw convention as connector.load_scenario.
-    return math.degrees(float(heading)) + 90.0
+    # World heading (atan2) -> BeamNG yaw.  Empirically calibrated on the
+    # tech build: the game applies the yaw clockwise, so the correct
+    # conversion is yaw(deg) = -degrees(h) - 90 (see the pose experiment
+    # in the 2026-08-15 commit; m5_drive_test uses the same formula).
+    return -math.degrees(float(heading)) - 90.0
 
 
 def main() -> None:
@@ -83,12 +86,14 @@ def main() -> None:
     ap.add_argument("--runtime", choices=("auto", "steam", "tech"),
                     default=config.RUNTIME_MODE,
                     help="game runtime: auto detects after connecting")
+    ap.add_argument("--map", default="smallgrid",
+                    help="map to load (italy spawns at the crossroads)")
     ap.add_argument("--port", type=int, default=None,
                     help="game port (default: resolved from --runtime)")
     args = ap.parse_args()
 
     conn = BeamNGConnector(
-        "smallgrid", "etk800",
+        args.map, "etk800",
         port=(args.port or config.runtime_port(args.runtime)),
         home=config.runtime_home(args.runtime))
     roadnet = RoadNetwork()
@@ -109,14 +114,22 @@ def main() -> None:
     try:
         conn.open(launch=True)
         # Own scenario with TWO vehicles: ego + a blocker parked in the lane.
-        scenario = Scenario("smallgrid", "autopilot_obstacle")
+        scenario = Scenario(args.map, "autopilot_obstacle")
         ego = Vehicle("ego", model="etk800", color="Red")
         blocker = Vehicle("blocker", model="etk800", color="Blue")
-        quat = angle_to_quat((0.0, 0.0, 90.0))
-        scenario.add_vehicle(ego, pos=(0.0, 0.0, 0.0), rot_quat=quat,
-                             cling=True)
-        scenario.add_vehicle(blocker, pos=(8.0, 0.0, 0.0), rot_quat=quat,
-                             cling=True)
+        if args.map == "italy":
+            # The italy town crossroads used by the M5 autopilot default.
+            spawn = config.ITALY_SPAWN_CROSSROADS_POS
+            spawn_heading = config.ITALY_SPAWN_CROSSROADS_HEADING
+        else:
+            spawn = (0.0, 0.0, 0.0)
+            spawn_heading = 0.0
+        quat = angle_to_quat(
+            (0.0, 0.0, _yaw_deg_from_heading(spawn_heading)))
+        scenario.add_vehicle(ego, pos=spawn, rot_quat=quat, cling=True)
+        scenario.add_vehicle(
+            blocker, pos=(spawn[0] + 8.0, spawn[1], spawn[2]),
+            rot_quat=quat, cling=True)
         scenario.make(conn.bng)
         conn.bng.scenario.load(scenario)
         conn.bng.scenario.start()
@@ -154,6 +167,21 @@ def main() -> None:
             time.sleep(1.0)
         if conn.reposition_on_road(roadnet):
             print("[obstacle] ego placed on road network")
+        if args.map == "italy" and roadnet.ready:
+            # Pin the ego to the crossroads default position and face it
+            # along the road.  The scenario spawn heading constant is off
+            # the real road axis on the current map build (~44 deg), so
+            # every spawn used to look crooked.
+            hdg = roadnet.road_heading_at(spawn[:2])
+            if hdg is None:
+                hdg = config.ITALY_SPAWN_CROSSROADS_HEADING
+            conn.vehicle.teleport(
+                (float(spawn[0]), float(spawn[1]), float(spawn[2]) + 0.3),
+                rot_quat=angle_to_quat(
+                    (0.0, 0.0, _yaw_deg_from_heading(hdg))))
+            conn.step(30)
+            print(f"[obstacle] ego pinned to crossroads, heading "
+                  f"{math.degrees(hdg):.0f}deg (road-aligned)")
 
         st = conn.get_state()
         start_xy = st.pos[:2].copy()
@@ -178,6 +206,24 @@ def main() -> None:
             seg = RoadNetwork._interpolate(start_xy, goal_xy, 1.5)
         route = np.asarray(seg, dtype=float)
         print(f"[obstacle] route: {len(route)} pts, goal {goal_xy.round(1)}")
+        if args.map == "italy" and len(route) >= 2:
+            # Align the car with the route travel direction.  The first
+            # route segment is a sub-metre hop from the car to the nearest
+            # road node whose direction is meaningless, so measure the
+            # direction over a few points instead.
+            j = min(5, len(route) - 1)
+            tv = route[j][:2] - route[0][:2]
+            tn = float(np.linalg.norm(tv))
+            if tn > 1e-6:
+                hdg = float(np.arctan2(tv[1], tv[0]))
+                conn.vehicle.teleport(
+                    (float(start_xy[0]), float(start_xy[1]),
+                     float(st.pos[2]) + 0.3),
+                    rot_quat=angle_to_quat(
+                        (0.0, 0.0, _yaw_deg_from_heading(hdg))))
+                conn.step(30)
+                print(f"[obstacle] ego aligned to route heading "
+                      f"{math.degrees(hdg):.0f}deg")
 
         # ---- park the blocker in the lane 35 m along the route ----
         d = np.linalg.norm(route[:, :2] - start_xy, axis=1)
@@ -197,6 +243,15 @@ def main() -> None:
         if np.linalg.norm(fwd) < 1e-6:
             fwd = route[target] - route[max(target - 3, 0)]
         heading_at = float(np.arctan2(fwd[1], fwd[0]))
+        if roadnet.ready:
+            # Park along the road axis (not the route tangent, which can
+            # cut a corner) and face the route travel direction so the
+            # blocker is never parked crooked.
+            road_h = roadnet.road_heading_at(bp)
+            if road_h is not None:
+                if math.cos(road_h - heading_at) < 0.0:
+                    road_h += math.pi
+                heading_at = road_h
 
         blocker = conn.scenario.get_vehicle("blocker")
         z = 0.4

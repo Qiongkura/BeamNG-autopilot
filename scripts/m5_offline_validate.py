@@ -921,7 +921,9 @@ def test_connector_italy_default_spawn() -> None:
     if captured.get("rot_quat"):
         qz, qw = captured["rot_quat"][2], captured["rot_quat"][3]
         yaw_deg = math.degrees(2.0 * math.atan2(qz, qw))
-        expected = math.degrees(config.ITALY_SPAWN_CROSSROADS_HEADING) + 90.0
+        # Empirically calibrated yaw convention (2026-08-15 crossroads
+        # experiment, four headings verified): yaw = -degrees(h) - 90.
+        expected = -math.degrees(config.ITALY_SPAWN_CROSSROADS_HEADING) - 90.0
         check("italy default spawn: crossroads heading",
               abs(yaw_deg - expected) < 1e-6,
               f"yaw={yaw_deg:.3f} expected={expected:.3f}")

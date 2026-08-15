@@ -54,7 +54,7 @@ def _teleport_to(conn, xyz, heading, lift: float = 0.6) -> None:
     """把车 teleport 到路网节点并按道路方向摆正。"""
     from beamngpy.misc.quat import angle_to_quat
 
-    yaw_deg = math.degrees(math.pi / 2.0 - heading)
+    yaw_deg = -math.degrees(float(heading)) - 90.0
     quat = angle_to_quat((0.0, 0.0, yaw_deg))
     with conn.io_lock:
         conn.vehicle.teleport((float(xyz[0]), float(xyz[1]),

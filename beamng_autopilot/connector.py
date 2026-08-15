@@ -155,9 +155,10 @@ class BeamNGConnector:
         with self.io_lock:
             scenario = Scenario(self.map_name, "autopilot_m1")
             vehicle = Vehicle("ego", model=self.vehicle_model, color="Red")
-        # 世界系航向角 h（atan2(dy,dx) 约定）与 BeamNG 的 yaw 存在 90° 基准差：
-        # yaw=0 时车头朝 -Y，因此 yaw(deg) = degrees(h) + 90。angle_to_quat 接受角度制。
-        yaw_deg = math.degrees(float(spawn_heading)) + 90.0
+        # 世界系航向角 h（atan2(dy,dx) 约定）与 BeamNG 的 yaw 换算（实测
+        # 于 2026-08-15 十字路口实验，四个方向全部验证）：
+        # teleport/场景里 yaw 按顺时针应用，yaw(deg) = -degrees(h) - 90。
+        yaw_deg = -math.degrees(float(spawn_heading)) - 90.0
         quat = angle_to_quat((0.0, 0.0, yaw_deg))
         scenario.add_vehicle(vehicle, pos=spawn_pos, rot_quat=quat, cling=True)
         with self.io_lock:
@@ -260,7 +261,7 @@ class BeamNGConnector:
         heading = roadnet.road_heading_at(st.pos[:2])
         rot_quat = None
         if heading is not None:
-            yaw_deg = math.degrees(math.pi / 2.0 - heading)
+            yaw_deg = -math.degrees(float(heading)) - 90.0
             rot_quat = angle_to_quat((0.0, 0.0, yaw_deg))
         pos = (float(xyz[0]), float(xyz[1]), float(xyz[2]) + lift)
         try:

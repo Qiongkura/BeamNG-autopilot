@@ -541,6 +541,28 @@ def is_sparse_raycast_speck(ob) -> bool:
             and 2.0 * ob.half_h <= 2.1)
 
 
+def is_small_lidar_clutter(ob) -> bool:
+    """True when a LiDAR cluster is small enough to be roadside clutter.
+
+    Dense town scenes return dozens of small lidar boxes (poles, trunks,
+    mailboxes, wall corners) that inflate the A* grid until no detour
+    exists.  Like ``is_sparse_raycast_speck`` these are kept for a gentle
+    speed limit but must not pin the path to blocked.  A real vehicle or
+    pedestrian is still covered by the Lua vehicle/scenario scans and the
+    vision channel, so dropping the small lidar boxes does not remove a
+    safety layer - it removes grid noise.
+    """
+    if getattr(ob, "category", "") != "lidar":
+        return False
+    if getattr(ob, "label", "") == "wall":
+        return False
+    if _obstacle_oriented(ob):
+        return (2.0 * float(getattr(ob, "half_len", 0.0)) <= 2.1
+                and 2.0 * float(getattr(ob, "half_thick", 0.0)) <= 2.1)
+    return (2.0 * ob.half_w <= 2.1
+            and 2.0 * ob.half_h <= 2.1)
+
+
 def _lane_tangent_at(lane_center, x: float, y: float) -> np.ndarray:
     """Local travel direction of a lane polyline near a world point."""
     pts = np.asarray(lane_center[:, :2], dtype=float)
@@ -1224,7 +1246,8 @@ class LocalPlanner:
         # whole corridor: a 0.9 m single-hit box or an unlabelled fused
         # blob must not park the car in an empty lane.
         obstacles = [ob for ob in obstacles
-                     if not is_sparse_raycast_speck(ob)]
+                     if not is_sparse_raycast_speck(ob)
+                     and not is_small_lidar_clutter(ob)]
         if lane_mode is not None:
             # The lane centre already keeps the car inside the detected
             # lane; a thin wall at the lane edge is the boundary itself,
