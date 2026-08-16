@@ -1,5 +1,11 @@
 # BeamNG Autopilot — 视觉智驾研究
 
+<div align="center">
+
+**中文** | [English](README.en.md)
+
+</div>
+
 基于 BeamNG.drive + BeamNGpy 的自动驾驶研究项目。路线：先分层（感知/决策/控制），再升级端到端模仿学习与图像 RL。
 
 ## 里程碑
