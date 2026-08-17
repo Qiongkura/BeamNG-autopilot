@@ -135,7 +135,7 @@ The project provides various testing and validation scripts:
 
 ## License
 
-This project does not specify a license. Please contact the project maintainer to confirm license terms before use.
+This project is licensed under the [MIT](LICENSE) license.
 
 ## Contact
 

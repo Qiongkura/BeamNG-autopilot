@@ -4,6 +4,7 @@
 
 **中文** | [English](README.en.md)
 
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Star](https://img.shields.io/github/stars/Qiongkura/BeamNG-autopilot.svg)](https://github.com/Qiongkura/BeamNG-autopilot/stargazers)
 [![Issues](https://img.shields.io/github/issues/Qiongkura/BeamNG-autopilot.svg)](https://github.com/Qiongkura/BeamNG-autopilot/issues)
 
@@ -137,7 +138,7 @@ GPU 显存 6GB 以上（YOLO 检测 + HUD 可视化需要）
 
 ## 📄 许可证
 
-本项目未指定许可证。请在使用前联系项目维护者确认许可条款。
+本项目采用 [MIT](LICENSE) 许可证。
 
 ## 📮 联系方式
 
