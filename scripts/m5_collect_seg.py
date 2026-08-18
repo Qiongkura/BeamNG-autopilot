@@ -69,6 +69,9 @@ def _teleport_to(conn, xyz, heading, lift: float = 0.6,
 def main() -> None:
     ap = argparse.ArgumentParser(description="分割数据采集")
     ap.add_argument("--port", type=int, default=64257)
+    ap.add_argument("--runtime", choices=("auto", "steam", "tech"),
+                    default="tech",
+                    help="game runtime: tech (default) or steam")
     ap.add_argument("--frames", type=int, default=None,
                     help="总帧数（默认 segments x frames-per-seg）")
     ap.add_argument("--segments", type=int, default=1,
@@ -98,7 +101,9 @@ def main() -> None:
     per_seg = max(20, args.frames_per_seg)
     total = args.frames or segments * per_seg
 
-    conn = BeamNGConnector(port=args.port)
+    conn = BeamNGConnector(
+        port=(args.port or config.runtime_port(args.runtime)),
+        home=config.runtime_home(args.runtime))
     conn.open(launch=False)
     try:
         conn.attach_vehicle(already_open=True)

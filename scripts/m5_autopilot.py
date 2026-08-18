@@ -84,6 +84,8 @@ from beamng_autopilot.planner import (
     SHARP_CORNER_KPH,
     LocalPlanner,
     _point_route_pos,
+    adaptive_lookahead_idx,
+    corner_angle_deg,
     creep_speed,
     is_sparse_raycast_speck,
 )
@@ -132,8 +134,8 @@ STEER_RATE = 1.2     # max normalized steering change per second.  The
                      # so a per-frame low-pass lag turns a bend into a wall.
 CREEP_MPS = 1.5     # ACC-style creep speed when an obstacle limit pins 0
 RULE_POLL_INTERVAL_S = 0.8   # road-rule/signal snapshot cadence
-HEADING_DEV_DEG = 18.0   # heading vs route direction at which we slow down
-HEADING_DEV_RELEASE = 13.0  # hysteresis: release the cap only below this
+HEADING_DEV_DEG = 8.0    # heading vs route direction at which we slow down
+HEADING_DEV_RELEASE = 6.0  # hysteresis: release the cap only below this
 HEADING_DEV_CAP = 2.5    # m/s speed cap right at the threshold
 HEADING_DEV_CRAWL = 0.6  # m/s floor when the car is fully sideways/spinning
 REVERSE_SPEED_MPS = -0.3  # signed forward speed below which we are rolling back
@@ -144,6 +146,7 @@ REVERSE_SOFT_BRAKE = 0.35  # transient-backward brake (no long hold)
 REVERSE_MOVEMENT_M = 0.10  # backward displacement that counts as reversing
 REVERSE_BACK_RATIO = 0.30  # minimum backward share of the frame displacement
 PLAN_INTERVAL_S = 0.15     # minimum wall time between full local re-plans
+RANGE_SCAN_INTERVAL_S = 0.2  # minimum wall time between LiDAR+ray scans
 VIS_TRACK_MATCH_M = 1.8    # world-space gate for matching a vision detection
 VIS_TRACK_CONFIRM = 2      # scans before a vision obstacle may act as a blocker
 VIS_TRACK_TTL_S = 8.0      # forget a vision track after this many seconds
@@ -180,6 +183,51 @@ def heading_deviation_deg(route, nearest, fwd) -> float:
     return math.degrees(math.acos(cos_a))
 
 
+def nearest_route_point(route, pos, fwd) -> int:
+    """Index of the route point nearest to ``pos``, consistent with the
+    ego heading.
+
+    A plain argmin over a switchback snaps to the return leg at the
+    apex: the doubled-back road is physically only a few metres away
+    while the car is still on the approach leg, so ``nearest`` jumps
+    past the corner, the heading guard reads ~180 deg of deviation and
+    the planning window starts on the wrong side of the hairpin (runs
+    46/51/54 died exactly there).  The route tangent at the candidate
+    must not oppose the ego heading; the closest agreeing point wins.
+    Falls back to the raw argmin when no agreeing point is close (car
+    off-road recovery, detour, spinning after a hit) so the planner can
+    still find the route.
+    """
+    route = np.asarray(route[:, :2], dtype=float)
+    pos = np.asarray(pos[:2], dtype=float)
+    fwd = np.asarray(fwd[:2], dtype=float)
+    n = len(route)
+    if n < 3:
+        return 0
+    d = np.linalg.norm(route - pos, axis=1)
+    raw = int(np.argmin(d))
+    fn = float(np.linalg.norm(fwd))
+    if fn < 1e-6:
+        return raw
+    fwd = fwd / fn
+    tv = np.zeros_like(route)
+    tv[1:-1] = route[2:] - route[:-2]
+    tv[0] = route[1] - route[0]
+    tv[-1] = route[-1] - route[-2]
+    tn = np.linalg.norm(tv, axis=1)
+    align = np.zeros(n)
+    ok = tn > 1e-6
+    align[ok] = (tv[ok] / tn[ok, None]) @ fwd
+    # Allow up to ~101 deg of heading mismatch (a car mid-turn in a
+    # hairpin legitimately points across the route); only near-opposite
+    # candidates are the wrong leg.
+    d_gated = np.where(align >= -0.2, d, np.inf)
+    gated = int(np.argmin(d_gated))
+    if d_gated[gated] <= max(25.0, 3.0 * float(d[raw])):
+        return gated
+    return raw
+
+
 def smooth_steer(prev: float, new: float, dt: float,
                  rate: float = STEER_RATE) -> float:
     """Rate-limited steering smoothing (normalized input units)."""
@@ -202,6 +250,19 @@ def heading_dev_speed_cap(dev_deg: float,
         return None
     t = min(1.0, max(0.0, (90.0 - dev_deg) / (90.0 - HEADING_DEV_DEG)))
     return HEADING_DEV_CRAWL + (HEADING_DEV_CAP - HEADING_DEV_CRAWL) * t
+
+
+def _route_spacing_m(route) -> float:
+    """Median segment length (m) of a route polyline."""
+    import numpy as _np
+
+    r = _np.asarray(route[:, :2], dtype=float)
+    if len(r) < 2:
+        return 2.0
+    seg = _np.linalg.norm(_np.diff(r, axis=0), axis=1)
+    if not len(seg):
+        return 2.0
+    return float(_np.median(seg))
 
 
 def beamng_process_running() -> bool:
@@ -300,7 +361,18 @@ def main() -> None:
         home=config.runtime_home(args.runtime))
     vision_lock = threading.Lock()
     state_lock = threading.Lock()
+    range_lock = threading.Lock()
     latest_st = None
+    range_snapshot: dict = {
+        "seq": 0,
+        "ts": 0.0,
+        "obstacles": [],
+        "ray_hits": [],
+        "sensor_ok": True,
+        "failures": 0,
+        "error": None,
+    }
+    last_range_seq = 0
     vision_snapshot: dict = {
         "seq": 0,
         "ts": 0.0,
@@ -372,6 +444,13 @@ def main() -> None:
     last_plan_t = 0.0
     last_plan_route: np.ndarray | None = None
     last_plan_rule: RoadRuleView | None = None
+    # Corner-speed hysteresis: once the curvature limit engages (an 80 deg
+    # highway bend), keep it engaged until the bend is really over.  In the
+    # middle of a long bend the lookahead window can momentarily read a
+    # smaller angle and release the cap; the car then re-accelerates into
+    # the tighter second half and swings wide off the road (run 35).
+    corner_hold_until = 0.0
+    corner_held_speed: float | None = None
     cached_drive_route: np.ndarray | None = None
     cached_blocked = False
     last_vision = 0.0
@@ -1022,6 +1101,51 @@ def main() -> None:
 
         threading.Thread(target=_vision_worker, daemon=True).start()
 
+    # LiDAR + raycast scan in a background worker too: one 360 LiDAR poll
+    # plus the Lua fan takes 200-450 ms, and running it inline capped the
+    # control loop at ~1 Hz (the run 42-45 launch weave / bend overshoot).
+    # The worker keeps the latest finished snapshot; the control loop only
+    # consumes it, so steering/throttle updates run at the fast cadence.
+    if range_provider is not None:
+        def _range_worker() -> None:
+            last_scan_worker = 0.0
+            while not quit_flag:
+                if not autopilot:
+                    time.sleep(0.05)
+                    continue
+                now = time.time()
+                if now - last_scan_worker < RANGE_SCAN_INTERVAL_S:
+                    time.sleep(0.02)
+                    continue
+                last_scan_worker = now
+                try:
+                    with state_lock:
+                        st_worker = latest_st
+                    if st_worker is None:
+                        continue
+                    sample = range_provider.scan(
+                        st_worker.pos, ego_vid=conn.vehicle.vid,
+                        radius=55.0)
+                    with range_lock:
+                        range_snapshot.update({
+                            "seq": int(range_snapshot["seq"]) + 1,
+                            "ts": now,
+                            "obstacles": list(sample.obstacles),
+                            "ray_hits": list(sample.ray_hits),
+                            "sensor_ok": not errors_active(),
+                            "failures": 0,
+                            "error": None,
+                        })
+                except Exception as exc:
+                    with range_lock:
+                        range_snapshot["failures"] += 1
+                        range_snapshot["error"] = str(exc)[:120]
+                        rf = int(range_snapshot["failures"])
+                    if rf <= 3 or rf % 20 == 0:
+                        print(f"[m5] range scan error: {exc}")
+
+        threading.Thread(target=_range_worker, daemon=True).start()
+
     def _atexit_safety() -> None:
         """Last-ditch safety so a normal/Ctrl+C exit never leaves the car
         latched with throttle/brake or stuck in a mode it did not start in:
@@ -1254,12 +1378,24 @@ def main() -> None:
                 last_st = st
                 speed = st.speed
                 _mark("get_state")
-                if now - last_scan > 0.2:
-                    last_scan = now
-                    sample = range_provider.scan(
-                        st.pos, ego_vid=conn.vehicle.vid, radius=55.0)
-                    obstacles, last_lidar_hits = (
-                        sample.obstacles, sample.ray_hits)
+                # Range scan runs in a background worker (like vision);
+                # consume the newest finished snapshot without ever waiting
+                # for the 200-450 ms LiDAR + raycast scan to complete.  The
+                # control cadence is therefore no longer capped at ~1 Hz by
+                # the scan (the 15 km/h weave / wall hit on run 42-45).
+                with range_lock:
+                    rs_seq = int(range_snapshot["seq"])
+                    rs_new = rs_seq != last_range_seq
+                    if rs_new:
+                        last_range_seq = rs_seq
+                        obstacles = list(range_snapshot["obstacles"])
+                        last_lidar_hits = list(range_snapshot["ray_hits"])
+                        sensor_ok = bool(range_snapshot["sensor_ok"])
+                        scan_failures = int(range_snapshot["failures"])
+                    else:
+                        sensor_ok = bool(range_snapshot["sensor_ok"])
+                        scan_failures = int(range_snapshot["failures"])
+                if rs_new:
                     # Guard against any sensor ghost whose footprint covers
                     # the ego itself (vision chase-cam self-detection, a
                     # scenario object registered under another id, ...):
@@ -1455,9 +1591,13 @@ def main() -> None:
                     plan_route = route if has_route else None
                     plan_nearest = nearest if has_route else 0
                     if has_route:
-                        d = np.linalg.norm(
-                            route[:, :2] - st.pos[:2], axis=1)
-                        nearest = int(np.argmin(d))
+                        # A raw argmin snaps to the return leg of a
+                        # switchback at the apex (runs 46/51/54 died in
+                        # the final hairpin with hdg_dev ~132 deg): the
+                        # doubled-back road is metres away while the car
+                        # is still on the approach leg.  Match the route
+                        # tangent to the ego heading instead.
+                        nearest = nearest_route_point(route, st.pos, st.dir)
                         plan_nearest = nearest
                     drive_route = cached_drive_route
                     blocked = cached_blocked
@@ -1498,9 +1638,58 @@ def main() -> None:
                             drive_route = drive_route[start_i:]
                     if len(drive_route) >= 2:
                         display_route = drive_route
+                        # Corner detection must see the bend far enough
+                        # ahead to brake in time.  drive_route is only a
+                        # 48 m planning window, so an 80 deg highway bend
+                        # that starts beyond it looks straight and the car
+                        # charges in at cruise speed (the guardrail hit on
+                        # the highway run).  Speed plan on the full nav
+                        # route; the local obstacle geometry is identical
+                        # (both follow the same corridor) and the bend is
+                        # visible from far enough out.
+                        speed_route = (
+                            route[:, :2] if route is not None
+                            and len(route) >= 2 else drive_route)
+                        speed_nearest = nearest_route_point(
+                            speed_route, st.pos, st.dir)
+                        # Look far enough ahead to brake for a bend from
+                        # the current speed.  A fixed 48 m window missed
+                        # the 80 deg highway corner 120 m past a straight
+                        # and the car charged in at cruise speed; real ACC
+                        # scales lookahead with speed.
+                        ahead_idx = adaptive_lookahead_idx(
+                            float(speed),
+                            spacing_m=max(0.5, _route_spacing_m(speed_route)))
+                        planner.last_sharp = corner_angle_deg(
+                            speed_route, speed_nearest,
+                            ahead_idx=ahead_idx) >= planner.sharp_angle_deg
                         desired_speed, obs_dist = planner.speed(
-                            drive_route, obstacles, st.pos, st.heading,
-                            0, cruise_speed)
+                            speed_route, obstacles, st.pos, st.heading,
+                            speed_nearest, cruise_speed,
+                            ahead_idx=ahead_idx)
+                        # Corner-speed hysteresis: a bend that engaged the
+                        # curvature cap stays capped until the car has
+                        # actually slowed to the cap and the bend angle has
+                        # clearly dropped, so the mid-bend re-acceleration
+                        # (run 35 wide swing) cannot happen.
+                        corner_v = float(getattr(
+                            planner, "last_corner", desired_speed))
+                        if corner_v < cruise_speed * 0.9:
+                            corner_hold_until = time.time() + 2.5
+                            corner_held_speed = min(
+                                corner_v,
+                                (corner_held_speed
+                                 if corner_held_speed is not None
+                                 else corner_v))
+                        if (corner_held_speed is not None
+                                and time.time() < corner_hold_until
+                                and speed > corner_held_speed + 1.0):
+                            desired_speed = min(desired_speed,
+                                                corner_held_speed)
+                        if (corner_held_speed is not None
+                                and time.time() >= corner_hold_until
+                                and corner_v >= cruise_speed * 0.9):
+                            corner_held_speed = None
                         if blocked:
                             # A moving lead in the lane is not a wall: keep
                             # the time-gap follow instead of parking (min()
@@ -1539,6 +1728,18 @@ def main() -> None:
                             st.pos, st.heading, drive_route, 0)
                         new_steer = float(np.clip(
                             -steer_rad / 0.6, -1.0, 1.0))
+                        # Speed-sensitive steering limit: a real car cannot
+                        # yank the wheel at 70 km/h the way it can at 20.
+                        # Without this, a big heading correction at speed
+                        # (run 48: hdg 23 deg at 19.5 m/s) snaps the wheels
+                        # over, the rear slides out and the car spins off
+                        # the road.  Cap the normalized steer demand so the
+                        # implied lateral acceleration stays within grip:
+                        # a_lat_max ~ 5 m/s^2 -> steer <= 5*L/(v^2*0.6).
+                        v_sq = max(speed * speed, 2.0)
+                        steer_cap = max(0.10, min(1.0, 5.0 * 2.9 / v_sq / 0.6))
+                        new_steer = float(np.clip(
+                            new_steer, -steer_cap, steer_cap))
                         steer = smooth_steer(prev_steer, new_steer, dt)
                         prev_steer = steer
                         # Curvature cap only for real corners; small tracking
@@ -1785,6 +1986,16 @@ def main() -> None:
                 throttle, brake = speed_ctrl.update(
                     target_speed, speed, dt=min(0.25, max(0.01, dt)),
                     wheel_speed=wheel_speed)
+                # Low-speed launch guard: pulling away with the nose
+                # off-line (a wide stop on a bend exit) under full
+                # throttle spins the rear wheels and the car swings wide
+                # off the road (run 37: hdg 10 deg, v 0.6 -> 15.8 in the
+                # corner exit).  While the heading is off and the car is
+                # still slow, cap the throttle so it eases off straight
+                # instead of fishtailing.
+                if (speed < 6.0 and hdg_dev > 5.0
+                        and not reverse_now and not reverse_hold):
+                    throttle = min(throttle, 0.35)
                 if reverse_now or reverse_hold:
                     throttle = 0.0
                     if rev_sustained or reverse_hold:
@@ -1927,6 +2138,11 @@ def main() -> None:
                         "lane_src": lane_src,
                         "lane_paired": int(bool(getattr(
                             lane_frame, "paired", False))),
+                        "lane_override": (
+                            None
+                            if getattr(planner, "last_lane_override",
+                                       None) is None
+                            else list(planner.last_lane_override)),
                         "lane_jump": int(bool(getattr(
                             lane_tracker, "last_rejected", False))),
                         "lane_conf": round(lane_conf, 2),

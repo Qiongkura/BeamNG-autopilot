@@ -58,11 +58,12 @@ def _ground_z(conn, x: float, y: float) -> float | None:
     return None
 
 
-def _teleport_start(conn, start_xy, goal_xy):
-    """Move the ego to the probe start and face the goal."""
+def _teleport_start(conn, start_xy, face_xy):
+    """Move the ego to the probe start and face ``face_xy`` (the first
+    route segment direction, not the straight-line goal heading)."""
     from beamngpy.misc.quat import angle_to_quat
 
-    heading = math.atan2(goal_xy[1] - start_xy[1], goal_xy[0] - start_xy[0])
+    heading = math.atan2(face_xy[1] - start_xy[1], face_xy[0] - start_xy[0])
     yaw_deg = -math.degrees(float(heading)) - 90.0
     st0 = conn.get_state()
     z = float(st0.pos[2]) if len(st0.pos) > 2 else 0.0
@@ -162,6 +163,12 @@ def main() -> None:
                          "from the camera lane pair only")
     ap.add_argument("--run", type=int, default=0,
                     help="run number used in artifact names")
+    ap.add_argument("--keep-nav", action="store_true",
+                    help="keep the current in-game nav route and current "
+                         "position: no teleport, do not overwrite the route")
+    ap.add_argument("--monitor-timeout", type=float,
+                    default=MONITOR_TIMEOUT_S,
+                    help="monitor timeout in seconds")
     ap.add_argument("--start-x", type=float, default=START_XY[0])
     ap.add_argument("--start-y", type=float, default=START_XY[1])
     ap.add_argument("--goal-x", type=float, default=GOAL_XY[0])
@@ -179,7 +186,8 @@ def main() -> None:
     start_xy = np.asarray((args.start_x, args.start_y), dtype=float)
     goal_xy = np.asarray((args.goal_x, args.goal_y), dtype=float)
     conn = BeamNGConnector(
-        args.map, args.vehicle, home=config.runtime_home(args.runtime))
+        args.map, args.vehicle, home=config.runtime_home(args.runtime),
+        port=config.runtime_port(args.runtime))
     route = None
     proc = None
     history: list[dict] = []
@@ -205,12 +213,34 @@ def main() -> None:
         session_runtime = resolve_runtime(conn, args.runtime)
         report["runtime"] = session_runtime
         print(f"[drive-test] runtime={session_runtime}")
-        _teleport_start(conn, start_xy, goal_xy)
-        if args.no_nav:
-            print("[drive-test] no-nav mode: camera lane pair only")
-        else:
-            nav = _set_nav_route(conn, goal_xy)
+        if args.keep_nav:
+            print("[drive-test] keep-current mode: no teleport, reuse the "
+                  "in-game nav route")
+            nav = conn.read_navigation_route()
+            if nav is None or len(nav) < 4:
+                raise RuntimeError("no in-game nav route is set")
+            dseg = np.linalg.norm(np.diff(nav[:, :2], axis=0), axis=1)
+            print(f"[drive-test] nav route: {len(nav)} pts, "
+                  f"{float(np.sum(dseg)):.1f} m")
             route = nav[:, :2]
+        else:
+            _teleport_start(conn, start_xy, goal_xy)
+            if args.no_nav:
+                print("[drive-test] no-nav mode: camera lane pair only")
+            else:
+                nav = _set_nav_route(conn, goal_xy)
+                route = nav[:, :2]
+                # Park the car ON the first route waypoint (the game's
+                # planner anchors the route to the nearest road point, which
+                # can sit metres from the requested start - launching from
+                # the grass/verge off the paint makes the first PP target
+                # demand a large steering angle that overshoots on a 1 s
+                # frame cadence, the run 42/43 launch failure).  Face the
+                # first route segment (the road direction), not the
+                # straight-line goal heading.
+                start_on_route = nav[0][:2]
+                face = nav[min(2, len(nav) - 1)][:2]
+                _teleport_start(conn, start_on_route, face)
 
         # Remove stale control/live files so the child starts with a clean
         # watermark and the idle-frame wait cannot match a previous run.
@@ -285,7 +315,7 @@ def main() -> None:
         last_extra = None
         ended_frame = None
         m0 = time.time()
-        while time.time() - m0 < MONITOR_TIMEOUT_S:
+        while time.time() - m0 < args.monitor_timeout:
             if proc.poll() is not None:
                 final_reason = f"autopilot exit rc={proc.returncode}"
                 print(f"[drive-test] {final_reason}")

@@ -87,8 +87,12 @@ class SpeedController:
         # vehicle actually moves (sand, gravel, ice), full throttle just
         # digs in.  Cut the throttle (and dab the brake once rolling) so
         # the tyres re-grip; the demand ramps back in on the next step.
+        # The guard only engages at a real driving speed: at 1-3 m/s the
+        # wheel-speed / body-speed sensors differ by more than the ratio
+        # threshold on ordinary asphalt (etk800 live runs), so without a
+        # speed floor the car would never accelerate past a crawl.
         self.slip_active = False
-        if (wheel_speed is not None and speed > 0.5
+        if (wheel_speed is not None and speed > 3.5
                 and wheel_speed > max(1.0, speed * 1.35)
                 and wheel_speed - speed > 1.2):
             thr_req = min(thr_req, 0.08)

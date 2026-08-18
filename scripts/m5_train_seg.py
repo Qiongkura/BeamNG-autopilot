@@ -113,6 +113,10 @@ def main() -> None:
     ap.add_argument("--val-frac", type=float, default=0.2)
     ap.add_argument("--out", default=str(config.LOGS_DIR / "m5_seg" / "seg_model"))
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--vram-frac", type=float, default=0.6,
+                    help="max fraction of GPU VRAM training may use; keeps "
+                         "headroom for the running game so its rendering "
+                         "never starves (white windows)")
     args = ap.parse_args()
 
     try:
@@ -123,6 +127,12 @@ def main() -> None:
     torch.manual_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"[train] device={device}")
+    if device == "cuda":
+        # Cap training VRAM so a concurrently running game keeps enough
+        # memory to render.  Without this, batch 16 training filled the
+        # whole 12 GB card and the game's window went white.
+        torch.cuda.set_per_process_memory_fraction(
+            max(0.1, min(1.0, args.vram_frac)))
 
     frames = load_frames([Path(p) for p in args.runs])
     n = len(frames)

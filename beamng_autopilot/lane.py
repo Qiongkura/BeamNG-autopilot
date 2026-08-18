@@ -31,7 +31,7 @@ LANE_MIN_SPAN_M = 4.0
 LANE_BOUNDARY_SPAN_M = 1.5
 LANE_PAIR_OVERLAP_M = 1.5
 LANE_FRAME_MIN_SPAN_M = 3.0
-LANE_PAIRED_VISION_MIN_SPAN_M = 1.5
+LANE_PAIRED_VISION_MIN_SPAN_M = 6.0
 LANE_EDGE_MAX_M = 5.0
 LANE_SINGLE_MIRROR_MAX_M = 3.5
 LANE_SINGLE_LIDAR_CENTER_MAX_M = 0.35
@@ -781,6 +781,19 @@ def build_lidar_corridor(
                 width = float(np.median(
                     left_lat[valid] - right_lat[valid]))
                 width = min(8.0, max(2.0, width))
+                # A LiDAR corridor is the drivable free space between
+                # walls / guardrails, not necessarily the current lane:
+                # on the highway the guardrails are 10-17 m apart (two or
+                # three lanes between them), so their midpoint is NOT the
+                # lane the car belongs to - following it dragged the car
+                # 8+ m sideways (run 33).  Only a corridor that is about
+                # one lane wide can act as the lane centre itself; a wider
+                # corridor is dropped and the single-edge / nav fallback
+                # keeps the car in its lane.
+                if width > LANE_FUSION_WIDTH_MAX_M:
+                    if debug is not None:
+                        debug["too_wide"] = round(float(width), 2)
+                    return None
                 valid_frac = n_ok / len(stations)
                 direct_frac = n_direct / n_ok if n_ok else 0.0
                 conf = 0.30 + 0.20 * valid_frac \

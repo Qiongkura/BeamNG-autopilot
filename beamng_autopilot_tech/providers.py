@@ -39,7 +39,8 @@ LIDAR_POS = (0.0, 0.0, 1.7)
 LIDAR_VERTICAL_RES = 16
 LIDAR_MAX_DIST = 120.0
 LIDAR_DENSITY = 12
-LIDAR_POLL_RETRIES = 3
+LIDAR_POLL_RETRIES = 3  # (kept for reference; scan() now polls once per
+                        # worker cycle and retries on the next cycle)
 LIDAR_MAX_POINTS = 6000
 LIDAR_SELF_MARGIN = 0.3
 LIDAR_OBSTACLE_RADIUS = 45.0
@@ -208,19 +209,22 @@ class TechRangeProvider(RangeProvider):
             return None
 
     def scan(self, pos, ego_vid=None, radius: float = 55.0) -> RangeSample:
+        # Only the sensor reads (LiDAR poll, Lua fan) need the connector
+        # lock.  The CPU-side clustering / fusion below can take 200+ ms
+        # on a dense 360 cloud and must NOT hold io_lock: the control loop
+        # steps/commands through that same lock, so holding it across the
+        # clustering would cap the control cadence at ~1 Hz and the car
+        # would weave on bends (run 42-45).  Read under the lock, compute
+        # outside it.
+        obstacles: list[Obstacle] = []
+        pts: list[tuple[float, float]] = []
+        ox, oy = float(pos[0]), float(pos[1])
+        cloud = np.empty((0, 3), dtype=float)
+        heading: float | None = None
         with self.conn.io_lock:
-            obstacles: list[Obstacle] = []
-            pts: list[tuple[float, float]] = []
-            ox, oy = float(pos[0]), float(pos[1])
-            cloud = np.empty((0, 3), dtype=float)
-            heading: float | None = None
             try:
-                for _ in range(LIDAR_POLL_RETRIES):
-                    data = self.lidar.poll()
-                    cloud = np.asarray(data.get("pointCloud"), dtype=float)
-                    if cloud.ndim == 2 and len(cloud) > 0:
-                        break
-                    time.sleep(0.15)
+                data = self.lidar.poll()
+                cloud = np.asarray(data.get("pointCloud"), dtype=float)
                 if cloud.ndim != 2 or cloud.shape[1] < 3:
                     cloud = np.empty((0, 3), dtype=float)
                 cloud = cloud[np.isfinite(cloud).all(axis=1)]
@@ -261,31 +265,31 @@ class TechRangeProvider(RangeProvider):
             except Exception as exc:
                 last_error["raycast"] = str(exc)
                 print(f"[tech] raycast scan failed: {exc}")
-            # Tech-native LiDAR obstacles: cluster the dense 360 cloud
-            # (with local ground removal) and fuse with the Lua sources.
-            # Lua boxes come first so a vehicle's registry velocity
-            # survives the merge; lidar-only clusters carry a tracker
-            # velocity estimate instead.
-            if len(cloud) >= 4:
-                try:
-                    boxes = lidar_obstacles(
-                        cloud, pos,
-                        radius=min(radius, LIDAR_OBSTACLE_RADIUS),
-                        self_rect=(self._ego_half_len + LIDAR_SELF_MARGIN,
-                                   self._ego_half_w + LIDAR_SELF_MARGIN,
-                                   float(heading if heading is not None
-                                         else 0.0)))
-                    self._lidar_tracker.update(boxes, time.time())
-                    obstacles = merge_obstacles(obstacles + boxes)
-                except Exception as exc:
-                    last_error["raycast"] = str(exc)
-                    print(f"[tech] lidar obstacle fusion failed: {exc}")
-            elif not obstacles and pts:
-                # Last-resort fallback when both the Lua scan and the fused
-                # lidar channel are unavailable: cluster the corridor hits.
-                for sector in _split_raycast_sectors(pts, (ox, oy)):
-                    obstacles.extend(_cluster_points(sector, split_walls=True))
-            return RangeSample(obstacles=obstacles, ray_hits=pts)
+        # Tech-native LiDAR obstacles: cluster the dense 360 cloud
+        # (with local ground removal) and fuse with the Lua sources.
+        # Lua boxes come first so a vehicle's registry velocity
+        # survives the merge; lidar-only clusters carry a tracker
+        # velocity estimate instead.
+        if len(cloud) >= 4:
+            try:
+                boxes = lidar_obstacles(
+                    cloud, pos,
+                    radius=min(radius, LIDAR_OBSTACLE_RADIUS),
+                    self_rect=(self._ego_half_len + LIDAR_SELF_MARGIN,
+                               self._ego_half_w + LIDAR_SELF_MARGIN,
+                               float(heading if heading is not None
+                                     else 0.0)))
+                self._lidar_tracker.update(boxes, time.time())
+                obstacles = merge_obstacles(obstacles + boxes)
+            except Exception as exc:
+                last_error["raycast"] = str(exc)
+                print(f"[tech] lidar obstacle fusion failed: {exc}")
+        elif not obstacles and pts:
+            # Last-resort fallback when both the Lua scan and the fused
+            # lidar channel are unavailable: cluster the corridor hits.
+            for sector in _split_raycast_sectors(pts, (ox, oy)):
+                obstacles.extend(_cluster_points(sector, split_walls=True))
+        return RangeSample(obstacles=obstacles, ray_hits=pts)
 
     def close(self) -> None:
         with self.conn.io_lock:

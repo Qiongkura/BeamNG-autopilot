@@ -16,8 +16,13 @@ class PurePursuit:
         self.search_window = search_window
 
     def adaptive_lookahead(self, speed: float) -> float:
-        """速度越快，预瞄越远（限制在安全区间）。"""
-        return float(np.clip(self.lookahead + 0.35 * speed, 4.0, 14.0))
+        """速度越快，预瞄越远（限制在安全区间）。
+
+        高速下预瞄必须足够远，否则 S 弯/缓弯里转向指令每帧剧烈变化，
+        车头来回甩（run 38: hdg_dev 到 41°）。10 m/s 时 11.5 m 预瞄让
+        转向随路线平缓变化；低速时保持短预瞄保证弯道响应。
+        """
+        return float(np.clip(self.lookahead + 0.55 * speed, 4.0, 16.0))
 
     def find_target(self, pos, path: np.ndarray, nearest_idx: int = 0):
         """在闭环轨迹上找预瞄点。返回 (目标点, 预瞄索引, 最近点索引)。"""

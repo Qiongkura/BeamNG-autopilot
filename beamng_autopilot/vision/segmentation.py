@@ -27,6 +27,10 @@ from beamng_autopilot import config
 N_CLASSES = 3
 CLASS_NAMES = ["background", "asphalt", "line"]
 _INFER_W, _INFER_H = 536, 403  # 训练分辨率
+# 标线连通域最小面积：小于它的块视为路面纹理/阴影噪点（真实标线
+# 在 536x403 上至少 ~150 px；远距离细线也能到几十 px，但形态细长，
+# 由 max(cw, ch) >= 24 分支保留）。
+_LINE_MIN_AREA_PX = 150
 
 
 class SegUNet(nn.Module):
@@ -123,23 +127,78 @@ class Segmenter:
         # 物理约束：标线必须位于路面上。石头/护墙/草地边缘与标线视觉
         # 特征相似，模型常把它们误检为线；这些物体不在沥青路面上，用
         # 膨胀后的路面掩码约束即可滤掉（标线紧贴路面，边缘容忍 ~3px）。
+        #
+        # When the model over-predicts the road (bridge shadows, walls and
+        # sky merged into "asphalt"), a dilated road mask covers the whole
+        # frame and lets every false line through.  Lines are then filtered
+        # by their own shape instead: a real painted line is a long thin
+        # stroke; texture / shadow specks are small blobs.  A component is
+        # kept when it is elongated (major axis much longer than minor) or
+        # big enough to be a real marking; scattered specks are dropped.
         road_d = cv2.dilate(road.astype(np.uint8),
                             cv2.getStructuringElement(cv2.MORPH_RECT,
                                                       (7, 7))).astype(bool)
         line &= road_d
+        if line.any():
+            n, labels, stats, _ = cv2.connectedComponentsWithStats(
+                line.astype(np.uint8), 8)
+            keep = np.zeros_like(line)
+            for i in range(1, n):
+                x, y, cw, ch, area = stats[i]
+                # 细长判据：连通域包围盒的长边 vs 短边。真实标线（含
+                # 虚线片段）长宽比通常 >= 3；噪点块接近方形。
+                long_side = max(cw, ch)
+                short_side = min(cw, ch)
+                if area >= _LINE_MIN_AREA_PX or (
+                        long_side >= 20 and short_side >= 2
+                        and long_side >= 2.5 * short_side):
+                    keep[labels == i] = True
+            line = keep
         return road, line
 
     def detect_lines(self, frame_rgb, cam_model, pos, heading,
                      ground_z: float | None = None) -> list:
-        """Line mask -> LaneMarking list (reuses the classic pipeline)."""
-        from beamng_autopilot.vision.lanes import _mask_to_markings
+        """Line mask -> LaneMarking list (reuses the classic pipeline).
+
+        The learned line mask is fused with a classic-CV bright-stroke
+        mask: the UNet may miss the markings on an unseen scene (bridge /
+        coastal roads), while painted lines are physically brighter than
+        the asphalt, so a brightness threshold reliably recovers them.
+        Both masks share the same ground-plane back-projection pipeline.
+        """
+        from beamng_autopilot.vision.lanes import (
+            _mask_to_markings, WHITE_SAT_MAX)
 
         _, line = self.predict(frame_rgb)
-        if not line.any():
-            return []
-        return _mask_to_markings(
-            line.astype(np.uint8) * 255, "white", cam_model, pos, heading,
-            ground_z=ground_z)
+        # Classic-CV bright-stroke recovery, contrast-based: on a light
+        # concrete road the absolute brightness of the paint and the
+        # pavement are both high, so a global threshold fires on the whole
+        # frame.  The paint is still BRIGHTER than the pavement around it,
+        # so compare each pixel against its local neighbourhood mean.
+        gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+        hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+        sat = hsv[:, :, 1]
+        hue = hsv[:, :, 0]
+        val = hsv[:, :, 2]
+        local = cv2.blur(gray, (9, 9))
+        bright = gray > local + 12
+        # White paint: brighter than the neighbourhood and low saturation.
+        cv_white = bright & (sat <= WHITE_SAT_MAX)
+        # Yellow paint (left edge / centre line): yellowish hue, not too
+        # saturated (sun-bleached paint reads as low-sat yellow).
+        cv_yellow = ((hue >= 12) & (hue <= 45) & (sat >= 30)
+                     & (val >= 100) & bright)
+        out: list = []
+        white_mask = (line | cv_white).astype(np.uint8) * 255
+        if white_mask.any():
+            out.extend(_mask_to_markings(
+                white_mask, "white", cam_model, pos, heading,
+                ground_z=ground_z))
+        if cv_yellow.any():
+            out.extend(_mask_to_markings(
+                cv_yellow.astype(np.uint8) * 255, "yellow",
+                cam_model, pos, heading, ground_z=ground_z))
+        return out
 
     def offroad_mask(self, frame_rgb: np.ndarray) -> np.ndarray:
         """True where the frame is NOT asphalt (feeds edge extraction)."""

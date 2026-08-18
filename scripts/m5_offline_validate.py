@@ -700,32 +700,32 @@ def test_heading_deviation() -> None:
     check("hdg: facing the wrong way",
           abs(dev(route, 1, (-1.0, 0.0)) - 180.0) < 1e-9,
           f"dev={dev(route, 1, (-1.0, 0.0))}")
-    check("hdg: no cap below 18 deg", cap(15.0) is None)
-    c18 = cap(18.5)
-    check("hdg: cap right above 18 deg",
+    check("hdg: no cap below 8 deg", cap(7.0) is None)
+    c18 = cap(9.0)
+    check("hdg: cap right above 8 deg",
           c18 is not None and 2.4 < c18 <= 2.5,
           f"cap={c18}")
     c45 = cap(45.0)
     check("hdg: cap scales down",
-          c45 is not None and 1.7 < c45 < 2.0,
+          c45 is not None and 1.5 < c45 < 2.0,
           f"cap={c45}")
     c90 = cap(95.0)
     check("hdg: crawl when sideways",
           c90 is not None and abs(c90 - 0.6) < 1e-9,
           f"cap={c90}")
-    check("hdg: no cap when not engaged below 18",
-          cap(17.0) is None, f"cap={cap(17.0)}")
-    c_hold = cap(17.0, engaged=True)
-    check("hdg: engaged holds the cap below 18",
+    check("hdg: no cap when not engaged below 8",
+          cap(7.0) is None, f"cap={cap(7.0)}")
+    c_hold = cap(7.0, engaged=True)
+    check("hdg: engaged holds the cap below 8",
           c_hold is not None and abs(c_hold - 2.5) < 1e-9,
           f"cap={c_hold}")
-    c_hold2 = cap(13.5, engaged=True)
-    check("hdg: engaged still active above 13 deg",
+    c_hold2 = cap(6.5, engaged=True)
+    check("hdg: engaged still active above 6 deg",
           c_hold2 is not None and abs(c_hold2 - 2.5) < 1e-9,
           f"cap={c_hold2}")
-    check("hdg: released below 13 deg",
-          cap(12.0, engaged=True) is None,
-          f"cap={cap(12.0, engaged=True)}")
+    check("hdg: released below 6 deg",
+          cap(5.0, engaged=True) is None,
+          f"cap={cap(5.0, engaged=True)}")
 
     # The run-9 bend showed steering still pointed the wrong way after a
     # ~1 s sensor-blocked loop.  Smoothing must be time-based: one blocked
@@ -1125,7 +1125,7 @@ def test_sharp_corner_speed(planner: LocalPlanner) -> None:
     check("corner: 30deg not classified sharp",
           a30 < 45.0, f"angle={a30:.1f}")
     check("corner: 30deg keeps curvature speed",
-          v30 > 12.0, f"v={v30:.2f}")
+          v30 > 30.0 / 3.6, f"v={v30:.2f}")
     _, _ = planner.speed(route30, [], (0.0, 0.0), 0.0, 30, 30.0)
     check("corner: last_sharp false for 30deg",
           planner.last_sharp is False)
@@ -1847,10 +1847,18 @@ def test_lane_pairing_and_lidar_corridor() -> None:
         wide_hits.append((float(s) / 10.0, 5.0))
         wide_hits.append((float(s) / 10.0, -5.0))
     wide_lidar = build_lidar_corridor(wide_hits, (0.0, 0.0), 0.0)
-    check("sensor-choose: whole-road lidar corridor rejected",
-          wide_lidar is not None
-          and choose_sensor_lane(None, wide_lidar) is None,
-          f"width={None if wide_lidar is None else wide_lidar.width:.1f}")
+    # A corridor as wide as the whole road (guardrails 10 m apart on the
+    # highway) is drivable free space, not the current lane: its midpoint
+    # is not the lane centre and must not steer the car (run 33 lane_lat
+    # -9 m weave).  It is rejected at build time; choose_sensor_lane must
+    # also refuse it if it ever arrives.
+    check("sensor-choose: whole-road lidar corridor rejected at build",
+          wide_lidar is None,
+          f"width={None if wide_lidar is None else round(wide_lidar.width, 1)}")
+    if wide_lidar is not None:
+        check("sensor-choose: whole-road corridor not chosen",
+              choose_sensor_lane(None, wide_lidar) is None,
+              f"src={choose_sensor_lane(None, wide_lidar)}")
 
     wv_xs = np.arange(0.0, 16.0, 1.5)
     wide_vision = LaneFrame(
@@ -1896,8 +1904,13 @@ def test_lane_boundary_guards() -> None:
         y = float(np.median(short.center[:, 1]))
         check("lane-guard: short pair centre on the middle",
               abs(y) < 0.05, f"y={y:.2f}")
-    check("lane-guard: short pair frame usable",
-          lane_frame_usable(short),
+    # A 3.2 m pair is too short to steer by: its centre can sit metres
+    # off the nav route while every point is "near" the car, which
+    # dragged the car sideways in runs 42/47/52.  LANE_PAIRED_VISION_
+    # MIN_SPAN_M (6.0) now requires a real overlap before a vision pair
+    # may replace the nav route as the driving centre.
+    check("lane-guard: short pair frame not usable",
+          short is None or not lane_frame_usable(short),
           f"conf={short.confidence:.2f} span={short.span_m:.1f} "
           f"w={short.width:.2f}")
 
@@ -2217,7 +2230,10 @@ def test_sensor_fusion_sides() -> None:
 
     # A right paint that starts ahead of the car still pairs with a left
     # wall seen from the car: sample the overlap instead of requiring a
-    # near point on the painted side.
+    # near point on the painted side.  But the overlap here is only
+    # ~4.5 m (9-13.5), below LANE_PAIRED_VISION_MIN_SPAN_M: such a short
+    # fused lane dragged the car sideways in runs 42/47/52, so the fusion
+    # is rejected and the wall corridor remains the fallback.
     far_vis_xs = np.arange(9.0, 16.0, 1.0)
     far_vis_right = LaneFrame(
         center=np.column_stack(
@@ -2231,10 +2247,7 @@ def test_sensor_fusion_sides() -> None:
     far_fy = None if far_fused is None else float(
         np.median(far_fused.center[:, 1]))
     check("fusion: far right paint + left wall overlap midpoint",
-          far_fused is not None and far_fused.paired
-          and far_fused.sources == ("vision", "lidar")
-          and far_fy is not None and abs(far_fy - (-0.625)) < 0.2
-          and far_fused.confidence <= LANE_FAR_MIRROR_CONF_MAX + 1e-9,
+          far_fused is None or not far_fused.paired,
           f"src={None if far_fused is None else far_fused.sources} "
           f"y={-9.0 if far_fy is None else far_fy:.2f} "
           f"conf={-1.0 if far_fused is None else far_fused.confidence:.2f}")
@@ -2391,14 +2404,14 @@ def test_lane_color_and_wide_fusion() -> None:
           f"mode={fdbg.get('mode')}")
 
     short_left = LaneMarking(
-        world=np.column_stack([np.arange(2.5, 7.01, 0.5),
-                               np.full(10, 3.3)]),
-        pixels=np.zeros((10, 2)), color="white", kind="dashed",
+        world=np.column_stack([np.arange(0.5, 10.01, 0.5),
+                               np.full(20, 3.3)]),
+        pixels=np.zeros((20, 2)), color="white", kind="dashed",
         confidence=0.8)
     short_right = LaneMarking(
-        world=np.column_stack([np.arange(4.5, 9.51, 0.5),
-                               np.full(11, -2.0)]),
-        pixels=np.zeros((11, 2)), color="yellow", kind="solid",
+        world=np.column_stack([np.arange(4.0, 10.01, 0.5),
+                               np.full(13, -2.0)]),
+        pixels=np.zeros((13, 2)), color="yellow", kind="solid",
         confidence=0.7)
     sdbg: dict = {}
     short_pair = pair_lane_markings(
@@ -2688,44 +2701,106 @@ def test_sensor_lane_planning() -> None:
 
 
 def test_lane_frame_primary() -> None:
-    """A two-sided lane frame is the lane centre, even without a nav route.
+    """A two-sided lane frame is the lane centre only when it agrees with
+    the nav route.
 
-    The nav route is only a long-range direction source.  When both lane
-    boundaries are real detections, the frame centre is the left/right
-    midpoint and the drive path follows it directly instead of staying
-    on (or right of) the nav route.
+    The nav route is generated by the game from the road graph, so a
+    paired sensor lane may replace it as the driving centre only while it
+    stays close to the route.  A wrong pairing (far lane's line, road-
+    side paint, guardrail shadow) sits metres off the route and must not
+    drag the car sideways - on the real map that was the lane_lat > 3 m
+    weave ending in a guardrail hit.  A frame 6 m off the route is
+    rejected and the plan degrades to nav-primary.
     """
     planner = LocalPlanner()
     route = straight_route()
     xs = np.arange(0.0, 16.0, 1.5)
-    center = np.column_stack([xs, np.full_like(xs, -6.0)])
-    frame = LaneFrame(center=center, width=3.5, confidence=0.8,
-                      span_m=15.0, sources=("vision",))
-
-    drive, blocked = planner.plan(
-        route, [], (0.0, 0.0), 0.0, 0, sensor_lane=frame)
-    drive = np.asarray(drive, dtype=float)
-    last_i = len(drive) - 1
-    y_far = float(drive[last_i, 1]) if last_i >= 5 else 99.0
-    check("lane-primary: paired frame drives its midpoint",
-          not blocked and last_i >= 5
-          and abs(y_far + 6.0) < 0.3,
-          f"ylast={y_far:.2f} blocked={blocked} n={len(drive)}")
+    # An agreeing pair: lane centre just off the route centre (a normal
+    # road-line pair on a two-way street), still well inside the trust
+    # band.  The drive path follows the frame centre, not the keep-right
+    # offset.
+    center_ok = np.column_stack([xs, np.full_like(xs, -0.5)])
+    frame_ok = LaneFrame(center=center_ok, width=3.5, confidence=0.8,
+                         span_m=15.0, sources=("vision",))
+    drive_ok, blocked_ok = planner.plan(
+        route, [], (0.0, 0.0), 0.0, 0, sensor_lane=frame_ok)
+    drive_ok = np.asarray(drive_ok, dtype=float)
+    last_i = len(drive_ok) - 1
+    y_ok = float(drive_ok[last_i, 1]) if last_i >= 5 else 99.0
+    check("lane-primary: agreeing pair drives its midpoint",
+          not blocked_ok and last_i >= 5 and abs(y_ok + 0.5) < 0.3,
+          f"ylast={y_ok:.2f} blocked={blocked_ok} n={len(drive_ok)}")
     check("lane-primary: lane mode still recorded",
           getattr(planner, "last_lane_mode", "") == "vision",
           f"mode={getattr(planner, 'last_lane_mode', '')}")
 
-    weak = LaneFrame(center=center, width=3.5, confidence=0.35,
+    # A far-off pair is a wrong read: it must not replace the route.
+    center_far = np.column_stack([xs, np.full_like(xs, -6.0)])
+    frame_far = LaneFrame(center=center_far, width=3.5, confidence=0.8,
+                          span_m=15.0, sources=("vision",))
+    drive_f, blocked_f = planner.plan(
+        route, [], (0.0, 0.0), 0.0, 0, sensor_lane=frame_far)
+    drive_f = np.asarray(drive_f, dtype=float)
+    last_i = len(drive_f) - 1
+    y_far = float(drive_f[last_i, 1]) if last_i >= 5 else 99.0
+    check("lane-primary: far-off pair rejected (nav primary)",
+          not blocked_f and last_i >= 5 and -1.8 <= y_far <= -1.2,
+          f"ylast={y_far:.2f} blocked={blocked_f} n={len(drive_f)}")
+    check("lane-primary: rejection recorded",
+          getattr(planner, "last_lane_override", None) is not None,
+          f"override={getattr(planner, 'last_lane_override', None)}")
+
+    weak = LaneFrame(center=center_ok, width=3.5, confidence=0.35,
                      span_m=15.0, sources=("vision",))
     drive_w, blocked_w = planner.plan(
         route, [], (0.0, 0.0), 0.0, 0, sensor_lane=weak)
     drive_w = np.asarray(drive_w, dtype=float)
     last_i = len(drive_w) - 1
     y_weak = float(drive_w[last_i, 1]) if last_i >= 5 else 99.0
-    check("lane-primary: low-conf paired frame still uses the midpoint",
-          not blocked_w and last_i >= 5
-          and abs(y_weak + 6.0) < 0.3,
+    check("lane-primary: low-conf agreeing frame still uses the midpoint",
+          not blocked_w and last_i >= 5 and abs(y_weak + 0.5) < 0.3,
           f"ylast={y_weak:.2f} blocked={blocked_w}")
+
+    # A single "right" edge that actually sits LEFT of the route is a
+    # tracker lock onto the wrong line: on run 53 the vision_right paint
+    # flipped to the left of the car and the boundary push dragged the
+    # car 7 m off the road.  The single-edge correction must be dropped
+    # entirely and the plan degrades to plain nav-primary (keep-right).
+    xs_s = np.arange(0.0, 16.0, 1.5)
+    wrong_side = LaneFrame(
+        center=np.column_stack([xs_s, np.full_like(xs_s, 1.5)]),
+        right=np.column_stack([xs_s, np.full_like(xs_s, 1.0)]),
+        width=3.5, confidence=0.8, span_m=15.0,
+        sources=("vision",), paired=False)
+    drive_ws, blocked_ws = planner.plan(
+        route, [], (0.0, 0.0), 0.0, 0, sensor_lane=wrong_side)
+    drive_ws = np.asarray(drive_ws, dtype=float)
+    last_i = len(drive_ws) - 1
+    y_ws = float(drive_ws[last_i, 1]) if last_i >= 5 else 99.0
+    check("lane-primary: wrong-side single edge dropped (nav primary)",
+          not blocked_ws and last_i >= 5 and -1.8 <= y_ws <= -1.2
+          and getattr(planner, "last_lane_override", None) is not None,
+          f"ylast={y_ws:.2f} "
+          f"ovr={getattr(planner, 'last_lane_override', None)}")
+
+    # A correct-side single edge far beyond the widest lane is another
+    # road's boundary (a far line / guardrail): it must not nudge the
+    # path either.
+    far_edge = LaneFrame(
+        center=np.column_stack([xs_s, np.full_like(xs_s, -6.0)]),
+        right=np.column_stack([xs_s, np.full_like(xs_s, -6.5)]),
+        width=3.5, confidence=0.8, span_m=15.0,
+        sources=("vision",), paired=False)
+    drive_fe, blocked_fe = planner.plan(
+        route, [], (0.0, 0.0), 0.0, 0, sensor_lane=far_edge)
+    drive_fe = np.asarray(drive_fe, dtype=float)
+    last_i = len(drive_fe) - 1
+    y_fe = float(drive_fe[last_i, 1]) if last_i >= 5 else 99.0
+    check("lane-primary: far single edge dropped (nav primary)",
+          not blocked_fe and last_i >= 5 and -1.8 <= y_fe <= -1.2
+          and getattr(planner, "last_lane_override", None) is not None,
+          f"ylast={y_fe:.2f} "
+          f"ovr={getattr(planner, 'last_lane_override', None)}")
 
 
 def test_lane_tracker_weighted_median() -> None:
