@@ -682,8 +682,9 @@ def test_heading_deviation() -> None:
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
-        "m5_autopilot",
-        str(Path(__file__).resolve().parent / "m5_autopilot.py"))
+        "autopilot",
+        str(Path(__file__).resolve().parent.parent
+            / "beamng_autopilot" / "autopilot.py"))
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
@@ -747,8 +748,9 @@ def test_lane_reuse_staleness() -> None:
     import importlib.util
 
     spec = importlib.util.spec_from_file_location(
-        "m5_autopilot",
-        str(Path(__file__).resolve().parent / "m5_autopilot.py"))
+        "autopilot",
+        str(Path(__file__).resolve().parent.parent
+            / "beamng_autopilot" / "autopilot.py"))
     assert spec is not None and spec.loader is not None
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
