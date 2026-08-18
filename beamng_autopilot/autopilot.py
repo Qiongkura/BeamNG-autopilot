@@ -464,9 +464,16 @@ class AutopilotSession:
 
     def toast(self, msg: str) -> None:
         print(f"[m5] {msg}")
+        # Fire-and-forget: display_gui_message() blocks on the Lua bridge ack
+        # which costs up to seconds and stalls the control loop.  Queue the
+        # message without waiting for a response instead.
         try:
-            with self.conn.io_lock:
-                self.conn.bng.display_gui_message(msg)
+            safe = (str(msg).replace("\\", "\\\\")
+                    .replace("'", "\\'"))
+            self.conn.vehicle.queue_lua_command(
+                f"if ui and ui.showScreenMessage then "
+                f"ui.showScreenMessage('{safe}') end",
+                response=False)
         except Exception:
             pass
 
