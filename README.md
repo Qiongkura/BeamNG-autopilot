@@ -255,6 +255,55 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
 | **`m5_autopilot.py` 主循环 2516 行**：热键处理、遥测、控制、感知全部内联在一个脚本里 | 脚本不可测试、不可复用；换个入口就要复制大段代码 | 高 |
 | **53 处裸 `except Exception`**：散布在 connector、perception、control 等模块中，多数只做 `print` 或静默吞掉 | 真实错误被掩盖，调试时难以定位根因；网络超时和 Lua 错误被同等对待 | 中 |
 
+#### 重构方案
+
+**`planner.py` → `planner/` 包**（当前 2790 行，目标每个子模块 ≤400 行）：
+
+```
+beamng_autopilot/planner/
+├── __init__.py      # re-export LocalPlanner，保持外部 import 不变
+├── constants.py     # 所有 SOLID_*/GRID_*/LANE_* 魔数集中管理
+├── path.py          # A* 网格、路径弹性带变形、路径裁剪
+├── speed.py         # 运动学限速、障碍物速度限制、creep_speed
+├── obstacles.py     # 膨胀框、footprint、blocker 检测、LiDAR 聚类过滤
+├── solid.py         # 实线检测、噪声过滤、crossing 判定
+└── bypass.py        # 横向绕行（lateral_bypass）、道路边缘墙
+```
+
+拆分原则：
+- `constants.py` 先行：把 60+ 个魔数从各处收集到一个文件，其他模块 `from .constants import *`
+- 按职责拆分，不改算法：每个子模块是从原文件剪切出来的，不改动逻辑
+- `__init__.py` 做 `from .path import *` 等聚合，外部 `from beamng_autopilot.planner import LocalPlanner` 等语句无需修改
+- 每拆一个子模块跑一次 `pytest tests/` + `m5_offline_validate.py`，确保行为不变
+
+**`lane.py` → `lane/` 包**（当前 1500 行）：
+
+```
+beamng_autopilot/lane/
+├── __init__.py      # re-export pair_lane_markings, LaneTracker 等
+├── constants.py     # LANE_*/MARKING_*/LIDAR_* 常量
+├── pairing.py       # 标线配对（pair_lane_markings）：左右边界 → 车道中心
+├── fusion.py        # 视觉 + LiDAR 融合（choose_sensor_lane）
+├── tracking.py      # LaneTracker：帧间跟踪、老化、置信度衰减
+└── lidar.py         # build_lidar_corridor：LiDAR 射线 → 自由空间走廊
+```
+
+**`m5_autopilot.py` → 薄脚本 + 库**（当前 2516 行）：
+
+```
+beamng_autopilot/
+├── autopilot.py     # AutopilotSession 类：主循环、状态机、遥测（从脚本提取）
+├── hud.py           # 已有，保持不变
+└── hotkeys.py       # 已有，保持不变
+
+scripts/
+└── m5_autopilot.py  # 薄入口：解析参数、创建 AutopilotSession、run()
+```
+
+脚本只保留 ~100 行的参数解析和组装逻辑，核心循环移入 `beamng_autopilot/autopilot.py` 作为可测试的类。
+
+**执行节奏**：建议按 planner → lane → autopilot 的顺序分三个 PR 逐步拆分，每个 PR 独立可回滚。
+
 ### 感知与视觉
 
 | 问题 | 影响 | 优先级 |
