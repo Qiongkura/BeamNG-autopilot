@@ -1409,6 +1409,7 @@ class AutopilotSession:
         Returns the display_route."""
         conn = self.conn
         args = self.args
+        display_route = self.route
         _ft0 = time.perf_counter()
         _st0 = _ft0
         _stages: dict[str, float] = {}
