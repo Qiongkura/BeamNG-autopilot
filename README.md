@@ -244,25 +244,56 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
 - GitHub：https://github.com/Qiongkura
 - 微信：Qiongkura
 
-## 已知限制
+## 已知问题与限制
 
-- 低帧率（<10fps）下端到端模仿学习模型训练效果有限，需要高频采集数据；
-- 传统 CV 颜色阈值在 BeamNG.tech 真渲染帧上几乎失效，必须使用学习式分割；
-- 纯视觉无先验的路径跟踪在复杂弯道中不可靠，易锁定阴影或深色特征；
-- 端到端模仿学习（M3）仍在进行中，当前 PoC 模型退化为常数预测；
-- 决策层（M4）DQN 训练尚未完成，离线验证基于规则基线；
-- 视觉检测依赖游戏窗口实时画面，窗口最小化或遮挡时会降级为无视觉模式。
+### 架构层面
 
-- `00:06 68cbfc0`：环境自检 `m5_env_check.py` 与抓帧性能探针 `bench_grab_screen.py`，README 补充用法。
-- `00:41 cf973d3`：`CameraModel.camera_pose` 支持车辆 6DOF 姿态（pitch/roll 参与反投影，BeamNG 四元数约定用真实 state 验证）；Tech 相机改为标定外参 + 姿态驱动，移除逐帧 GE 查询；`m5_lane_state_view.py` 抓帧失败降级。
-- `00:58 2481774`：`m5_lane_truth_probe.py` 对比经典 CV 与 BeamNG.tech 像素真值；italy AI 80 帧实测路面 IoU 0.734、标线 recall 0.015、边界误差 0.8-1.0m，量化确认传统 CV 在真渲染帧上不可用。
-- `01:01 起（当前未提交）`：学习式分割路线。新增 `vision/segmentation.py`（轻量 UNet，约 1.3M 参数，background/asphalt/line 三类）、`m5_collect_seg.py`（Tech colour + annotation 半分辨率采集）、`m5_train_seg.py`（时间序 80/20、中位频率加权、mIoU 监控）；`lanes.py` 抽取共享 `_mask_to_markings` 管线，`lane_overlay.py` 的 `estimate_pavement_edges` 支持学习式 off-road mask；`m5_lane_truth_probe.py --model` 与 `m5_autopilot.py --seg-model` 接入，无模型时回退经典 CV。
-- `3925723`：动态交通 ACC 跟车/超车。`traffic.py` 新增 `find_lead_vehicle` / `follow_speed` / `should_overtake` / `vehicle_along_speed`（沿路线投影找前车、时间间隙跟车、慢前车触发超车请求）；场景车辆扫描带速度/航向/ID（Lua `getVelocity`），`merge_obstacles` 合并时保留动态状态；`planner.speed` 运动学限速改为 `sqrt(v_lead^2 + 2ad)`，移动前车不再当静态墙刹停、对向来车仍按静态处理；`m5_autopilot.py` 在 blocked / 可绕行两分支接入 ACC 跟车（moving lead 跟车、静态障碍仍停车），遥测新增 `lead_d` / `lead_v` / `follow` / `overtake` 字段。
-- `3aee1c0`：Tech-first 开发前提 + pytest 回归体系。`AGENTS.md` / `README` 明确"优先 BeamNG.tech 研发、Steam 只保底不坏、后期统一下放"；新增 `pytest.ini`、`requirements-dev.txt`、`tests/`（traffic ACC / planner 速度 / perception merge 共 30 用例），深度回归 `m5_offline_validate.py` 保持双门禁。
-- `9583d27`：Tech LiDAR 障碍物融合。`perception.py` 新增局部地面估计（72 扇区 × 5m 环 5 分位）、1D int64 key 体素降采样（6 倍提速）、`lidar_obstacles` 聚类管线、`LidarClusterTracker` 质心速度追踪（min_speed=2.0 滤抖动幻影）；`merge_obstacles` 纳入 lidar 紧凑合并 + 墙-墙合并；`TechRangeProvider` 把 360 点云作为一等障碍通道与 Lua 场景/车辆/射线融合；实机验证：聚类 117-139ms、幻影"移动车辆"清零；新增 `m5_lidar_probe.py` 诊断探针与 `tests/test_lidar_fusion.py`。
-- `7b8a44b`：超车意图状态机。`traffic.OvertakeStateMachine`（none→requested→active 滞回，慢前车持续 1.5s + 确认 0.4s；对向来车 / 左侧实线取消；前车提速或消失回落恢复跟车）+ `oncoming_vehicle_ahead` / `solid_marking_left` 门控；`m5_autopilot.py` 接入（遥测新增 `ovk` 状态）；`docs/planner_baseline_20260814.md` 标记横向基准改造完成（`map_offset=None`、固定 `RIGHT_OFFSET_M=1.5`、`preferred_offset_m` 无运行时消费者）。
-- `d3ca386`：Tech 数据工厂。`beamng_autopilot_tech/annotations.py` 共享 annotation 助手（`to_label` / `road_share`，路面色适配 italy `(128,128,128)` 与 smallgrid `(128,196,255)`）；`TechCameraProvider` 支持 annotation 渲染（`grab_annotated`），`build_camera_provider` 透传；`m3_collect_bc.py` 新增 `--tech-annot --min-road-share` 质量门（离路/黑帧在源头丢弃）+ 端口按 `--runtime` 解析（修掉默认连 Steam 口的问题）；`m5_collect_seg.py` 改用共享助手。
-- M3 BC 闭环（Tech 实跑）：smallgrid 地图 2 圈 700 帧 @7fps，`--tech-annot` 质量门 0 丢弃；转向分布 std=0.18（26% 帧 `|steer|>0.15`，不再是近零标签）；`m3_train_bc.py` 训练 60 epoch → **val MAE=0.012、val R²=+0.903**（对比 08-11 PoC：MAE=0.048、R²≈0 常数预测），模型 `logs/m3_bc/bc_tech_smallgrid.pt`。Tech 高频采集 + annotation 质量门解决了 M3 数据没有训练价值的问题。
+| 问题 | 影响 | 优先级 |
+| --- | --- | --- |
+| **`planner.py` 单文件 2790 行**：路径规划、速度规划、A* 网格、实线检测、障碍物限速全部堆在一个文件里，包含 20+ 个函数和数十个互相关联的魔数常量 | 可维护性极差，改一个逻辑容易牵连其他行为；新贡献者几乎无法理解整体流程 | 高 |
+| **`lane.py` 1500 行、`perception.py` 964 行**：传感器车道帧构建和障碍物融合同样过度膨胀 | 与 planner 同款维护困难 | 高 |
+| **`m5_autopilot.py` 主循环 2516 行**：热键处理、遥测、控制、感知全部内联在一个脚本里 | 脚本不可测试、不可复用；换个入口就要复制大段代码 | 高 |
+| **53 处裸 `except Exception`**：散布在 connector、perception、control 等模块中，多数只做 `print` 或静默吞掉 | 真实错误被掩盖，调试时难以定位根因；网络超时和 Lua 错误被同等对待 | 中 |
+
+### 感知与视觉
+
+| 问题 | 影响 | 优先级 |
+| --- | --- | --- |
+| **传统 CV 阈值在 Tech 真渲染帧上几乎失效**：标线 recall 仅 1.5%，边界误差 0.8-1.0m | 没有学习式分割模型时，Steam 回退路径的车道检测基本不可用 | 已缓解（有 UNet 回退） |
+| **学习式分割模型泛化能力未验证**：当前 UNet 仅在 italy/smallgrid 两个地图上训练 | 换地图可能需要重新采集训练数据 | 中 |
+| **视觉检测依赖游戏窗口实时画面**：窗口最小化或被遮挡时降级为无视觉模式 | 多任务切换时自动驾驶功能失效 | 中 |
+| **LiDAR 聚类有 117-139ms 延迟**：360 点云的体素降采样 + 聚类管线耗时较长 | 高速场景下障碍物更新可能滞后 | 低 |
+
+### 决策与规划
+
+| 问题 | 影响 | 优先级 |
+| --- | --- | --- |
+| **超车决策基于规则状态机**：`OvertakeStateMachine` 的阈值（1.5s 持续、0.4s 确认）是硬编码的 | 不同道路场景下超车行为可能过于保守或过于激进 | 中 |
+| **A* 路径规划网格分辨率固定 0.5m**：`GRID_RES = 0.5`，网格范围 55m × 40m | 密集场景下计算量大；稀疏场景下精度浪费 | 低 |
+| **实线检测的噪声过滤参数多且脆弱**：`SOLID_*` 系列有 12 个常量，用于过滤误检 | 换地图或光照变化后可能需要重新调参 | 中 |
+| **PurePursuit `find_target` 未使用 `adaptive_lookahead`**：`adaptive_lookahead(speed)` 方法存在但 `find_target` 仍用固定 `self.lookahead` | 高速时预瞄距离不足，S 弯/缓弯中转向指令可能剧烈抖动 | 中 |
+
+### 模仿学习（M3）
+
+| 问题 | 影响 | 优先级 |
+| --- | --- | --- |
+| **低帧率（<10fps）下训练效果有限**：早期 PoC 仅 2.4fps、229 帧，模型退化为常数预测 | 需要高频采集（≥10fps）+ 多弯道多圈数据才有训练价值 | 已缓解（Tech 采集可达 7fps） |
+| **单地图训练的模型泛化差**：`bc_tech_smallgrid.pt` 仅在 smallgrid 上验证 | 换地图或换车型后模型可能失效 | 中 |
+| **缺乏闭环评估指标**：目前只有 val MAE / R²，没有实际驾驶中的横向偏差、碰撞率等指标 | 无法量化模型在真实驾驶中的表现 | 中 |
+
+### 决策层（M4）
+
+| 问题 | 影响 | 优先级 |
+| --- | --- | --- |
+| **DQN 训练尚未完成**：离线验证基于规则基线，没有真正的 RL 策略 | M4 功能名存实亡 | 低（当前优先 M5） |
+
+### 运行时与工程
+
+| 问题 | 影响 | 优先级 |
+| --- | --- | --- |
+| **双运行时的 Tech 路径未经 CI 测试**：Tech 专属功能（annotation、LiDAR）只能在有 Tech 授权的机器上手动验证 | 回归测试覆盖不完整 | 中 |
+| **缺少类型注解**：虽然使用了 `from __future__ import annotations`，但多数函数缺少参数和返回值类型标注 | IDE 补全和静态检查效果差 | 低 |
+| **日志体系不统一**：部分模块用 `print`，部分用 `logging`，遥测走 JSON 文件 | 排障时信息分散，难以聚合分析 | 低 |
 
 ## 与相关项目的关系
 
