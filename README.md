@@ -1,35 +1,79 @@
-# BeamNG Autopilot — 视觉智驾研究
+# BeamNG-autopilot（BeamNG自动驾驶）
 
-基于 BeamNG.drive + BeamNGpy 的自动驾驶研究项目。路线：先分层（感知/决策/控制），再升级端到端模仿学习与图像 RL。
+<div align="center">
 
-## 里程碑
+**中文** | [English](README.en.md)
 
-- M1 循迹闭环：Pure Pursuit + PID，车沿闭环自动跑圈 ✅
-- M2 视觉感知：相机标定 + 轮胎印条带检测 + 路径投影 ✅
-- M3 端到端模仿学习：DAVE-2 风格 CNN（单帧图像 -> 转向）🔨 进行中
-- M4 决策层：DQN 离散动作（巡航/减速/变道/超车），Stable-Baselines3
-- M5 整合 demo：感知 -> 决策 -> 控制，新能源车机界面（前视 + BEV + 仪表）
-- M6 图像端到端 RL（SAC/PPO from pixels）
+[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Star](https://img.shields.io/github/stars/Qiongkura/BeamNG-autopilot.svg)](https://github.com/Qiongkura/BeamNG-autopilot/stargazers)
+[![Issues](https://img.shields.io/github/issues/Qiongkura/BeamNG-autopilot.svg)](https://github.com/Qiongkura/BeamNG-autopilot/issues)
 
-## 环境
+</div>
 
-- BeamNG.drive 0.39+（Steam 版；BeamNG.tech 可选增强）。安装目录自动探测
-  （Steam 注册表 / `libraryfolders.vdf` / 常见路径），找不到时用环境变量
-  `BEAMNG_HOME` 指定；用户目录默认使用当前用户的
-  `%LOCALAPPDATA%\BeamNG.drive\<版本>`，可用环境变量 `BEAMNG_USER` 覆盖。
-- Python 3.10 + venv（`--system-site-packages`，复用系统 torch cu128 / OpenCV）
-- 显卡建议 6GB 显存以上（YOLO 检测 + HUD 需要）
+基于 BeamNG.drive + BeamNGpy 的自动驾驶研究项目，采用分层架构（感知/决策/控制），逐步演进到端到端模仿学习与图像强化学习。
 
-```powershell
-python -m venv --system-site-packages .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
+- **分层架构**：清晰的感知、决策、控制模块，便于研究与扩展；
+- **双运行时支持**：兼容 Steam 与 BeamNG.tech，自动检测并适配不同版本；
+- **视觉感知与避障**：集成 YOLO 实时目标检测与 BEV 地面反投影，实现视觉避障。
+
+## 功能
+
+| 功能 | 说明 |
+| --- | --- |
+| M1 循迹闭环 | Pure Pursuit + PID 控制，车辆沿预录轨迹自动行驶 |
+| M2 视觉感知 | 相机标定、轮胎印条带检测、路径投影，提供转向特征 |
+| M3 端到端模仿学习 | DAVE-2 风格 CNN 模型，单帧图像直接预测转向角 |
+| M4 决策层 | DQN 离散动作（巡航/减速/变道/超车），基于 Stable-Baselines3 |
+| M5 游戏内自动驾驶助手 | 通过热键激活，沿游戏内置导航路线自动行驶，带实时 HUD |
+| M5 视觉避障 | YOLOv8n 前视检测 + 地面反投影，与场景/射线障碍融合绕行 |
+| 学习式路面分割 | 轻量 UNet 模型，区分背景/路面/标线，替代传统 CV 阈值方法 |
+| 实时遥测与可视化 | 遥测 HUD、仪表盘、决策层可视化、鸟瞰图等 |
+
+## 架构设计
+
+项目采用分层模块化设计：
+
+- **感知层**（`beamng_autopilot/perception.py`、`vision/`）：融合场景、射线、视觉障碍数据，提供环境感知。
+- **决策层**（`beamng_autopilot/planner.py`）：局部路径规划与避障决策。
+- **控制层**（`beamng_autopilot/control/`）：Pure Pursuit 路径跟踪、PID 速度控制、档位管理、人机交接。
+- **运行时**（`beamng_autopilot/runtime.py`）：Steam/Tech 双运行时适配，惰性导入 Tech 专属功能。
+- **可视化**（`beamng_autopilot/hud.py`、`telemetry.py`、`visionview.py`）：实时遥测与感知叠加。
+
+## 📦 环境依赖
+
+```bash
+BeamNG.drive 0.39+（Steam 版；BeamNG.tech 可选增强）
+Python 3.10 + venv（--system-site-packages）
+GPU 显存 6GB 以上（YOLO 检测 + HUD 可视化需要）
 ```
 
-首次使用前建议跑一遍环境自检，输出依赖 / 游戏路径 / 资源 / 运行时状态清单：
+## 安装与使用
 
-```powershell
-.venv\Scripts\python.exe scripts\m5_env_check.py
-```
+1. **安装 BeamNG.drive**：通过 Steam 安装 0.39+ 版本。
+2. **创建虚拟环境**：
+   ```powershell
+   python -m venv --system-site-packages .venv
+   .venv\Scripts\python.exe -m pip install -r requirements.txt
+   ```
+3. **环境自检**（首次使用前建议运行）：
+   ```powershell
+   .venv\Scripts\python.exe scripts\m5_env_check.py
+   ```
+4. **启动游戏**（或通过控制台启动）：
+   ```powershell
+   .venv\Scripts\python.exe scripts\launch_game.py --runtime steam
+   ```
+5. **运行自动驾驶助手**：
+   ```powershell
+   # 附着到已运行的游戏
+   .venv\Scripts\python.exe scripts\m5_autopilot.py --attach
+   # 或自动启动游戏并加载地图
+   .venv\Scripts\python.exe scripts\m5_autopilot.py
+   ```
+6. **使用图形控制台**：双击项目根目录的 `启动自动驾驶.vbs` 或手动运行：
+   ```powershell
+   .venv\Scripts\python.exe scripts\m5_launcher.py
+   ```
 
 抓帧性能对比探针（可选，需游戏窗口位于主屏；dxcam 需自行 `pip install dxcam`）：
 
@@ -142,10 +186,7 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
 # 循迹：Pure Pursuit 沿轨迹自动跑 2 圈
 .venv\Scripts\python.exe scripts\m1_follow_track.py --track data\track_smallgrid.npz
 
-# M2 采集（低帧率，用于感知标定）
-.venv\Scripts\python.exe scripts\m2_capture.py --track data\track_smallgrid.npz --laps 1
-
-# M3 高频采集（BC 训练数据，320x180 帧）
+# M3 高频采集（BC 训练数据）
 .venv\Scripts\python.exe scripts\m3_collect_bc.py --track data\track_smallgrid.npz --speed 8.0 --laps 3
 
 # M3 训练
@@ -153,171 +194,64 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
 
 # M3 实车推理（BC 驾驶）
 .venv\Scripts\python.exe scripts\m3_drive_bc.py --model logs\m3_bc\bc_steer.pt --track data\track_smallgrid.npz --speed 8.0 --duration 180
-```
 
-运行时会启动 BeamNG.drive 窗口，可实时观察车辆。遥测与数据集保存在 `logs/`。
-
-## 实时遥测 HUD
-
-`m3_drive_bc.py` / `m1_follow_track.py` 运行时默认弹出可视化遥测窗口（油门、刹车、转向、速度、G 力表、航向、圈数），带前置摄像头预览；按 `q` / `ESC` 可提前结束驾驶。禁用方式：
-
-```powershell
-# 关掉整个 HUD 窗口
-.venv\Scripts\python.exe scripts\m3_drive_bc.py --model logs\m3_bc\bc_steer.pt --track data\track_smallgrid.npz --no-hud
-# 只去掉摄像头预览，保留仪表
-.venv\Scripts\python.exe scripts\m3_drive_bc.py --model logs\m3_bc\bc_steer.pt --track data\track_smallgrid.npz --no-camera
-```
-
-也可以在第二个终端单独开仪表盘（无摄像头），读取运行中的实时遥测：
-
-```powershell
-.venv\Scripts\python.exe scripts\m4_dashboard.py
-```
-
-决策层实时可视化（读 autopilot 实际发布的遥测，显示感知融合 / planner
-模式 / 速度决策链 / 交通规则 / 控制输出 + 鸟瞰 + 速度时序图）：
-
-```powershell
-.venv\Scripts\python.exe scripts\m5_decision_view.py
-```
-
-## M5 游戏内自动驾驶助手（可手动激活）
-
-在游戏里通过热键手动激活/关闭自动驾驶，车辆严格沿游戏内置导航路线（大地图里点选目的地生成的蓝色箭头路线）自己跑，并带特斯拉式视觉叠加和结束后的遥测图表。
-
-非 `--attach` 启动时，脚本会自动加载 `italy`（模拟意大利）地图的 `spawn_crossroads` 十字路口出生点，并把车放到附近路网节点上按道路方向摆正（避免像 `hirochi_raceway` 这种原点不在路面上的地图把车生成到地图下面）。路线直接抓取游戏内置导航（不再自己用路网 A* 寻路），脚本只负责抓取后跟车。
-
-### 启动（推荐：先开游戏，进地图，摆好车）
-
-```powershell
-.venv\Scripts\python.exe scripts\m5_autopilot.py --attach
-```
-
-不带 `--attach` 时脚本会自己启动游戏并加载 `italy` 地图的十字路口出生点（`spawn_crossroads`）：
-
-```powershell
-.venv\Scripts\python.exe scripts\m5_autopilot.py
-```
-
-### 热键（全局，游戏内直接按）
-
-| 按键 | 功能 |
-| --- | --- |
-| `F8` | 视觉叠加 开/关（3D 世界路线 + 前视投影 + 鸟瞰图） |
-| `F9` | 自动驾驶 开/关 |
-| `F10` | 抓取游戏内导航路线（先按 `M` 开大地图，点选目的地生成蓝色路线） |
-| `F11` | 清除路线 |
-| `F12` | 退出 |
-
-### 玩法
-
-1. 在游戏里按 `M` 打开大地图，点一个目的地，关闭地图后出现蓝色导航路线；
-2. 按 `F10` 抓取这条导航路线（提示"navigation route grabbed: N pts"）；
-3. 按 `F9` 激活自动驾驶：Pure Pursuit + 弯道限速 + PID 跟车，严格沿游戏生成的导航路线行驶，到达目的地自动刹车结束；
-4. 自动驾驶期间/之后可用 `F8` 开关 3D 世界叠加与 HUD 里的前视投影 + 鸟瞰图；
-5. 每次自动驾驶结束（到达 / 手动关闭 / 超时）自动弹出"油门 / 刹车 / 速度"三段连续条形统计图，同时保存 PNG 到 `logs/telemetry/m5_telemetry_*.png`；
-6. 自动驾驶关闭后车辆控制交还给你（手动驾驶）。
-
-常用参数：`--speed 10` 巡航速度（m/s）、`--max-run 600` 单次最长秒数、`--no-hud` 关掉 HUD 窗口、`--no-show` 只存图表不弹窗。控制台的 `限速 (km/h)` 会以 `--speed` 传给助手，并可在运行中通过 `set_speed` 更新。
-
-## 控制台界面（一键启动 + EID 环境信息显示）
-
-`scripts/m5_launcher.py` 是一个像软件一样的启动控制台：不用记命令、不用开多个窗口，按钮就能完成"启动游戏 → 启动助手 → 一键自动驾驶"，右侧实时显示环境信息（EID）。
-
-双击项目根目录的 `启动自动驾驶.vbs` 即可直接打开控制台界面（自动定位 venv、隐藏黑窗口，不需要开终端）；也可以手动运行：
-
-```powershell
-.venv\Scripts\python.exe scripts\m5_launcher.py
-```
-
-### 界面布局
-
-- 左侧按钮：`启动游戏`（自动以 TCP 模式拉起 BeamNG）、`启动助手`（运行 m5_autopilot.py）、`一键自动驾驶(F9)`、`抓取路线(F10)`、`清除路线`、`停止自动驾驶`；
-- 左侧设置区：`限速 (km/h)` 输入 + `应用` 按钮（助手运行中立即生效，未运行则保存到下次启动）、地图、车型、`--attach` 与标记点开关；
-- 右侧 EID 面板：当前速度（大数字）+ 目标速度 + 限速显示、模式徽章（手动 / 巡航 / 避障中）、油门 / 刹车 / 转向条、G 力图、障碍物数量、最近障碍距离、视觉检测目标、传感器状态、路线点数量、距目标距离、已运行时间、航向角；
-- 中部 `BirdView`：俯视地图，实时画路线点、障碍物包围框和车头朝向；
-- 底部日志区：实时滚动显示助手进程输出。
-
-### 按钮流程
-
-1. 点 `启动游戏`，等游戏进地图、把车摆好；
-2. 在游戏里按 `M` 打开大地图选目的地（出现蓝色导航路线）；
-3. 回控制台点 `抓取路线(F10)`（对应游戏内热键 F10），再点 `一键自动驾驶(F9)`；
-4. 想停就点 `停止自动驾驶`（对应 F9 再次按下），退出时不会关游戏。
-
-设置区里的 `限速 (km/h)` 会在启动助手时作为 `--speed` 传入；助手运行中点 `应用` 会立即下发 `set_speed`，未运行时则先保存、下次启动生效。
-
-### 通信说明
-
-控制台通过 `logs/autopilot_ctl.json` 与 m5 助手做命令桥（带单调序号水印防重放），助手把 EID 数据实时写进 `logs/telemetry/live.json`，控制台按帧读取刷新。除 F9/F10/F11 这类开关命令外，命令桥还支持带数值的 `set_speed`，用于运行时更新巡航限速。仅此界面需要，命令行玩法不受影响。
-
-## M5 视觉避障（YOLO 前视 + 反投影）
-
-M5 自动驾驶默认开启视觉障碍物感知：后台线程预热 YOLOv8n，主循环里约每 0.33s（`--vision-rate 3`）抓一次游戏窗口帧，YOLO 检测人 / 车 / 摩托车 / 公交车 / 卡车，再通过当前游戏镜头的真实位姿（Lua 查询 `getCameraPosition / Forward / Up / FovDeg`）把检测框底边中心反投影到地平面（z=0），得到障碍物世界坐标，随后与场景 / 射线障碍合并后交给 planner 绕行。
-
-- 依赖：`weights/yolov8n.pt`（约 6.5MB，缺省时自动下载到项目目录）+ `.yolo/`（ultralytics 配置目录，避免写入 AppData 导致无权限崩溃）。
-- 拿不到游戏窗口 / 画面空白时自动降级：静默跳过视觉扫描并计数，不影响其他感知与控制。
-- HUD 叠加青色检测框（类别 + 置信度），状态行显示 `vis=N`（当前视觉障碍数量）。
-- 同一辆车被视觉与场景 / 射线同时看到时按距离合并成一个障碍（`merge_obstacles`），避免重复绕行。
-
-### 视觉探针（建议先跑这个验证检测效果）
-
-进游戏地图后运行，不需要开自动驾驶：
-
-```powershell
-# 单帧：打印检测到的障碍物（世界坐标 / 距离 / 尺寸）
-.venv\Scripts\python.exe scripts\m5_vision_probe.py --attach --once
-
-# 持续检测并保存标注帧到 logs\m5_vision\
-.venv\Scripts\python.exe scripts\m5_vision_probe.py --attach --save
-
-# 弹窗实时预览（按 q 退出）
+# M5 视觉探针（验证检测效果）
 .venv\Scripts\python.exe scripts\m5_vision_probe.py --attach --show
 ```
 
-### 视觉相关参数
+## ⚙️ 配置说明
 
-- `--no-vision-obstacles`：关闭视觉避障（仅用场景 + 射线障碍）。
-- `--vision-conf 0.35`：YOLO 置信度阈值（默认 0.35，误报多就调高）。
-- `--vision-rate 3`：视觉扫描频率 Hz（默认 3；RTX 5070 上可调到 5–10）。
-- `--max-dist 55`（探针）：忽略超过该距离的检测。
+| 配置项 | 说明 | 默认 |
+| --- | --- | --- |
+| `BEAMNG_HOME` | BeamNG.drive 安装目录（Steam 版） | 自动检测 |
+| `BEAMNG_USER` | BeamNG.drive 用户数据目录 | `%LOCALAPPDATA%\BeamNG.drive\<版本>` |
+| `BEAMNG_RUNTIME` | 运行时选择：`auto`/`steam`/`tech` | `auto` |
+| `BEAMNG_TECH_HOME` | BeamNG.tech 安装目录 | 无（需手动设置） |
+| `BEAMNG_TECH_USER` | BeamNG.tech 用户数据目录 | `...\BeamNG.drive\0.38` |
+| `BEAMNG_PORT` | 连接端口 | `64256` |
+| `--speed` | 巡航速度（m/s） | `10` |
+| `--vision-conf` | YOLO 置信度阈值 | `0.35` |
+| `--vision-rate` | 视觉扫描频率（Hz） | `3` |
+| `--seg-model` | 语义分割模型路径 | 自动加载最佳模型 |
 
-注意：视觉检测依赖当前游戏镜头真实位姿（Lua 查询），玩家自由视角下同样自洽；`m5_autopilot.py --attach` 默认已开启视觉。
+## 🧪 测试
 
-## 开发日志
+项目提供多种测试与验证脚本：
 
-按时间正序记录；2026-08-14 之前的条目由文件时间戳、README 与 docs 重建，之后以 git 提交为准。新增改动追加到本节末尾。
+- **环境自检**：`.venv\Scripts\python.exe scripts\m5_env_check.py`
+- **离线回归验证**：`.venv\Scripts\python.exe scripts\m5_offline_validate.py`
+- **端到端测试**（需游戏运行）：`.venv\Scripts\python.exe scripts\m5_e2e_test.py --attach`
+- **实车驾驶测试**（需游戏运行）：`.venv\Scripts\python.exe scripts\m5_drive_test.py --speed 6 --run 10`
+- **GUI 冒烟测试**：`.venv\Scripts\python.exe scripts\m5_gui_smoke.py`
+- **各类诊断探针**：`diag_*.py`、`m5_*_probe.py` 等脚本用于特定功能验证
 
-### 2026-08-11
+## 🤝 贡献指南
 
-- 项目起步与 M1 循迹闭环：搭建 venv 与 `requirements.txt`，实现轨迹录制/回放（`track.py`）、PID（`control/pid.py`）、Pure Pursuit（`control/pure_pursuit.py`），`m1_smoke_test.py` / `m1_record_track.py` / `m1_follow_track.py` 跑通闭环，并保存样例轨迹 `data/track_smallgrid.npz`。
-- M2 视觉感知起步：`vision/band.py` 轮胎印条带检测，`m2_capture.py` / `m2_calibrate_camera.py` 完成相机标定与低帧率采集；结论为 4m 条带 r=+0.93、12m r=+0.91，但纯视觉无先验在 2.4fps 下不可靠。
-- M3 模仿学习起步：`bc.py` + `m3_train_bc.py` 实现 DAVE-2 CNN 训练流程，用 M2 的 229 帧跑通 PoC（val MAE=0.048，R²≈0），确认低帧率、近零转向标签的数据没有训练价值。
-- 遥测可视化：`hud.py`、`telemetry_chart.py`、`m4_dashboard.py` 仪表盘雏形，M1/M3 驾驶可弹 HUD 实时查看油门/刹车/转向/速度。
+欢迎提交 Issue 和 Pull Request！
 
-### 2026-08-12
+1. Fork 本仓库
+2. 创建你的功能分支 (`git checkout -b feature/xxx`)
+3. 提交你的修改 (`git commit -m 'feat: 新增xxx功能'`)
+4. 推送到分支 (`git push origin feature/xxx`)
+5. 打开 Pull Request
 
-- 热键框架：`beamng_autopilot/hotkeys.py`，为 M5 游戏内 F8/F9/F10/F11/F12 控制打基础。
-- 控制链路诊断：`diag_parkingbrake.py` / `diag_disconnect.py` / `diag_r_latch_drive.py` / `diag_gear_map.py` / `diag_gearbox_info.py` / `diag_gearbox_list.py` / `diag_arcade_standstill.py` / `diag_arcade_neutral.py`，排查手刹、断开、倒挡自锁、挡位映射与 arcade 控制问题。
-- 感知探针：`m5_rayframe_probe.py` / `m5_rayground_probe.py` / `m5_castray_struct.py` / `m5_castray_compare.py` / `m5_live_blocker_probe.py` / `m5_watchdog_probe.py`，并新增 `watchdog.py` 看门狗；记录 twitch/park 场景，后续纳入 `m5_offline_validate.py` 回归。
-- 视觉检测：`vision/detection.py` 加入 YOLO 检测与地面反投影，下载 `weights/yolov8n.pt`；`control/speed.py` 速度控制；`m5_vision` 检测结果落地。
+## 📄 许可证
 
-### 2026-08-13
+本项目采用 [MIT](LICENSE) 许可证。
 
-- 墙体/路线/避障排障：`m5_wall_shape_probe.py` / `m5_wall_fan_probe.py` / `m5_wall_multi_probe.py` / `m5_live_wall_probe.py` / `m5_live_wall_probe2.py` / `m5_wall_route_probe.py` / `m5_live_route_probe.py` / `m5_live_planner_diag.py`，覆盖墙面形状、扇形/多墙、live 路线与 planner 诊断。
-- 挡位控制：`control/gearbox.py` + `m5_gearbox_diag.py`。
-- 感知与遥测：`perception.py` 场景/射线/视觉融合、`vision/tracking.py` 目标跟踪、`visionview.py` 前视叠加、`control/handover.py` 人机交接、`telemetry.py` 实时遥测，`m5_watchdog_beat_test.py` 心跳测试；lane debug run55-57 用于车道状态排障。
+## 📮 联系方式
 
-### 2026-08-14
+- GitHub：https://github.com/Qiongkura
+- 微信：Qiongkura
 
-- 双运行时：`beamng_autopilot_tech/providers.py` 惰性创建 Tech `Camera` / `Lidar`，`launch_game.py` / `runtime.py` / `download_beamng_tech.py` / `bridge.py` 与 `BEAMNG_RUNTIME` 系列环境变量；同日完成 Steam/Tech 多轮 e2e 验证。
-- M5 整合：`m5_e2e_test.py` / `m5_drive_test.py` 端到端/实车测试、`m5_launcher.py` + `m5_gui_smoke.py` 控制台界面、`traffic.py` 交通、`connector.py` 扩展，以及 `启动自动驾驶.vbs` / `启动车道状态窗口.vbs`。
-- 车道状态与局部规划：`lane.py` 车道几何/状态、`planner.py` 局部规划、`roadnet.py` 路网，配套 `m5_lane_state_probe.py` / `m5_lane_center_capture.py` / `m5_lane_state_annotate.py` / `m5_lane_state_view.py`，车道状态数据落到 `logs/m5_lane_state`。
-- 离线回归与 planner 基线：`m5_offline_validate.py` 大型离线回归；`docs/planner_baseline_20260814.md` 记录 Steam run 98（median_lat=1.76、centered_ratio=0.901），并明确“导航线只决定路线、不决定车道内横向基准”的改进方向。
-- M2 收尾分析：`m2_steering_signal.py` / `m2_steering_vision.py` / `m2_validate_projection.py` / `m2_visualize.py`，把转向信号/视觉相关性结论固化为可重跑脚本。
-- 工程落地：14:37 初始化 git 仓库与 `AGENTS.md` / `.gitignore` / README 首版，23:42 首次提交 `9702e71`（整仓快照，107 个文件、28981 行）。
+## 已知限制
 
-### 2026-08-15
+- 低帧率（<10fps）下端到端模仿学习模型训练效果有限，需要高频采集数据；
+- 传统 CV 颜色阈值在 BeamNG.tech 真渲染帧上几乎失效，必须使用学习式分割；
+- 纯视觉无先验的路径跟踪在复杂弯道中不可靠，易锁定阴影或深色特征；
+- 端到端模仿学习（M3）仍在进行中，当前 PoC 模型退化为常数预测；
+- 决策层（M4）DQN 训练尚未完成，离线验证基于规则基线；
+- 视觉检测依赖游戏窗口实时画面，窗口最小化或遮挡时会降级为无视觉模式。
 
 - `00:06 68cbfc0`：环境自检 `m5_env_check.py` 与抓帧性能探针 `bench_grab_screen.py`，README 补充用法。
 - `00:41 cf973d3`：`CameraModel.camera_pose` 支持车辆 6DOF 姿态（pitch/roll 参与反投影，BeamNG 四元数约定用真实 state 验证）；Tech 相机改为标定外参 + 姿态驱动，移除逐帧 GE 查询；`m5_lane_state_view.py` 抓帧失败降级。
@@ -329,3 +263,11 @@ M5 自动驾驶默认开启视觉障碍物感知：后台线程预热 YOLOv8n，
 - `7b8a44b`：超车意图状态机。`traffic.OvertakeStateMachine`（none→requested→active 滞回，慢前车持续 1.5s + 确认 0.4s；对向来车 / 左侧实线取消；前车提速或消失回落恢复跟车）+ `oncoming_vehicle_ahead` / `solid_marking_left` 门控；`m5_autopilot.py` 接入（遥测新增 `ovk` 状态）；`docs/planner_baseline_20260814.md` 标记横向基准改造完成（`map_offset=None`、固定 `RIGHT_OFFSET_M=1.5`、`preferred_offset_m` 无运行时消费者）。
 - `d3ca386`：Tech 数据工厂。`beamng_autopilot_tech/annotations.py` 共享 annotation 助手（`to_label` / `road_share`，路面色适配 italy `(128,128,128)` 与 smallgrid `(128,196,255)`）；`TechCameraProvider` 支持 annotation 渲染（`grab_annotated`），`build_camera_provider` 透传；`m3_collect_bc.py` 新增 `--tech-annot --min-road-share` 质量门（离路/黑帧在源头丢弃）+ 端口按 `--runtime` 解析（修掉默认连 Steam 口的问题）；`m5_collect_seg.py` 改用共享助手。
 - M3 BC 闭环（Tech 实跑）：smallgrid 地图 2 圈 700 帧 @7fps，`--tech-annot` 质量门 0 丢弃；转向分布 std=0.18（26% 帧 `|steer|>0.15`，不再是近零标签）；`m3_train_bc.py` 训练 60 epoch → **val MAE=0.012、val R²=+0.903**（对比 08-11 PoC：MAE=0.048、R²≈0 常数预测），模型 `logs/m3_bc/bc_tech_smallgrid.pt`。Tech 高频采集 + annotation 质量门解决了 M3 数据没有训练价值的问题。
+
+## 与相关项目的关系
+
+- [BeamNG.drive](https://beamng.com/)：物理仿真驾驶游戏平台
+- [BeamNGpy](https://github.com/BeamNG/BeamNGpy)：BeamNG.drive 的 Python API
+- [Ultralytics YOLOv8](https://github.com/ultralytics/ultralytics)：实时目标检测框架
+- [Stable-Baselines3](https://github.com/DLR-RM/stable-baselines3)：强化学习算法库
+- [DAVE-2](https://arxiv.org/abs/1604.07316)：端到端自动驾驶神经网络架构
