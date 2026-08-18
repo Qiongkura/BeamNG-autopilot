@@ -61,7 +61,7 @@ SHARP_ANGLE_DEG = 45.0
 SHARP_CORNER_KPH = 30.0
 
 # ── Occupancy grid A* ────────────────────────────────────────────────
-GRID_RES = 0.5            # occupancy-grid cell size (m)
+GRID_RES = 0.8            # occupancy-grid cell size (m)
 GRID_AHEAD = 55.0         # grid extent behind the car (m)
 GRID_BEHIND = 10.0        # grid extent behind the car (m)
 GRID_HALF_W = 20.0        # grid half width (m)

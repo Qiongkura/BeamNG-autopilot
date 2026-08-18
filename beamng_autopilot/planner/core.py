@@ -789,7 +789,8 @@ class LocalPlanner:
         else:
             length = max(2.0 * ob.half_w, 2.0 * ob.half_h)
             thick = min(2.0 * ob.half_w, 2.0 * ob.half_h)
-        if length < ROADSIDE_WALL_MIN_LEN_M:
+        # 放宽长度要求：2m 以上的墙都算路边墙
+        if length < 2.0:
             return False
         if thick > ROADSIDE_WALL_MAX_THICK_M:
             return False
@@ -802,7 +803,7 @@ class LocalPlanner:
                     for c in _obstacle_corners(ob)]
             pos = sum(1 for v in lats if v > ROADSIDE_WALL_MIN_EDGE_M)
             neg = sum(1 for v in lats if v < -ROADSIDE_WALL_MIN_EDGE_M)
-            if pos >= 3 or neg >= 3:
+            if pos >= 2 or neg >= 2:
                 return True
             # Through a bend the same wall can straddle the polyline:
             # corner lats land on both sides (pos ~= neg ~= 2) even
@@ -811,11 +812,14 @@ class LocalPlanner:
             # than half a car + edge clear off the route cannot be
             # blocking the corridor, it is the boundary beside it.
             arc_c, lat_c = _point_route_pos_np(ob.x, ob.y, pts)
+            # 放宽：只要中心偏离路线 1m 以上就视为路边墙
+            if abs(lat_c) >= 1.0:
+                return True
             return abs(lat_c) >= CAR_HALF_WIDTH + ROADSIDE_WALL_MIN_EDGE_M
         lon0, lon1, lat0, lat1 = profile
         lon_span = lon1 - lon0
         lat_span = lat1 - lat0
-        if lon_span < 2.0 * lat_span:
+        if lon_span < 1.5 * lat_span:
             return False
         # Fallback without a polyline: clearly on one side of the window.
         return lat0 > ROADSIDE_WALL_MIN_EDGE_M \
