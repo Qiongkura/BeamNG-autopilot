@@ -507,6 +507,26 @@ class BeamNGConnector:
                 rotation=np.asarray(st["rotation"], dtype=float),
             )
 
+    def get_state_fast(self) -> VehicleState:
+        """Read the vehicle transform without polling sensors.
+
+        ``get_state()`` calls ``sensors.poll()`` which pulls every attached
+        sensor (Camera / LiDAR) over the Lua bridge - the dominant cost in
+        the autopilot control loop (~150 ms/frame on this machine).  The
+        autopilot's vision/range workers already stream sensor data through
+        their own snapshots, so the control loop only needs the ego pose
+        here.  This fast path reads just ``vehicle.state``.
+        """
+        with self.io_lock:
+            st = self.vehicle.state
+            return VehicleState(
+                pos=np.asarray(st["pos"], dtype=float),
+                dir=np.asarray(st["dir"], dtype=float),
+                up=np.asarray(st["up"], dtype=float),
+                vel=np.asarray(st["vel"], dtype=float),
+                rotation=np.asarray(st["rotation"], dtype=float),
+            )
+
     def get_wheel_speed(self):
         """Best-effort average wheel speed (m/s) via the Lua bridge.
 

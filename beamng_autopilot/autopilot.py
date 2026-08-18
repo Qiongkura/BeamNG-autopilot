@@ -1450,7 +1450,7 @@ class AutopilotSession:
             _stages[name] = time.perf_counter() - _st0
             _st0 = time.perf_counter()
 
-        st = conn.get_state()
+        st = conn.get_state_fast()
         with self.state_lock:
             self.latest_st = st
         self.last_st = st
@@ -2088,7 +2088,7 @@ class AutopilotSession:
                 self.target_speed - RAMP_DECEL * dt)
         _mark("ramp")
 
-        if now - self.last_wspd > 0.1:
+        if now - self.last_wspd > 0.25:
             self.last_wspd = now
             self.wheel_speed = conn.get_wheel_speed()
             if (self.wheel_speed is None
