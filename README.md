@@ -252,7 +252,7 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
 | --- | --- | --- | --- |
 | **`planner.py` 单文件 2790 行** | 可维护性极差 | 高 | ✅ 已拆分为 `planner/` 包（6 个子模块） |
 | **`lane.py` 1500 行** | 维护困难 | 高 | ✅ 已拆分为 `lane/` 包（6 个子模块） |
-| **`m5_autopilot.py` 主循环 2516 行** | 脚本不可测试、不可复用 | 高 | 待拆分 |
+| **`m5_autopilot.py` 主循环 2516 行** | 脚本不可测试、不可复用 | 高 | ✅ 已拆分为 `autopilot.py`（AutopilotSession 类）+ 薄脚本 |
 | **53 处裸 `except Exception`** | 真实错误被掩盖 | 中 | ✅ 已清理（6 个模块，140 行改动） |
 
 #### 重构方案
@@ -281,7 +281,7 @@ beamng_autopilot/lane/
 └── tracking.py      # LaneTracker 类 + 帧间跟踪/稳定性检查
 ```
 
-**`m5_autopilot.py` → 薄脚本 + 库**（待拆分，当前 2516 行）：
+**`m5_autopilot.py` → 薄脚本 + 库** ✅ 已完成：
 
 ```
 beamng_autopilot/
