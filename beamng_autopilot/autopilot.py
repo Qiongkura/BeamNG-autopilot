@@ -618,7 +618,8 @@ class AutopilotSession:
                 debug_lane: dict = {}
                 if not self.args.no_lanes:
                     seg_model_path = self.args.seg_model
-                    if seg_model_path is None:
+                    if seg_model_path is None \
+                            and not getattr(self.args, 'no_seg', False):
                         try:
                             from beamng_autopilot.vision.segmentation \
                                 import default_model_path

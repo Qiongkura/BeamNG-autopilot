@@ -73,6 +73,13 @@ def main() -> None:
                     help="learned lane/road segmentation model path "
                          "(default: logs/m5_seg/seg_model/best.pt when "
                          "present; without it classic CV is used)")
+    ap.add_argument("--no-seg", action="store_true",
+                    help="do NOT auto-load the semantic segmentation model "
+                         "(default: a found segmenter loads automatically). "
+                         "Segmentation is the heaviest GPU load and the most "
+                         "likely to destabilise BeamNG.tech; --no-seg falls "
+                         "back to classic CV lane detection which is much "
+                         "lighter, while YOLO + LiDAR remain active")
     ap.add_argument("--no-markers", action="store_true",
                     help="do not draw the yellow start / red goal spheres "
                          "in the game world")

@@ -572,6 +572,10 @@ class LauncherApp:
             args.append("--attach")
         if not self.markers_var.get():
             args.append("--no-markers")
+        # 温和模式：默认不自动加载最重的语义分割模型（最易把
+        # BeamNG.tech 引擎打崩），回退到轻量 CV 车道检测，YOLO+LiDAR
+        # 保持开启。需要分割可手动加 --seg-model。
+        args.append("--no-seg")
         args += ["--nav-world",
                  "1" if self.nav_world_var.get() else "0"]
         try:
