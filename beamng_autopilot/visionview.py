@@ -157,15 +157,31 @@ class WorldOverlay:
                 content="GOAL", color=GOAL_COLOR, cling=True, offset=0.0))
         if obstacles:
             for ob in obstacles:
-                hw, hh = float(ob.half_w), float(ob.half_h)
+                # 有朝向信息时用旋转矩形，否则用轴对齐矩形
+                if (getattr(ob, "axis", None) is not None
+                        and ob.half_len > 0.0):
+                    ux, uy = float(ob.axis[0]), float(ob.axis[1])
+                    vx, vy = -uy, ux
+                    hl = ob.half_len
+                    ht = max(0.0, ob.half_thick)
+                    corners = [
+                        (ob.x + ux*hl + vx*ht, ob.y + uy*hl + vy*ht),
+                        (ob.x + ux*hl - vx*ht, ob.y + uy*hl - vy*ht),
+                        (ob.x - ux*hl - vx*ht, ob.y - uy*hl - vy*ht),
+                        (ob.x - ux*hl + vx*ht, ob.y - uy*hl + vy*ht),
+                    ]
+                else:
+                    hw, hh = float(ob.half_w), float(ob.half_h)
+                    corners = [
+                        (ob.x + hw, ob.y + hh),
+                        (ob.x - hw, ob.y + hh),
+                        (ob.x - hw, ob.y - hh),
+                        (ob.x + hw, ob.y - hh),
+                    ]
                 messages.append(dict(
                     type="AddDebugRectangle",
-                    vertices=[
-                        (float(ob.x + hw), float(ob.y + hh), z),
-                        (float(ob.x - hw), float(ob.y + hh), z),
-                        (float(ob.x - hw), float(ob.y - hh), z),
-                        (float(ob.x + hw), float(ob.y - hh), z),
-                    ],
+                    vertices=[(float(cx), float(cy), z)
+                              for cx, cy in corners],
                     color=OBS_COLOR, cling=True, offset=0.1))
         if status_text and status_pos is not None:
             messages.append(dict(
