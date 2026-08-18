@@ -1796,8 +1796,15 @@ class AutopilotSession:
                     desired_speed)
                 obs_lim = getattr(
                     self.planner, "last_obs_lim", None)
-                # BC steering mode: use DAVE-2 neural network
-                if self.bc_mode and self.bc_model is not None:
+                # BC steering mode: use DAVE-2 neural network ONLY when the
+                # planner's safety layer says the current path is clear.
+                # If the path is blocked or a detour is needed, the
+                # rule-based steering on the safety-verified path takes
+                # over so the neural net can never override obstacle
+                # avoidance, wall/guardrail detection or solid-line rules.
+                use_bc = (self.bc_mode and self.bc_model is not None
+                          and not blocked)
+                if use_bc:
                     with self.vision_lock:
                         frame = self.vision_snapshot.get("frame")
                     if frame is not None:
@@ -1808,8 +1815,10 @@ class AutopilotSession:
                         with torch.no_grad():
                             pred = self.bc_model(tensor)
                         bc_steer = float(pred.item())
+                        # Clamp BC output to a conservative band: the net
+                        # can drift hard; keep it physically tame.
                         new_steer = float(np.clip(
-                            bc_steer, -1.0, 1.0))
+                            bc_steer, -0.6, 0.6))
                         steer = smooth_steer(
                             self.prev_steer, new_steer, dt)
                         self.prev_steer = steer
@@ -1829,7 +1838,8 @@ class AutopilotSession:
                         steer_angle = abs(steer) * 0.6
                         steer_capped = False
                 else:
-                    # Rule-based steering (Pure Pursuit)
+                    # Rule-based steering (Pure Pursuit) - always used when
+                    # the path is blocked / a detour is running.
                     self.pp.lookahead = (
                         self.pp.adaptive_lookahead(speed))
                     steer_rad, _, _ = self.pp.steering(
