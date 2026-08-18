@@ -199,7 +199,7 @@ class WorldOverlay:
                     self._rect_ids.append(int(res["rectangleID"]))
                 elif msg["type"] == "AddDebugText":
                     self._text_ids.append(int(res["textID"]))
-            except Exception:
+            except (KeyError, TypeError, ValueError):
                 pass
         return True
 
@@ -227,6 +227,9 @@ class WorldOverlay:
                 pid = self.bng.add_debug_polyline(coords, ROUTE_COLOR)
                 self._polyline_ids.append(pid)
             except Exception:
+                # NOTE: bare except kept — debug primitive add is best-
+                # effort; failure only means the overlay is incomplete.
+                logger.debug("[visionview] add_debug_polyline failed")
                 pass
         if markers and waypoints is not None and len(waypoints) > 0:
             coords = [(float(x), float(y), z) for x, y in waypoints]
@@ -236,6 +239,9 @@ class WorldOverlay:
                     coords, radii, WP_COLOR, cling=True)
                 self._sphere_ids.extend(ids)
             except Exception:
+                # NOTE: bare except kept — debug primitive add is best-
+                # effort; failure only means the overlay is incomplete.
+                logger.debug("[visionview] add_debug_spheres (waypoints) failed")
                 pass
         if markers and goal_xy is not None:
             try:
@@ -248,6 +254,9 @@ class WorldOverlay:
                     "GOAL", GOAL_COLOR, cling=True)
                 self._text_ids.append(tid)
             except Exception:
+                # NOTE: bare except kept — debug primitive add is best-
+                # effort; failure only means the overlay is incomplete.
+                logger.debug("[visionview] add_debug_spheres/text (goal) failed")
                 pass
         if obstacles:
             for ob in obstacles:
@@ -263,6 +272,8 @@ class WorldOverlay:
                         verts, OBS_COLOR, cling=True, offset=0.1)
                     self._rect_ids.append(rid)
                 except Exception:
+                    # NOTE: bare except kept — debug primitive add is best-
+                    # effort; failure only means the overlay is incomplete.
                     pass
         if status_text and status_pos is not None:
             try:
@@ -272,6 +283,8 @@ class WorldOverlay:
                     status_text, STATUS_COLOR, cling=True)
                 self._text_ids.append(tid)
             except Exception:
+                # NOTE: bare except kept — debug primitive add is best-
+                # effort; failure only means the overlay is incomplete.
                 pass
 
     def close(self) -> None:

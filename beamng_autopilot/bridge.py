@@ -16,11 +16,14 @@ before it started.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 import time
 from pathlib import Path
 
 from . import config
+
+logger = logging.getLogger(__name__)
 
 
 def ctl_path() -> Path:
@@ -30,7 +33,7 @@ def ctl_path() -> Path:
 def _read(path: Path) -> dict | None:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, ValueError, TypeError):
         return None
 
 
@@ -64,7 +67,8 @@ class ControlBridge:
                     data["value"] = float(value)
                 self._write(data)
                 return True
-            except Exception:
+            except (OSError, ValueError) as exc:
+                logger.debug("[bridge] send failed: %s", exc)
                 return False
 
     def poll(self, seen: int) -> tuple[list[tuple[str, float | None]], int]:
@@ -87,5 +91,5 @@ class ControlBridge:
         with self._lock:
             try:
                 self.path.unlink(missing_ok=True)
-            except Exception:
+            except OSError:
                 pass

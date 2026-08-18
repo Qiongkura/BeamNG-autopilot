@@ -8,10 +8,13 @@ by the offline annotator and the live lane-state viewer.
 
 from __future__ import annotations
 
+import logging
 import math
 
 import cv2
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 BODY_COLOR = (255, 80, 255)
 ROAD_COLOR = (0, 200, 255)
@@ -201,6 +204,9 @@ def ego_extents(conn) -> tuple[float, float]:
         width = float(np.linalg.norm((fr + rr) / 2.0 - (fl + rl) / 2.0))
         return max(0.5, length / 2.0), max(0.5, width / 2.0)
     except Exception:
+        # NOTE: bare except kept — get_bbox can fail with any transport
+        # error or missing keys; return conservative default extents.
+        logger.debug("[lane_overlay] ego bbox query failed; using defaults")
         return 2.4, 1.0
 
 

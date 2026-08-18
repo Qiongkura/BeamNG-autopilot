@@ -10,9 +10,12 @@ A* must find a real route and returns None on failure.
 from __future__ import annotations
 
 import heapq
+import logging
 import math
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 class RoadNetwork:
@@ -41,6 +44,8 @@ class RoadNetwork:
                 roads = bng.get_road_network(
                     include_edges=True, drivable_only=True)
         except Exception:
+            # NOTE: bare except kept — scenario API can fail with any
+            # transport error; fall back to legacy get_roads().
             try:
                 roads = bng.get_roads()
             except Exception as exc:
@@ -65,6 +70,8 @@ class RoadNetwork:
                 try:
                     edge_rows = bng.get_road_edges(str(name))
                 except Exception:
+                    # NOTE: bare except kept — Lua command can fail with
+                    # any transport error; skip this road segment.
                     continue
             if not edge_rows:
                 continue

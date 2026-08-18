@@ -22,6 +22,9 @@ never latch.
 from __future__ import annotations
 
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 _MODULE_LUA = r"""
@@ -98,7 +101,9 @@ def _cmd(conn, chunk: str, response: bool = True):
     try:
         resp = conn.vehicle.queue_lua_command(chunk, response=response)
     except Exception as exc:
-        print(f"[watchdog] lua failed: {exc}")
+        # NOTE: bare except kept — Lua command can fail with any
+        # transport error; we return None for graceful degradation.
+        logger.warning("[watchdog] lua failed: %s", exc)
         return None
     if resp is None:
         return None
@@ -167,4 +172,5 @@ def disarm(conn) -> None:
     try:
         _cmd(conn, f"autopilot_watchdog.disarm(); return 1")
     except Exception:
+        # NOTE: bare except kept — disarm is best-effort; ignore any error.
         pass

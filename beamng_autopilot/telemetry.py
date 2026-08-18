@@ -10,12 +10,15 @@ low-pass filtered.
 from __future__ import annotations
 
 import json
+import logging
 import threading
 from pathlib import Path
 
 import numpy as np
 
 from . import config
+
+logger = logging.getLogger(__name__)
 
 G = 9.81
 SMOOTH = 0.35  # EMA alpha for acceleration smoothing at ~15 Hz updates
@@ -30,7 +33,7 @@ def _json_vec(v) -> list | None:
         if arr.ndim != 1 or arr.size < 3:
             return None
         return [round(float(x), 3) for x in arr[:3]]
-    except Exception:
+    except (ValueError, TypeError):
         return None
 
 
@@ -39,7 +42,7 @@ def read_live(path=None) -> dict | None:
     p = Path(path or (config.LOGS_DIR / "telemetry" / "live.json"))
     try:
         return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
+    except (OSError, ValueError):
         return None
 
 
@@ -96,7 +99,7 @@ class TelemetryBroadcaster:
             try:
                 tmp.write_text(json.dumps(data), encoding="utf-8")
                 tmp.replace(self.path)
-            except Exception:
+            except OSError:
                 pass  # dashboard survives a failed write
 
     def publish(
@@ -152,5 +155,5 @@ class TelemetryBroadcaster:
             try:
                 tmp.write_text(json.dumps(data), encoding="utf-8")
                 tmp.replace(self.path)
-            except Exception:
+            except OSError:
                 pass
