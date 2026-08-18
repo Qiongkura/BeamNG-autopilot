@@ -14,6 +14,9 @@ park.
 from __future__ import annotations
 
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 _cache: dict[str, int] = {}
 _PROBE_INPUTS = (1, 2, 3, 4, 5, 6)
@@ -36,11 +39,13 @@ def read_gearbox_mode(vehicle) -> str | None:
                 parsed = json.loads(resp)
                 if isinstance(parsed, str):
                     resp = parsed
-            except Exception:
+            except (ValueError, TypeError):
                 pass
         return str(resp) if resp else None
     except Exception as exc:
-        print(f"[gearbox] read mode failed: {exc}")
+        # NOTE: bare except kept — Lua command can fail with any
+        # transport error; we return None for graceful degradation.
+        logger.warning("[gearbox] read mode failed: %s", exc)
         return None
 
 
@@ -49,7 +54,9 @@ def set_gearbox_mode(vehicle, mode: str) -> None:
         vehicle.queue_lua_command(
             f'controller.mainController.setGearboxMode("{mode}")')
     except Exception as exc:
-        print(f"[gearbox] set mode failed: {exc}")
+        # NOTE: bare except kept — Lua command can fail with any
+        # transport error; we silently ignore mode-set failures.
+        logger.warning("[gearbox] set mode failed: %s", exc)
 
 
 def read_gear(conn) -> str | None:
@@ -66,12 +73,14 @@ def read_gear(conn) -> str | None:
                 parsed = json.loads(resp)
                 if isinstance(parsed, str):
                     resp = parsed
-            except Exception:
+            except (ValueError, TypeError):
                 pass
             if resp:
                 return resp.strip()
     except Exception as exc:
-        print(f"[gearbox] read gear failed: {exc}")
+        # NOTE: bare except kept — Lua command can fail with any
+        # transport error; we return None for graceful degradation.
+        logger.warning("[gearbox] read gear failed: %s", exc)
     return None
 
 
@@ -98,7 +107,9 @@ def engage_neutral(conn) -> bool:
         conn.step(8)
         return read_gear(conn) == "N"
     except Exception as exc:
-        print(f"[gearbox] engage neutral failed: {exc}")
+        # NOTE: bare except kept — any transport or Lua error means
+        # we could not confirm neutral; return False.
+        logger.warning("[gearbox] engage neutral failed: %s", exc)
         return False
 
 
@@ -107,6 +118,8 @@ def _signed_speed(conn) -> float:
         st = conn.get_state()
         return float(st.vel[0] * st.dir[0] + st.vel[1] * st.dir[1])
     except Exception:
+        # NOTE: bare except kept — get_state can fail with any transport
+        # error; default to zero speed so the caller proceeds safely.
         return 0.0
 
 

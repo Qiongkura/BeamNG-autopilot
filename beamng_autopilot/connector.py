@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import threading
 import time
@@ -18,6 +19,8 @@ from pathlib import Path
 
 from . import config
 from .traffic import RoadRuleView, SignalRule
+
+logger = logging.getLogger(__name__)
 
 
 _WINDOW_CLASS_NAMES = (
@@ -101,6 +104,9 @@ class BeamNGConnector:
                         last_exc = None
                         break
                     except Exception as exc:
+                        # NOTE: bare except kept — beamngpy may raise
+                        # its own ConnectionError or library-specific errors
+                        # during the RPC handshake; all are retried.
                         last_exc = exc
                         time.sleep(1.0)
                 if last_exc is not None:
@@ -134,8 +140,10 @@ class BeamNGConnector:
                 # and leaves the game running.
                 with self.io_lock:
                     self.bng.disconnect()
-        except Exception as exc:  # 关闭阶段异常只记录，不阻断
-            print(f"[close] {exc}")
+        except Exception as exc:
+            # NOTE: bare except kept — disconnect can raise any transport
+            # error; we must not let cleanup failures propagate.
+            logger.warning("[close] %s", exc)
 
     def load_scenario(self, spawn_pos=None, spawn_heading: Optional[float] = None):
         """加载地图并生成车辆，等待场景正式开始。
@@ -194,7 +202,7 @@ class BeamNGConnector:
             vehicle.connect(self.bng)
             self.vehicle = vehicle
             self.scenario = None
-        print(f"[attach] vehicle '{target_vid}' attached")
+        logger.info("[attach] vehicle '%s' attached", target_vid)
         return vehicle
 
     def current_env(self) -> dict:
@@ -218,9 +226,11 @@ class BeamNGConnector:
                     env["map"] = scenario.name
                 self._env_fail_printed = False
             except Exception as exc:
+                # NOTE: bare except kept — scenario query can fail with
+                # any transport or Lua error; we fall back to launch args.
                 if not getattr(self, "_env_fail_printed", False):
                     self._env_fail_printed = True
-                    print(f"[env] current map query failed: {exc}")
+                    logger.warning("[env] current map query failed: %s", exc)
             if self.vehicle is not None:
                 model = getattr(self.vehicle, "model", None)
                 if model:
@@ -236,25 +246,27 @@ class BeamNGConnector:
         car to a road node fixes that so autopilot routes stay on the roads.
         """
         if not roadnet.ready:
-            print("[reposition] roadnet not ready; vehicle left in place")
+            logger.debug("[reposition] roadnet not ready; vehicle left in place")
             return False
         if roadnet.node_count < config.ROADNET_REPOSITION_MIN_NODES:
-            print("[reposition] road network still loading "
-                  f"({roadnet.node_count} nodes); vehicle left in place")
+            logger.debug("[reposition] road network still loading "
+                         "(%d nodes); vehicle left in place", roadnet.node_count)
             return False
         try:
             st = self.get_state()
         except Exception as exc:
-            print(f"[reposition] state read failed: {exc}")
+            # NOTE: bare except kept — get_state talks to the game over
+            # socket; any transport error means the state is unavailable.
+            logger.warning("[reposition] state read failed: %s", exc)
             return False
         xyz = roadnet.nearest_node_xyz(st.pos[:2])
         if xyz is None:
-            print("[reposition] no road height data; vehicle left in place")
+            logger.debug("[reposition] no road height data; vehicle left in place")
             return False
         dist = math.hypot(st.pos[0] - xyz[0], st.pos[1] - xyz[1])
         if dist <= config.ROADNET_REPOSITION_NEAR_M:
-            print(f"[reposition] vehicle already on road "
-                  f"({dist:.1f}m); left in place")
+            logger.debug("[reposition] vehicle already on road "
+                         "(%.1fm); left in place", dist)
             return False
         # Align the car with the road axis so it doesn't spawn pointing into
         # a wall/barrier on maps whose roads are not axis-aligned.
@@ -269,11 +281,13 @@ class BeamNGConnector:
                 self.vehicle.teleport(pos, rot_quat=rot_quat)
                 self.step(settle)
                 after = self.get_state()
-            print(f"[reposition] vehicle -> ({pos[0]:.1f}, {pos[1]:.1f}, "
-                  f"{after.pos[2]:.1f}) heading={math.degrees(after.heading):.0f}deg")
+            logger.info("[reposition] vehicle -> (%.1f, %.1f, %.1f) heading=%.0fdeg",
+                        pos[0], pos[1], after.pos[2], math.degrees(after.heading))
             return True
         except Exception as exc:
-            print(f"[reposition] failed: {exc}")
+            # NOTE: bare except kept — teleport/step talk to the game;
+            # any transport or Lua error leaves the vehicle in place.
+            logger.warning("[reposition] failed: %s", exc)
             return False
 
     def set_front_camera(self, pos=(0.0, 1.2, 1.4), direction=(0.0, -1.0, 0.0)):
@@ -440,6 +454,8 @@ class BeamNGConnector:
                     f"nil, nil, '{rel}', 'png')\n"
                     "return 'queued'", response=True)
         except Exception as exc:
+            # NOTE: bare except kept — beamngpy may raise its own errors
+            # or transport errors; all are converted to RuntimeError.
             raise RuntimeError(f"Lua screenshot queue failed: {exc}") from exc
 
         candidates = [
@@ -513,9 +529,11 @@ class BeamNGConnector:
                 val = float(resp)
                 return val if math.isfinite(val) and val >= 0.0 else None
             except Exception:
-                # Legacy builds without the vehicle-scoped channel:
-                # engine-scope lookup, guarded so the removed global never
-                # raises.
+                # NOTE: bare except kept — legacy builds without the
+                # vehicle-scoped channel raise various beamngpy errors;
+                # fall through to engine-scope lookup.
+                logger.debug("[wheel_speed] vehicle-scoped Lua failed, "
+                             "trying engine-scope fallback")
                 try:
                     vid = self.vehicle.vid
                     resp = self.bng.queue_lua_command(
@@ -530,6 +548,9 @@ class BeamNGConnector:
                     val = float(resp)
                     return val if math.isfinite(val) and val >= 0.0 else None
                 except Exception:
+                    # NOTE: bare except kept — engine-scope lookup also
+                    # fails on very old builds; return None gracefully.
+                    logger.debug("[wheel_speed] engine-scope Lua also failed")
                     return None
 
     def control(
@@ -596,14 +617,16 @@ class BeamNGConnector:
                 resp = self.bng.control.queue_lua_command(
                     chunk, response=True)
             except Exception as exc:
-                print(f"[lua] read_navigation_route failed: {exc}")
+                # NOTE: bare except kept — Lua command can fail with any
+                # transport error; we return None for graceful degradation.
+                logger.warning("[lua] read_navigation_route failed: %s", exc)
                 return None
         if not resp:
             return None
         try:
             data = json.loads(str(resp))
         except (ValueError, TypeError):
-            print(f"[lua] read_navigation_route: bad response {resp!r}")
+            logger.warning("[lua] read_navigation_route: bad response %r", resp)
             return None
         if not data or len(data) < 2:
             return None
@@ -615,17 +638,17 @@ class BeamNGConnector:
         # -57000). Reject implausible routes instead of autopiloting into
         # them; the user can just pick the destination again on the map.
         if not np.all(np.isfinite(arr)):
-            print("[lua] read_navigation_route: non-finite points; ignored")
+            logger.warning("[lua] read_navigation_route: non-finite points; ignored")
             return None
         if float(np.max(np.abs(arr))) > 20000.0:
-            print("[lua] read_navigation_route: coordinates out of map "
-                  "bounds; ignored")
+            logger.warning("[lua] read_navigation_route: coordinates out of map "
+                           "bounds; ignored")
             return None
         if len(arr) > 1:
             seg = np.linalg.norm(np.diff(arr[:, :3], axis=0), axis=1)
             if float(np.max(seg)) > 5000.0:
-                print("[lua] read_navigation_route: implausible segment "
-                      "length; ignored")
+                logger.warning("[lua] read_navigation_route: implausible segment "
+                               "length; ignored")
                 return None
         # The big map's route can be sparse (road-node spaced, ~15-20 m
         # apart), which makes pure-pursuit steering jaggy. Densify to a
@@ -649,13 +672,15 @@ class BeamNGConnector:
                 resp = self.bng.control.queue_lua_command(
                     chunk, response=True)
             except Exception as exc:
-                print(f"[lua] read_nav_world_visible failed: {exc}")
+                # NOTE: bare except kept — Lua command can fail with any
+                # transport error; default to visible (safe fallback).
+                logger.warning("[lua] read_nav_world_visible failed: %s", exc)
                 return True
         try:
             flags = json.loads(str(resp))
             return bool(flags and (flags[0] or flags[1]))
         except (ValueError, TypeError, IndexError):
-            print(f"[lua] read_nav_world_visible: bad response {resp!r}")
+            logger.warning("[lua] read_nav_world_visible: bad response %r", resp)
             return True
 
     def read_current_road_rule(self, pos, dir_vec) -> RoadRuleView | None:
@@ -711,9 +736,11 @@ class BeamNGConnector:
                 resp = self.bng.control.queue_lua_command(
                     chunk, response=True)
             except Exception as exc:
+                # NOTE: bare except kept — Lua command can fail with any
+                # transport error; we return None and warn once.
                 if not getattr(self, "_road_rule_warned", False):
                     self._road_rule_warned = True
-                    print(f"[lua] read_current_road_rule failed: {exc}")
+                    logger.warning("[lua] read_current_road_rule failed: %s", exc)
                 return None
         if resp is None or str(resp).strip() == "nil":
             return None
@@ -722,7 +749,7 @@ class BeamNGConnector:
         except (ValueError, TypeError):
             if not getattr(self, "_road_rule_warned", False):
                 self._road_rule_warned = True
-                print(f"[lua] read_current_road_rule: bad response {resp!r}")
+                logger.warning("[lua] read_current_road_rule: bad response %r", resp)
             return None
         rule = RoadRuleView.from_lua_dict(data)
         if rule is not None:
@@ -773,9 +800,11 @@ class BeamNGConnector:
                 resp = self.bng.control.queue_lua_command(
                     chunk, response=True)
             except Exception as exc:
+                # NOTE: bare except kept — Lua command can fail with any
+                # transport error; we return empty list and warn once.
                 if not getattr(self, "_signal_rule_warned", False):
                     self._signal_rule_warned = True
-                    print(f"[lua] read_signal_snapshot failed: {exc}")
+                    logger.warning("[lua] read_signal_snapshot failed: %s", exc)
                 return []
         if resp is None or str(resp).strip() in ("", "nil"):
             return []
@@ -784,7 +813,7 @@ class BeamNGConnector:
         except (ValueError, TypeError):
             if not getattr(self, "_signal_rule_warned", False):
                 self._signal_rule_warned = True
-                print(f"[lua] read_signal_snapshot: bad response {resp!r}")
+                logger.warning("[lua] read_signal_snapshot: bad response %r", resp)
             return []
         if not isinstance(data, list):
             return []
@@ -819,7 +848,9 @@ class BeamNGConnector:
                 resp = self.bng.control.queue_lua_command(
                     chunk, response=True)
             except Exception as exc:
-                print(f"[lua] set_nav_world_visible failed: {exc}")
+                # NOTE: bare except kept — Lua command can fail with any
+                # transport error; return False for graceful degradation.
+                logger.warning("[lua] set_nav_world_visible failed: %s", exc)
                 return False
         return str(resp).strip() == "ok"
 

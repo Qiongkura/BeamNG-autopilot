@@ -46,6 +46,9 @@ obstacle / handover tests, so the tests exercise exactly what ships.
 from __future__ import annotations
 
 import json
+import logging
+
+logger = logging.getLogger(__name__)
 
 from .gearbox import (
     engage_neutral,
@@ -77,11 +80,13 @@ def _parking_brake(conn) -> str | None:
                 parsed = json.loads(resp)
                 if isinstance(parsed, str):
                     resp = parsed
-            except Exception:
+            except (ValueError, TypeError):
                 pass
         return str(resp) if resp is not None else None
     except Exception as exc:
-        print(f"[handover] parking brake read failed: {exc}")
+        # NOTE: bare except kept — Lua command can fail with any
+        # transport error; we return None for graceful degradation.
+        logger.warning("[handover] parking brake read failed: %s", exc)
         return None
 
 
@@ -108,7 +113,9 @@ def _brake_to_standstill(conn, log=print) -> bool:
             if abs(signed_speed(conn.get_state())) < 0.25:
                 return True
         except Exception as exc:
-            log(f"[handover] brake loop error: {exc}")
+            # NOTE: bare except kept — transport error during braking is
+            # unrecoverable in this loop; return False immediately.
+            logger.warning("[handover] brake loop error: %s", exc)
             return False
     return False
 
@@ -196,10 +203,14 @@ def handover_vehicle(conn, saved_gearbox: str | None,
             f"mode={state['mode']}, "
             f"parkingbrake={state['parkingbrake']}, pedals zeroed)")
     except Exception as exc:
-        print(f"[handover] failed: {exc}")
+        # NOTE: bare except kept — any error during the handover sequence
+        # must not crash; we try to park the car and return.
+        logger.warning("[handover] failed: %s", exc)
         try:
             conn.control(throttle=0.0, brake=0.0, steering=0.0,
                          parkingbrake=1.0)
             conn.step(3)
         except Exception:
+            # NOTE: bare except kept — best-effort parking attempt
+            # during error recovery; nothing more we can do.
             pass

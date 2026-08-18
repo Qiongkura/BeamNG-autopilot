@@ -5,7 +5,11 @@ a front-camera projection overlay in the HUD.
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 
 def _to_xy(points):
@@ -62,6 +66,8 @@ class WorldOverlay:
             try:
                 sent.append(conn.send(msg))
             except Exception:
+                # NOTE: bare except kept — debug primitive send can fail
+                # with any transport error; mark as failed.
                 sent.append(None)
         out: list = []
         for msg, resp in zip(messages, sent):
@@ -72,6 +78,8 @@ class WorldOverlay:
             try:
                 out.append(resp.recv(want))
             except Exception:
+                # NOTE: bare except kept — debug primitive recv can fail
+                # with any transport error; mark as failed.
                 out.append(None)
         return out
 
@@ -88,6 +96,8 @@ class WorldOverlay:
                 elif obj_type == "rectangles":
                     self.bng.remove_debug_rectangle(oid)
             except Exception:
+                # NOTE: bare except kept — best-effort removal of
+                # individual debug primitives; ignore failures.
                 pass
 
     def _clear(self):

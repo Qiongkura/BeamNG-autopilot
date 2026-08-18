@@ -27,10 +27,13 @@ limit.
 from __future__ import annotations
 
 import json
+import logging
 import math
 from dataclasses import dataclass
 
 import numpy as np
+
+logger = logging.getLogger(__name__)
 
 _LUA_CHUNK = r"""
 local ego = %(ego)s
@@ -686,8 +689,10 @@ def scan_obstacles_raycast(
     try:
         resp = bng.queue_lua_command(chunk, response=True)
     except Exception as exc:
+        # NOTE: bare except kept — Lua command can fail with any
+        # transport error; we return empty results and record the error.
         last_error["raycast"] = str(exc)
-        print(f"[perception] raycast scan failed: {exc}")
+        logger.warning("[perception] raycast scan failed: %s", exc)
         return [] if not return_hits else ([], [])
     if not resp:
         last_error["raycast"] = "empty response"
@@ -696,7 +701,7 @@ def scan_obstacles_raycast(
         data = json.loads(str(resp))
     except (ValueError, TypeError):
         last_error["raycast"] = "bad response"
-        print("[perception] raycast scan: bad response")
+        logger.warning("[perception] raycast scan: bad response")
         return [] if not return_hits else ([], [])
     last_error["raycast"] = None
     pts: list[tuple[float, float]] = []
@@ -921,8 +926,10 @@ def scan_obstacles_vehicles(
     try:
         resp = bng.queue_lua_command(chunk, response=True)
     except Exception as exc:
+        # NOTE: bare except kept — Lua command can fail with any
+        # transport error; we return empty results and record the error.
         last_error["vehicles"] = str(exc)
-        print(f"[perception] vehicle scan failed: {exc}")
+        logger.warning("[perception] vehicle scan failed: %s", exc)
         return []
     if not resp:
         last_error["vehicles"] = "empty response"
@@ -931,7 +938,7 @@ def scan_obstacles_vehicles(
         data = json.loads(str(resp))
     except (ValueError, TypeError):
         last_error["vehicles"] = "bad response"
-        print("[perception] vehicle scan: bad response")
+        logger.warning("[perception] vehicle scan: bad response")
         return []
     last_error["vehicles"] = None
     out: list[Obstacle] = []
@@ -999,8 +1006,10 @@ def scan_obstacles(
     try:
         resp = bng.queue_lua_command(chunk, response=True)
     except Exception as exc:
+        # NOTE: bare except kept — Lua command can fail with any
+        # transport error; we return empty results and record the error.
         last_error["scenario"] = str(exc)
-        print(f"[perception] obstacle scan failed: {exc}")
+        logger.warning("[perception] obstacle scan failed: %s", exc)
         return []
     if not resp:
         last_error["scenario"] = "empty response"
@@ -1009,7 +1018,7 @@ def scan_obstacles(
         data = json.loads(str(resp))
     except (ValueError, TypeError):
         last_error["scenario"] = "bad response"
-        print("[perception] obstacle scan: bad response")
+        logger.warning("[perception] obstacle scan: bad response")
         return []
     last_error["scenario"] = None
     out: list[Obstacle] = []

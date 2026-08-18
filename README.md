@@ -248,47 +248,40 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
 
 ### 架构层面
 
-| 问题 | 影响 | 优先级 |
-| --- | --- | --- |
-| **`planner.py` 单文件 2790 行**：路径规划、速度规划、A* 网格、实线检测、障碍物限速全部堆在一个文件里，包含 20+ 个函数和数十个互相关联的魔数常量 | 可维护性极差，改一个逻辑容易牵连其他行为；新贡献者几乎无法理解整体流程 | 高 |
-| **`lane.py` 1500 行、`perception.py` 964 行**：传感器车道帧构建和障碍物融合同样过度膨胀 | 与 planner 同款维护困难 | 高 |
-| **`m5_autopilot.py` 主循环 2516 行**：热键处理、遥测、控制、感知全部内联在一个脚本里 | 脚本不可测试、不可复用；换个入口就要复制大段代码 | 高 |
-| **53 处裸 `except Exception`**：散布在 connector、perception、control 等模块中，多数只做 `print` 或静默吞掉 | 真实错误被掩盖，调试时难以定位根因；网络超时和 Lua 错误被同等对待 | 中 |
+| 问题 | 影响 | 优先级 | 状态 |
+| --- | --- | --- | --- |
+| **`planner.py` 单文件 2790 行** | 可维护性极差 | 高 | ✅ 已拆分为 `planner/` 包（6 个子模块） |
+| **`lane.py` 1500 行** | 维护困难 | 高 | ✅ 已拆分为 `lane/` 包（6 个子模块） |
+| **`m5_autopilot.py` 主循环 2516 行** | 脚本不可测试、不可复用 | 高 | 待拆分 |
+| **53 处裸 `except Exception`** | 真实错误被掩盖 | 中 | 🔄 清理中 |
 
 #### 重构方案
 
-**`planner.py` → `planner/` 包**（当前 2790 行，目标每个子模块 ≤400 行）：
+**`planner.py` → `planner/` 包** ✅ 已完成：
 
 ```
 beamng_autopilot/planner/
 ├── __init__.py      # re-export LocalPlanner，保持外部 import 不变
-├── constants.py     # 所有 SOLID_*/GRID_*/LANE_* 魔数集中管理
-├── path.py          # A* 网格、路径弹性带变形、路径裁剪
-├── speed.py         # 运动学限速、障碍物速度限制、creep_speed
-├── obstacles.py     # 膨胀框、footprint、blocker 检测、LiDAR 聚类过滤
-├── solid.py         # 实线检测、噪声过滤、crossing 判定
-└── bypass.py        # 横向绕行（lateral_bypass）、道路边缘墙
+├── constants.py     # 53 个魔数常量 + _MapLaneBoundary 类
+├── geometry.py      # 18 个纯数学函数（曲率、投影、距离）
+├── obstacles.py     # 14 个障碍物几何/分类/碰撞检测函数
+├── solid.py         # 5 个实线检测/噪声过滤/禁止穿越函数
+└── core.py          # LocalPlanner 类 + creep_speed
 ```
 
-拆分原则：
-- `constants.py` 先行：把 60+ 个魔数从各处收集到一个文件，其他模块 `from .constants import *`
-- 按职责拆分，不改算法：每个子模块是从原文件剪切出来的，不改动逻辑
-- `__init__.py` 做 `from .path import *` 等聚合，外部 `from beamng_autopilot.planner import LocalPlanner` 等语句无需修改
-- 每拆一个子模块跑一次 `pytest tests/` + `m5_offline_validate.py`，确保行为不变
-
-**`lane.py` → `lane/` 包**（当前 1500 行）：
+**`lane.py` → `lane/` 包** ✅ 已完成：
 
 ```
 beamng_autopilot/lane/
 ├── __init__.py      # re-export pair_lane_markings, LaneTracker 等
-├── constants.py     # LANE_*/MARKING_*/LIDAR_* 常量
-├── pairing.py       # 标线配对（pair_lane_markings）：左右边界 → 车道中心
-├── fusion.py        # 视觉 + LiDAR 融合（choose_sensor_lane）
-├── tracking.py      # LaneTracker：帧间跟踪、老化、置信度衰减
-└── lidar.py         # build_lidar_corridor：LiDAR 射线 → 自由空间走廊
+├── constants.py     # 55 个车道追踪常量
+├── pairing.py       # 19 个视觉标线配对函数
+├── lidar.py         # LiDAR 射线走廊估算
+├── fusion.py        # 视觉 + LiDAR 传感器融合
+└── tracking.py      # LaneTracker 类 + 帧间跟踪/稳定性检查
 ```
 
-**`m5_autopilot.py` → 薄脚本 + 库**（当前 2516 行）：
+**`m5_autopilot.py` → 薄脚本 + 库**（待拆分，当前 2516 行）：
 
 ```
 beamng_autopilot/
