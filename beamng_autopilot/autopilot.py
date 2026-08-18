@@ -915,9 +915,19 @@ class AutopilotSession:
                               "press F9 to drive on lane vision, or M "
                               "+ F10 for a nav route")
                     except Exception as exc:
-                        print(f"[m5] instance found but no vehicle to "
-                              f"attach ({exc}); loading a fresh "
-                              "scenario")
+                        # 游戏已在运行但场景没有可附着的车辆。此时不要自动
+                        # 加载新场景——load_scenario() 会在已运行的游戏上
+                        # 触发重型 Lua 操作（+随后的 roadnet.build() 90s
+                        # 循环），正是把 BeamNG.tech 引擎卡死/崩掉的根源。
+                        # 改为友好提示用户放车后 --attach，程序立即退出。
+                        print("[m5] 场景里没有可附着的车辆，请先在游戏里")
+                        print("[m5] 放置一辆车（或进入有车的场景），再")
+                        print("[m5] 用 --attach 重新启动助手。")
+                        print(f"[m5] （详情：{exc}）")
+                        raise RuntimeError("no vehicle in running map")
+                except RuntimeError as exc:
+                    # 明确的无车/无通讯端口情况：直接退出，不加载场景。
+                    raise exc
                 except Exception as exc:
                     if beamng_process_running():
                         print("[m5] BeamNG is running but the "
@@ -933,13 +943,15 @@ class AutopilotSession:
                     print(f"[m5] no running instance ({exc}); "
                           "launching a fresh scenario")
                 if not attached:
+                    # 仅当游戏完全没在运行、且确实需要从头启动时才加载
+                    # 新场景。用一个宽松的超时避免 roadnet 构建无限阻塞。
                     self.conn.open(launch=True)
                     self.conn.load_scenario()
                     print("[m5] scenario loaded: press F9 to drive on "
                           "lane vision, or M + F10 for a nav route")
                     t0 = time.time()
                     while (not self.roadnet.ready
-                           and time.time() - t0 < 90.0):
+                           and time.time() - t0 < 15.0):
                         with self.conn.io_lock:
                             road_ready = self.roadnet.build(
                                 self.conn.bng)
