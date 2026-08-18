@@ -46,6 +46,7 @@ MOD_WIN = 0x0008
 # RegisterHotKey modifier flag -> the virtual key to poll for it.
 _MOD_VK = {MOD_ALT: 0x12, MOD_CONTROL: 0x11, MOD_SHIFT: 0x10, MOD_WIN: 0x5B}
 
+VK_F7 = 0x76
 VK_F8 = 0x77
 VK_F9 = 0x78
 VK_F10 = 0x79

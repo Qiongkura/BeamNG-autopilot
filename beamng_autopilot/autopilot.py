@@ -22,6 +22,7 @@ from typing import Iterator
 
 import cv2
 import numpy as np
+import torch
 
 from beamng_autopilot import config
 from beamng_autopilot.bridge import ControlBridge
@@ -33,6 +34,7 @@ from beamng_autopilot.control.speed import SpeedController
 from beamng_autopilot.hotkeys import (
     HotkeyListener,
     MOD_CONTROL,
+    VK_F7,
     VK_F8,
     VK_F9,
     VK_F10,
@@ -293,6 +295,7 @@ class AutopilotSession:
         }
         self.hotkeys = HotkeyListener(
             bindings={
+                VK_F7: "bc_mode",
                 VK_F8: "vision",
                 VK_F9: "autopilot",
                 VK_F10: "navroute",
@@ -317,6 +320,28 @@ class AutopilotSession:
             sharp_corner_kph=args.sharp_corner_kph,
         )
         self.speed_ctrl = SpeedController()
+
+        # --- DAVE-2 BC model (M3) -------------------------------------------
+        self.bc_model = None
+        self.bc_device = None
+        self.bc_w, self.bc_h = 200, 66
+        self.bc_mode = False  # True = use neural net for steering
+        if getattr(args, 'bc_model', None):
+            try:
+                from beamng_autopilot.bc import Dave2, conv_feature_size
+                ckpt = torch.load(args.bc_model, map_location="cpu")
+                self.bc_w, self.bc_h = ckpt.get("resize", (200, 66))
+                self.bc_device = torch.device(
+                    "cuda" if torch.cuda.is_available() else "cpu")
+                self.bc_model = Dave2(
+                    feat_in=conv_feature_size(self.bc_h, self.bc_w))
+                self.bc_model.load_state_dict(ckpt["state_dict"])
+                self.bc_model.to(self.bc_device).eval()
+                print(f"[m5] BC model loaded: {args.bc_model} "
+                      f"input={self.bc_w}x{self.bc_h} "
+                      f"device={self.bc_device}")
+            except Exception as exc:
+                print(f"[m5] BC model load failed: {exc}")
 
         # --- state ---------------------------------------------------------------
         self.route: np.ndarray | None = None
@@ -1109,6 +1134,16 @@ class AutopilotSession:
                                 "invalid cruise speed (1-60 m/s)")
                     elif key == "quit":
                         self.quit_flag = True
+                    elif key == "bc_mode":
+                        if self.bc_model is None:
+                            self.toast("no BC model loaded "
+                                       "(use --bc-model)")
+                        else:
+                            self.bc_mode = not self.bc_mode
+                            self.toast(
+                                "BC steering ON"
+                                if self.bc_mode
+                                else "BC steering OFF")
                     elif key == "vision":
                         self.vision = not self.vision
                         self.toast(
@@ -1761,23 +1796,57 @@ class AutopilotSession:
                     desired_speed)
                 obs_lim = getattr(
                     self.planner, "last_obs_lim", None)
-                self.pp.lookahead = (
-                    self.pp.adaptive_lookahead(speed))
-                steer_rad, _, _ = self.pp.steering(
-                    st.pos, st.heading, drive_route, 0)
-                new_steer = float(np.clip(
-                    -steer_rad / 0.6, -1.0, 1.0))
-                v_sq = max(speed * speed, 2.0)
-                steer_cap = max(
-                    0.10,
-                    min(1.0, 5.0 * 2.9 / v_sq / 0.6))
-                new_steer = float(np.clip(
-                    new_steer, -steer_cap, steer_cap))
-                steer = smooth_steer(
-                    self.prev_steer, new_steer, dt)
-                self.prev_steer = steer
-                steer_angle = abs(steer) * 0.6
-                steer_capped = False
+                # BC steering mode: use DAVE-2 neural network
+                if self.bc_mode and self.bc_model is not None:
+                    with self.vision_lock:
+                        frame = self.vision_snapshot.get("frame")
+                    if frame is not None:
+                        from beamng_autopilot.bc import preprocess_frame
+                        tensor = preprocess_frame(
+                            frame, self.bc_w, self.bc_h)
+                        tensor = tensor.to(self.bc_device)
+                        with torch.no_grad():
+                            pred = self.bc_model(tensor)
+                        bc_steer = float(pred.item())
+                        new_steer = float(np.clip(
+                            bc_steer, -1.0, 1.0))
+                        steer = smooth_steer(
+                            self.prev_steer, new_steer, dt)
+                        self.prev_steer = steer
+                        steer_angle = abs(steer) * 0.6
+                        steer_capped = False
+                    else:
+                        # No frame available, fall back to rule-based
+                        self.pp.lookahead = (
+                            self.pp.adaptive_lookahead(speed))
+                        steer_rad, _, _ = self.pp.steering(
+                            st.pos, st.heading, drive_route, 0)
+                        new_steer = float(np.clip(
+                            -steer_rad / 0.6, -1.0, 1.0))
+                        steer = smooth_steer(
+                            self.prev_steer, new_steer, dt)
+                        self.prev_steer = steer
+                        steer_angle = abs(steer) * 0.6
+                        steer_capped = False
+                else:
+                    # Rule-based steering (Pure Pursuit)
+                    self.pp.lookahead = (
+                        self.pp.adaptive_lookahead(speed))
+                    steer_rad, _, _ = self.pp.steering(
+                        st.pos, st.heading, drive_route, 0)
+                    new_steer = float(np.clip(
+                        -steer_rad / 0.6, -1.0, 1.0))
+                    v_sq = max(speed * speed, 2.0)
+                    steer_cap = max(
+                        0.10,
+                        min(1.0, 5.0 * 2.9 / v_sq / 0.6))
+                    new_steer = float(np.clip(
+                        new_steer, -steer_cap, steer_cap))
+                    steer = smooth_steer(
+                        self.prev_steer, new_steer, dt)
+                    self.prev_steer = steer
+                    steer_angle = abs(steer) * 0.6
+                    steer_capped = False
                 if ((steer_angle > 0.09
                         and corner_v
                         < self.cruise_speed * 0.85)):

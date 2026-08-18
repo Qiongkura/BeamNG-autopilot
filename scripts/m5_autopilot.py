@@ -94,6 +94,10 @@ def main() -> None:
     ap.add_argument("--sharp-corner-kph", type=float,
                     default=SHARP_CORNER_KPH,
                     help="max speed through a sharp corner (km/h)")
+    ap.add_argument("--bc-model", default=None,
+                    help="DAVE-2 behavioural cloning model path "
+                         "(e.g. logs/m3_bc/bc_tech_smallgrid.pt). "
+                         "When loaded, press F7 to toggle BC steering mode")
     args = ap.parse_args()
 
     session = AutopilotSession(args)
