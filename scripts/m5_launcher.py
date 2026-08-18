@@ -1015,8 +1015,43 @@ class LauncherApp:
 
 
 def main() -> None:
+    # 单实例锁：防止重复打开多个启动器窗口，避免它们各自拉起
+    # 重复的 m5_autopilot.py 进程，互相抢同一个游戏连接导致卡死。
+    import uuid
+    _lock = config.LOGS_DIR / "m5_launcher.lock"
+    try:
+        _lock.parent.mkdir(parents=True, exist_ok=True)
+        _fd = open(_lock, "w")
+        try:
+            import msvcrt
+            if msvcrt.locking(_fd.fileno(), msvcrt.LK_NBLCK, 1):
+                _lock.unlink()
+        except OSError:
+            import tkinter.messagebox as _mb
+            import sys as _sys
+            _root = tk.Tk()
+            _root.withdraw()
+            _mb.showwarning(
+                "启动器已运行",
+                "检测到另一个启动器实例已打开。\n"
+                "请先关闭现有的启动器窗口，避免多个自动驾驶助手重复连接。")
+            _root.destroy()
+            _sys.exit(1)
+    except Exception:
+        pass
+
     app = LauncherApp(tk.Tk())
-    app.root.mainloop()
+    try:
+        app.root.mainloop()
+    finally:
+        try:
+            _fd.close()
+        except Exception:
+            pass
+        try:
+            _lock.unlink()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
