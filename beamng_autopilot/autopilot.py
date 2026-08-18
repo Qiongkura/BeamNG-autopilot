@@ -1142,24 +1142,20 @@ class AutopilotSession:
                                 "route with F10 or enable lane "
                                 "vision")
                     elif key == "navroute":
-                        if self.autopilot:
-                            self.toast("stop autopilot first (F9)")
+                        nav = conn.read_navigation_route()
+                        if nav is not None:
+                            self.route = (
+                                nav[:, :2]
+                                if nav.ndim == 2
+                                and nav.shape[1] >= 3
+                                else nav)
+                            self.toast(
+                                f"navigation route grabbed: "
+                                f"{len(self.route)} pts")
                         else:
-                            nav = conn.read_navigation_route()
-                            if nav is not None:
-                                self.route = (
-                                    nav[:, :2]
-                                    if nav.ndim == 2
-                                    and nav.shape[1] >= 3
-                                    else nav)
-                                self.toast(
-                                    f"navigation route grabbed: "
-                                    f"{len(self.route)} pts - "
-                                    "press F9")
-                            else:
-                                self.toast(
-                                    "no navigation route - press M "
-                                    "in game and pick a destination")
+                            self.toast(
+                                "no navigation route - press M "
+                                "in game and pick a destination")
                     elif key == "clear":
                         self.route = None
                         self.cached_drive_route = None
