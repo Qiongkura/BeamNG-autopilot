@@ -121,10 +121,22 @@ local ego = %(ego)s
 local ex, ey = %(ex)s, %(ey)s
 local radius = %(radius)s
 local out = {}
+-- The beamngpy-side ``ego_vid`` ("ego") is not the vehicle id the game
+-- registry uses (a numeric id such as 77405), so comparing ids alone can
+-- never exclude the player's own car.  Ask the engine for the real
+-- player vehicle and skip it by id; when the API is unavailable (older
+-- Steam builds) fall back to the string comparison.
+local player_id = nil
+local pok, pveh = pcall(function() return be:getPlayerVehicle(0) end)
+if pok and pveh then
+  local pid_ok, pid_val = pcall(function() return pveh:getId() end)
+  if pid_ok then player_id = pid_val end
+end
 invalidateVehicleCache()
 for _, veh in ipairs(getAllVehicles()) do
   local ok, id = pcall(function() return veh:getId() end)
-  if ok and id ~= nil and tostring(id) ~= ego then
+  if ok and id ~= nil and tostring(id) ~= ego
+     and (player_id == nil or tostring(id) ~= tostring(player_id)) then
     local okp, pos = pcall(function() return veh:getPosition() end)
     if okp and pos then
       local dx = pos.x - ex
@@ -705,6 +717,13 @@ def scan_obstacles_raycast(
         return [] if not return_hits else ([], [])
     last_error["raycast"] = None
     pts: list[tuple[float, float]] = []
+    # Near-field hits strictly for the standalone raw-sensor safety layer
+    # (forward_clearance_m).  ``min_dist`` still guards the *clustering*
+    # pool so own-car tail / wheel guards do not become road obstacles,
+    # but a wall 1-2 m in front of the bonnet must stay visible to the
+    # emergency-stop layer - otherwise the car floors the throttle into
+    # it (observed: throttle=94.7% at v=0 until the STUCK watchdog).
+    near_pts: list[tuple[float, float]] = []
     for entry in data or []:
         try:
             x = float(entry["x"])
@@ -716,6 +735,26 @@ def scan_obstacles_raycast(
             continue
         hdist = math.hypot(x - p[0], y - p[1])
         if hdist < min_dist:
+            # Keep points just outside the body (>= 1.0 m) for the
+            # emergency stop layer only; they never enter the obstacle
+            # clustering.  The same terrain-rise probe used for the normal
+            # pool is applied here too: a horizontal fan hit that a higher
+            # probe easily clears is the ground / a curb, not something the
+            # car can drive into, and it would otherwise project onto the
+            # emergency corridor and pin the car to a standstill (observed
+            # EMERGENCY STOP raw clear=0.7m on flat ground everywhere).
+            if return_hits and hdist >= 1.0 and abs(z - p[2]) <= z_tol:
+                fan = str(entry.get("fan") or "mid")
+                fan_r = float(low_radius if fan == "low" else radius)
+                try:
+                    up = None if entry.get("up") is None \
+                        else float(entry["up"])
+                except (TypeError, ValueError):
+                    up = None
+                ground_like = (up is not None and up <= fan_r
+                               and up > hdist + float(rise_tol))
+                if not ground_like:
+                    near_pts.append((x, y))
             continue  # own car / very close clutter
         if abs(z - p[2]) > z_tol:
             continue  # bridges far above or tunnels below
@@ -739,14 +778,21 @@ def scan_obstacles_raycast(
         elif up > hdist + float(rise_tol):
             continue
         pts.append((x, y))
+    if return_hits:
+        hits = pts + near_pts
+        if not hits and not pts:
+            return [], []
+        out: list[Obstacle] = []
+        for sector in _split_raycast_sectors(pts, p[:2]):
+            out.extend(_cluster_points(sector, cell=cluster_cell,
+                                       split_walls=True))
+        return out, hits
     if not pts:
-        return [] if not return_hits else ([], [])
-    out: list[Obstacle] = []
+        return []
+    out = []
     for sector in _split_raycast_sectors(pts, p[:2]):
         out.extend(_cluster_points(sector, cell=cluster_cell,
                                    split_walls=True))
-    if return_hits:
-        return out, pts
     return out
 
 
