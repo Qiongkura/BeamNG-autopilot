@@ -12,7 +12,9 @@ from .constants import (
     CAR_HALF_WIDTH, CORRIDOR_HALF_W, DECEL_MPS2, DEV_PENALTY, GRID_AHEAD,
     GRID_ANTICIPATE, GRID_BEHIND, GRID_HALF_W, GRID_RES, GRID_RIGHT_BIAS,
     LANE_BOUNDARY_CLEAR_M, LANE_BOUNDARY_CORRECTION_MAX_M, LANE_BOUNDARY_MAX_M,
-    LANE_EDGE_NAV_MAX_DEV_M, LANE_EDGE_NAV_MIN_SIGN_M, LANE_FULL_CONF,
+    LANE_EDGE_NAV_MAX_DEV_M, LANE_EDGE_NAV_MIN_SIGN_M,
+    LANE_EDGE_PULL_MAX_M, LANE_EDGE_RIGHT_MAX_DEV_M,
+    LANE_EDGE_RIGHT_VISION_MAX_DEV_M, LANE_FULL_CONF,
     LANE_LIDAR_CORRECTION_MAX_M, LANE_LIDAR_EDGE_CORRECTION_MAX_M,
     LANE_NAV_MAX_DEV_M, LANE_WIDTH_DEFAULT_M, LIDAR_PATH_CLEAR_M,
     MAX_LATERAL_DEV, PASS_BY_MIN_MPS, PLAN_HORIZON_M, RIGHT_OFFSET_M,
@@ -99,6 +101,12 @@ class LocalPlanner:
         # single lane boundary (right line / wall / guardrail) defined the
         # drive path.  Diagnostics only.
         self.last_lane_offset = 0.0
+        # True while the car sits on the FORBIDDEN side of the map centre
+        # line: the plan forces the full legal-lane target so the car
+        # recovers immediately, and the autopilot crawls back instead of
+        # driving wrong-way.  One second of wrong-way driving is not
+        # allowed.
+        self.last_map_recover = False
         # When a paired sensor lane was rejected because it deviated too
         # far from the nav route: ("nav", deviation_m) or None.
         self.last_lane_override: tuple[str, float] | None = None
@@ -148,6 +156,18 @@ class LocalPlanner:
         self.last_plan_stages = {}
         self._cross_solid = bool(cross_solid)
         _t0 = time.perf_counter()
+        # Full obstacle set for the final clearance guarantee, captured
+        # before the per-stage filters strip obstacles out.  The detour
+        # grid and the final no-contact check must still see a wall that
+        # was classified as a "roadside boundary": a detour around a
+        # different blocker can otherwise sweep straight into it (fuzz
+        # scene 14 drove y=-3.5 through a wall the grid never saw).
+        # Sparse raycast specks / small lidar clutter are sensor noise
+        # and never participate.
+        all_obstacles = [
+            ob for ob in (obstacles or [])
+            if not is_sparse_raycast_speck(ob)
+            and not is_small_lidar_clutter(ob)]
 
         def _stage(name: str) -> None:
             self.last_plan_stages[name] = (
@@ -236,7 +256,108 @@ class LocalPlanner:
         # ``map_offset`` at ``None`` means no code path may shift the drive
         # path by ``preferred_offset_m``.
         map_offset = None
+        # The map knows the exact legal lane centre (link width / lane
+        # count / side of travel).  When no trusted two-sided sensor lane
+        # is present, this is the lateral driving target: the in-game nav
+        # route rides the ROAD centre, which on a two-way street is the
+        # centre line itself - following it presses the paint and, in a
+        # left curve, cuts into the oncoming side (run 1787134963
+        # t=14-27: route_lat -0.5..-1.2).  The map target is only a
+        # fallback reference: a paired vision+LiDAR lane still replaces
+        # it, obstacles may shrink it (``_safe_lateral_offset`` never
+        # flips side), and the map centre-line boundary below is the
+        # hard no-cross rule.
+        map_target = None
+        if (map_lane is not None and map_lane.legal
+                and map_lane.preferred_offset_m):
+            map_target = float(map_lane.preferred_offset_m)
+        # Map wrong-side recovery: when the car already sits on the
+        # forbidden side of the map centre line while the road itself
+        # stays legal, the full legal-lane target is forced immediately
+        # (no obstacle shrink, no sensor-lane detour) so the car returns
+        # to its own lane at crawl speed instead of continuing wrong-way
+        # (run 1787150245 t=36-40: the offset snapped from 1.75 to 0 on
+        # a lidar cluster and the car cut the left bend on the oncoming
+        # side).  ``last_map_recover`` lets the autopilot cap the speed.
+        self.last_map_recover = False
+        if (map_target is not None and map_boundaries
+                and route is not None and len(route) >= 2):
+            pos2 = np.asarray(pos, dtype=float)[:2]
+            for b in map_boundaries:
+                wb = np.asarray(b.world[:, :2], dtype=float)
+                if len(wb) < 2:
+                    continue
+                side = float(b.allowed_side)
+                if (_point_lat_offset(pos2[0], pos2[1], wb) * side
+                        >= -0.35):
+                    continue
+                rw = np.asarray(
+                    self._window(route, nearest)[0][:, :2], dtype=float)
+                if len(rw) >= 2:
+                    rlats = np.asarray([
+                        _point_lat_offset(float(px), float(py), wb)
+                        for px, py in rw])
+                    if float(np.median(rlats)) * side < -0.1:
+                        # The road itself turns away from this link's
+                        # straight centre line; not a recovery case.
+                        continue
+                self.last_map_recover = True
+                self.last_lane_override = (
+                    "map-recover", round(float(map_target), 2))
+                break
         raw_path = None
+        # Map-side trust guard: a two-sided sensor lane whose centre sits
+        # on the FORBIDDEN side of the map centre line (while the nav
+        # route itself stays legal) is a wrong pairing - a far lane's
+        # lines or a vision+LiDAR fusion on the oncoming side.  Following
+        # it drives wrong-way (run 1787134963 t=17: fusion lane_lat
+        # +1.4 m pushed the car to route_lat -1.16 m).  The map boundary
+        # is authoritative, so the lane is dropped to nav-primary and the
+        # map legal-lane target drives the car back into its own lane.
+        if lane_primary and map_boundaries and lane_center is not None:
+            pos2 = np.asarray(pos, dtype=float)[:2]
+            lane_np = np.asarray(lane_center[:, :2], dtype=float)
+            if lane_np.ndim == 2 and len(lane_np) >= 2:
+                d2 = np.sum((lane_np - pos2) ** 2, axis=1)
+                lane_near = lane_np[d2 <= 30.0 ** 2]
+                if len(lane_near) >= 2:
+                    for b in map_boundaries:
+                        w = np.asarray(b.world[:, :2], dtype=float)
+                        if len(w) < 2:
+                            continue
+                        side = float(b.allowed_side)
+                        lane_lats = np.asarray([
+                            _point_lat_offset(float(px), float(py), w)
+                            for px, py in lane_near])
+                        route_ok = True
+                        if route is not None and len(route) >= 2:
+                            rw = np.asarray(
+                                self._window(route, nearest)[0][:, :2],
+                                dtype=float)
+                            if len(rw) >= 2:
+                                route_lats = np.asarray([
+                                    _point_lat_offset(
+                                        float(px), float(py), w)
+                                    for px, py in rw])
+                                # The road itself turning / leaving the
+                                # link's straight centre line is a real
+                                # geometry change; then the lane is not a
+                                # wrong pairing.
+                                route_ok = bool(
+                                    float(np.median(route_lats)) * side
+                                    >= -0.1)
+                        if (route_ok
+                                and float(np.median(lane_lats)) * side
+                                < -0.35):
+                            lane_primary = False
+                            lane_mode = None
+                            lane_edge = None
+                            lane_center_hint = False
+                            self.last_lane_override = (
+                                "nav-map",
+                                round(float(abs(
+                                    np.median(lane_lats))), 2))
+                            break
         # Trust guard: a paired sensor lane may replace the nav route as
         # the driving centre only while it stays close to the route.  A
         # wrong pairing (far lane's line, roadside paint, guardrail
@@ -244,7 +365,14 @@ class LocalPlanner:
         # sideways - that was the lane_lat > 3 m weave / guardrail hit.
         # When the lane deviates too far, drop it to a single-edge
         # protection (nav route primary) instead.
-        if lane_primary and route is not None and len(route) >= 2:
+        if self.last_map_recover:
+            # Recovery overrides every sensor lane: a wrong-side pairing
+            # or a low-trust single edge must not fight the map target.
+            lane_primary = False
+            lane_mode = None
+            lane_edge = None
+            lane_center_hint = False
+        elif lane_primary and route is not None and len(route) >= 2:
             dev = self._sensor_nav_deviation(lane_center, route, pos)
             if dev is not None and dev > LANE_NAV_MAX_DEV_M:
                 lane_primary = False
@@ -281,28 +409,13 @@ class LocalPlanner:
             raw_path = pts.copy()
             i0, i1 = 0, len(pts) - 1
             if src.startswith("lidar") and lane_edge is None:
-                lane_gain = _lane_correction_gain(sensor_lane.confidence)
-                corr_max = LANE_LIDAR_CORRECTION_MAX_M
-                base = pts.copy()
-                n = len(pts)
-                d = np.linalg.norm(np.diff(base, axis=0), axis=1)
-                cum = np.concatenate([[0.0], np.cumsum(d)])
-                for i in range(n):
-                    f = _smoothstep(cum[i] / max(1e-9, self.right_ramp_m))
-                    a = base[max(0, i - 2)]
-                    b = base[min(n - 1, i + 2)]
-                    tv = b - a
-                    tn = float(np.linalg.norm(tv))
-                    if tn < 1e-9:
-                        left = np.array([-math.sin(heading),
-                                         math.cos(heading)])
-                    else:
-                        left = np.array([-tv[1] / tn, tv[0] / tn])
-                    off = _point_lat_offset(
-                        base[i, 0], base[i, 1], lane_center)
-                    off = max(-corr_max, min(corr_max, off))
-                    pts[i] = base[i] + left * (f * off * lane_gain)
-                self.last_lane_offset = 0.0
+                if map_target is not None:
+                    # Map data gives the exact lane centre; a low-trust
+                    # lidar centre hint must not stack on top of it.
+                    self.last_lane_offset = 0.0
+                else:
+                    self._apply_lidar_center_hint(
+                        pts, sensor_lane, heading, pos, lane_center)
             elif lane_edge is not None:
                 # Single-boundary protection: the nav route is the primary
                 # lane centre, so a right paint / wall / guardrail only
@@ -314,8 +427,19 @@ class LocalPlanner:
                 edge_ok = edge_dev is None
                 if edge_dev is not None:
                     if lane_edge_side < 0.0:
+                        # RIGHT edge: it defines the car's own lane,
+                        # so a far right edge (3-6 m on a two-way
+                        # street) is still the lane boundary, not
+                        # "another road".  A LiDAR wall is a
+                        # physical edge (real run: 6.85 m off the
+                        # road-centre route); a far vision paint is
+                        # capped tighter to avoid phantom lines.
+                        right_max = (
+                            LANE_EDGE_RIGHT_VISION_MAX_DEV_M
+                            if src.startswith("vision")
+                            else LANE_EDGE_RIGHT_MAX_DEV_M)
                         edge_ok = (LANE_EDGE_NAV_MIN_SIGN_M <= edge_dev
-                                   <= LANE_EDGE_NAV_MAX_DEV_M)
+                                   <= right_max)
                     else:
                         edge_ok = (-LANE_EDGE_NAV_MAX_DEV_M <= edge_dev
                                    <= -LANE_EDGE_NAV_MIN_SIGN_M)
@@ -335,10 +459,14 @@ class LocalPlanner:
                         "nav", 0.0 if edge_dev is None
                         else round(abs(edge_dev), 2))
                     self.last_lane_offset = 0.0
-                else:
+                elif map_target is None:
                     self._apply_single_edge_correction(
                         pts, lane_edge, lane_edge_side, src, sensor_lane,
                         heading)
+                else:
+                    # Map target drives the lane centre; the edge stays a
+                    # diagnostics boundary (and feeds the wall filter).
+                    self.last_lane_offset = 0.0
         elif route is not None:
             nav_pts, nav_i0, nav_i1 = self._window(route, nearest)
             pts = nav_pts[nav_i0:nav_i1 + 1].copy()
@@ -404,29 +532,42 @@ class LocalPlanner:
             # The offset is never pressed into a wall or a lane blocker; on
             # a wall-lined road the path simply eases back instead of
             # trying to squeeze past the wall.
-            safe_off = self._safe_right_offset(
-                raw_pts, i0, i1, heading, obstacles,
-                edge_pts=lane_edge, edge_side=lane_edge_side)
-            # In a bend, keep the car near the lane centre instead of
-            # pressing it to the right: a right-hand offset through a
-            # corner pushes the car toward the outside of the bend and
-            # onto the shoulder (run 36 exited the highway bend 5 m off
-            # the route).  Real drivers hold the line through the curve
-            # and only move right on straights.  The curvature is judged
-            # on the raw nav window; when it is sharp the offset ramps
-            # out smoothly.
-            bend_ang = corner_angle_max_deg(
-                raw_pts if len(raw_pts) >= 4 else pts, 0,
-                ahead_idx=max(16, int(40.0 / max(0.5, _route_spacing_m_impl(raw_pts)))))
-            # Even a gentle bend pushes the keep-right offset toward the
-            # outside of the curve: at 9 m/s a 16 deg corner with a 1.5 m
-            # right offset ran the car off the shoulder (run 40).  Ramp
-            # the offset out from 12 deg and remove it entirely above
-            # 25 deg - real drivers hold the line through any curve.
-            if bend_ang >= 25.0:
-                safe_off = 0.0
-            elif bend_ang >= 12.0:
-                safe_off *= 1.0 - (bend_ang - 12.0) / 13.0
+            if map_target is not None:
+                # Legal-lane centre from the map.  During a wrong-side
+                # recovery the full target is forced (snapping back to
+                # the centre line mid-curve is exactly what cut the
+                # corner wrong-way in run 1787150245); otherwise the
+                # offset eases back to the route centre when the target
+                # side is blocked (never flips to the opposite side).
+                if self.last_map_recover:
+                    safe_off = float(map_target)
+                else:
+                    safe_off = self._safe_lateral_offset(
+                        raw_pts, i0, i1, heading, obstacles,
+                        target=map_target)
+            else:
+                safe_off = self._safe_right_offset(
+                    raw_pts, i0, i1, heading, obstacles,
+                    edge_pts=lane_edge, edge_side=lane_edge_side)
+            # The MAP lane-centre target is the legal lane centre and is
+            # held through bends (real ADAS holds the line in a curve);
+            # only the legacy keep-right offset ramps out in bends,
+            # because a right-hand offset through a corner pushes the
+            # car toward the outside of the bend and onto the shoulder
+            # (run 36 exited the highway bend 5 m off the route).
+            if map_target is None:
+                bend_ang = corner_angle_max_deg(
+                    raw_pts if len(raw_pts) >= 4 else pts, 0,
+                    ahead_idx=max(16, int(40.0 / max(0.5, _route_spacing_m_impl(raw_pts)))))
+                # Even a gentle bend pushes the keep-right offset toward
+                # the outside of the curve: at 9 m/s a 16 deg corner with
+                # a 1.5 m right offset ran the car off the shoulder
+                # (run 40).  Ramp the offset out from 12 deg and remove
+                # it entirely above 25 deg.
+                if bend_ang >= 25.0:
+                    safe_off = 0.0
+                elif bend_ang >= 12.0:
+                    safe_off *= 1.0 - (bend_ang - 12.0) / 13.0
             self.last_lane_offset = float(safe_off) if abs(safe_off) > 1e-9 \
                 else 0.0
             _stage("safe_offset")
@@ -470,20 +611,30 @@ class LocalPlanner:
         def finish(out, mode: str):
             """Apply the solid-line boundary rule and record the mode."""
             boundaries = list(solid_lines or [])
-            # Map lane boundaries are long-range direction / wrong-way
-            # safety, not lane-level geometry.  Once the camera or LiDAR
-            # has produced a sensor lane, the car must steer by that local
-            # lane only; a map centre-line must not turn a legal local
-            # path into a phantom "solid line" stop.
-            if map_boundaries and lane_mode is None:
+            # Map lane boundaries are the AUTHORITATIVE no-cross /
+            # wrong-way safety layer derived from the road graph.  They
+            # ALWAYS apply: a paired two-sided lane proves where the
+            # car's lane is, but a wrong pairing on the oncoming side of
+            # the centre line must never be followed (one second of
+            # wrong-way driving is not allowed), and a SINGLE sensor edge
+            # (lidar|left/right, vision_left/right) knows only one side:
+            # without the map boundary the path rides the nav route (the
+            # road/link centre) and presses the centre line the whole
+            # run.  The map centre line therefore always applies, including
+            # when a paired lane drives the centre.
+            map_only: list = []
+            if map_boundaries:
+                map_only = list(map_boundaries)
                 boundaries.extend(map_boundaries)
             if self._cross_solid and mode == "detour":
-                # Overtaking with no oncoming traffic: the centre line
-                # (visual or map - on a two-way link the map boundary IS
-                # the centre line) may be crossed.  Staying on the road
-                # surface is enforced by the road-width clamp below, so no
-                # solid boundary applies to the detour.
-                boundaries = []
+                # Overtaking with no oncoming traffic may cross a
+                # VISUAL / explicitly supplied centre line, but never
+                # the authoritative map boundary (road graph): one
+                # second of wrong-way driving is not allowed.  Staying
+                # on the road surface is enforced by the road-width
+                # clamp below.
+                boundaries = [
+                    b for b in boundaries if b in map_only]
             if boundaries:
                 _t1 = time.perf_counter()
                 # A detour deliberately leaves the current lane: if it
@@ -499,13 +650,25 @@ class LocalPlanner:
                                or (sensor_lane.paired
                                    and sensor_lane.confidence
                                    >= SOLID_BLOCK_LANE_CONF))
-                allow_block = allow_block or bool(
-                    map_boundaries and lane_mode is None)
+                # Map boundaries are authoritative: they may always
+                # block (stop in front of the centre line) even in
+                # single-edge mode.
+                allow_block = allow_block or bool(map_boundaries)
+                # The map boundary is checked against the NAV route (the
+                # road reference), not against the sensor path being
+                # tested: a wrong sensor pairing on the oncoming side is a
+                # violation even while the road itself stays legal, and a
+                # turn / intersection where the nav route itself leaves
+                # the link's straight centre line is a genuine road
+                # geometry change, not a wrong-way attempt.
+                map_cor = raw_pts
+                if route is not None and len(route) >= 2:
+                    map_cor = self._window(route, nearest)[0]
                 out, crossed, cross_dist = _clamp_to_solid_lines(
                     out, boundaries, pos, SOLID_LINE_MARGIN,
                     corridor=raw_pts, allow_block=allow_block,
                     block_near_cross=(mode == "detour"),
-                    map_nudge=(lane_mode is None))
+                    map_nudge=True, map_corridor=map_cor)
                 self.last_plan_stages["solid"] = (
                     time.perf_counter() - _t1) * 1000.0
                 if crossed:
@@ -516,7 +679,8 @@ class LocalPlanner:
                         # Refuse the lane change: stop on the original
                         # lane path in front of the obstacle instead of
                         # following a path that crosses the boundary.
-                        return pts[: max(2, hit + 2)], True
+                        stop = pts[: hit + 1] if hit >= 1 else pts[:1]
+                        return stop, True
                     return out, True
             # Stay on the road surface: detour/deform paths can drift onto
             # the shoulder in dense obstacle scenes.  When the map knows
@@ -528,6 +692,26 @@ class LocalPlanner:
                 if w is not None and w > 2.0 * (CAR_HALF_WIDTH + 0.5):
                     out = _clamp_path_lateral(
                         out, raw_pts, w / 2.0 - CAR_HALF_WIDTH - 0.3)
+            # Final clearance guarantee ("never drive through a wall").
+            # The A* grid / lateral-bypass path is verified against the
+            # occupancy grid, not the true oriented footprints, so a
+            # detour's return leg can still graze a tilted blocker.  Any
+            # drive path that would touch an obstacle's real footprint
+            # (inflated by the car half width + a small margin) is never
+            # handed to the controller: fall back to stopping on the route
+            # in front of the first blocker instead.
+            if all_obstacles:
+                safe_h = CAR_HALF_WIDTH
+                hit_out = _path_hit_index(
+                    out, 0, len(out) - 1, all_obstacles, safe_h)
+                if hit_out >= 0:
+                    mode = "blocked"
+                    # Stop at the first blocked segment's vertex: keep the
+                    # clear prefix before it.  When the very first segment
+                    # is blocked (``hit_out == 0``) the car is already at
+                    # the wall, so return only the single start point and
+                    # let the controller hold the car stopped.
+                    out = out[: hit_out + 1] if hit_out >= 1 else out[:1]
             self.last_mode = mode
             return out, mode == "blocked"
 
@@ -565,9 +749,10 @@ class LocalPlanner:
         if blocker is not None and self._is_roadside_wall(
                 blocker, self._obstacle_route_profile(
                     blocker, pts, i0, i1), pts=pts):
-            return finish(pts[: hit + 2], "blocked")
+            stop = pts[: hit + 1] if hit >= 1 else pts[:1]
+            return finish(stop, "blocked")
         detour, reached = self._grid_path(
-            pts, obstacles, pos, heading, i0, i1, margin=self.margin)
+            pts, all_obstacles, pos, heading, i0, i1, margin=self.margin)
         _stage("grid")
         if detour is not None and len(detour) >= 2 and reached:
             # A detour that actually reaches the route horizon is drivable.
@@ -576,7 +761,7 @@ class LocalPlanner:
         # try a smooth lateral bypass around the first compact blocker
         # before declaring the corridor blocked, so a parked car in the
         # lane becomes a lane change instead of an emergency stop.
-        bypass = self._lateral_bypass(pts, obstacles, i0, i1)
+        bypass = self._lateral_bypass(pts, all_obstacles, i0, i1)
         _stage("bypass")
         if bypass is not None and len(bypass) >= 2:
             return finish(bypass, "detour")
@@ -585,7 +770,8 @@ class LocalPlanner:
             # obstacle, then stop in front of it instead of creeping on.
             return finish(detour, "blocked")
         # No drivable way at all: stop in front of the first blocker.
-        return finish(pts[: hit + 2], "blocked")
+        stop = pts[: hit + 1] if hit >= 1 else pts[:1]
+        return finish(stop, "blocked")
 
     def _map_legal_lane(self, road_rule: RoadRuleView | None):
         """Return (LegalLaneView|None, map no-cross boundary list)."""
@@ -609,20 +795,71 @@ class LocalPlanner:
                 np.vstack([a, b]), allowed_side))
         return view, boundaries
 
-    def _apply_single_edge_correction(self, pts, lane_edge, lane_edge_side,
-                                      src, sensor_lane, heading) -> None:
-        """Nudge ``pts`` away from a single detected boundary (painted
-        line / wall / guardrail) that the nav route runs too close to.
+    def _apply_lidar_center_hint(self, pts, sensor_lane, heading,
+                                  lane_center) -> None:
+        """Pull the nav window toward a low-trust LiDAR centre hint.
 
-        The nav route stays the primary lane centre; the edge only pushes
-        the path away when a route point is already too close to it, it
-        never actively pulls the car toward a half-lane position.
+        Extracted from the inline fallback: a single LiDAR corridor
+        centre is a weak lane reference (it may mirror a guardrail), so
+        it only nudges the path toward its centre, capped by
+        ``LANE_LIDAR_CORRECTION_MAX_M`` and ramped in over
+        ``right_ramp_m``.  Called only when no map legal-lane target is
+        available (the map target is authoritative and must not stack
+        with a second correction).
         """
         lane_gain = _lane_correction_gain(sensor_lane.confidence)
-        corr_max = (
-            LANE_BOUNDARY_CORRECTION_MAX_M
-            if src.startswith("vision")
-            else LANE_LIDAR_EDGE_CORRECTION_MAX_M)
+        corr_max = LANE_LIDAR_CORRECTION_MAX_M
+        base = pts.copy()
+        n = len(pts)
+        d = np.linalg.norm(np.diff(base, axis=0), axis=1)
+        cum = np.concatenate([[0.0], np.cumsum(d)])
+        for i in range(n):
+            f = _smoothstep(cum[i] / max(1e-9, self.right_ramp_m))
+            a = base[max(0, i - 2)]
+            b = base[min(n - 1, i + 2)]
+            tv = b - a
+            tn = float(np.linalg.norm(tv))
+            if tn < 1e-9:
+                left = np.array([-math.sin(heading),
+                                 math.cos(heading)])
+            else:
+                left = np.array([-tv[1] / tn, tv[0] / tn])
+            off = _point_lat_offset(
+                base[i, 0], base[i, 1], lane_center)
+            off = max(-corr_max, min(corr_max, off))
+            pts[i] = base[i] + left * (f * off * lane_gain)
+        self.last_lane_offset = 0.0
+
+    def _apply_single_edge_correction(self, pts, lane_edge, lane_edge_side,
+                                      src, sensor_lane, heading) -> None:
+        """Keep the path in the car's own lane using a single boundary.
+
+        A RIGHT boundary (painted line / wall / guardrail) defines the
+        car's lane: the path is actively pulled to the lane centre
+        (half an assumed lane width inside the edge, capped by
+        ``LANE_EDGE_PULL_MAX_M``) - the nav route alone rides the road
+        centre / oncoming lane (run 1787130718).  A LEFT boundary may
+        only push the path right when the route is too close to it; it
+        never pulls left toward the oncoming lane.  The gain still
+        ramps with frame confidence and the ramp smooths it in.
+        """
+        lane_gain = _lane_correction_gain(sensor_lane.confidence)
+        if lane_edge_side < 0.0:
+            # Right edge = active lane-centre pull, capped generously.
+            corr_max = float(LANE_EDGE_PULL_MAX_M)
+            if not src.startswith("vision"):
+                # A LiDAR wall is a physical edge: the raw-sensor
+                # emergency stop and the final no-contact check are
+                # the safety net, so the lane-centre pull is not
+                # scaled down by the fallback frame's low confidence
+                # (0.45-0.5 would halve the pull and leave the car
+                # between the lanes instead of centred in its own).
+                lane_gain = 1.0
+        else:
+            corr_max = (
+                LANE_BOUNDARY_CORRECTION_MAX_M
+                if src.startswith("vision")
+                else LANE_LIDAR_EDGE_CORRECTION_MAX_M)
         edge_pts = np.asarray(lane_edge[:, :2], dtype=float)
         lane_w = float(getattr(sensor_lane, "width",
                                LANE_WIDTH_DEFAULT_M))
@@ -678,7 +915,14 @@ class LocalPlanner:
         boundary_lat = _point_lat_offset(float(x), float(y), edge_pts)
         if not math.isfinite(boundary_lat):
             return None
-        if abs(boundary_lat) > LANE_BOUNDARY_MAX_M:
+        # A right boundary may be metres from the route (the route is
+        # the road-centre line; real right wall measured 6.85 m).
+        # A left boundary farther than a lane is another road and
+        # must never pull the car toward it.
+        if side < 0.0:
+            if abs(boundary_lat) > LANE_EDGE_RIGHT_MAX_DEV_M:
+                return None
+        elif abs(boundary_lat) > LANE_BOUNDARY_MAX_M:
             return None
         # A right edge must sit to the right of the path point and a
         # left edge to the left: a "right" paint that is actually left
@@ -696,21 +940,38 @@ class LocalPlanner:
         # car's clearance do we shift away from the edge; a route point
         # that already clears it stays untouched.
         clear = LANE_BOUNDARY_CLEAR_M
-        # A boundary that sits more than ~1.5 m beyond the car's clearance
-        # is normal road furniture (guardrail / kerb / wall lining a lane),
-        # not a boundary the car must run from: it does not define where
-        # the lane centre is, only the edge of the drivable surface.  On
-        # the highway the guardrail 3-8 m off the route would otherwise
-        # mirror a phantom "lane centre" metres off the road and drag the
-        # path sideways (the lane_lat -9 m weave on run 33).  Only a
-        # boundary that is genuinely close pushes the path.
-        if abs(boundary_lat) > clear + 1.5:
+        # A LEFT boundary that sits more than ~1.5 m beyond the car's
+        # clearance is normal road furniture (guardrail / kerb / wall
+        # lining the OPPOSITE side of the road): it must never pull the
+        # path toward the oncoming lane (run 33 weave).  A RIGHT
+        # boundary is different: the nav route is anchored to the road
+        # link centre, so on a two-way street the car's own lane's
+        # right edge is 3-6 m right of the route.  Real ADAS drives the
+        # lane centre = half an assumed lane width inside that edge;
+        # ignoring it let the car ride the centre line / drift right
+        # the whole run (1787130718: lat 0.7-3.8 m).  The right edge
+        # therefore actively pulls the path back into its own lane.
+        if side > 0.0 and abs(boundary_lat) > clear + 1.5:
             return 0.0
         if side < 0.0:
+            # RIGHT boundary (painted line / wall / guardrail).
             if boundary_lat <= -clear:
-                return 0.0
+                # Route clears the edge: pull toward the centre of the
+                # lane this edge defines (half a lane width inside it).
+                # boundary_lat < 0 (edge right of the route point), so
+                # the centre offset is -(edge_lat + half_lane), a shift
+                # to the RIGHT (positive = right of the route tangent).
+                pull_max = float(LANE_EDGE_PULL_MAX_M)
+                centre_off = -boundary_lat - lane_width * 0.5
+                return max(-pull_max, min(pull_max, centre_off))
+            # Edge intrudes into the route: push away with clearance.
             off = -boundary_lat - clear
         else:
+            # LEFT boundary.  The car's legal lane lies to the RIGHT of
+            # a left edge: it may only PUSH the path right (never pull
+            # left toward the oncoming lane - one second of wrong-way
+            # driving is not allowed).  When the route already clears
+            # the left edge, it stays untouched.
             if boundary_lat >= clear:
                 return 0.0
             off = clear - boundary_lat
@@ -799,23 +1060,38 @@ class LocalPlanner:
         # window chord) keeps this correct through bends, where a straight
         # i0->i1 axis makes a diagonal wall look like it crosses the road.
         if pts is not None and len(pts) >= 2:
+            # 墙到路线的最小距离取两个度量里更严的那个：(1) 中心距减去
+            # 半厚——捕捉垂直横穿道路的墙（四个角都在 2m 外，但墙身从
+            # 路中间穿过，中心距是 0）；(2) 四个墙角的实际横向距离——
+            # 捕捉斜墙（中心 3m 外、某个角却深探进车道，fuzz scene 7 的
+            # 底角实际到 y=0.56）。只有两者都保持在车半宽 + 边缘余量
+            # 之外，才允许当作不阻挡的边界。该检查必须排在"角全在单侧"
+            # 判定之前。
             lats = [_point_lat_offset(c[0], c[1], pts)
                     for c in _obstacle_corners(ob)]
+            if _obstacle_oriented(ob):
+                thick = max(0.0, float(getattr(ob, "half_thick", 0.0)))
+            else:
+                thick = min(float(ob.half_w), float(ob.half_h))
+            _, lat_c = _point_route_pos_np(ob.x, ob.y, pts)
+            inner = min(abs(lat_c) - thick,
+                        min(abs(float(v)) for v in lats))
+            if inner < CAR_HALF_WIDTH + ROADSIDE_WALL_MIN_EDGE_M:
+                # 墙内缘贴近或越过车道：它是真正的挡路墙，不是路边边界
+                return False
+            # 内缘足够远之后，单侧判定才是安全的：墙的相邻角至少两个
+            # 明显落在线路同一侧 -> 它是可沿其行驶的边界。这时即使墙
+            # 中心距路线很远，也不把它当普通障碍物绕行。
             pos = sum(1 for v in lats if v > ROADSIDE_WALL_MIN_EDGE_M)
             neg = sum(1 for v in lats if v < -ROADSIDE_WALL_MIN_EDGE_M)
             if pos >= 2 or neg >= 2:
                 return True
             # Through a bend the same wall can straddle the polyline:
             # corner lats land on both sides (pos ~= neg ~= 2) even
-            # though the wall only lines the road.  Fall back to the
-            # wall-centre lateral offset: a wall whose centre sits more
-            # than half a car + edge clear off the route cannot be
-            # blocking the corridor, it is the boundary beside it.
-            arc_c, lat_c = _point_route_pos_np(ob.x, ob.y, pts)
-            # 放宽：只要中心偏离路线 1m 以上就视为路边墙
-            if abs(lat_c) >= 1.0:
-                return True
-            return abs(lat_c) >= CAR_HALF_WIDTH + ROADSIDE_WALL_MIN_EDGE_M
+            # though the wall only lines the road.  The inner-edge check
+            # above already guarantees the wall keeps clear of the
+            # corridor, so it is the boundary beside it.
+            return True
         lon0, lon1, lat0, lat1 = profile
         lon_span = lon1 - lon0
         lat_span = lat1 - lat0
@@ -907,10 +1183,23 @@ class LocalPlanner:
                 return off
         if _path_hit_index(src, i0, i1, obstacles,
                            CAR_HALF_WIDTH + clearance) >= 0:
-            # The corridor itself is blocked, not the right-hand lane:
-            # keep a modest right bias so a noisy/merged wall box cannot
-            # steer the car onto the centre line while approaching it.
-            return max(0.5, min(0.8, self.right_offset))
+            # The route centre is already inside an obstacle footprint.
+            # The fallback may ONLY return an offset whose shifted path is
+            # itself proven clear: returning an unchecked bias drove the
+            # car straight into a tilted wall that left a ~0.3 m gap (the
+            # offset -0.8 path overlapped the wall inner edge while the
+            # wall was then dropped as "roadside" - fuzz scene 0).  Try
+            # the original bias values, keep the first clear one, and
+            # otherwise return the route centre so the downstream hit /
+            # deform / blocked pipeline decides with the obstacle still in
+            # the list.
+            for bias in (0.8, 0.5):
+                cand = src + off_dir * bias
+                if _path_hit_index(cand, i0, i1, obstacles,
+                                   CAR_HALF_WIDTH + clearance) < 0 \
+                        and self._edge_clear(cand, edge_pts, edge_side):
+                    return bias
+            return 0.0
         return 0.0
 
     def _safe_lateral_offset(self, pts, i0: int, i1: int, heading: float,
@@ -928,6 +1217,20 @@ class LocalPlanner:
         if abs(target) < 1e-9 or not obstacles:
             return target
         src = np.asarray(pts, dtype=float)
+        # Roadside walls are road boundaries, not lane blockers.  A wall
+        # that lines the road must not shrink the legal-lane centre away
+        # (run 1787150245 t=36-40: wall/lidar boxes beside the bend cut
+        # the map target 1.75 -> 0 and the car cut the left curve on the
+        # oncoming side).  The downstream path-hit stage filters the same
+        # walls; do it here too so the map centre is evaluated on the
+        # open corridor.
+        if any(ob.label == "wall" or ob.category in ("wall", "raycast")
+               for ob in obstacles):
+            obstacles = [
+                ob for ob in obstacles
+                if not self._is_roadside_wall(
+                    ob, self._obstacle_route_profile(ob, pts, i0, i1),
+                    pts=pts)]
         unit = self._right_offset_path(src, i0, heading, offset=1.0)
         off_dir = unit - src
         step = 0.1
@@ -1123,6 +1426,15 @@ class LocalPlanner:
             # grove scenes are calibrated against it).
             if ob.category == "lidar":
                 m = max(0.0, LIDAR_PATH_CLEAR_M - CAR_HALF_WIDTH)
+            elif self._is_roadside_wall(
+                    ob, self._obstacle_route_profile(ob, pts, i0, i1),
+                    pts=pts):
+                # Roadside boundary (tree row / wall lining the road):
+                # the car legitimately drives beside it, so plan with a
+                # tight pad (car half width + 0.5 m) instead of the full
+                # margin; the final no-contact check still enforces the
+                # physical clearance.
+                m = CAR_HALF_WIDTH + 0.5
             else:
                 m = margin
             if _obstacle_oriented(ob):
@@ -1638,6 +1950,18 @@ class LocalPlanner:
             # stop/creep twitch when a roadside grove projected onto the
             # trimmed route start (lon = 0) while the detour ran around it.
             in_lane = abs(lat_c) < CAR_HALF_WIDTH + 0.3
+            # A sparse raycast cluster's half-extents are a noise floor
+            # (single/few hit points become a fixed 0.9 m box), not a real
+            # footprint.  When its centre sits beyond the car half-width
+            # (the detour has already routed around it), treating it as an
+            # in-lane blocker pins the speed to zero on every frame, which
+            # is the twitch/park regression on a roadside grove.  Only a
+            # sparse cluster whose centre is truly inside the car's track
+            # stays an in-lane blocker, so the car never charges a real
+            # obstacle.
+            if (in_lane and is_sparse_raycast_speck(ob)
+                    and abs(lat_c) >= CAR_HALF_WIDTH):
+                in_lane = False
             if in_lane or closest < self.corridor_half_w:
                 v_max = math.sqrt(
                     _vehicle_speed_along(ob, seg_pts, seg_k) ** 2

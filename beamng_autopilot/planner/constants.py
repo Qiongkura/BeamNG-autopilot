@@ -55,7 +55,13 @@ SOLID_BLOCK_LANE_CONF = 0.55  # only a confident lane frame may turn a
                                # vision only nudges the path away
 
 # ── Route shaping / sharp-corner handling ─────────────────────────────
-RIGHT_OFFSET_M = 1.5
+# Default lateral offset from the nav-route centre.  像真实智驾一样,
+# 默认沿路线/车道中心行驶,不常驻横向偏移:一劳永逸的 keep-right
+# (旧值 1.5/0.4) 在 3.5 m 车道上必然压线(run 29 中 490/864 帧满载
+# 1.5 m 右偏,压的是道路中线/边线,驾驶员全程看到压线)。只有检测到
+# 右侧实体障碍 / 实线边界需要避让时,plan() 才临时生成横向偏移
+# (_safe_right_offset / 单边边界修正),避让完回中心。
+RIGHT_OFFSET_M = 0.0
 RIGHT_RAMP_M = 12.0
 SHARP_ANGLE_DEG = 45.0
 SHARP_CORNER_KPH = 30.0
@@ -130,8 +136,13 @@ LANE_BOUNDARY_MAX_M = LANE_WIDTH_MAX_M
 # game from the road graph; a detected "lane" whose centre deviates more
 # than this from the route close to the car is a wrong pairing (a far
 # lane's marking, a roadside line, a guardrail shadow) and must not drag
-# the car sideways.  Degrades to nav-primary + single-edge protection.
-LANE_NAV_MAX_DEV_M = 1.8
+# the car sideways.  The nav route is anchored to the ROAD link centre,
+# so on a two-way street the car's own lane centre legitimately sits
+# 2-4 m off the route; the old 1.8 m gate rejected every good paired
+# lane and the car rode the centre line (run 1787130718).  The map
+# centre line still applies in every mode (see plan/finish), so a
+# truly wrong pairing that would cross it is stopped.
+LANE_NAV_MAX_DEV_M = 5.0
 # A lone detected edge (painted line / wall / guardrail) may only nudge
 # the nav window while it sits on its declared side of the route near
 # the car.  A wrong-side or far edge is a tracker lock onto the opposite
@@ -141,6 +152,30 @@ LANE_NAV_MAX_DEV_M = 1.8
 # a phantom; farther than this it is not the current lane's boundary.
 LANE_EDGE_NAV_MIN_SIGN_M = 0.6
 LANE_EDGE_NAV_MAX_DEV_M = 4.0
+# A RIGHT boundary may sit up to this far from the route and still
+# define the car's lane centre.  The in-game nav route is anchored to
+# the road/link centre, so on a two-way street the right edge of the
+# car's lane is 3-6 m right of the route; the old 4 m gate dropped it
+# as "another road" and the car rode the centre line / drifted right
+# (run 1787130718: lat 0.7-3.8 m the whole way).  The LEFT edge keeps
+# the 4 m gate: pulling toward a far left edge would drive the wrong
+# way (one second of wrong-way driving is not allowed).
+LANE_EDGE_RIGHT_MAX_DEV_M = 8.0
+# A right VISION line may sit up to this far from the route.  A
+# painted line farther than this is another road's marking / a
+# phantom (the old 6.5 m far-edge test) and must not drag the car
+# onto the shoulder; a LiDAR wall is a physical edge and may be
+# farther (LANE_EDGE_RIGHT_MAX_DEV_M).
+LANE_EDGE_RIGHT_VISION_MAX_DEV_M = 5.5
+# Max lateral shift the planner may actively PULL toward a single
+# right boundary's lane centre (a real ADAS drives its own lane
+# centre, which is half a lane width inside the near boundary).
+# This is larger than the old 0.35-0.4 m push-only nudges, which
+# could never pull the car off the road-centre route back into
+# its own lane (run 1787130718 rode the centre line the whole
+# way).  The final clearance check still stops the car before any
+# wall contact.
+LANE_EDGE_PULL_MAX_M = 5.5
 
 
 # ── Map-lane boundary helper ─────────────────────────────────────────

@@ -87,6 +87,99 @@ def _obstacle_half_extents(ob, fwd, lat):
             ob.half_w * abs(lat[0]) + ob.half_h * abs(lat[1]))
 
 
+def forward_clearance_m(hits, pos, fwd, half_width: float = 1.6,
+                       max_dist: float = 30.0) -> float:
+    """Nearest raw sensor hit ahead of the car inside a forward corridor.
+
+    This is an independent physical safety layer: it answers "how far can
+    the car travel along its current heading before anything occupies the
+    corridor?" directly from raw ray/LiDAR hit points, without any obstacle
+    classification.  A planner that misreads a wall as roadside furniture,
+    or a cluster that was wrongly merged/split, cannot defeat this check.
+
+    ``hits`` is a list of (x, y) world points, ``pos`` the ego (x, y),
+    ``fwd`` the unit forward vector and ``half_width`` the half corridor
+    width (car half width + margin).  Points behind the car, outside the
+    corridor or farther than ``max_dist`` are ignored.  Returns the
+    minimum forward distance (a small negative value when the car already
+    overlaps a hit, otherwise >= 0), or ``float("inf")`` when the corridor
+    is clear.
+    """
+    if not hits:
+        return float("inf")
+    pts = np.asarray(hits, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] < 2 or not len(pts):
+        return float("inf")
+    fwd = np.asarray(fwd, dtype=float)[:2]
+    fn = float(np.linalg.norm(fwd))
+    if fn < 1e-9:
+        return float("inf")
+    fwd = fwd / fn
+    left = np.array([-fwd[1], fwd[0]])
+    rel = pts[:, :2] - np.asarray(pos, dtype=float)[:2]
+    lon = rel @ fwd
+    lat = rel @ left
+    mask = (lon >= -0.5) & (lon <= max_dist) & (np.abs(lat) <= half_width)
+    if not np.any(mask):
+        return float("inf")
+    return float(np.min(lon[mask]))
+
+
+def emergency_stop_clearance_m(speed: float, decel: float = 6.0,
+                               margin: float = 1.0) -> float:
+    """Braking distance (m) the car still needs at ``speed`` (m/s).
+
+    Uses a conservative deceleration (default 6 m/s^2, above the comfort
+    4 m/s^2 used by the planner) plus a fixed safety margin so the raw
+    sensor forward-clearance check always asks for more room than the
+    car physically needs to stop.
+    """
+    return float(speed * speed / (2.0 * max(0.1, decel)) + margin)
+
+
+def approach_speed_limit_mps(clearance: float, need: float,
+                              gain: float = 2.5) -> float:
+    """Approach-speed cap (m/s) for the remaining raw forward clearance.
+
+    The raw-sensor emergency layer keeps ``need`` (braking distance +
+    standstill margin) as a hard stop reserve.  This helper returns a
+    smooth approach speed that shrinks as the forward clearance
+    approaches ``need``: the car eases down well before the last-second
+    hard stop instead of charging at a wall and slamming the brakes at
+    the stopping threshold.  It is monotone and reaches ~0 when the
+    clearance equals the reserve, so a wall is always approached slowly.
+    """
+    spare = float(clearance) - float(need)
+    return max(0.0, gain * spare)
+
+
+def emergency_speed_limit_mps(clearance: float, need: float,
+                              gain: float = 2.5) -> tuple[bool, float]:
+    """Central raw-sensor safety decision: (force_stop, capped_speed).
+
+    This is the single policy used by the autopilot's last-line-of-
+    defence speed layer so the logic stays testable and lives beside the
+    clearance helpers instead of being inlined in the 2600-line control
+    loop.
+
+    * ``force_stop=True`` when the forward clearance is already inside
+      the braking reserve (``need``): the car must stop, no matter what
+      the planner classified.
+    * Otherwise it returns the smooth approach-speed cap from
+      ``approach_speed_limit_mps``: the car eases down progressively as
+      it approaches the reserve instead of charging at a wall and
+      stamping the brake at the last metre.
+
+    Callers only ever use ``capped_speed`` to lower their speed, never to
+    raise it.
+    """
+    if float(clearance) < float(need):
+        return True, 0.0
+    return False, approach_speed_limit_mps(clearance, need, gain=gain)
+
+
+
+
 def _obstacle_footprint_area(ob) -> float:
     """Footprint area (m^2) of an obstacle's own, uninflated box."""
     if _obstacle_oriented(ob):

@@ -229,7 +229,8 @@ def _clamp_to_solid_lines(path, solid_lines, anchor,
                           margin: float = SOLID_LINE_MARGIN,
                           corridor=None, allow_block: bool = True,
                           block_near_cross: bool = False,
-                          map_nudge: bool = True):
+                          map_nudge: bool = True,
+                          map_corridor=None):
     """Push a path off detected solid markings; block when it crosses one
     well ahead of the car.
 
@@ -245,6 +246,14 @@ def _clamp_to_solid_lines(path, solid_lines, anchor,
     is a rule violation even when the crossing is only metres ahead.
     ``map_nudge`` controls whether a map boundary may push a legal-but-
     close path back to the map side; it still blocks a crossing either way.
+    ``map_corridor`` is the navigation-route window (the road reference)
+    used to tell a road that turns / curves away from the current link's
+    straight centre line (the corridor itself leaves the legal side, so
+    the boundary stops applying) from a sensor path that wrongly crosses
+    the centre line while the road keeps going straight (the corridor
+    stays legal, so the crossing is a rule violation and blocks, even
+    right under the car - one second of wrong-way driving is not
+    allowed).  Defaults to ``corridor`` when not given.
     """
     out = np.asarray(path, dtype=float).copy()
     if out.ndim != 2 or len(out) < 2 or not solid_lines:
@@ -300,6 +309,41 @@ def _clamp_to_solid_lines(path, solid_lines, anchor,
             along = (samples - w[0]) @ axis
             in_span = (along >= -0.5) & (along <= span + 0.5)
             bad &= in_span.reshape(len(out) - 1, 5)
+        cor = None
+        cor_lat = None
+        if is_map:
+            ref = corridor if map_corridor is None else map_corridor
+            if ref is not None:
+                cor = np.asarray(ref[:, :2], dtype=float)
+                if len(cor) >= 2:
+                    _, _, cor_lat, _ = _pts_to_segments(cor, w)
+                    n_seg = len(out) - 1
+                    n_cor = len(cor)
+                    idx = np.minimum(
+                        np.round(np.arange(n_seg) * (n_cor - 1)
+                                 / max(1, n_seg)).astype(int),
+                        n_cor - 1)
+                    # The map boundary stops constraining the path where
+                    # the navigation corridor itself is on the forbidden
+                    # side (a curve / intersection turn: the current
+                    # link's straight centre line no longer represents
+                    # the road ahead).  Only a path that crosses while
+                    # the corridor stays legal is a sensor error or a
+                    # wrong-way attempt - that must block.
+                    corr_legal = (cor_lat[idx] * side) >= -0.05
+                    bad &= corr_legal[:, None]
+        # A path that STARTS on the forbidden side of a MAP boundary is a
+        # wrong-way recovery (the car already crossed, or a sensor lane
+        # was built on the oncoming side).  Blocking it would pin the car
+        # on the wrong side; instead the near-nudge below pulls the whole
+        # prefix back onto the legal side so the car can return.  Only a
+        # path that starts legal and crosses - or stays forbidden without
+        # ever returning - is a rule violation.
+        starts_bad = False
+        if is_map and len(out) >= 1:
+            lat0 = _point_lat_offset(float(out[0, 0]),
+                                     float(out[0, 1]), w)
+            starts_bad = (lat0 * side) < -0.05
         first_bad = np.argmax(bad, axis=1)
         has_bad = np.any(bad, axis=1)
         cross_i = -1
@@ -316,8 +360,10 @@ def _clamp_to_solid_lines(path, solid_lines, anchor,
                 cross_dist = d
         if allow_block and cross_i >= 0 \
                 and cross_dist <= SOLID_BLOCK_MAX_M \
+                and not (is_map and starts_bad) \
                 and (block_near_cross
-                     or cross_dist >= SOLID_BLOCK_MIN_M):
+                     or cross_dist >= SOLID_BLOCK_MIN_M
+                     or is_map):
             # Stop before the crossing.  A coarse detour vertex can already
             # be far across the paint, so keep the complete vertices before
             # the crossing segment plus the last sample still on the
@@ -339,6 +385,13 @@ def _clamp_to_solid_lines(path, solid_lines, anchor,
         near = (lat * side) < margin
         if is_map and not map_nudge:
             near[:] = False
+        if is_map and cor_lat is not None:
+            n_cor = len(cor)
+            idx_p = np.minimum(
+                np.round(np.arange(len(out)) * (n_cor - 1)
+                         / max(1, len(out) - 1)).astype(int),
+                n_cor - 1)
+            near &= (cor_lat[idx_p] * side) >= -0.05
         if axis is not None:
             along = (out[:, :2] - w[0]) @ axis
             near &= (along >= -0.5) & (along <= span + 0.5)
