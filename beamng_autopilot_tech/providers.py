@@ -2,15 +2,20 @@
 
 from __future__ import annotations
 
+import json
 import os
 import time
+from pathlib import Path
 
 import numpy as np
 
 from beamng_autopilot.perception import (
+    LIDAR_GROUND_CLEARANCE_M,
+    LIDAR_MAX_HEIGHT_M,
     LidarClusterTracker,
     Obstacle,
     _cluster_points,
+    _local_ground_z,
     _split_raycast_sectors,
     downsample_cloud,
     last_error,
@@ -19,6 +24,12 @@ from beamng_autopilot.perception import (
     scan_obstacles_all,
 )
 from beamng_autopilot.runtime import CameraProvider, RangeProvider, RangeSample
+from beamng_autopilot.vision.ring import (
+    CAMERA_RING,
+    FRONT_MAIN,
+    CameraMount,
+    camera_ring_models,
+)
 from beamng_autopilot.vision.projection import CameraModel
 
 # Sensor names must be unique per game instance: two Python processes
@@ -50,6 +61,53 @@ BLACK_FRAME_RETRIES = 2
 BLACK_FRAME_RETRY_DELAY_S = 0.1
 
 
+# ── 图形质量前置检查 ──────────────────────────────────────────────
+# BeamNG.tech 的 Camera/LiDAR 传感器依赖 GPU prepass buffer：当画质
+# 处于 'Lowest' 时引擎不生成该 buffer，传感器一旦创建，GPU Request
+# Manager 会以每秒数千条的频率刷 "Failed to get prepass buffer"，渲染
+# 线程被拖死，游戏窗口直接卡成"未响应"（实测 4 份 beamng.log 全部复现）。
+# 因此在创建任何 Tech 传感器之前先读 settings.json，命中 Lowest 就打印
+# 明确的中文提示并中止启动，而不是让游戏默默卡死。
+_GRAPHICS_QUALITY_KEYS = (
+    "GraphicLightingQuality",
+    "GraphicShaderQuality",
+    "GraphicMeshQuality",
+    "GraphicTextureQuality",
+    "GraphicShadowsQuality",
+)
+
+
+def check_graphics_quality(user_dir) -> None:
+    """Raise RuntimeError when the Tech user's graphics preset is 'Lowest'.
+
+    读取 ``<user_dir>/current/settings/settings.json``，只要任一关键画质项
+    为 ``Lowest`` 就中止（该画质下 Tech 传感器会刷爆 GPU prepass buffer，
+    导致游戏窗口未响应）。设置文件缺失/不可读时只打印警告并放行。
+    """
+    path = Path(user_dir) / "current" / "settings" / "settings.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, TypeError):
+        print("[tech] WARNING: 无法读取图形设置 "
+              f"{path}（继续创建传感器，若卡死请检查画质是否为 Lowest）")
+        return
+    lowest = [k for k in _GRAPHICS_QUALITY_KEYS
+              if str(data.get(k, "")).strip().lower() == "lowest"]
+    if not lowest:
+        return
+    print("[tech] ✗ 检测到图形质量为 'Lowest'，无法创建 Camera/LiDAR 传感器：")
+    for k in lowest:
+        print(f"[tech]   - {k} = Lowest")
+    print("[tech] 'Lowest' 画质下引擎不生成 GPU prepass buffer，Tech 传感器")
+    print("[tech] 一创建就会把游戏卡成窗口未响应（实测稳定复现）。")
+    print("[tech] 请在游戏 选项 → 图形 里把 光照质量(Lighting Quality) 至少")
+    print("[tech] 调到 Low（建议 Normal 或更高），然后重启游戏再试。")
+    raise RuntimeError(
+        "graphics quality is 'Lowest' which breaks Tech camera/LiDAR "
+        "sensors; raise Lighting Quality to Low+ in the game settings "
+        "and restart BeamNG.tech first")
+
+
 def _frame_is_black(frame, max_mean: float = BLACK_FRAME_MAX_MEAN) -> bool:
     """True when a camera frame is an all-black/stale shared-memory read."""
     if frame is None or frame.size == 0:
@@ -62,6 +120,7 @@ class TechCameraProvider(CameraProvider):
 
     def __init__(self, conn, width: int = 1076, height: int = 806,
                  annotations: bool = False) -> None:
+        check_graphics_quality(conn.user_dir)
         from beamngpy.sensors import Camera
 
         self.conn = conn
@@ -160,6 +219,7 @@ class TechRangeProvider(RangeProvider):
     """LiDAR plus scenario/vehicle obstacle sources on BeamNG.tech."""
 
     def __init__(self, conn) -> None:
+        check_graphics_quality(conn.user_dir)
         from beamngpy.sensors import Lidar
 
         self.conn = conn
@@ -235,6 +295,15 @@ class TechRangeProvider(RangeProvider):
                 dist = np.hypot(cloud[:, 0] - ox, cloud[:, 1] - oy)
                 keep = ((dist >= 2.5) & (dist <= radius)
                         & (np.abs(cloud[:, 2] - oz) <= 4.0))
+                # Near-field 360-LiDAR points (1-2.5 m) are kept ONLY for
+                # the raw-sensor emergency-stop / approach-speed layer
+                # (forward_clearance_m).  The cluster/corridor pool still
+                # starts at 2.5 m so the own car's tail / wheel guards do
+                # not become road obstacles, but a wall 1-2 m off the
+                # bonnet must remain visible or the car floors the throttle
+                # into it while standing still (throttle=94.7% at v=0).
+                near_keep = ((dist >= 1.0) & (dist < 2.5)
+                             & (np.abs(cloud[:, 2] - oz) <= 4.0))
                 if heading is not None:
                     uf = np.array([np.cos(heading), np.sin(heading)])
                     ur = np.array([-uf[1], uf[0]])
@@ -244,8 +313,29 @@ class TechRangeProvider(RangeProvider):
                               & (np.abs(local @ ur)
                                  <= self._ego_half_w + LIDAR_SELF_MARGIN))
                     keep = keep & ~on_car
+                    near_keep = near_keep & ~on_car
                 kept = downsample_cloud(cloud[keep])
                 pts = [(float(x), float(y)) for x, y, _ in kept]
+                # Drop the local ground plane from the near field the same
+                # way lidar_obstacles does: on flat ground the 1-2.5 m band
+                # is full of ground returns that project onto the emergency
+                # corridor and pin the car forever (EMERGENCY STOP raw
+                # clear=0.7m everywhere, v never leaves 0).  A wall / tree /
+                # vehicle right off the bonnet still has points above the
+                # ground clearance and stays visible to the safety layer.
+                near_cloud = downsample_cloud(cloud[near_keep])
+                if len(near_cloud) >= 4:
+                    gnd = _local_ground_z(near_cloud, ox, oy)
+                    above = ((near_cloud[:, 2] - gnd
+                              >= LIDAR_GROUND_CLEARANCE_M)
+                             & (near_cloud[:, 2] - gnd
+                                <= LIDAR_MAX_HEIGHT_M))
+                    if np.any(above):
+                        near_cloud = near_cloud[above]
+                    else:
+                        near_cloud = near_cloud[:0]
+                near_pts = [(float(x), float(y))
+                            for x, y, _ in near_cloud]
                 last_error["raycast"] = None
             except Exception as exc:
                 last_error["raycast"] = str(exc)
@@ -261,6 +351,10 @@ class TechRangeProvider(RangeProvider):
                     return_hits=True)
                 if ray_hits:
                     pts = ray_hits
+                # Merge the 360-LiDAR near field on top of the Lua fan so
+                # a wall right in front of the bonnet is never invisible,
+                # whichever sensor channel happened to fire this frame.
+                pts = pts + near_pts
                 last_error["raycast"] = None
             except Exception as exc:
                 last_error["raycast"] = str(exc)
@@ -294,3 +388,126 @@ class TechRangeProvider(RangeProvider):
     def close(self) -> None:
         with self.conn.io_lock:
             self.lidar.remove()
+
+
+def _mount_to_tp(mount: CameraMount) -> tuple[tuple, tuple, tuple]:
+    """Map a ring mount into BeamNG vehicle-local Sensor inputs.
+
+    BeamNG vehicle-local axes use forward = -Y; the ring defines forward
+    on the +Y axis (matching ``CameraModel``), so the Y components of the
+    position and of the direction/up vectors are negated here - the same
+    convention the existing front ``CAMERA_POS/DIR/UP`` use.
+    """
+    pos = (float(mount.offset[0]), -float(mount.offset[1]),
+           float(mount.offset[2]))
+    d = mount.fwd_local
+    direction = (float(d[0]), -float(d[1]), float(d[2]))
+    u = mount.up_local
+    up = (float(u[0]), -float(u[1]), float(u[2]))
+    return pos, direction, up
+
+
+class TechCameraRingProvider(CameraProvider):
+    """The full eight-camera FSD-style ring on BeamNG.tech.
+
+    One beamngpy ``Camera`` per ring mount, all polled from the same
+    snapshot so the multi-view frames are close in time (the shared-memory
+    sensors are queried back to back under the connector lock).  ``grab()``
+    returns the front-main frame for the legacy front-only consumers;
+    ``grab_ring()`` returns ``{role: (rgb, CameraModel)}`` for the
+    perception pipeline.
+    """
+
+    def __init__(self, conn, width: int = 1076, height: int = 806,
+                 roles: tuple[str, ...] | None = None) -> None:
+        check_graphics_quality(conn.user_dir)
+        from beamngpy.sensors import Camera
+
+        self.conn = conn
+        self.width = int(width)
+        self.height = int(height)
+        if roles is None:
+            self._roles = tuple(m.role for m in CAMERA_RING)
+        else:
+            wanted = set(roles)
+            self._roles = tuple(m.role for m in CAMERA_RING
+                                if m.role in wanted)
+        if FRONT_MAIN not in self._roles:
+            self._roles = (FRONT_MAIN,) + self._roles
+        self._mounts: dict[str, CameraMount] = {
+            m.role: m for m in CAMERA_RING if m.role in self._roles}
+        with conn.io_lock:
+            self.cameras: dict[str, object] = {}
+            for mount in CAMERA_RING:
+                if mount.role not in self._roles:
+                    continue
+                name = f"autopilot_ring_{mount.role}_{_PID}"
+                pos, direction, up = _mount_to_tp(mount)
+                self.cameras[mount.role] = Camera(
+                    name, conn.bng, conn.vehicle,
+                    requested_update_time=0.05,
+                    pos=pos, dir=direction, up=up,
+                    resolution=(int(width), int(height)),
+                    field_of_view_y=mount.fov_deg,
+                    near_far_planes=(0.05, 150.0),
+                    is_using_shared_memory=True,
+                    is_render_colours=True,
+                    is_visualised=False,
+                )
+
+    def _poll(self, cam: object) -> np.ndarray:
+        # Ring cameras share the GPU prepass buffer with the other Tech
+        # sensors; a single frame can come back black right after the
+        # buffer is re-authored (fresh sensor creation, scenario load).
+        # Retry a few times with a small delay (the next poll usually
+        # returns a real frame) and only give up after several
+        # consecutive failures.  The shared-memory camera keeps the
+        # latest valid image, so a genuinely black mount would fail every
+        # attempt and surface as an error instead of silently feeding a
+        # black frame to the perception pipeline.
+        last_error: RuntimeError | None = None
+        for attempt in range(BLACK_FRAME_RETRIES + 4):
+            with self.conn.io_lock:
+                data = cam.poll()
+            image = data.get("colour")
+            if image is None:
+                last_error = RuntimeError(f"{cam} returned no colour frame")
+            else:
+                frame = np.ascontiguousarray(
+                    np.asarray(image), dtype=np.uint8).copy()
+                if not _frame_is_black(frame):
+                    return frame
+                last_error = RuntimeError(f"{cam} returned a black frame")
+            time.sleep(0.1)
+        raise last_error
+
+    def grab(self) -> np.ndarray:
+        return self._poll(self.cameras[FRONT_MAIN])
+
+    def grab_ring(self) -> dict[str, tuple[np.ndarray, CameraModel]]:
+        """Poll the whole ring; ``{role: (rgb, CameraModel)}``."""
+        models = camera_ring_models(self.width, self.height)
+        # Warm-up: on a fresh ring the first polls against the GPU prepass
+        # buffer frequently come back black.  One throwaway pass clocks the
+        # sensors, then the real pass reads them.
+        for cam in self.cameras.values():
+            try:
+                self._poll(cam)
+            except RuntimeError:
+                pass
+        out: dict[str, tuple[np.ndarray, CameraModel]] = {}
+        for role, cam in self.cameras.items():
+            out[role] = (self._poll(cam), models[role])
+        return out
+
+    def camera_model(self, pos, heading, width, height,
+                     fallback: CameraModel | None = None,
+                     rotation=None) -> CameraModel:
+        # Front-main model for the legacy single-camera consumers.
+        return camera_ring_models(int(width), int(height))[FRONT_MAIN]
+
+    def close(self) -> None:
+        with self.conn.io_lock:
+            for cam in self.cameras.values():
+                cam.remove()
+        self.cameras = {}
