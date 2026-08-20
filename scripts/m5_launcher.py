@@ -216,7 +216,7 @@ class LauncherApp:
 
         self.map_var = tk.StringVar(value=config.DEFAULT_MAP)
         self.veh_var = tk.StringVar(value=config.DEFAULT_VEHICLE)
-        self.speed_var = tk.StringVar(value="60")
+        self.speed_var = tk.StringVar(value="30")
         self.attach_var = tk.BooleanVar(value=True)
         self.markers_var = tk.BooleanVar(value=True)
         self.nav_world_var = tk.BooleanVar(value=False)
