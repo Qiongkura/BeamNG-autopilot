@@ -38,6 +38,42 @@ The project adopts a layered modular design:
 - **Runtime** (`beamng_autopilot/runtime.py`)：Steam/Tech dual runtime adaptation with lazy import of Tech-exclusive features。
 - **Visualization** (`beamng_autopilot/hud.py`, `telemetry.py`, `visionview.py`)：Real-time telemetry and perception overlay。
 
+## FSD-style Stack (aligned with Tesla Full Self-Driving architecture)
+
+Data collection is not the priority yet - the goal is to align the
+**structure and data flow** with Tesla FSD (AI Day 2021/2022): a
+surround camera ring, a shared backbone with HydraNet multi-task heads,
+a BEV / vector-space occupancy representation, a layered planner with
+speed profiles, a safety monitor + arbitration layer, and a shadow-recording
+loop plus an end-to-end skeleton.  The proven rule autopilot (M5) stays
+as the execution layer during the transition.
+
+- **Camera ring** - `beamng_autopilot/vision/ring.py` (8 mounts: front
+  main/narrow/fisheye, B-pillar, rear wing mirrors, rear) +
+  `TechCameraRingProvider` (8 beamngpy `Camera` sensors on BeamNG.tech).
+- **HydraNet heads** - `vision/hydra.py` + `vision/heads/` (semantic
+  UNet, YOLO object, traffic-signal colour, lane-topology graph).
+- **BEV occupancy / vector space** - `occupancy.py` (`OccupancyGrid`),
+  `bev_fusion.py` (`BEVFeatureMap` multi-camera log-odds fusion),
+  `temporal.py` (EMA occupancy filter + world-object tracker).
+- **Layered planner** - `planning/` : `scene` / `trajectory`
+  (arc + lane-shift fan) / `constraints` (+ corridor-connectivity gate) /
+  `speed_profile` / `selector` / `intent` (routing label) / `arbiter`
+  (FSD path vs rule fallback).
+- **Safety + control guard** - `safety_monitor.py` (Safe/Degraded/
+  MinimalRisk with target speed), `control/reverse_guard.py` (the FSD
+  drive never drives backwards).
+- **Live FSD driving** - `fsd_stack.py` + `scripts/m5_fsd_drive.py`
+  (plan -> safety arbitration -> PurePursuit/SpeedController, with rule
+  fallback and reverse guard).
+- **Shadow recording + e2e skeleton** - `recording.py`
+  (`ShadowRecorder`/`EpisodeDataset`) and `neural/` (`E2ENet`:
+  BEV -> trajectory + action, forward/backward + synthetic training
+  verified; not trained on real data yet).
+
+The Chinese `README.md` documents each layer in more detail, including
+run commands for the FSD probes and the live drive.
+
 ## 📦 Environment Dependencies
 
 ```bash

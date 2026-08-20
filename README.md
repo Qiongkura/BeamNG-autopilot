@@ -28,6 +28,113 @@
 | M5 视觉避障 | YOLOv8n 前视检测 + 地面反投影，与场景/射线障碍融合绕行 |
 | 学习式路面分割 | 轻量 UNet 模型，区分背景/路面/标线，替代传统 CV 阈值方法 |
 | 实时遥测与可视化 | 遥测 HUD、仪表盘、决策层可视化、鸟瞰图等 |
+| **M6 FSD 结构栈** | 参考特斯拉 FSD（AI Day 2021/2022）：环视相机环 → 多任务 HydraNet 感知头 → BEV/占用向量空间 → 分层规划 → 安全监控与仲裁 → 影子录制 → 端到端骨架（详见下文「FSD 结构栈」） |
+
+## FSD 结构栈（参考特斯拉全自动驾驶 FSD 架构）
+
+数据采集不急于规模化，重点是把**结构和代码对齐特斯拉 FSD** 的分层数据流。
+方向严格参照 FSD（AI Day 2021/2022）公开架构：**环视多相机 → 共享视觉骨干 →
+BEV/向量空间 → 占用 → 规划 → 安全 → 影子数据闭环**。现有规则驾驶（M5，
+94.6% 山地路线完成度）始终作为执行层保留，FSD 栈以并行包落地、逐步切换。
+
+```
+相机环(8) ─► HydraNet 多任务头 ─► BEV 占用 / 向量空间 ─► 分层规划
+   ▲              │                      │                    │
+   │         语义/目标/交通灯/            │             轨迹+速度剖面
+   │         车道拓扑(共享帧)             │                    │
+   └──── 时序融合 + 目标追踪 ◄────────────┘             安全监控+仲裁
+                                                              │
+                        影子录制 ◄── 真实驾驶闭环 ◄────────────┘
+```
+
+### 1) 环视多相机（`beamng_autopilot/vision/ring.py`）
+
+- 8 个相机挂载，对齐 FSD 相机布局：前主 / 前窄(长焦) / 前鱼眼(侧盲区) /
+  B 柱左·右 / 后视镜左·右 / 后尾。
+- 每个挂载 = 固定外参标定 + 内参（`CameraModel`），运行时只喂整车 6-DOF 位姿。
+- Tech 侧 `beamng_autopilot_tech.providers.TechCameraRingProvider` 在
+  BeamNG.tech 上创建 8 路 beamngpy `Camera` 传感器（含 GPU prepass 预热与
+  黑帧重试）；Steam 回退为单前视。
+
+### 2) HydraNet 多任务感知头（`beamng_autopilot/vision/hydra.py`、`heads/`）
+
+单个共享帧分发给多个任务头，每个头输出统一 `TaskOutput`，失败头被隔离：
+- 语义头：学习式 UNet → 路面/标线掩码 + 车道路面落地（`SemanticHead`）
+- 目标头：YOLO → 世界坐标系障碍 + 像素框（`ObjectHead`）
+- 交通灯头：HSV 红/黄/绿检测，紧凑度 + 单色优势门控，免疫琥珀色大范围偏色
+  （`TrafficSignalHead`）
+- 车道拓扑头：左/右邻车道存在性与可穿越性（实线/护墙=不可并线）（`LaneTopologyHead`）
+
+### 3) BEV 占用 / 向量空间（`occupancy.py`、`bev_fusion.py`、`temporal.py`）
+
+- `OccupancyGrid`：车身系网格，每个 cell 含占用/可行驶/障碍/高度/来源计数；
+  相机掩码经地面反投影（`project_road_mask_to_grid`）写入可行驶，LiDAR/射线
+  灌入障碍；`query_path_cost` 供轨迹打分。
+- `BEVFeatureMap`：FSD 向量空间——各路相机反投影证据经 log-odds 融合成
+  obstacle/drivable/lane/sign 语义通道，预留 attention 权重接口（未来学习式
+  交叉注意力）。
+- 时序融合：`TemporalOccupancyFilter`（EMA，正向证据增高、空帧只衰减）让
+  单帧 LiDAR 抖动不产生幻影墙、也不抹掉真实墙；`WorldObjectTracker` 跨帧
+  匹配目标并估计速度。
+
+### 4) 分层规划（`beamng_autopilot/planning/`）
+
+- `scene.py`：规划读取的统一场景快照（占用 + 车道/路线参考 + 规则）。
+- `trajectory.py`：候选轨迹扇（单车模型弧线 + 车道偏移），物理曲率上界，
+  不走回头路。
+- `constraints.py`：碰撞 / 曲率 / 车道对齐成本；`corridor_free_band` 空间
+  连通门控——仅当前方横向带真被连续堵死才判无路（散射路边柱不再误杀候选）。
+- `speed_profile.py`：沿轨迹每点最大速度（弯道/障碍刹车带/巡航上限），
+  轨迹与速度一起规划——补上纵向规划。
+- `selector.py`：best-of-N 择优并附带速度剖面。
+- `intent.py`：从导航路线推断路口意图（直行/左转/右转/U 型）与建议车速。
+- `arbiter.py`：FSD 轨迹 vs 规则兜底仲裁——FSD 无路时降级到规则路径慢开，
+  不再瞬态死停。
+
+### 5) 安全监控与仲裁（`safety_monitor.py`、`control/reverse_guard.py`）
+
+- `SafetyMonitor`：影子健康 + 最小风险策略——对比轨迹与占用、检查车道保持、
+  监测传感器/规划时效，输出 Safe / Degraded / MinimalRisk 与目标车速；
+  尊重走廊连通门控。
+- `ReverseGuard`：FSD 驾驶永不倒车——沿车头前进速度分量为负即刹车，
+  滞后释放（撞墙弹回后防止「无脑倒车」）。
+
+### 6) 真实驾驶闭环（`fsd_stack.py`、`scripts/m5_fsd_drive.py`）
+
+- `FSDStack`：一条可调用完整管线——相机环 → HydraNet → 时序占用 → 分层
+  规划（带速度剖面）→ 控制提示；teleport 后 `reset_temporal()` 防止旧占用
+  泄漏成幻影墙；BEV 可行驶空间中线作为车道参考（相机车道不可用回退导航路线）。
+- `m5_fsd_drive.py`：实车 FSD 模式驾驶——FSDStack 规划 → 安全监控仲裁 →
+  PurePursuit 转向 + SpeedController 纵向，仲裁含规则兜底与反向防护；
+  兜底路径强制使用世界坐标（避免车身系参考把车甩进墙）。
+
+### 7) 影子录制 + 端到端骨架（`recording.py`、`neural/`）
+
+- `ShadowRecorder` / `EpisodeDataset`：每次驾驶录制（真值控制、影子预测、
+  BEV 栅格、轨迹）对齐成 .npz 数据，产出 `(bev_raster, action)` 训练对。
+- `E2ENet`：FSD v12 形状的端到端骨架——BEV → 轨迹 + 动作，前向/反向/
+  合成训练闭环均已打通，**暂不训练真实数据**（数据采集后续再做）。
+
+### 运行 FSD 栈
+
+```powershell
+# 1) 环视相机会采（需 Tech，游戏运行中）
+.venv\Scripts\python.exe scripts\m5_ring_probe.py --runtime tech --attach
+
+# 2) 单次完整感知+规划 tick（HydraNet → BEV → planner）
+.venv\Scripts\python.exe scripts\m5_fsd_stack_probe.py --runtime tech --attach
+
+# 3) 分层规划候选评分可视化
+.venv\Scripts\python.exe scripts\m5_planning_probe.py --runtime tech --attach
+
+# 4) 真实驾驶（FSD 模式，带安全监控 + 仲裁 + 反向防护）
+.venv\Scripts\python.exe scripts\m5_fsd_drive.py --runtime tech --attach `
+    --seconds 30 --speed 6 --teleport 729.6 763.9 45
+
+# 5) 影子录制一集（规则开 + FSD 栈影子预测）
+.venv\Scripts\python.exe scripts\m5_shadow_drive.py --runtime tech `
+    --attach --seconds 15 --drive
+```
 
 ## 架构设计
 
@@ -245,6 +352,15 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
 - 微信：Qiongkura
 
 ## 已知问题与限制
+
+### FSD 结构栈现状
+
+| 问题 | 影响 | 优先级 | 状态 |
+| --- | --- | --- | --- |
+| **FSD 栈默认不驱动、仅供验证** | `m5_fsd_drive` 是独立验证入口，`AutopilotSession` 仍走 M5 规则驾驶 | 中 | FSD 栈与旧路径并行，尚未切换为主驾驶 |
+| **多任务头是「结构对齐」非「共训练」** | 各 head 仍调用原有独立算法，未真正共享一个训练过的骨干 | 中 | 目标仅对齐 HydraNet 数据流形状 |
+| **FSD 模式在多变场景偏向保守** | 十字路口密集 LiDAR 时可能降速/回退规则路径 | 中 | 已有走廊连通门控 + 仲裁兜底，仍待长测 |
+| **端到端骨架未训练** | `E2ENet` 仅保证前向/反向/合成 loss 可降 | 低 | 数据采集后续再做 |
 
 ### 架构层面
 
