@@ -508,16 +508,24 @@ class BeamNGConnector:
             )
 
     def get_state_fast(self) -> VehicleState:
-        """Read the vehicle transform without polling sensors.
+        """Read the vehicle transform, polling only the lightweight state sensor.
 
         ``get_state()`` calls ``sensors.poll()`` which pulls every attached
         sensor (Camera / LiDAR) over the Lua bridge - the dominant cost in
         the autopilot control loop (~150 ms/frame on this machine).  The
         autopilot's vision/range workers already stream sensor data through
         their own snapshots, so the control loop only needs the ego pose
-        here.  This fast path reads just ``vehicle.state``.
+        here.  ``vehicle.state`` is a *snapshot* that only refreshes when
+        its sensor is polled, so this fast path polls exactly the ``state``
+        sensor (a tiny RPC, nothing like the camera/LiDAR cost) every frame.
+        Without that poll the cache froze at the last full poll: the car
+        physically drove (throttle against a stale speed=0) while planning /
+        the raw-sensor emergency layer kept working in the old coordinate
+        frame - the run-26 "launch straight into the right wall" / "blocked
+        at v=0" failure.
         """
         with self.io_lock:
+            self.vehicle.sensors.poll("state")
             st = self.vehicle.state
             return VehicleState(
                 pos=np.asarray(st["pos"], dtype=float),

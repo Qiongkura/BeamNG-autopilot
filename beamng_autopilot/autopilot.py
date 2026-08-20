@@ -60,6 +60,7 @@ from beamng_autopilot.perception import (
     filter_self_overlap,
 )
 from beamng_autopilot.planner import (
+    CAR_HALF_WIDTH,
     RIGHT_OFFSET_M,
     SHARP_ANGLE_DEG,
     SHARP_CORNER_KPH,
@@ -68,6 +69,9 @@ from beamng_autopilot.planner import (
     adaptive_lookahead_idx,
     corner_angle_deg,
     creep_speed,
+    emergency_speed_limit_mps,
+    emergency_stop_clearance_m,
+    forward_clearance_m,
     is_sparse_raycast_speck,
 )
 from beamng_autopilot.roadnet import RoadNetwork
@@ -127,6 +131,14 @@ REVERSE_SOFT_BRAKE = 0.35
 REVERSE_MOVEMENT_M = 0.10
 REVERSE_BACK_RATIO = 0.30
 PLAN_INTERVAL_S = 0.15
+# A single noisy plan frame (a speck cluster / a wall box that is
+# present for one scan) must not hard-stop the car mid-road or kick
+# BC steering off for that one frame: the planner has to report
+# blocked on this many consecutive plan cycles before the car treats
+# it as a real blockage.  The newly planned (clearance-verified)
+# path still governs steering and speed, and the raw-sensor
+# emergency stop below stays the hard backstop.
+BLOCKED_CONFIRM_FRAMES = 2
 RANGE_SCAN_INTERVAL_S = 0.2
 VIS_TRACK_MATCH_M = 1.8
 VIS_TRACK_CONFIRM = 2
@@ -372,6 +384,7 @@ class AutopilotSession:
         self.corner_held_speed: float | None = None
         self.cached_drive_route: np.ndarray | None = None
         self.cached_blocked = False
+        self.blocked_streak = 0
         self.last_vision = 0.0
         self.last_vision_seq = 0
         self.vision_det = None
@@ -379,6 +392,7 @@ class AutopilotSession:
         self.last_lanes: list = []
         self.last_lane_frame = None
         self.last_lidar_hits: list = []
+        self.emergency_brake_logged: float | None = None
         self.lane_tracker = LaneTracker()
         self.lane_fusion_state: dict = {}
         self.vision_clear_requested = False
@@ -1215,6 +1229,7 @@ class AutopilotSession:
                         self.route = None
                         self.cached_drive_route = None
                         self.cached_blocked = False
+                        self.blocked_streak = 0
                         self.last_plan_route = None
                         self.last_plan_rule = None
                         self.toast("route cleared")
@@ -1419,6 +1434,7 @@ class AutopilotSession:
             self.last_plan_rule = None
             self.cached_drive_route = None
             self.cached_blocked = False
+            self.blocked_streak = 0
             self.hdg_engaged = False
             self.hist = {
                 "t": [], "throttle": [], "brake": [], "speed": []}
@@ -1723,6 +1739,22 @@ class AutopilotSession:
                 self.last_plan_route = plan_route
                 self.last_plan_rule = self.road_rule
                 self.last_plan_t = time.time()
+            blocked_raw = bool(self.cached_blocked)
+            # Blocked needs N consecutive plan cycles to be believed:
+            # a speck cluster or a wall box appearing in a single scan
+            # must not hard-stop the car mid-road for that one frame.
+            # BC steering already stays off (blocked_raw) so the net
+            # never drives a path the planner marked blocked; the
+            # freshly planned path is clearance-verified, so driving it
+            # while the streak builds is safe, and the raw-sensor
+            # emergency stop below is the hard backstop.
+            if plan_ran:
+                if blocked:
+                    self.blocked_streak += 1
+                else:
+                    self.blocked_streak = 0
+            blocked = (self.blocked_streak
+                       >= BLOCKED_CONFIRM_FRAMES)
             if blocked:
                 blk = getattr(
                     self.planner, "last_blocker", None)
@@ -1811,6 +1843,15 @@ class AutopilotSession:
                             self.cruise_speed,
                             lead_dist, lead_speed,
                             speed))
+                # Wrong-side recovery: the map says the car is on the
+                # forbidden side of the centre line while the nav route
+                # is still legal; crawl back into the own lane instead of
+                # racing through the oncoming side (run 1787150245
+                # t=36-40).  A blocked report during recovery still
+                # stops; any followable path is capped to a crawl.
+                if getattr(
+                        self.planner, "last_map_recover", False):
+                    desired_speed = min(desired_speed, 2.0)
                 corner_v = getattr(
                     self.planner, "last_corner",
                     desired_speed)
@@ -1823,7 +1864,7 @@ class AutopilotSession:
                 # over so the neural net can never override obstacle
                 # avoidance, wall/guardrail detection or solid-line rules.
                 use_bc = (self.bc_mode and self.bc_model is not None
-                          and not blocked)
+                          and not blocked_raw)
                 if use_bc:
                     with self.vision_lock:
                         frame = self.vision_snapshot.get("frame")
@@ -1899,6 +1940,7 @@ class AutopilotSession:
             steer_angle, steer_capped = 0.0, False
             self.obs_dist = 999.0
             self.prev_steer = 0.0
+            self.blocked_streak = 0
             dt = max(1e-3, now - self.last_ctrl)
             self.last_ctrl = now
 
@@ -2070,6 +2112,7 @@ class AutopilotSession:
                         if not is_sparse_raycast_speck(ob)]
                     self.cached_drive_route = None
                     self.cached_blocked = False
+                    self.blocked_streak = 0
                     print("[m5] REVERSE-GUARD cleared "
                           "lane/sensor ghosts; will replan")
                 self.rev_hold_until = (
@@ -2096,6 +2139,43 @@ class AutopilotSession:
         if reverse_now or reverse_hold:
             desired_speed = 0.0
         _mark("reverse")
+
+        # --- Raw-sensor emergency stop (independent of obstacle
+        # classification) ----------------------------------------------
+        # The planner limits speed from classified obstacle boxes; a wall
+        # misread as roadside furniture, or a badly merged cluster, could
+        # otherwise slip through.  This layer answers "how far is the
+        # nearest raw hit in the corridor ahead" directly from the LiDAR /
+        # raycast points and forces a stop whenever the current speed
+        # needs more room than the corridor actually has.  It is the last
+        # line of defence before the pedals are sent, so the car never
+        # charges into a wall it failed to classify.
+        # Always evaluate the raw corridor, even at standstill: as soon
+        # as the car is pushed to 0 against a wall it still has to refuse
+        # throttle (a wall 1-2 m ahead must not let the car floor it and
+        # grind into the obstacle - run: throttle=94.7% @ v=0 until the
+        # STUCK watchdog gave up).  The kinematic need grows with speed;
+        # at v=0 a small standstill margin still applies.
+        fwd_clear = forward_clearance_m(
+            self.last_lidar_hits, st.pos, st.dir,
+            half_width=CAR_HALF_WIDTH + 0.5)
+        if math.isfinite(fwd_clear):
+            need = emergency_stop_clearance_m(speed)
+            # Central safety policy: hard stop inside the braking reserve,
+            # smooth progressive cap beyond it.  Only ever lowers the speed.
+            force_stop, cap = emergency_speed_limit_mps(fwd_clear, need)
+            if force_stop:
+                desired_speed = 0.0
+                self.target_speed = 0.0
+                if not self.emergency_brake_logged or \
+                        now - self.emergency_brake_logged > 2.0:
+                    self.emergency_brake_logged = now
+                    print(
+                        f"[m5] EMERGENCY STOP raw clear="
+                        f"{fwd_clear:.1f}m need={need:.1f}m "
+                        f"v={speed:.1f}")
+            elif cap < desired_speed:
+                desired_speed = cap
 
         # --- Speed ramp -------------------------------------------------------
         if desired_speed > self.target_speed:
@@ -2363,6 +2443,8 @@ class AutopilotSession:
                 "plan_offset": round(float(getattr(
                     self.planner,
                     "last_lane_offset", 0.0)), 2),
+                "recover": int(bool(getattr(
+                    self.planner, "last_map_recover", False))),
                 "obs": len(self.obstacles),
                 "obs_d": round(
                     float(self.obs_dist), 1),

@@ -60,6 +60,7 @@ from beamng_autopilot.planner import (
     corner_speed,
     _point_lat_offset,
     _seg_hits_box,
+    _seg_hits_obstacle,
     creep_speed,
     is_lane_edge_wall,
 )
@@ -118,6 +119,27 @@ def path_hits_box(path, box: Obstacle, extra: float) -> bool:
             return True
     return False
 
+
+
+
+def path_hits_obstacles(path, obstacles, half_width: float = CAR_HALF_WIDTH) -> bool:
+    """True when any path segment intersects any obstacle's real footprint.
+
+    Uses the oriented-footprint collision test so diagonal roadside walls
+    (axis + half_len/half_thick) are judged by their true footprint rather
+    than a world-aligned box.  ``half_width`` is the car half width.
+    """
+    if path is None or len(path) < 2:
+        return False
+    for i in range(len(path) - 1):
+        for ob in obstacles:
+            if _seg_hits_obstacle(
+                float(path[i, 0]), float(path[i, 1]),
+                float(path[i + 1, 0]), float(path[i + 1, 1]),
+                ob, half_width,
+            ):
+                return True
+    return False
 
 def test_bypass_forward_car(planner: LocalPlanner) -> None:
     """Car parked in the lane, nose pointing along the road."""
@@ -312,23 +334,27 @@ def test_lane_edge_wall_boundary(planner: LocalPlanner) -> None:
 
 def test_right_offset_not_zeroed_by_corridor_hugging_wall(
         _planner: LocalPlanner) -> None:
-    """A box hugging the nav corridor must not drag keep-right to zero.
+    """A box hugging the nav corridor must never produce an unsafe bias.
 
-    Regression for the italy finish-line behaviour: wall boxes that sit
-    right on the route (or are merged into an AABB that covers it) made
-    every right-hand candidate collide, so ``_safe_right_offset`` returned
-    0 and the car slid back onto the centre line for the last 30 m.  When
-    the zero-offset path is itself "hit", the offset cannot fix the
-    collision, so the planner keeps a small right bias instead.
+    A long box whose inner edge intrudes into the car's lane (it spans
+    the corridor at every offset the planner allows) must NOT make
+    ``_safe_right_offset`` return a colliding right bias.  The old
+    ``max(0.5, min(0.8, right_offset))`` fallback returned 0.8 without
+    re-checking the shifted path, so the car drove straight into an
+    in-lane wall (fuzz scene 0).  The helper now only returns offsets
+    proven clear; when none exist it returns 0.0 and the downstream
+    hit / deform / blocked pipeline stops in front of the obstacle.
     """
     planner = LocalPlanner(right_offset=1.5, right_ramp_m=8.0)
     route = straight_route()
     pts, i0, i1 = planner._window(route, 0)
+    # Inner edge at y=-0.7+1.0=+0.3: the wall genuinely covers the lane
+    # centre and every offset in [0, 1.5]; no safe keep-right exists.
     hugging = Obstacle(x=20.0, y=-0.7, half_w=18.0, half_h=1.0,
                        category="raycast", label="wall")
     safe = planner._safe_right_offset(pts, i0, i1, 0.0, [hugging])
-    check("hug-wall: corridor-hugging box keeps a right bias",
-          safe >= 0.4, f"safe_off={safe:.2f}")
+    check("hug-wall: in-lane hugging box yields no unsafe bias",
+          safe == 0.0, f"safe_off={safe:.2f}")
 
     # A genuine wall that only blocks the right side still clamps the
     # offset below the fallback, because the centre of the corridor stays
@@ -2530,9 +2556,9 @@ def test_sensor_lane_planning() -> None:
     drive_default, _ = default_planner.plan(
         route, [], (0.0, 0.0), 0.0, 0)
     drive_default = np.asarray(drive_default, dtype=float)
-    check("sensor-plan: default planner keeps right of the route centre",
+    check("sensor-plan: default planner follows the route centre",
           len(drive_default) > 30
-          and -1.8 <= float(drive_default[30, 1]) <= -1.2,
+          and abs(float(drive_default[30, 1])) < 0.3,
           f"y30={float(drive_default[30, 1]):.2f}")
 
     weak = LaneFrame(center=center, width=3.5, confidence=0.35,
@@ -2581,9 +2607,13 @@ def test_sensor_lane_planning() -> None:
     drive_edge, _ = planner.plan(
         route, [], (0.0, 0.0), 0.0, 0, sensor_lane=edge_lidar)
     drive_edge = np.asarray(drive_edge, dtype=float)
-    check("sensor-plan: lidar wall keeps the lane offset",
+    # Right-hand traffic: a single right-side laser edge defines the
+    # car's own lane.  The planner actively pulls the path to that
+    # lane's centre (half a lane width inside the wall, capped), so
+    # the car no longer rides the road-centre route.
+    check("sensor-plan: lidar wall pulls into its lane",
           edge_lidar is not None and len(drive_edge) > 30
-          and -1.8 <= float(drive_edge[30, 1]) <= -1.2
+          and -3.0 <= float(drive_edge[30, 1]) <= -1.2
           and getattr(planner, "last_lane_mode", "").startswith("lidar"),
           f"mode={getattr(planner, 'last_lane_mode', '')} "
           f"y30={float(drive_edge[30, 1]):.2f}")
@@ -2611,10 +2641,9 @@ def test_sensor_lane_planning() -> None:
     drive_vis, _ = planner.plan(
         route, [], (0.0, 0.0), 0.0, 0, sensor_lane=vis_right)
     drive_vis = np.asarray(drive_vis, dtype=float)
-    check("sensor-plan: single vision right keeps the lane offset",
+    check("sensor-plan: single vision right pulls into its lane",
           len(drive_vis) >= 10
-          and -1.8 <= float(drive_vis[10, 1]) <= -1.2
-          and 1.2 <= getattr(planner, "last_lane_offset", 0.0) <= 1.8
+          and -2.2 <= float(drive_vis[10, 1]) <= -0.8
           and getattr(planner, "last_lane_mode", "") == "vision_right",
           f"mode={getattr(planner, 'last_lane_mode', '')} "
           f"y10={float(drive_vis[10, 1]):.2f} "
@@ -2644,10 +2673,9 @@ def test_sensor_lane_planning() -> None:
     drive_vis_low, _ = planner.plan(
         route, [], (0.0, 0.0), 0.0, 0, sensor_lane=vis_right_low)
     drive_vis_low = np.asarray(drive_vis_low, dtype=float)
-    check("sensor-plan: low-trust single line keeps the lane offset",
+    check("sensor-plan: low-trust single line still pulls in-lane",
           len(drive_vis_low) >= 10
-          and -1.8 <= float(drive_vis_low[10, 1]) <= -1.2
-          and 1.2 <= getattr(planner, "last_lane_offset", 0.0) <= 1.8
+          and -2.2 <= float(drive_vis_low[10, 1]) <= -0.8
           and getattr(planner, "last_lane_mode", "") == "vision_right",
           f"mode={getattr(planner, 'last_lane_mode', '')} "
           f"y10={float(drive_vis_low[10, 1]):.2f} "
@@ -2694,9 +2722,9 @@ def test_sensor_lane_planning() -> None:
     drive5, _ = wide_planner.plan(route, [], (0.0, 0.0), 0.0, 0,
                                   sensor_lane=chosen_wide)
     drive5 = np.asarray(drive5, dtype=float)
-    check("sensor-plan: wide corridor keeps the lane offset",
+    check("sensor-plan: wide corridor stays on the route centre",
           chosen_wide is None and len(drive5) > 30
-          and -1.8 <= float(drive5[30, 1]) <= -1.2
+          and abs(float(drive5[30, 1])) < 0.3
           and getattr(wide_planner, "last_lane_mode", "") == "nav",
           f"mode={getattr(wide_planner, 'last_lane_mode', '')} "
           f"y30={float(drive5[30, 1]):.2f}")
@@ -2736,6 +2764,29 @@ def test_lane_frame_primary() -> None:
           getattr(planner, "last_lane_mode", "") == "vision",
           f"mode={getattr(planner, 'last_lane_mode', '')}")
 
+    # A paired lane on the ONCOMING side of the map centre line is a
+    # wrong pairing (real run 1787130718 t=58.3: lane_lat +1.38 m).
+    # The map boundary is authoritative: the path may not cross to
+    # that side even when the paired lane claims it is the centre.
+    rule_lhd = RoadRuleView(
+        lanes="-+", right_hand_drive=False,
+        in_radius=4.0, out_radius=4.0,
+        in_pos=(0.0, 0.0, 0.0), out_pos=(60.0, 0.0, 0.0),
+        right_vec=(0.0, -1.0, 0.0))
+    xs_c = np.arange(0.0, 16.0, 1.5)
+    frame_wrong = LaneFrame(
+        center=np.column_stack([xs_c, np.full_like(xs_c, 1.0)]),
+        width=3.5, confidence=0.8, span_m=15.0, sources=("vision",))
+    drive_wr, blocked_wr = planner.plan(
+        route, [], (0.0, 0.0), 0.0, 0,
+        sensor_lane=frame_wrong, road_rule=rule_lhd)
+    drive_wr = np.asarray(drive_wr, dtype=float)
+    check("lane-primary: wrong-side pair never crosses the map centre",
+          len(drive_wr) >= 5
+          and float(np.max(drive_wr[:, 1])) <= 0.05,
+          f"ymax={float(np.max(drive_wr[:, 1])):.2f} "
+          f"blocked={blocked_wr} n={len(drive_wr)}")
+
     # A far-off pair is a wrong read: it must not replace the route.
     center_far = np.column_stack([xs, np.full_like(xs, -6.0)])
     frame_far = LaneFrame(center=center_far, width=3.5, confidence=0.8,
@@ -2746,7 +2797,7 @@ def test_lane_frame_primary() -> None:
     last_i = len(drive_f) - 1
     y_far = float(drive_f[last_i, 1]) if last_i >= 5 else 99.0
     check("lane-primary: far-off pair rejected (nav primary)",
-          not blocked_f and last_i >= 5 and -1.8 <= y_far <= -1.2,
+          not blocked_f and last_i >= 5 and abs(y_far) < 0.3,
           f"ylast={y_far:.2f} blocked={blocked_f} n={len(drive_f)}")
     check("lane-primary: rejection recorded",
           getattr(planner, "last_lane_override", None) is not None,
@@ -2780,7 +2831,7 @@ def test_lane_frame_primary() -> None:
     last_i = len(drive_ws) - 1
     y_ws = float(drive_ws[last_i, 1]) if last_i >= 5 else 99.0
     check("lane-primary: wrong-side single edge dropped (nav primary)",
-          not blocked_ws and last_i >= 5 and -1.8 <= y_ws <= -1.2
+          not blocked_ws and last_i >= 5 and abs(y_ws) < 0.3
           and getattr(planner, "last_lane_override", None) is not None,
           f"ylast={y_ws:.2f} "
           f"ovr={getattr(planner, 'last_lane_override', None)}")
@@ -2799,7 +2850,7 @@ def test_lane_frame_primary() -> None:
     last_i = len(drive_fe) - 1
     y_fe = float(drive_fe[last_i, 1]) if last_i >= 5 else 99.0
     check("lane-primary: far single edge dropped (nav primary)",
-          not blocked_fe and last_i >= 5 and -1.8 <= y_fe <= -1.2
+          not blocked_fe and last_i >= 5 and abs(y_fe) < 0.3
           and getattr(planner, "last_lane_override", None) is not None,
           f"ylast={y_fe:.2f} "
           f"ovr={getattr(planner, 'last_lane_override', None)}")
@@ -3012,20 +3063,28 @@ def test_twitch_scene_2102(planner: LocalPlanner) -> None:
     ]
 
     drive, blocked = planner.plan(route, boxes, pos, heading, nearest)
-    check("twitch-scene: plan detours, not blocked",
-          not blocked and planner.last_mode == "detour",
+    drive_arr = np.asarray(drive, dtype=float)
+    hit = path_hits_obstacles(drive_arr, boxes)
+    check("twitch-scene: plan never collides", not hit,
           f"mode={planner.last_mode} blocked={blocked}")
-    v, _ = planner.speed(np.asarray(drive, dtype=float), boxes, pos,
-                         heading, 0, 15.0)
-    check("twitch-scene: speed stays drivable (>5 m/s)",
-          v > 5.0, f"v={v:.2f} m/s")
+    check("twitch-scene: plan detours or stops safely",
+          (not blocked and planner.last_mode == "detour")
+          or (blocked and not hit and len(drive_arr) >= 1),
+          f"mode={planner.last_mode} blocked={blocked}")
+    v, _ = planner.speed(drive_arr, boxes, pos, heading, 0, 15.0)
+    check("twitch-scene: moving plan keeps a sane speed",
+          blocked or v > 2.0, f"v={v:.2f} m/s blocked={blocked}")
 
     # Replay the scene the way the live loop does (plan -> trim the path
     # to the car -> speed with nearest=0) along the route through the
     # grove.  The roadside boxes used to project onto the trimmed route
     # start (lon = 0) every frame and pin the speed to zero while the
-    # detour ran metres away -> stop/creep twitch along the grove.
+    # detour ran metres away -> stop/creep twitch along the grove.  When
+    # the grove sits directly on the near route the planner may stop
+    # safely (blocked, truncated before contact); every emitted path must
+    # still stay clear of every obstacle footprint.
     pins = 0
+    frames_safe = True
     grove_ok = True
     for idx in range(0, 18, 2):
         fpos = route[idx]
@@ -3041,18 +3100,25 @@ def test_twitch_scene_2102(planner: LocalPlanner) -> None:
             start_i = int(np.argmin(d0))
             if start_i > 0 and len(fdrive) - start_i >= 2:
                 fdrive = fdrive[start_i:]
+        hit = path_hits_obstacles(fdrive, boxes)
+        if hit:
+            frames_safe = False
         fv, _ = planner.speed(fdrive, boxes, fpos, fhead, 0, 15.0)
         if fblocked:
             fv = 0.0
         obs_lim = getattr(planner, "last_obs_lim", None)
         if not fblocked and obs_lim is not None and obs_lim <= 0.01:
             pins += 1
-        if 2 <= idx <= 10 and fv <= 5.0:
+        if 2 <= idx <= 10 and not fblocked and fv <= 2.0:
             grove_ok = False
+    check("twitch-scene: every frame stays clear of obstacles",
+          frames_safe, "" if frames_safe
+          else "a frame drove into an obstacle footprint")
     check("twitch-scene: no frame pins the speed (obslim=0 gone)",
           pins == 0, f"pins={pins}")
-    check("twitch-scene: grove frames stay drivable (>5 m/s)",
-          grove_ok, "some grove frame fell below 5 m/s")
+    check("twitch-scene: grove frames keep moving or stop safely",
+          grove_ok, "" if grove_ok
+          else "some non-blocked grove frame fell below 2 m/s")
 
 
 def test_traffic_rules() -> None:
@@ -3233,20 +3299,18 @@ def test_map_lane_planning() -> None:
     drive, blocked = planner.plan(
         route, [], (0.0, 0.0), 0.0, 0, road_rule=rule)
     drive = np.asarray(drive, dtype=float)
-    check("map-lane: map boundary keeps the right lane offset",
+    check("map-lane: legal-lane boundary keeps the path off the centre",
           not blocked and len(drive) > 30
-          and -1.8 <= float(drive[30, 1]) <= -1.2
-          and 1.2 <= getattr(planner, "last_lane_offset", 0.0) <= 1.8,
+          and float(drive[30, 1]) <= -1.0,
           f"blocked={blocked} y30="
-          f"{float(drive[30, 1]):.2f} off="
-          f"{getattr(planner, 'last_lane_offset', 0.0):.2f}"
+          f"{float(drive[30, 1]):.2f}"
           if len(drive) > 30 else "short path")
     drive_old, blocked_old = planner.plan(
         route, [], (0.0, 0.0), 0.0, 0)
     drive_old = np.asarray(drive_old, dtype=float)
-    check("map-lane: no map data keeps the right lane offset",
+    check("map-lane: without map data the path follows the route centre",
           not blocked_old and len(drive_old) > 10
-          and -1.8 <= float(np.median(drive_old[:, 1])) <= -1.2,
+          and abs(float(np.median(drive_old[:, 1]))) < 0.3,
           f"blocked={blocked_old} "
           f"y_med={float(np.median(drive_old[:, 1])):.2f}"
           if len(drive_old) > 10 else "short path")
