@@ -76,15 +76,22 @@ def _path_infractions(scene: Scene, path, span: float = 2.0) -> list:
     if scene.grid is None or len(path) < 2:
         return []
     pos = np.asarray(scene.pos[:2], dtype=float)
+    extent = float(getattr(scene.grid, "extent", 0.0) or 0.0)
     bad = 0
     total = 0
     for x, y in path:
         d = math.hypot(x - pos[0], y - pos[1])
         if d < 2.5:
             continue
+        # Only cells inside the sensor grid carry collision evidence;
+        # beyond the FOV horizon is unknown, not a wall.
+        if extent > 0.0 and d > extent:
+            continue
         total += 1
         cell = scene.grid.world_to_cell(x, y)
-        if cell is None or scene.grid.obstacle[cell] > 0:
+        if cell is None:
+            continue
+        if scene.grid.obstacle[cell] > 0:
             bad += 1
     return [bad, total]
 

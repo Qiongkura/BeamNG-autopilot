@@ -83,15 +83,24 @@ class SafetyMonitor:
             return 0.0
         path = np.asarray(path, dtype=float)[:, :2]
         pos = np.asarray(scene.pos[:2], dtype=float)
+        extent = float(getattr(scene.grid, "extent", 0.0) or 0.0)
         bad = 0
         total = 0
         for x, y in path:
             d = math.hypot(x - pos[0], y - pos[1])
             if d < 2.5:
                 continue
+            # Beyond the sensor/FOV horizon the world is *unknown*, not
+            # blocked. A long nav-route reference must not read as if it
+            # were driving through a wall out of sensor range; the forward
+            # corridor check owns the "wall ahead" verdict.
+            if extent > 0.0 and d > extent:
+                continue
             total += 1
             cell = scene.grid.world_to_cell(x, y)
-            if cell is None or scene.grid.obstacle[cell] > 0:
+            if cell is None:
+                continue
+            if scene.grid.obstacle[cell] > 0:
                 bad += 1
         return (bad / total) if total else 0.0
 
@@ -222,11 +231,20 @@ class SafetyMonitor:
             return v
 
         # --- obstacle approach speed ------------------------------------
+        # Nearby roadside walls/cars ease speed; a genuinely closed
+        # forward corridor (real blockage) is what degrades/stops.  A
+        # narrow town street keeps FSD engaged past buildings (which are
+        # normal lane bounds) while slowing, instead of dropping to the
+        # rule creep on every frame (town runs 2026-08-21).
         if closest < 8.0:
             # ease speed as the closest obstacle closes in (brake band)
             k = max(0.0, 1.0 - (8.0 - closest) / 6.0)
-            v.target_speed = min(v.target_speed, self.max_speed * k)
-            if v.target_speed < 1.0:
+            eased = self.max_speed * k
+            if corridor_open:
+                # roadside objects are lane bounds: creep, never stop
+                eased = max(eased, self.min_risk_speed)
+            v.target_speed = min(v.target_speed, eased)
+            if not corridor_open and v.target_speed < 1.0:
                 v.level = "degraded"
                 v.reason = "obstacle very close"
         return v

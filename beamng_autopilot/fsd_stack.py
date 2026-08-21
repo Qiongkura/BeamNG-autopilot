@@ -53,6 +53,7 @@ class FSDTick:
         self.bev: np.ndarray | None = None      # (N, N) occupancy raster
         self.drivable: np.ndarray | None = None
         self.best_path: np.ndarray | None = None
+        self.lane_ref: np.ndarray | None = None  # vision lane centreline
         self.best_speed: float = 0.0            # planned speed at the start
         self.min_speed: float = 0.0             # lowest speed on the path
         self.n_candidates: int = 0
@@ -183,14 +184,26 @@ class FSDStack:
         # available).  The safety monitor's lane-deviation check must
         # measure against a *meaningful* reference, not None.
         lane_ref = self._bev_drivable_center(grid, pos, heading)
+        # The sensor (vision+LiDAR) drivable-centreline is the lane the
+        # car must hold (FSD "vector space" lane): plan ALONG it when the
+        # road is visible, and only fall back to the map/nav prior when
+        # the sensor lane is unavailable.  A nav route that is not
+        # re-anchored to the ego (or runs far from the car) must not drag
+        # the planner off the real road - observed town runs where the
+        # car followed the road fine but the stale nav route pinned it
+        # "off-lane".
+        plan_route = lane_ref if (lane_ref is not None
+                                  and len(lane_ref) >= 4) else route_ref
         if lane_ref is None:
             lane_ref = route_ref
+        out.lane_ref = np.asarray(plan_route, dtype=float)
         scene = Scene(pos=pos, heading=heading, grid=grid,
-                      route=route_ref, lane_ref=lane_ref,
+                      route=plan_route, lane_ref=lane_ref,
                       target_speed=getattr(self, "target_speed", 8.0))
         fans = sample_arc(pos, heading, speed=max(2.0, float(st.speed)),
                           max_steer=0.4, n_curv=9)
-        shifts = sample_lane_shift(route_ref, offsets=(-2.0, -1.0, 1.0, 2.0))
+        shifts = sample_lane_shift(plan_route,
+                                   offsets=(-2.0, -1.0, 1.0, 2.0))
         for c in shifts.candidates:
             fans.add(c.path, c.meta.get("kind", "shift"),
                      offset=c.meta.get("offset", 0.0))

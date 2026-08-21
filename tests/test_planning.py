@@ -150,3 +150,18 @@ def test_selector_keeps_candidate_on_scattered_cluster() -> None:
     # at least one feasible candidate exists (corridor not fully closed)
     best, meta = select_trajectory(sc, arc, cons)
     assert best is not None, meta
+
+def test_out_of_grid_path_not_collision() -> None:
+    """Collision cost counts only cells inside the sensor grid; a route
+    that continues past the grid horizon is unknown, not a wall."""
+    from beamng_autopilot.planning.constraints import cost_collision
+    from beamng_autopilot.planning import Scene
+    from beamng_autopilot.occupancy import OccupancyGrid
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.origin = (0.0, 0.0)
+    grid.heading = 0.0
+    xs = np.linspace(0, 80, 60)
+    route = np.column_stack([xs, np.zeros_like(xs)])
+    scene = Scene(pos=np.array([0.0, 0.0]), heading=0.0, grid=grid,
+                  route=route, lane_ref=route)
+    assert cost_collision(scene, route, max_frac=0.15) < 1.0

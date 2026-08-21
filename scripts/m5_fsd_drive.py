@@ -16,6 +16,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 from pathlib import Path
@@ -46,6 +47,43 @@ REVERSE_THRESHOLD_MPS = -0.35
 REVERSE_CLEAR_MPS = 0.2
 
 
+def _local_route(pos, heading, nav_route, ahead_m=32.0) -> np.ndarray:
+    """The route in front of the ego, re-anchored at the car.
+
+    The in-game navigation route is a map prior that can start far from
+    the ego when the car drifts; planning and lane-keep must measure
+    against the *forward* part of the route only - the far tail of a
+    long route reads as a wall / lane edge and stalls the car on the
+    first town bend.  Falls back to a straight line ahead without a
+    nav route.
+    """
+    pos = np.asarray(pos[:2], dtype=float)
+    fwd = np.array([float(np.cos(heading)), float(np.sin(heading))])
+    if nav_route is not None and len(nav_route) >= 2:
+        r = np.asarray(nav_route[:, :2], dtype=float)
+        i0 = int(np.argmin(np.linalg.norm(r - pos, axis=1)))
+        d_prev = float("inf")
+        d_next = float("inf")
+        if i0 > 0:
+            v = r[i0] - r[i0 - 1]
+            d_prev = float(np.dot(v, fwd))
+        if i0 + 1 < len(r):
+            v = r[i0 + 1] - r[i0]
+            d_next = float(np.dot(v, fwd))
+        if d_next > 0 or d_prev == float("inf"):
+            seg = r[i0:]
+        else:
+            seg = r[i0::-1]  # route runs opposite; walk it backwards
+        # keep only the near, ahead part (the far route is unknown space)
+        dseg = np.linalg.norm(seg - pos, axis=1)
+        seg = seg[dseg <= ahead_m + 8.0]
+        if len(seg) >= 4:
+            return seg
+    xs = np.linspace(0, ahead_m, 25)
+    return np.column_stack([pos[0] + xs * np.cos(heading),
+                            pos[1] + xs * np.sin(heading)])
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="FSD-mode live driving")
     ap.add_argument("--runtime", choices=("auto", "steam", "tech"),
@@ -59,6 +97,12 @@ def main() -> int:
     ap.add_argument("--teleport", nargs=3, type=float, default=None,
                     metavar=("X", "Y", "YAW_DEG"),
                     help="teleport to an open stretch before driving")
+    ap.add_argument("--out", type=str, default=None,
+                    help="path for per-frame JSON telemetry export")
+    ap.add_argument("--goal", nargs=2, type=float, default=None,
+                    metavar=("X", "Y"),
+                    help="set an in-game navigation route to this goal "
+                         "before driving (else reuse the active nav route)")
     args = ap.parse_args()
 
     conn = BeamNGConnector(
@@ -99,6 +143,28 @@ def main() -> int:
                   f"({float(st1.pos[0]):.1f}, {float(st1.pos[1]):.1f}, "
                   f"{float(st1.pos[2]):.1f})")
 
+        # Navigation route: a real stack plans ALONG the destination
+        # route (FSD vector-space planner), not a straight line ahead -
+        # a straight reference drives the car into the building on the
+        # first town bend (observed town run 2026-08-21).  Use the
+        # in-game navigation route when available.
+        nav_route = None
+        if args.goal is not None:
+            conn.bng.control.queue_lua_command(
+                "core_groundMarkers.setPath({vec3(%.3f, %.3f, 0)})\n"
+                "return 'ok'" % (float(args.goal[0]), float(args.goal[1])),
+                response=True)
+            time.sleep(0.8)
+        nav = conn.read_navigation_route()
+        if nav is not None and len(nav) >= 4:
+            nav_route = np.asarray(nav[:, :2], dtype=float)
+            dseg = np.linalg.norm(np.diff(nav_route, axis=0), axis=1)
+            print(f"[fsd-drive] nav route: {len(nav_route)} pts, "
+                  f"{float(np.sum(dseg)):.1f} m")
+        else:
+            print("[fsd-drive] no nav route set; falling back to "
+                  "straight-ahead reference")
+
         stack = FSDStack(conn, args.runtime,
                          heads=[SemanticHead(), TrafficSignalHead()],
                          cam_w=args.cam_w, cam_h=args.cam_h,
@@ -122,6 +188,7 @@ def main() -> int:
         stopps = 0
         t0 = time.time()
         last_t = time.time()
+        hist: list[dict] = []
         while time.time() < t_end:
             st = conn.get_state()
             pos = np.asarray(st.pos, dtype=float)
@@ -137,24 +204,37 @@ def main() -> int:
             last_t = now_t
             rev_brk, reversing = rguard.decide(signed, dt=dt)
 
-            # one full FSD tick -> best trajectory
-            out = stack.tick(st=st)
+            # one full FSD tick -> best trajectory (planned along the
+            # navigation route when one exists)
+            out = stack.tick(st=st, route_ref=nav_route)
             best = out.best_path
 
-            # safety arbitration on the chosen path
+            # safety arbitration on the chosen path: evaluate against the
+            # tick's FUSED occupancy (the planner's own vector space), not
+            # a fresh empty grid - an empty grid read every path as
+            # "grazes obstacle" and kicked the FSD path out on the first
+            # bend (observed town run 2026-08-21).
             grid = OccupancyGrid(stack.grid_n, stack.grid_n,
                                  stack.grid_res,
                                  origin=(float(pos[0]), float(pos[1])),
                                  heading=heading)
-            # reuse the tick's fused grid if the stack exposed it
+            # Lane reference for the safety monitor: prefer the stack's
+            # vision/LiDAR drivable centreline (the lane the planner
+            # actually follows); the map nav route only when the sensor
+            # lane is not available.
+            local = _local_route(pos, heading, nav_route)
+            if out.lane_ref is not None and len(out.lane_ref) >= 4:
+                local = np.asarray(out.lane_ref, dtype=float)
             if out.bev is not None and out.bev.shape == grid.occupancy.shape:
-                xs_r = np.linspace(0, 30, 31)
-                route_ref = np.column_stack(
-                    [pos[0] + xs_r * np.cos(heading),
-                     pos[1] + xs_r * np.sin(heading)])
+                grid.occupancy[:] = np.asarray(out.bev, dtype=np.float32)
+                grid.obstacle[:] = (np.asarray(out.bev) >= 0.6
+                                    ).astype(np.uint8)
+                if out.drivable is not None and \
+                        out.drivable.shape == grid.drivable.shape:
+                    grid.drivable[:] = np.asarray(out.drivable)
                 scene = Scene(pos=pos, heading=heading, grid=grid,
-                              route=route_ref,
-                              lane_ref=route_ref, target_speed=args.speed)
+                              route=local,
+                              lane_ref=local, target_speed=args.speed)
                 verd = monitor.evaluate(scene, best,
                                         planner_age_s=0.0)
             else:
@@ -169,10 +249,7 @@ def main() -> int:
             # a minimal-risk stop).  A body-frame reference handed to
             # PurePursuit points at a wrong world target and spins the
             # car (the "dumb reversing" seen in probes).
-            xs_r = np.linspace(0, 25, 26)
-            rule_ref = np.column_stack(
-                [pos[0] + xs_r * np.cos(heading),
-                 pos[1] + xs_r * np.sin(heading)])
+            rule_ref = local
             from beamng_autopilot.planning import arbitrate
             chosen = arbitrate(
                 best, rule_ref,
@@ -209,6 +286,23 @@ def main() -> int:
                 steer = 0.0
             conn.control(throttle=thr, brake=brk, steering=steer,
                          gear=fwd_gear)
+            # snapshot for offline stability evaluation (safe / degraded
+            # ratio over a long route); written once at the end.
+            hist.append({
+                "t": round(time.time() - t0, 3),
+                "pos": [round(float(p), 3) for p in pos[:3]],
+                "heading": round(float(heading), 4),
+                "speed": round(float(v), 3),
+                "signed": round(float(signed), 3),
+                "level": str(verd.level),
+                "reason": verd.reason or "-",
+                "source": str(chosen.source),
+                "plan_speed": round(float(plan_speed), 2),
+                "throttle": round(float(thr), 4),
+                "brake": round(float(brk), 4),
+                "steer": round(float(steer), 4),
+                "reversing": int(bool(reversing)),
+            })
             conn.step(args.steps)
             frames += 1
             if frames % 4 == 1:
@@ -228,6 +322,15 @@ def main() -> int:
         except Exception:
             pass
         conn.close()
+        if hist and args.out:
+            try:
+                from pathlib import Path as _P
+                _P(args.out).parent.mkdir(parents=True, exist_ok=True)
+                _P(args.out).write_text(
+                    json.dumps(hist, ensure_ascii=False), encoding="utf-8")
+                print(f"[fsd-drive] telemetry -> {args.out} ({len(hist)} frames)")
+            except Exception as _e:
+                print(f"[fsd-drive] telemetry write failed: {_e}")
     return 0
 
 
