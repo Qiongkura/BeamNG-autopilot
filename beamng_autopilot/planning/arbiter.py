@@ -61,6 +61,69 @@ def arbitrate(fsd_path, rule_path, fsd_safe: bool = True,
     return ArbiterOutcome(None, "none", "no fsd and no rule path")
 
 
+def _ref_blocked_fraction(ref, pos, heading, grid,
+                          lo_m: float = 3.0, hi_m: float = 25.0,
+                          fwd_min_m: float = 0.5) -> float:
+    """Fraction of a reference line's near samples inside occupied cells.
+
+    ``ref`` is a world-space polyline, ``pos``/``heading`` the ego pose and
+    ``grid`` the current occupancy grid.  Only samples a sensible 3-25 m
+    window ahead of the ego are counted; a long map-route tail beyond the
+    sensor horizon is unknown space, not a wall (so it does not punish a
+    route that simply extends past the grid).  Used to decide whether the
+    map/nav route should keep governing planning when the sensor lane is
+    clearly the drivable space ahead.
+    """
+    if ref is None or len(ref) < 2 or grid is None:
+        return 0.0
+    r = np.asarray(ref[:, :2], dtype=float)
+    p = np.asarray(pos[:2], dtype=float)
+    ch, sh = math.cos(float(heading)), math.sin(float(heading))
+    extent = float(getattr(grid, "extent", 0.0) or 0.0)
+    bad = 0.0
+    tot = 0.0
+    for x, y in r:
+        dx, dy = x - p[0], y - p[1]
+        d = math.hypot(dx, dy)
+        if d < lo_m or d > hi_m:
+            continue
+        if extent > 0.0 and d > extent:
+            continue
+        if (dx * ch + dy * sh) < fwd_min_m:
+            continue
+        tot += 1.0
+        cell = grid.world_to_cell(x, y)
+        if cell is not None and grid.obstacle[cell] > 0:
+            bad += 1.0
+    return (bad / tot) if tot > 0 else 0.0
+
+
+def choose_plan_route(route, lane_ref, pos, heading, grid,
+                      route_blocked_frac: float = 0.20,
+                      lane_clear_frac: float = 0.15):
+    """Pick the navigational reference the planner should follow.
+
+    Real FSD plans in vector space: the map/nav route carries the long
+    intent, but the *sensor lane* (drivable-space centreline) is the
+    roadway actually observed ahead.  Normally plan along the ego-anchored
+    map route, but if that route's near-ahead corridor is occupied while
+    the sensor lane ahead is clearly free, choose the sensor lane instead -
+    a route that cuts through a building wall just parks the car against
+    the wall if planning insists on it (town corner run 2026-08-21: the
+    single-marker ``setPath`` route was a straight line through a wall,
+    while the BEV lane actually turned away).
+    """
+    if route is None or len(route) < 2:
+        return lane_ref if (lane_ref is not None and len(lane_ref) >= 2) else route
+    if lane_ref is None or len(lane_ref) < 2:
+        return route
+    r_b = _ref_blocked_fraction(route, pos, heading, grid)
+    l_b = _ref_blocked_fraction(lane_ref, pos, heading, grid)
+    if float(r_b) >= float(route_blocked_frac) and float(l_b) <= float(lane_clear_frac):
+        return lane_ref
+    return route
+
+
 def anchored_rule_ref(pos, heading, ref, near_m: float = 4.0,
                       forward_m: float = 1.0):
     """Return ``ref`` only when it is a path the car can actually drive

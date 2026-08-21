@@ -19,12 +19,19 @@ logger = logging.getLogger(__name__)
 
 
 class RoadNetwork:
-    def __init__(self):
+    def __init__(self, intersection_join_m: float = 2.5):
         self.nodes: np.ndarray | None = None  # Nx2 (x, y)
         self.heights: np.ndarray | None = None  # N, road-surface z per node
         self.adj: dict[int, list[tuple[int, float]]] = {}
         self.ready = False
         self.info = "no road data"
+        # Road centre-lines arrive per DecalRoad segment; two roads meeting
+        # at an intersection keep separate endpoint nodes that the raw edge
+        # list never links.  Stitch their near nodes into one graph so A*
+        # can route ACROSS junctions (town -> goal probe: the car's start
+        # component was only 23 nodes and A* returned "no path").
+        self.intersection_join_m = float(intersection_join_m)
+        self.stitch_edges = 0
 
     @property
     def node_count(self) -> int:
@@ -104,9 +111,62 @@ class RoadNetwork:
             d = float(np.linalg.norm(self.nodes[a] - self.nodes[b]))
             self.adj[a].append((b, d))
             self.adj[b].append((a, d))
+        # Stitch DecalRoad endpoints that meet near an intersection so the
+        # graph becomes one connected navigable network (A* otherwise can
+        # find no path across a junction).
+        try:
+            self.stitch_edges = self._stitch_intersections(
+                join_m=self.intersection_join_m)
+        except Exception as exc:  # scipy unavailable should not kill build
+            logger.warning("[roadnet] intersection stitch failed: %s", exc)
+            self.stitch_edges = 0
         self.ready = True
-        self.info = f"{len(self.nodes)} nodes / {len(edges)} edges / {n_used} roads"
+        self.info = (f"{len(self.nodes)} nodes / {len(edges)} edges / "
+                     f"+{self.stitch_edges} join edges / {n_used} roads")
         return True
+
+    def _stitch_intersections(self, join_m: float) -> int:
+        """Bridge near DecalRoad nodes so A* can cross junctions.
+
+        Each road's centre line is stored as one polyline; its nodes are
+        only linked to the node before/after on the SAME road.  At a
+        junction (including where a road continues straight through while
+        another one ends into it) the endpoint nodes of the meeting roads
+        lie within a couple of metres but are never connected, so the graph
+        is disconnected and ``route()`` returns None for any start/goal on
+        different roads.
+
+        We add an undirected edge between every node pair that is closer
+        than ``join_m`` and not already adjacent.  The radius is deliberately
+        small so we only stitch genuine junction geography and never shortcut
+        across a wide median / block between parallel carriageways.
+        """
+        if self.nodes is None or len(self.nodes) < 3:
+            return 0
+        try:
+            from scipy.spatial import cKDTree
+        except Exception:
+            return 0
+        tree = cKDTree(self.nodes)
+        pairs = tree.query_pairs(r=float(join_m), output_type="ndarray")
+        existing = set()
+        for a, bs in self.adj.items():
+            for b, _ in bs:
+                existing.add((a, b))
+        added = 0
+        for a, b in pairs:
+            ia, ib = int(a), int(b)
+            if ia == ib or (ia, ib) in existing or (ib, ia) in existing:
+                continue
+            d = float(np.linalg.norm(self.nodes[ia] - self.nodes[ib]))
+            if d <= 1e-9 or d > float(join_m):
+                continue
+            self.adj[ia].append((ib, d))
+            self.adj[ib].append((ia, d))
+            existing.add((ia, ib))
+            existing.add((ib, ia))
+            added += 1
+        return added
 
     def _nearest(self, xy) -> int:
         d = np.linalg.norm(self.nodes - np.asarray(xy[:2], dtype=float), axis=1)

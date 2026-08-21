@@ -221,12 +221,21 @@ class FSDStack:
                           and float(np.linalg.norm(
                               np.asarray(route_ref[0], dtype=float)[:2]
                               - np.asarray(pos[:2], dtype=float))) <= 6.0)
-        # Route intent first (the map route is the navigational goal), the
-        # sensor lane second - a free-space centreline alone pointed
-        # straight through the town turn and the car drove off-road
-        # (2026-08-21 runs); the ego-anchored nav route carries the turn.
-        plan_route = np.asarray(route_ref, dtype=float)[:, :2] \
-            if route_anchored else (sensor_lane and lane_ref or route_ref)
+        # Route intent is the navigational goal, but when that route's near
+        # corridor is genuinely occupied while the sensor lane ahead is
+        # free, plan along the DRIVABLE sensor lane instead.  A route that
+        # cuts through a wall (single-marker ``setPath`` produced a straight
+        # line through town buildings) must not keep pushing the car at the
+        # wall just because it is ego-anchored (town run 2026-08-21).
+        from beamng_autopilot.planning.arbiter import choose_plan_route
+        _base_route = np.asarray(route_ref, dtype=float)[:, :2]
+        if route_anchored:
+            plan_route = choose_plan_route(
+                _base_route, lane_ref, pos, heading, grid)
+        else:
+            plan_route = (sensor_lane and lane_ref or _base_route)
+        if plan_route is None or len(plan_route) < 2:
+            plan_route = _base_route
         if lane_ref is None:
             lane_ref = plan_route
         out.lane_ref = np.asarray(lane_ref, dtype=float)

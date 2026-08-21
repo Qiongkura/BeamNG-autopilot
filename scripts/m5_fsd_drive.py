@@ -37,6 +37,7 @@ from beamng_autopilot.control.speed import SpeedController
 from beamng_autopilot.fsd_stack import FSDStack
 from beamng_autopilot.occupancy import OccupancyGrid
 from beamng_autopilot.planning import Scene
+from beamng_autopilot.roadnet import RoadNetwork
 from beamng_autopilot.planner import (
     emergency_speed_limit_mps,
     emergency_stop_clearance_m,
@@ -167,18 +168,63 @@ def main() -> int:
         # Navigation route: a real stack plans ALONG the destination
         # route (FSD vector-space planner), not a straight line ahead -
         # a straight reference drives the car into the building on the
-        # first town bend (observed town run 2026-08-21).  Use the
-        # in-game navigation route when available.
+        # first town bend (observed town run 2026-08-21).  A single-marker
+        # ``core_groundMarkers.setPath`` route is just a straight
+        # interpolation to the marker, NOT a road-following nav route, so
+        # it cuts across roads/walls (town run 2026-08-21: a straight line
+        # pointed at a wall at (711.8,730.8) and the car wedged there).
+        # Prefer the road-graph A* route built from the actual DecalRoad
+        # centre-lines; fall back to the in-game route only when the road
+        # graph is unavailable.
         nav_route = None
+        st0 = conn.get_state()
+        p0 = np.asarray(st0.pos[:2], dtype=float)
         if args.goal is not None:
+            rn = RoadNetwork()
+            t_road = time.time()
+            while not rn.ready and time.time() - t_road < 90.0:
+                try:
+                    if rn.build(conn.bng):
+                        break
+                except Exception:
+                    pass
+                time.sleep(1.0)
+            if rn.ready:
+                # Start the route at the nearest ROAD node, not the raw
+                # (possibly off-road) ego/teleport point: interpolating the
+                # route from an off-road start crosses terrain before the
+                # car reaches the road, and leaves the auto-snap disabled
+                # (route[0] == start so d0 == 0).  Snap will then place the
+                # car on the road and face it along the route.
+                n0 = rn.nodes[rn._nearest(p0)]
+                r_route = rn.route(n0, np.asarray(args.goal, dtype=float))
+                if r_route is not None and len(r_route) >= 4:
+                    nav_route = np.asarray(r_route[:, :2], dtype=float)
+                    dseg = np.linalg.norm(np.diff(nav_route, axis=0), axis=1)
+                    print(f"[fsd-drive] road-graph route: "
+                          f"{len(nav_route)} pts, "
+                          f"{float(np.sum(dseg)):.1f} m "
+                          f"({rn.info})")
+                else:
+                    print("[fsd-drive] road-graph A* found no route; "
+                          "falling back to in-game nav route")
+            else:
+                print("[fsd-drive] road graph unavailable; "
+                      "falling back to in-game nav route")
+        if nav_route is None and args.goal is not None:
             conn.bng.control.queue_lua_command(
                 "core_groundMarkers.setPath({vec3(%.3f, %.3f, 0)})\n"
                 "return 'ok'" % (float(args.goal[0]), float(args.goal[1])),
                 response=True)
             time.sleep(0.8)
-        nav = conn.read_navigation_route()
-        if nav is not None and len(nav) >= 4:
-            nav_route = np.asarray(nav[:, :2], dtype=float)
+            nav = conn.read_navigation_route()
+            if nav is not None and len(nav) >= 4:
+                nav_route = np.asarray(nav[:, :2], dtype=float)
+        elif nav_route is None:
+            nav = conn.read_navigation_route()
+            if nav is not None and len(nav) >= 4:
+                nav_route = np.asarray(nav[:, :2], dtype=float)
+        if nav_route is not None and len(nav_route) >= 4:
             dseg = np.linalg.norm(np.diff(nav_route, axis=0), axis=1)
             print(f"[fsd-drive] nav route: {len(nav_route)} pts, "
                   f"{float(np.sum(dseg)):.1f} m")
