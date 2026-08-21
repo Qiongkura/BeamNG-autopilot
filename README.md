@@ -91,6 +91,17 @@ BEV/向量空间 → 占用 → 规划 → 安全 → 影子数据闭环**。现
 - `arbiter.py`：FSD 轨迹 vs 规则兜底仲裁——FSD 无路时降级到规则路径慢开，
   不再瞬态死停。
 
+### 5) 路网导航路线（`roadnet.py`、`fsd_stack.py`）
+
+- `RoadNetwork`：查询 DecalRoad 中心线构建路网图；**交叉路口缝合**
+  （近邻节点建边）把碎片化路网连通，A* 才能跨路口导航（此前 start/goal
+  往往落在不同连通分量，A* 直接返回 None）。
+- `m5_fsd_drive.py` 优先用 road-graph A* 生成沿路线（并 snap 到最近路网
+  节点），不再用单点 `core_groundMarkers.setPath` 的**直线插值**——那种
+  直线会横穿路面/车辆/建筑导致逆行、压线与撞墙。
+- `choose_plan_route`：当 map route 前方被占用而感知车道（BEV 可行驶
+  中线）前方通畅时，计划沿感知车道走——避免「路线直穿墙还把车往墙上推」。
+
 ### 5) 安全监控与仲裁（`safety_monitor.py`、`control/reverse_guard.py`）
 
 - `SafetyMonitor`：影子健康 + 最小风险策略——对比轨迹与占用、检查车道保持、
