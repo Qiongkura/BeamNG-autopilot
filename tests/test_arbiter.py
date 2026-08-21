@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from beamng_autopilot.planning import arbitrate
+from beamng_autopilot.planning import anchored_rule_ref, arbitrate
 
 
 def _path():
@@ -56,3 +56,27 @@ def test_none_when_everything_missing() -> None:
     out = arbitrate(None, None, fsd_safe=False)
     assert out.source == "none"
     assert out.path is None
+
+def test_anchored_rule_ref_keeps_forward_reference() -> None:
+    ref = np.array([[0.0, 0.0], [3.0, 0.0], [6.0, 0.0]])
+    out = anchored_rule_ref(np.array([0.0, 0.0]), 0.0, ref)
+    assert out is ref
+
+
+def test_anchored_rule_ref_rejects_far_start() -> None:
+    ref = np.array([[5.0, 0.0], [8.0, 0.0]])
+    out = anchored_rule_ref(np.array([0.0, 0.0]), 0.0, ref)
+    assert out is None
+
+
+def test_anchored_rule_ref_rejects_backward_path() -> None:
+    back = np.array([[0.0, 0.0], [0.0, -3.0]])
+    assert anchored_rule_ref(np.array([0.0, 0.0]), 0.0, back) is None
+    back2 = np.array([[0.0, 0.0], [-3.0, 0.0]])
+    assert anchored_rule_ref(np.array([0.0, 0.0]), 0.0, back2) is None
+
+
+def test_anchored_rule_ref_none_for_empty() -> None:
+    assert anchored_rule_ref(np.array([0.0, 0.0]), 0.0, None) is None
+    assert anchored_rule_ref(np.array([0.0, 0.0]), 0.0,
+                             np.zeros((1, 2))) is None

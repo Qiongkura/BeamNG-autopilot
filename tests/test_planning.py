@@ -165,3 +165,38 @@ def test_out_of_grid_path_not_collision() -> None:
     scene = Scene(pos=np.array([0.0, 0.0]), heading=0.0, grid=grid,
                   route=route, lane_ref=route)
     assert cost_collision(scene, route, max_frac=0.15) < 1.0
+
+
+def test_forward_progress_rejects_far_anchor() -> None:
+    """A candidate whose start sits > starts_near_m from the ego is a
+    mis-anchored map prior, not a drivable path from where the car is."""
+    sc = _scene()
+    cons = Constraints()
+    far = np.array([[4.5, 0.0], [7.0, 0.0], [10.0, 0.0]])
+    assert cons._has_forward_progress(sc, far) is False
+
+
+def test_forward_progress_rejects_backward_path() -> None:
+    sc = _scene()
+    cons = Constraints()
+    back = np.array([[0.0, 0.0], [-2.0, 0.0], [-4.0, 0.0]])
+    assert cons._has_forward_progress(sc, back) is False
+
+
+def test_forward_progress_accepts_forward_path() -> None:
+    sc = _scene()
+    cons = Constraints()
+    fwd = np.array([[0.0, 0.0], [1.5, 0.0], [4.0, 0.0]])
+    assert cons._has_forward_progress(sc, fwd) is True
+
+
+def test_score_rejects_far_anchor_candidate() -> None:
+    """The progress gate runs inside Constraints.score, so a candidate
+    anchored metres from the ego is infeasible regardless of lane cost."""
+    from beamng_autopilot.planning.trajectory import Candidate
+    sc = _scene()
+    cons = Constraints()
+    far = np.array([[5.0, 0.0], [8.0, 0.0], [11.0, 0.0]])
+    cost, feasible = cons.score(sc, Candidate(path=far))
+    assert not feasible
+    assert cost >= 1e9

@@ -34,7 +34,7 @@ from .constraints import (
     cost_lane_align,
 )
 from .selector import select_trajectory
-from .arbiter import ArbiterOutcome, arbitrate
+from .arbiter import ArbiterOutcome, anchored_rule_ref, arbitrate
 from .speed_profile import speed_profile_for_path
 from .intent import (
     RoutingIntent,
@@ -53,6 +53,7 @@ __all__ = [
     "cost_lane_align",
     "select_trajectory",
     "ArbiterOutcome",
+    "anchored_rule_ref",
     "arbitrate",
     "speed_profile_for_path",
 ]

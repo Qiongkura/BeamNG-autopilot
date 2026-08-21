@@ -34,11 +34,35 @@ class Constraints:
     # declare "no drivable path".
     corridor_clear_m: float = 3.0
     corridor_bands: int = 8
+    # A trajectory that does not actually move the vehicle ahead is not a
+    # drivable path - a mis-anchored map reference sitting behind/ beside
+    # the ego used to stay feasible and push the car into a wall (town
+    # runs 2026-08-21).  Require at least this much forward net progress
+    # (metres of displacement along the ego heading).
+    progress_min_m: float = 1.0
+    # Candidate starts farther than this from the ego are considered
+    # mis-anchored map priors (not drivable from where the car is).
+    starts_near_m: float = 3.0
+
+    def _has_forward_progress(self, scene: Scene, path) -> bool:
+        path = np.asarray(path, dtype=float)[:, :2]
+        pos = np.asarray(scene.pos[:2], dtype=float)
+        ch = math.cos(float(scene.heading))
+        sh = math.sin(float(scene.heading))
+        d0 = math.hypot(path[0, 0] - pos[0], path[0, 1] - pos[1])
+        if d0 > self.starts_near_m:
+            return False
+        # net forward displacement from the path start
+        dx = path[-1, 0] - path[0, 0]
+        dy = path[-1, 1] - path[0, 1]
+        return bool(dx * ch + dy * sh >= self.progress_min_m)
 
     def score(self, scene: Scene, candidate) -> tuple[float, bool]:
         """Return (cost, feasible)."""
         path = candidate.path
         if path is None or len(path) < 2:
+            return 1e9, False
+        if not self._has_forward_progress(scene, path):
             return 1e9, False
         feasible = True
         cost = 0.0

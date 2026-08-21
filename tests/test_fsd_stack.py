@@ -151,3 +151,28 @@ def test_bev_drivable_center_empty_returns_none() -> None:
     grid.origin = (0.0, 0.0)
     grid.heading = 0.0
     assert st._bev_drivable_center(grid, np.array([0.0, 0.0]), 0.0) is None
+
+def test_fsd_tick_lane_ref_anchored_near_ego() -> None:
+    """The drivable-centreline lane reference must be anchored at the ego
+    (start within ~3 m) so the planner's shift candidates pass the
+    forward-progress gate - a far-first reference started 8 m ahead and
+    made every candidate infeasible (town runs 2026-08-21)."""
+    st = _stack()
+    out = st.tick()
+    assert out.lane_ref is not None and len(out.lane_ref) >= 3
+    d0 = float(np.linalg.norm(np.asarray(out.lane_ref[0], dtype=float)))
+    assert d0 <= 3.0, f"lane reference not anchored: start {d0:.1f} m away"
+
+
+def test_fsd_tick_candidates_survive_progress_gate() -> None:
+    """An ego-anchored lane reference must not silently kill the lane-shift
+    candidates via the forward-progress gate.  At least the 11 arc fan plus
+    the shift family should reach the selector (a couple of straight arcs
+    can legitimately collide with the stub obstacle at (6, 0) and drop).
+    Regression: the far-first lane reference once rejected every shift and
+    left only the arcs (town runs 2026-08-21)."""
+    st = _stack()
+    out = st.tick()
+    meta = out.meta.get("planner", {})
+    if meta.get("n_eval") is not None:
+        assert meta["n_eval"] >= 12, meta

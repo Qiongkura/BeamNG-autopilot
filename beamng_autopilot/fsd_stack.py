@@ -200,10 +200,16 @@ class FSDStack:
         scene = Scene(pos=pos, heading=heading, grid=grid,
                       route=plan_route, lane_ref=lane_ref,
                       target_speed=getattr(self, "target_speed", 8.0))
+        # Town corners need a tighter arc fan than a highway fan: a
+        # 5-8 m radius bend is 0.12-0.2 rad/m, and the old 0.10 rad/m
+        # cap (10 m radius) could not turn away from a corner wall
+        # (town runs 2026-08-21) - it kept pressing the throttle into
+        # the wall.  Sample to the physical steer limit and add wider
+        # lateral shifts so the planner can actually dodge a near wall.
         fans = sample_arc(pos, heading, speed=max(2.0, float(st.speed)),
-                          max_steer=0.4, n_curv=9)
+                          max_steer=0.5, n_curv=11, max_curv=0.20)
         shifts = sample_lane_shift(plan_route,
-                                   offsets=(-2.0, -1.0, 1.0, 2.0))
+                                   offsets=(-3.0, -1.5, 1.5, 3.0))
         for c in shifts.candidates:
             fans.add(c.path, c.meta.get("kind", "shift"),
                      offset=c.meta.get("offset", 0.0))
@@ -289,11 +295,29 @@ class FSDStack:
         if len(pts) < 3:
             return None
         arr = np.asarray(pts, dtype=float)
-        # keep only the ahead part (positive along travel) to avoid the
-        # car's own lane being wrapped around itself
-        d0 = np.linalg.norm(arr - np.asarray(pos[:2]), axis=1)
-        ahead = arr[d0 <= 30.0]
-        return ahead if len(ahead) >= 3 else arr
+        # Anchor the centreline at the ego and order it near -> far so the
+        # planner sees a path it can actually drive from here.  The raw
+        # grid rows run far -> near, so without re-anchoring the first
+        # point sits metres ahead of the car and every candidate gets
+        # scored as off-lane (town runs 2026-08-21: all arcs infeasible at
+        # (717.8,754.6) because the reference started 8 m away).
+        d = arr - np.asarray(pos[:2], dtype=float)
+        fwd_m = d[:, 0] * math.cos(float(heading)) + \
+                d[:, 1] * math.sin(float(heading))
+        ahead = arr[fwd_m > 0.5]
+        if len(ahead) < 3:
+            ahead = arr
+        d0 = np.linalg.norm(ahead - np.asarray(pos[:2], dtype=float), axis=1)
+        ahead = ahead[np.argsort(d0)]          # near -> far
+        # Anchor the reference at the ego: when the nearest drivable row
+        # is already a couple of metres in front, prepend the ego so the
+        # planner's shift candidates start inside the forward-progress
+        # gate (a reference whose first point is beyond ~3 m got every
+        # lane-shift candidate rejected - town runs 2026-08-21).
+        if len(ahead) and float(np.linalg.norm(ahead[0] - np.asarray(pos[:2],
+                                                                     dtype=float))) > 2.0:
+            ahead = np.vstack([np.asarray(pos[:2], dtype=float), ahead])
+        return ahead if len(ahead) >= 3 else None
 
     def reset_temporal(self) -> None:
         """Clear the temporal filter - call after a teleport so stale

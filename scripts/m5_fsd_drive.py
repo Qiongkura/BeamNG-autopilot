@@ -205,8 +205,12 @@ def main() -> int:
             rev_brk, reversing = rguard.decide(signed, dt=dt)
 
             # one full FSD tick -> best trajectory (planned along the
-            # navigation route when one exists)
-            out = stack.tick(st=st, route_ref=nav_route)
+            # LOCAL forward route anchored at the ego; the full nav
+            # route tail is a map prior that can cut through a corner
+            # wall when the car drifts (town runs 2026-08-21) - the
+            # local forward route is what the planner may follow.
+            out = stack.tick(st=st,
+                             route_ref=_local_route(pos, heading, nav_route))
             best = out.best_path
 
             # safety arbitration on the chosen path: evaluate against the
@@ -249,8 +253,14 @@ def main() -> int:
             # a minimal-risk stop).  A body-frame reference handed to
             # PurePursuit points at a wrong world target and spins the
             # car (the "dumb reversing" seen in probes).
-            rule_ref = local
-            from beamng_autopilot.planning import arbitrate
+            # The rule fallback must also be a path the car can actually
+            # drive from here: anchored at the ego and heading forward.  A
+            # mis-anchored map prior sitting metres away must not be an
+            # excuse to push the wall - when no drivable path exists, the
+            # correct FSD behaviour is a minimal-risk stop (town runs
+            # 2026-08-21 pushed a wall under a far-away route reference).
+            from beamng_autopilot.planning import anchored_rule_ref, arbitrate
+            rule_ref = anchored_rule_ref(pos, heading, local)
             chosen = arbitrate(
                 best, rule_ref,
                 fsd_safe=verd.safe and best is not None and len(best) >= 2,

@@ -22,6 +22,7 @@ forensics FSD exposes between its neural and rule planners.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
 import numpy as np
@@ -58,3 +59,27 @@ def arbitrate(fsd_path, rule_path, fsd_safe: bool = True,
         return ArbiterOutcome(rule_path, "rule", "fsd unavailable")
 
     return ArbiterOutcome(None, "none", "no fsd and no rule path")
+
+
+def anchored_rule_ref(pos, heading, ref, near_m: float = 4.0,
+                      forward_m: float = 1.0):
+    """Return ``ref`` only when it is a path the car can actually drive
+    from ``pos``.
+
+    A rule/route fallback is only usable when it is anchored at the ego
+    (start near the car, endpoint forward of it).  A mis-anchored map
+    prior whose start sits metres away - or a path that leads backward /
+    sideways - is not a drivable fallback; when the layered planner
+    declines, the correct FSD behaviour is a minimal-risk stop, not
+    steering at a wall under a distant reference (town runs 2026-08-21).
+    """
+    if ref is None or len(ref) < 2:
+        return None
+    r = np.asarray(ref, dtype=float)[:, :2]
+    pos = np.asarray(pos[:2], dtype=float)
+    d0 = float(np.hypot(r[0, 0] - pos[0], r[0, 1] - pos[1]))
+    fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
+    fwd_m = float(np.dot(r[-1] - pos, fwd))
+    if d0 > near_m or fwd_m < forward_m:
+        return None
+    return ref
