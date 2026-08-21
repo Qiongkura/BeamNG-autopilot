@@ -39,6 +39,7 @@ from beamng_autopilot.planning import (
     sample_lane_shift,
     select_trajectory,
 )
+from beamng_autopilot.planner import CAR_HALF_WIDTH, forward_clearance_m
 from beamng_autopilot.runtime import (
     build_camera_ring_provider,
     build_range_provider,
@@ -60,6 +61,8 @@ class FSDTick:
         self.meta: dict = {}
         self.head_outputs: dict = {}
         self.errors: dict = {}
+        self.ray_hits: list = []
+        self.forward_clearance: float = float("inf")
 
 
 class FSDStack:
@@ -89,6 +92,9 @@ class FSDStack:
         self.constraints = Constraints(
             w_collision=5.0, w_curvature=0.5, w_lane_align=1.0)
         self.target_speed = 8.0  # plan cruise speed (m/s); drive can raise
+        # Raw-sensor forward corridor half width (car half width + margin)
+        # used by the independent FSD safety layer (m5_fsd_drive).
+        self.ego_half_width = CAR_HALF_WIDTH + 0.5
 
         # FSD-style temporal occupancy fusion: single-frame LiDAR glitches
         # must not create a phantom wall or erase a real one.
@@ -145,7 +151,25 @@ class FSDStack:
                     snap["front_main"][1], pos, heading, step=4)
             try:
                 rng = self.range_prov.scan(pos)
-                fuse_obstacles_to_grid(grid, rng.obstacles, rng.ray_hits)
+                out.ray_hits = list(getattr(rng, "ray_hits", []) or [])
+                out.forward_clearance = forward_clearance_m(
+                    out.ray_hits, pos,
+                    np.array([math.cos(heading), math.sin(heading)]),
+                    half_width=float(getattr(self, "ego_half_width",
+                                             CAR_HALF_WIDTH + 0.5)))
+                out.meta["fwd_clearance"] = round(
+                    float(out.forward_clearance), 3)
+                # Fuse only the CLUSTERED obstacle boxes (walls, vehicles,
+                # poles) into the BEV.  The raw ray hits are ignored for
+                # the obstacle layer: in a tree-lined town road dozens of
+                # ground/foliage reflections land inside the drivable lane,
+                # push the cell occupancy past 0.6 and the temporal fusion
+                # then re-derives obstacle=(bev>=0.6), turning the whole
+                # road ahead "occupied" and making every FSD path graze an
+                # obstacle (town runs 2026-08-21 - 86% of the forward 4 m
+                # corridor was marked occupied).  Clustered boxes keep the
+                # real walls/vehicles, the drivable layer keeps the road.
+                fuse_obstacles_to_grid(grid, rng.obstacles)
                 out.meta["n_obstacles"] = len(rng.obstacles)
             except Exception as exc:
                 out.errors["range"] = str(exc)
@@ -205,7 +229,11 @@ class FSDStack:
             if route_anchored else (sensor_lane and lane_ref or route_ref)
         if lane_ref is None:
             lane_ref = plan_route
-        out.lane_ref = np.asarray(plan_route, dtype=float)
+        out.lane_ref = np.asarray(lane_ref, dtype=float)
+        # out.lane_ref drives the *lateral* lane-keep reference (sensor
+        # drivable center when available); plan_route stays the
+        # navigational intent in the planner's Scene.
+
         scene = Scene(pos=pos, heading=heading, grid=grid,
                       route=plan_route, lane_ref=lane_ref,
                       target_speed=getattr(self, "target_speed", 8.0))

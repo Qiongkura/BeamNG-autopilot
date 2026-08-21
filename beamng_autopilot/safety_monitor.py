@@ -28,7 +28,12 @@ import numpy as np
 # How old a range/vision snapshot can be before the monitor distrusts it.
 STALE_SNAPSHOT_S = 0.8
 # Fraction of path samples inside occupied cells that triggers "blocked".
-OCC_FRACTION_DEGRADE = 0.10
+# Town roads are lined by trees/curbs whose clustered boxes overlap the
+# lane margin, so a 0.10 threshold made every FSD path "graze obstacle"
+# and the car crawled at rule speed through town (2026-08-21 runs).  The
+# corridor_free_band gate is the real "is the way clear" check; this
+# fraction only flags a path genuinely weaving through clutter.
+OCC_FRACTION_DEGRADE = 0.30
 OCC_FRACTION_STOP = 0.40
 # Lane-keep: the path must stay within this of the lane reference.
 LANE_DEV_DEGRADE_M = 3.0

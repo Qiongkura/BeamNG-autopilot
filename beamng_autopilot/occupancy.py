@@ -127,15 +127,68 @@ class OccupancyGrid:
             self.occupancy[r, c] = max(0.0, self.occupancy[r, c] - 0.15)
 
     def mark_obstacle_region(self, wx: float, wy: float, hw: float,
-                             hh: float, z: float = 1.0) -> None:
-        """Flood a rectangular obstacle footprint (axis-aligned in world)
-        into the grid - a vehicle/pillar box from sensor fusion.
+                             hh: float, z: float = 1.0,
+                             axis=None, half_len: float = 0.0,
+                             half_thick: float = 0.0) -> None:
+        """Flood a rectangular obstacle footprint into the grid.
 
-        Samples the footprint's corners/cross and fills the whole cell
-        range between them; corners that fall off the grid are clamped to
-        the border cells (a wall wider than the ego grid still closes the
-        whole grid, which is what a real wall does).
+        Without an oriented footprint a world-axis-aligned rectangle
+        ``(wx +/- hw, wy +/- hh)`` is flooded (vehicle / pillar boxes).
+        When ``axis`` + ``half_len`` / ``half_thick`` are provided the
+        footprint is a ROTATED rectangle along ``axis`` - a diagonal
+        roadside wall must only occupy its thin strip, not the huge
+        world-AABB that would otherwise cover the road (town runs
+        2026-08-21: a 3.6 m roadside wall flooded a 7.2 x 3.6 m world
+        rectangle and every FSD path "grazed" it).
         """
+        if axis is not None and half_len is not None and half_thick is not None:
+            ax = np.asarray(axis, dtype=float)[:2]
+            n = float(np.linalg.norm(ax))
+            if n > 1e-9:
+                ax = ax / n
+            else:
+                ax = np.array([1.0, 0.0])
+            px = np.array([-ax[1], ax[0]])
+            hl = max(0.0, float(half_len))
+            ht = max(0.0, float(half_thick))
+            # world-axis-aligned bounds of the rotated rectangle corners
+            ctr = np.array([wx, wy])
+            corner_pts = []
+            for sa in (-1, 1):
+                for st in (-1, 1):
+                    corner_pts.append(ctr + sa * hl * ax + st * ht * px)
+            x0 = float(min(pt[0] for pt in corner_pts))
+            x1 = float(max(pt[0] for pt in corner_pts))
+            y0 = float(min(pt[1] for pt in corner_pts))
+            y1 = float(max(pt[1] for pt in corner_pts))
+            hit: list[tuple[int, int]] = []
+            for wx_c in np.arange(x0, x1 + self.res, self.res):
+                for wy_c in np.arange(y0, y1 + self.res, self.res):
+                    dx = wx_c - ctr[0]
+                    dy = wy_c - ctr[1]
+                    if abs(dx * ax[0] + dy * ax[1]) > hl:
+                        continue
+                    if abs(dx * px[0] + dy * px[1]) > ht:
+                        continue
+                    cdx = wx_c - self.origin[0]
+                    cdy = wy_c - self.origin[1]
+                    ch = math.cos(self.heading)
+                    sh = math.sin(self.heading)
+                    ex = cdx * ch + cdy * sh
+                    ey = -cdx * sh + cdy * ch
+                    cell = self.ego_to_cell(ex, ey)
+                    if cell is not None:
+                        hit.append(cell)
+            if not hit:
+                return
+            rs = [c[0] for c in hit]
+            cs = [c[1] for c in hit]
+            r0, r1 = max(0, min(rs)), min(self.n_rows - 1, max(rs))
+            c0, c1 = max(0, min(cs)), min(self.n_cols - 1, max(cs))
+            self.obstacle[r0:r1 + 1, c0:c1 + 1] = 1
+            self.occupancy[r0:r1 + 1, c0:c1 + 1] = np.maximum(
+                self.occupancy[r0:r1 + 1, c0:c1 + 1], 0.9)
+            return
         x0, x1 = wx - hw, wx + hw
         y0, y1 = wy - hh, wy + hh
         ch, sh = math.cos(self.heading), math.sin(self.heading)
@@ -261,6 +314,9 @@ def fuse_obstacles_to_grid(grid: OccupancyGrid, obstacles,
         grid.mark_obstacle_region(float(ob.x), float(ob.y),
                                   float(getattr(ob, "half_w", 0.5)),
                                   float(getattr(ob, "half_h", 0.5)),
-                                  z=getattr(ob, "z", 1.0))
+                                  z=getattr(ob, "z", 1.0),
+                                  axis=getattr(ob, "axis", None),
+                                  half_len=float(getattr(ob, "half_len", 0.0)),
+                                  half_thick=float(getattr(ob, "half_thick", 0.0)))
     for hx, hy in (ray_hits or []):
         grid.add_obstacle_point(hx, hy, weight=0.35)

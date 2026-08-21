@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 import time
 from pathlib import Path
@@ -36,6 +37,10 @@ from beamng_autopilot.control.speed import SpeedController
 from beamng_autopilot.fsd_stack import FSDStack
 from beamng_autopilot.occupancy import OccupancyGrid
 from beamng_autopilot.planning import Scene
+from beamng_autopilot.planner import (
+    emergency_speed_limit_mps,
+    emergency_stop_clearance_m,
+)
 from beamng_autopilot.safety_monitor import SafetyMonitor
 from beamng_autopilot.vision.heads import SemanticHead, TrafficSignalHead
 
@@ -78,12 +83,6 @@ def _local_route(pos, heading, nav_route, ahead_m=32.0) -> np.ndarray:
         dseg = np.linalg.norm(seg - pos, axis=1)
         seg = seg[dseg <= ahead_m + 8.0]
         if len(seg) >= 4:
-            # Only follow the map route when it lies AHEAD of the ego: a
-            # car started before the route start (or drifted off-lane) has
-            # its nearest route vertex metres behind/ beside it, and using
-            # that prior drags the planner backward / off the road (town
-            # corner 2026-08-21).  Require the first kept point to be at
-            # least partly forward along the travel heading.
             if float(np.dot(seg[0] - pos, fwd)) > 1.0:
                 # anchor the reference at the car so it is a drivable
                 # start for the planner (a far start would trip the
@@ -91,6 +90,16 @@ def _local_route(pos, heading, nav_route, ahead_m=32.0) -> np.ndarray:
                 if float(np.linalg.norm(seg[0] - pos)) > 2.0:
                     seg = np.vstack([pos, seg])
                 return seg
+            # The nearest route vertex is beside/behind the ego (the car
+            # drifted off the map route).  Never fall back to the straight
+            # "goal" line here - it cuts across terrain/walls and wedges
+            # the car.  Build a return-to-route path from the ego to the
+            # next forward route points instead (town run 2026-08-21: car
+            # at (715.9,750.5) with the route beside/behind it drove a
+            # straight line across a wall and stuck, throttle 0.34 / v=0).
+            ahead = seg[np.dot(seg - pos, fwd) > 1.0]
+            if len(ahead) >= 2:
+                return np.vstack([pos, ahead])
     xs = np.linspace(0, ahead_m, 25)
     return np.column_stack([pos[0] + xs * np.cos(heading),
                             pos[1] + xs * np.sin(heading)])
@@ -173,6 +182,47 @@ def main() -> int:
             dseg = np.linalg.norm(np.diff(nav_route, axis=0), axis=1)
             print(f"[fsd-drive] nav route: {len(nav_route)} pts, "
                   f"{float(np.sum(dseg)):.1f} m")
+            # If the car was spawned far from the nav route (or the
+            # supplied --teleport missed the road), driving straight at
+            # the route cuts across terrain/walls and wedges the car
+            # (town runs 2026-08-21: 17-24 m off-route starts all ended
+            # against a wall at ~1.8 m raw clearance).  Snap determinist-
+            # ically onto the route and face along it so the FSD stack
+            # verifies route-following instead of a cross-country path.
+            st0 = conn.get_state()
+            p0 = np.asarray(st0.pos[:2], dtype=float)
+            d0 = np.linalg.norm(nav_route - p0, axis=1)
+            i = int(np.argmin(d0))
+            if d0[i] > 8.0:
+                rx, ry = float(nav_route[i, 0]), float(nav_route[i, 1])
+                if i + 1 < len(nav_route):
+                    ndx, ndy = (float(nav_route[i + 1, 0] - rx),
+                                float(nav_route[i + 1, 1] - ry))
+                else:
+                    ndx, ndy = (float(rx - nav_route[i - 1, 0]),
+                                float(ry - nav_route[i - 1, 1]))
+                h = float(np.arctan2(ndy, ndx))
+                yaw_deg = -math.degrees(h) - 90.0
+                from beamng_autopilot.connector import angle_to_quat
+                resp = conn.bng.control.queue_lua_command(
+                    f"local r = Engine.castRay(vec3({rx:.3f}, {ry:.3f}, 10000), "
+                    f"vec3({rx:.3f}, {ry:.3f}, -1000), true, false)\n"
+                    "if r and r.pt then return string.format('%.3f', r.pt.z) "
+                    "end\nreturn 'nil'", response=True)
+                z = 154.1
+                if resp and str(resp).strip() != "nil":
+                    try:
+                        z = float(str(resp).strip()) + 0.6
+                    except ValueError:
+                        pass
+                conn.vehicle.teleport(pos=(rx, ry, z),
+                                      rot_quat=angle_to_quat((0, 0, yaw_deg)))
+                conn.step(8)
+                st1 = conn.get_state()
+                print(f"[fsd-drive] snapped onto nav route "
+                      f"({float(st1.pos[0]):.1f}, {float(st1.pos[1]):.1f}, "
+                      f"{float(st1.pos[2]):.1f}) "
+                      f"(was {d0[i]:.1f} m off route)")
         else:
             print("[fsd-drive] no nav route set; falling back to "
                   "straight-ahead reference")
@@ -293,9 +343,23 @@ def main() -> int:
             if chosen.source == "rule":
                 plan_speed = min(plan_speed, 3.0)
             target = min(verd.target_speed, plan_speed, float(args.speed))
+            # Raw-sensor forward-clearance layer (independent of obstacle
+            # classification): clustered boxes can miss a gap narrower
+            # than the car body, so the raw hit corridor gates the FSD
+            # drive too - a 1.3 m gap must stop the car, not wedge it
+            # (town run 2026-08-21: throttle 27% against a too-narrow
+            # gap with zero forward motion).
+            force_stop = False
+            fwd_clear = float(out.forward_clearance)
+            if np.isfinite(fwd_clear):
+                need = emergency_stop_clearance_m(v)
+                force_stop, cap = emergency_speed_limit_mps(fwd_clear, need)
+                target = min(target, cap if not force_stop else 0.0)
             thr, brk = speed_ctrl.update(target, v)
-            # hard stop ONLY when no path at all remains (arbitration none)
-            if chosen.path is None:
+            # hard stop when no path remains, or the raw-sensor forward
+            # clearance is inside the braking reserve (never grind into a
+            # wall / wedge the car into a too-narrow gap)
+            if chosen.path is None or force_stop:
                 thr, brk = 0.0, 1.0
                 steer = 0.0
                 stopps += 1
@@ -324,6 +388,9 @@ def main() -> int:
                 "brake": round(float(brk), 4),
                 "steer": round(float(steer), 4),
                 "reversing": int(bool(reversing)),
+                "fwd_clear": float(out.forward_clearance)
+                    if np.isfinite(out.forward_clearance) else None,
+                "emergency": int(bool(force_stop)),
             })
             conn.step(args.steps)
             frames += 1
