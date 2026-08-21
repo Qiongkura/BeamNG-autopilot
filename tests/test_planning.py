@@ -200,3 +200,28 @@ def test_score_rejects_far_anchor_candidate() -> None:
     cost, feasible = cons.score(sc, Candidate(path=far))
     assert not feasible
     assert cost >= 1e9
+
+
+def test_score_rejects_fully_occupied_path_even_if_corridor_open() -> None:
+    """A candidate whose samples are almost entirely inside occupied cells
+    must be infeasible even when corridor_free_band reports an open lateral
+    band - otherwise the planner picks a path through trees/walls and the
+    FSD car crawls through them (town runs 2026-08-21)."""
+    from beamng_autopilot.planning.trajectory import Candidate
+    sc = _scene()
+    sc.grid.origin = (0.0, 0.0)
+    # fill a wide swath ahead so the straight path is fully occupied
+    sc.grid.mark_obstacle_region(5.0, 0.0, 3.0, 8.0)
+    sc.grid.mark_obstacle_region(12.0, 0.0, 3.0, 8.0)
+    path = np.array([[0.0, 0.0], [2.0, 0.0], [4.0, 0.0],
+                     [6.0, 0.0], [8.0, 0.0], [10.0, 0.0],
+                     [12.0, 0.0], [14.0, 0.0]])
+    cons = Constraints(w_lane_align=0.0, collision_fraction_stop=0.5)
+    # sanity: corridor has an open lateral band so the old relaxation
+    # would have kept the path feasible; the hard cap must reject it.
+    assert corridor_free_band(sc) is True
+    cost, feasible = cons.score(sc, Candidate(path=path))
+    assert not feasible
+    # collision-infeasible candidates still carry their collected labour
+    # cost (existing convention) - feasibility is the hard gate.
+    assert cost > 0.0

@@ -78,7 +78,19 @@ def _local_route(pos, heading, nav_route, ahead_m=32.0) -> np.ndarray:
         dseg = np.linalg.norm(seg - pos, axis=1)
         seg = seg[dseg <= ahead_m + 8.0]
         if len(seg) >= 4:
-            return seg
+            # Only follow the map route when it lies AHEAD of the ego: a
+            # car started before the route start (or drifted off-lane) has
+            # its nearest route vertex metres behind/ beside it, and using
+            # that prior drags the planner backward / off the road (town
+            # corner 2026-08-21).  Require the first kept point to be at
+            # least partly forward along the travel heading.
+            if float(np.dot(seg[0] - pos, fwd)) > 1.0:
+                # anchor the reference at the car so it is a drivable
+                # start for the planner (a far start would trip the
+                # forward-progress gate / point at a wall).
+                if float(np.linalg.norm(seg[0] - pos)) > 2.0:
+                    seg = np.vstack([pos, seg])
+                return seg
     xs = np.linspace(0, ahead_m, 25)
     return np.column_stack([pos[0] + xs * np.cos(heading),
                             pos[1] + xs * np.sin(heading)])

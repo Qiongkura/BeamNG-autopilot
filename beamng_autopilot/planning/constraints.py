@@ -24,8 +24,16 @@ class Constraints:
     w_curvature: float = 1.0
     w_lane_align: float = 2.0
     w_progress: float = 0.01
-    # Paths whose sampled cells are > this fraction occupied are infeasible.
+    # Paths whose sampled cells are > this fraction occupied are "blocked".
     collision_fraction_max: float = 0.15
+    # A candidate is NEVER drivable when more than this fraction of its
+    # samples lie inside occupied cells, even if a lateral corridor slice
+    # is open.  The corridor-free-band relaxation only stops a scattered
+    # roadside cluster from declaring "no drivable path"; it must not let
+    # the planner pick a trajectory that is almost entirely inside
+    # obstacles (town runs 2026-08-21: the planner chose a path with 100%
+    # of its samples in trees and the car crawled at 1 m/s through them).
+    collision_fraction_stop: float = 0.9
     # Paths that leave the nav route farther than this are rejected.
     lane_dev_max_m: float = 4.0
     # Spatial-connectivity gate: a candidate is only fully infeasible when
@@ -68,12 +76,15 @@ class Constraints:
         cost = 0.0
         col = cost_collision(scene, path, self.collision_fraction_max)
         # A path whose samples are mostly inside occupied cells is a
-        # collision.  BUT a scattered cluster of roadside obstacles that
-        # leaves the corridor open must not kill every candidate: the car
-        # can pick another arc.  Only when the forward corridor is truly
-        # closed (a full lateral band occupied across several bands) is
-        # the path set infeasible.
-        if col >= 1.0 and not corridor_free_band(
+        # collision and is never drivable.  The corridor-free-band
+        # relaxation below only protects a scattered roadside cluster from
+        # declaring "no drivable path" - it must not let a candidate that
+        # runs almost entirely through obstacles stay feasible.
+        _bad, _tot = _path_infractions(scene, path)
+        _frac = (_bad / _tot) if _tot else 0.0
+        if _frac > self.collision_fraction_stop:
+            feasible = False
+        elif col >= 1.0 and not corridor_free_band(
                 scene, min_clear_m=self.corridor_clear_m,
                 bands=self.corridor_bands):
             feasible = False

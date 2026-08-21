@@ -180,22 +180,31 @@ class FSDStack:
                  pos[1] + xs * np.sin(heading)])
         # Lane reference from the drivable-space centreline (FSD "vector
         # space" lane) when the sensor road is visible, else the nav
-        # route itself (FSD uses map prior when the camera lane is not
-        # available).  The safety monitor's lane-deviation check must
-        # measure against a *meaningful* reference, not None.
+        # route itself.  This lane_ref is the LATERAL reference the
+        # safety monitor uses for lane deviation.
         lane_ref = self._bev_drivable_center(grid, pos, heading)
-        # The sensor (vision+LiDAR) drivable-centreline is the lane the
-        # car must hold (FSD "vector space" lane): plan ALONG it when the
-        # road is visible, and only fall back to the map/nav prior when
-        # the sensor lane is unavailable.  A nav route that is not
-        # re-anchored to the ego (or runs far from the car) must not drag
-        # the planner off the real road - observed town runs where the
-        # car followed the road fine but the stale nav route pinned it
-        # "off-lane".
-        plan_route = lane_ref if (lane_ref is not None
-                                  and len(lane_ref) >= 4) else route_ref
+        sensor_lane = lane_ref is not None and len(lane_ref) >= 4
+        # Route intent vs sensor lane: the map/nav route is the heading
+        # the car must follow (FSD planning consumes the route as the
+        # navigational goal), while the sensor lane is the lateral
+        # lane-keep reference.  At a junction the free-space centreline
+        # alone can point straight ahead through a turn (start->corner
+        # town runs 2026-08-21: the car followed a -135 deg sensor centre
+        # and drove off-road instead of curving onto the nav route).  So
+        # plan ALONG the route when it is ego-anchored (starts near the
+        # car), and use the sensor lane as the lateral lane reference.
+        route_anchored = (route_ref is not None and len(route_ref) >= 4
+                          and float(np.linalg.norm(
+                              np.asarray(route_ref[0], dtype=float)[:2]
+                              - np.asarray(pos[:2], dtype=float))) <= 6.0)
+        # Route intent first (the map route is the navigational goal), the
+        # sensor lane second - a free-space centreline alone pointed
+        # straight through the town turn and the car drove off-road
+        # (2026-08-21 runs); the ego-anchored nav route carries the turn.
+        plan_route = np.asarray(route_ref, dtype=float)[:, :2] \
+            if route_anchored else (sensor_lane and lane_ref or route_ref)
         if lane_ref is None:
-            lane_ref = route_ref
+            lane_ref = plan_route
         out.lane_ref = np.asarray(plan_route, dtype=float)
         scene = Scene(pos=pos, heading=heading, grid=grid,
                       route=plan_route, lane_ref=lane_ref,
@@ -272,6 +281,20 @@ class FSDStack:
         drv = getattr(grid, "drivable", None)
         if drv is None or not getattr(drv, "any", lambda: False)():
             return None
+        # The lane centre must be over the FREE corridor: drivable road
+        # cells that are NOT inside an obstacle footprint.  A roadside or
+        # corner wall erases the drivable cells it occupies via obstacle
+        # fusion, so using plain "drivable" would pull the centreline into
+        # the wall (town corner runs 2026-08-21).  When the corridor is so
+        # dense that no free cell survives, fall back to the raw drivable
+        # cells so the sensor lane still exists.
+        occ = getattr(grid, "obstacle", None)
+        if occ is not None and occ.shape == drv.shape:
+            free = np.logical_and(drv != 0, occ == 0)
+        else:
+            free = drv != 0
+        if not free.any():
+            free = drv != 0
         n = int(getattr(grid, "n_rows", None) or
                 getattr(grid, "n_cols", None) or 60)
         res = grid.res
@@ -279,7 +302,7 @@ class FSDStack:
         step = max(1, n // 24)
         pts = []
         for r in range(0, n, step):
-            row = drv[r]
+            row = free[r]
             cols = np.nonzero(row)[0]
             if cols.size == 0:
                 continue

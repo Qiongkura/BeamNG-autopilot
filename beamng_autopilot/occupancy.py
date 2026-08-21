@@ -163,7 +163,15 @@ class OccupancyGrid:
         self.obstacle[r0:r1 + 1, c0:c1 + 1] = 1
         self.occupancy[r0:r1 + 1, c0:c1 + 1] = np.maximum(
             self.occupancy[r0:r1 + 1, c0:c1 + 1], 0.9)
-        self.drivable[r0:r1 + 1, c0:c1 + 1] = 0.0
+        # NOTE: do NOT erase the drivable layer here.  Drivable is the
+        # sensor-observed road surface (vision), obstacle is the occupied
+        # space (LiDAR/boxes).  A roadside wall must not erase the lane
+        # next to it - the planner's lane centre is computed over the FREE
+        # corridor (drivable AND NOT obstacle), so occupancy still blocks
+        # driving while the road surface survives beside the wall (town
+        # corner runs 2026-08-21: the corner wall wiped all drivable cells
+        # and the planner declared "no drivable path" 8 m short of the
+        # turn).
         self.height[r0:r1 + 1, c0:c1 + 1] = float(z)
 
     # ------------------------------------------------------------------
