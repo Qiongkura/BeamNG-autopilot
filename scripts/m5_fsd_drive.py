@@ -29,6 +29,7 @@ if str(ROOT) not in sys.path:
 from beamng_autopilot import config
 from beamng_autopilot.connector import BeamNGConnector
 from beamng_autopilot.control import gearbox
+from beamng_autopilot.control.reverse_guard import ReverseGuard
 from beamng_autopilot.control.pure_pursuit import PurePursuit
 from beamng_autopilot.control.speed import SpeedController
 from beamng_autopilot.fsd_stack import FSDStack
@@ -103,6 +104,16 @@ def main() -> int:
                          cam_w=args.cam_w, cam_h=args.cam_h,
                          temporal=True)
         stack.reset_temporal()  # stale occupancy before start must not leak
+        # Realistic gearbox locked into a forward gear (D).  A real stack
+        # never leaves the car in reverse; keep the D input on every
+        # control frame so an impact can never leave the gearbox in R.
+        fwd_gear = gearbox.forward_gear_input(conn)
+        conn.control(throttle=0.0, brake=0.0, steering=0.0,
+                     parkingbrake=0.0, gear=fwd_gear)
+        conn.step(3)
+        print(f"[fsd-drive] gearbox realistic, forward gear input = {fwd_gear}")
+        rguard = ReverseGuard(threshold_mps=REVERSE_THRESHOLD_MPS,
+                              clear_mps=REVERSE_CLEAR_MPS)
         print(f"[fsd-drive] runtime={stack.mode} FSD pipeline driving "
               f"for {args.seconds}s at {args.speed} m/s")
 
@@ -110,11 +121,21 @@ def main() -> int:
         frames = 0
         stopps = 0
         t0 = time.time()
+        last_t = time.time()
         while time.time() < t_end:
             st = conn.get_state()
             pos = np.asarray(st.pos, dtype=float)
             heading = float(st.heading)
             v = float(st.speed)
+            signed = 0.0
+            if st.vel is not None and st.dir is not None:
+                signed = float(np.dot(
+                    np.asarray(st.vel[:2], dtype=float),
+                    np.asarray(st.dir[:2], dtype=float)))
+            now_t = time.time()
+            dt = max(0.0, now_t - last_t)
+            last_t = now_t
+            rev_brk, reversing = rguard.decide(signed, dt=dt)
 
             # one full FSD tick -> best trajectory
             out = stack.tick(st=st)
@@ -179,7 +200,15 @@ def main() -> int:
                 thr, brk = 0.0, 1.0
                 steer = 0.0
                 stopps += 1
-            conn.control(throttle=thr, brake=brk, steering=steer)
+            # Reverse guard is the final control authority: while the car
+            # is (still) moving backwards, brake with steering centred and
+            # no throttle until forward motion returns (hysteresis in
+            # ReverseGuard prevents brake flap around standstill).
+            if reversing:
+                thr, brk = 0.0, max(brk, float(rev_brk))
+                steer = 0.0
+            conn.control(throttle=thr, brake=brk, steering=steer,
+                         gear=fwd_gear)
             conn.step(args.steps)
             frames += 1
             if frames % 4 == 1:
@@ -187,12 +216,14 @@ def main() -> int:
                       f"level={verd.level} src={chosen.source:4s} "
                       f"reason={verd.reason or '-':22s} "
                       f"steer={steer:+.2f} thr={thr:.2f} "
-                      f"plan_v={plan_speed:.1f}")
+                      f"plan_v={plan_speed:.1f} "
+                      f"rev={int(reversing)} signed={signed:+.2f}")
         print(f"[fsd-drive] done: {frames} frames, {stopps} stops")
     finally:
         # ensure the car stops
         try:
-            conn.control(throttle=0.0, brake=1.0, steering=0.0)
+            conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                         gear=locals().get("fwd_gear"))
             conn.step(3)
         except Exception:
             pass
