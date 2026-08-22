@@ -47,6 +47,32 @@ def test_curved_path_slows_in_bend() -> None:
     assert float(sp.min()) < 8.0
 
 
+def test_roadside_wall_does_not_pin_speed() -> None:
+    """A wall lining the road but OUTSIDE the driven corridor is not an
+    obstacle ahead: the profile must cruise, not brake to 1 m/s (town
+    runs 2026-08-22: every path in a wall-lined street got a 1.0 m/s
+    profile because the closest occupied cell was a roadside wall)."""
+    sc = _scene()
+    # walls 3.5 m either side of the straight path (corridor half-width 2.0)
+    for y in (-3.5, 3.5):
+        sc.grid.mark_obstacle_region(6.0, y, 1.2, 1.2)
+    path = np.column_stack([np.linspace(0, 20, 40), np.zeros(40)])
+    sp = speed_profile_for_path(path, sc, target_speed=12.0,
+                                obstacle_brake_m=25.0)
+    assert float(np.median(sp)) > 9.0, sp
+
+
+def test_obstacle_inside_corridor_still_slows() -> None:
+    """An obstacle that intrudes INTO the path corridor must still trigger
+    the brake band (regression guard for the corridor filter)."""
+    sc = _scene()
+    sc.grid.mark_obstacle_region(8.0, 1.0, 1.2, 1.2)  # inside corridor
+    path = np.column_stack([np.linspace(0, 20, 40), np.zeros(40)])
+    sp = speed_profile_for_path(path, sc, target_speed=12.0,
+                                obstacle_brake_m=25.0)
+    assert float(sp.min()) < 8.0, sp
+
+
 def test_obstacle_brake_band_slows() -> None:
     sc = _scene(with_obstacle=True)
     path = np.column_stack([np.linspace(0, 20, 40), np.zeros(40)])

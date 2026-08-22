@@ -159,7 +159,7 @@ def main() -> int:
                 except ValueError:
                     pass
             conn.vehicle.teleport(pos=(float(x), float(y), z),
-                                  rot_quat=angle_to_quat((0, 0, float(yaw))))
+                                  rot_quat=angle_to_quat((0, 0, -float(yaw) - 90.0)))
             conn.step(8)
             st1 = conn.get_state()
             print(f"[fsd-drive] teleport -> "
@@ -238,9 +238,32 @@ def main() -> int:
             # verifies route-following instead of a cross-country path.
             st0 = conn.get_state()
             p0 = np.asarray(st0.pos[:2], dtype=float)
+            h0 = float(st0.heading)
+            f0 = np.array([float(np.cos(h0)), float(np.sin(h0))])
             d0 = np.linalg.norm(nav_route - p0, axis=1)
             i = int(np.argmin(d0))
-            if d0[i] > 8.0:
+            # Route start direction: which way the map route leaves the
+            # nearest route vertex (forward vs backward along the polyline).
+            rdir = None
+            if i + 1 < len(nav_route):
+                rv = nav_route[i + 1] - nav_route[i]
+                if np.linalg.norm(rv) > 1e-9:
+                    rdir = rv / np.linalg.norm(rv)
+            elif i > 0:
+                rv = nav_route[i] - nav_route[i - 1]
+                if np.linalg.norm(rv) > 1e-9:
+                    rdir = rv / np.linalg.norm(rv)
+            heading_ok = True
+            if rdir is not None:
+                cos_a = float(np.dot(f0, rdir))
+                heading_ok = cos_a >= 0.0
+            # Snap when the car is far off the route OR faces against the
+            # route direction (town runs 2026-08-22: a 0.4 m off-route
+            # start with the nose pointing the wrong way made the local
+            # route fall back to a straight line and drove across the
+            # town into a wall).  Align the nose along the route so the
+            # planner follows the road graph, not a cross-field line.
+            if d0[i] > 8.0 or not heading_ok:
                 rx, ry = float(nav_route[i, 0]), float(nav_route[i, 1])
                 if i + 1 < len(nav_route):
                     ndx, ndy = (float(nav_route[i + 1, 0] - rx),
@@ -373,6 +396,9 @@ def main() -> int:
             # correct FSD behaviour is a minimal-risk stop (town runs
             # 2026-08-21 pushed a wall under a far-away route reference).
             from beamng_autopilot.planning import anchored_rule_ref, arbitrate
+            from beamng_autopilot.planning.constraints import (
+                _boundary_lateral,
+            )
             rule_ref = anchored_rule_ref(pos, heading, local)
             chosen = arbitrate(
                 best, rule_ref,
@@ -401,19 +427,24 @@ def main() -> int:
             # (town corner run 2026-08-21: planner picked a feasible arc,
             # raw LiDAR foliage read 0.5 m and the emergency layer
             # force-stopped every frame).  A path that really is blocked
-            # still forces the same stop.  The raw-sensor heading corridor
-            # stays as a fallback only when no path is being followed.
+            # still forces the same stop.  ``inf`` from
+            # ``path_grid_clearance_m`` MEANS the path is clear - it must
+            # not be treated as "missing" (run 2026-08-22: the fallback
+            # replaced a clean-path inf with the raw heading corridor
+            # 0.19 m at a town corner and parked a car that was steering
+            # fine).  The raw-sensor heading corridor is only the last
+            # line when there is NO planned path at all.
             force_stop = False
             fwd_clear = float("inf")
             if chosen.path is not None and len(chosen.path) >= 2:
                 fwd_clear = path_grid_clearance_m(chosen.path, grid)
-            if not np.isfinite(fwd_clear) or fwd_clear <= 0.0:
+            else:
                 fwd_clear = float(out.forward_clearance)
             if np.isfinite(fwd_clear):
                 need = emergency_stop_clearance_m(v)
                 force_stop, cap = emergency_speed_limit_mps(fwd_clear, need)
                 target = min(target, cap if not force_stop else 0.0)
-            thr, brk = speed_ctrl.update(target, v)
+            thr, brk = speed_ctrl.update(target, v, dt=min(0.25, max(0.01, dt)))
             # hard stop when no path remains, or the raw-sensor forward
             # clearance is inside the braking reserve (never grind into a
             # wall / wedge the car into a too-narrow gap)
@@ -430,6 +461,27 @@ def main() -> int:
                 steer = 0.0
             conn.control(throttle=thr, brake=brk, steering=steer,
                          gear=fwd_gear)
+            # Lane-position telemetry: signed lateral offset of the ego from
+            # each DETECTED lane boundary (left: + = inside oncoming traffic;
+            # right: - = off the road edge).  None when the boundary does
+            # not extend to the ego or no lane was detected this frame.
+            lat_left = lat_right = None
+            fwd_lane = np.array([float(np.cos(heading)),
+                                 float(np.sin(heading))])
+            if out.lane_left is not None:
+                try:
+                    _ll, _cl = _boundary_lateral(
+                        float(pos[0]), float(pos[1]), out.lane_left, fwd_lane)
+                    lat_left = round(float(_ll), 3) if _cl else None
+                except Exception:
+                    pass
+            if out.lane_right is not None:
+                try:
+                    _lr, _cr = _boundary_lateral(
+                        float(pos[0]), float(pos[1]), out.lane_right, fwd_lane)
+                    lat_right = round(float(_lr), 3) if _cr else None
+                except Exception:
+                    pass
             # snapshot for offline stability evaluation (safe / degraded
             # ratio over a long route); written once at the end.
             hist.append({
@@ -449,6 +501,11 @@ def main() -> int:
                 "fwd_clear": float(out.forward_clearance)
                     if np.isfinite(out.forward_clearance) else None,
                 "emergency": int(bool(force_stop)),
+                "lane_src": str(out.meta.get("lane_src", "?")),
+                "lane_paired": int(out.meta.get("lane_paired", 0)),
+                "lane_dev_m": round(float(getattr(verd, "lane_dev_m", 0.0)), 3),
+                "lat_left": lat_left,
+                "lat_right": lat_right,
             })
             conn.step(args.steps)
             frames += 1
@@ -458,7 +515,10 @@ def main() -> int:
                       f"reason={verd.reason or '-':22s} "
                       f"steer={steer:+.2f} thr={thr:.2f} "
                       f"plan_v={plan_speed:.1f} "
-                      f"rev={int(reversing)} signed={signed:+.2f}")
+                      f"rev={int(reversing)} signed={signed:+.2f} "
+                      f"lane={out.meta.get('lane_src', '?')}/"
+                      f"{'P' if out.meta.get('lane_paired') else '1'} "
+                      f"dev={getattr(verd, 'lane_dev_m', 0.0):.2f}")
         print(f"[fsd-drive] done: {frames} frames, {stopps} stops")
     finally:
         # ensure the car stops
@@ -483,3 +543,6 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+
