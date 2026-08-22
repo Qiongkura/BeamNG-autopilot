@@ -39,7 +39,12 @@ from beamng_autopilot.planning import (
     sample_lane_shift,
     select_trajectory,
 )
-from beamng_autopilot.planner import CAR_HALF_WIDTH, forward_clearance_m
+from beamng_autopilot.planner import CAR_HALF_WIDTH, forward_clearance_m, path_forward_clearance_m
+from beamng_autopilot.lane import (
+    build_lidar_corridor,
+    pair_lane_markings,
+    choose_sensor_lane,
+)
 from beamng_autopilot.runtime import (
     build_camera_ring_provider,
     build_range_provider,
@@ -54,7 +59,10 @@ class FSDTick:
         self.bev: np.ndarray | None = None      # (N, N) occupancy raster
         self.drivable: np.ndarray | None = None
         self.best_path: np.ndarray | None = None
-        self.lane_ref: np.ndarray | None = None  # vision lane centreline
+        self.lane_ref: np.ndarray | None = None  # sensor lane centreline
+        self.lane_left: np.ndarray | None = None  # paired lane boundary (world)
+        self.lane_right: np.ndarray | None = None  # paired lane boundary (world)
+        self.lane_width: float = 0.0
         self.best_speed: float = 0.0            # planned speed at the start
         self.min_speed: float = 0.0             # lowest speed on the path
         self.n_candidates: int = 0
@@ -63,6 +71,7 @@ class FSDTick:
         self.errors: dict = {}
         self.ray_hits: list = []
         self.forward_clearance: float = float("inf")
+        self.path_forward_clearance: float = float("inf")
 
 
 class FSDStack:
@@ -101,6 +110,9 @@ class FSDStack:
         self.temporal = bool(temporal)
         self.occ_filter = None
         self._tick_t0 = None
+        # Per-frame lane-fusion state (choose_sensor_lane) across ticks
+        # to prevent flicker between vision / lidar / fallback.
+        self._lane_fusion_state: dict = {}
         if self.temporal:
             from beamng_autopilot.temporal import TemporalOccupancyFilter
             self.occ_filter = TemporalOccupancyFilter(
@@ -202,12 +214,44 @@ class FSDStack:
             route_ref = np.column_stack(
                 [pos[0] + xs * np.cos(heading),
                  pos[1] + xs * np.sin(heading)])
-        # Lane reference from the drivable-space centreline (FSD "vector
-        # space" lane) when the sensor road is visible, else the nav
-        # route itself.  This lane_ref is the LATERAL reference the
-        # safety monitor uses for lane deviation.
-        lane_ref = self._bev_drivable_center(grid, pos, heading)
-        sensor_lane = lane_ref is not None and len(lane_ref) >= 4
+        # Lane reference: use the SENSOR lane centre (vision lane-marking
+        # pairing -> LiDAR corridor -> fusion) when available, and only
+        # fall back to the BEV drivable-space centreline / nav route.  The
+        # BEV centre of the *whole* drivable road is the road centreline -
+        # on a two-way road that IS the centre line the car must never
+        # ride.  A real stack keeps to the centre of ITS OWN lane, which
+        # is what pair_lane_markings / build_lidar_corridor deliver.
+        lane_frame = self._sensor_lane(out, pos, heading)
+        lane_ref = None
+        lane_left = None
+        lane_right = None
+        lane_width = 0.0
+        if lane_frame is not None:
+            if getattr(lane_frame, "center", None) is not None \
+                    and len(lane_frame.center) >= 2:
+                lane_ref = np.asarray(lane_frame.center, dtype=float)[:, :2]
+            # Only a REAL two-sided detection provides hard lane
+            # boundaries; a single-edge mirror is not a physical edge the
+            # no-cross rule may enforce.
+            if getattr(lane_frame, "paired", False):
+                lane_left = getattr(lane_frame, "left", None)
+                lane_right = getattr(lane_frame, "right", None)
+                lane_width = float(getattr(lane_frame, "width", 0.0) or 0.0)
+        if lane_ref is None or len(lane_ref) < 4:
+            # BEV drivable-space fallback (single-sided / sparse sensor
+            # frames): the lateral centre of the FREE corridor, never the
+            # whole-road centre when a lane is detected.
+            bev_ref = self._bev_drivable_center(grid, pos, heading)
+            if bev_ref is not None and len(bev_ref) >= 4:
+                lane_ref = bev_ref
+        out.lane_ref = (np.asarray(lane_ref, dtype=float)
+                        if lane_ref is not None else None)
+        if lane_frame is not None and getattr(lane_frame, "paired", False):
+            if lane_left is not None:
+                out.lane_left = np.asarray(lane_left, dtype=float)[:, :2]
+            if lane_right is not None:
+                out.lane_right = np.asarray(lane_right, dtype=float)[:, :2]
+            out.lane_width = lane_width
         # Route intent vs sensor lane: the map/nav route is the heading
         # the car must follow (FSD planning consumes the route as the
         # navigational goal), while the sensor lane is the lateral
@@ -233,18 +277,34 @@ class FSDStack:
             plan_route = choose_plan_route(
                 _base_route, lane_ref, pos, heading, grid)
         else:
-            plan_route = (sensor_lane and lane_ref or _base_route)
+            plan_route = (lane_ref if lane_ref is not None
+                          and len(lane_ref) >= 4 else _base_route)
         if plan_route is None or len(plan_route) < 2:
             plan_route = _base_route
         if lane_ref is None:
             lane_ref = plan_route
-        out.lane_ref = np.asarray(lane_ref, dtype=float)
         # out.lane_ref drives the *lateral* lane-keep reference (sensor
-        # drivable center when available); plan_route stays the
-        # navigational intent in the planner's Scene.
+        # lane centre when available); plan_route stays the navigational
+        # intent in the planner's Scene.
+        out.meta["lane_src"] = (
+            "sensor" if lane_frame is not None else "bev/route")
+        out.meta["lane_paired"] = int(
+            bool(lane_frame is not None and getattr(lane_frame, "paired", False)))
+        if lane_frame is not None:
+            out.meta["lane_width"] = round(lane_width, 2)
 
+        # Only pass a sensor lane centre to Scene (the planner uses
+        # scene.lane_ref for lateral alignment).  The BEV drivable-space
+        # centre is the centre of the whole road — on a two-way road that
+        # IS the centre line the car must never ride; passing it as
+        # lane_ref would pull the planner toward the centre line.
+        # out.lane_ref (set above) still carries the BEV fallback for the
+        # safety monitor but the planner Scene must not see it.
+        scene_lane_ref = (lane_ref if lane_frame is not None else None)
         scene = Scene(pos=pos, heading=heading, grid=grid,
-                      route=plan_route, lane_ref=lane_ref,
+                      route=plan_route, lane_ref=scene_lane_ref,
+                      lane_left=lane_left, lane_right=lane_right,
+                      lane_width=lane_width,
                       target_speed=getattr(self, "target_speed", 8.0))
         # Town corners need a tighter arc fan than a highway fan: a
         # 5-8 m radius bend is 0.12-0.2 rad/m, and the old 0.10 rad/m
@@ -262,6 +322,16 @@ class FSDStack:
         out.n_candidates = len(fans.candidates)
         best, meta = select_trajectory(scene, fans, self.constraints)
         out.best_path = best
+        # Path-aware forward clearance: safety layer evaluates the chosen
+        # trajectory corridor instead of the raw heading corridor, so a
+        # turn away from a wall does not force a stop (town runs 2026-08-21).
+        if best is not None and len(best) >= 2 and out.ray_hits:
+            out.path_forward_clearance = path_forward_clearance_m(
+                best, out.ray_hits,
+                half_width=float(getattr(self, "ego_half_width",
+                                         CAR_HALF_WIDTH + 0.5)))
+            out.meta["path_fwd_clearance"] = round(
+                float(out.path_forward_clearance), 3)
         out.meta["planner"] = meta
         out.meta["total_candidates"] = out.n_candidates
         # the chosen path's speed profile (planning-side longitudinal plan)
@@ -291,6 +361,57 @@ class FSDStack:
                 pass
         out.meta.update(semantic_to_meta(out.head_outputs))
         return out
+
+
+    def _sensor_lane(self, out, pos, heading):
+        """Fused sensor lane: vision markings -> LiDAR corridor -> fusion.
+
+        Returns a ``LaneFrame`` whose centre is the ego lane centre in
+        world coordinates and whose left/right (when ``paired``) are the
+        detected lane boundaries - the correct lateral reference for a
+        real FSD, unlike the whole-road drivable centre.
+        """
+        try:
+            vision = self._sensor_lane_from_semantic(
+                out.head_outputs, pos, heading)
+        except Exception:
+            vision = None
+        lidar = None
+        if out.ray_hits:
+            try:
+                lidar = build_lidar_corridor(out.ray_hits, pos, heading)
+            except Exception:
+                lidar = None
+        try:
+            frame = choose_sensor_lane(
+                vision, lidar, pos, heading,
+                state=getattr(self, "_lane_fusion_state", None))
+        except Exception:
+            frame = vision or lidar
+        if frame is None:
+            return None
+        # Re-anchor the centre at the CURRENT ego.  The fusion state may
+        # return a held lane computed at an earlier pose; the planner
+        # needs a drivable reference starting at/near the car (near ->
+        # far order, ego prepended) just like _bev_drivable_center.
+        center = np.asarray(frame.center, dtype=float)[:, :2]
+        center = center[np.isfinite(center).all(axis=1)]
+        if len(center):
+            pos2 = np.asarray(pos[:2], dtype=float)
+            fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
+            fwd_m = (center - pos2) @ fwd
+            ahead = center[fwd_m > -0.5]
+            if len(ahead) >= 2:
+                d0 = np.linalg.norm(ahead - pos2, axis=1)
+                ahead = ahead[np.argsort(d0)]
+                if float(np.linalg.norm(ahead[0] - pos2)) > 2.0:
+                    ahead = np.vstack([pos2, ahead])
+                frame.center = ahead
+            else:
+                d0 = np.linalg.norm(center - pos2, axis=1)
+                center = center[np.argsort(d0)]
+                frame.center = np.vstack([pos2, center])
+        return frame
 
     def _sensor_lane_from_semantic(self, head_outputs, pos, heading):
         """Pair the semantic head's world markings into a LaneFrame."""
@@ -386,6 +507,7 @@ class FSDStack:
         if getattr(self, "occ_filter", None) is not None:
             self.occ_filter.clear()
         self._tick_t0 = None
+        self._lane_fusion_state.clear()
 
     def close(self) -> None:
         if self.ring is not None:

@@ -28,6 +28,9 @@ class Scene:
     grid: object = None                    # OccupancyGrid | None
     route: np.ndarray | None = None
     lane_ref: np.ndarray | None = None
+    lane_left: np.ndarray | None = None
+    lane_right: np.ndarray | None = None
+    lane_width: float = 0.0
     road_rule: object = None
     target_speed: float = 12.0
     # obstacle boxes for legacy checks (the grid is the canonical source,

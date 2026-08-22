@@ -41,6 +41,7 @@ from beamng_autopilot.roadnet import RoadNetwork
 from beamng_autopilot.planner import (
     emergency_speed_limit_mps,
     emergency_stop_clearance_m,
+    path_grid_clearance_m,
 )
 from beamng_autopilot.safety_monitor import SafetyMonitor
 from beamng_autopilot.vision.heads import SemanticHead, TrafficSignalHead
@@ -346,7 +347,11 @@ def main() -> int:
                     grid.drivable[:] = np.asarray(out.drivable)
                 scene = Scene(pos=pos, heading=heading, grid=grid,
                               route=local,
-                              lane_ref=local, target_speed=args.speed)
+                              lane_ref=local,
+                              lane_left=out.lane_left,
+                              lane_right=out.lane_right,
+                              lane_width=out.lane_width,
+                              target_speed=args.speed)
                 verd = monitor.evaluate(scene, best,
                                         planner_age_s=0.0)
             else:
@@ -389,14 +394,21 @@ def main() -> int:
             if chosen.source == "rule":
                 plan_speed = min(plan_speed, 3.0)
             target = min(verd.target_speed, plan_speed, float(args.speed))
-            # Raw-sensor forward-clearance layer (independent of obstacle
-            # classification): clustered boxes can miss a gap narrower
-            # than the car body, so the raw hit corridor gates the FSD
-            # drive too - a 1.3 m gap must stop the car, not wedge it
-            # (town run 2026-08-21: throttle 27% against a too-narrow
-            # gap with zero forward motion).
+            # Safety clearance along the CHOSEN path (FSD vector-space
+            # safety layer): the grid obstacle layer the planner itself
+            # scored against is the authority, so a wall beside the nose
+            # that the chosen arc turns away from does not park the car
+            # (town corner run 2026-08-21: planner picked a feasible arc,
+            # raw LiDAR foliage read 0.5 m and the emergency layer
+            # force-stopped every frame).  A path that really is blocked
+            # still forces the same stop.  The raw-sensor heading corridor
+            # stays as a fallback only when no path is being followed.
             force_stop = False
-            fwd_clear = float(out.forward_clearance)
+            fwd_clear = float("inf")
+            if chosen.path is not None and len(chosen.path) >= 2:
+                fwd_clear = path_grid_clearance_m(chosen.path, grid)
+            if not np.isfinite(fwd_clear) or fwd_clear <= 0.0:
+                fwd_clear = float(out.forward_clearance)
             if np.isfinite(fwd_clear):
                 need = emergency_stop_clearance_m(v)
                 force_stop, cap = emergency_speed_limit_mps(fwd_clear, need)

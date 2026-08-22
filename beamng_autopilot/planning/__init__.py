@@ -27,6 +27,7 @@ is proven and switched over.
 from .scene import Scene
 from .trajectory import CandidateSet, sample_arc, sample_lane_shift
 from .constraints import (
+    lane_cross_dist_m,
     Constraints,
     corridor_free_band,
     cost_collision,
@@ -55,6 +56,7 @@ __all__ = [
     "corridor_free_band",
     "cost_collision",
     "cost_curvature",
+    "lane_cross_dist_m",
     "cost_lane_align",
     "select_trajectory",
     "ArbiterOutcome",

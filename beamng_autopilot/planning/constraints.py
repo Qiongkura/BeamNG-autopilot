@@ -24,6 +24,12 @@ class Constraints:
     w_curvature: float = 1.0
     w_lane_align: float = 2.0
     w_progress: float = 0.01
+    # Paths that CROSS a detected lane boundary (solid paint / map
+    # boundary) are never drivable - a real stack never crosses the
+    # centre line (wrong-way / 逆行 is not allowed, even for one
+    # second).  Only paths that stay on the legal side of both
+    # detected boundaries are feasible.
+    lane_cross_max_m: float = 0.35
     # Paths whose sampled cells are > this fraction occupied are "blocked".
     collision_fraction_max: float = 0.15
     # A candidate is NEVER drivable when more than this fraction of its
@@ -71,6 +77,8 @@ class Constraints:
         if path is None or len(path) < 2:
             return 1e9, False
         if not self._has_forward_progress(scene, path):
+            return 1e9, False
+        if lane_cross_dist_m(scene, path, max_cross_m=self.lane_cross_max_m) > 0.0:
             return 1e9, False
         feasible = True
         cost = 0.0
@@ -129,6 +137,119 @@ def _path_infractions(scene: Scene, path, span: float = 2.0) -> list:
         if scene.grid.obstacle[cell] > 0:
             bad += 1
     return [bad, total]
+
+
+def _boundary_lateral(wx, wy, ref, fwd):
+    """Signed lateral offset of a world point from a boundary polyline.
+
+    Returns ``(lat, covered)`` - ``covered`` is False when the nearest
+    polyline point is an endpoint (the boundary simply does not extend
+    to that location: a painted line ends at an intersection / a lane
+    change, so a path turning there must not be punished as a
+    crossing).  Positive lat = left of travel.
+    """
+    pts = np.asarray(ref[:, :2], dtype=float)
+    best = float("inf")
+    sign = 0.0
+    covered = False
+    best_k = None
+    best_t = 0.0
+    for k in range(len(pts) - 1):
+        ax, ay = pts[k]
+        bx, by = pts[k + 1]
+        abx, aby = bx - ax, by - ay
+        l2 = abx * abx + aby * aby
+        if l2 < 1e-12:
+            continue
+        t = float(((wx - ax) * abx + (wy - ay) * aby) / l2)
+        tc = min(1.0, max(0.0, t))
+        cx, cy = ax + tc * abx, ay + tc * aby
+        d = math.hypot(wx - cx, wy - cy)
+        # cross product of ref tangent and point offset
+        s = float((abx * (wy - ay) - aby * (wx - ax)) / math.sqrt(l2))
+        if d < best:
+            best = d
+            sign = s
+            covered = 0.02 < t < 0.98
+            best_k = k
+            best_t = t
+    if best_k is not None and not covered:
+        # The nearest point lies at an endpoint of the best segment.
+        # Only the FIRST/LAST vertex of the whole polyline is a true
+        # line end (paint stops at an intersection / lane change); an
+        # *interior* vertex is just a bend of the same boundary, and a
+        # crossing exactly at that bend must be caught too - otherwise
+        # a path that cuts the line at a corner is not punished
+        # (cross_right vertex repro 2026-08-22).
+        if best_t <= 0.02 and best_k > 0:
+            covered = True
+        elif best_t >= 0.98 and best_k < len(pts) - 2:
+            covered = True
+    # fwd vs ref tangent sign flip: positive lateral in the ref frame
+    # stays positive only when the ref runs the same direction as fwd
+    v0 = pts[min(1, len(pts) - 1)] - pts[0]
+    n0 = float(np.linalg.norm(v0))
+    if n0 > 1e-9:
+        if float(v0[0] * fwd[0] + v0[1] * fwd[1]) < 0.0:
+            sign = -sign
+    return sign * best, covered
+
+
+
+def lane_cross_dist_m(scene: Scene, path, max_cross_m: float = 0.35) -> float:
+    """Distance along the path at which it first crosses a lane boundary.
+
+    Returns > 0 when the path crosses a detected left/right boundary
+    (``scene.lane_left`` / ``scene.lane_right``) at a lateral intrusion
+    deeper than ``max_cross_m`` beyond the boundary - a hard no-cross
+    rule.  Returns 0 when no boundary is detected or no crossing exists.
+    Only samples within 2.5-15 m of the ego are checked (beyond the car
+    footprint and within the sensor lane horizon); the boundary coverage
+    flag (``_boundary_lateral``) ensures a path turning at a line ending
+    at an intersection is not falsely rejected.
+    """
+    left = getattr(scene, "lane_left", None)
+    right = getattr(scene, "lane_right", None)
+    if left is None and right is None:
+        return 0.0
+    path = np.asarray(path, dtype=float)[:, :2]
+    if len(path) < 2:
+        return 0.0
+    pos = np.asarray(scene.pos[:2], dtype=float)
+    fwd = np.array([math.cos(float(scene.heading)),
+                    math.sin(float(scene.heading))])
+    cum = 0.0
+    for i in range(len(path) - 1):
+        ax, ay = path[i]
+        bx, by = path[i + 1]
+        seg = math.hypot(bx - ax, by - ay)
+        if seg < 1e-9:
+            continue
+        n = max(2, int(seg / 0.5) + 1)
+        for k in range(n):
+            t = k / (n - 1) if n > 1 else 0.0
+            px, py = ax + t * (bx - ax), ay + t * (by - ay)
+            d0 = math.hypot(px - pos[0], py - pos[1])
+            if d0 < 2.5 or d0 > 15.0:
+                continue
+            lat_l = cov_l = 0.0
+            lat_r = cov_r = 0.0
+            if left is not None:
+                lat_l, cov_l = _boundary_lateral(px, py, left, fwd)
+            if right is not None:
+                lat_r, cov_r = _boundary_lateral(px, py, right, fwd)
+            # Left boundary: legal lane lies right of it (lat <= 0);
+            # crossing left into oncoming traffic is forbidden.  Right
+            # boundary: legal lane lies left of it (lat >= 0); crossing
+            # right off the road edge is forbidden.  Only a boundary that
+            # actually extends to this sample (``covered``) can be
+            # violated - a line ending at an intersection is not a wall
+            # the turn must stop for.
+            if (left is not None and cov_l and lat_l > max_cross_m) or \
+               (right is not None and cov_r and lat_r < -max_cross_m):
+                return cum + t * seg
+        cum += seg
+    return 0.0
 
 
 def cost_collision(scene: Scene, path, max_frac: float = 0.15) -> float:
@@ -205,13 +326,19 @@ def cost_curvature(path, jerk_w: float = 0.0) -> float:
 
 
 def cost_lane_align(scene: Scene, path) -> float:
-    """Median lateral distance of the path's near segment from the route.
+    """Median lateral distance of the path's near segment from the lane reference.
 
-    Positive mean = the path runs right of the nav route in the ego frame;
-    the route is the lane centre, so large values mean the candidate left
-    the lane.
+    Uses ``scene.lane_ref`` when available (the sensor lane centre), else
+    ``scene.route`` (the nav route / map road centre).  The sensor lane
+    centre is the correct centre of the ego lane (vision/LiDAR pairing),
+    not the road centreline - a real FSD never aligns to the centre line
+    of a two-way road.
     """
-    route = np.asarray(scene.route[:, :2], dtype=float)
+    route = getattr(scene, "lane_ref", None)
+    if route is None or len(route) < 2:
+        route = getattr(scene, "route", None)
+    if route is None or len(route) < 2:
+        return 0.0
     path = np.asarray(path, dtype=float)[:, :2]
     if len(route) < 2 or len(path) < 2:
         return 0.0

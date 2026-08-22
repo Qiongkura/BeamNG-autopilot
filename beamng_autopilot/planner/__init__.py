@@ -62,6 +62,8 @@ from .obstacles import (  # noqa: F401
     emergency_speed_limit_mps,
     emergency_stop_clearance_m,
     forward_clearance_m,
+    path_forward_clearance_m,
+    path_grid_clearance_m,
     is_sparse_raycast_speck,
     is_small_lidar_clutter,
 )

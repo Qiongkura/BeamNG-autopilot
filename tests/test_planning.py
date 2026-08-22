@@ -116,6 +116,68 @@ def test_selector_full_blockage_returns_none() -> None:
     assert "no feasible" in meta["why"]
 
 
+def _lane_scene() -> Scene:
+    """Two-way road: left boundary y=+4, right boundary y=-4 (heading 0)."""
+    grid = OccupancyGrid(60, 60, 0.5)
+    left = np.array([[0, 4], [10, 4], [20, 4]], dtype=float)
+    right = np.array([[0, -4], [10, -4], [20, -4]], dtype=float)
+    return Scene(pos=np.array([0.0, 0.0]), heading=0.0, grid=grid,
+                 route=np.array([[0, 0], [20, 0]], dtype=float),
+                 lane_ref=np.array([[0, 0], [20, 0]], dtype=float),
+                 lane_left=left, lane_right=right, lane_width=8.0)
+
+
+def test_lane_cross_in_lane_is_clear() -> None:
+    from beamng_autopilot.planning import lane_cross_dist_m
+    sc = _lane_scene()
+    stay = np.array([[0, 0], [5, 0.5], [10, 0], [15, -0.5], [20, 0]])
+    assert lane_cross_dist_m(sc, stay) == 0.0
+
+
+def test_lane_cross_left_boundary_rejected() -> None:
+    """Crossing the left boundary (into oncoming traffic) is a hard
+    no-cross: the candidate must be infeasible."""
+    from beamng_autopilot.planning import lane_cross_dist_m
+    from beamng_autopilot.planning.trajectory import Candidate
+    sc = _lane_scene()
+    cross = np.array([[0, 0], [5, 2], [10, 5], [15, 2], [20, 0]])
+    assert lane_cross_dist_m(sc, cross) > 0.0
+    cons = Constraints(w_lane_align=0.0, w_curvature=0.0, w_progress=0.0)
+    cost, feasible = cons.score(sc, Candidate(path=cross))
+    assert not feasible
+
+
+def test_lane_cross_right_boundary_rejected() -> None:
+    """Crossing the right boundary (off the road edge) is a hard no-cross
+    too - including a crossing exactly at an interior vertex of the
+    boundary polyline (vertex repro 2026-08-22)."""
+    from beamng_autopilot.planning import lane_cross_dist_m
+    from beamng_autopilot.planning.trajectory import Candidate
+    sc = _lane_scene()
+    cross = np.array([[0, 0], [5, 2], [10, -5], [15, 2], [20, 0]])
+    assert lane_cross_dist_m(sc, cross) > 0.0
+    cons = Constraints(w_lane_align=0.0, w_curvature=0.0, w_progress=0.0)
+    cost, feasible = cons.score(sc, Candidate(path=cross))
+    assert not feasible
+
+
+def test_lane_cross_at_true_line_end_allowed() -> None:
+    """A boundary that ends (paint stops at an intersection / lane
+    change) is not a wall: turning at its true endpoint is legal."""
+    from beamng_autopilot.planning import lane_cross_dist_m
+    sc = _lane_scene()
+    # path crosses the right boundary only beyond its far end (x=20)
+    turn = np.array([[0, 0], [5, 0], [10, 0], [15, 0], [20, -5]])
+    assert lane_cross_dist_m(sc, turn) == 0.0
+
+
+def test_lane_cross_no_boundaries_clear() -> None:
+    from beamng_autopilot.planning import lane_cross_dist_m
+    sc = _scene()
+    path = np.array([[0, 0], [5, 3], [10, 5], [15, 3], [20, 0]])
+    assert lane_cross_dist_m(sc, path) == 0.0
+
+
 def test_corridor_free_open() -> None:
     sc = _scene()
     sc.grid.origin = (0.0, 0.0)

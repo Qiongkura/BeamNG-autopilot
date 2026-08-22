@@ -125,6 +125,118 @@ def forward_clearance_m(hits, pos, fwd, half_width: float = 1.6,
     return float(np.min(lon[mask]))
 
 
+def path_grid_clearance_m(path, grid, half_width: float = 1.6,
+                                max_dist: float = 30.0) -> float:
+    """Distance along path (m) to the first occupied cell in the grid.
+
+    The grid obstacle layer (BEV occupancy >= 0.6) is the same vector
+    space the planner uses for collision checking.  The raw-sensor hit
+    layer (``path_forward_clearance_m`` / ``forward_clearance_m``) is
+    independent but noisy - LiDAR foliage reflections that the clustering
+    pipeline correctly filtered out as noise still trip the raw layer
+    and force-stop a feasible arc (town corner runs 2026-08-21: the
+    planner picked a feasible arc, the raw clearance read 0.5 m due to
+    roadside bushes, and the emergency layer parked the car).  The grid
+    layer is the authority: a path that ``select_trajectory`` already
+    found feasible is not blocked by sensor noise.
+
+    Returns ``float("inf")`` when the path is clear, or the arc length
+    to the first path point whose cell is occupied (the car's own
+    footprint is skipped).
+    """
+    if path is None or grid is None:
+        return float("inf")
+    path = np.asarray(path, dtype=float)[:, :2]
+    if len(path) < 2:
+        return float("inf")
+    cum = 0.0
+    for i in range(len(path) - 1):
+        ax, ay = path[i]
+        bx, by = path[i + 1]
+        dx, dy = bx - ax, by - ay
+        seg = math.hypot(dx, dy)
+        if seg < 1e-9:
+            continue
+        n_steps = max(2, int(seg / 0.4) + 1)
+        for k in range(n_steps):
+            t = k / (n_steps - 1) if n_steps > 1 else 0.0
+            px = ax + t * dx
+            py = ay + t * dy
+            cell = grid.world_to_cell(px, py)
+            if cell is not None:
+                r, c = cell
+                if 0 <= r < grid.obstacle.shape[0] and 0 <= c < grid.obstacle.shape[1]:
+                    if grid.obstacle[r, c] > 0:
+                        d = cum + t * seg
+                        if 0.0 <= d <= max_dist:
+                            # skip the car's own footprint (first 2.5 m)
+                            if d < 2.5:
+                                continue
+                            return d
+        cum += seg
+        if cum > max_dist:
+            break
+    return float("inf")
+
+
+
+
+def path_forward_clearance_m(path, hits, half_width: float = 1.6,
+                               max_dist: float = 30.0) -> float:
+    """Nearest raw sensor hit along a *planned path* corridor.
+
+    ``forward_clearance_m`` measures the corridor along the car's current
+    heading, which is the correct last-line brake reserve while the car
+    is actually driving straight - but it forces a stop whenever a wall
+    sits ahead of the nose even when the planner's chosen path already
+    turns away from that wall (town corner runs 2026-08-21: the planner
+    picked a feasible arc, the raw heading corridor still read 1.2 m and
+    the emergency layer parked the car).  This variant measures the
+    swept corridor along the planned path polyline: a hit only counts
+    when it intrudes into the corridor of the path itself, and the
+    returned distance is the arc length along the path to the first
+    intrusion (0 when the car already overlaps a hit).
+    """
+    if path is None:
+        return float("inf")
+    path = np.asarray(path, dtype=float)[:, :2]
+    if len(path) < 2:
+        return float("inf")
+    if not hits:
+        return float("inf")
+    pts = np.asarray(hits, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] < 2 or not len(pts):
+        return float("inf")
+    best = float("inf")
+    cum = 0.0
+    for i in range(len(path) - 1):
+        ax, ay = path[i]
+        bx, by = path[i + 1]
+        dx, dy = bx - ax, by - ay
+        seg = math.hypot(dx, dy)
+        if seg < 1e-9:
+            continue
+        ux, uy = dx / seg, dy / seg
+        nx, ny = -uy, ux
+        rel = pts[:, :2] - np.array([ax, ay], dtype=float)
+        lon = rel[:, 0] * ux + rel[:, 1] * uy
+        lat = rel[:, 0] * nx + rel[:, 1] * ny
+        # Hits slightly behind a segment start are covered by the
+        # previous segment's corridor (t clamps to 0 -> distance = cum);
+        # the -0.5 m tolerance keeps a hit at the car's nose on segment 0.
+        mask = (np.abs(lat) <= half_width) & (lon >= -0.5)
+        if np.any(mask):
+            t = np.clip(lon[mask] / seg, 0.0, 1.0)
+            d = cum + t * seg
+            d = d[d <= max_dist]
+            if d.size:
+                best = min(best, float(np.min(d)))
+        cum += seg
+        if best <= 0.0:
+            break
+    return best
+
+
 def emergency_stop_clearance_m(speed: float, decel: float = 6.0,
                                margin: float = 1.0) -> float:
     """Braking distance (m) the car still needs at ``speed`` (m/s).
