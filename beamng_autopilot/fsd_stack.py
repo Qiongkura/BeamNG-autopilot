@@ -83,18 +83,26 @@ class FSDStack:
                  grid_n: int = 60, grid_res: float = 0.5,
                  ring_roles=None, heads=None,
                  cam_w: int = 320, cam_h: int = 240,
-                 temporal: bool = True, tau_s: float = 1.5):
+                 temporal: bool = True, tau_s: float = 1.5,
+                 range_every_n: int = 1):
         self.conn = conn
         self.grid_n = int(grid_n)
         self.grid_res = float(grid_res)
         self.heads = list(heads) if heads else []
 
         ring, self.mode = build_camera_ring_provider(
-            conn, mode, cam_w, cam_h)
+            conn, mode, cam_w, cam_h, roles=ring_roles)
         self.ring = ring
         if self.ring is None:
             self.mode = "steam-front"    # front camera only available
         self.range_prov, _ = build_range_provider(conn, mode)
+        # LiDAR scan throttling: a 360 scan + clustering costs ~300-400 ms.
+        # range_every_n>1 reuses the previous scan on intermediate ticks
+        # (the temporal occupancy filter already smooths over frames); the
+        # safety layers still see a fresh wall within one control burst.
+        self.range_every_n = max(1, int(range_every_n))
+        self._range_skip = 0
+        self._last_range = None
 
         self.hydra = HydraNet()
         for head in self.heads:
@@ -137,6 +145,8 @@ class FSDStack:
             st = self.conn.get_state()
         pos = np.asarray(st.pos, dtype=float)
         heading = float(st.heading)
+        _tw = time.time()
+        _times: dict[str, float] = {}
 
         # --- 1) camera ring -> HydraNet heads ---------------------------
         snap: dict = {}
@@ -154,6 +164,8 @@ class FSDStack:
                 ground_z=float(pos[2]) if len(pos) > 2 else 0.0,
                 role=role)
             out.head_outputs = self.hydra.run(ctx)
+            _times['ring'] = round((time.time() - _tw) * 1000.0, 1)
+            _tw = time.time()
 
         # --- 2) BEV vector space (occupancy grid) -----------------------
         grid = OccupancyGrid(self.grid_n, self.grid_n, self.grid_res,
@@ -167,7 +179,18 @@ class FSDStack:
                     grid, semantic.masks["road"],
                     snap["front_main"][1], pos, heading, step=4)
             try:
-                rng = self.range_prov.scan(pos)
+                # getattr defaults keep __new__-built test stubs
+                # (no __init__) working: they always scan.
+                if getattr(self, '_range_skip', 0) <= 0:
+                    rng = self.range_prov.scan(pos)
+                    self._last_range = rng
+                    self._range_skip = max(
+                        0, int(getattr(self, 'range_every_n', 1)) - 1)
+                else:
+                    self._range_skip -= 1
+                    rng = getattr(self, '_last_range', None)
+                if rng is None:
+                    raise RuntimeError("no range sample")
                 out.ray_hits = list(getattr(rng, "ray_hits", []) or [])
                 out.forward_clearance = forward_clearance_m(
                     out.ray_hits, pos,
@@ -190,6 +213,8 @@ class FSDStack:
                 out.meta["n_obstacles"] = len(rng.obstacles)
             except Exception as exc:
                 out.errors["range"] = str(exc)
+        _times['range'] = round((time.time() - _tw) * 1000.0, 1)
+        _tw = time.time()
         out.bev = grid.as_raster()
         out.drivable = grid.drivable
         out.observed = getattr(grid, "observed", None)
@@ -522,6 +547,9 @@ class FSDStack:
             except Exception:
                 pass
         out.meta.update(semantic_to_meta(out.head_outputs))
+        _times['plan'] = round((time.time() - _tw) * 1000.0, 1)
+        _times['total'] = round(sum(_times.values()), 1)
+        out.meta['tick_ms'] = _times
         return out
 
 

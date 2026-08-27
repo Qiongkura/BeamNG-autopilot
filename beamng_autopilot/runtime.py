@@ -129,7 +129,8 @@ def build_range_provider(conn, mode):
 
 
 def build_camera_ring_provider(conn, mode, width: int = 1076,
-                               height: int = 806):
+                               height: int = 806,
+                               roles: tuple[str, ...] | None = None):
     """Return a multi-camera ring provider, or None on Steam.
 
     The FSD-style surround camera ring is a Tech capability (beamngpy
@@ -140,5 +141,6 @@ def build_camera_ring_provider(conn, mode, width: int = 1076,
     if mode == "tech":
         from beamng_autopilot_tech.providers import TechCameraRingProvider
 
-        return TechCameraRingProvider(conn, width, height), mode
+        return TechCameraRingProvider(conn, width, height,
+                                       roles=roles), mode
     return None, mode

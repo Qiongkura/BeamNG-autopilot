@@ -436,6 +436,12 @@ class TechCameraRingProvider(CameraProvider):
             self._roles = (FRONT_MAIN,) + self._roles
         self._mounts: dict[str, CameraMount] = {
             m.role: m for m in CAMERA_RING if m.role in self._roles}
+        # Ring warm-up is one-shot: the GPU prepass buffer is re-authored
+        # right after sensor creation, so the first polls can be black.
+        # Re-doing the throwaway pass on EVERY grab_ring would double the
+        # poll cost (16 camera polls per FSD tick); individual black
+        # frames are still retried inside _poll afterwards.
+        self._warmed = False
         with conn.io_lock:
             self.cameras: dict[str, object] = {}
             for mount in CAMERA_RING:
@@ -487,14 +493,18 @@ class TechCameraRingProvider(CameraProvider):
     def grab_ring(self) -> dict[str, tuple[np.ndarray, CameraModel]]:
         """Poll the whole ring; ``{role: (rgb, CameraModel)}``."""
         models = camera_ring_models(self.width, self.height)
-        # Warm-up: on a fresh ring the first polls against the GPU prepass
-        # buffer frequently come back black.  One throwaway pass clocks the
-        # sensors, then the real pass reads them.
-        for cam in self.cameras.values():
-            try:
-                self._poll(cam)
-            except RuntimeError:
-                pass
+        # Warm-up only ONCE per provider (first grab after creation): the
+        # GPU prepass buffer is re-authored on a fresh ring and the first
+        # polls frequently come back black.  A throwaway pass on every
+        # tick would double the ring poll cost; per-frame black frames are
+        # still retried inside _poll, so a later black streak recovers.
+        if not self._warmed:
+            for cam in self.cameras.values():
+                try:
+                    self._poll(cam)
+                except RuntimeError:
+                    pass
+            self._warmed = True
         out: dict[str, tuple[np.ndarray, CameraModel]] = {}
         for role, cam in self.cameras.items():
             out[role] = (self._poll(cam), models[role])
