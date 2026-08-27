@@ -821,19 +821,28 @@ def main() -> int:
             # the speed is there.
             if v < 2.5 and signed > 0.3 and target_sm <= plan_speed:
                 thr = min(thr, 0.08)
+            # Downhill acceleration cap: once the car is rolling, full
+            # throttle demand plus gravity overshoots the plan in one
+            # 0.66 s burst (opt8: 0.80 throttle -> 2.7 -> 7.3 m/s).
+            # Cap the pedal while approaching the target so gravity does
+            # most of the work; the plan governor trims the rest.
+            if v > 2.5 and signed > 0.5 and v < target_sm - 0.5:
+                thr = min(thr, 0.35)
             # (The old "corner brake zone" here is gone: with the sim
             # paused and stepped in 0.33 s bursts the speed controller
             # reacts within one burst, while the zone caused an
             # accelerate -> brake-to-stop oscillation - fix54 reached
             # v=3.6 then brk=0.8 stopped it dead at every tick.  The
             # plan-speed governor below still hard-brakes overshoot.)
-            # Hard speed governor: the ~1.4 s control loop can miss a
-            # downhill acceleration (fix40: 5.0 -> 9.7 m/s in one tick
-            # on the east-side descent).  Never let the car exceed the
+            # Soft overspeed governor: never let the car exceed the
             # commanded cruise speed by more than 1 m/s regardless of
-            # the smoothed pedal state.
+            # the smoothed pedal state.  The old brk=1.0 here stopped
+            # the car DEAD on the downhill, then the controller relaunched
+            # with full throttle -> 0 <-> 7.8 m/s bang-bang (opt8).
+            # Cut the throttle here and let the plan governor's gentle
+            # GOV_BRAKE trim the overshoot with release hysteresis.
             if v > float(args.speed) + 1.0:
-                thr, brk = 0.0, 1.0
+                thr = 0.0
             # Plan-speed governor: never let the car exceed the planned
             # corner speed by more than 0.8 m/s even within one tick -
             # the profile alone is sampled at tick boundaries and the
