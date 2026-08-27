@@ -68,13 +68,13 @@ REVERSE_CLEAR_MPS = 0.2
 # is not wedged - it needs torque, not a backward roll).
 CLIMB_ASSIST_S = 3.5
 # Physics steps advanced per control tick while the sim is paused
-# (1/60 s per step => 20 steps = 0.33 s of driving per control).  The
+# (1/60 s per step => 40 steps = 0.66 s of driving per control).  The
 # FSD tick itself takes ~0.7-2 s of WALL time; without pause the car
 # drove that whole wall time with the PREVIOUS control.  Paused and
 # stepped in 0.33 s bursts, the control spacing in sim time is fixed and
 # much finer than the old wall-time drift (fix44-51: 5-10 m of stale
 # control per frame at the hairpin).
-CTRL_BURST_STEPS = 20
+CTRL_BURST_STEPS = 40
 # Target-speed smoothing: the plan speed changes by whole m/s between
 # ticks (corner governor, obstacle caps).  Feeding it straight into the
 # SpeedController made the pedals oscillate throttle -> brake -> throttle
