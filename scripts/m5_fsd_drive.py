@@ -60,13 +60,13 @@ REVERSE_CLEAR_MPS = 0.2
 # is not wedged - it needs torque, not a backward roll).
 CLIMB_ASSIST_S = 3.5
 # Physics steps advanced per control tick while the sim is paused
-# (1/60 s per step => 30 steps = 0.5 s of driving per control).  The
+# (1/60 s per step => 20 steps = 0.33 s of driving per control).  The
 # FSD tick itself takes ~0.7-2 s of WALL time; without pause the car
 # drove that whole wall time with the PREVIOUS control.  Paused and
-# stepped in 0.5 s bursts, the control spacing in sim time is fixed and
+# stepped in 0.33 s bursts, the control spacing in sim time is fixed and
 # much finer than the old wall-time drift (fix44-51: 5-10 m of stale
 # control per frame at the hairpin).
-CTRL_BURST_STEPS = 30
+CTRL_BURST_STEPS = 20
 # Target-speed smoothing: the plan speed changes by whole m/s between
 # ticks (corner governor, obstacle caps).  Feeding it straight into the
 # SpeedController made the pedals oscillate throttle -> brake -> throttle
@@ -77,7 +77,7 @@ SPEED_HYST_MPS = 0.4            # SpeedController brake/throttle hysteresis
 # Plan-speed brake governor hysteresis: enter at +1.0 m/s overshoot,
 # release once back within +0.5 m/s, and brake gently (0.25) instead of
 # 1.0 - BeamNG's brake is highly nonlinear and even 0.4-0.7 stands the
-# car dead in one 0.5 s burst, which then re-triggers the full-throttle
+# car dead in one 0.33 s burst, which then re-triggers the full-throttle
 # stall loop (fix61-64).  The downhill-start guard below prevents the
 # overshoot in the first place.
 GOV_ON_MPS = 1.0
@@ -440,7 +440,7 @@ def main() -> int:
                     np.asarray(st.dir[:2], dtype=float)))
             # Control-loop dt in SIMULATION time: the sim is paused and
             # advanced in CTRL_BURST_STEPS bursts, so each tick is exactly
-            # 0.5 s of driving regardless of the wall-time the FSD tick
+            # 0.33 s of driving regardless of the wall-time the FSD tick
             # took (which can be 2-7 s).  Using wall dt made the stuck /
             # reverse / climb state machines count a 7 s computation as
             # 7 s of standstill and reverse after every stop (fix53).
@@ -822,7 +822,7 @@ def main() -> int:
             if v < 2.5 and signed > 0.3 and target_sm <= plan_speed:
                 thr = min(thr, 0.08)
             # (The old "corner brake zone" here is gone: with the sim
-            # paused and stepped in 0.5 s bursts the speed controller
+            # paused and stepped in 0.33 s bursts the speed controller
             # reacts within one burst, while the zone caused an
             # accelerate -> brake-to-stop oscillation - fix54 reached
             # v=3.6 then brk=0.8 stopped it dead at every tick.  The
