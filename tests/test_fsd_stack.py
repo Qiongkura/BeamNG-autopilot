@@ -164,6 +164,51 @@ def test_fsd_tick_lane_ref_anchored_near_ego() -> None:
     assert d0 <= 3.0, f"lane reference not anchored: start {d0:.1f} m away"
 
 
+class _CountingSemantic(_FakeSemantic):
+    """Semantic stub that counts how many times it actually runs."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run(self, ctx):
+        self.calls += 1
+        return super().run(ctx)
+
+
+def test_fsd_tick_semantic_throttle_reuses_last_output() -> None:
+    st = _stack()
+    from beamng_autopilot.vision.hydra import HydraNet
+    st.hydra = HydraNet()
+    sem = _CountingSemantic()
+    st.hydra.add(sem)
+    st.semantic_every_n = 2
+    st._semantic_skip = 0
+    st._last_heads = None
+    out1 = st.tick()
+    assert sem.calls == 1
+    out2 = st.tick()
+    assert sem.calls == 1          # second tick reuses the last output
+    assert out2.head_outputs["semantic"] is out1.head_outputs["semantic"]
+    out3 = st.tick()
+    assert sem.calls == 2          # third tick runs the head again
+    # the reused output still carries the road mask for BEV fusion
+    assert "road" in out2.head_outputs["semantic"].masks
+
+
+def test_fsd_tick_semantic_throttle_off_by_default() -> None:
+    st = _stack()
+    from beamng_autopilot.vision.hydra import HydraNet
+    st.hydra = HydraNet()
+    sem = _CountingSemantic()
+    st.hydra.add(sem)
+    st.semantic_every_n = 1
+    st._semantic_skip = 0
+    st._last_heads = None
+    st.tick()
+    st.tick()
+    assert sem.calls == 2          # default runs every tick
+
+
 def test_fsd_tick_candidates_survive_progress_gate() -> None:
     """An ego-anchored lane reference must not silently kill the lane-shift
     candidates via the forward-progress gate.  At least the 11 arc fan plus

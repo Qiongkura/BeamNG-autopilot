@@ -380,7 +380,8 @@ def main() -> int:
                          heads=[SemanticHead(), TrafficSignalHead()],
                          ring_roles=('front_main',),
                          cam_w=args.cam_w, cam_h=args.cam_h,
-                         temporal=True, range_every_n=2)
+                         temporal=True, range_every_n=2,
+                         semantic_every_n=2)
         stack.reset_temporal()  # stale occupancy before start must not leak
         # Realistic gearbox locked into a forward gear (D).  A real stack
         # never leaves the car in reverse; keep the D input on every

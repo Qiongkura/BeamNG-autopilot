@@ -84,7 +84,8 @@ class FSDStack:
                  ring_roles=None, heads=None,
                  cam_w: int = 320, cam_h: int = 240,
                  temporal: bool = True, tau_s: float = 1.5,
-                 range_every_n: int = 1):
+                 range_every_n: int = 1,
+                 semantic_every_n: int = 1):
         self.conn = conn
         self.grid_n = int(grid_n)
         self.grid_res = float(grid_res)
@@ -103,6 +104,15 @@ class FSDStack:
         self.range_every_n = max(1, int(range_every_n))
         self._range_skip = 0
         self._last_range = None
+        # Semantic-head throttling: the UNet semantic head is the most
+        # expensive task (~100-300 ms on the live 400x300 front frame).
+        # The road/line masks change slowly between ticks, so the head
+        # runs every ``semantic_every_n`` ticks and intermediate ticks
+        # reuse its last output (cheap heads like traffic still run on
+        # every fresh frame; LiDAR is throttled by ``range_every_n``).
+        self.semantic_every_n = max(1, int(semantic_every_n))
+        self._semantic_skip = 0
+        self._last_heads = None
 
         self.hydra = HydraNet()
         for head in self.heads:
@@ -163,7 +173,24 @@ class FSDStack:
                 frame_rgb=frame, cam=cam, pos=pos, heading=heading,
                 ground_z=float(pos[2]) if len(pos) > 2 else 0.0,
                 role=role)
-            out.head_outputs = self.hydra.run(ctx)
+            if getattr(self, '_semantic_skip', 0) <= 0:
+                out.head_outputs = self.hydra.run(ctx)
+                self._last_heads = dict(out.head_outputs)
+                self._semantic_skip = max(
+                    0, int(getattr(self, 'semantic_every_n', 1)) - 1)
+            else:
+                self._semantic_skip -= 1
+                heads: dict = {}
+                for _name, _head in self.hydra._heads.items():
+                    if _name == "semantic":
+                        continue
+                    try:
+                        heads[_name] = _head.run(ctx)
+                    except Exception as _exc:
+                        self.hydra.errors[_name] = str(_exc)
+                _last = getattr(self, '_last_heads', None) or {}
+                heads["semantic"] = _last.get("semantic")
+                out.head_outputs = heads
             _times['ring'] = round((time.time() - _tw) * 1000.0, 1)
             _tw = time.time()
 
