@@ -98,6 +98,128 @@ def _ref_blocked_fraction(ref, pos, heading, grid,
     return (bad / tot) if tot > 0 else 0.0
 
 
+
+def polyline_bearing(ref, pos, min_m: float = 1.5, max_m: float = 20.0):
+    """Direction (rad) of ``ref``'s near-ahead part seen from ``pos``.
+
+    The ego-anchored polyline starts at (or near) the car, so the zero-
+    distance first vertex is skipped and the bearing is measured from
+    the first vertex at least ``min_m`` ahead to the last vertex inside
+    ``max_m``.  None when the reference has no measurable forward
+    extent.
+    """
+    if ref is None or len(ref) < 2:
+        return None
+    r = np.asarray(ref[:, :2], dtype=float)
+    p = np.asarray(pos[:2], dtype=float)
+    d = np.linalg.norm(r - p, axis=1)
+    sel = np.flatnonzero((d >= min_m) & (d <= max_m))
+    if len(sel) < 2:
+        sel = np.flatnonzero(d >= min_m)
+    if len(sel) < 2:
+        return None
+    i = int(sel[0])
+    j = int(sel[-1])
+    v = r[j] - r[i]
+    L = float(np.linalg.norm(v))
+    if L < 1e-9:
+        return None
+    return math.atan2(v[1], v[0])
+
+
+def bearing_diff_deg(a, b):
+    """Signed angle difference (deg) normalized to (-180, 180]."""
+    d = (float(a) - float(b)) % (2.0 * math.pi)
+    if d > math.pi:
+        d -= 2.0 * math.pi
+    return math.degrees(d)
+
+
+def lane_heading_ok(route, lane_ref, pos, heading,
+                    max_yaw_deg: float = 60.0) -> bool:
+    """True when the sensor lane points along the same roadway as route.
+
+    The lane may only replace the route (or steer lateral alignment)
+    when its near-ahead direction agrees with the route / ego heading.
+    At a junction the vision/LiDAR lane can pair onto a DIFFERENT road
+    (side branch or oncoming lane) whose free corridor looks clear; a
+    heading check keeps the car on the navigational route instead of
+    driving into that road (town run 2026-08-22: the paired lane headed
+    into the side road and the car left the road and wedged).  When the
+    lane bearing cannot be measured the decision falls back to True so
+    the blocked-fraction logic keeps its old behaviour.
+    """
+    l_b = polyline_bearing(lane_ref, pos)
+    if l_b is None:
+        return True
+    r_b = polyline_bearing(route, pos)
+    ref = r_b if r_b is not None else float(heading)
+    return abs(bearing_diff_deg(l_b, ref)) <= float(max_yaw_deg)
+
+
+def lane_side_offset_m(lane, route, pos, max_m: float = 20.0):
+    """Median signed lateral offset (m) of the lane from the route.
+
+    Positive = LEFT of the route's travel direction, negative = RIGHT.
+    The map nav route is the ROAD CENTRE line; the ego's own lane (right-
+    hand traffic) sits on the RIGHT of it (~ -half lane width).  A sensor
+    lane centre that lies LEFT of (or on) the road centreline is the
+    ONCOMING lane and must never steer the car (town runs 2026-08-22:
+    the paired vision/LiDAR lane locked onto the oncoming lane, passed
+    the bearing gate - same direction - and the car rode the centre line
+    / oncoming lane end to end).  None when no measurable overlap.
+    """
+    if route is None or len(route) < 2 or lane is None or len(lane) < 2:
+        return None
+    r = np.asarray(route[:, :2], dtype=float)
+    l = np.asarray(lane[:, :2], dtype=float)
+    p = np.asarray(pos[:2], dtype=float)
+    dl = np.linalg.norm(l - p, axis=1)
+    near = l[(dl >= 0.5) & (dl <= max_m)]
+    if len(near) < 2:
+        near = l[dl <= max_m]
+    if len(near) < 2:
+        return None
+    vals = []
+    for px, py in near:
+        best = None
+        for k in range(len(r) - 1):
+            ax, ay = r[k]
+            bx, by = r[k + 1]
+            tx, ty = bx - ax, by - ay
+            l2 = tx * tx + ty * ty
+            if l2 < 1e-12:
+                continue
+            t = max(0.0, min(1.0, ((px - ax) * tx + (py - ay) * ty) / l2))
+            cx, cy = ax + t * tx, ay + t * ty
+            sx, sy = px - cx, py - cy
+            d = math.hypot(sx, sy)
+            if d > 12.0:
+                continue
+            cross = tx * sy - ty * sx   # >0 = left of travel
+            sign = 1.0 if cross > 0 else -1.0
+            val = sign * d
+            if best is None or d < best[0]:
+                best = (d, val)
+        if best is not None:
+            vals.append(best[1])
+    return float(np.median(vals)) if vals else None
+
+
+def lane_side_ok(lane, route, pos, left_max_m: float = 0.0) -> bool:
+    """True when the lane sits on the ego (RIGHT) side of the route.
+
+    A sensor lane whose centre is LEFT of (or on) the road centreline is
+    the oncoming lane, never the ego lane - reject it (the map-prior own
+    lane / navigational route takes over).  When the offset cannot be
+    measured the decision falls back to True (old behaviour).
+    """
+    off = lane_side_offset_m(lane, route, pos)
+    if off is None:
+        return True
+    return float(off) <= float(left_max_m)
+
+
 def choose_plan_route(route, lane_ref, pos, heading, grid,
                       route_blocked_frac: float = 0.20,
                       lane_clear_frac: float = 0.15):
@@ -112,6 +234,12 @@ def choose_plan_route(route, lane_ref, pos, heading, grid,
     the wall if planning insists on it (town corner run 2026-08-21: the
     single-marker ``setPath`` route was a straight line through a wall,
     while the BEV lane actually turned away).
+
+    The sensor lane must also HEAD the same way as the route: at a
+    junction the lane can pair onto a different road whose corridor
+    reads clear, and following it drives the car off the navigational
+    route (town run 2026-08-22 - the lane pointed into the side road
+    and the car wedged).  ``lane_heading_ok`` gates that decision.
     """
     if route is None or len(route) < 2:
         return lane_ref if (lane_ref is not None and len(lane_ref) >= 2) else route
@@ -119,7 +247,10 @@ def choose_plan_route(route, lane_ref, pos, heading, grid,
         return route
     r_b = _ref_blocked_fraction(route, pos, heading, grid)
     l_b = _ref_blocked_fraction(lane_ref, pos, heading, grid)
-    if float(r_b) >= float(route_blocked_frac) and float(l_b) <= float(lane_clear_frac):
+    if float(r_b) >= float(route_blocked_frac) and \
+            float(l_b) <= float(lane_clear_frac) and \
+            lane_heading_ok(route, lane_ref, pos, heading) and \
+            lane_side_ok(lane_ref, route, pos):
         return lane_ref
     return route
 
@@ -142,7 +273,17 @@ def anchored_rule_ref(pos, heading, ref, near_m: float = 4.0,
     pos = np.asarray(pos[:2], dtype=float)
     d0 = float(np.hypot(r[0, 0] - pos[0], r[0, 1] - pos[1]))
     fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
-    fwd_m = float(np.dot(r[-1] - pos, fwd))
+    # Forward progress over the FIRST ~8 m of the reference, never the
+    # endpoint.  At a hairpin the reference turns ~90-180 deg and its END
+    # sits BEHIND the ego heading while the near part still drives
+    # forward along the road; the old endpoint gate rejected that fallback
+    # and the car stopped dead at the apex with src=none (mountain run
+    # 2026-08-26, run_fix8: stall at (724.8, 753.2) after the car drifted
+    # off-route at the first hairpin).  Only the near part is evidence
+    # the reference is drivable from here.
+    k = max(2, min(len(r), 8))
+    rel = r[:k] - pos
+    fwd_m = float(np.max(rel[:, 0] * fwd[0] + rel[:, 1] * fwd[1]))
     if d0 > near_m or fwd_m < forward_m:
         return None
     return ref

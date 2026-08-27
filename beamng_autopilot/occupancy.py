@@ -54,6 +54,7 @@ class OccupancyGrid:
     obstacle: np.ndarray = field(init=False)    # 0/1 persistent barrier
     height: np.ndarray = field(init=False)      # mean z of hits (m)
     sources: np.ndarray = field(init=False)     # integration count
+    observed: np.ndarray = field(init=False)    # 0/1 seen by a sensor
 
     def __post_init__(self) -> None:
         shape = (self.n_rows, self.n_cols)
@@ -62,6 +63,7 @@ class OccupancyGrid:
         self.obstacle = np.zeros(shape, dtype=np.uint8)
         self.height = np.full(shape, np.nan, dtype=np.float32)
         self.sources = np.zeros(shape, dtype=np.uint16)
+        self.observed = np.zeros(shape, dtype=np.float32)
         self._recompute_extent()
 
     def _recompute_extent(self) -> None:
@@ -114,6 +116,20 @@ class OccupancyGrid:
         else:
             self.height[r, c] = float(z)
         self.sources[r, c] += 1
+
+    def add_observed_point(self, wx: float, wy: float) -> None:
+        """Mark a grid cell as SEEN by a sensor (road or not).
+
+        ``drivable`` only records road evidence; a 0 cell therefore means
+        either grass/terrain OR simply "not stamped yet".  The observed
+        layer records every back-projected camera pixel (road and non-
+        road), so the planner can tell "seen as non-drivable" from
+        "unknown" - a hard off-road gate must only punish the former.
+        """
+        cell = self.world_to_cell(wx, wy)
+        if cell is None:
+            return
+        self.observed[cell] = 1.0
 
     def add_drivable_point(self, wx: float, wy: float) -> None:
         cell = self.world_to_cell(wx, wy)
@@ -273,8 +289,6 @@ def project_road_mask_to_grid(grid: OccupancyGrid, road_mask: np.ndarray,
     cx, cy = cam.cx, cam.cy
     for v in range(0, h, step):
         for u in range(0, w, step):
-            if not road_mask[v, u]:
-                continue
             # ray from camera through pixel (u, v)
             x_cam = (u - cx) / fx
             y_cam = (v - cy) / fy
@@ -298,7 +312,13 @@ def project_road_mask_to_grid(grid: OccupancyGrid, road_mask: np.ndarray,
             wy = C[1] + t * D[1]
             if (wx - pos[0]) ** 2 + (wy - pos[1]) ** 2 > max_ahead_m ** 2:
                 continue
-            grid.add_drivable_point(wx, wy)
+            # Every back-projected pixel (road OR non-road) is "observed";
+            # only road pixels are drivable.  The observed layer lets the
+            # planner distinguish grass/terrain (seen, not drivable) from
+            # unknown space beyond the sensor footprint.
+            grid.add_observed_point(wx, wy)
+            if road_mask[v, u]:
+                grid.add_drivable_point(wx, wy)
 
 
 def fuse_obstacles_to_grid(grid: OccupancyGrid, obstacles,

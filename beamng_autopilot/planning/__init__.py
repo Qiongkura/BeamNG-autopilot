@@ -42,6 +42,7 @@ from .arbiter import (
     choose_plan_route,
 )
 from .speed_profile import speed_profile_for_path
+from .local_route import local_route, AHEAD_M, BACK_M, DUP_MIN_M
 from .intent import (
     RoutingIntent,
     infer_route_intent,
@@ -58,6 +59,10 @@ __all__ = [
     "cost_curvature",
     "lane_cross_dist_m",
     "cost_lane_align",
+    "local_route",
+    "AHEAD_M",
+    "BACK_M",
+    "DUP_MIN_M",
     "select_trajectory",
     "ArbiterOutcome",
     "anchored_rule_ref",

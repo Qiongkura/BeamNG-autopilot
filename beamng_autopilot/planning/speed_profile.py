@@ -22,7 +22,7 @@ import math
 import numpy as np
 
 # Comfort lateral acceleration limit for curvature speed (m/s^2).
-COMFORT_LAT = 3.0
+COMFORT_LAT = 2.0
 # How far ahead we start braking for an obstacle (m).
 OBSTACLE_BRAKE_M = 25.0
 # Half-width of the path corridor that can actually limit speed.  Roadside
@@ -75,7 +75,13 @@ def speed_profile_for_path(path, scene, target_speed: float = 12.0,
         n2 = float(np.linalg.norm(v2))
         if n1 < 1e-9 or n2 < 1e-9:
             continue
-        curvature = abs(cr) / (n1 * n2)
+        # Polyline curvature at a vertex (1/m): 2*|cross|/(|v1||v2|(|v1|+
+        # |v2|)) equals sin(dtheta)/s for equal-length segments s, i.e.
+        # the true circle curvature dtheta/s (the older ``|cross|/(n1*n2)``
+        # was dimensionless sin(dtheta) and made the speed limit depend on
+        # the sampling step - on the 0.6 m-rounded first hairpin it read
+        # ~6.3 m/s for an 8 m radius instead of ~4.9).
+        curvature = 2.0 * abs(cr) / (n1 * n2 * (n1 + n2))
         if curvature > 1e-6:
             v[i] = min(v[i], math.sqrt(A / curvature))
     v[0] = min(v[0], v[1])
@@ -91,6 +97,22 @@ def speed_profile_for_path(path, scene, target_speed: float = 12.0,
             if near < obstacle_brake_m:
                 f = max(0.0, near / obstacle_brake_m)
                 v[i] = min(v[i], max(MIN_SPEED, target * f))
+
+    # --- look-ahead braking -------------------------------------------
+    # The per-point limits above apply AT the bend/obstacle; the plan
+    # must brake BEFORE them, or the car arrives at the corner at cruise
+    # speed (mountain hairpin 2026-08-22: ``best_speed = v[0]`` stayed
+    # 8 m/s while the apex 6 m ahead was limited to ~1.7 m/s, so the
+    # throttle kept accelerating into a 5-8 m radius hairpin, the car ran
+    # wide off the road and parked itself beside it).  Propagate each
+    # point's limit back over the next ``lookahead_m`` metres so the
+    # entry speed of a bend is already the bend speed.
+    lookahead_m = 12.0
+    arc = np.concatenate(
+        [[0.0], np.cumsum(np.linalg.norm(np.diff(path, axis=0), axis=1))])
+    for i in range(n):
+        hi = int(np.searchsorted(arc, arc[i] + lookahead_m))
+        v[i] = float(np.min(v[i: hi + 1]))
     return v
 
 

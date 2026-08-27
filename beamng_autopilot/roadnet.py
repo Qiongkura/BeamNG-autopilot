@@ -22,6 +22,8 @@ class RoadNetwork:
     def __init__(self, intersection_join_m: float = 2.5):
         self.nodes: np.ndarray | None = None  # Nx2 (x, y)
         self.heights: np.ndarray | None = None  # N, road-surface z per node
+        self.lefts: np.ndarray | None = None  # Nx2 road LEFT edge (world)
+        self.rights: np.ndarray | None = None  # Nx2 road RIGHT edge (world)
         self.adj: dict[int, list[tuple[int, float]]] = {}
         self.ready = False
         self.info = "no road data"
@@ -64,6 +66,8 @@ class RoadNetwork:
 
         pts: list[np.ndarray] = []
         heights: list[float] = []
+        lefts: list[np.ndarray] = []
+        rights: list[np.ndarray] = []
         edges: list[tuple[int, int]] = []
         n_used = 0
         for road_id, meta in roads.items():
@@ -90,6 +94,12 @@ class RoadNetwork:
                 m3 = np.asarray(m, dtype=float)
                 row_pts.append(m3[:2])
                 heights.append(float(m3[2]) if m3.size >= 3 else math.nan)
+                _edge2 = lambda k: (np.asarray(row.get(k), dtype=float)[:2]
+                                    if row.get(k) is not None
+                                    and len(np.asarray(row.get(k), dtype=float)) >= 2
+                                    else np.array([np.nan, np.nan]))
+                lefts.append(_edge2("left"))
+                rights.append(_edge2("right"))
             if len(row_pts) >= 2:
                 base = len(pts)
                 pts.extend(row_pts)
@@ -102,6 +112,10 @@ class RoadNetwork:
             return False
 
         self.nodes = np.asarray(pts, dtype=float)
+        self.lefts = (np.asarray(lefts, dtype=float)
+                      if len(lefts) == len(self.nodes) else None)
+        self.rights = (np.asarray(rights, dtype=float)
+                       if len(rights) == len(self.nodes) else None)
         self.heights = None
         if len(heights) == len(self.nodes) and all(
                 math.isfinite(h) for h in heights):
@@ -280,15 +294,14 @@ class RoadNetwork:
         i = best[1]
         return (float(self.nodes[i, 0]), float(self.nodes[i, 1]))
 
-    def route(self, start_xy, goal_xy, step: float = 1.5):
-        """A* along the road graph; returns Nx2 waypoints (start..goal)."""
+    def _astar_idx(self, start_xy, goal_xy):
+        """A* over the road graph; returns the node-index path or None."""
         if not self.ready:
             return None
         s = self._nearest(start_xy)
         g = self._nearest(goal_xy)
         if s == g:
-            return self._interpolate(start_xy, goal_xy, step)
-
+            return [s]
         open_heap: list[tuple[float, int]] = [(0.0, s)]
         came: dict[int, int] = {}
         gcost = {s: 0.0}
@@ -312,17 +325,137 @@ class RoadNetwork:
         if g not in gcost:
             self.info = "A* found no path on road graph"
             return None
-
         idx_path = [g]
         cur = g
         while cur != s:
             cur = came[cur]
             idx_path.append(cur)
         idx_path.reverse()
+        return idx_path
+
+    def route(self, start_xy, goal_xy, step: float = 1.5):
+        """A* along the road graph; returns Nx2 waypoints (start..goal)."""
+        idx_path = self._astar_idx(start_xy, goal_xy)
+        if idx_path is None:
+            return None
         chain = [np.asarray(start_xy[:2], dtype=float)]
         chain.extend(self.nodes[i] for i in idx_path)
         chain.append(np.asarray(goal_xy[:2], dtype=float))
         return self._interpolate_chain(chain, step)
+
+    def route_with_edges(self, start_xy, goal_xy, step: float = 1.5):
+        """A* route plus the road's real LEFT/RIGHT edge polylines.
+
+        Returns ``(route, left, right)`` - all Nx2 world polylines
+        sampled at the SAME arc positions (same ``step`` interpolation as
+        ``route()``), so ``right[k]`` is the road's right edge beside
+        ``route[k]``.  Edge rows can be missing for a node (NaN rows are
+        skipped); the caller falls back to synthetic offsets when a
+        polyline has too few usable points.
+        """
+        idx_path = self._astar_idx(start_xy, goal_xy)
+        if idx_path is None:
+            return None, None, None
+        if self.lefts is None or self.rights is None:
+            route = self.route(start_xy, goal_xy, step=step)
+            return route, None, None
+        route_pts: list[np.ndarray] = []
+        left_pts: list[np.ndarray] = []
+        right_pts: list[np.ndarray] = []
+        route_pts.append(np.asarray(start_xy[:2], dtype=float))
+        left_pts.append(np.array([np.nan, np.nan]))
+        right_pts.append(np.array([np.nan, np.nan]))
+        nodes = self.nodes
+        lefts = self.lefts
+        rights = self.rights
+        for i in idx_path:
+            route_pts.append(nodes[i])
+            left_pts.append(lefts[i])
+            right_pts.append(rights[i])
+        route_pts.append(np.asarray(goal_xy[:2], dtype=float))
+        left_pts.append(np.array([np.nan, np.nan]))
+        right_pts.append(np.array([np.nan, np.nan]))
+
+        # Interpolate edges with the SAME t fractions as the route: walk
+        # route_pts pairs and, for each route sample, the edge pair index
+        # matches the route pair index (start/goal appended NaN rows are
+        # skipped by holding the previous valid edge point).
+        def _interp_edge(edge_pts, route_out):
+            out: list[np.ndarray] = []
+            k = 0
+            prev = None
+            for a, b in zip(route_pts, route_pts[1:]):
+                dist = float(np.linalg.norm(b - a))
+                if dist < 1e-6:
+                    # Zero-length route pair (e.g. the caller passed the
+                    # nearest road NODE as start, so start == nodes[0]):
+                    # the route interpolation skips it AND its edge pair
+                    # must be skipped too - otherwise the edge index lags
+                    # one node behind and the whole first segment holds
+                    # the node-0 edge constant (own-lane boundary 5 m
+                    # wrong at the start -> every candidate rejected).
+                    k += 1
+                    continue
+                n = max(1, int(np.ceil(dist / step)))
+                ts = np.linspace(0.0, 1.0, n, endpoint=False)
+                ea = edge_pts[k]
+                eb = edge_pts[k + 1]
+                k += 1
+                if (ea is None or not np.all(np.isfinite(ea))):
+                    ea = prev if prev is not None else eb
+                if (eb is None or not np.all(np.isfinite(eb))):
+                    eb = ea
+                if np.all(np.isfinite(ea)):
+                    prev = ea
+                if np.all(np.isfinite(ea)) and np.all(np.isfinite(eb)):
+                    for t in ts:
+                        out.append(ea + t * (eb - ea))
+                else:
+                    for _ in ts:
+                        out.append(np.array([np.nan, np.nan]))
+            if len(out) < len(route_out):
+                last = prev if prev is not None else np.array([np.nan, np.nan])
+                out.append(last)
+            return np.asarray(out, dtype=float)
+
+        route_out = self._interpolate_chain(route_pts, step)
+        left_out = _interp_edge(left_pts, route_out)
+        right_out = _interp_edge(right_pts, route_out)
+        # Trim NaN padding at the head/tail using a COMMON window so the
+        # left/right polylines keep the same index as the route (trimming
+        # each side independently would shift them relative to each other).
+        good = np.flatnonzero(
+            np.all(np.isfinite(left_out), axis=1)
+            & np.all(np.isfinite(right_out), axis=1))
+        if len(good) < 4:
+            return route_out, None, None
+        s = int(good[0])
+        e = int(good[-1]) + 1
+        route_out = route_out[s:e]
+        left_out = left_out[s:e]
+        right_out = right_out[s:e]
+        n = len(route_out)
+        # Orient the stored left/right edges to the ROUTE travel direction:
+        # DecalRoad rows store left/right in the road's own direction, which
+        # can be the OPPOSITE of the A* path on a segment (hairpin rows flip
+        # the pair at the apex).  The planner needs the edge on the route's
+        # RIGHT side - pick per vertex by the sign of the lateral offset.
+        for k in range(1, n - 1):
+            tv = route_out[k + 1] - route_out[k - 1]
+            L = float(np.linalg.norm(tv))
+            if L < 1e-9:
+                continue
+            rn = np.array([tv[1] / L, -tv[0] / L])
+            if np.all(np.isfinite(left_out[k])) \
+                    and np.all(np.isfinite(right_out[k])):
+                dl = float(np.dot(left_out[k] - route_out[k], rn))
+                dr = float(np.dot(right_out[k] - route_out[k], rn))
+                if dr < 0.0 and dl > 0.0:
+                    lk = left_out[k].copy()
+                    rk = right_out[k].copy()
+                    left_out[k] = rk
+                    right_out[k] = lk
+        return route_out, left_out, right_out
 
     @staticmethod
     def _interpolate_chain(chain, step: float) -> np.ndarray:

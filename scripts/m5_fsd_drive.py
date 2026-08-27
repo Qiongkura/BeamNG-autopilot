@@ -32,13 +32,16 @@ from beamng_autopilot import config
 from beamng_autopilot.connector import BeamNGConnector
 from beamng_autopilot.control import gearbox
 from beamng_autopilot.control.reverse_guard import ReverseGuard
+from beamng_autopilot.control.reverse_maneuver import ReverseManeuver
 from beamng_autopilot.control.pure_pursuit import PurePursuit
 from beamng_autopilot.control.speed import SpeedController
 from beamng_autopilot.fsd_stack import FSDStack
 from beamng_autopilot.occupancy import OccupancyGrid
-from beamng_autopilot.planning import Scene
+from beamng_autopilot.planning import Scene, local_route
 from beamng_autopilot.roadnet import RoadNetwork
+from beamng_autopilot.autopilot import nearest_route_point, smooth_steer
 from beamng_autopilot.planner import (
+    LocalPlanner,
     emergency_speed_limit_mps,
     emergency_stop_clearance_m,
     path_grid_clearance_m,
@@ -52,59 +55,96 @@ from beamng_autopilot.vision.heads import SemanticHead, TrafficSignalHead
 # reversed into walls after an impact ("dumb reversing" seen on probes).
 REVERSE_THRESHOLD_MPS = -0.35
 REVERSE_CLEAR_MPS = 0.2
+# Slope-creep assist: seconds of full throttle before a "stuck" car is
+# allowed to reverse (a car stopped at the bottom of a dip facing uphill
+# is not wedged - it needs torque, not a backward roll).
+CLIMB_ASSIST_S = 3.5
+# Physics steps advanced per control tick while the sim is paused
+# (1/60 s per step => 45 steps = 0.75 s of driving per control).  The
+# FSD tick itself takes ~1.4-7 s of WALL time; without pause the car
+# drove that whole wall time with the PREVIOUS control.  Paused and
+# stepped in 0.75 s bursts, the control spacing in sim time is fixed and
+# much finer than the old wall-time drift (fix44-51: 5-10 m of stale
+# control per frame at the hairpin).
+CTRL_BURST_STEPS = 45
 
 
-def _local_route(pos, heading, nav_route, ahead_m=32.0) -> np.ndarray:
-    """The route in front of the ego, re-anchored at the car.
 
-    The in-game navigation route is a map prior that can start far from
-    the ego when the car drifts; planning and lane-keep must measure
-    against the *forward* part of the route only - the far tail of a
-    long route reads as a wall / lane edge and stalls the car on the
-    first town bend.  Falls back to a straight line ahead without a
-    nav route.
+def _ref_bearing(ref, pos, min_m: float = 1.5, max_m: float = 20.0):
+    """Bearing (deg) of the near-ahead part of a reference polyline."""
+    if ref is None or len(ref) < 2:
+        return None
+    r = np.asarray(ref[:, :2], dtype=float)
+    p = np.asarray(pos[:2], dtype=float)
+    d = np.linalg.norm(r - p, axis=1)
+    sel = np.flatnonzero((d >= min_m) & (d <= max_m))
+    if len(sel) < 2:
+        sel = np.flatnonzero(d >= min_m)
+    if len(sel) < 2:
+        return None
+    i, j = int(sel[0]), int(sel[-1])
+    v = r[j] - r[i]
+    L = float(np.linalg.norm(v))
+    if L < 1e-9:
+        return None
+    return round(float(math.degrees(math.atan2(v[1], v[0]))), 1)
+
+
+def _path_curvature_ff(path, pos, heading, near_m: float = 1.5,
+                       horizon_m: float = 8.0, wheelbase: float = 2.9,
+                       ratio: float = 0.6, max_ff: float = 0.40) -> float:
+    """Feed-forward steering from the chosen path's near-ahead curvature.
+
+    The ~1.4 s control loop only reacts to the PurePursuit target at the
+    lookahead point, so at 2 m/s the car has already passed the entry of
+    a hairpin before the pursuit asks for the turn (fix37-41 runs: the
+    first -110 -> -24 deg bend was missed every time and the car ran
+    straight past the apex).  A feed-forward term from the path curvature
+    2-10 m ahead starts the turn as soon as the path bends.
+
+    Returns a NORMALIZED steering input (negative = left), scaled by how
+    aligned the ego heading is with the path so a sideways rejoin is not
+    fought.  ``ratio`` is the rad-per-normalized-input steering ratio used
+    by the pursuit conversion below.
     """
-    pos = np.asarray(pos[:2], dtype=float)
-    fwd = np.array([float(np.cos(heading)), float(np.sin(heading))])
-    if nav_route is not None and len(nav_route) >= 2:
-        r = np.asarray(nav_route[:, :2], dtype=float)
-        i0 = int(np.argmin(np.linalg.norm(r - pos, axis=1)))
-        d_prev = float("inf")
-        d_next = float("inf")
-        if i0 > 0:
-            v = r[i0] - r[i0 - 1]
-            d_prev = float(np.dot(v, fwd))
-        if i0 + 1 < len(r):
-            v = r[i0 + 1] - r[i0]
-            d_next = float(np.dot(v, fwd))
-        if d_next > 0 or d_prev == float("inf"):
-            seg = r[i0:]
-        else:
-            seg = r[i0::-1]  # route runs opposite; walk it backwards
-        # keep only the near, ahead part (the far route is unknown space)
-        dseg = np.linalg.norm(seg - pos, axis=1)
-        seg = seg[dseg <= ahead_m + 8.0]
-        if len(seg) >= 4:
-            if float(np.dot(seg[0] - pos, fwd)) > 1.0:
-                # anchor the reference at the car so it is a drivable
-                # start for the planner (a far start would trip the
-                # forward-progress gate / point at a wall).
-                if float(np.linalg.norm(seg[0] - pos)) > 2.0:
-                    seg = np.vstack([pos, seg])
-                return seg
-            # The nearest route vertex is beside/behind the ego (the car
-            # drifted off the map route).  Never fall back to the straight
-            # "goal" line here - it cuts across terrain/walls and wedges
-            # the car.  Build a return-to-route path from the ego to the
-            # next forward route points instead (town run 2026-08-21: car
-            # at (715.9,750.5) with the route beside/behind it drove a
-            # straight line across a wall and stuck, throttle 0.34 / v=0).
-            ahead = seg[np.dot(seg - pos, fwd) > 1.0]
-            if len(ahead) >= 2:
-                return np.vstack([pos, ahead])
-    xs = np.linspace(0, ahead_m, 25)
-    return np.column_stack([pos[0] + xs * np.cos(heading),
-                            pos[1] + xs * np.sin(heading)])
+    if path is None or len(path) < 4:
+        return 0.0
+    p = np.asarray(path[:, :2], dtype=float)
+    pos2 = np.asarray(pos[:2], dtype=float)
+    n = len(p)
+    d = np.linalg.norm(p - pos2, axis=1)
+    i0 = int(np.argmin(d))
+    arc = np.concatenate(
+        [[0.0], np.cumsum(np.linalg.norm(np.diff(p, axis=0), axis=1))])
+    base = float(arc[i0])
+    idxs = [i0]
+    for tgt in (near_m, near_m + horizon_m):
+        j = i0
+        while j < n - 1 and float(arc[j]) - base < tgt:
+            j += 1
+        idxs.append(j)
+    i1, i2 = idxs[1], idxs[2]
+    if i2 - i1 < 2:
+        return 0.0
+
+    def _tangent(i: int) -> np.ndarray:
+        a = max(0, i - 1)
+        b = min(n - 1, i + 1)
+        v = p[b] - p[a]
+        L = float(np.linalg.norm(v))
+        return (v / L) if L > 1e-9 else np.array([1.0, 0.0])
+
+    t1 = _tangent(i1)
+    t2 = _tangent(i2)
+    th1 = math.atan2(float(t1[1]), float(t1[0]))
+    th2 = math.atan2(float(t2[1]), float(t2[0]))
+    dth = (th2 - th1 + math.pi) % (2.0 * math.pi) - math.pi
+    ds = max(1e-3, float(arc[i2] - arc[i1]))
+    kappa = dth / ds
+    align = float(np.clip(
+        math.cos(th1 - float(heading)), 0.0, 1.0))
+    ff = -kappa * wheelbase / ratio   # left curve (kappa>0) -> negative input
+    return float(np.clip(ff * (0.3 + 0.7 * align), -max_ff, max_ff))
 
 
 def main() -> int:
@@ -178,6 +218,8 @@ def main() -> int:
         # centre-lines; fall back to the in-game route only when the road
         # graph is unavailable.
         nav_route = None
+        road_left = None
+        road_right = None
         st0 = conn.get_state()
         p0 = np.asarray(st0.pos[:2], dtype=float)
         if args.goal is not None:
@@ -198,9 +240,12 @@ def main() -> int:
                 # (route[0] == start so d0 == 0).  Snap will then place the
                 # car on the road and face it along the route.
                 n0 = rn.nodes[rn._nearest(p0)]
-                r_route = rn.route(n0, np.asarray(args.goal, dtype=float))
-                if r_route is not None and len(r_route) >= 4:
-                    nav_route = np.asarray(r_route[:, :2], dtype=float)
+                _rwe = rn.route_with_edges(
+                    n0, np.asarray(args.goal, dtype=float))
+                if _rwe[0] is not None and len(_rwe[0]) >= 4:
+                    nav_route = np.asarray(_rwe[0][:, :2], dtype=float)
+                    road_left = _rwe[1]
+                    road_right = _rwe[2]
                     dseg = np.linalg.norm(np.diff(nav_route, axis=0), axis=1)
                     print(f"[fsd-drive] road-graph route: "
                           f"{len(nav_route)} pts, "
@@ -257,13 +302,21 @@ def main() -> int:
             if rdir is not None:
                 cos_a = float(np.dot(f0, rdir))
                 heading_ok = cos_a >= 0.0
-            # Snap when the car is far off the route OR faces against the
-            # route direction (town runs 2026-08-22: a 0.4 m off-route
-            # start with the nose pointing the wrong way made the local
-            # route fall back to a straight line and drove across the
-            # town into a wall).  Align the nose along the route so the
-            # planner follows the road graph, not a cross-field line.
-            if d0[i] > 8.0 or not heading_ok:
+            # Snap when the car is off the road centre OR faces more than
+            # ~60 deg away from the route direction (town runs 2026-08-22:
+            # a 0.4 m off-route start with the nose pointing the wrong way
+            # made the local route fall back to a straight line and drove
+            # across the town into a wall; mountain run 2026-08-27
+            # run_fix22: a start ON the route but facing 71 deg off drove
+            # straight onto the grass and spun).  Align the nose along the
+            # route so the planner follows the road graph, not a
+            # cross-field line - a real stack never starts a run facing
+            # across its own lane.
+            snap_heading = False
+            if rdir is not None:
+                cos_a = float(np.dot(f0, rdir))
+                snap_heading = cos_a < 0.5
+            if d0[i] > 1.5 or not heading_ok or snap_heading:
                 rx, ry = float(nav_route[i, 0]), float(nav_route[i, 1])
                 if i + 1 < len(nav_route):
                     ndx, ndy = (float(nav_route[i + 1, 0] - rx),
@@ -272,6 +325,11 @@ def main() -> int:
                     ndx, ndy = (float(rx - nav_route[i - 1, 0]),
                                 float(ry - nav_route[i - 1, 1]))
                 h = float(np.arctan2(ndy, ndx))
+                # Connector convention (see connector.py spawn): the snap
+                # passes angle_to_quat the yaw directly with
+                # ``yaw_deg = -degrees(h) - 90`` so the resulting STATE
+                # heading equals h (route direction).  Do NOT use the
+                # --teleport convention here (that one adds the -90 itself).
                 yaw_deg = -math.degrees(h) - 90.0
                 from beamng_autopilot.connector import angle_to_quat
                 resp = conn.bng.control.queue_lua_command(
@@ -297,6 +355,11 @@ def main() -> int:
             print("[fsd-drive] no nav route set; falling back to "
                   "straight-ahead reference")
 
+        # Proven rule planner as the arbitration fallback: it rounds
+        # switchback corners into drivable arcs (the 94.6% rule-autopilot
+        # path), so the FSD drive never stops dead at a hairpin apex or
+        # full-locks across a kinked map-prior lane.
+        rule_planner = LocalPlanner()
         stack = FSDStack(conn, args.runtime,
                          heads=[SemanticHead(), TrafficSignalHead()],
                          cam_w=args.cam_w, cam_h=args.cam_h,
@@ -309,17 +372,41 @@ def main() -> int:
         conn.control(throttle=0.0, brake=0.0, steering=0.0,
                      parkingbrake=0.0, gear=fwd_gear)
         conn.step(3)
+        # Deterministic control: pause the simulation for the control
+        # loop.  Without this the sim keeps running in REAL TIME while
+        # the FSD tick computes (~1.4-7 s per frame): the first frame
+        # takes ~7 s and the car rolls ~9 m straight down the slope
+        # before the first steering is ever sent (diag2: f=0 "before"
+        # position was already (725.6,753.1), the hairpin entry), and
+        # every later frame the car drives several metres with the
+        # PREVIOUS tick's controls.  Paused, each tick is: sense ->
+        # plan -> control -> step(2), a tight closed loop.
+        try:
+            conn.bng.pause()
+        except Exception as _pe:
+            print(f"[fsd-drive] pause failed: {_pe}")
         print(f"[fsd-drive] gearbox realistic, forward gear input = {fwd_gear}")
         rguard = ReverseGuard(threshold_mps=REVERSE_THRESHOLD_MPS,
                               clear_mps=REVERSE_CLEAR_MPS)
+        rman = ReverseManeuver(fwd_gear=fwd_gear)
         print(f"[fsd-drive] runtime={stack.mode} FSD pipeline driving "
               f"for {args.seconds}s at {args.speed} m/s")
 
+        prev_steer = 0.0  # rate-limited steering state (rule-autopilot convention)
+        last_h = None      # previous heading for the yaw-rate steering damper
+        climb_t = 0.0      # seconds spent in slope-creep assist
+        stuck_t = 0.0    # seconds at near-standstill with a "safe" plan
         t_end = time.time() + args.seconds
         frames = 0
         stopps = 0
         t0 = time.time()
-        last_t = time.time()
+        # First-frame steering: with last_t set to NOW the first tick has
+        # dt ~= 0, smooth_steer cannot move the wheel, and the car runs
+        # the whole first ~7 m straight past the corner entry before any
+        # steering appears (fix50: steer stayed -0.02 while the car went
+        # from the spawn to (726.9,756.8)).  Pretend one control interval
+        # has already elapsed so the first frame can steer immediately.
+        last_t = time.time() - 1.5
         hist: list[dict] = []
         while time.time() < t_end:
             st = conn.get_state()
@@ -331,18 +418,45 @@ def main() -> int:
                 signed = float(np.dot(
                     np.asarray(st.vel[:2], dtype=float),
                     np.asarray(st.dir[:2], dtype=float)))
+            # Control-loop dt in SIMULATION time: the sim is paused and
+            # advanced in CTRL_BURST_STEPS bursts, so each tick is exactly
+            # 0.75 s of driving regardless of the wall-time the FSD tick
+            # took (which can be 2-7 s).  Using wall dt made the stuck /
+            # reverse / climb state machines count a 7 s computation as
+            # 7 s of standstill and reverse after every stop (fix53).
+            dt = CTRL_BURST_STEPS / 60.0
             now_t = time.time()
-            dt = max(0.0, now_t - last_t)
+            _wall_dt = max(0.0, now_t - last_t)
             last_t = now_t
             rev_brk, reversing = rguard.decide(signed, dt=dt)
+            # Yaw rate for the steering damper: a low-speed car at full
+            # lock keeps rotating for seconds after the wheel is centred
+            # (the fix37/38 loop - the car swung -130 deg around the
+            # junction because the bang-bang pursuit had no damping).
+            yaw_rate = 0.0
+            if last_h is not None and dt > 0.05:
+                _d = float(heading) - float(last_h)
+                _d = (_d + math.pi) % (2.0 * math.pi) - math.pi
+                yaw_rate = _d / dt
+            last_h = float(heading)
 
             # one full FSD tick -> best trajectory (planned along the
             # LOCAL forward route anchored at the ego; the full nav
             # route tail is a map prior that can cut through a corner
             # wall when the car drifts (town runs 2026-08-21) - the
             # local forward route is what the planner may follow.
-            out = stack.tick(st=st,
-                             route_ref=_local_route(pos, heading, nav_route))
+            route_local = local_route(pos, heading, nav_route)
+            map_lane = None
+            if road_left is not None and road_right is not None:
+                try:
+                    from beamng_autopilot.planning.local_route import (
+                        map_lane_edges)
+                    map_lane = map_lane_edges(
+                        nav_route, road_left, road_right, pos, heading)
+                except Exception:
+                    map_lane = None
+            out = stack.tick(st=st, route_ref=route_local,
+                                   map_lane_override=map_lane)
             best = out.best_path
 
             # safety arbitration on the chosen path: evaluate against the
@@ -358,7 +472,7 @@ def main() -> int:
             # vision/LiDAR drivable centreline (the lane the planner
             # actually follows); the map nav route only when the sensor
             # lane is not available.
-            local = _local_route(pos, heading, nav_route)
+            local = route_local
             if out.lane_ref is not None and len(out.lane_ref) >= 4:
                 local = np.asarray(out.lane_ref, dtype=float)
             if out.bev is not None and out.bev.shape == grid.occupancy.shape:
@@ -368,6 +482,9 @@ def main() -> int:
                 if out.drivable is not None and \
                         out.drivable.shape == grid.drivable.shape:
                     grid.drivable[:] = np.asarray(out.drivable)
+                if out.observed is not None and \
+                        out.observed.shape == grid.drivable.shape:
+                    grid.observed[:] = np.asarray(out.observed)
                 scene = Scene(pos=pos, heading=heading, grid=grid,
                               route=local,
                               lane_ref=local,
@@ -396,19 +513,215 @@ def main() -> int:
             # correct FSD behaviour is a minimal-risk stop (town runs
             # 2026-08-21 pushed a wall under a far-away route reference).
             from beamng_autopilot.planning import anchored_rule_ref, arbitrate
-            from beamng_autopilot.planning.constraints import (
-                _boundary_lateral,
-            )
-            rule_ref = anchored_rule_ref(pos, heading, local)
+            from beamng_autopilot.planning.constraints import _boundary_lateral
+            # Proven rule-autopilot fallback: the LocalPlanner rounds
+            # switchback corners and keeps the car in its own lane, so the
+            # FSD drive does not stop dead at a hairpin apex when the
+            # layered planner declines every kinked map-prior candidate.
+            # The path must still be ego-anchored and head forward; the
+            # FSD safety monitor re-verifies it below (and can stop).
+            rule_ref = None
+            if nav_route is not None and len(nav_route) >= 2:
+                try:
+                    _fwd = (np.asarray(st.dir[:2], dtype=float)
+                            if st.dir is not None else np.array(
+                                [math.cos(heading), math.sin(heading)]))
+                    _nidx = nearest_route_point(nav_route[:, :2], pos, _fwd)
+                    _rd, _rblk = rule_planner.plan(
+                        np.asarray(nav_route[:, :2], dtype=float), [],
+                        pos, heading, _nidx,
+                        sensor_lane=None, road_rule=None, cross_solid=False)
+                    if _rd is not None and len(_rd) >= 2 and not _rblk:
+                        rule_ref = anchored_rule_ref(
+                            pos, heading, np.asarray(_rd, dtype=float)[:, :2])
+                except Exception:
+                    rule_ref = None
             chosen = arbitrate(
                 best, rule_ref,
                 fsd_safe=verd.safe and best is not None and len(best) >= 2,
                 prefer_rule=False)
+            # Re-verify the verdict against the path the car actually
+            # runs: the FSD verdict above was computed on the FSD best
+            # (which may be None / minimal-risk).  Arbitration then
+            # handed a drivable rule path to control, but the old
+            # minimal-risk stop stayed latched and braked the fallback
+            # to a standstill every frame (run_fix6: src=rule with
+            # brk=1.0 and v=0 for 60 s after a transient no-path frame).
+            if chosen.path is not None and len(chosen.path) >= 2 and \
+                    (best is None or len(best) < 2 or not verd.safe):
+                try:
+                    verd = monitor.evaluate(scene, chosen.path,
+                                            planner_age_s=0.0)
+                except Exception:
+                    pass
             steer = 0.0
+            pp_alpha = None
+            pp_tgt = None
+            ff_steer = 0.0
             if chosen.path is not None and len(chosen.path) >= 2:
-                steer = float(pp.steering(
-                    pos, heading, np.asarray(chosen.path))[0])
+                # Same conversion as the proven rule autopilot: PurePursuit
+                # returns the steering ANGLE (rad), BeamNG expects a
+                # normalized input with the OPPOSITE sign (left target ->
+                # positive angle -> negative input).  Feeding the raw angle
+                # (as before 2026-08-22) steered the car the WRONG WAY at
+                # the town junction - the route bent left, the raw positive
+                # steer was applied as right, yaw swung -32 -> -70 deg and
+                # every candidate crossed the lane boundaries -> wedged.
+                # Also rate-limit like m5_autopilot so the wheel does not
+                # slam from lock to lock on a flickering reference.
+                # Speed-adaptive lookahead like the proven rule autopilot:
+                # a fixed 5 m lookahead at the hairpin lands the target ON the
+                # bend instead of past it, so the wheel barely turns and the
+                # car understeers off the road before the corner (mountain run
+                # 2026-08-26 run_fix11: at (727.1,757.5) the controller only
+                # asked -0.12 and the car missed the first hairpin, then only
+                # looping arcs were left).  Computed from the BASE lookahead
+                # each frame (no compounding ratchet).
+                pp.lookahead = float(np.clip(
+                    5.0 + 0.55 * max(0.0, v), 4.0, 16.0))
+                steer_rad, pp_tgt, pp_near = pp.steering(
+                    pos, heading, np.asarray(chosen.path))
+                steer_rad = float(steer_rad)
+                ff_steer = _path_curvature_ff(chosen.path, pos, heading)
+                new_steer = float(np.clip(
+                    -steer_rad / 0.6 + ff_steer, -1.0, 1.0))
+                # Speed-adaptive steering cap (same as the proven rule
+                # autopilot): at speed a full-lock correction swings the
+                # car far past the lane direction (the FSD runs showed
+                # 40-60 deg over-rotation at the junction exits, mountain
+                # runs 2026-08-27 fix31/32).  The rule autopilot caps the
+                # wheel by v^2 so high-speed corrections stay gentle.
+                v_sq = max(v * v, 2.0)
+                steer_cap = max(0.10, min(1.0, 5.0 * 2.9 / v_sq / 0.6))
+                # Low-speed cap: full lock at 2 m/s is a ~2.9 m radius
+                # circle and builds a yaw rate the slow control loop
+                # cannot catch - the car swings around the junction
+                # instead of converging onto the lane.  0.45 (~10.7 m
+                # radius) cannot track the 8 m hairpin fillet, so the
+                # first -110 -> -24 deg bend was run wide every time
+                # (fix44: lat_l=-7.7 at the apex, then reverse-loops).
+                # 0.55 (~8.8 m radius) matches the hairpin geometry; the
+                # old 0.55 over-rotation (fix40, 9.7 m/s downhill) is
+                # now blocked by the hard speed governor below.
+                steer_cap = min(steer_cap, 0.55)
+                new_steer = float(np.clip(new_steer, -steer_cap, steer_cap))
+                # Yaw-rate damper: oppose a fast rotation that is not
+                # being commanded (left rotation -> steer right).  It must
+                # NOT fight a hard commanded turn - in the hairpin the car
+                # needs ~0.35 rad/s of yaw and the damper cut the full-lock
+                # input from -0.55 to -0.46, so the car ran wide off the
+                # road (fix49: lat_left -7.5 m at the apex).  Only damp
+                # while the wheel is not already at a strong commanded
+                # angle.
+                if abs(yaw_rate) > 0.3 and abs(new_steer) < 0.35:
+                    new_steer = float(np.clip(
+                        new_steer + 0.25 * yaw_rate,
+                        -steer_cap, steer_cap))
+                steer = smooth_steer(prev_steer, new_steer, dt,
+                                 rate=0.8)
+                prev_steer = steer
+                _tv = np.asarray(pp_tgt, dtype=float)[:2] - pos[:2]
+                pp_alpha = round(float(math.degrees(
+                    math.atan2(_tv[1], _tv[0]) - heading)), 1)
 
+            # Longitudinal plan from the FULL RAW nav route, never the
+            # local resampled window: the local window starts ON the
+            # corner and its Catmull-Rom resample rounds the hairpin into
+            # a 4-5 m sweep, so the curvature profile reads 4-5 m/s into
+            # the bend and the car understeers off the road (mountain run
+            # 2026-08-23, run_fix6: plan_v 4.9-6.0 at the first hairpin,
+            # car left the road 3-10 m west of the route and never came
+            # back).  The raw road-graph polyline keeps the 90-degree
+            # kink - its look-ahead profile caps the entry speed at
+            # ~1.7 m/s, which is the speed the bend can actually take.
+            _corner_d_ahead = None
+            try:
+                from beamng_autopilot.planning.local_route import (
+                    _dedup as _rdd, _extend_back as _reb,
+                    _round_corners as _rrc, _resample as _rrs,
+                    CORNER_RADIUS_M as _CR, CORNER_RESAMPLE_M as _CSM,
+                    DUP_MIN_M as _DUP)
+                from beamng_autopilot.planning.speed_profile import \
+                    speed_profile_for_path as _spf_raw
+                # Profile the ROUNDED full route, not the raw road-graph
+                # polyline: the graph collapses the first hairpin into a
+                # sharp vertex whose curvature profile caps the bend at
+                # ~1.7 m/s - at that speed the tyres scrub and the car
+                # cannot even turn (steering probe 2026-08-27).  The
+                # rounded route (same 8 m fillet the lane centre uses)
+                # lets the bend be taken at a speed the steering can
+                # actually execute.
+                _rfull = _rrs(_rrc(_reb(_rdd(nav_route[:, :2])), _CR),
+                              _CSM)
+                _sp_raw = _spf_raw(_rfull, scene,
+                                   target_speed=float(args.speed))
+                if len(_sp_raw):
+                    # The full-route profile is indexed along the WHOLE
+                    # route; [0] is the speed at the ROUTE START, not at
+                    # the car.  Sample the profile at the nearest route
+                    # point so a hairpin 100 m into the route still caps
+                    # the speed when the car reaches it (run_fix25:
+                    # plan_speed stayed at the start speed into the bend).
+                    _i = int(np.argmin(np.linalg.norm(
+                        _rfull - pos[:2], axis=1)))
+                    out.best_speed = float(_sp_raw[_i])
+                    out.meta["plan_src"] = "nav_round"
+            except Exception:
+                pass
+            # Tight-bend entry governor: the ~1.4 s control tick lets the
+            # car overshoot the profiled corner speed by ~+1 m/s mid-tick
+            # (fix45: 4.4 target -> ~5.5 actual at the first hairpin, ran
+            # wide off the left edge).  For a bend tighter than 15 m in
+            # the next 12 m, cap the plan speed at sqrt(1.5*R) so the
+            # actual peak stays near 4 m/s, where the 0.55 steering cap
+            # (~8.8 m radius) can track the 8 m hairpin fillet.
+            try:
+                _ga = np.concatenate(
+                    [[0.0], np.cumsum(np.linalg.norm(
+                        np.diff(_rfull, axis=0), axis=1))])
+                _gi = int(np.argmin(np.linalg.norm(
+                    _rfull - pos[:2], axis=1)))
+                _ghi = int(np.searchsorted(_ga, _ga[_gi] + 12.0))
+                _rmin = 1e9
+                for _j in range(max(1, _gi),
+                                min(_ghi + 1, len(_rfull) - 1)):
+                    _a, _b, _cc = (_rfull[_j - 1], _rfull[_j],
+                                   _rfull[_j + 1])
+                    _v1 = _b - _a
+                    _v2 = _cc - _b
+                    _n1 = float(np.linalg.norm(_v1))
+                    _n2 = float(np.linalg.norm(_v2))
+                    if _n1 < 1e-9 or _n2 < 1e-9:
+                        continue
+                    _cr = abs(_v1[0] * _v2[1] - _v1[1] * _v2[0])
+                    _curv = 2.0 * _cr / (_n1 * _n2 * (_n1 + _n2))
+                    if _curv > 1e-6:
+                        _rmin = min(_rmin, 1.0 / _curv)
+                if _rmin < 15.0:
+                    out.best_speed = float(min(
+                        out.best_speed, math.sqrt(1.3 * _rmin)))
+                    out.meta["plan_src"] = "nav_round+gov"
+                # Distance (m) from the car to the first bend tighter
+                # than 15 m within the 12 m window; used by the corner
+                # brake zone below.
+                _corner_d_ahead = None
+                for _j in range(max(1, _gi),
+                                min(_ghi + 1, len(_rfull) - 1)):
+                    _a, _b, _cc = (_rfull[_j - 1], _rfull[_j],
+                                   _rfull[_j + 1])
+                    _v1 = _b - _a
+                    _v2 = _cc - _b
+                    _n1 = float(np.linalg.norm(_v1))
+                    _n2 = float(np.linalg.norm(_v2))
+                    if _n1 < 1e-9 or _n2 < 1e-9:
+                        continue
+                    _cr = abs(_v1[0] * _v2[1] - _v1[1] * _v2[0])
+                    _curv = 2.0 * _cr / (_n1 * _n2 * (_n1 + _n2))
+                    if _curv > 1e-6 and 1.0 / _curv < 15.0:
+                        _corner_d_ahead = float(_ga[_j] - _ga[_gi])
+                        break
+            except Exception:
+                pass
             # control from the (possibly degraded) target speed, but never
             # exceed the *planned* speed along the chosen trajectory - the
             # FSD longitudinal plan (bend deceleration, obstacle brake
@@ -445,22 +758,149 @@ def main() -> int:
                 force_stop, cap = emergency_speed_limit_mps(fwd_clear, need)
                 target = min(target, cap if not force_stop else 0.0)
             thr, brk = speed_ctrl.update(target, v, dt=min(0.25, max(0.01, dt)))
-            # hard stop when no path remains, or the raw-sensor forward
+            # (The old "corner brake zone" here is gone: with the sim
+            # paused and stepped in 0.75 s bursts the speed controller
+            # reacts within one burst, while the zone caused an
+            # accelerate -> brake-to-stop oscillation - fix54 reached
+            # v=3.6 then brk=0.8 stopped it dead at every tick.  The
+            # plan-speed governor below still hard-brakes overshoot.)
+            # Hard speed governor: the ~1.4 s control loop can miss a
+            # downhill acceleration (fix40: 5.0 -> 9.7 m/s in one tick
+            # on the east-side descent).  Never let the car exceed the
+            # commanded cruise speed by more than 1 m/s regardless of
+            # the smoothed pedal state.
+            if v > float(args.speed) + 1.0:
+                thr, brk = 0.0, 1.0
+            # Plan-speed governor: never let the car exceed the planned
+            # corner speed by more than 0.8 m/s even within one tick -
+            # the profile alone is sampled at tick boundaries and the
+            # car can overshoot a 4.4 m/s hairpin plan to ~5.5 mid-tick.
+            if v > plan_speed + 0.8:
+                thr, brk = 0.0, 1.0
+            # Stuck detection: the planner can keep reporting "safe" while
+            # the car physically cannot move (wedged against a guardrail /
+            # embankment after an over-correction).  Holding throttle
+            # against the obstruction forever is the "spinning in place"
+            # failure - after a couple of seconds at near-standstill with
+            # a commanded forward path, treat it as "no forward path" so
+            # the bounded reverse escape backs out and re-plans (mountain
+            # run 2026-08-27 run_fix31: wedged at (741.2,745.7) with
+            # thr=0.53 and v=0 for 50 s).
+            if (chosen.path is not None and not force_stop
+                    and v < 0.35 and thr > 0.0):
+                stuck_t += max(0.0, float(dt))
+            else:
+                stuck_t = 0.0
+            stuck = stuck_t >= 2.5
+            # hard stop when no path remains, the raw-sensor forward
             # clearance is inside the braking reserve (never grind into a
-            # wall / wedge the car into a too-narrow gap)
-            if chosen.path is None or force_stop:
+            # wall / wedge the car into a too-narrow gap), or the car is
+            # stuck spinning against an obstruction
+            pb = 0.0  # handbrake: hold the car on a slope while stopped
+            # Slope-creep assist: the planner keeps a CLEAR forward path
+            # while the car cannot move (e.g. stopped at the bottom of a
+            # dip facing uphill).  Full throttle for a bounded window lets
+            # it climb before the reverse escape is allowed to arm - the
+            # fix41 east-side dip at (756.7,740.6) had fwd=8.6 clear but
+            # the stuck detector sent the car backwards downhill instead
+            # of giving it torque.
+            climb = False
+            if (stuck and not force_stop and chosen.path is not None
+                    and len(chosen.path) >= 2
+                    and np.isfinite(fwd_clear) and fwd_clear > 3.0):
+                if climb_t < CLIMB_ASSIST_S:
+                    climb = True
+                    climb_t += max(0.0, float(dt))
+                else:
+                    climb_t = 0.0  # give up climbing -> allow reverse
+            if (chosen.path is None or force_stop or stuck) and not climb:
                 thr, brk = 0.0, 1.0
                 steer = 0.0
                 stopps += 1
-            # Reverse guard is the final control authority: while the car
-            # is (still) moving backwards, brake with steering centred and
-            # no throttle until forward motion returns (hysteresis in
-            # ReverseGuard prevents brake flap around standstill).
-            if reversing:
+                pb = 1.0
+            if climb:
+                thr, brk = 1.0, 0.0
+                steer = 0.0
+                pb = 0.0
+            # Controlled reverse escape: when NO drivable forward path
+            # remains (dead-end / wedged nose) and the space BEHIND the
+            # car is clear, back up a bounded distance in R, then let the
+            # planner re-attempt a forward path.  This is the "reverse to
+            # find a feasible path" behaviour; it never reverses while a
+            # forward path exists and never reverses blindly (no rear
+            # clearance data -> stay stopped).
+            has_forward_path = (chosen.path is not None
+                                and len(chosen.path) >= 2
+                                and not force_stop and not stuck) or climb
+            rear_clear_m = None
+            if not has_forward_path and grid is not None:
+                try:
+                    _bh = float(heading) + math.pi
+                    _ln = np.array([math.cos(_bh), math.sin(_bh)])
+                    _lt = np.array([-_ln[1], _ln[0]])
+                    _best = float("inf")
+                    for _lat in (0.0, -1.5, 1.5):
+                        _o = pos[:2] + _lat * _lt
+                        for _ds in np.arange(1.0, 10.0, 0.4):
+                            _wx = float(_o[0] + _ds * _ln[0])
+                            _wy = float(_o[1] + _ds * _ln[1])
+                            _cell = grid.world_to_cell(_wx, _wy)
+                            if _cell is not None:
+                                _r, _c = int(_cell[0]), int(_cell[1])
+                                if (0 <= _r < grid.obstacle.shape[0]
+                                        and 0 <= _c < grid.obstacle.shape[1]
+                                        and grid.obstacle[_r, _c] > 0):
+                                    _best = min(_best, _ds - 0.5)
+                                    break
+                    rear_clear_m = (float(_best) if _best < float("inf")
+                                     else 40.0)
+                except Exception:
+                    rear_clear_m = None
+            rm = rman.decide(has_forward_path=has_forward_path,
+                             rear_clear_m=rear_clear_m,
+                             signed_speed=signed,
+                             pos2d=pos[:2], dt=dt)
+            gear_use = fwd_gear
+            if rm.active:
+                # Bounded reverse: gear R, slow, straight back (steering
+                # centred) until the state machine releases the attempt.
+                gear_use = rm.gear
+                steer = 0.0
+                pb = 0.0  # the car must roll for the escape
+                if signed >= -0.05:
+                    # Gentle R throttle: 0.25 ramped the car to -3 m/s in
+                    # ~1.5 s (fix37); 0.10 still reached -3.0 on the
+                    # east-side slope (fix41).  0.06 keeps the escape
+                    # near the -0.4 m/s target even on a mild grade.
+                    # No throttle once the car is ALREADY rolling back
+                    # (signed < -0.05): on a downhill slope gravity does
+                    # the backing, adding throttle only rolls it further
+                    # before the brake catches (east-side roll-back).
+                    thr, brk = 0.06, 0.0
+                elif signed > rm.target_speed_mps:
+                    # Approaching the reverse target: back off the
+                    # throttle and brake softly instead of waiting for a
+                    # full overshoot (control ticks are ~1.4 s apart).
+                    thr, brk = 0.0, 0.6
+                else:
+                    # Backward speed already beyond the target (downhill
+                    # roll): brake hard AND handbrake - 0.8 alone let the
+                    # car run away to -7 m/s on a slope (run_fix17).
+                    thr, brk, pb = 0.0, 1.0, 1.0
+                # Extra stop margin when the rear space is nearly gone.
+                if rear_clear_m is not None and rear_clear_m <= 2.0:
+                    thr, brk, pb = 0.0, 1.0, 1.0
+            elif reversing:
+                # Passive reverse guard (unintended backward motion, e.g.
+                # a wall bounce): brake, centre the wheel, no throttle.
+                # Handbrake too while still moving backwards so a slope
+                # cannot roll the car away.
                 thr, brk = 0.0, max(brk, float(rev_brk))
                 steer = 0.0
+                if signed < -0.1:
+                    pb = 1.0
             conn.control(throttle=thr, brake=brk, steering=steer,
-                         gear=fwd_gear)
+                         gear=gear_use, parkingbrake=pb)
             # Lane-position telemetry: signed lateral offset of the ego from
             # each DETECTED lane boundary (left: + = inside oncoming traffic;
             # right: - = off the road edge).  None when the boundary does
@@ -494,20 +934,38 @@ def main() -> int:
                 "reason": verd.reason or "-",
                 "source": str(chosen.source),
                 "plan_speed": round(float(plan_speed), 2),
+                "plan_src": str(out.meta.get("plan_src", "?")),
                 "throttle": round(float(thr), 4),
                 "brake": round(float(brk), 4),
                 "steer": round(float(steer), 4),
                 "reversing": int(bool(reversing)),
+                "rev_state": str(rman.state),
+                "rev_active": int(bool(rm.active)),
+                "rear_clear": (round(float(rear_clear_m), 2)
+                               if rear_clear_m is not None else None),
                 "fwd_clear": float(out.forward_clearance)
                     if np.isfinite(out.forward_clearance) else None,
                 "emergency": int(bool(force_stop)),
+                "stuck": int(bool(stuck)),
                 "lane_src": str(out.meta.get("lane_src", "?")),
                 "lane_paired": int(out.meta.get("lane_paired", 0)),
                 "lane_dev_m": round(float(getattr(verd, "lane_dev_m", 0.0)), 3),
                 "lat_left": lat_left,
                 "lat_right": lat_right,
+                "kind": str(out.meta.get("planner", {}).get("kind", "?")),
+                "cost": round(float(out.meta.get("planner", {}).get("cost", 0.0)), 3),
+                "n_eval": int(out.meta.get("planner", {}).get("n_eval", 0)),
+                "pp_alpha": pp_alpha,
+                "yaw_rate": round(float(yaw_rate), 3),
+                "ff_steer": round(float(ff_steer), 3),
+                "climb": int(bool(climb)),
+                "pp_tgt": ([round(float(v), 2) for v in pp_tgt[:2]]
+                           if pp_tgt is not None else None),
+                "lane_bear": _ref_bearing(out.lane_ref, pos),
+                "route_bear": _ref_bearing(route_local, pos),
+                "best_bear": _ref_bearing(out.best_path, pos),
             })
-            conn.step(args.steps)
+            conn.step(CTRL_BURST_STEPS)
             frames += 1
             if frames % 4 == 1:
                 print(f"[fsd-drive] t={time.time()-t0:5.1f} v={v:4.1f} "
@@ -528,6 +986,11 @@ def main() -> int:
             conn.step(3)
         except Exception:
             pass
+        # leave the game running (the control loop paused it)
+        try:
+            conn.bng.resume()
+        except Exception:
+            pass
         conn.close()
         if hist and args.out:
             try:
@@ -543,6 +1006,11 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
+
+
+
+
+
 
 
 

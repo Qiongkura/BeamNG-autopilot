@@ -90,7 +90,7 @@ def sample_arc(start_pos, heading: float, speed: float,
     # physical curvature bound (rad/m); do not scale by speed (curvature
     # is a geometry property, speed only limits it via lateral accel which
     # is handled by the speed layer, not the steering fan).
-    max_curv = max(0.02, min(float(max_curv), 0.20))
+    max_curv = max(0.02, min(float(max_curv), 0.26))
     curvatures = np.linspace(-max_curv, max_curv, n_curv)
     ds = max(0.5, float(speed) * dt)
     head_cap = math.pi / 2.0

@@ -42,6 +42,47 @@ class Constraints:
     collision_fraction_stop: float = 0.9
     # Paths that leave the nav route farther than this are rejected.
     lane_dev_max_m: float = 4.0
+    # Paths that leave the nav route farther than this are rejected.
+    lane_dev_max_m: float = 4.0
+    # --- drivable-surface gate -----------------------------------------
+    # A real FSD never leaves the drivable road surface.  Grass / terrain
+    # is NOT an obstacle cell (the collision layer alone cannot see it),
+    # so the camera/LiDAR drivable layer is the road-surface authority:
+    # candidates whose samples mostly fall outside drivable cells are
+    # infeasible, and one that leaves drivable within the next few metres
+    # is rejected outright (town runs 2026-08-26: the car drove onto the
+    # grass / terrain at the first hairpin because only obstacles were
+    # enforced).  The gate only activates when the drivable layer has
+    # real evidence (a missing road mask is "unknown", not "grass").
+    off_drivable_fraction_max: float = 0.15
+    # Reference candidates (lane centre / route / lane shift) are only
+    # drivable as TRACKING paths when the lane they track points
+    # forward of the ego.  The measured direction is the lane TANGENT
+    # (first real lane segment), not the ego-anchor diagonal: at a
+    # hairpin the lane legitimately turns far more than 50 deg right in
+    # front of the car, and a car sitting at the road edge must be able
+    # to converge back along its own lane.  Only a reference whose near
+    # lane points backward (~180 deg) is rejected; the lane-boundary and
+    # drivable-surface gates still stop a bad map-lane from cutting
+    # across the road (mountain run 2026-08-27 run_fix29: the old
+    # first-segment 50 deg gate rejected the lane centre at the hairpin
+    # apex, the planner fell back to arcs, over-rotated onto the wrong
+    # side and stalled at the right edge).
+    ref_start_yaw_max_deg: float = 120.0
+    off_drivable_near_fraction_max: float = 0.25
+    off_drivable_near_m: float = 8.0
+    off_drivable_min_evidence: float = 0.03
+    # A candidate that runs mostly through UNOBSERVED cells is not a
+    # drivable path: unknown space carries no collision/off-road
+    # evidence, so a looping arc that leaves the sensor footprint
+    # passes every other gate and is picked with full throttle -
+    # that is the in-place spin (mountain runs 2026-08-27 run_fix22:
+    # at (741.0,745.8) the only 'feasible' arc pointed 57 deg off the
+    # nose into cells the sensors never saw and the car spun on the
+    # grass).  A real vector-space stack treats unknown as 'do not
+    # drive here' unless the path follows the known route/lane.
+    known_min_frac: float = 0.35
+    known_near_m: float = 10.0
     # Spatial-connectivity gate: a candidate is only fully infeasible when
     # the forward corridor keeps no free lateral band OF THIS WIDTH across
     # THIS MANY longitudinal bands.  Scattered roadside clusters must not
@@ -54,11 +95,27 @@ class Constraints:
     # runs 2026-08-21).  Require at least this much forward net progress
     # (metres of displacement along the ego heading).
     progress_min_m: float = 1.0
+    # Ego-anchored reference candidates (own-lane centre, plan route,
+    # lane shifts) get a lower bar.  At a hairpin apex the car can sit at
+    # a large angle to its own lane: the first metres of the lane centre
+    # still point sideways while the path curves back onto the road, and
+    # a 1 m forward requirement rejects the correct rejoin path, leaving
+    # only looping arcs (mountain run 2026-08-26 run_fix11: at
+    # (725.3,755.2) heading -128 deg, lane_center/reference/lane_shift
+    # were all prog-0.00 and the car circled off-road instead of turning
+    # left into the hairpin).  0.35 m still rejects a reference that
+    # points backward or sideways-away, which is what the gate exists for.
+    progress_min_m_ref: float = 0.35
     # Candidate starts farther than this from the ego are considered
     # mis-anchored map priors (not drivable from where the car is).
     starts_near_m: float = 3.0
+    # Candidate kinds that are derived from the ego-anchored lane/route
+    # reference (not raw kinematic arcs) - they may use the relaxed
+    # forward-progress bar above.
+    ref_kinds: tuple = ("lane_center", "reference", "lane_shift")
 
-    def _has_forward_progress(self, scene: Scene, path) -> bool:
+    def _has_forward_progress(self, scene: Scene, path,
+                              min_m: float | None = None) -> bool:
         path = np.asarray(path, dtype=float)[:, :2]
         pos = np.asarray(scene.pos[:2], dtype=float)
         ch = math.cos(float(scene.heading))
@@ -66,19 +123,86 @@ class Constraints:
         d0 = math.hypot(path[0, 0] - pos[0], path[0, 1] - pos[1])
         if d0 > self.starts_near_m:
             return False
-        # net forward displacement from the path start
-        dx = path[-1, 0] - path[0, 0]
-        dy = path[-1, 1] - path[0, 1]
-        return bool(dx * ch + dy * sh >= self.progress_min_m)
+        # Maximum forward displacement over the FIRST HALF of the path.
+        # A hairpin lane-shift / map-lane reference ENDS "behind" the ego
+        # heading after the 90-degree bend, but it still drives forward
+        # along the road; the old endpoint gate killed those candidates and
+        # the planner was left with a single over-aggressive arc that cut
+        # the corner and drove off-route (mountain run 2026-08-23,
+        # run_fix7: t=5.7 n_eval=1 -> src=none stall at (720.2,743.8)).
+        # Only the path's start is evidence that it is drivable from here.
+        n = len(path)
+        k = max(2, int(n * 0.5))
+        rel = path[:k] - path[0]
+        fwd = rel[:, 0] * ch + rel[:, 1] * sh
+        return bool(float(fwd.max()) >= float(self.progress_min_m
+                                              if min_m is None else min_m))
 
     def score(self, scene: Scene, candidate) -> tuple[float, bool]:
         """Return (cost, feasible)."""
         path = candidate.path
         if path is None or len(path) < 2:
             return 1e9, False
-        if not self._has_forward_progress(scene, path):
+        kind = str(candidate.meta.get("kind", ""))
+        min_m = self.progress_min_m_ref if kind in self.ref_kinds \
+            else self.progress_min_m
+        if not self._has_forward_progress(scene, path, min_m):
             return 1e9, False
+        if kind in self.ref_kinds and len(path) >= 2:
+            # Direction of the LANE just ahead of the ego, not the
+            # ego-anchor diagonal.  References are re-anchored at the car
+            # (path[0] == pos), so path[0]->path[1] is a cross-field line
+            # to the nearest lane vertex - at a hairpin apex or with the
+            # car sitting at the road edge that diagonal is 80-130 deg off
+            # the nose even when the lane is correct.  Measuring it
+            # rejected the lane centre exactly where the car had to turn,
+            # leaving only arcs that over-rotated and drove off the road
+            # (mountain run 2026-08-27 run_fix29: hairpin exit swung +30
+            # deg wrong-way, then stalled at (741.2,746.0) on the right
+            # edge).  The lane tangent (first real lane segment) is what
+            # the reference actually tracks; a reference whose near lane
+            # points backward still fails the same gate (~180 deg).
+            if len(path) >= 3:
+                _v = np.asarray(path[2], dtype=float)[:2] \
+                    - np.asarray(path[1], dtype=float)[:2]
+            else:
+                _v = np.asarray(path[1], dtype=float)[:2] \
+                    - np.asarray(path[0], dtype=float)[:2]
+            _L = float(np.linalg.norm(_v))
+            if _L > 1e-9:
+                _a = math.degrees(math.atan2(_v[1], _v[0]))
+                _d = (_a - math.degrees(float(scene.heading)) + 180.0) \
+                    % 360.0 - 180.0
+                if abs(_d) > self.ref_start_yaw_max_deg:
+                    return 1e9, False
         if lane_cross_dist_m(scene, path, max_cross_m=self.lane_cross_max_m) > 0.0:
+            return 1e9, False
+        # Hard drivable-surface gate: never leave the road (grass/terrain
+        # is not an obstacle cell, so the collision layer cannot catch it).
+        _bdrv, _tdrv, _nbdrv, _ntdrv = _path_off_drivable(
+            scene, path, near_m=self.off_drivable_near_m,
+            min_evidence=self.off_drivable_min_evidence)
+        if _tdrv:
+            if (_bdrv / _tdrv) > self.off_drivable_fraction_max:
+                return 1e9, False
+            if _ntdrv >= 4 and \
+                    (_nbdrv / _ntdrv) > self.off_drivable_near_fraction_max:
+                return 1e9, False
+        # Driving blind is not allowed.  A path that mostly crosses cells
+        # the sensors never saw is not drivable - it is the loop-arc /
+        # grass-escape failure mode, not a road.  Map-prior candidates
+        # (lane centre / route reference / lane shift) are KNOWN geometry
+        # from the nav route, not blind guesses - only the kinematic arc
+        # fan must prove it stays inside the sensor footprint (mountain
+        # runs 2026-08-27: the lane-following candidate was rejected with
+        # blind0/12 while the sparse camera footprint saw only ~10% of
+        # the BEV, leaving a single off-road loop arc as the only
+        # "feasible" path and the car swung onto the grass at the
+        # switchback).  The gate is skipped when the observed layer is
+        # missing/empty (offline unit scenes).
+        _kn, _kt = _path_known(scene, path, near_m=self.known_near_m)
+        if kind not in self.ref_kinds and _kt >= 4 \
+                and (_kn / _kt) < self.known_min_frac:
             return 1e9, False
         feasible = True
         cost = 0.0
@@ -112,6 +236,8 @@ class Constraints:
         return float(np.sum(np.linalg.norm(d, axis=1))) if len(d) else 0.0
 
 
+
+
 def _path_infractions(scene: Scene, path, span: float = 2.0) -> list:
     """Sample the path (skip the car's own footprint) and return the
     fraction of samples inside an occupied grid cell."""
@@ -137,6 +263,117 @@ def _path_infractions(scene: Scene, path, span: float = 2.0) -> list:
         if scene.grid.obstacle[cell] > 0:
             bad += 1
     return [bad, total]
+
+def _path_off_drivable(scene: Scene, path, near_m: float = 8.0,
+                       min_evidence: float = 0.03) -> list:
+    """Sample the path and count cells OUTSIDE the drivable road layer.
+
+    Returns ``(bad, total, near_bad, near_total)``.  The drivable layer
+    marks the road surface seen by the camera (semantic road mask lifted
+    into BEV) / LiDAR corridor; a 0 cell is grass / terrain / unknown.
+    The gate only activates when the layer actually saw a road
+    (``drivable.sum() >= min_evidence * size``): a missing road mask
+    means "unknown", not "grass", and must not park the car.
+    """
+    path = np.asarray(path, dtype=float)[:, :2]
+    if scene.grid is None or len(path) < 2:
+        return [0, 0, 0, 0]
+    grid = scene.grid
+    drv = getattr(grid, "drivable", None)
+    if drv is None or drv.size == 0:
+        return [0, 0, 0, 0]
+    obs = getattr(grid, "observed", None)
+    # Activation: the sensor must have SEEN enough of the world to tell
+    # road from grass.  Unknown space (no observed evidence) is not
+    # grass - a sparse camera footprint must not reject every candidate
+    # (mountain run 2026-08-27 run_fix15: the drivable layer covered
+    # only ~10% of the grid, so every straight-ahead path read "off
+    # road" and the car never started).
+    evid = obs if (obs is not None and obs.size == drv.size) else drv
+    if float(np.asarray(evid).sum()) < float(min_evidence) * evid.size:
+        return [0, 0, 0, 0]
+    pos = np.asarray(scene.pos[:2], dtype=float)
+    extent = float(getattr(grid, "extent", 0.0) or 0.0)
+    fwd = np.array([math.cos(float(scene.heading)),
+                    math.sin(float(scene.heading))])
+    left = getattr(scene, "lane_left", None)
+    right = getattr(scene, "lane_right", None)
+    bad = near_bad = total = near_total = 0
+    for x, y in path:
+        d = math.hypot(x - pos[0], y - pos[1])
+        if d < 2.5 or (extent > 0.0 and d > extent):
+            continue
+        total += 1
+        if d <= near_m:
+            near_total += 1
+        cell = grid.world_to_cell(x, y)
+        if cell is None:
+            continue
+        if drv[cell] <= 0:
+            # The camera road mask is partial/noisy; a cell the map-prior
+            # lane corridor covers (between lane_left / lane_right) is
+            # ROAD even when this frame's mask missed it - only a cell
+            # OUTSIDE the corridor that the sensor saw as non-road counts
+            # as grass/terrain (mountain corner runs 2026-08-27: a 2%
+            # partial mask at (752.7,741.9) rejected every road-aligned
+            # arc as "grass" and left only off-road looping arcs).
+            if left is not None or right is not None:
+                in_corr = True
+                if left is not None:
+                    ll, cl = _boundary_lateral(x, y, left, fwd)
+                    if cl and ll > 0.35:
+                        in_corr = False
+                if right is not None:
+                    lr, cr = _boundary_lateral(x, y, right, fwd)
+                    if cr and lr < -0.35:
+                        in_corr = False
+                if in_corr:
+                    continue
+            # Only a cell the sensor actually SAW as non-road counts as
+            # grass/terrain; unobserved cells are unknown, not a wall.
+            if obs is not None and obs.size == drv.size and obs[cell] <= 0:
+                continue
+            bad += 1
+            if d <= near_m:
+                near_bad += 1
+    return [bad, total, near_bad, near_total]
+
+
+def _path_known(scene: Scene, path, near_m: float = 10.0) -> list:
+    """Count near-window path samples inside sensor-observed cells.
+
+    Returns ``[known, total]``.  ``total`` is the number of samples in the
+    2.5..``near_m`` window; ``known`` are those that fall inside an
+    ``observed`` (or drivable) cell.  A path that mostly runs through
+    unobserved cells is driving blind - infeasible for a real stack.
+    """
+    path = np.asarray(path, dtype=float)[:, :2]
+    if scene.grid is None or len(path) < 2:
+        return [0, 0]
+    grid = scene.grid
+    obs = getattr(grid, "observed", None)
+    drv = getattr(grid, "drivable", None)
+    evid = None
+    if obs is not None and obs.size > 0:
+        evid = obs
+    elif drv is not None and drv.size > 0:
+        evid = drv
+    if evid is None:
+        return [1, 1]      # no evidence layer: gate not enforced
+    if float(np.asarray(evid).sum()) < 0.03 * evid.size:
+        return [1, 1]      # sparse footprint: unknown, gate not enforced
+    pos = np.asarray(scene.pos[:2], dtype=float)
+    known = total = 0
+    for x, y in path:
+        d = math.hypot(x - pos[0], y - pos[1])
+        if d < 2.5 or d > near_m:
+            continue
+        total += 1
+        cell = grid.world_to_cell(x, y)
+        if cell is not None and (obs is None or obs.size == 0 or obs[cell] > 0):
+            known += 1
+    return [known, total]
+
 
 
 def _boundary_lateral(wx, wy, ref, fwd):
@@ -185,28 +422,38 @@ def _boundary_lateral(wx, wy, ref, fwd):
             covered = True
         elif best_t >= 0.98 and best_k < len(pts) - 2:
             covered = True
-    # fwd vs ref tangent sign flip: positive lateral in the ref frame
-    # stays positive only when the ref runs the same direction as fwd
-    v0 = pts[min(1, len(pts) - 1)] - pts[0]
-    n0 = float(np.linalg.norm(v0))
-    if n0 > 1e-9:
-        if float(v0[0] * fwd[0] + v0[1] * fwd[1]) < 0.0:
-            sign = -sign
-    return sign * best, covered
+    # No fwd-based sign flip: the boundary polylines are stored in
+    # their own travel direction (map prior near->far, sensor lanes
+    # along the ego's forward at capture time).  A lane crossing is a
+    # WORLD constraint - never into the oncoming lane, never off the
+    # road edge - independent of which way the car happens to point at
+    # a bend (hairpin repro 2026-08-22: the flip inverted every
+    # in-lane candidate into a "crossing" at the apex, so the planner
+    # only had cross-lot arcs left and drove off the road).
+    return sign, covered
 
 
 
 def lane_cross_dist_m(scene: Scene, path, max_cross_m: float = 0.35) -> float:
-    """Distance along the path at which it first crosses a lane boundary.
+    """Distance along the path at which it first violates a lane boundary.
 
-    Returns > 0 when the path crosses a detected left/right boundary
-    (``scene.lane_left`` / ``scene.lane_right``) at a lateral intrusion
-    deeper than ``max_cross_m`` beyond the boundary - a hard no-cross
-    rule.  Returns 0 when no boundary is detected or no crossing exists.
+    Returns > 0 when the path violates a detected left/right boundary
+    (``scene.lane_left`` / ``scene.lane_right``) - a hard no-cross rule.
+    Returns 0 when no boundary is detected or no violation exists.
     Only samples within 2.5-15 m of the ego are checked (beyond the car
     footprint and within the sensor lane horizon); the boundary coverage
     flag (``_boundary_lateral``) ensures a path turning at a line ending
     at an intersection is not falsely rejected.
+
+    Recovery: when the EGO already sits beyond a boundary (drifted onto
+    the shoulder / past the centre line), a path that CONVERGES back into
+    the lane is legal - a real stack eases back, it does not stand still.
+    Only a path that keeps diverging farther outside, or that never
+    returns inside the corridor, is a violation (mountain runs 2026-08-27
+    run_fix22: the car started 3 m outside the right boundary and every
+    road-aligned arc was rejected with cross=3.00 because its near
+    samples were still outside, leaving only a looping arc that spun it
+    on the grass).
     """
     left = getattr(scene, "lane_left", None)
     right = getattr(scene, "lane_right", None)
@@ -218,6 +465,26 @@ def lane_cross_dist_m(scene: Scene, path, max_cross_m: float = 0.35) -> float:
     pos = np.asarray(scene.pos[:2], dtype=float)
     fwd = np.array([math.cos(float(scene.heading)),
                     math.sin(float(scene.heading))])
+
+    def _ego_lat(bnd):
+        if bnd is None:
+            return None
+        # Raw signed lateral of the ego, regardless of coverage: the
+        # ego often sits beside the START of a windowed boundary (the
+        # window cuts the line ~1 m behind the nearest road vertex), so
+        # the nearest point is an endpoint and ``covered`` is False even
+        # though the car is clearly outside the lane.  The convergence
+        # rule below only requires re-entry when the boundary actually
+        # covers the path samples, so a line that ends at an
+        # intersection is never held against the car.
+        return _boundary_lateral(float(pos[0]), float(pos[1]), bnd, fwd)[0]
+
+    e_l = _ego_lat(left)
+    e_r = _ego_lat(right)
+    l_beyond = e_l is not None and e_l > max_cross_m
+    r_beyond = e_r is not None and e_r < -max_cross_m
+    l_seen = l_converged = False
+    r_seen = r_converged = False
     cum = 0.0
     for i in range(len(path) - 1):
         ax, ay = path[i]
@@ -245,10 +512,34 @@ def lane_cross_dist_m(scene: Scene, path, max_cross_m: float = 0.35) -> float:
             # actually extends to this sample (``covered``) can be
             # violated - a line ending at an intersection is not a wall
             # the turn must stop for.
-            if (left is not None and cov_l and lat_l > max_cross_m) or \
-               (right is not None and cov_r and lat_r < -max_cross_m):
-                return cum + t * seg
+            if left is not None and cov_l:
+                l_seen = True
+                if l_beyond:
+                    # Ego already past the line: diverging farther is a
+                    # violation, converging back is recovery.
+                    if lat_l > e_l + 0.3:
+                        return cum + t * seg
+                    if lat_l <= max_cross_m:
+                        l_converged = True
+                elif lat_l > max_cross_m:
+                    return cum + t * seg
+            if right is not None and cov_r:
+                r_seen = True
+                if r_beyond:
+                    if lat_r < e_r - 0.3:
+                        return cum + t * seg
+                    if lat_r >= -max_cross_m:
+                        r_converged = True
+                elif lat_r < -max_cross_m:
+                    return cum + t * seg
         cum += seg
+    # An off-corridor start must actually re-enter the lane within the
+    # window; a path that drives parallel outside forever is a violation
+    # (the drivable gate also rejects it when the camera sees the grass).
+    if l_beyond and l_seen and not l_converged:
+        return max(cum, 0.1)
+    if r_beyond and r_seen and not r_converged:
+        return max(cum, 0.1)
     return 0.0
 
 

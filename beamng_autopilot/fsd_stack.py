@@ -41,6 +41,7 @@ from beamng_autopilot.planning import (
 )
 from beamng_autopilot.planner import CAR_HALF_WIDTH, forward_clearance_m, path_forward_clearance_m
 from beamng_autopilot.lane import (
+    LANE_WIDTH_DEFAULT_M,
     build_lidar_corridor,
     pair_lane_markings,
     choose_sensor_lane,
@@ -58,6 +59,7 @@ class FSDTick:
     def __init__(self):
         self.bev: np.ndarray | None = None      # (N, N) occupancy raster
         self.drivable: np.ndarray | None = None
+        self.observed: np.ndarray | None = None  # (N, N) sensor-seen mask
         self.best_path: np.ndarray | None = None
         self.lane_ref: np.ndarray | None = None  # sensor lane centreline
         self.lane_left: np.ndarray | None = None  # paired lane boundary (world)
@@ -101,6 +103,8 @@ class FSDStack:
         self.constraints = Constraints(
             w_collision=5.0, w_curvature=0.5, w_lane_align=1.0)
         self.target_speed = 8.0  # plan cruise speed (m/s); drive can raise
+        # Map-prior own-lane width (fallback when sensors see no lane)
+        self.map_lane_width_m = LANE_WIDTH_DEFAULT_M
         # Raw-sensor forward corridor half width (car half width + margin)
         # used by the independent FSD safety layer (m5_fsd_drive).
         self.ego_half_width = CAR_HALF_WIDTH + 0.5
@@ -120,7 +124,8 @@ class FSDStack:
 
     # ------------------------------------------------------------------
     def tick(self, st=None, route_ref: np.ndarray | None = None,
-             include_bev: bool = True) -> FSDTick:
+             include_bev: bool = True,
+             map_lane_override=None) -> FSDTick:
         """Run one full perception + planning tick.
 
         ``st`` is a vehicle state with ``.pos`` / ``.heading`` / ``.speed``
@@ -187,6 +192,7 @@ class FSDStack:
                 out.errors["range"] = str(exc)
         out.bev = grid.as_raster()
         out.drivable = grid.drivable
+        out.observed = getattr(grid, "observed", None)
 
         # Temporal fusion: smooth the single-frame occupancy before the
         # planner / safety layers read it (a one-frame glitch is neither a
@@ -209,6 +215,10 @@ class FSDStack:
                 grid.occupancy[:] = np.asarray(out.bev, dtype=np.float32)
 
         # --- 3) layered planner -----------------------------------------
+        # ``has_nav_route``: only a caller-supplied map/nav route carries
+        # real road geometry for the map-prior own-lane fallback; a
+        # synthetic straight line does not.
+        has_nav_route = route_ref is not None and len(route_ref) >= 2
         if route_ref is None or len(route_ref) < 2:
             xs = np.linspace(0, 40, 41)
             route_ref = np.column_stack(
@@ -222,6 +232,8 @@ class FSDStack:
         # ride.  A real stack keeps to the centre of ITS OWN lane, which
         # is what pair_lane_markings / build_lidar_corridor deliver.
         lane_frame = self._sensor_lane(out, pos, heading)
+        sensor_paired = (lane_frame is not None
+                         and getattr(lane_frame, "paired", False))
         lane_ref = None
         lane_left = None
         lane_right = None
@@ -233,20 +245,129 @@ class FSDStack:
             # Only a REAL two-sided detection provides hard lane
             # boundaries; a single-edge mirror is not a physical edge the
             # no-cross rule may enforce.
-            if getattr(lane_frame, "paired", False):
+            if sensor_paired:
                 lane_left = getattr(lane_frame, "left", None)
                 lane_right = getattr(lane_frame, "right", None)
                 lane_width = float(getattr(lane_frame, "width", 0.0) or 0.0)
+        # Map-prior own-lane fallback: when NO sensor lane (vision or
+        # LiDAR) could be paired this frame, derive the ego lane from the
+        # nav route - half a lane width RIGHT of the road centreline
+        # (right-hand traffic), with the centreline as the hard left
+        # boundary and the road's right edge as the hard right boundary.
+        # Without this the planner tracked the road CENTRE line whenever
+        # ``lane_paired=0`` (town runs 2026-08-22: g8/g10/g12 rode the
+        # centre line end to end, and the no-cross rule had no boundaries
+        # to enforce).  The road-graph route starts at the nearest road
+        # node, so it also anchors the car's own lane even when the ego
+        # has drifted off the A* polyline.
+        map_lane = map_lane_override
+        # Built whenever a nav route exists: it is both the fallback for a
+        # missing sensor lane AND the override when a sensor lane heads into
+        # a different road at a junction (heading gate below).  A caller
+        # may supply ``map_lane_override`` (real road-edge own-lane window
+        # from map_lane_edges); when absent the synthetic map lane is built.
+        if has_nav_route and map_lane is None:
+            try:
+                from beamng_autopilot.planning.local_route import (
+                    map_lane_local)
+                map_lane = map_lane_local(route_ref, pos, heading)
+            except Exception:
+                map_lane = None
+        # Heading gate: a PAIRED sensor lane is only trustworthy when its
+        # near-ahead direction agrees with the nav route (or the ego
+        # heading).  At a junction the vision/LiDAR pairing can lock onto a
+        # DIFFERENT road whose corridor reads clear - following it drives
+        # the car off the navigational route (town run 2026-08-22: the
+        # paired lane headed into the side road and the car left the road
+        # and wedged).  Reject the whole sensor lane (centre + hard
+        # boundaries) and fall back to the map-prior own lane.
+        lane_rejected = False
+        # Gate ANY sensor lane (paired or not) against the map-prior own
+        # lane: an unpaired vision/LiDAR corridor is often the whole-road
+        # centre, which on a two-way road sits on the oncoming side of the
+        # own lane.  Without the gate that centre was fed to the planner
+        # as the lane reference, the chosen path parked 3.6 m off it and
+        # the safety monitor declared "path near lane edge" -> src=none
+        # stop at (734.9,753.4) mountain run 2026-08-23.
+        if lane_frame is not None and map_lane is not None:
+            try:
+                from beamng_autopilot.planning.arbiter import (
+                    lane_heading_ok, lane_side_ok)
+                # Bearing gate: the lane must HEAD the same way as the
+                # route (junction pairing onto a side road is rejected).
+                side_bad = False
+                if not lane_heading_ok(route_ref, lane_ref, pos, heading):
+                    lane_rejected = True
+                # SIDE gate: the lane centre must sit clearly RIGHT of the
+                # road centreline (own lane).  A lane locked onto the
+                # ONCOMING lane passes the bearing gate (same direction)
+                # but still steers the car over the centre line (town runs
+                # 2026-08-22: the car rode the centre/oncoming lane end
+                # to end with lane_src=sensor).  A lane sitting ON the
+                # centreline is the WHOLE-ROAD free corridor, not the own
+                # lane - trusting it parks the car on the centre line and
+                # the switch to the map-prior own lane then forces a
+                # 2-3 m over-correction that swings it off the road edge
+                # (mountain run 2026-08-27 run_fix31: after the junction
+                # the car rode the centre line, then over-corrected right
+                # and wedged at (741.2,745.7)).  Require the lane centre
+                # at least 0.4 m right of the route, else the map-prior
+                # own lane replaces it.
+                elif not lane_side_ok(lane_ref, route_ref, pos,
+                                     left_max_m=-0.4):
+                    lane_rejected = True
+                    side_bad = True
+                if lane_rejected:
+                    out.meta["lane_reject_reason"] = (
+                        "side" if side_bad else "heading")
+                    sensor_paired = False
+                    lane_ref = None
+                    lane_left = None
+                    lane_right = None
+                    lane_width = 0.0
+            except Exception:
+                pass
+        if map_lane is not None:
+            mc, ml, mr = map_lane
+            # An unpaired sensor centre is often the whole-road centre
+            # (LiDAR free corridor / single-edge mirror) - never trust it
+            # as the lane-keep reference over the map-prior own lane.
+            if not sensor_paired:
+                lane_ref = mc
+            if lane_left is None or lane_right is None:
+                lane_left = ml if lane_left is None else lane_left
+                lane_right = mr if lane_right is None else lane_right
+            if lane_width <= 0.0:
+                # Real road-edge width when the map lane comes from
+                # DecalRoad edges (median left-right distance); fall back
+                # to the fixed map-prior lane width otherwise.
+                _w = 0.0
+                try:
+                    _wa = np.linalg.norm(
+                        np.asarray(ml, dtype=float)[:, :2]
+                        - np.asarray(mr, dtype=float)[:, :2], axis=1)
+                    _wf = _wa[np.isfinite(_wa)]
+                    if _wf.size:
+                        _w = float(np.median(_wf))
+                except Exception:
+                    _w = 0.0
+                lane_width = (_w if _w > 0.0
+                              else float(getattr(self, "map_lane_width_m", 0.0)
+                                         or LANE_WIDTH_DEFAULT_M))
         if lane_ref is None or len(lane_ref) < 4:
-            # BEV drivable-space fallback (single-sided / sparse sensor
-            # frames): the lateral centre of the FREE corridor, never the
-            # whole-road centre when a lane is detected.
+            # BEV drivable-space fallback when there is NO nav route to
+            # derive a map-prior own lane from (standalone probes / unit
+            # stubs): the lateral centre of the FREE corridor.  In real
+            # nav runs the map lane (or a paired sensor lane) takes
+            # priority, so this whole-road centre never reaches the
+            # planner's lateral reference there.
             bev_ref = self._bev_drivable_center(grid, pos, heading)
             if bev_ref is not None and len(bev_ref) >= 4:
                 lane_ref = bev_ref
         out.lane_ref = (np.asarray(lane_ref, dtype=float)
                         if lane_ref is not None else None)
-        if lane_frame is not None and getattr(lane_frame, "paired", False):
+        if (lane_frame is not None and getattr(lane_frame, "paired", False)) \
+                or map_lane is not None:
             if lane_left is not None:
                 out.lane_left = np.asarray(lane_left, dtype=float)[:, :2]
             if lane_right is not None:
@@ -287,10 +408,15 @@ class FSDStack:
         # lane centre when available); plan_route stays the navigational
         # intent in the planner's Scene.
         out.meta["lane_src"] = (
-            "sensor" if lane_frame is not None else "bev/route")
+            "map_lane" if lane_rejected
+            else "sensor" if lane_frame is not None
+            else "map_lane" if map_lane is not None else "bev/route")
         out.meta["lane_paired"] = int(
             bool(lane_frame is not None and getattr(lane_frame, "paired", False)))
-        if lane_frame is not None:
+        if lane_rejected:
+            out.meta["lane_reject"] = "heading"
+            out.meta["lane_paired"] = 0
+        if lane_frame is not None or map_lane is not None:
             out.meta["lane_width"] = round(lane_width, 2)
 
         # Only pass a sensor lane centre to Scene (the planner uses
@@ -300,7 +426,10 @@ class FSDStack:
         # lane_ref would pull the planner toward the centre line.
         # out.lane_ref (set above) still carries the BEV fallback for the
         # safety monitor but the planner Scene must not see it.
-        scene_lane_ref = (lane_ref if lane_frame is not None else None)
+        # Only sensor lanes (or the map-prior OWN lane) may steer the
+        # planner's lateral alignment; the BEV whole-road centre must not.
+        scene_lane_ref = (lane_ref if lane_frame is not None
+                          or map_lane is not None else None)
         scene = Scene(pos=pos, heading=heading, grid=grid,
                       route=plan_route, lane_ref=scene_lane_ref,
                       lane_left=lane_left, lane_right=lane_right,
@@ -313,12 +442,25 @@ class FSDStack:
         # the wall.  Sample to the physical steer limit and add wider
         # lateral shifts so the planner can actually dodge a near wall.
         fans = sample_arc(pos, heading, speed=max(2.0, float(st.speed)),
-                          max_steer=0.5, n_curv=11, max_curv=0.20)
+                          max_steer=0.5, n_curv=13, max_curv=0.25)
         shifts = sample_lane_shift(plan_route,
                                    offsets=(-3.0, -1.5, 1.5, 3.0))
         for c in shifts.candidates:
             fans.add(c.path, c.meta.get("kind", "shift"),
                      offset=c.meta.get("offset", 0.0))
+        # The LANE CENTRE itself is a candidate.  The synthetic shifts
+        # blend the route over 8 m, so at low speed a 7 m PurePursuit
+        # lookahead sits inside that blend and steers RIGHT while the
+        # road curves LEFT (mountain runs 2026-08-26 run_fix8/9: the
+        # planner flipped between shift (right) and arc (left) every
+        # frame, the car oscillated instead of turning into the first
+        # hairpin and stalled off-route at (724.8, 753.2)).  Tracking
+        # the lane centre (sensor or map-prior own lane) keeps the car
+        # in its lane with no blend wiggle; its alignment cost is ~0 so
+        # it wins whenever it is drivable.
+        if scene_lane_ref is not None and len(scene_lane_ref) >= 4:
+            fans.add(np.asarray(scene_lane_ref, dtype=float)[:, :2],
+                     "lane_center", offset=0.0)
         out.n_candidates = len(fans.candidates)
         best, meta = select_trajectory(scene, fans, self.constraints)
         out.best_path = best
@@ -341,6 +483,26 @@ class FSDStack:
             out.min_speed = float(np.asarray(sp).min())
             out.meta["best_speed"] = out.best_speed
             out.meta["min_speed"] = out.min_speed
+
+        # Longitudinal plan along the NAV route (route_ref), never the
+        # sensor lane: choose_plan_route may pick a straight sensor
+        # corridor that does not contain the bend, and the profile then
+        # allows 5+ m/s into a hairpin (run 2026-08-23).  The nav local
+        # route carries the real curvature; v[0] becomes the bend speed
+        # via the look-ahead propagation.
+        try:
+            from .speed_profile import speed_profile_for_path as _spf
+            _sr = _spf(np.asarray(route_ref, dtype=float)[:, :2], scene,
+                       target_speed=getattr(self, "target_speed", 8.0))
+            if len(_sr):
+                out.best_speed = float(_sr[0])
+                out.min_speed = float(np.asarray(_sr).min())
+                out.meta["best_speed"] = out.best_speed
+                out.meta["min_speed"] = out.min_speed
+                out.meta["plan_src"] = "route"
+        except Exception:
+            out.meta["plan_src"] = "candidate"
+
 
         # Run the topology head over the sensor lane derived from the
         # semantic markings (its graph needs a real LaneFrame, not just a
@@ -532,3 +694,4 @@ def semantic_to_meta(head_outputs: dict) -> dict:
         meta["change_left"] = topo.meta.get("change_left")
         meta["change_right"] = topo.meta.get("change_right")
     return meta
+
