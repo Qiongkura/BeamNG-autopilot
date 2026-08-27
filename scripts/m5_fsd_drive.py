@@ -60,13 +60,29 @@ REVERSE_CLEAR_MPS = 0.2
 # is not wedged - it needs torque, not a backward roll).
 CLIMB_ASSIST_S = 3.5
 # Physics steps advanced per control tick while the sim is paused
-# (1/60 s per step => 45 steps = 0.75 s of driving per control).  The
-# FSD tick itself takes ~1.4-7 s of WALL time; without pause the car
+# (1/60 s per step => 30 steps = 0.5 s of driving per control).  The
+# FSD tick itself takes ~0.7-2 s of WALL time; without pause the car
 # drove that whole wall time with the PREVIOUS control.  Paused and
-# stepped in 0.75 s bursts, the control spacing in sim time is fixed and
+# stepped in 0.5 s bursts, the control spacing in sim time is fixed and
 # much finer than the old wall-time drift (fix44-51: 5-10 m of stale
 # control per frame at the hairpin).
-CTRL_BURST_STEPS = 45
+CTRL_BURST_STEPS = 30
+# Target-speed smoothing: the plan speed changes by whole m/s between
+# ticks (corner governor, obstacle caps).  Feeding it straight into the
+# SpeedController made the pedals oscillate throttle -> brake -> throttle
+# every other frame (fix54/fix56).  Ramp the effective target toward the
+# plan at a bounded rate instead.
+SPEED_TARGET_RAMP_MPS = 1.5     # m/s per sim second
+SPEED_HYST_MPS = 0.4            # SpeedController brake/throttle hysteresis
+# Plan-speed brake governor hysteresis: enter at +1.0 m/s overshoot,
+# release once back within +0.5 m/s, and brake gently (0.25) instead of
+# 1.0 - BeamNG's brake is highly nonlinear and even 0.4-0.7 stands the
+# car dead in one 0.5 s burst, which then re-triggers the full-throttle
+# stall loop (fix61-64).  The downhill-start guard below prevents the
+# overshoot in the first place.
+GOV_ON_MPS = 1.0
+GOV_OFF_MPS = 0.5
+GOV_BRAKE = 0.25
 
 
 
@@ -155,8 +171,8 @@ def main() -> int:
     ap.add_argument("--seconds", type=float, default=20.0)
     ap.add_argument("--speed", type=float, default=6.0)
     ap.add_argument("--steps", type=int, default=3)
-    ap.add_argument("--cam-w", type=int, default=536)
-    ap.add_argument("--cam-h", type=int, default=403)
+    ap.add_argument("--cam-w", type=int, default=400)
+    ap.add_argument("--cam-h", type=int, default=300)
     ap.add_argument("--teleport", nargs=3, type=float, default=None,
                     metavar=("X", "Y", "YAW_DEG"),
                     help="teleport to an open stretch before driving")
@@ -173,7 +189,7 @@ def main() -> int:
         port=config.runtime_port(args.runtime),
         home=config.runtime_home(args.runtime))
     pp = PurePursuit(lookahead=5.0)
-    speed_ctrl = SpeedController()
+    speed_ctrl = SpeedController(hyst_mps=SPEED_HYST_MPS)
     monitor = SafetyMonitor(max_speed=args.speed)
     try:
         conn.open(launch=not args.attach)
@@ -362,8 +378,9 @@ def main() -> int:
         rule_planner = LocalPlanner()
         stack = FSDStack(conn, args.runtime,
                          heads=[SemanticHead(), TrafficSignalHead()],
+                         ring_roles=('front_main',),
                          cam_w=args.cam_w, cam_h=args.cam_h,
-                         temporal=True)
+                         temporal=True, range_every_n=2)
         stack.reset_temporal()  # stale occupancy before start must not leak
         # Realistic gearbox locked into a forward gear (D).  A real stack
         # never leaves the car in reverse; keep the D input on every
@@ -400,6 +417,8 @@ def main() -> int:
         frames = 0
         stopps = 0
         t0 = time.time()
+        target_sm = float(args.speed)
+        gov_brake = False
         # First-frame steering: with last_t set to NOW the first tick has
         # dt ~= 0, smooth_steer cannot move the wheel, and the car runs
         # the whole first ~7 m straight past the corner entry before any
@@ -409,6 +428,7 @@ def main() -> int:
         last_t = time.time() - 1.5
         hist: list[dict] = []
         while time.time() < t_end:
+            _f0 = time.time()
             st = conn.get_state()
             pos = np.asarray(st.pos, dtype=float)
             heading = float(st.heading)
@@ -420,7 +440,7 @@ def main() -> int:
                     np.asarray(st.dir[:2], dtype=float)))
             # Control-loop dt in SIMULATION time: the sim is paused and
             # advanced in CTRL_BURST_STEPS bursts, so each tick is exactly
-            # 0.75 s of driving regardless of the wall-time the FSD tick
+            # 0.5 s of driving regardless of the wall-time the FSD tick
             # took (which can be 2-7 s).  Using wall dt made the stuck /
             # reverse / climb state machines count a 7 s computation as
             # 7 s of standstill and reverse after every stop (fix53).
@@ -455,8 +475,10 @@ def main() -> int:
                         nav_route, road_left, road_right, pos, heading)
                 except Exception:
                     map_lane = None
+            _ta = time.time()  # local route / map lane / FSD tick split
             out = stack.tick(st=st, route_ref=route_local,
                                    map_lane_override=map_lane)
+            _tb = time.time()
             best = out.best_path
 
             # safety arbitration on the chosen path: evaluate against the
@@ -497,6 +519,7 @@ def main() -> int:
             else:
                 verd = monitor.evaluate(Scene(pos=pos, heading=heading),
                                         best)
+            _tc = time.time()
 
             # planner arbitration: FSD path first; when the layered
             # planner declined (even to minimal risk) fall back to the
@@ -521,7 +544,8 @@ def main() -> int:
             # The path must still be ego-anchored and head forward; the
             # FSD safety monitor re-verifies it below (and can stop).
             rule_ref = None
-            if nav_route is not None and len(nav_route) >= 2:
+            _need_rule = (best is None or len(best) < 2 or not verd.safe)
+            if _need_rule and nav_route is not None and len(nav_route) >= 2:
                 try:
                     _fwd = (np.asarray(st.dir[:2], dtype=float)
                             if st.dir is not None else np.array(
@@ -698,6 +722,14 @@ def main() -> int:
                     if _curv > 1e-6:
                         _rmin = min(_rmin, 1.0 / _curv)
                 if _rmin < 15.0:
+                    # Floor the implied radius: the 0.8 m resample can
+                    # measure a hairpin fillet edge as R~0.8 m (three
+                    # nearly-collinear points), which caps the plan at
+                    # ~1 m/s and stands the car dead on the approach
+                    # (fix65: plan=1.00 at the second bend, v=5.6 ->
+                    # brake-to-0).  Real roads never bend tighter than
+                    # ~3 m; anything smaller is a sampling artifact.
+                    _rmin = max(_rmin, 3.0)
                     out.best_speed = float(min(
                         out.best_speed, math.sqrt(1.3 * _rmin)))
                     out.meta["plan_src"] = "nav_round+gov"
@@ -757,9 +789,40 @@ def main() -> int:
                 need = emergency_stop_clearance_m(v)
                 force_stop, cap = emergency_speed_limit_mps(fwd_clear, need)
                 target = min(target, cap if not force_stop else 0.0)
-            thr, brk = speed_ctrl.update(target, v, dt=min(0.25, max(0.01, dt)))
+            # Smooth the effective target: ramp toward the raw plan at a
+            # bounded rate (sim time), so the corner governor stepping the
+            # plan from 6 to 3.2 m/s in one tick cannot flip the pedals.
+            # A safety force-stop bypasses the ramp and brakes immediately.
+            if force_stop:
+                target_sm = 0.0
+            else:
+                _dmax = SPEED_TARGET_RAMP_MPS * dt
+                if target > target_sm:
+                    target_sm = min(target, target_sm + _dmax)
+                else:
+                    target_sm = max(target, target_sm - _dmax)
+                # Never cruise above the planned corner speed.  The ramp
+                # can still be converging down from a high initial target
+                # (first frames), which let the car overshoot the bend
+                # plan and trip the hard governor every tick (fix61:
+                # v=4.45 against plan 3.23 -> brake 1.0 -> stall ->
+                # full throttle again).  Capping the smoothed target by
+                # plan_speed keeps the pedals inside the plan from the
+                # very first tick.
+                target_sm = min(target_sm, plan_speed)
+            thr, brk = speed_ctrl.update(
+                target_sm, v, dt=min(0.25, max(0.01, dt)))
+            # Downhill-start throttle guard: on the descent the car
+            # accelerates by gravity alone, so feeding throttle near the
+            # plan overshoots the bend speed and the governor then brakes
+            # it to a standstill every tick (fix61-64: v 0 -> 4.4 -> 0).
+            # Below a low speed, hold the pedal near idle and let gravity
+            # bring the speed up to the plan; the controller resumes once
+            # the speed is there.
+            if v < 2.5 and signed > 0.3 and target_sm <= plan_speed:
+                thr = min(thr, 0.08)
             # (The old "corner brake zone" here is gone: with the sim
-            # paused and stepped in 0.75 s bursts the speed controller
+            # paused and stepped in 0.5 s bursts the speed controller
             # reacts within one burst, while the zone caused an
             # accelerate -> brake-to-stop oscillation - fix54 reached
             # v=3.6 then brk=0.8 stopped it dead at every tick.  The
@@ -775,8 +838,12 @@ def main() -> int:
             # corner speed by more than 0.8 m/s even within one tick -
             # the profile alone is sampled at tick boundaries and the
             # car can overshoot a 4.4 m/s hairpin plan to ~5.5 mid-tick.
-            if v > plan_speed + 0.8:
-                thr, brk = 0.0, 1.0
+            if v > plan_speed + GOV_ON_MPS:
+                gov_brake = True
+            elif not (v > plan_speed + GOV_OFF_MPS):
+                gov_brake = False
+            if gov_brake:
+                thr, brk = 0.0, max(brk, GOV_BRAKE)
             # Stuck detection: the planner can keep reporting "safe" while
             # the car physically cannot move (wedged against a guardrail /
             # embankment after an over-correction).  Holding throttle
@@ -934,7 +1001,15 @@ def main() -> int:
                 "reason": verd.reason or "-",
                 "source": str(chosen.source),
                 "plan_speed": round(float(plan_speed), 2),
+                "target_sm": round(float(target_sm), 2),
                 "plan_src": str(out.meta.get("plan_src", "?")),
+                "tick_ms": out.meta.get("tick_ms"),
+                'frame_ms': {
+                    'local': round((_ta - _f0) * 1000.0, 1),
+                    'tick': round((_tb - _ta) * 1000.0, 1),
+                    'grid_mon': round((_tc - _tb) * 1000.0, 1),
+                    'rest': round((time.time() - _tc) * 1000.0, 1),
+                },
                 "throttle": round(float(thr), 4),
                 "brake": round(float(brk), 4),
                 "steer": round(float(steer), 4),
