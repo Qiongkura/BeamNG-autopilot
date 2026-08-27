@@ -126,6 +126,11 @@ def _scene_obstacle_points(scene, path, corridor_half_width_m: float):
     are NOT in the lane and must not trigger the speed brake band.  This
     mirrors ``path_grid_clearance_m`` (the safety layer measures the same
     corridor); the profile then brakes on the along-path distance.
+
+    Vectorized: the old per-cell Python loop over thousands of LiDAR
+    occupied cells cost ~1 s per frame on the full-route profile (the
+    dominant "rest" stall of the FSD drive loop).  World transform and
+    polyline lateral offsets are computed with numpy.
     """
     grid = getattr(scene, "grid", None)
     if grid is None:
@@ -136,20 +141,47 @@ def _scene_obstacle_points(scene, path, corridor_half_width_m: float):
     path = np.asarray(path, dtype=float)[:, :2]
     if len(path) < 2:
         return None
-    pts = []
     ch = math.cos(grid.heading)
     sh = math.sin(grid.heading)
-    for r, c in zip(rr, cc):
-        ex = grid.max_x - (r + 0.5) * grid.res
-        ey = grid.max_y - (c + 0.5) * grid.res
-        wx = grid.origin[0] + ex * ch - ey * sh
-        wy = grid.origin[1] + ex * sh + ey * ch
-        lat = _point_path_lat(wx, wy, path)
-        if lat is not None and abs(lat) <= corridor_half_width_m:
-            pts.append((wx, wy))
-    if not pts:
+    ex = grid.max_x - (rr + 0.5) * grid.res
+    ey = grid.max_y - (cc + 0.5) * grid.res
+    wx = grid.origin[0] + ex * ch - ey * sh
+    wy = grid.origin[1] + ex * sh + ey * ch
+    pts = np.column_stack((wx, wy))
+    lat = _points_path_lat(pts, path)
+    sel = np.abs(lat) <= corridor_half_width_m
+    if not np.any(sel):
         return None
-    return [np.asarray(pts, dtype=float)]
+    return [np.asarray(pts[sel], dtype=float)]
+
+
+def _points_path_lat(points: np.ndarray, path: np.ndarray) -> np.ndarray:
+    """Lateral offset of N points from a polyline, vectorized.
+
+    Equivalent to ``_point_path_lat`` per point but O(segments) Python
+    iterations over N-element numpy arrays instead of an O(N * segments)
+    Python double loop.  Returns an N-array (inf never occurs for a
+    valid polyline).
+    """
+    pts = np.asarray(points, dtype=float)
+    if pts.ndim == 1:
+        pts = pts[None, :]
+    seg = path[1:] - path[:-1]
+    l2 = np.einsum("ij,ij->i", seg, seg)
+    lat = np.full(len(pts), np.inf, dtype=float)
+    for k in range(len(seg)):
+        s2 = float(l2[k])
+        if s2 < 1e-12:
+            continue
+        ax = path[k]
+        rel = pts - ax
+        t = (rel[:, 0] * seg[k, 0] + rel[:, 1] * seg[k, 1]) / s2
+        tc = np.clip(t, 0.0, 1.0)
+        cx = ax[0] + tc * seg[k, 0]
+        cy = ax[1] + tc * seg[k, 1]
+        d = np.hypot(pts[:, 0] - cx, pts[:, 1] - cy)
+        lat = np.minimum(lat, d)
+    return lat
 
 
 def _point_path_lat(wx: float, wy: float, path) -> float | None:
