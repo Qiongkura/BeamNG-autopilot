@@ -175,6 +175,17 @@ class BeamNGConnector:
             self.bng.scenario.start()
         self.scenario = scenario
         self.vehicle = vehicle
+        # Universal anti-underground: a scenario spawned at a map origin
+        # that is not on a road can place the car below terrain (e.g.
+        # hirochi_raceway at (0,0,0)).  Lift it to the real surface so
+        # every entry point that calls load_scenario starts drivable.
+        try:
+            self.step(6)
+            self.ensure_above_ground()
+        except Exception:
+            # NOTE: bare except kept - scenario may still be settling;
+            # reposition_on_road() remains the caller-side fallback.
+            pass
         return vehicle
 
     def attach_vehicle(self, vid: Optional[str] = None,
@@ -289,6 +300,114 @@ class BeamNGConnector:
             # any transport or Lua error leaves the vehicle in place.
             logger.warning("[reposition] failed: %s", exc)
             return False
+
+    def ground_z_at(self, x: float, y: float) -> Optional[float]:
+        """Terrain/road surface height at (x, y) via a vertical cast ray.
+
+        Returns the world z of the first surface hit (roads, terrain,
+        bridges), or None when the ray fails.  This is the single source
+        of truth for "where is the ground" so no caller ever has to
+        hardcode a map-specific height (a hardcoded z teleports the car
+        below terrain on maps whose surface is much higher).
+        """
+        try:
+            with self.io_lock:
+                resp = self.bng.control.queue_lua_command(
+                    f"local r = Engine.castRay(vec3({float(x):.3f}, "
+                    f"{float(y):.3f}, 10000), "
+                    f"vec3({float(x):.3f}, {float(y):.3f}, -1000), "
+                    "true, false)\n"
+                    "if r and r.pt then return "
+                    "string.format('%.3f', r.pt.z) end\n"
+                    "return 'nil'", response=True)
+        except Exception:
+            # NOTE: bare except kept - Lua transport can fail with any
+            # error; the caller falls back to its existing z.
+            return None
+        if resp is None or str(resp).strip() == "nil":
+            return None
+        try:
+            return float(str(resp).strip())
+        except ValueError:
+            return None
+
+    def safe_teleport(self, x: float, y: float,
+                      heading_deg: Optional[float] = None,
+                      z: Optional[float] = None,
+                      lift: float = 0.6, settle: int = 8) -> bool:
+        """Teleport to (x, y) always ON the ground, never below it.
+
+        The ground height is measured with ``ground_z_at`` (vertical
+        cast ray), so the car is placed ``lift`` metres above the real
+        surface on ANY map - no per-map hardcoded heights.  After the
+        teleport the pose is re-checked: if the car still sits below the
+        measured surface (teleport raced a terrain load / bridge), it is
+        retried with a higher lift.  ``heading_deg`` is the world heading
+        in atan2 degrees (route direction); None keeps the current yaw.
+        Returns True when the car ended up above ground.
+        """
+        ground = self.ground_z_at(x, y)
+        if ground is None and z is None:
+            logger.warning("[safe_teleport] no ground height at "
+                           "(%.1f, %.1f); vehicle left in place", x, y)
+            return False
+        base = float(z) if z is not None else ground
+        for attempt, h in ((0, lift), (1, lift + 0.8)):
+            rot = None
+            if heading_deg is not None:
+                yaw_deg = -float(heading_deg) - 90.0
+                rot = angle_to_quat((0.0, 0.0, yaw_deg))
+            pos = (float(x), float(y), float(base) + h)
+            try:
+                with self.io_lock:
+                    self.vehicle.teleport(pos, rot_quat=rot)
+                    self.step(settle)
+                    after = self.get_state()
+            except Exception as exc:
+                # NOTE: bare except kept - teleport/step talk to the
+                # game; any transport error means we cannot verify.
+                logger.warning("[safe_teleport] failed: %s", exc)
+                return False
+            az = float(after.pos[2])
+            if ground is not None and az < ground - 0.5:
+                logger.warning("[safe_teleport] still below ground "
+                               "(z=%.1f < %.1f); retrying with lift %.1f",
+                               az, ground, h + 0.8)
+                continue
+            logger.info("[safe_teleport] vehicle -> (%.2f, %.2f, %.2f)",
+                        x, y, az)
+            return True
+        logger.error("[safe_teleport] vehicle left below ground at "
+                     "(%.1f, %.1f)", x, y)
+        return False
+
+    def ensure_above_ground(self, lift: float = 0.8,
+                            settle: int = 6) -> bool:
+        """Lift the ego back onto the surface when it spawned below it.
+
+        Scenario spawns can leave the car underground on maps whose
+        origin is not on a road (hirochi_raceway spawns at (0,0,0)); this
+        compares the current z against the ground height at the same xy
+        and teleports the car up when it is clearly below.  No-op when
+        the car is already on/above the surface.
+        """
+        try:
+            st = self.get_state()
+        except Exception:
+            # NOTE: bare except kept - state read can fail while the
+            # scenario is still loading; leave the car in place.
+            return False
+        gz = self.ground_z_at(float(st.pos[0]), float(st.pos[1]))
+        if gz is None:
+            return False
+        if float(st.pos[2]) >= gz - 0.5:
+            return True
+        logger.warning("[ensure_above_ground] ego at z=%.1f below "
+                       "ground %.1f; lifting", float(st.pos[2]), gz)
+        return self.safe_teleport(
+            float(st.pos[0]), float(st.pos[1]),
+            heading_deg=math.degrees(float(st.heading)),
+            z=gz, lift=lift, settle=settle)
 
     def set_front_camera(self, pos=(0.0, 1.2, 1.4), direction=(0.0, -1.0, 0.0)):
         """Switch the in-game camera to a fixed point ahead of the ego vehicle.
