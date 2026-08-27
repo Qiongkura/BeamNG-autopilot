@@ -203,6 +203,7 @@ class FSDStack:
                 except Exception as _exc:
                     self.hydra.errors[_name] = str(_exc)
             out.head_outputs = heads
+            out.meta["object_head"] = int("object" in self.hydra._heads)
             _times['ring'] = round((time.time() - _tw) * 1000.0, 1)
             _tw = time.time()
 

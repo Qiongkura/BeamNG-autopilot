@@ -1024,6 +1024,9 @@ def main() -> int:
                 "stuck": int(bool(stuck)),
                 "lane_src": str(out.meta.get("lane_src", "?")),
                 "lane_paired": int(out.meta.get("lane_paired", 0)),
+                "n_object_obstacles": int(
+                    out.meta.get("n_object_obstacles", 0)),
+                "object_head": int(out.meta.get("object_head", 0)),
                 "lane_dev_m": round(float(getattr(verd, "lane_dev_m", 0.0)), 3),
                 "lat_left": lat_left,
                 "lat_right": lat_right,
