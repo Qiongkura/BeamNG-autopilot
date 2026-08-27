@@ -67,14 +67,23 @@ REVERSE_CLEAR_MPS = 0.2
 # allowed to reverse (a car stopped at the bottom of a dip facing uphill
 # is not wedged - it needs torque, not a backward roll).
 CLIMB_ASSIST_S = 3.5
-# Physics steps advanced per control tick while the sim is paused
-# (1/60 s per step => 20 steps = 0.33 s of driving per control).  The
-# FSD tick itself takes ~0.7-2 s of WALL time; without pause the car
-# drove that whole wall time with the PREVIOUS control.  Paused and
-# stepped in 0.33 s bursts, the control spacing in sim time is fixed and
-# much finer than the old wall-time drift (fix44-51: 5-10 m of stale
-# control per frame at the hairpin).
-CTRL_BURST_STEPS = 20
+# Real-time control loop: the sim runs continuously and the loop paces
+# itself to ~REALTIME_CTRL_HZ, so the car never freezes between ticks
+# (the old paused-step design moved 0.33 s then froze ~1.2 s - the
+# stutter).  Each tick now drives with the previous control for at most
+# ~0.5 s, so the stale-control window is the tick time itself (ticks are
+# ~0.4-0.6 s after warm-up, vs the 5-10 m stale drift of fix44-51).
+REALTIME_CTRL_HZ = 2.0
+# Warm-up crawl: the first FSD ticks load YOLO and settle camera/LiDAR
+# (observed 4-6 s); in real time the car would otherwise run open-loop
+# during that.  Crawl until the object head is live, capped at WARMUP_S.
+WARMUP_S = 8.0
+WARMUP_SPEED_MPS = 1.5
+# If a tick ever takes longer than this, the car has been driving
+# open-loop for that long - keep this frame slow instead of trusting
+# stale controls.
+STALE_CTRL_S = 1.2
+STALE_CTRL_SPEED_MPS = 2.0
 # Target-speed smoothing: the plan speed changes by whole m/s between
 # ticks (corner governor, obstacle caps).  Feeding it straight into the
 # SpeedController made the pedals oscillate throttle -> brake -> throttle
@@ -397,19 +406,12 @@ def main() -> int:
         conn.control(throttle=0.0, brake=0.0, steering=0.0,
                      parkingbrake=0.0, gear=fwd_gear)
         conn.step(3)
-        # Deterministic control: pause the simulation for the control
-        # loop.  Without this the sim keeps running in REAL TIME while
-        # the FSD tick computes (~1.4-7 s per frame): the first frame
-        # takes ~7 s and the car rolls ~9 m straight down the slope
-        # before the first steering is ever sent (diag2: f=0 "before"
-        # position was already (725.6,753.1), the hairpin entry), and
-        # every later frame the car drives several metres with the
-        # PREVIOUS tick's controls.  Paused, each tick is: sense ->
-        # plan -> control -> step(2), a tight closed loop.
-        try:
-            conn.bng.pause()
-        except Exception as _pe:
-            print(f"[fsd-drive] pause failed: {_pe}")
+        # Real-time control: DO NOT pause the sim.  With ticks now
+        # ~0.4-0.6 s (after warm-up) the stale-control window is a few
+        # metres at cruise and a fraction of a metre at bend speeds, so
+        # the sim runs continuously - the car is always moving, which
+        # removes the paused-step stutter.  The warm-up crawl and
+        # stale-tick scrub below bound the open-loop windows.
         print(f"[fsd-drive] gearbox realistic, forward gear input = {fwd_gear}")
         rguard = ReverseGuard(threshold_mps=REVERSE_THRESHOLD_MPS,
                               clear_mps=REVERSE_CLEAR_MPS)
@@ -425,6 +427,7 @@ def main() -> int:
         frames = 0
         stopps = 0
         t0 = time.time()
+        warmup_until = time.time() + WARMUP_S
         target_sm = float(args.speed)
         gov_brake = False
         # First-frame steering: with last_t set to NOW the first tick has
@@ -478,16 +481,15 @@ def main() -> int:
                 signed = float(np.dot(
                     np.asarray(st.vel[:2], dtype=float),
                     np.asarray(st.dir[:2], dtype=float)))
-            # Control-loop dt in SIMULATION time: the sim is paused and
-            # advanced in CTRL_BURST_STEPS bursts, so each tick is exactly
-            # 0.33 s of driving regardless of the wall-time the FSD tick
-            # took (which can be 2-7 s).  Using wall dt made the stuck /
-            # reverse / climb state machines count a 7 s computation as
-            # 7 s of standstill and reverse after every stop (fix53).
-            dt = CTRL_BURST_STEPS / 60.0
+            # Control-loop dt in real time: the sim runs continuously, so
+            # wall time between ticks IS the driving time.  Clamp the
+            # warm-up frames (which can take seconds) so the stuck /
+            # reverse / climb state machines do not count a camera stall
+            # as seconds of standstill (fix53) - dt caps at 0.5 s.
             now_t = time.time()
             _wall_dt = max(0.0, now_t - last_t)
             last_t = now_t
+            dt = min(0.5, max(0.05, _wall_dt))
             rev_brk, reversing = rguard.decide(signed, dt=dt)
             # Yaw rate for the steering damper: a low-speed car at full
             # lock keeps rotating for seconds after the wheel is centred
@@ -765,6 +767,13 @@ def main() -> int:
             if chosen.source == "rule":
                 plan_speed = min(plan_speed, 3.0)
             target = min(verd.target_speed, plan_speed, float(args.speed))
+            # Warm-up crawl + stale-tick scrub (real-time mode): before
+            # the object head is live, or after an unusually long tick,
+            # the car has been driving open-loop - keep it slow.
+            if time.time() < warmup_until and not out.meta.get("object_head"):
+                target = min(target, WARMUP_SPEED_MPS)
+            if _wall_dt > STALE_CTRL_S:
+                target = min(target, STALE_CTRL_SPEED_MPS)
             # Safety clearance along the CHOSEN path (FSD vector-space
             # safety layer): the grid obstacle layer the planner itself
             # scored against is the authority, so a wall beside the nose
@@ -1052,7 +1061,13 @@ def main() -> int:
                 "route_bear": _ref_bearing(route_local, pos),
                 "best_bear": _ref_bearing(out.best_path, pos),
             })
-            conn.step(CTRL_BURST_STEPS)
+            # Real-time cadence: the sim keeps running; pace the control
+            # loop to ~2 Hz so the car is never left without a fresh
+            # command for long.
+            _elapsed = time.time() - _f0
+            _slack = (1.0 / REALTIME_CTRL_HZ) - _elapsed
+            if _slack > 0.0:
+                time.sleep(_slack)
             frames += 1
             if frames % 4 == 1:
                 print(f"[fsd-drive] t={time.time()-t0:5.1f} v={v:4.1f} "
@@ -1071,11 +1086,6 @@ def main() -> int:
             conn.control(throttle=0.0, brake=1.0, steering=0.0,
                          gear=locals().get("fwd_gear"))
             conn.step(3)
-        except Exception:
-            pass
-        # leave the game running (the control loop paused it)
-        try:
-            conn.bng.resume()
         except Exception:
             pass
         # Remove the Tech camera/LiDAR sensors so a next attach process
