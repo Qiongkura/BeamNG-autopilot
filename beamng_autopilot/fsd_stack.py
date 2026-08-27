@@ -53,6 +53,19 @@ from beamng_autopilot.runtime import (
 from beamng_autopilot.vision.hydra import FrameContext, HydraNet
 
 
+# Heading gate threshold for a PAIRED sensor lane against the nav
+# route.  The old 60 deg default let a lane locked onto a DIFFERENT
+# road (or a centreline fitted from roadside clutter after the ego
+# drifted) through: live run 2026-08-27 opt12, the sensor lane at
+# (705,708) pointed -56.6 deg while the route ran -111 deg (55 deg
+# off) and the planner generated a 51 deg left arc that drove the
+# car into the right-side wall.  A real stack trusts its map/nav
+# intent: anything more than 35 deg off is a different roadway and
+# falls back to the map-prior own lane (which still rounds real
+# hairpins).
+LANE_HEADING_MAX_YAW_DEG = 35.0
+
+
 class FSDTick:
     """One planning-tick result from ``FSDStack``."""
 
@@ -374,7 +387,8 @@ class FSDStack:
                 # Bearing gate: the lane must HEAD the same way as the
                 # route (junction pairing onto a side road is rejected).
                 side_bad = False
-                if not lane_heading_ok(route_ref, lane_ref, pos, heading):
+                if not lane_heading_ok(route_ref, lane_ref, pos, heading,
+                             max_yaw_deg=LANE_HEADING_MAX_YAW_DEG):
                     lane_rejected = True
                 # SIDE gate: the lane centre must sit clearly RIGHT of the
                 # road centreline (own lane).  A lane locked onto the
