@@ -412,6 +412,34 @@ def main() -> int:
         # the sim runs continuously - the car is always moving, which
         # removes the paused-step stutter.  The warm-up crawl and
         # stale-tick scrub below bound the open-loop windows.
+        # Pre-warm the pipeline BEFORE driving: the first FSD ticks load
+        # YOLO and settle camera/LiDAR (observed 4-6 s, opt11: a 5.3 s
+        # tick).  Running that with the car braked means the long tick
+        # cannot drive the car open-loop off the road; release once the
+        # object head is live (or WARMUP_S elapsed).
+        try:
+            conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                         parkingbrake=1.0, gear=fwd_gear)
+            _pw_t0 = time.time()
+            while time.time() - _pw_t0 < WARMUP_S:
+                _pw_state = conn.get_state()
+                _pw_route = local_route(
+                    np.asarray(_pw_state.pos[:2], dtype=float),
+                    float(_pw_state.heading), nav_route)
+                try:
+                    _pw_out = stack.tick(st=_pw_state, route_ref=_pw_route)
+                    if _pw_out.meta.get("object_head"):
+                        break
+                except Exception:
+                    pass
+            print(f"[fsd-drive] pipeline warm: "
+                  f"{time.time() - _pw_t0:.1f}s, "
+                  f"object_head={bool(_pw_out.meta.get('object_head'))}")
+            conn.control(throttle=0.0, brake=0.0, steering=0.0,
+                         parkingbrake=0.0, gear=fwd_gear)
+            conn.step(3)
+        except Exception as _pw_e:
+            print(f"[fsd-drive] pre-warm skipped: {_pw_e}")
         print(f"[fsd-drive] gearbox realistic, forward gear input = {fwd_gear}")
         rguard = ReverseGuard(threshold_mps=REVERSE_THRESHOLD_MPS,
                               clear_mps=REVERSE_CLEAR_MPS)
@@ -490,6 +518,16 @@ def main() -> int:
             _wall_dt = max(0.0, now_t - last_t)
             last_t = now_t
             dt = min(0.5, max(0.05, _wall_dt))
+            # Long-tick brake guard: if the PREVIOUS tick took too long
+            # the car just drove open-loop for that long.  Brake now
+            # (before the next, possibly long, tick) so no more distance
+            # is added uncontrolled; the tick below re-plans and resumes.
+            if _wall_dt > STALE_CTRL_S and v > 1.0:
+                try:
+                    conn.control(throttle=0.0, brake=0.5,
+                                 steering=prev_steer, gear=fwd_gear)
+                except Exception:
+                    pass
             rev_brk, reversing = rguard.decide(signed, dt=dt)
             # Yaw rate for the steering damper: a low-speed car at full
             # lock keeps rotating for seconds after the wheel is centred
