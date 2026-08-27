@@ -47,7 +47,9 @@ from beamng_autopilot.planner import (
     path_grid_clearance_m,
 )
 from beamng_autopilot.safety_monitor import SafetyMonitor
-from beamng_autopilot.vision.heads import SemanticHead, TrafficSignalHead
+from beamng_autopilot.vision.heads import (
+    ObjectHead, SemanticHead, TrafficSignalHead,
+)
 
 # Reverse guard: the car must never drive backwards under the FSD mode.
 # A real factory stack has lane/gear protections - m5_autopilot does too
@@ -377,11 +379,12 @@ def main() -> int:
         # full-locks across a kinked map-prior lane.
         rule_planner = LocalPlanner()
         stack = FSDStack(conn, args.runtime,
-                         heads=[SemanticHead(), TrafficSignalHead()],
+                         heads=[SemanticHead(), TrafficSignalHead(),
+                                ObjectHead()],
                          ring_roles=('front_main',),
                          cam_w=args.cam_w, cam_h=args.cam_h,
                          temporal=True, range_every_n=2,
-                         semantic_every_n=2)
+                         semantic_every_n=2, object_every_n=2)
         stack.reset_temporal()  # stale occupancy before start must not leak
         # Realistic gearbox locked into a forward gear (D).  A real stack
         # never leaves the car in reverse; keep the D input on every

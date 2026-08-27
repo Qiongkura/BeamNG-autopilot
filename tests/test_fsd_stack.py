@@ -182,8 +182,8 @@ def test_fsd_tick_semantic_throttle_reuses_last_output() -> None:
     sem = _CountingSemantic()
     st.hydra.add(sem)
     st.semantic_every_n = 2
-    st._semantic_skip = 0
-    st._last_heads = None
+    st._head_skip = {}
+    st._last_heads = {}
     out1 = st.tick()
     assert sem.calls == 1
     out2 = st.tick()
@@ -202,8 +202,8 @@ def test_fsd_tick_semantic_throttle_off_by_default() -> None:
     sem = _CountingSemantic()
     st.hydra.add(sem)
     st.semantic_every_n = 1
-    st._semantic_skip = 0
-    st._last_heads = None
+    st._head_skip = {}
+    st._last_heads = {}
     st.tick()
     st.tick()
     assert sem.calls == 2          # default runs every tick
@@ -221,3 +221,55 @@ def test_fsd_tick_candidates_survive_progress_gate() -> None:
     meta = out.meta.get("planner", {})
     if meta.get("n_eval") is not None:
         assert meta["n_eval"] >= 12, meta
+
+
+class _CountingObject(_FakeSemantic):
+    """Object stub that counts runs and returns one world obstacle."""
+
+    name = "object"
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def run(self, ctx):
+        self.calls += 1
+        from beamng_autopilot.vision.hydra import TaskOutput
+        from beamng_autopilot.perception import Obstacle
+        return TaskOutput(obstacles=[Obstacle(
+            x=8.0, y=0.0, half_w=0.8, half_h=0.8,
+            category="vehicle")])
+
+
+def test_fsd_tick_object_throttle_reuses_last_output() -> None:
+    st = _stack()
+    from beamng_autopilot.vision.hydra import HydraNet
+    st.hydra = HydraNet()
+    obj = _CountingObject()
+    st.hydra.add(obj)
+    st.object_every_n = 2
+    st._head_skip = {}
+    st._last_heads = {}
+    out1 = st.tick()
+    assert obj.calls == 1
+    out2 = st.tick()
+    assert obj.calls == 1          # second tick reuses the last output
+    assert out2.head_outputs["object"] is out1.head_outputs["object"]
+    out3 = st.tick()
+    assert obj.calls == 2          # third tick runs the head again
+
+
+def test_fsd_tick_object_obstacles_fused_into_bev() -> None:
+    st = _stack()
+    from beamng_autopilot.vision.hydra import HydraNet
+    st.hydra = HydraNet()
+    obj = _CountingObject()
+    st.hydra.add(obj)
+    st.object_every_n = 1
+    st._head_skip = {}
+    st._last_heads = {}
+    out = st.tick()
+    assert out.meta.get("n_object_obstacles") == 1
+    # world (8,0) -> ego (8,0) -> cell index in the 60x60@0.5 grid
+    r = int((st.grid_n * st.grid_res * 0.5 - 8.0) / st.grid_res)
+    assert 0 <= r < st.grid_n
+    assert out.bev[r, st.grid_n // 2] > 0.0
