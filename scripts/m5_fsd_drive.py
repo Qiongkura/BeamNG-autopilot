@@ -97,6 +97,19 @@ SPEED_HYST_MPS = 0.4            # SpeedController brake/throttle hysteresis
 # car dead in one 0.33 s burst, which then re-triggers the full-throttle
 # stall loop (fix61-64).  The downhill-start guard below prevents the
 # overshoot in the first place.
+# Heading-error speed scrub: with a ~0.6 s control tick a 7-8 m/s
+# car keeps rotating long after the pure-pursuit correction, and
+# the loop oscillates instead of converging (opt12 2026-08-27: the
+# heading swung -99 -> -131 -> -94 deg and the car drifted into the
+# right-side wall).  Once the nose points more than START_DEG away
+# from the nav route, ramp the target down to FLOOR at FULL_DEG so
+# the steering loop can catch the rotation at a speed it can
+# control.  Real bends (hairpins) are already slowed by the corner
+# governor, so this only trims the oscillation case.
+HEADING_DEV_START_DEG = 12.0
+HEADING_DEV_FULL_DEG = 40.0
+HEADING_DEV_CAP_MPS = 5.0
+HEADING_DEV_FLOOR_MPS = 1.5
 GOV_ON_MPS = 1.0
 GOV_OFF_MPS = 0.5
 GOV_BRAKE = 0.25
@@ -805,6 +818,26 @@ def main() -> int:
             if chosen.source == "rule":
                 plan_speed = min(plan_speed, 3.0)
             target = min(verd.target_speed, plan_speed, float(args.speed))
+            # Heading-error speed scrub: the nav route is the intent;
+            # when the nose drifts off it (oscillation / over-rotation)
+            # slow down so the steering loop converges instead of
+            # feeding the swing.  Falls back to no-op when the local
+            # route bearing cannot be measured.
+            _rh_b = _ref_bearing(route_local, pos)
+            if _rh_b is not None:
+                _hdg_dev = abs((float(heading)
+                                - math.radians(_rh_b) + math.pi)
+                               % (2.0 * math.pi) - math.pi)
+                _hdg_deg = math.degrees(_hdg_dev)
+                if _hdg_deg > HEADING_DEV_START_DEG:
+                    _k = min(1.0, (_hdg_deg - HEADING_DEV_START_DEG)
+                             / (HEADING_DEV_FULL_DEG
+                                - HEADING_DEV_START_DEG))
+                    _hdg_cap = (HEADING_DEV_FLOOR_MPS
+                                + (HEADING_DEV_CAP_MPS
+                                   - HEADING_DEV_FLOOR_MPS)
+                                * (1.0 - _k))
+                    target = min(target, _hdg_cap)
             # Warm-up crawl + stale-tick scrub (real-time mode): before
             # the object head is live, or after an unusually long tick,
             # the car has been driving open-loop - keep it slow.
