@@ -426,6 +426,38 @@ def main() -> int:
         # from the spawn to (726.9,756.8)).  Pretend one control interval
         # has already elapsed so the first frame can steer immediately.
         last_t = time.time() - 1.5
+        # Static full-route geometry: the nav route never changes during
+        # a run, so dedup/extend/round/resample + arc lengths + per-vertex
+        # radii are computed ONCE before the loop instead of every frame
+        # (the old per-frame rebuild of the whole rounded route cost
+        # ~10-20 ms on a long route, plus a repeated curvature scan for
+        # the bend governor).
+        route_round = None
+        route_arc = None
+        route_rad = None
+        if nav_route is not None and len(nav_route) >= 4:
+            try:
+                from beamng_autopilot.planning.local_route import (
+                    _dedup as _rdd, _extend_back as _reb,
+                    _round_corners as _rrc, _resample as _rrs,
+                    CORNER_RADIUS_M as _CR, CORNER_RESAMPLE_M as _CSM)
+                route_round = _rrs(_rrc(_reb(_rdd(nav_route[:, :2])), _CR),
+                                   _CSM)
+                route_arc = np.concatenate(
+                    [[0.0], np.cumsum(np.linalg.norm(
+                        np.diff(route_round, axis=0), axis=1))])
+                _rv1 = np.diff(route_round, axis=0)
+                _rn1 = np.linalg.norm(_rv1, axis=1)
+                _rn2 = _rn1[1:]
+                _rcr = (_rv1[:-1, 0] * _rv1[1:, 1]
+                        - _rv1[:-1, 1] * _rv1[1:, 0])
+                _rcurv = 2.0 * np.abs(_rcr) / (
+                    _rn1[:-1] * _rn2 * (_rn1[:-1] + _rn2))
+                route_rad = np.full(len(route_round), np.inf)
+                _rm = _rcurv > 1e-6
+                route_rad[1:-1][_rm] = 1.0 / _rcurv[_rm]
+            except Exception:
+                route_round = route_arc = route_rad = None
         hist: list[dict] = []
         while time.time() < t_end:
             _f0 = time.time()
@@ -658,102 +690,68 @@ def main() -> int:
             # back).  The raw road-graph polyline keeps the 90-degree
             # kink - its look-ahead profile caps the entry speed at
             # ~1.7 m/s, which is the speed the bend can actually take.
-            _corner_d_ahead = None
-            try:
-                from beamng_autopilot.planning.local_route import (
-                    _dedup as _rdd, _extend_back as _reb,
-                    _round_corners as _rrc, _resample as _rrs,
-                    CORNER_RADIUS_M as _CR, CORNER_RESAMPLE_M as _CSM,
-                    DUP_MIN_M as _DUP)
-                from beamng_autopilot.planning.speed_profile import \
-                    speed_profile_for_path as _spf_raw
-                # Profile the ROUNDED full route, not the raw road-graph
-                # polyline: the graph collapses the first hairpin into a
-                # sharp vertex whose curvature profile caps the bend at
-                # ~1.7 m/s - at that speed the tyres scrub and the car
-                # cannot even turn (steering probe 2026-08-27).  The
-                # rounded route (same 8 m fillet the lane centre uses)
-                # lets the bend be taken at a speed the steering can
-                # actually execute.
-                _rfull = _rrs(_rrc(_reb(_rdd(nav_route[:, :2])), _CR),
-                              _CSM)
-                _sp_raw = _spf_raw(_rfull, scene,
-                                   target_speed=float(args.speed))
-                if len(_sp_raw):
-                    # The full-route profile is indexed along the WHOLE
-                    # route; [0] is the speed at the ROUTE START, not at
-                    # the car.  Sample the profile at the nearest route
-                    # point so a hairpin 100 m into the route still caps
-                    # the speed when the car reaches it (run_fix25:
-                    # plan_speed stayed at the start speed into the bend).
-                    _i = int(np.argmin(np.linalg.norm(
+            if route_round is not None and route_arc is not None \
+                    and route_rad is not None:
+                _rfull = route_round
+                _ga = route_arc
+                try:
+                    from beamng_autopilot.planning.speed_profile import \
+                        speed_profile_for_path as _spf_raw
+                    # Profile the ROUNDED full route, not the raw road-graph
+                    # polyline: the graph collapses the first hairpin into a
+                    # sharp vertex whose curvature profile caps the bend at
+                    # ~1.7 m/s - at that speed the tyres scrub and the car
+                    # cannot even turn (steering probe 2026-08-27).  The
+                    # rounded route (same 8 m fillet the lane centre uses)
+                    # lets the bend be taken at a speed the steering can
+                    # actually execute.  The rounded polyline, its arc
+                    # lengths and per-vertex radii are precomputed once
+                    # before the loop (route_round/route_arc/route_rad).
+                    _sp_raw = _spf_raw(_rfull, scene,
+                                       target_speed=float(args.speed))
+                    if len(_sp_raw):
+                        # The full-route profile is indexed along the WHOLE
+                        # route; [0] is the speed at the ROUTE START, not at
+                        # the car.  Sample the profile at the nearest route
+                        # point so a hairpin 100 m into the route still caps
+                        # the speed when the car reaches it (run_fix25:
+                        # plan_speed stayed at the start speed into the bend).
+                        _i = int(np.argmin(np.linalg.norm(
+                            _rfull - pos[:2], axis=1)))
+                        out.best_speed = float(_sp_raw[_i])
+                        out.meta["plan_src"] = "nav_round"
+                except Exception:
+                    pass
+                # Tight-bend entry governor: the ~1.4 s control tick lets the
+                # car overshoot the profiled corner speed by ~+1 m/s mid-tick
+                # (fix45: 4.4 target -> ~5.5 actual at the first hairpin, ran
+                # wide off the left edge).  For a bend tighter than 15 m in
+                # the next 12 m, cap the plan speed at sqrt(1.5*R) so the
+                # actual peak stays near 4 m/s, where the 0.55 steering cap
+                # (~8.8 m radius) can track the 8 m hairpin fillet.
+                try:
+                    _gi = int(np.argmin(np.linalg.norm(
                         _rfull - pos[:2], axis=1)))
-                    out.best_speed = float(_sp_raw[_i])
-                    out.meta["plan_src"] = "nav_round"
-            except Exception:
-                pass
-            # Tight-bend entry governor: the ~1.4 s control tick lets the
-            # car overshoot the profiled corner speed by ~+1 m/s mid-tick
-            # (fix45: 4.4 target -> ~5.5 actual at the first hairpin, ran
-            # wide off the left edge).  For a bend tighter than 15 m in
-            # the next 12 m, cap the plan speed at sqrt(1.5*R) so the
-            # actual peak stays near 4 m/s, where the 0.55 steering cap
-            # (~8.8 m radius) can track the 8 m hairpin fillet.
-            try:
-                _ga = np.concatenate(
-                    [[0.0], np.cumsum(np.linalg.norm(
-                        np.diff(_rfull, axis=0), axis=1))])
-                _gi = int(np.argmin(np.linalg.norm(
-                    _rfull - pos[:2], axis=1)))
-                _ghi = int(np.searchsorted(_ga, _ga[_gi] + 12.0))
-                _rmin = 1e9
-                for _j in range(max(1, _gi),
-                                min(_ghi + 1, len(_rfull) - 1)):
-                    _a, _b, _cc = (_rfull[_j - 1], _rfull[_j],
-                                   _rfull[_j + 1])
-                    _v1 = _b - _a
-                    _v2 = _cc - _b
-                    _n1 = float(np.linalg.norm(_v1))
-                    _n2 = float(np.linalg.norm(_v2))
-                    if _n1 < 1e-9 or _n2 < 1e-9:
-                        continue
-                    _cr = abs(_v1[0] * _v2[1] - _v1[1] * _v2[0])
-                    _curv = 2.0 * _cr / (_n1 * _n2 * (_n1 + _n2))
-                    if _curv > 1e-6:
-                        _rmin = min(_rmin, 1.0 / _curv)
-                if _rmin < 15.0:
-                    # Floor the implied radius: the 0.8 m resample can
-                    # measure a hairpin fillet edge as R~0.8 m (three
-                    # nearly-collinear points), which caps the plan at
-                    # ~1 m/s and stands the car dead on the approach
-                    # (fix65: plan=1.00 at the second bend, v=5.6 ->
-                    # brake-to-0).  Real roads never bend tighter than
-                    # ~3 m; anything smaller is a sampling artifact.
-                    _rmin = max(_rmin, 3.0)
-                    out.best_speed = float(min(
-                        out.best_speed, math.sqrt(1.3 * _rmin)))
-                    out.meta["plan_src"] = "nav_round+gov"
-                # Distance (m) from the car to the first bend tighter
-                # than 15 m within the 12 m window; used by the corner
-                # brake zone below.
-                _corner_d_ahead = None
-                for _j in range(max(1, _gi),
-                                min(_ghi + 1, len(_rfull) - 1)):
-                    _a, _b, _cc = (_rfull[_j - 1], _rfull[_j],
-                                   _rfull[_j + 1])
-                    _v1 = _b - _a
-                    _v2 = _cc - _b
-                    _n1 = float(np.linalg.norm(_v1))
-                    _n2 = float(np.linalg.norm(_v2))
-                    if _n1 < 1e-9 or _n2 < 1e-9:
-                        continue
-                    _cr = abs(_v1[0] * _v2[1] - _v1[1] * _v2[0])
-                    _curv = 2.0 * _cr / (_n1 * _n2 * (_n1 + _n2))
-                    if _curv > 1e-6 and 1.0 / _curv < 15.0:
-                        _corner_d_ahead = float(_ga[_j] - _ga[_gi])
-                        break
-            except Exception:
-                pass
+                    _ghi = int(np.searchsorted(_ga, _ga[_gi] + 12.0))
+                    _lo = max(1, _gi)
+                    _hi = min(_ghi, len(route_rad) - 2) + 1
+                    _rmin = 1e9
+                    if _lo < _hi:
+                        _rmin = float(np.min(route_rad[_lo:_hi]))
+                    if _rmin < 15.0:
+                        # Floor the implied radius: the 0.8 m resample can
+                        # measure a hairpin fillet edge as R~0.8 m (three
+                        # nearly-collinear points), which caps the plan at
+                        # ~1 m/s and stands the car dead on the approach
+                        # (fix65: plan=1.00 at the second bend, v=5.6 ->
+                        # brake-to-0).  Real roads never bend tighter than
+                        # ~3 m; anything smaller is a sampling artifact.
+                        _rmin = max(_rmin, 3.0)
+                        out.best_speed = float(min(
+                            out.best_speed, math.sqrt(1.3 * _rmin)))
+                        out.meta["plan_src"] = "nav_round+gov"
+                except Exception:
+                    pass
             # control from the (possibly degraded) target speed, but never
             # exceed the *planned* speed along the chosen trajectory - the
             # FSD longitudinal plan (bend deceleration, obstacle brake
