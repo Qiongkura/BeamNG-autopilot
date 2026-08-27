@@ -15,6 +15,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from .geometry import polyline_point_distances
+
 
 @dataclass
 class Constraints:
@@ -639,23 +641,6 @@ def cost_lane_align(scene: Scene, path) -> float:
     near = path[d0 <= 25.0]
     if len(near) < 2:
         near = path[: min(4, len(path))]
-    # median distance to the nearest route segment
-    offs = []
-    for px, py in near:
-        best = float("inf")
-        for k in range(len(route) - 1):
-            ax, ay = route[k]
-            bx, by = route[k + 1]
-            abx, aby = bx - ax, by - ay
-            l2 = abx * abx + aby * aby
-            if l2 < 1e-12:
-                d = math.hypot(px - ax, py - ay)
-            else:
-                t = max(0.0, min(1.0, ((px - ax) * abx + (py - ay) * aby)
-                                 / l2))
-                cx, cy = ax + t * abx, ay + t * aby
-                d = math.hypot(px - cx, py - cy)
-            if d < best:
-                best = d
-        offs.append(best)
-    return float(np.median(offs)) if offs else 0.0
+    # median distance to the nearest route segment (vectorised)
+    offs = polyline_point_distances(near, route)
+    return float(np.median(offs)) if len(offs) else 0.0

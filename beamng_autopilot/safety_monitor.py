@@ -25,6 +25,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from beamng_autopilot.planning.geometry import polyline_point_distances
+
 # How old a range/vision snapshot can be before the monitor distrusts it.
 STALE_SNAPSHOT_S = 0.8
 # Fraction of path samples inside occupied cells that triggers "blocked".
@@ -123,25 +125,8 @@ class SafetyMonitor:
         near = path[d0 <= 25.0]
         if len(near) < 2:
             near = path[: min(4, len(path))]
-        offs = []
-        for px, py in near:
-            best = float("inf")
-            for k in range(len(ref) - 1):
-                ax, ay = ref[k]
-                bx, by = ref[k + 1]
-                abx, aby = bx - ax, by - ay
-                l2 = abx * abx + aby * aby
-                if l2 < 1e-12:
-                    d = math.hypot(px - ax, py - ay)
-                else:
-                    t = max(0.0, min(1.0, ((px - ax) * abx +
-                                            (py - ay) * aby) / l2))
-                    cx, cy = ax + t * abx, ay + t * aby
-                    d = math.hypot(px - cx, py - cy)
-                if d < best:
-                    best = d
-            offs.append(best)
-        return float(np.median(offs)) if offs else 0.0
+        offs = polyline_point_distances(near, ref)
+        return float(np.median(offs)) if len(offs) else 0.0
 
     # ------------------------------------------------------------------
     def evaluate(self, scene, path, closed_loop_steer: float = 0.0,
@@ -167,17 +152,15 @@ class SafetyMonitor:
             path = np.asarray(path, dtype=float)[:, :2]
             rr, cc = np.nonzero(scene.grid.obstacle)
             if len(rr):
-                occ_pts = []
-                for r, c in zip(rr, cc):
-                    ex = scene.grid.max_x - (r + 0.5) * scene.grid.res
-                    ey = scene.grid.max_y - (c + 0.5) * scene.grid.res
-                    # back to world
-                    ch = math.cos(scene.heading)
-                    sh = math.sin(scene.heading)
-                    wx = scene.grid.origin[0] + ex * ch - ey * sh
-                    wy = scene.grid.origin[1] + ex * sh + ey * ch
-                    occ_pts.append((wx, wy))
-                occ_pts = np.asarray(occ_pts)
+                # vectorised: grid cell -> world (same formula as the old
+                # per-cell Python loop, but one numpy pass)
+                ex = scene.grid.max_x - (rr + 0.5) * scene.grid.res
+                ey = scene.grid.max_y - (cc + 0.5) * scene.grid.res
+                ch = math.cos(scene.heading)
+                sh = math.sin(scene.heading)
+                wx = scene.grid.origin[0] + ex * ch - ey * sh
+                wy = scene.grid.origin[1] + ex * sh + ey * ch
+                occ_pts = np.stack([wx, wy], axis=1)
                 dd = np.linalg.norm(path[:, None, :] - occ_pts[None, :, :],
                                     axis=2)
                 best_path_d = float(dd.min()) if dd.size else 999.0
