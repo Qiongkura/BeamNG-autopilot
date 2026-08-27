@@ -40,6 +40,14 @@ OCC_FRACTION_STOP = 0.40
 # Lane-keep: the path must stay within this of the lane reference.
 LANE_DEV_DEGRADE_M = 3.0
 LANE_DEV_STOP_M = 6.0
+# Obstacle-approach speed ease: only occupied cells that intrude into
+# the driven corridor AHEAD of the ego count (same 1.6 m corridor as
+# ``path_forward_clearance_m``).  Roadside trees/curbs beside or behind
+# the car are lane bounds, not obstacles - easing to the 2 m/s creep
+# for every LiDAR point within 8 m parked the car on open mountain
+# roads (run 2026-08-27: plan 6 m/s, monitor crept at 2 m/s all run).
+EASE_CORRIDOR_HALF_WIDTH_M = 1.6
+EASE_AHEAD_MIN_M = 1.0
 
 
 @dataclass
@@ -63,6 +71,42 @@ class SafetyVerdict:
     @property
     def degraded(self) -> bool:
         return self.level == "degraded"
+
+
+def _corridor_ahead_distance(occ_pts, path, half_width_m: float,
+                           ahead_min_m: float) -> float | None:
+    """Along-path distance of the nearest occupied cell that intrudes
+    into the path corridor AHEAD of the ego (None when nothing does).
+
+    The old ``closest`` distance counted every occupied cell within 8 m
+    of the path regardless of where it sat laterally or longitudinally,
+    so continuous roadside clutter kept the target at the 2 m/s creep.
+    Only cells within ``half_width_m`` of the path and at least
+    ``ahead_min_m`` along it (the path is ego-anchored) can ease speed.
+    """
+    pts = np.asarray(occ_pts, dtype=float)
+    poly = np.asarray(path, dtype=float)[:, :2]
+    if len(pts) == 0 or len(poly) < 2:
+        return None
+    a = poly[:-1]
+    b = poly[1:]
+    ab = b - a
+    l2 = np.einsum("ij,ij->i", ab, ab)
+    seg_len = np.sqrt(np.maximum(l2, 1e-12))
+    arc0 = np.concatenate([[0.0], np.cumsum(seg_len)])[:-1]
+    rel = pts[:, None, :] - a[None, :, :]
+    t = np.clip(np.einsum("ijk,jk->ij", rel, ab)
+                / np.maximum(l2[None, :], 1e-12), 0.0, 1.0)
+    proj = a[None, :, :] + t[..., None] * ab[None, :, :]
+    lat = np.linalg.norm(pts[:, None, :] - proj, axis=2)
+    along = arc0[None, :] + t * seg_len[None, :]
+    j = np.argmin(lat, axis=1)
+    lat_best = lat[np.arange(len(pts)), j]
+    along_best = along[np.arange(len(pts)), j]
+    sel = (lat_best <= half_width_m) & (along_best >= ahead_min_m)
+    if not np.any(sel):
+        return None
+    return float(np.min(along_best[sel]))
 
 
 class SafetyMonitor:
@@ -147,24 +191,29 @@ class SafetyMonitor:
 
         closest = 999.0
         if scene.grid is not None and path is not None and len(path) > 1:
-            # closest obstacle to the chosen path
+            # nearest corridor-intruding obstacle AHEAD of the ego, not
+            # any cell near the path (roadside clutter must not creep
+            # the target speed - run 2026-08-27)
             pos = np.asarray(scene.pos[:2], dtype=float)
             path = np.asarray(path, dtype=float)[:, :2]
             rr, cc = np.nonzero(scene.grid.obstacle)
             if len(rr):
                 # vectorised: grid cell -> world (same formula as the old
                 # per-cell Python loop, but one numpy pass)
+                ch = math.cos(getattr(scene.grid, "heading",
+                                      scene.heading))
+                sh = math.sin(getattr(scene.grid, "heading",
+                                      scene.heading))
                 ex = scene.grid.max_x - (rr + 0.5) * scene.grid.res
                 ey = scene.grid.max_y - (cc + 0.5) * scene.grid.res
-                ch = math.cos(scene.heading)
-                sh = math.sin(scene.heading)
                 wx = scene.grid.origin[0] + ex * ch - ey * sh
                 wy = scene.grid.origin[1] + ex * sh + ey * ch
                 occ_pts = np.stack([wx, wy], axis=1)
-                dd = np.linalg.norm(path[:, None, :] - occ_pts[None, :, :],
-                                    axis=2)
-                best_path_d = float(dd.min()) if dd.size else 999.0
-                closest = best_path_d
+                _ahead = _corridor_ahead_distance(
+                    occ_pts, path, EASE_CORRIDOR_HALF_WIDTH_M,
+                    EASE_AHEAD_MIN_M)
+                if _ahead is not None:
+                    closest = _ahead
 
         v = SafetyVerdict(
             level="safe", reason="", target_speed=self.max_speed,
@@ -219,11 +268,11 @@ class SafetyMonitor:
             return v
 
         # --- obstacle approach speed ------------------------------------
-        # Nearby roadside walls/cars ease speed; a genuinely closed
-        # forward corridor (real blockage) is what degrades/stops.  A
-        # narrow town street keeps FSD engaged past buildings (which are
-        # normal lane bounds) while slowing, instead of dropping to the
-        # rule creep on every frame (town runs 2026-08-21).
+        # A corridor-intruding obstacle AHEAD of the ego eases speed; a
+        # genuinely closed forward corridor (real blockage) is what
+        # degrades/stops.  Roadside walls/trees beside the lane are lane
+        # bounds and never touch this band (they used to pin the car to
+        # the 2 m/s creep on every tree-lined road - run 2026-08-27).
         if closest < 8.0:
             # ease speed as the closest obstacle closes in (brake band)
             k = max(0.0, 1.0 - (8.0 - closest) / 6.0)
