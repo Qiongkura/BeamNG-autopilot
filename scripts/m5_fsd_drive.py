@@ -229,23 +229,11 @@ def main() -> int:
             conn.load_scenario()
         if args.teleport is not None:
             x, y, yaw = args.teleport
-            # ground ray: from high above straight down, take the real
-            # terrain z and lift the car above it - a hardcoded z puts the
-            # car underground and the camera sees nothing useful.
-            resp = conn.bng.control.queue_lua_command(
-                f"local r = Engine.castRay(vec3({x:.3f}, {y:.3f}, 10000), "
-                f"vec3({x:.3f}, {y:.3f}, -1000), true, false)\n"
-                "if r and r.pt then return string.format('%.3f', r.pt.z) "
-                "end\nreturn 'nil'", response=True)
-            z = 154.1
-            if resp and str(resp).strip() != "nil":
-                try:
-                    z = float(str(resp).strip()) + 0.6
-                except ValueError:
-                    pass
-            conn.vehicle.teleport(pos=(float(x), float(y), z),
-                                  rot_quat=angle_to_quat((0, 0, -float(yaw) - 90.0)))
-            conn.step(8)
+            # Ground-safe teleport: the connector measures the real surface
+            # with a cast ray and re-checks after settling, so no map can
+            # ever drop the car below terrain (hardcoded z heights did on
+            # maps whose surface sits much higher - 2026-08-28).
+            conn.safe_teleport(float(x), float(y), heading_deg=float(yaw))
             st1 = conn.get_state()
             print(f"[fsd-drive] teleport -> "
                   f"({float(st1.pos[0]):.1f}, {float(st1.pos[1]):.1f}, "
@@ -370,26 +358,10 @@ def main() -> int:
                     ndx, ndy = (float(rx - nav_route[i - 1, 0]),
                                 float(ry - nav_route[i - 1, 1]))
                 h = float(np.arctan2(ndy, ndx))
-                # Connector convention (see connector.py spawn): the snap
-                # passes angle_to_quat the yaw directly with
-                # ``yaw_deg = -degrees(h) - 90`` so the resulting STATE
-                # heading equals h (route direction).  Do NOT use the
-                # --teleport convention here (that one adds the -90 itself).
-                yaw_deg = -math.degrees(h) - 90.0
-                resp = conn.bng.control.queue_lua_command(
-                    f"local r = Engine.castRay(vec3({rx:.3f}, {ry:.3f}, 10000), "
-                    f"vec3({rx:.3f}, {ry:.3f}, -1000), true, false)\n"
-                    "if r and r.pt then return string.format('%.3f', r.pt.z) "
-                    "end\nreturn 'nil'", response=True)
-                z = 154.1
-                if resp and str(resp).strip() != "nil":
-                    try:
-                        z = float(str(resp).strip()) + 0.6
-                    except ValueError:
-                        pass
-                conn.vehicle.teleport(pos=(rx, ry, z),
-                                      rot_quat=angle_to_quat((0, 0, yaw_deg)))
-                conn.step(8)
+                # Ground-safe snap: same connector helper as --teleport, so
+                # the car is always placed on the real surface (never below
+                # terrain) and facing the route direction.
+                conn.safe_teleport(rx, ry, heading_deg=math.degrees(h))
                 st1 = conn.get_state()
                 print(f"[fsd-drive] snapped onto nav route "
                       f"({float(st1.pos[0]):.1f}, {float(st1.pos[1]):.1f}, "
