@@ -757,6 +757,12 @@ class FSDStack:
                 self.ring.close()
             except Exception:
                 pass
+        try:
+            rp = getattr(self, "range_prov", None)
+            if rp is not None and hasattr(rp, "close"):
+                rp.close()
+        except Exception:
+            pass
 
 
 def semantic_to_meta(head_outputs: dict) -> dict:

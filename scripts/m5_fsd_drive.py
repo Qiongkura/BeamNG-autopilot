@@ -1066,6 +1066,13 @@ def main() -> int:
             conn.bng.resume()
         except Exception:
             pass
+        # Remove the Tech camera/LiDAR sensors so a next attach process
+        # does not pile up sensors in the running game (leftover sensors
+        # made later camera polls fail intermittently).
+        try:
+            stack.close()
+        except Exception:
+            pass
         conn.close()
         if hist and args.out:
             try:
