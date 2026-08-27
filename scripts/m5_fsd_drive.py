@@ -29,7 +29,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from beamng_autopilot import config
-from beamng_autopilot.connector import BeamNGConnector
+from beamng_autopilot.connector import BeamNGConnector, angle_to_quat
 from beamng_autopilot.control import gearbox
 from beamng_autopilot.control.reverse_guard import ReverseGuard
 from beamng_autopilot.control.reverse_maneuver import ReverseManeuver
@@ -37,7 +37,13 @@ from beamng_autopilot.control.pure_pursuit import PurePursuit
 from beamng_autopilot.control.speed import SpeedController
 from beamng_autopilot.fsd_stack import FSDStack
 from beamng_autopilot.occupancy import OccupancyGrid
-from beamng_autopilot.planning import Scene, local_route
+from beamng_autopilot.planning import (
+    Scene, anchored_rule_ref, arbitrate, local_route,
+)
+from beamng_autopilot.planning.constraints import _boundary_lateral
+from beamng_autopilot.planning.local_route import map_lane_edges
+from beamng_autopilot.planning.speed_profile import \
+    speed_profile_for_path as _spf_raw
 from beamng_autopilot.roadnet import RoadNetwork
 from beamng_autopilot.autopilot import nearest_route_point, smooth_steer
 from beamng_autopilot.planner import (
@@ -200,7 +206,6 @@ def main() -> int:
         except Exception:
             conn.load_scenario()
         if args.teleport is not None:
-            from beamng_autopilot.connector import angle_to_quat
             x, y, yaw = args.teleport
             # ground ray: from high above straight down, take the real
             # terrain z and lift the car above it - a hardcoded z puts the
@@ -349,7 +354,6 @@ def main() -> int:
                 # heading equals h (route direction).  Do NOT use the
                 # --teleport convention here (that one adds the -90 itself).
                 yaw_deg = -math.degrees(h) - 90.0
-                from beamng_autopilot.connector import angle_to_quat
                 resp = conn.bng.control.queue_lua_command(
                     f"local r = Engine.castRay(vec3({rx:.3f}, {ry:.3f}, 10000), "
                     f"vec3({rx:.3f}, {ry:.3f}, -1000), true, false)\n"
@@ -505,8 +509,6 @@ def main() -> int:
             map_lane = None
             if road_left is not None and road_right is not None:
                 try:
-                    from beamng_autopilot.planning.local_route import (
-                        map_lane_edges)
                     map_lane = map_lane_edges(
                         nav_route, road_left, road_right, pos, heading)
                 except Exception:
@@ -571,8 +573,6 @@ def main() -> int:
             # excuse to push the wall - when no drivable path exists, the
             # correct FSD behaviour is a minimal-risk stop (town runs
             # 2026-08-21 pushed a wall under a far-away route reference).
-            from beamng_autopilot.planning import anchored_rule_ref, arbitrate
-            from beamng_autopilot.planning.constraints import _boundary_lateral
             # Proven rule-autopilot fallback: the LocalPlanner rounds
             # switchback corners and keeps the car in its own lane, so the
             # FSD drive does not stop dead at a hairpin apex when the
@@ -699,8 +699,6 @@ def main() -> int:
                 _rfull = route_round
                 _ga = route_arc
                 try:
-                    from beamng_autopilot.planning.speed_profile import \
-                        speed_profile_for_path as _spf_raw
                     # Profile the ROUNDED full route, not the raw road-graph
                     # polyline: the graph collapses the first hairpin into a
                     # sharp vertex whose curvature profile caps the bend at
@@ -1071,9 +1069,8 @@ def main() -> int:
         conn.close()
         if hist and args.out:
             try:
-                from pathlib import Path as _P
-                _P(args.out).parent.mkdir(parents=True, exist_ok=True)
-                _P(args.out).write_text(
+                Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+                Path(args.out).write_text(
                     json.dumps(hist, ensure_ascii=False), encoding="utf-8")
                 print(f"[fsd-drive] telemetry -> {args.out} ({len(hist)} frames)")
             except Exception as _e:
