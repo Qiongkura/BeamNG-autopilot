@@ -29,6 +29,7 @@ class SpeedController:
         max_decel: float = 4.0,      # m/s^2 emergency-ish braking
         kp: float = 0.6,             # accel per m/s of speed error
         deadband: float = 0.35,      # m/s error below which we coast
+        hyst_mps: float = 0.0,       # extra m/s before brake<->throttle flips
         creep_throttle: float = 0.34,
         creep_speed: float = 0.7,    # m/s below which creep engages
         thr_up: float = 1.6,         # pedal rate when pressing throttle (1/s)
@@ -41,6 +42,7 @@ class SpeedController:
         self.max_decel = max_decel
         self.kp = kp
         self.deadband = deadband
+        self.hyst_mps = float(hyst_mps)
         self.creep_throttle = creep_throttle
         self.creep_speed = creep_speed
         self.thr_up = thr_up
@@ -54,6 +56,11 @@ class SpeedController:
         self._throttle = 0.0
         self._brake = 0.0
         self.slip_active = False
+        # Pedal mode for the brake/throttle hysteresis: -1 brake, 0 coast,
+        # +1 throttle.  Keeps the pedal state across frames so a target
+        # speed that jitters around the deadband edge does not slam the
+        # brake on one tick and the throttle on the next.
+        self._mode = 0
 
     @property
     def throttle(self) -> float:
@@ -69,15 +76,28 @@ class SpeedController:
         """Return smoothed (throttle, brake) for this control step."""
         dt = dt or self.dt
         err = float(target_speed - speed)
-        if abs(err) < self.deadband:
-            err = 0.0
+        # Hysteresis: enter a pedal mode only when the error clearly
+        # crosses the (deadband + hyst) edge, and hold that mode until it
+        # crosses the OPPOSITE edge.  Inside the band the controller
+        # coasts (both pedals ramp to 0).  With hyst=0 the behaviour is
+        # the classic deadband controller; hyst>0 stops a jittering
+        # target speed from flicking brake<->throttle frame to frame.
+        mode = self._mode
+        if mode <= 0 and err > self.deadband + self.hyst_mps:
+            mode = 1
+        elif mode >= 0 and err < -(self.deadband + self.hyst_mps):
+            mode = -1
         accel = float(np.clip(self.kp * err, -self.max_decel, self.max_accel))
-        if accel >= 0.0:
+        if mode == 1:
             thr_req = float(np.clip(accel / self.max_accel, 0.0, 1.0))
             brk_req = 0.0
-        else:
+        elif mode == -1:
             thr_req = 0.0
             brk_req = float(np.clip(-accel / self.max_decel, 0.0, 1.0))
+        else:
+            thr_req = 0.0
+            brk_req = 0.0
+        self._mode = mode
 
         # Gentle creep to get moving from standstill (ramped, not a jump).
         if speed < self.creep_speed and target_speed > 1.0:
