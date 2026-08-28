@@ -104,3 +104,21 @@ def test_speed_at_idx_clamps() -> None:
     assert c.speed_at_idx(99) == pytest.approx(3.0)  # clamped
     empty = Candidate(path=np.zeros((5, 2)))
     assert empty.speed_at_idx(0) == 0.0
+
+def test_obstacle_min_speed_floor_when_open() -> None:
+    """With the forward corridor verified open, dense junction/end-zone
+    LiDAR inside the brake band must not pin the plan to the 1 m/s
+    MIN_SPEED crawl (fsd opt22: plan snapped 6.0 <-> 1.0 and the car
+    brake->stalled at the junction).  A caller with corridor knowledge
+    passes obstacle_min_speed = 0.4*target; the profile then eases to
+    that floor instead of MIN_SPEED."""
+    sc = _scene()
+    sc.grid.mark_obstacle_region(8.0, 0.0, 1.2, 1.2)  # inside corridor
+    path = np.column_stack([np.linspace(0, 20, 40), np.zeros(40)])
+    sp_low = speed_profile_for_path(path, sc, target_speed=12.0,
+                                    obstacle_brake_m=25.0)
+    sp_open = speed_profile_for_path(path, sc, target_speed=12.0,
+                                     obstacle_brake_m=25.0,
+                                     obstacle_min_speed=4.8)
+    assert float(sp_low.min()) <= 1.2, sp_low
+    assert float(sp_open.min()) >= 4.0, sp_open

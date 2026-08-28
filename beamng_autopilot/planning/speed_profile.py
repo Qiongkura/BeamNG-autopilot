@@ -40,6 +40,7 @@ def speed_profile_for_path(path, scene, target_speed: float = 12.0,
                            comfort_lat: float = COMFORT_LAT,
                            obstacle_brake_m: float = OBSTACLE_BRAKE_M,
                            corridor_half_width_m: float = CORRIDOR_HALF_WIDTH_M,
+                           obstacle_min_speed: float = MIN_SPEED,
                            ) -> np.ndarray:
     """Per-point max speed (m/s) along ``path``.
 
@@ -50,7 +51,11 @@ def speed_profile_for_path(path, scene, target_speed: float = 12.0,
     * obstacle: a brake band ahead of the first obstacle that actually
       intrudes into the path corridor (within ``corridor_half_width_m``
       laterally), NOT any occupied cell within 25 m - roadside walls and
-      buildings must not pin the profile to 1 m/s in town;
+      buildings must not pin the profile to 1 m/s in town.  The band
+      eases to ``obstacle_min_speed`` (default ``MIN_SPEED``): callers
+      with corridor knowledge (the safety monitor already verified a
+      free band exists) raise this floor so dense junction LiDAR does
+      not pin the plan to a 1 m/s crawl;
     * target: caps the cruise speed.
 
     Returns an array of length N.
@@ -96,7 +101,7 @@ def speed_profile_for_path(path, scene, target_speed: float = 12.0,
             near = float(d[i].min()) if d.shape[1] else float("inf")
             if near < obstacle_brake_m:
                 f = max(0.0, near / obstacle_brake_m)
-                v[i] = min(v[i], max(MIN_SPEED, target * f))
+                v[i] = min(v[i], max(obstacle_min_speed, target * f))
 
     # --- look-ahead braking -------------------------------------------
     # The per-point limits above apply AT the bend/obstacle; the plan

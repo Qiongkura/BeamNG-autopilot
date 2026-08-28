@@ -45,6 +45,7 @@ from beamng_autopilot.planning.local_route import (
     map_lane_edges, _project_arc,
 )
 from beamng_autopilot.planning.speed_profile import \
+    MIN_SPEED as _PROF_MIN_SPEED, \
     speed_profile_for_path as _spf_raw
 from beamng_autopilot.roadnet import RoadNetwork
 from beamng_autopilot.autopilot import nearest_route_point, smooth_steer
@@ -149,6 +150,16 @@ END_BRAKE = 0.7
 GOV_ON_MPS = 0.8
 GOV_OFF_MPS = 0.4
 GOV_BRAKE = 0.25
+# Plan-speed rate limit (m/s per sim second): the full-route profile is
+# re-profiled every frame against the LIVE LiDAR grid, and junction /
+# end-zone clutter appears and disappears between ticks.  Without a rate
+# limit the plan snapped 6.0 <-> 1.0 and the controller slammed the
+# brakes then relaunched (opt22 t=50.6: plan=1.00 brk=0.75, next frame
+# plan=6.00).  The down rate stays above SPEED_TARGET_RAMP so real bend
+# deceleration still binds; the up rate is gentler so a transient
+# obstruction never ends in a relaunch kick.
+PLAN_DOWN_RATE_MPS2 = 2.0
+PLAN_UP_RATE_MPS2 = 1.0
 
 
 
@@ -481,6 +492,7 @@ def main() -> int:
         t0 = time.time()
         warmup_until = time.time() + WARMUP_S
         target_sm = float(args.speed)
+        plan_sm = float(args.speed)
         gov_brake = False
         # First-frame steering: with last_t set to NOW the first tick has
         # dt ~= 0, smooth_steer cannot move the wheel, and the car runs
@@ -881,6 +893,11 @@ def main() -> int:
                     and route_rad is not None:
                 _rfull = route_round
                 _ga = route_arc
+                # Arc-length projection (not nearest-vertex): the nearest
+                # vertex can flip between two close route samples frame to
+                # frame, which snapped the sampled profile speed by whole
+                # m/s on straight segments; the projection stays stable.
+                _proj_s = float(_project_arc(_rfull, pos[:2]))
                 try:
                     # Profile the ROUNDED full route, not the raw road-graph
                     # polyline: the graph collapses the first hairpin into a
@@ -892,8 +909,18 @@ def main() -> int:
                     # actually execute.  The rounded polyline, its arc
                     # lengths and per-vertex radii are precomputed once
                     # before the loop (route_round/route_arc/route_rad).
-                    _sp_raw = _spf_raw(_rfull, scene,
-                                       target_speed=float(args.speed))
+                    _sp_raw = _spf_raw(
+                        _rfull, scene,
+                        target_speed=float(args.speed),
+                        # Corridor-open clutter (dense junction/end-zone
+                        # LiDAR that still leaves a free band) must not
+                        # pin the full-route plan to the 1 m/s MIN_SPEED -
+                        # the safety monitor keeps the same cruise floor
+                        # when its corridor is open.
+                        obstacle_min_speed=(
+                            max(_PROF_MIN_SPEED,
+                                0.4 * float(args.speed))
+                            if verd.corridor_open else _PROF_MIN_SPEED))
                     if len(_sp_raw):
                         # The full-route profile is indexed along the WHOLE
                         # route; [0] is the speed at the ROUTE START, not at
@@ -901,8 +928,9 @@ def main() -> int:
                         # point so a hairpin 100 m into the route still caps
                         # the speed when the car reaches it (run_fix25:
                         # plan_speed stayed at the start speed into the bend).
-                        _i = int(np.argmin(np.linalg.norm(
-                            _rfull - pos[:2], axis=1)))
+                        _i = int(np.clip(
+                            int(np.searchsorted(_ga, _proj_s)),
+                            0, len(_rfull) - 1))
                         out.best_speed = float(_sp_raw[_i])
                         out.meta["plan_src"] = "nav_round"
                 except Exception:
@@ -915,9 +943,10 @@ def main() -> int:
                 # actual peak stays near 4 m/s, where the 0.55 steering cap
                 # (~8.8 m radius) can track the 8 m hairpin fillet.
                 try:
-                    _gi = int(np.argmin(np.linalg.norm(
-                        _rfull - pos[:2], axis=1)))
-                    _ghi = int(np.searchsorted(_ga, _ga[_gi] + 12.0))
+                    _gi = int(np.clip(
+                        int(np.searchsorted(_ga, _proj_s)),
+                        0, len(_rfull) - 1))
+                    _ghi = int(np.searchsorted(_ga, _proj_s + 12.0))
                     _lo = max(1, _gi)
                     _hi = min(_ghi, len(route_rad) - 2) + 1
                     _rmin = 1e9
@@ -947,6 +976,20 @@ def main() -> int:
             # cautious creep so the L2 fallback is gentle
             if chosen.source == "rule":
                 plan_speed = min(plan_speed, 3.0)
+            plan_raw_speed = float(plan_speed)
+            # Rate-limit the plan (PLAN_* constants): transient LiDAR
+            # clutter at junctions/end zones must not snap the plan
+            # 6.0 <-> 1.0 between ticks and make the controller brake
+            # then relaunch (opt22).  Real bends still decelerate - the
+            # profile drops smoothly over many frames, well inside the
+            # down rate - and the safety monitor / force-stop remain the
+            # authority for genuine emergencies.
+            _dplan = float(np.clip(
+                plan_raw_speed - plan_sm,
+                -PLAN_DOWN_RATE_MPS2 * dt,
+                PLAN_UP_RATE_MPS2 * dt))
+            plan_sm = float(plan_sm + _dplan)
+            plan_speed = plan_sm
             target = min(verd.target_speed, plan_speed, float(args.speed))
             # Heading-error speed scrub: the nav route is the intent;
             # when the nose drifts off it (oscillation / over-rotation)
@@ -1279,6 +1322,7 @@ def main() -> int:
                 "reason": verd.reason or "-",
                 "source": str(chosen.source),
                 "plan_speed": round(float(plan_speed), 2),
+                "plan_raw": round(float(plan_raw_speed), 2),
                 "target_sm": round(float(target_sm), 2),
                 "plan_src": str(out.meta.get("plan_src", "?")),
                 "tick_ms": out.meta.get("tick_ms"),
