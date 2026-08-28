@@ -157,6 +157,43 @@ def lane_heading_ok(route, lane_ref, pos, heading,
     return abs(bearing_diff_deg(l_b, ref)) <= float(max_yaw_deg)
 
 
+def lane_route_turn_ok(route, pos, look_m: float = 12.0,
+                      max_turn_deg: float = 25.0) -> bool:
+    """True when the nav route does NOT turn hard in the near-ahead window.
+
+    A hard turn ahead means the car is at a real corner; there the
+    map-prior own lane (a rounded copy of the same route) is the reliable
+    reference and the sensor lane must not override it - vision/LiDAR
+    pairing reads corner geometry wide (town run 2026-08-28 run11: the
+    paired sensor lane read -48.6 deg vs route -24.6 deg, only 24 deg
+    off so the 35 deg heading gate passed; the car S-curved 2.7 m left
+    of the centreline then 5.2 m right past the edge).  Falls back to
+    True when the turn cannot be measured.
+    """
+    if route is None or len(route) < 4:
+        return True
+    r = np.asarray(route[:, :2], dtype=float)
+    p = np.asarray(pos[:2], dtype=float)
+    arc = np.concatenate(
+        [[0.0], np.cumsum(np.linalg.norm(np.diff(r, axis=0), axis=1))])
+    i_near = int(np.argmin(np.linalg.norm(r - p, axis=1)))
+    if float(arc[i_near]) >= float(arc[-1]):
+        return True
+    # Include a few samples BEHIND the nearest vertex: at a corner the
+    # nearest route point snaps to the post-turn road, so a pure forward
+    # window measures only the straight and misses the turn being driven.
+    i0 = max(0, i_near - 5)
+    i1 = int(np.searchsorted(arc, float(arc[i_near]) + float(look_m)))
+    i1 = min(i1, len(r) - 1)
+    if i1 - i0 < 2:
+        return True
+    seg = np.diff(r[i0:i1 + 1], axis=0)
+    ang = np.arctan2(seg[:, 1], seg[:, 0])
+    d = np.diff(ang)
+    d = (d + np.pi) % (2.0 * np.pi) - np.pi
+    return float(np.degrees(np.abs(d).sum())) <= float(max_turn_deg)
+
+
 def lane_side_offset_m(lane, route, pos, max_m: float = 20.0):
     """Median signed lateral offset (m) of the lane from the route.
 

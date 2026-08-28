@@ -66,6 +66,16 @@ from beamng_autopilot.vision.hydra import FrameContext, HydraNet
 LANE_HEADING_MAX_YAW_DEG = 35.0
 
 
+# Route-turn gate: when the nav route turns more than this in the next
+# window the car is at a real corner.  There the map-prior own lane
+# (rounded from the same route) is authoritative: vision/LiDAR lane
+# pairing reads corner geometry wide (town run 2026-08-28 run11: sensor
+# lane -48.6 deg vs route -24.6 deg passed the 35 deg heading gate and
+# the car S-curved 2.7 m left then 5.2 m right of the centreline).
+LANE_ROUTE_TURN_MAX_DEG = 25.0
+LANE_ROUTE_TURN_LOOK_M = 12.0
+
+
 class FSDTick:
     """One planning-tick result from ``FSDStack``."""
 
@@ -383,13 +393,27 @@ class FSDStack:
         if lane_frame is not None and map_lane is not None:
             try:
                 from beamng_autopilot.planning.arbiter import (
-                    lane_heading_ok, lane_side_ok)
+                    lane_heading_ok, lane_route_turn_ok,
+                    lane_side_ok)
                 # Bearing gate: the lane must HEAD the same way as the
                 # route (junction pairing onto a side road is rejected).
                 side_bad = False
+                corner_bad = False
                 if not lane_heading_ok(route_ref, lane_ref, pos, heading,
                              max_yaw_deg=LANE_HEADING_MAX_YAW_DEG):
                     lane_rejected = True
+                # CORNER gate: at a real turn in the nav route the
+                # map-prior own lane is the authority - the sensor lane
+                # reads the corner wide and steers the car off the line
+                # (see LANE_ROUTE_TURN_MAX_DEG).  The 35 deg heading gate
+                # alone does not catch it: a wide corner read can still
+                # be within 35 deg of the route.
+                elif not lane_route_turn_ok(
+                        route_ref, pos,
+                        look_m=LANE_ROUTE_TURN_LOOK_M,
+                        max_turn_deg=LANE_ROUTE_TURN_MAX_DEG):
+                    lane_rejected = True
+                    corner_bad = True
                 # SIDE gate: the lane centre must sit clearly RIGHT of the
                 # road centreline (own lane).  A lane locked onto the
                 # ONCOMING lane passes the bearing gate (same direction)
@@ -411,7 +435,8 @@ class FSDStack:
                     side_bad = True
                 if lane_rejected:
                     out.meta["lane_reject_reason"] = (
-                        "side" if side_bad else "heading")
+                        "side" if side_bad
+                        else "corner" if corner_bad else "heading")
                     sensor_paired = False
                     lane_ref = None
                     lane_left = None
