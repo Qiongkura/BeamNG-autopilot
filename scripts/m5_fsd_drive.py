@@ -34,7 +34,9 @@ from beamng_autopilot.control import gearbox
 from beamng_autopilot.control.reverse_guard import ReverseGuard
 from beamng_autopilot.control.reverse_maneuver import ReverseManeuver
 from beamng_autopilot.control.pure_pursuit import PurePursuit
-from beamng_autopilot.control.speed import SpeedController
+from beamng_autopilot.control.speed import (
+    SpeedController, rate_limit_pedal,
+)
 from beamng_autopilot.fsd_stack import FSDStack
 from beamng_autopilot.occupancy import OccupancyGrid
 from beamng_autopilot.planning import (
@@ -502,6 +504,8 @@ def main() -> int:
         warmup_until = time.time() + WARMUP_S
         target_sm = float(args.speed)
         plan_sm = float(args.speed)
+        prev_thr = 0.0
+        prev_brk = 0.0
         gov_brake = False
         # First-frame steering: with last_t set to NOW the first tick has
         # dt ~= 0, smooth_steer cannot move the wheel, and the car runs
@@ -1307,6 +1311,20 @@ def main() -> int:
                 brk = max(brk, END_BRAKE)
                 if v < 0.4:
                     pb = 1.0
+            # Pedal rate limit: the branches above (downhill cap, taper,
+            # governor, climb/reverse/hard-stop) can step thr/brk by a
+            # whole pedal in one tick - a relaunch then reads as a speed
+            # kick (opt23: 13 speed jumps >1.5 m/s per tick).  Ramp the
+            # FINAL commanded pedals toward the previous tick's at bounded
+            # rates; safety branches bypass on purpose (hard stop, climb,
+            # reverse escape, end-zone hold).
+            _hard_pedal = bool(
+                force_stop or stuck or climb or rm.active or reversing
+                or (rem_end is not None and rem_end < END_STOP_M))
+            if not _hard_pedal:
+                thr, brk = rate_limit_pedal(
+                    thr, brk, prev_thr, prev_brk, dt)
+            prev_thr, prev_brk = thr, brk
             conn.control(throttle=thr, brake=brk, steering=steer,
                          gear=gear_use, parkingbrake=pb)
             # Lane-position telemetry: signed lateral offset of the ego from

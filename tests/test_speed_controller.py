@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from beamng_autopilot.control.speed import SpeedController
+import pytest
+
+from beamng_autopilot.control.speed import SpeedController, rate_limit_pedal
 
 
 def _fresh(hyst: float = 0.0, **kw):
@@ -83,3 +85,27 @@ class TestHysteresis:
         thr, brk = _drive(c, 5.4, 5.0, n=4)
         assert thr > 0.0 and brk == 0.0
         assert c._mode == 1
+
+
+def test_rate_limit_pedal_ramps_up_and_down() -> None:
+    """The final commanded pedals ramp at bounded rates per sim second."""
+    thr, brk = rate_limit_pedal(0.8, 0.0, 0.0, 0.0, dt=0.4)
+    assert thr == pytest.approx(0.32)          # 0.8/s * 0.4 s
+    assert brk == 0.0
+    thr, brk = rate_limit_pedal(0.8, 0.0, thr, brk, dt=0.4)
+    assert thr == pytest.approx(0.64)
+    thr, brk = rate_limit_pedal(0.0, 1.0, thr, brk, dt=0.4)
+    assert thr == pytest.approx(0.16)          # down 1.2/s * 0.4 s
+    assert brk == pytest.approx(0.48)          # up 1.2/s * 0.4 s
+
+
+def test_rate_limit_pedal_keeps_small_changes() -> None:
+    thr, brk = rate_limit_pedal(0.3, 0.0, 0.2, 0.0, dt=0.4)
+    assert thr == pytest.approx(0.3)
+    assert brk == 0.0
+
+
+def test_rate_limit_pedal_clamps_low_end() -> None:
+    thr, brk = rate_limit_pedal(0.0, 0.0, 0.1, 0.1, dt=0.4)
+    assert thr == 0.0
+    assert brk == 0.0

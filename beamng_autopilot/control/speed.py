@@ -20,6 +20,30 @@ def _ramp(current: float, target: float, up: float, down: float) -> float:
     return current - min(down, current - target)
 
 
+def rate_limit_pedal(throttle: float, brake: float,
+                     prev_throttle: float, prev_brake: float,
+                     dt: float,
+                     thr_up: float = 0.8, thr_down: float = 1.2,
+                     brk_up: float = 1.2, brk_down: float = 0.8,
+                     ) -> tuple[float, float]:
+    """Clamp commanded pedals toward the previous tick's at bounded rates.
+
+    ``SpeedController`` already ramps its own outputs, but a driving loop
+    overrides them (downhill cap, overspeed taper, bend governor, climb /
+    reverse / hard stop) and feeds the result straight to the vehicle - an
+    override step (0 -> 0.8 throttle after a relaunch) reads as a visible
+    speed kick.  Applying this AFTER all overrides makes every *commanded*
+    change a linear ramp; safety branches bypass it on purpose (hard stop,
+    climb, reverse escape, end-zone hold).
+    """
+    dt = max(0.01, float(dt))
+    thr = float(np.clip(throttle, prev_throttle - thr_down * dt,
+                        prev_throttle + thr_up * dt))
+    brk = float(np.clip(brake, prev_brake - brk_down * dt,
+                        prev_brake + brk_up * dt))
+    return thr, brk
+
+
 class SpeedController:
     """Convert target speed to smooth throttle/brake commands."""
 
