@@ -110,8 +110,25 @@ HEADING_DEV_START_DEG = 12.0
 HEADING_DEV_FULL_DEG = 40.0
 HEADING_DEV_CAP_MPS = 5.0
 HEADING_DEV_FLOOR_MPS = 1.5
-GOV_ON_MPS = 1.0
-GOV_OFF_MPS = 0.5
+# Map road-edge guard: the real DecalRoad left/right edges are the
+# hard map prior for "where the road is".  Once the ego crosses an
+# edge the car is on grass/verge (right) or in the oncoming lane
+# (left) - cut the target hard so it never cruises off-road (opt13:
+# with no nav route the straight-line reference drove straight onto
+# grass and crept there).  Thresholds are beyond the own-lane centre
+# so normal right-lane driving is never punished.
+ROAD_OFF_EDGE_M = 1.0     # past an edge: crawl (stop if it worsens)
+ROAD_OFF_CRAWL_MPS = 0.5
+ROAD_EDGE_SLOW_MPS = 2.0
+# Map-prior lane centre EMA: map_lane_edges re-derives the own-lane
+# centre every frame from the road edges; at junctions / edge
+# sampling switches it can wiggle a few degrees between frames and
+# feed the steering loop (opt12: map_lane bearing swung ~7 deg).
+# Blend the new centre with the previous one (arc-aligned) so the
+# reference stays smooth; boundaries are left untouched.
+MAP_LANE_EMA = 0.6
+GOV_ON_MPS = 0.8
+GOV_OFF_MPS = 0.4
 GOV_BRAKE = 0.25
 
 
@@ -433,6 +450,7 @@ def main() -> int:
               f"for {args.seconds}s at {args.speed} m/s")
 
         prev_steer = 0.0  # rate-limited steering state (rule-autopilot convention)
+        map_mc_smooth = None   # EMA-smoothed map-prior lane centre
         last_h = None      # previous heading for the yaw-rate steering damper
         climb_t = 0.0      # seconds spent in slope-creep assist
         stuck_t = 0.0    # seconds at near-standstill with a "safe" plan
@@ -538,6 +556,27 @@ def main() -> int:
                         nav_route, road_left, road_right, pos, heading)
                 except Exception:
                     map_lane = None
+            if map_lane is not None:
+                _mc = np.asarray(map_lane[0], dtype=float)[:, :2]
+                if map_mc_smooth is not None and len(_mc) >= 3 \
+                        and len(map_mc_smooth) >= 3:
+                    try:
+                        _a_new = np.concatenate([[0.0], np.cumsum(
+                            np.linalg.norm(np.diff(_mc, axis=0), axis=1))])
+                        _a_old = np.concatenate([[0.0], np.cumsum(
+                            np.linalg.norm(np.diff(map_mc_smooth, axis=0),
+                                           axis=1))])
+                        _al = np.empty_like(_mc)
+                        for _j in range(len(_mc)):
+                            _k = int(np.clip(np.searchsorted(
+                                _a_old, _a_new[_j]), 0,
+                                len(map_mc_smooth) - 1))
+                            _al[_j] = map_mc_smooth[_k]
+                        _mc = _al * (1.0 - MAP_LANE_EMA) + _mc * MAP_LANE_EMA
+                    except Exception:
+                        pass
+                map_mc_smooth = _mc.copy()
+                map_lane = (_mc, map_lane[1], map_lane[2])
             _ta = time.time()  # local route / map lane / FSD tick split
             out = stack.tick(st=st, route_ref=route_local,
                                    map_lane_override=map_lane)
@@ -810,6 +849,31 @@ def main() -> int:
                                    - HEADING_DEV_FLOOR_MPS)
                                 * (1.0 - _k))
                     target = min(target, _hdg_cap)
+            # No-route guard: without a nav route there is no map prior to
+            # keep the car on the road - a straight-line reference drives
+            # straight onto grass (opt13 2026-08-28: no route after a game
+            # restart, car crept on the grass at 0-4 m/s).  Never cruise
+            # without a route; the caller must pass --goal.
+            if nav_route is None:
+                target = min(target, 1.0)
+            # Map road-edge guard: hard DecalRoad edges are the ground
+            # truth for "on the road".  Past an edge (grass/verge on the
+            # right, oncoming lane on the left) the car must not keep
+            # driving - crawl at 0.5 m/s; the monitor still stops it if
+            # the path is blocked.
+            road_off = 0.0
+            if road_left is not None and road_right is not None:
+                _fl2 = np.array([math.cos(heading), math.sin(heading)])
+                _rl2, _okl2 = _boundary_lateral(
+                    float(pos[0]), float(pos[1]), road_left, _fl2)
+                _rr2, _okr2 = _boundary_lateral(
+                    float(pos[0]), float(pos[1]), road_right, _fl2)
+                if _okl2 and _okr2:
+                    road_off = max(-float(_rr2), float(_rl2), 0.0)
+                    if road_off > ROAD_OFF_EDGE_M:
+                        target = min(target, ROAD_OFF_CRAWL_MPS)
+                    elif road_off > 0.0:
+                        target = min(target, ROAD_EDGE_SLOW_MPS)
             # Warm-up crawl + stale-tick scrub (real-time mode): before
             # the object head is live, or after an unusually long tick,
             # the car has been driving open-loop - keep it slow.
@@ -1098,6 +1162,7 @@ def main() -> int:
                 "yaw_rate": round(float(yaw_rate), 3),
                 "ff_steer": round(float(ff_steer), 3),
                 "climb": int(bool(climb)),
+                "road_off": round(float(road_off), 3),
                 "pp_tgt": ([round(float(v), 2) for v in pp_tgt[:2]]
                            if pp_tgt is not None else None),
                 "lane_bear": _ref_bearing(out.lane_ref, pos),
