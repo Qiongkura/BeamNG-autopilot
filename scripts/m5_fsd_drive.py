@@ -131,6 +131,14 @@ HEADING_DEV_FLOOR_MPS = 1.5
 ROAD_OFF_EDGE_M = 1.0     # past an edge: crawl (stop if it worsens)
 ROAD_OFF_CRAWL_MPS = 0.5
 ROAD_EDGE_SLOW_MPS = 2.0
+# Past STOP_M the car is definitively off the road - stop creeping and
+# steer back to the road centre (town opt24: after a 90-deg corner cut
+# the car drove 20 m on grass because route_local anchors at the car
+# and the old guard only capped at 0.5 m/s).
+ROAD_OFF_STOP_M = 3.0   # beyond this = definitely off-road (hard stop);
+                    # junction/start offsets stay ~2 m and only crawl
+ROAD_RETURN_LOOK_M = 40.0  # road-centre target for the return steering
+ROAD_RETURN_STEER_MAX = 0.55
 # Map-prior lane centre EMA: map_lane_edges re-derives the own-lane
 # centre every frame from the road edges; at junctions / edge
 # sampling switches it can wiggle a few degrees between frames and
@@ -1048,15 +1056,28 @@ def main() -> int:
             # driving - crawl at 0.5 m/s; the monitor still stops it if
             # the path is blocked.
             road_off = 0.0
+            off_recover = False
             if road_left is not None and road_right is not None:
                 _fl2 = np.array([math.cos(heading), math.sin(heading)])
+                # Endpoint (junction) readings are deliberately NOT forced:
+                # a road edge ends exactly where the car legitimately
+                # crosses the junction, and forcing coverage flagged the
+                # crossroads start as 2 m off-road and hard-stopped the
+                # car at spawn (town opt24).  The sharp-corner cut still
+                # triggers once the car is genuinely beyond the edge (the
+                # nearest point is then an interior segment, covered=True).
                 _rl2, _okl2 = _boundary_lateral(
                     float(pos[0]), float(pos[1]), road_left, _fl2)
                 _rr2, _okr2 = _boundary_lateral(
                     float(pos[0]), float(pos[1]), road_right, _fl2)
                 if _okl2 and _okr2:
                     road_off = max(-float(_rr2), float(_rl2), 0.0)
-                    if road_off > ROAD_OFF_EDGE_M:
+                    if road_off > ROAD_OFF_STOP_M:
+                        # Hard stop + return steering (recovery block
+                        # below), not a 0.5 m/s grass cruise.
+                        target = min(target, ROAD_OFF_CRAWL_MPS)
+                        off_recover = True
+                    elif road_off > ROAD_OFF_EDGE_M:
                         target = min(target, ROAD_OFF_CRAWL_MPS)
                     elif road_off > 0.0:
                         target = min(target, ROAD_EDGE_SLOW_MPS)
@@ -1197,7 +1218,8 @@ def main() -> int:
             # the stuck detector sent the car backwards downhill instead
             # of giving it torque.
             climb = False
-            if (stuck and not force_stop and chosen.path is not None
+            if (stuck and not force_stop and not off_recover
+                    and chosen.path is not None
                     and len(chosen.path) >= 2
                     and np.isfinite(fwd_clear) and fwd_clear > 3.0):
                 if climb_t < CLIMB_ASSIST_S:
@@ -1205,7 +1227,8 @@ def main() -> int:
                     climb_t += max(0.0, float(dt))
                 else:
                     climb_t = 0.0  # give up climbing -> allow reverse
-            if (chosen.path is None or force_stop or stuck) and not climb:
+            if (chosen.path is None or force_stop or stuck) \
+                    and not climb and not off_recover:
                 thr, brk = 0.0, 1.0
                 steer = 0.0
                 stopps += 1
@@ -1223,7 +1246,8 @@ def main() -> int:
             # clearance data -> stay stopped).
             has_forward_path = (chosen.path is not None
                                 and len(chosen.path) >= 2
-                                and not force_stop and not stuck) or climb
+                                and not force_stop and not stuck) or climb \
+                or off_recover
             # Arrived at the destination: once inside the stop zone and
             # nearly stopped, treat the forward path as present so the
             # reverse escape never backs the car over the line at the end
@@ -1297,6 +1321,20 @@ def main() -> int:
                 thr, brk = 0.0, max(brk, float(rev_brk))
                 steer = 0.0
                 if signed < -0.1:
+                    pb = 1.0
+            # Off-road recovery: the hard DecalRoad edges are the ground
+            # truth for "on the road".  Once the car has LEFT the road
+            # (grass/verge on the right, oncoming side on the left) it
+            # must not keep driving - creeping on the verge understeered
+            # 2 m -> 10 m further away at the town corner (opt24).  Hard
+            # stop + hold like the end zone; the driver / next teleport
+            # repositions.  Reverse escape is suppressed while off-road
+            # (has_forward_path above) so it never backs further off.
+            if off_recover:
+                thr = 0.0
+                brk = max(brk, END_BRAKE)
+                steer = 0.0
+                if v < 0.4:
                     pb = 1.0
             # End-of-route hard stop + hold: target=0 alone only asks the
             # speed controller for a gentle ramp (brk ~0.16 at 1.3 m/s),
@@ -1398,6 +1436,7 @@ def main() -> int:
                 "ff_steer": round(float(ff_steer), 3),
                 "climb": int(bool(climb)),
                 "road_off": round(float(road_off), 3),
+                "off_recover": int(off_recover),
                 "rem_end": (round(float(rem_end), 2)
                             if rem_end is not None else None),
                 "mon_target": round(float(verd.target_speed), 2),
