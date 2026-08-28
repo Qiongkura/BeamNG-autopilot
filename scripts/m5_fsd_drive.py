@@ -41,7 +41,9 @@ from beamng_autopilot.planning import (
     Scene, anchored_rule_ref, arbitrate, local_route,
 )
 from beamng_autopilot.planning.constraints import _boundary_lateral
-from beamng_autopilot.planning.local_route import map_lane_edges
+from beamng_autopilot.planning.local_route import (
+    map_lane_edges, _project_arc,
+)
 from beamng_autopilot.planning.speed_profile import \
     speed_profile_for_path as _spf_raw
 from beamng_autopilot.roadnet import RoadNetwork
@@ -127,6 +129,17 @@ ROAD_EDGE_SLOW_MPS = 2.0
 # Blend the new centre with the previous one (arc-aligned) so the
 # reference stays smooth; boundaries are left untouched.
 MAP_LANE_EMA = 0.6
+# End-of-route handling: the nav route is finite.  When the local
+# forward window reaches the route END, the car has arrived; without
+# an explicit stop it creeps onto the road end / kerb and parks over
+# the edge line (opt15 2026-08-28: parked at the destination with
+# lat_right -0.3~-0.5 m, i.e. over the right line).  Slow from 10 m
+# out and stop from 4 m out, while the planner still keeps the lane
+# centre, so the car ends gently in its lane before the road end.
+END_START_SLOW_M = 12.0
+END_STOP_M = 6.0
+END_SLOW_MPS = 1.0
+END_BRAKE = 0.7
 GOV_ON_MPS = 0.8
 GOV_OFF_MPS = 0.4
 GOV_BRAKE = 0.25
@@ -451,6 +464,7 @@ def main() -> int:
 
         prev_steer = 0.0  # rate-limited steering state (rule-autopilot convention)
         map_mc_smooth = None   # EMA-smoothed map-prior lane centre
+        map_lc_smooth = None   # EMA-smoothed TRUE (geometric) lane centre
         last_h = None      # previous heading for the yaw-rate steering damper
         climb_t = 0.0      # seconds spent in slope-creep assist
         stuck_t = 0.0    # seconds at near-standstill with a "safe" plan
@@ -577,6 +591,56 @@ def main() -> int:
                         pass
                 map_mc_smooth = _mc.copy()
                 map_lane = (_mc, map_lane[1], map_lane[2])
+                # TRUE own-lane centre = midpoint of the rounded road
+                # centreline (left boundary) and the real right edge.
+                # map_mc_smooth is the CAR-ANCHORED blended centre (it
+                # starts at the ego's current lateral and converges over
+                # CENTER_BLEND_M): a car that enters the end zone left of
+                # lane centre keeps a reference LEFT of the true centre,
+                # so the stop parks it hugging the line (opt20: ll -1.12
+                # vs true -1.75/-2.0).  Keep the geometric centre too and
+                # use it for end-zone steering.
+                try:
+                    _lbt = np.asarray(map_lane[1], dtype=float)[:, :2]
+                    _rbt = np.asarray(map_lane[2], dtype=float)[:, :2]
+                    _n2 = min(len(_lbt), len(_rbt))
+                    _lct = (_lbt[:_n2] + _rbt[:_n2]) * 0.5
+                    if map_lc_smooth is not None and len(_lct) >= 3 \
+                            and len(map_lc_smooth) >= 3:
+                        _a3 = np.concatenate([[0.0], np.cumsum(np.linalg.norm(
+                            np.diff(_lct, axis=0), axis=1))])
+                        _a4 = np.concatenate([[0.0], np.cumsum(np.linalg.norm(
+                            np.diff(map_lc_smooth, axis=0), axis=1))])
+                        _al3 = np.empty_like(_lct)
+                        for _j3 in range(len(_lct)):
+                            _k3 = int(np.clip(np.searchsorted(
+                                _a4, _a3[_j3]), 0,
+                                len(map_lc_smooth) - 1))
+                            _al3[_j3] = map_lc_smooth[_k3]
+                        _lct = _al3 * (1.0 - MAP_LANE_EMA) + _lct * MAP_LANE_EMA
+                    map_lc_smooth = _lct
+                except Exception:
+                    map_lc_smooth = None
+            # End-of-route remaining distance, measured on the FULL nav
+            # route (arc from the ego's projection to the route END).
+            # The old end-stop checked route_local[-1] against
+            # nav_route[-1]; right at the end the local window collapses
+            # to a straight fallback (its last point jumps ~40 m away),
+            # so rem_end became None exactly at the goal, the end-stop
+            # released, and the car crept onto the centre line and
+            # parked ON it (opt17: lat_left 0.00 -> +0.97 inside oncoming
+            # -> parked lat_left 0.00).  Computed here so the steering
+            # zone override and the target cap both use it.
+            rem_end = None
+            if nav_route is not None and len(nav_route) >= 2:
+                try:
+                    _r2 = np.asarray(nav_route[:, :2], dtype=float)
+                    _arc2 = np.concatenate([[0.0], np.cumsum(np.linalg.norm(
+                        np.diff(_r2, axis=0), axis=1))])
+                    _proj2 = _project_arc(_r2, pos[:2])
+                    rem_end = float(max(0.0, _arc2[-1] - _proj2))
+                except Exception:
+                    rem_end = None
             _ta = time.time()  # local route / map lane / FSD tick split
             out = stack.tick(st=st, route_ref=route_local,
                                    map_lane_override=map_lane)
@@ -678,11 +742,59 @@ def main() -> int:
                                             planner_age_s=0.0)
                 except Exception:
                     pass
+            # End-zone steering reference: inside the final stop zone the
+            # raw route tail sits ON the road centre line at the
+            # destination (the road ends / edges swap there) and the
+            # near-end map lane can collapse onto the centreline -
+            # following it parked the car ON the line (opt17: lat_left
+            # 0.00 -> +0.97 inside oncoming -> parked lat_left 0.00).
+            # Steer along the LAST GOOD own-lane centre bearing as a
+            # STRAIGHT reference (a short clipped lane-centre window
+            # would wrap inside PurePursuit's 5-16 m lookahead and point
+            # backward), so the car brakes to a stop centred in its lane
+            # instead of turning onto the line.
+            steer_path = chosen.path
+            if rem_end is not None and rem_end < END_START_SLOW_M:
+                _bear = None
+                _anchor = np.asarray(pos[:2], dtype=float)
+                # Use the TRUE own-lane centre (midpoint of the rounded
+                # centreline and the real right edge) while it is still
+                # valid (>= ~2 m before the route end; inside 2 m the
+                # road ends / edges swap and the lane centre degenerates
+                # onto the centreline - opt17 lat_left 0.00).  Anchor the
+                # reference at the true lane centre nearest the ego so
+                # the car is pulled to the CENTRE of its lane during the
+                # slow-down instead of holding its entry offset (opt20:
+                # entered at ll=-1.14 and the hard brake parked it there
+                # - left edge 0.17 m from the line).
+                if rem_end >= 2.0 and map_lc_smooth is not None \
+                        and len(map_lc_smooth) >= 3:
+                    _ep2 = np.asarray(map_lc_smooth, dtype=float)[:, :2]
+                    _pd2 = np.asarray(pos[:2], dtype=float)
+                    _dd2 = np.linalg.norm(_ep2 - _pd2, axis=1)
+                    _k0 = int(np.argmin(_dd2))
+                    if _dd2[_k0] < 8.0:
+                        _anchor = _ep2[_k0]
+                    _lim2 = min(8.0, max(2.0, float(rem_end) - 0.5))
+                    _near2 = np.flatnonzero((_dd2 >= 0.5) & (_dd2 <= _lim2))
+                    if len(_near2) >= 2:
+                        _a2, _b2 = int(_near2[0]), int(_near2[-1])
+                        _v2 = _ep2[_b2] - _ep2[_a2]
+                        if float(np.linalg.norm(_v2)) > 1e-6:
+                            _bear = float(math.atan2(_v2[1], _v2[0]))
+                if _bear is None:
+                    # Very close to the road end: hold the current heading
+                    # straight (the car is nearly stopped and in its lane)
+                    # instead of following the degenerate tail.
+                    _bear = float(heading)
+                _f3 = np.array([math.cos(_bear), math.sin(_bear)])
+                steer_path = _anchor + _f3 * np.arange(
+                    0.0, 8.0, 0.8)[:, None]
             steer = 0.0
             pp_alpha = None
             pp_tgt = None
             ff_steer = 0.0
-            if chosen.path is not None and len(chosen.path) >= 2:
+            if steer_path is not None and len(steer_path) >= 2:
                 # Same conversion as the proven rule autopilot: PurePursuit
                 # returns the steering ANGLE (rad), BeamNG expects a
                 # normalized input with the OPPOSITE sign (left target ->
@@ -704,9 +816,9 @@ def main() -> int:
                 pp.lookahead = float(np.clip(
                     5.0 + 0.55 * max(0.0, v), 4.0, 16.0))
                 steer_rad, pp_tgt, pp_near = pp.steering(
-                    pos, heading, np.asarray(chosen.path))
+                    pos, heading, np.asarray(steer_path))
                 steer_rad = float(steer_rad)
-                ff_steer = _path_curvature_ff(chosen.path, pos, heading)
+                ff_steer = _path_curvature_ff(steer_path, pos, heading)
                 new_steer = float(np.clip(
                     -steer_rad / 0.6 + ff_steer, -1.0, 1.0))
                 # Speed-adaptive steering cap (same as the proven rule
@@ -874,6 +986,15 @@ def main() -> int:
                         target = min(target, ROAD_OFF_CRAWL_MPS)
                     elif road_off > 0.0:
                         target = min(target, ROAD_EDGE_SLOW_MPS)
+            # End-of-route (rem_end computed above from the FULL nav route
+            # arc, so it never goes None when the local window collapses):
+            # ease to a stop while still in the lane instead of parking
+            # over the edge line at the road end (opt15).
+            if rem_end is not None:
+                if rem_end < END_STOP_M:
+                    target = 0.0
+                elif rem_end < END_START_SLOW_M:
+                    target = min(target, END_SLOW_MPS)
             # Warm-up crawl + stale-tick scrub (real-time mode): before
             # the object head is live, or after an unusually long tick,
             # the car has been driving open-loop - keep it slow.
@@ -1024,6 +1145,13 @@ def main() -> int:
             has_forward_path = (chosen.path is not None
                                 and len(chosen.path) >= 2
                                 and not force_stop and not stuck) or climb
+            # Arrived at the destination: once inside the stop zone and
+            # nearly stopped, treat the forward path as present so the
+            # reverse escape never backs the car over the line at the end
+            # (opt18: rev=1 at the goal moved the car onto the oncoming
+            # lane and it parked over the line).
+            if rem_end is not None and rem_end < END_STOP_M and v < 0.6:
+                has_forward_path = True
             rear_clear_m = None
             if not has_forward_path and grid is not None:
                 try:
@@ -1090,6 +1218,19 @@ def main() -> int:
                 thr, brk = 0.0, max(brk, float(rev_brk))
                 steer = 0.0
                 if signed < -0.1:
+                    pb = 1.0
+            # End-of-route hard stop + hold: target=0 alone only asks the
+            # speed controller for a gentle ramp (brk ~0.16 at 1.3 m/s),
+            # so the car rolled through the whole stop zone, the lane
+            # reference collapsed onto the centre line and it parked ON
+            # the line (opt18: ll -1.00 -> 0.00 at rem 4->0, final parked
+            # over the line after the reverse escape).  Inside the stop
+            # zone brake hard so the car stops BEFORE the degenerate road
+            # end, and hold with the handbrake once stopped.
+            if rem_end is not None and rem_end < END_STOP_M:
+                thr = 0.0
+                brk = max(brk, END_BRAKE)
+                if v < 0.4:
                     pb = 1.0
             conn.control(throttle=thr, brake=brk, steering=steer,
                          gear=gear_use, parkingbrake=pb)
@@ -1163,6 +1304,8 @@ def main() -> int:
                 "ff_steer": round(float(ff_steer), 3),
                 "climb": int(bool(climb)),
                 "road_off": round(float(road_off), 3),
+                "rem_end": (round(float(rem_end), 2)
+                            if rem_end is not None else None),
                 "pp_tgt": ([round(float(v), 2) for v in pp_tgt[:2]]
                            if pp_tgt is not None else None),
                 "lane_bear": _ref_bearing(out.lane_ref, pos),
