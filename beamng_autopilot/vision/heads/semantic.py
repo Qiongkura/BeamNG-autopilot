@@ -65,5 +65,15 @@ class SemanticHead:
                     ground_z=ctx.ground_z)
             except Exception:
                 markings = []
+            if not markings and not line.any():
+                # Model unavailable or predicted no paint: fall back to the
+                # classic-CV colour-threshold detector so the planner still
+                # receives lane markings instead of an empty sensor lane.
+                try:
+                    markings = self._get_lanes().detect(
+                        ctx.frame_rgb, ctx.cam, ctx.pos, ctx.heading,
+                        ground_z=ctx.ground_z)
+                except Exception:
+                    markings = []
         out.meta["markings"] = markings
         return out

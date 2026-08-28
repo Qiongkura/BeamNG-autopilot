@@ -106,14 +106,28 @@ def test_semantic_head_masks_and_markings() -> None:
 
 def test_semantic_head_absent_model_falls_back() -> None:
     """Without a trained model the semantic head must not crash: it returns
-    an all-road mask (no sensor lane) and no markings."""
+    an all-road mask and falls back to classic-CV lane detection."""
     from beamng_autopilot.vision.heads.semantic import SemanticHead
 
     head = SemanticHead(segmenter="missing")  # never used; forces fallback
     out = head.run(_ctx())
     assert out.masks["road"].dtype == bool
     assert out.masks["road"].all()
-    assert out.meta["markings"] == []
+    assert isinstance(out.meta["markings"], list)
+
+
+def test_semantic_head_fallback_uses_classic_lanes() -> None:
+    """When the segmentation model is absent the head must call the
+    classic-CV LaneDetector and surface its markings to the planner."""
+    from beamng_autopilot.vision.heads.semantic import SemanticHead
+
+    class FakeLanes:
+        def detect(self, *a, **k):
+            return [("cv-mark", 2.0)]
+
+    head = SemanticHead(segmenter="missing", lane_detector=FakeLanes())
+    out = head.run(_ctx())
+    assert out.meta["markings"] == [("cv-mark", 2.0)]
 
 
 def test_object_head_skips_disabled_roles() -> None:
