@@ -687,7 +687,37 @@ def main() -> int:
                     _lbt = np.asarray(map_lane[1], dtype=float)[:, :2]
                     _rbt = np.asarray(map_lane[2], dtype=float)[:, :2]
                     _n2 = min(len(_lbt), len(_rbt))
-                    _lct = (_lbt[:_n2] + _rbt[:_n2]) * 0.5
+                    # Robust geometric centre: only rows whose right edge
+                    # REALLY sits right of the centreline count as a lane.
+                    # At a hairpin apex / road end the edge rows swap (the
+                    # graph tangent reverses there) and the plain midpoint
+                    # collapses onto the centreline - the end-zone
+                    # reference then pulled the car onto the line and
+                    # parked it there (opt26: lat_left -0.73, body across
+                    # the centreline).  Invalid rows fall back to the
+                    # parallel offset at the median valid half-width.
+                    _lcn = np.zeros((_n2, 2), dtype=float)
+                    for _j in range(_n2):
+                        _j0 = max(0, _j - 2)
+                        _j1 = min(_n2 - 1, _j + 2)
+                        _tv = _lbt[_j1] - _lbt[_j0]
+                        _L2 = float(np.linalg.norm(_tv))
+                        if _L2 > 1e-9:
+                            _lcn[_j] = np.array(
+                                [_tv[1] / _L2, -_tv[0] / _L2])
+                    _side = np.sum(
+                        (_rbt[:_n2] - _lbt[:_n2]) * _lcn, axis=1)
+                    _valid = np.isfinite(_side) & (_side > 0.3)
+                    _hws = np.linalg.norm(
+                        _rbt[:_n2] - _lbt[:_n2], axis=1)
+                    if np.any(_valid):
+                        _hw2 = float(np.median(_hws[_valid]) * 0.5)
+                    else:
+                        _hw2 = 2.0
+                    _lct = np.where(
+                        _valid[:, None],
+                        (_lbt[:_n2] + _rbt[:_n2]) * 0.5,
+                        _lbt[:_n2] + _lcn * _hw2)
                     if map_lc_smooth is not None and len(_lct) >= 3 \
                             and len(map_lc_smooth) >= 3:
                         _a3 = np.concatenate([[0.0], np.cumsum(np.linalg.norm(
@@ -855,16 +885,82 @@ def main() -> int:
                     _ep2 = np.asarray(map_lc_smooth, dtype=float)[:, :2]
                     _pd2 = np.asarray(pos[:2], dtype=float)
                     _dd2 = np.linalg.norm(_ep2 - _pd2, axis=1)
-                    _k0 = int(np.argmin(_dd2))
-                    if _dd2[_k0] < 8.0:
-                        _anchor = _ep2[_k0]
-                    _lim2 = min(8.0, max(2.0, float(rem_end) - 0.5))
-                    _near2 = np.flatnonzero((_dd2 >= 0.5) & (_dd2 <= _lim2))
-                    if len(_near2) >= 2:
-                        _a2, _b2 = int(_near2[0]), int(_near2[-1])
-                        _v2 = _ep2[_b2] - _ep2[_a2]
-                        if float(np.linalg.norm(_v2)) > 1e-6:
-                            _bear = float(math.atan2(_v2[1], _v2[0]))
+                    # Anchor AHEAD of the car (not the nearest point,
+                    # which often sits behind it): a straight reference
+                    # that starts behind the ego only carries the lane
+                    # direction, so the car keeps its entry offset and
+                    # can park over the line (opt29: entered at -1.2 m,
+                    # stopped at -1.29 m).  An anchor 1.5-6 m AHEAD on
+                    # the true lane centre pulls the pursuit target to
+                    # the right and converges the car into the lane
+                    # during the slow-down.
+                    _f2a = np.array([math.cos(heading), math.sin(heading)])
+                    _rn2 = np.array([math.sin(heading), -math.cos(heading)])
+                    _ahead3 = (np.sum(
+                        (_ep2 - _pd2[None, :]) * _f2a[None, :], axis=1) > 0.0)
+                    # Point the reference AT a lane-centre point 1-6 m
+                    # AHEAD and clearly RIGHT of the car.  A straight
+                    # reference along the lane direction carries no
+                    # lateral pull (map_lane_edges is car-anchored, so
+                    # the car keeps its entry offset - opt29 parked
+                    # 1.3 m off-centre, body over the line).  Aiming at
+                    # the ahead centre point gives the pursuit target a
+                    # real sideways offset and converges the car into
+                    # the lane during the slow-down.  The right-side
+                    # check drops degenerate tail points that sit left
+                    # of the line.
+                    _side3 = np.sum(
+                        (_ep2 - _pd2[None, :]) * _rn2[None, :], axis=1)
+                    _cand2 = np.flatnonzero(
+                        _ahead3 & (_side3 > 0.4)
+                        & (_dd2 >= 1.8) & (_dd2 <= 3.5))
+                    if len(_cand2):
+                        _k0 = int(_cand2[np.argmin(_dd2[_cand2])])
+                        _tgt2 = _ep2[_k0]
+                        _anchor = np.asarray(pos[:2], dtype=float)
+                        _v3 = _tgt2 - _anchor
+                        if float(np.linalg.norm(_v3)) > 1e-6:
+                            _bear = float(math.atan2(_v3[1], _v3[0]))
+                    else:
+                        _k0 = int(np.argmin(_dd2))
+                        if _dd2[_k0] < 8.0:
+                            _anchor = _ep2[_k0]
+                    # Only the NEAR part of the lane centre is trusted
+                    # for the bearing (when no ahead target point was
+                    # found): farther out the route tail bends toward the
+                    # (off-road) goal and the edge rows swap, and the
+                    # midpoint collapses left of the centreline - a
+                    # 0.5-7.6 m window then pointed the reference left
+                    # and parked the car over the line (opt27: lat_left
+                    # -0.88).  The car only needs the direction of the
+                    # lane it is stopping IN, which is the near 5 m.
+                    if _bear is None:
+                        _lim2 = min(5.0, max(2.0, float(rem_end) - 0.5))
+                        _near2 = np.flatnonzero(
+                            (_dd2 >= 0.5) & (_dd2 <= _lim2))
+                        if len(_near2) >= 2:
+                            # Direction from the two points CLOSEST to the
+                            # car that are AHEAD of it: index order is
+                            # lane-arc order, not distance order, and the
+                            # nearest pair can sit BEHIND the car (reverse
+                            # bearing) or span into the degenerate route
+                            # tail (points left) - both parked the car
+                            # over the line (opt27/28).
+                            _f2 = np.array(
+                                [math.cos(heading), math.sin(heading)])
+                            _ahead2 = (np.sum(
+                                (_ep2[_near2] - _pd2[None, :])
+                                * _f2[None, :], axis=1) > 0.0)
+                            _ord2 = _near2[np.argsort(_dd2[_near2])]
+                            _fwd2 = _ord2[
+                                _ahead2[np.argsort(_dd2[_near2])]]
+                            if len(_fwd2) >= 2:
+                                _ord2 = _fwd2
+                            _a2, _b2 = int(_ord2[0]), int(_ord2[1])
+                            _v2 = _ep2[_b2] - _ep2[_a2]
+                            if float(np.linalg.norm(_v2)) > 1e-6:
+                                _bear = float(math.atan2(
+                                    _v2[1], _v2[0]))
                 if _bear is None:
                     # Very close to the road end: hold the current heading
                     # straight (the car is nearly stopped and in its lane)
