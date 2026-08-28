@@ -378,7 +378,7 @@ def _path_known(scene: Scene, path, near_m: float = 10.0) -> list:
 
 
 
-def _boundary_lateral(wx, wy, ref, fwd):
+def _boundary_lateral(wx, wy, ref, fwd, covered_any: bool = False):
     """Signed lateral offset of a world point from a boundary polyline.
 
     Returns ``(lat, covered)`` - ``covered`` is False when the nearest
@@ -386,6 +386,13 @@ def _boundary_lateral(wx, wy, ref, fwd):
     to that location: a painted line ends at an intersection / a lane
     change, so a path turning there must not be punished as a
     crossing).  Positive lat = left of travel.
+
+    ``covered_any=True`` forces ``covered`` regardless of endpoint
+    proximity - used by the road-edge guard where the DecalRoad edge
+    polyline physically ends at the road end, and a car beyond it is
+    off-road even at an endpoint (town opt24: at a 90-deg corner the
+    boundary ``covered`` flipped False, the edge guard released and the
+    car drove 20 m on the grass beside the road).
     """
     pts = np.asarray(ref[:, :2], dtype=float)
     best = float("inf")
@@ -432,6 +439,8 @@ def _boundary_lateral(wx, wy, ref, fwd):
     # a bend (hairpin repro 2026-08-22: the flip inverted every
     # in-lane candidate into a "crossing" at the apex, so the planner
     # only had cross-lot arcs left and drove off the road).
+    if covered_any:
+        covered = True
     return sign, covered
 
 
