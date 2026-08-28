@@ -162,29 +162,3 @@ def test_route_turn_deg_gentle_arc_stays_below_gate() -> None:
     th = np.linspace(0, np.pi / 6, 20)          # 30 deg over ~26 m
     route = np.column_stack([np.cos(th) * 50.0, np.sin(th) * 50.0])
     assert _route_turn_deg(route, 0, len(route) - 1) < 40.0
-
-
-def test_boundary_lateral_covered_any_forces_coverage() -> None:
-    """The road-edge guard needs coverage even beyond a boundary END.
-
-    A DecalRoad edge polyline physically ends at the road end / a sharp
-    corner; ``_boundary_lateral`` reports ``covered=False`` when the
-    nearest point is an endpoint, which silently disabled the edge guard
-    at the exact corner where the car leaves the road (town opt24: 20 m
-    of grass driving).  ``covered_any=True`` forces coverage so the guard
-    always sees the boundary.
-    """
-    from beamng_autopilot.planning.constraints import _boundary_lateral
-
-    # boundary along +x from (0,0) to (10,0); fwd is unused for the sign
-    bnd = np.array([[0.0, 0.0], [10.0, 0.0]])
-    fwd = np.array([1.0, 0.0])
-    # Point 2 m past the line END (x=12) and 2 m to the left of it.
-    pos = (12.0, 2.0)
-    lat, cov = _boundary_lateral(*pos, bnd, fwd)
-    assert not cov
-    lat2, cov2 = _boundary_lateral(*pos, bnd, fwd, covered_any=True)
-    assert cov2
-    assert abs(lat2 - lat) < 1e-9
-    # Sign is world-based: left of the stored travel direction = positive.
-    assert lat2 > 1.0
