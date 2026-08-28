@@ -198,6 +198,49 @@ def _ref_bearing(ref, pos, min_m: float = 1.5, max_m: float = 20.0):
     return round(float(math.degrees(math.atan2(v[1], v[0]))), 1)
 
 
+def _route_lateral_off_m(pos, nav_route, road_left, road_right,
+                         window: int = 10, cap_m: float = 12.0,
+                         default_m: float = 7.0):
+    """Signed lateral + metres beyond the local road edge vs the NAV
+    centreline.
+
+    Returns ``(lat, beyond, half_width)``: ``lat`` is the ego's signed
+    offset from the route centreline (positive = right of travel),
+    ``half_width`` the local road half-width (max edge distance in a
+    rolling window, capped), and ``beyond = max(0, |lat| - half_width)``.
+
+    The guard measures against the centreline instead of the raw
+    DecalRoad edge polylines because those fold at junctions (two road
+    segments stitched by the graph) and go stale past the last graph
+    node - the nearest-edge point then jumps to a far-away corner and
+    reports a fake 3 m off-road on a straight section while the car is
+    on the centreline (town run10 t=11 at (737,751)).
+    """
+    p = np.asarray(pos[:2], dtype=float)
+    r = np.asarray(nav_route[:, :2], dtype=float)
+    n = len(r)
+    if n < 2:
+        return 0.0, 0.0, default_m
+    i = int(np.argmin(np.linalg.norm(r - p, axis=1)))
+    i0 = max(0, i - 2)
+    i1 = min(n - 1, i + 2)
+    tv = r[i1] - r[i0]
+    L = float(np.linalg.norm(tv))
+    if L < 1e-9:
+        return 0.0, 0.0, default_m
+    rn = np.array([tv[1] / L, -tv[0] / L])
+    lat = float(np.dot(p - r[i], rn))
+    hw = []
+    for k in range(max(0, i - window), min(n, i + window + 1)):
+        lk = road_left[k]
+        rk = road_right[k]
+        if np.all(np.isfinite(lk)) and np.all(np.isfinite(rk)):
+            hw.append(float(np.linalg.norm(r[k] - lk)))
+            hw.append(float(np.linalg.norm(r[k] - rk)))
+    hw_m = min(cap_m, max(hw)) if hw else default_m
+    return lat, max(0.0, abs(lat) - hw_m), hw_m
+
+
 def _path_curvature_ff(path, pos, heading, near_m: float = 1.5,
                        horizon_m: float = 8.0, wheelbase: float = 2.9,
                        ratio: float = 0.6, max_ff: float = 0.40) -> float:
@@ -1050,37 +1093,32 @@ def main() -> int:
             # without a route; the caller must pass --goal.
             if nav_route is None:
                 target = min(target, 1.0)
-            # Map road-edge guard: hard DecalRoad edges are the ground
-            # truth for "on the road".  Past an edge (grass/verge on the
+            # Map road-edge guard: the nav centreline + real DecalRoad
+            # edge rows are the map prior for "where the road is".  Once
+            # the ego is beyond the local road edge (grass/verge on the
             # right, oncoming lane on the left) the car must not keep
             # driving - crawl at 0.5 m/s; the monitor still stops it if
-            # the path is blocked.
+            # the path is blocked.  The centreline is used instead of the
+            # raw edge polylines because edge rows fold at junctions and
+            # go stale past the last graph node (town run10: a folded
+            # edge corner reported 3.2 m off-road on a straight section
+            # while the car sat on the centreline).
             road_off = 0.0
             off_recover = False
-            if road_left is not None and road_right is not None:
-                _fl2 = np.array([math.cos(heading), math.sin(heading)])
-                # Endpoint (junction) readings are deliberately NOT forced:
-                # a road edge ends exactly where the car legitimately
-                # crosses the junction, and forcing coverage flagged the
-                # crossroads start as 2 m off-road and hard-stopped the
-                # car at spawn (town opt24).  The sharp-corner cut still
-                # triggers once the car is genuinely beyond the edge (the
-                # nearest point is then an interior segment, covered=True).
-                _rl2, _okl2 = _boundary_lateral(
-                    float(pos[0]), float(pos[1]), road_left, _fl2)
-                _rr2, _okr2 = _boundary_lateral(
-                    float(pos[0]), float(pos[1]), road_right, _fl2)
-                if _okl2 and _okr2:
-                    road_off = max(-float(_rr2), float(_rl2), 0.0)
-                    if road_off > ROAD_OFF_STOP_M:
-                        # Hard stop + return steering (recovery block
-                        # below), not a 0.5 m/s grass cruise.
-                        target = min(target, ROAD_OFF_CRAWL_MPS)
-                        off_recover = True
-                    elif road_off > ROAD_OFF_EDGE_M:
-                        target = min(target, ROAD_OFF_CRAWL_MPS)
-                    elif road_off > 0.0:
-                        target = min(target, ROAD_EDGE_SLOW_MPS)
+            if (nav_route is not None and len(nav_route) >= 2
+                    and road_left is not None and road_right is not None):
+                _lat2, _beyond2, _hw2 = _route_lateral_off_m(
+                    pos, nav_route, road_left, road_right)
+                road_off = float(_beyond2)
+                if road_off > ROAD_OFF_STOP_M:
+                    # Hard stop + return steering (recovery block
+                    # below), not a 0.5 m/s grass cruise.
+                    target = min(target, ROAD_OFF_CRAWL_MPS)
+                    off_recover = True
+                elif road_off > ROAD_OFF_EDGE_M:
+                    target = min(target, ROAD_OFF_CRAWL_MPS)
+                elif road_off > 0.0:
+                    target = min(target, ROAD_EDGE_SLOW_MPS)
             # End-of-route (rem_end computed above from the FULL nav route
             # arc, so it never goes None when the local window collapses):
             # ease to a stop while still in the lane instead of parking
