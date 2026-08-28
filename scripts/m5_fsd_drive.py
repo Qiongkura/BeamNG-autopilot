@@ -154,6 +154,13 @@ MAP_LANE_EMA = 0.6
 # out and stop from 4 m out, while the planner still keeps the lane
 # centre, so the car ends gently in its lane before the road end.
 END_START_SLOW_M = 12.0
+# Lateral re-centring starts earlier than the braking zone: the car
+# enters the final stretch ~1.0-1.4 m from the centreline and the
+# 12-6 m stop zone alone cannot pull it to the lane centre before the
+# stop (opt35-41 parked 1.4-1.7 m off-centre).  From 20 m out the
+# steering reference aims at the own-lane centre ahead; braking still
+# starts at END_START_SLOW_M.
+END_PULL_START_M = 20.0
 END_STOP_M = 6.0
 END_SLOW_MPS = 1.0
 END_BRAKE = 0.7
@@ -176,6 +183,33 @@ BEND_GOV_MIN_TURN_DEG = 40.0
 PLAN_DOWN_RATE_MPS2 = 2.0
 PLAN_UP_RATE_MPS2 = 1.0
 
+
+
+def _trim_backtrack(route):
+    """Drop a terminal backtracking tail from a road-graph route.
+
+    When the goal is NOT on the road network, ``route_with_edges`` appends
+    a straight segment from the last road node to the off-road goal - the
+    route doubles back against the road direction and the final ~2 m of
+    centreline / edge data point the wrong way (the end-zone reference
+    then aimed left and the car parked 1.4-1.7 m off the lane centre,
+    opt35-38).  The end-zone reference must only use the real road part,
+    so cut the route at the first terminal direction reversal.
+    """
+    r = np.asarray(route[:, :2], dtype=float)
+    n = len(r)
+    if n < 6:
+        return r
+    seg = np.diff(r, axis=0)
+    ang = np.arctan2(seg[:, 1], seg[:, 0])
+    for k in range(n - 3, 2, -1):
+        a = ang[max(0, k - 4):k]
+        b = ang[k:k + 2]
+        if len(a) and len(b):
+            da = np.arctan2(np.sin(a - b[0]), np.cos(a - b[0]))
+            if float(np.median(np.abs(da))) > 2.0:
+                return r[:k]
+    return r
 
 
 def _ref_bearing(ref, pos, min_m: float = 1.5, max_m: float = 20.0):
@@ -357,6 +391,7 @@ def main() -> int:
         # centre-lines; fall back to the in-game route only when the road
         # graph is unavailable.
         nav_route = None
+        nav_route_ref = None
         road_left = None
         road_right = None
         st0 = conn.get_state()
@@ -383,6 +418,10 @@ def main() -> int:
                     n0, np.asarray(args.goal, dtype=float))
                 if _rwe[0] is not None and len(_rwe[0]) >= 4:
                     nav_route = np.asarray(_rwe[0][:, :2], dtype=float)
+                    # Real-road reference for the end-zone steering: cut
+                    # the off-road goal tail so the last metres point
+                    # along the actual road (see _trim_backtrack).
+                    nav_route_ref = _trim_backtrack(nav_route)
                     road_left = _rwe[1]
                     road_right = _rwe[2]
                     dseg = np.linalg.norm(np.diff(nav_route, axis=0), axis=1)
@@ -405,10 +444,12 @@ def main() -> int:
             nav = conn.read_navigation_route()
             if nav is not None and len(nav) >= 4:
                 nav_route = np.asarray(nav[:, :2], dtype=float)
+                nav_route_ref = _trim_backtrack(nav_route)
         elif nav_route is None:
             nav = conn.read_navigation_route()
             if nav is not None and len(nav) >= 4:
                 nav_route = np.asarray(nav[:, :2], dtype=float)
+                nav_route_ref = _trim_backtrack(nav_route)
         if nav_route is not None and len(nav_route) >= 4:
             dseg = np.linalg.norm(np.diff(nav_route, axis=0), axis=1)
             print(f"[fsd-drive] nav route: {len(nav_route)} pts, "
@@ -543,6 +584,7 @@ def main() -> int:
               f"for {args.seconds}s at {args.speed} m/s")
 
         prev_steer = 0.0  # rate-limited steering state (rule-autopilot convention)
+        end_pull_on = True  # end-zone lateral pull hysteresis state
         map_mc_smooth = None   # EMA-smoothed map-prior lane centre
         map_lc_smooth = None   # EMA-smoothed TRUE (geometric) lane centre
         last_h = None      # previous heading for the yaw-rate steering damper
@@ -867,7 +909,7 @@ def main() -> int:
             # backward), so the car brakes to a stop centred in its lane
             # instead of turning onto the line.
             steer_path = chosen.path
-            if rem_end is not None and rem_end < END_START_SLOW_M:
+            if rem_end is not None and rem_end < END_PULL_START_M:
                 _bear = None
                 _anchor = np.asarray(pos[:2], dtype=float)
                 # Use the TRUE own-lane centre (midpoint of the rounded
@@ -934,25 +976,42 @@ def main() -> int:
                     # - opt29 parked 1.3 m off-centre, body over the
                     # line).  Aiming at the ahead centre point gives the
                     # pursuit target a real sideways offset and converges
-                    # the car into the lane.  Once the car is nearly
-                    # stopped (v < 1.5) the pull must stop too - it left
-                    # the nose angled across the lane at the stop
-                    # (opt32/33: hdg -146 vs lane -133).
-                    if v >= 1.5:
-                        _ahead3 = (np.sum(
-                            (_ep2 - _pd2[None, :]) * _f2a[None, :],
-                            axis=1) > 0.0)
-                        _side3 = np.sum(
-                            (_ep2 - _pd2[None, :]) * _rn2[None, :],
-                            axis=1)
-                        _cand2 = np.flatnonzero(
-                            _ahead3 & (_side3 > 0.4)
-                            & (_dd2 >= 3.0) & (_dd2 <= 6.0))
-                        if len(_cand2):
-                            _k0 = int(_cand2[np.argmin(_dd2[_cand2])])
-                            _tgt2 = _ep2[_k0]
+                    # the car into the lane.  The pull must stop once the
+                    # car is nearly stopped - it left the nose angled
+                    # across the lane at the stop (opt32/33: hdg -146 vs
+                    # lane -133).  Hysteresis: pull while v >= 2.0, drop
+                    # it only below v < 1.0 so a 1.3-1.6 m/s crawl does
+                    # not flap the reference (opt35 parked 1.44 m from
+                    # the centreline because the pull switched off too
+                    # early).
+                    # Synthetic target from the ROAD-GRAPH centreline:
+                    # the nav route is the trustworthy map prior (the
+                    # edge/lane data degenerates near the off-road goal),
+                    # so the own-lane centre is the route + 2.0 m to its
+                    # right, and the reference aims 5 m ahead along it.
+                    # As the car converges the aim angle naturally drops
+                    # to zero, so the nose straightens by itself and the
+                    # car parks centred in the lane (no speed-gated
+                    # switching needed - opt35/36 stopped 1.4-1.6 m from
+                    # the centreline, opt37 was pulled left by a
+                    # degenerate nearest lane-centre point).
+                    _nav_ref = nav_route_ref if nav_route_ref is not None \
+                        else nav_route
+                    if _nav_ref is not None and len(_nav_ref) >= 4:
+                        _r3 = np.asarray(_nav_ref[:, :2], dtype=float)
+                        _d3 = np.linalg.norm(_r3 - _pd2[None, :], axis=1)
+                        _i3 = int(np.argmin(_d3))
+                        _i3a = max(0, _i3 - 2)
+                        _i3b = min(len(_r3) - 1, _i3 + 2)
+                        _tv3 = _r3[_i3b] - _r3[_i3a]
+                        _L3 = float(np.linalg.norm(_tv3))
+                        if _L3 > 1e-9:
+                            _dir3 = _tv3 / _L3
+                            _rn3 = np.array([_dir3[1], -_dir3[0]])
+                            _lc3 = _r3[_i3] + _rn3 * 2.0
+                            _tgt3 = _lc3 + _dir3 * 5.0
                             _anchor = np.asarray(pos[:2], dtype=float)
-                            _v3 = _tgt2 - _anchor
+                            _v3 = _tgt3 - _anchor
                             if float(np.linalg.norm(_v3)) > 1e-6:
                                 _bear = float(math.atan2(_v3[1], _v3[0]))
                     if _bear is None and _lane_bear is not None:
