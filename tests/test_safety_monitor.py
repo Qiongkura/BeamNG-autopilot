@@ -94,6 +94,33 @@ def test_obstacle_approach_slows() -> None:
     assert 0.0 < v.target_speed < 15.0
 
 
+def test_corridor_open_never_crawls_to_creep() -> None:
+    """Dense intersection LiDAR leaves the forward corridor open: the
+    target may ease, but must not drop to the 2 m/s minimal-risk creep
+    (fsd opt21 t=54-60: junction clutter pulled target to ~2-3 m/s and
+    the car brake->nearly-stalled).  With corridor_open_floor_frac the
+    eased target stays at cruise * floor."""
+    mon = SafetyMonitor(max_speed=15.0)
+    scene = _scene(obs_at=(5.0, 2.0), obs_half=1.0)  # intrudes the 1.6 m ease band
+    v = mon.evaluate(scene, _straight())
+    assert v.safe
+    assert v.target_speed >= 15.0 * 0.55 - 1e-9
+    assert v.target_speed < 15.0
+
+
+def test_closed_corridor_still_eases_to_creep() -> None:
+    """A really blocked forward corridor (free band gone) still eases all
+    the way down - the floor must not apply when the road is closed."""
+    mon = SafetyMonitor(max_speed=15.0)
+    scene = _scene()
+    # close the corridor: occupied cells across the whole lateral width
+    # at every ahead band
+    for x in range(3, 28, 3):
+        scene.grid.mark_obstacle_region(float(x), 0.0, 8.0, 0.5)
+    v = mon.evaluate(scene, _straight())
+    assert not v.safe or v.target_speed < 15.0 * 0.55
+
+
 def test_roadside_clutter_beside_lane_does_not_creep() -> None:
     """Continuous roadside trees/curbs beside the lane are lane bounds:
     with the forward corridor open they must NOT pin the target to the

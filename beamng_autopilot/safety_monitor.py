@@ -63,6 +63,7 @@ class SafetyVerdict:
     closest_obs_m: float = 999.0
     stale_sensor: bool = False
     stale_planner: bool = False
+    corridor_open: bool = True
 
     @property
     def safe(self) -> bool:
@@ -119,7 +120,8 @@ class SafetyMonitor:
                  lane_dev_stop_m: float = LANE_DEV_STOP_M,
                  stale_snapshot_s: float = STALE_SNAPSHOT_S,
                  max_speed: float = 15.0,
-                 min_risk_speed: float = 2.0):
+                 min_risk_speed: float = 2.0,
+                 corridor_open_floor_frac: float = 0.55):
         self.occ_degrade = occ_fraction_degrade
         self.occ_stop = occ_fraction_stop
         self.lane_degrade_m = lane_dev_degrade_m
@@ -127,6 +129,10 @@ class SafetyMonitor:
         self.stale_s = stale_snapshot_s
         self.max_speed = float(max_speed)
         self.min_risk_speed = float(min_risk_speed)
+        # When the forward corridor is verified OPEN, roadside clutter
+        # only eases the target to this fraction of cruise (never the
+        # minimal-risk creep); a closed corridor still creeps/stops.
+        self.corridor_open_floor = float(corridor_open_floor_frac)
 
     # ------------------------------------------------------------------
     def _path_occupied_fraction(self, scene, path) -> float:
@@ -243,6 +249,7 @@ class SafetyMonitor:
                 corridor_open = corridor_free_band(scene)
             except Exception:
                 corridor_open = False
+        v.corridor_open = corridor_open
         if path_occ >= self.occ_stop and not corridor_open:
             v.level = "minimal_risk"
             v.reason = "path blocked by obstacle"
@@ -278,7 +285,14 @@ class SafetyMonitor:
             k = max(0.0, 1.0 - (8.0 - closest) / 6.0)
             eased = self.max_speed * k
             if corridor_open:
-                # roadside objects are lane bounds: creep, never stop
+                # Roadside objects are lane bounds: ease, but never
+                # crawl.  The planner verified a free band exists, so
+                # dense intersection LiDAR must not drop the target to
+                # the 2 m/s creep and stall the car (fsd opt21 t=54-60:
+                # v 5.3 -> 0.1 -> 3.0 with plan 6.0, junction clutter).
+                eased = max(eased, self.max_speed * self.corridor_open_floor)
+            else:
+                # Real forward blockage: keep the creep / stop reserve.
                 eased = max(eased, self.min_risk_speed)
             v.target_speed = min(v.target_speed, eased)
             if not corridor_open and v.target_speed < 1.0:
