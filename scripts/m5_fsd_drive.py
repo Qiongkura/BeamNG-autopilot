@@ -429,7 +429,11 @@ def main() -> int:
                                 ObjectHead()],
                          ring_roles=('front_main',),
                          cam_w=args.cam_w, cam_h=args.cam_h,
-                         temporal=True, range_every_n=2,
+                         temporal=True, range_every_n=3,
+                         # LiDAR every 3rd tick: a fresh scan costs
+                         # ~280 ms while a reuse is ~40 ms; the world-frame
+                         # hits stay valid for static walls and the
+                         # temporal occupancy filter bridges the gap.
                          semantic_every_n=2, object_every_n=2)
         stack.reset_temporal()  # stale occupancy before start must not leak
         # Realistic gearbox locked into a forward gear (D).  A real stack

@@ -18,6 +18,17 @@ class _StubRange:
             ray_hits=[(6.0, -1.0), (6.0, 1.0)])
 
 
+class _CountingRange:
+    """Range stub that counts how many real scans happened."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def scan(self, pos):
+        self.calls += 1
+        return _StubRange().scan(pos)
+
+
 class _StubRing:
     role = "front_main"
 
@@ -273,3 +284,24 @@ def test_fsd_tick_object_obstacles_fused_into_bev() -> None:
     r = int((st.grid_n * st.grid_res * 0.5 - 8.0) / st.grid_res)
     assert 0 <= r < st.grid_n
     assert out.bev[r, st.grid_n // 2] > 0.0
+
+
+def test_fsd_tick_range_throttle_reuses_last_scan() -> None:
+    """range_every_n>1 polls LiDAR every n-th tick and reuses the last
+    world-frame scan in between (static walls stay valid; the temporal
+    occupancy filter bridges the gap)."""
+    st = _stack()
+    st.range_prov = _CountingRange()
+    st.range_every_n = 3
+    st._range_skip = 0
+    st._last_range = None
+    out1 = st.tick()
+    assert st.range_prov.calls == 1
+    out2 = st.tick()
+    assert st.range_prov.calls == 1
+    assert out2.ray_hits == out1.ray_hits
+    assert out2.meta.get("n_obstacles", 0) >= 1
+    out3 = st.tick()
+    assert st.range_prov.calls == 1
+    out4 = st.tick()
+    assert st.range_prov.calls == 2          # fresh scan on the 4th tick

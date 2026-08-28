@@ -48,13 +48,20 @@ CAMERA_FOV_DEG = 65.0
 
 LIDAR_POS = (0.0, 0.0, 1.7)
 LIDAR_VERTICAL_RES = 16
-LIDAR_MAX_DIST = 120.0
+# The pipeline already filters the cloud to <=55 m, so a 120 m sensor
+# just returns more terrain points to read and downsample on the mountain
+# route.  80 m keeps the full usable range and roughly halves the cloud.
+LIDAR_MAX_DIST = 80.0
 LIDAR_DENSITY = 8
 LIDAR_POLL_RETRIES = 3  # (kept for reference; scan() now polls once per
                         # worker cycle and retries on the next cycle)
 LIDAR_MAX_POINTS = 4500
 LIDAR_SELF_MARGIN = 0.3
-LIDAR_OBSTACLE_RADIUS = 40.0
+# Cluster obstacles only inside 30 m (5 s at 6 m/s): the planner's
+# brake band is 25 m and the safety stop band is 8 m, so nothing
+# actionable lives beyond it; the 40 m radius fed ~40% more points to
+# the clusterer for no decision value.
+LIDAR_OBSTACLE_RADIUS = 30.0
 
 BLACK_FRAME_MAX_MEAN = 1.0
 BLACK_FRAME_RETRIES = 2
