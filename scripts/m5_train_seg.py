@@ -169,8 +169,11 @@ def main() -> None:
             ys = torch.stack([to_tensor(f, device)[1] for f in batch])
             if train:
                 opt.zero_grad()
-            logits = model(xs)
-            loss = crit(logits, ys)
+            # Validation must not build autograd graphs: it halves the
+            # peak VRAM and keeps a concurrently running game rendering.
+            with torch.set_grad_enabled(train):
+                logits = model(xs)
+                loss = crit(logits, ys)
             if train:
                 loss.backward()
                 opt.step()
