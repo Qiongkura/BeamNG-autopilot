@@ -347,6 +347,12 @@ def main() -> int:
                     help="teleport to an open stretch before driving")
     ap.add_argument("--out", type=str, default=None,
                     help="path for per-frame JSON telemetry export")
+    ap.add_argument("--lane-mode", choices=("map", "auto", "sensor"),
+                    default="map",
+                    help="lane-keep reference policy: map (rule-stable "
+                         "default), auto (sensor leads only when it agrees "
+                         "with the map lane), sensor (perception-led; map "
+                         "prior stays the hard guard-rail)")
     ap.add_argument("--goal", nargs=2, type=float, default=None,
                     metavar=("X", "Y"),
                     help="set an in-game navigation route to this goal "
@@ -527,6 +533,7 @@ def main() -> int:
                          heads=[SemanticHead(), TrafficSignalHead(),
                                 ObjectHead()],
                          ring_roles=('front_main',),
+                         lane_mode=args.lane_mode,
                          cam_w=args.cam_w, cam_h=args.cam_h,
                          temporal=True, range_every_n=3,
                          # LiDAR every 3rd tick: a fresh scan costs
@@ -581,7 +588,8 @@ def main() -> int:
                               clear_mps=REVERSE_CLEAR_MPS)
         rman = ReverseManeuver(fwd_gear=fwd_gear)
         print(f"[fsd-drive] runtime={stack.mode} FSD pipeline driving "
-              f"for {args.seconds}s at {args.speed} m/s")
+              f"for {args.seconds}s at {args.speed} m/s "
+              f"(lane_mode={args.lane_mode})")
 
         prev_steer = 0.0  # rate-limited steering state (rule-autopilot convention)
         end_pull_on = True  # end-zone lateral pull hysteresis state
@@ -1621,6 +1629,9 @@ def main() -> int:
                 "emergency": int(bool(force_stop)),
                 "stuck": int(bool(stuck)),
                 "lane_src": str(out.meta.get("lane_src", "?")),
+                "lane_mode": str(args.lane_mode),
+                "lane_reject": str(out.meta.get("lane_reject_reason", "")),
+                "lane_sel": str(out.meta.get("lane_src_sel", "")),
                 "lane_paired": int(out.meta.get("lane_paired", 0)),
                 "n_object_obstacles": int(
                     out.meta.get("n_object_obstacles", 0)),

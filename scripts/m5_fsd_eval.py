@@ -45,6 +45,7 @@ def _run_drive(i: int, args) -> Path:
         "--cam-w", str(args.cam_w),
         "--cam-h", str(args.cam_h),
         "--out", str(out),
+        "--lane-mode", str(args.lane_mode),
     ]
     if args.attach:
         cmd.append("--attach")
@@ -123,6 +124,9 @@ def main() -> int:
                     metavar=("X", "Y"))
     ap.add_argument("--out", type=str, default=None,
                     help="path for the aggregate JSON report")
+    ap.add_argument("--lane-mode", choices=("map", "auto", "sensor"),
+                    default="map",
+                    help="lane-keep reference policy passed to the drive")
     args = ap.parse_args()
 
     paths: list[Path] = []

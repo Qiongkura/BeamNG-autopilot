@@ -109,7 +109,8 @@ class FSDStack:
                  temporal: bool = True, tau_s: float = 1.5,
                  range_every_n: int = 1,
                  semantic_every_n: int = 1,
-                 object_every_n: int = 1):
+                 object_every_n: int = 1,
+                 lane_mode: str = "map"):
         self.conn = conn
         self.grid_n = int(grid_n)
         self.grid_res = float(grid_res)
@@ -160,6 +161,23 @@ class FSDStack:
         # Per-frame lane-fusion state (choose_sensor_lane) across ticks
         # to prevent flicker between vision / lidar / fallback.
         self._lane_fusion_state: dict = {}
+        # Lane-keep reference policy:
+        #   map    - current rule-stable behaviour: map-prior own lane is
+        #            the default, a paired sensor lane only takes over
+        #            after strict heading/corner/side gates.
+        #   auto   - perception-led when it agrees with the map prior:
+        #            side gate relaxed, hard boundaries always from the
+        #            map, sensor lane used when within CONSISTENCY_M of
+        #            the map lane centre.
+        #   sensor - FSD-style perception-led: sensor lane leads through
+        #            corners too (corner gate off), map prior remains the
+        #            hard guard-rail (centreline + right edge) and the
+        #            safety monitor can always stop.
+        self.lane_mode = str(lane_mode) if lane_mode in (
+            "map", "auto", "sensor") else "map"
+        # auto-mode max lateral gap between the sensor lane centre and the
+        # map-prior own-lane centre before the map takes over.
+        self.lane_consistency_m = 1.5
         if self.temporal:
             from beamng_autopilot.temporal import TemporalOccupancyFilter
             self.occ_filter = TemporalOccupancyFilter(
@@ -383,6 +401,7 @@ class FSDStack:
         # and wedged).  Reject the whole sensor lane (centre + hard
         # boundaries) and fall back to the map-prior own lane.
         lane_rejected = False
+        lane_mode = getattr(self, "lane_mode", "map")
         # Gate ANY sensor lane (paired or not) against the map-prior own
         # lane: an unpaired vision/LiDAR corridor is often the whole-road
         # centre, which on a two-way road sits on the oncoming side of the
@@ -390,6 +409,12 @@ class FSDStack:
         # as the lane reference, the chosen path parked 3.6 m off it and
         # the safety monitor declared "path near lane edge" -> src=none
         # stop at (734.9,753.4) mountain run 2026-08-23.
+        #
+        # Gate strictness follows lane_mode: map keeps all three gates;
+        # auto keeps heading+corner but relaxes the side gate; sensor
+        # (perception-led) keeps only heading+side so the sensor lane can
+        # lead through corners - the map prior still supplies the hard
+        # lane boundaries below (never the sensor's own flickering edges).
         if lane_frame is not None and map_lane is not None:
             try:
                 from beamng_autopilot.planning.arbiter import (
@@ -407,8 +432,11 @@ class FSDStack:
                 # reads the corner wide and steers the car off the line
                 # (see LANE_ROUTE_TURN_MAX_DEG).  The 35 deg heading gate
                 # alone does not catch it: a wide corner read can still
-                # be within 35 deg of the route.
-                elif not lane_route_turn_ok(
+                # be within 35 deg of the route.  Only the map mode keeps
+                # this; perception-led modes let the sensor lane lead
+                # through corners (the map guard-rail still stops a real
+                # crossing).
+                elif lane_mode != "sensor" and not lane_route_turn_ok(
                         route_ref, pos,
                         look_m=LANE_ROUTE_TURN_LOOK_M,
                         max_turn_deg=LANE_ROUTE_TURN_MAX_DEG):
@@ -427,10 +455,13 @@ class FSDStack:
                 # (mountain run 2026-08-27 run_fix31: after the junction
                 # the car rode the centre line, then over-corrected right
                 # and wedged at (741.2,745.7)).  Require the lane centre
-                # at least 0.4 m right of the route, else the map-prior
-                # own lane replaces it.
-                elif not lane_side_ok(lane_ref, route_ref, pos,
-                                     left_max_m=-0.4):
+                # at least 0.4 m right of the route in map mode; in
+                # perception-led modes allow a small oncoming-side read
+                # (corner apex) because the map centreline is still the
+                # hard no-cross boundary.
+                elif not lane_side_ok(
+                        lane_ref, route_ref, pos,
+                        left_max_m=(-0.4 if lane_mode == "map" else 0.5)):
                     lane_rejected = True
                     side_bad = True
                 if lane_rejected:
@@ -446,14 +477,53 @@ class FSDStack:
                 pass
         if map_lane is not None:
             mc, ml, mr = map_lane
-            # An unpaired sensor centre is often the whole-road centre
-            # (LiDAR free corridor / single-edge mirror) - never trust it
-            # as the lane-keep reference over the map-prior own lane.
-            if not sensor_paired:
-                lane_ref = mc
-            if lane_left is None or lane_right is None:
-                lane_left = ml if lane_left is None else lane_left
-                lane_right = mr if lane_right is None else lane_right
+            lane_src_sel = "map"
+            if sensor_paired and lane_ref is not None \
+                    and len(lane_ref) >= 3:
+                lane_src_sel = "sensor"
+            if lane_mode in ("auto", "sensor"):
+                # Perception-led modes: the MAP boundaries are the hard
+                # guard-rail (centreline = no-cross, real right edge =
+                # no off-road).  The sensor's own paired edges flicker /
+                # jump frame to frame and must never be the hard rule.
+                lane_left = ml
+                lane_right = mr
+                if lane_mode == "auto" and sensor_paired \
+                        and lane_ref is not None:
+                    # Only let the sensor lane lead when it agrees with
+                    # the map-prior own lane; otherwise the map lane is
+                    # the reference (perception-led but consistency
+                    # gated - the first rung towards full sensor mode).
+                    try:
+                        _lr2 = np.asarray(lane_ref[:, :2], dtype=float)
+                        _mc2 = np.asarray(mc[:, :2], dtype=float)
+                        _p2 = np.asarray(pos[:2], dtype=float)
+                        _d2 = np.linalg.norm(_lr2 - _p2[None, :], axis=1)
+                        _sel2 = np.flatnonzero(
+                            (_d2 >= 0.5) & (_d2 <= 8.0))
+                        if len(_sel2) >= 3:
+                            _dm = np.linalg.norm(
+                                _lr2[_sel2][:, None, :]
+                                - _mc2[None, :, :], axis=2).min(axis=1)
+                            if float(np.median(_dm)) > \
+                                    getattr(self, "lane_consistency_m",
+                                            1.5):
+                                lane_ref = mc
+                                lane_src_sel = "map"
+                    except Exception:
+                        lane_ref = mc
+                        lane_src_sel = "map"
+            else:
+                # An unpaired sensor centre is often the whole-road centre
+                # (LiDAR free corridor / single-edge mirror) - never trust
+                # it as the lane-keep reference over the map-prior own
+                # lane.
+                if not sensor_paired:
+                    lane_ref = mc
+                if lane_left is None or lane_right is None:
+                    lane_left = ml if lane_left is None else lane_left
+                    lane_right = mr if lane_right is None else lane_right
+            out.meta["lane_src_sel"] = lane_src_sel
             if lane_width <= 0.0:
                 # Real road-edge width when the map lane comes from
                 # DecalRoad edges (median left-right distance); fall back
