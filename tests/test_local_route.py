@@ -10,10 +10,12 @@ from __future__ import annotations
 import math
 
 import numpy as np
+import pytest
 
 from beamng_autopilot.planning.local_route import (
     local_route,
     map_lane_local,
+    _route_turn_deg,
 )
 
 
@@ -139,3 +141,24 @@ def test_map_lane_local_ego_anchor_does_not_flip_boundaries() -> None:
     assert float(np.linalg.norm(center[0] - pos)) < 2.0
     assert float(np.linalg.norm(center[3] - left[3])) > 1.4
     assert float(np.linalg.norm(right[3] - left[3])) > 2.8
+
+
+def test_route_turn_deg_straight_is_zero() -> None:
+    route = np.column_stack([np.linspace(0, 20, 21), np.zeros(21)])
+    assert _route_turn_deg(route, 0, 20) == pytest.approx(0.0, abs=1e-6)
+
+
+def test_route_turn_deg_90_deg_corner_is_large() -> None:
+    xs = list(np.linspace(0, 10, 11)) + [10.0] * 11
+    ys = [0.0] * 11 + list(np.linspace(0, 10, 11))
+    route = np.column_stack([xs, ys])
+    deg = _route_turn_deg(route, 0, len(route) - 1)
+    assert 60.0 < deg < 120.0, deg
+
+
+def test_route_turn_deg_gentle_arc_stays_below_gate() -> None:
+    """The tight-bend governor gate (40 deg) must NOT fire on a gentle
+    wide-radius arc even when the local resample measures a small radius."""
+    th = np.linspace(0, np.pi / 6, 20)          # 30 deg over ~26 m
+    route = np.column_stack([np.cos(th) * 50.0, np.sin(th) * 50.0])
+    assert _route_turn_deg(route, 0, len(route) - 1) < 40.0

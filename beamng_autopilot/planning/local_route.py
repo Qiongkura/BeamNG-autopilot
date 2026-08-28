@@ -152,6 +152,29 @@ def _project_arc(r: np.ndarray, pos: np.ndarray) -> float:
     return best[1]
 
 
+def _route_turn_deg(route, i0: int, i1: int) -> float:
+    """Absolute turn angle (deg) of a route over vertex indices i0..i1.
+
+    Sums the per-segment heading deltas (an S-curve adds up too).  Used to
+    gate the hairpin speed governor: a tiny radius measured over a 12 m
+    window is only worth a 2 m/s cap if the route actually turns - a
+    rounded junction corner / resample wiggle can measure R~3 m while
+    turning <30 deg total, and capping there made the car crawl 5+ s
+    through a widening junction (fsd opt23 t=36-45, plan 1.97).
+    """
+    if route is None or len(route) < 3:
+        return 0.0
+    i1 = min(int(i1), len(route) - 1)
+    i0 = max(0, min(int(i0), i1 - 2))
+    if i1 - i0 < 2:
+        return 0.0
+    seg = np.diff(np.asarray(route[i0:i1 + 1], dtype=float)[:, :2], axis=0)
+    ang = np.arctan2(seg[:, 1], seg[:, 0])
+    d = np.diff(ang)
+    d = (d + np.pi) % (2.0 * np.pi) - np.pi
+    return float(np.degrees(np.abs(d).sum()))
+
+
 def _right_normals(r: np.ndarray) -> np.ndarray:
     """Unit right-of-travel normal per route vertex (smoothed tangent)."""
     norm = np.zeros_like(r)

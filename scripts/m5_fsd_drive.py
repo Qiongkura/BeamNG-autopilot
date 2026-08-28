@@ -42,7 +42,7 @@ from beamng_autopilot.planning import (
 )
 from beamng_autopilot.planning.constraints import _boundary_lateral
 from beamng_autopilot.planning.local_route import (
-    map_lane_edges, _project_arc,
+    map_lane_edges, _project_arc, _route_turn_deg,
 )
 from beamng_autopilot.planning.speed_profile import \
     MIN_SPEED as _PROF_MIN_SPEED, \
@@ -150,6 +150,11 @@ END_BRAKE = 0.7
 GOV_ON_MPS = 0.8
 GOV_OFF_MPS = 0.4
 GOV_BRAKE = 0.25
+# Tight-bend governor gate: only apply the hairpin speed cap when the
+# 12 m look-ahead actually TURNS this much.  A rounded junction corner /
+# resample wiggle can measure R~3 m while turning <30 deg; capping there
+# made the car crawl 5+ s through a widening junction (fsd opt23).
+BEND_GOV_MIN_TURN_DEG = 40.0
 # Plan-speed rate limit (m/s per sim second): the full-route profile is
 # re-profiled every frame against the LIVE LiDAR grid, and junction /
 # end-zone clutter appears and disappears between ticks.  Without a rate
@@ -957,17 +962,28 @@ def main() -> int:
                     if _lo < _hi:
                         _rmin = float(np.min(route_rad[_lo:_hi]))
                     if _rmin < 15.0:
-                        # Floor the implied radius: the 0.8 m resample can
-                        # measure a hairpin fillet edge as R~0.8 m (three
-                        # nearly-collinear points), which caps the plan at
-                        # ~1 m/s and stands the car dead on the approach
-                        # (fix65: plan=1.00 at the second bend, v=5.6 ->
-                        # brake-to-0).  Real roads never bend tighter than
-                        # ~3 m; anything smaller is a sampling artifact.
-                        _rmin = max(_rmin, 3.0)
-                        out.best_speed = float(min(
-                            out.best_speed, math.sqrt(1.3 * _rmin)))
-                        out.meta["plan_src"] = "nav_round+gov"
+                        # Turn-angle gate: only a REAL bend deserves the
+                        # hairpin speed cap.  A rounded junction corner /
+                        # resample wiggle can measure R~3 m over 12 m while
+                        # turning <30 deg total; capping there parked the
+                        # plan at sqrt(1.3*3)=1.97 and the car crawled 5+ s
+                        # through a widening junction (fsd opt23 t=36-45,
+                        # lat_right 1.5->4.2).  A true hairpin turns
+                        # 60-180 deg over the same window.
+                        if _route_turn_deg(route_round, _lo, _hi) >= \
+                                BEND_GOV_MIN_TURN_DEG:
+                            # Floor the implied radius: the 0.8 m resample
+                            # can measure a hairpin fillet edge as R~0.8 m
+                            # (three nearly-collinear points), which caps
+                            # the plan at ~1 m/s and stands the car dead
+                            # on the approach (fix65: plan=1.00 at the
+                            # second bend, v=5.6 -> brake-to-0).  Real
+                            # roads never bend tighter than ~3 m; anything
+                            # smaller is a sampling artifact.
+                            _rmin = max(_rmin, 3.0)
+                            out.best_speed = float(min(
+                                out.best_speed, math.sqrt(1.3 * _rmin)))
+                            out.meta["plan_src"] = "nav_round+gov"
                 except Exception:
                     pass
             # control from the (possibly degraded) target speed, but never
