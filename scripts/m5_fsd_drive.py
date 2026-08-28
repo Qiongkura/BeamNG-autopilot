@@ -92,7 +92,13 @@ STALE_CTRL_SPEED_MPS = 2.0
 # every other frame (fix54/fix56).  Ramp the effective target toward the
 # plan at a bounded rate instead.
 SPEED_TARGET_RAMP_MPS = 1.5     # m/s per sim second
-SPEED_HYST_MPS = 0.4            # SpeedController brake/throttle hysteresis
+# SpeedController pedal band: brake enters at err < -(deadband+hyst),
+# throttle at err > +(deadband+hyst).  The old 0.35/0.4 pair made the
+# car coast a +/-0.75 m/s band around cruise (5.25 <-> 7.0), which
+# read as a visible accelerate -> brake -> accelerate wave; 0.2/0.25
+# keeps a real hysteresis but halves the band to +/-0.45 m/s.
+SPEED_DEADBAND_MPS = 0.2        # SpeedController coast deadband
+SPEED_HYST_MPS = 0.25           # SpeedController brake/throttle hysteresis
 # Plan-speed brake governor hysteresis: enter at +1.0 m/s overshoot,
 # release once back within +0.5 m/s, and brake gently (0.25) instead of
 # 1.0 - BeamNG's brake is highly nonlinear and even 0.4-0.7 stands the
@@ -249,7 +255,8 @@ def main() -> int:
         port=config.runtime_port(args.runtime),
         home=config.runtime_home(args.runtime))
     pp = PurePursuit(lookahead=5.0)
-    speed_ctrl = SpeedController(hyst_mps=SPEED_HYST_MPS)
+    speed_ctrl = SpeedController(deadband=SPEED_DEADBAND_MPS,
+                                hyst_mps=SPEED_HYST_MPS)
     monitor = SafetyMonitor(max_speed=args.speed)
     try:
         conn.open(launch=not args.attach)
@@ -1076,10 +1083,15 @@ def main() -> int:
             # the smoothed pedal state.  The old brk=1.0 here stopped
             # the car DEAD on the downhill, then the controller relaunched
             # with full throttle -> 0 <-> 7.8 m/s bang-bang (opt8).
-            # Cut the throttle here and let the plan governor's gentle
-            # GOV_BRAKE trim the overshoot with release hysteresis.
-            if v > float(args.speed) + 1.0:
-                thr = 0.0
+            # Taper the throttle off between +0.5 and +1.3 m/s overshoot
+            # instead of the old hard cut at +1.0.  A hard cut to 0 then
+            # a full re-launch made a +/-0.9 m/s speed wave around cruise
+            # (opt21: 49 throttle on/off flips in 169 frames); a gradual
+            # taper removes the relaunch kick while the plan governor's
+            # gentle GOV_BRAKE still trims the overshoot.
+            _ov = v - (float(args.speed) + 0.5)
+            if _ov > 0.0:
+                thr *= float(np.clip((0.8 - _ov) / 0.8, 0.0, 1.0))
             # Plan-speed governor: never let the car exceed the planned
             # corner speed by more than 0.8 m/s even within one tick -
             # the profile alone is sampled at tick boundaries and the
@@ -1306,6 +1318,9 @@ def main() -> int:
                 "road_off": round(float(road_off), 3),
                 "rem_end": (round(float(rem_end), 2)
                             if rem_end is not None else None),
+                "mon_target": round(float(verd.target_speed), 2),
+                "closest_obs": (round(float(verd.closest_obs_m), 2)
+                                if verd.closest_obs_m < 900.0 else None),
                 "pp_tgt": ([round(float(v), 2) for v in pp_tgt[:2]]
                            if pp_tgt is not None else None),
                 "lane_bear": _ref_bearing(out.lane_ref, pos),
