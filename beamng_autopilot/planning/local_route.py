@@ -530,7 +530,7 @@ def map_lane_edges(nav_route, left_edge, right_edge, pos, heading,
     _wd = np.linalg.norm(np.asarray(right, dtype=float)[:, :2]
                          - np.asarray(route, dtype=float)[:, :2], axis=1)
     _wd = _wd[np.isfinite(_wd)]
-    _lane_half = (float(np.clip(np.median(_wd) * 0.25,
+    _lane_half = (float(np.clip(np.median(_wd) * 0.5,
                                 MAP_LANE_HALF_MIN_M, MAP_LANE_HALF_MAX_M))
                   if _wd.size else float(MAP_LANE_HALF_MAX_M))
     # Lane CENTRE from a corner-rounded copy of the FULL (back-extended)
