@@ -55,6 +55,59 @@ from beamng_autopilot.vision.hydra import FrameContext, HydraNet
 from beamng_autopilot.vision.heads.semantic import SemanticHead
 
 
+def _path_curvature_ff(path, pos, heading, near_m: float = 1.5,
+                       horizon_m: float = 8.0, wheelbase: float = 2.9,
+                       ratio: float = 0.6, max_ff: float = 0.40) -> float:
+    """Feed-forward steering from the chosen path's near-ahead curvature.
+
+    PurePursuit only reacts at the lookahead point, so on a hairpin the
+    car reaches the entry still pointing straight and runs into the
+    outside wall (first -110 -> -24 deg bend on the mountain route).  A
+    feed-forward term from the path curvature 2-10 m ahead starts the
+    turn as soon as the path bends.  Returns a NORMALIZED steering input
+    (negative = left), scaled by how aligned the ego heading is with the
+    path so a sideways rejoin is not fought.
+    """
+    if path is None or len(path) < 4:
+        return 0.0
+    p = np.asarray(path[:, :2], dtype=float)
+    pos2 = np.asarray(pos[:2], dtype=float)
+    n = len(p)
+    d = np.linalg.norm(p - pos2, axis=1)
+    i0 = int(np.argmin(d))
+    arc = np.concatenate(
+        [[0.0], np.cumsum(np.linalg.norm(np.diff(p, axis=0), axis=1))])
+    base = float(arc[i0])
+    idxs = [i0]
+    for tgt in (near_m, near_m + horizon_m):
+        j = i0
+        while j < n - 1 and float(arc[j]) - base < tgt:
+            j += 1
+        idxs.append(j)
+    i1, i2 = idxs[1], idxs[2]
+    if i2 - i1 < 2:
+        return 0.0
+
+    def _tangent(i: int) -> np.ndarray:
+        a = max(0, i - 1)
+        b = min(n - 1, i + 1)
+        v = p[b] - p[a]
+        L = float(np.linalg.norm(v))
+        return (v / L) if L > 1e-9 else np.array([1.0, 0.0])
+
+    t1 = _tangent(i1)
+    t2 = _tangent(i2)
+    th1 = math.atan2(float(t1[1]), float(t1[0]))
+    th2 = math.atan2(float(t2[1]), float(t2[0]))
+    dth = (th2 - th1 + math.pi) % (2.0 * math.pi) - math.pi
+    ds = max(1e-3, float(arc[i2] - arc[i1]))
+    kappa = dth / ds
+    align = float(np.clip(
+        math.cos(th1 - float(heading)), 0.0, 1.0))
+    ff = -kappa * wheelbase / ratio   # left curve (kappa>0) -> negative input
+    return float(np.clip(ff * (0.3 + 0.7 * align), -max_ff, max_ff))
+
+
 def _curve_speed_mps(route: np.ndarray | None, pos: np.ndarray,
                     heading: float, horizon_m: float = 10.0) -> float:
     """Cap speed ahead of a bend (rule-driver curve governor).
@@ -295,7 +348,16 @@ def main() -> int:
             if route_ref is not None and len(route_ref) >= 2:
                 res = pp.steering(
                     pos, heading, np.asarray(route_ref, dtype=float))
-                steer = float(res[0]) if isinstance(res, tuple) else float(res)
+                steer_rad = float(res[0]) if isinstance(res, tuple) \
+                    else float(res)
+                # PurePursuit returns radians: normalise by the steering
+                # ratio (and flip sign to BeamNG's left-negative input) and
+                # add the curvature feed-forward so bends are pre-turned
+                # instead of run wide into the outside wall.
+                steer = float(np.clip(
+                    -steer_rad / 0.6 +
+                    _path_curvature_ff(route_ref, pos, heading),
+                    -1.0, 1.0))
             v_target = min(args.speed,
                            _curve_speed_mps(drive_route, pos, heading))
             throttle = 0.35 if v < v_target else 0.0
