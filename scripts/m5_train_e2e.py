@@ -32,6 +32,19 @@ def _mse(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.mean((a - b) ** 2)
 
 
+def _masked_mse(pred: torch.Tensor, target: torch.Tensor,
+                mask: torch.Tensor) -> torch.Tensor:
+    """MSE over the valid waypoints only; 0 when a frame has none.
+
+    Frames whose shadow planner found no trajectory are kept for
+    action-only supervision, so the trajectory loss must not see their
+    zero-filled padding.
+    """
+    err = (pred - target) ** 2 * mask.unsqueeze(-1)
+    denom = mask.sum().clamp(min=1.0)
+    return err.sum() / denom
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="train the multimodal E2E net")
     ap.add_argument("--data", type=str, required=True,
@@ -96,15 +109,21 @@ def main() -> int:
     def run_epoch(dl, train: bool) -> float:
         model.train(train)
         total = 0.0
-        for obs, traj_t, act_t in dl:
+        for obs, traj_t, mask_t, act_t in dl:
             rgb, label, bev = obs
             rgb = rgb.to(device)
             label = label.to(device) if label is not None else None
             bev = bev.to(device) if bev is not None else None
             traj_t = traj_t.to(device)
+            mask_t = mask_t.to(device)
             act_t = act_t.to(device)
             traj_p, act_p = model(rgb, label, bev)
-            loss = _mse(traj_p, traj_t) + _mse(act_p * act_w, act_t * act_w)
+            # Trajectory error is normalised to metres/10 so the action
+            # head is not starved by the much larger absolute waypoint
+            # scale; frames without a feasible trajectory only pay the
+            # action term (masked trajectory loss).
+            loss = _masked_mse(traj_p / 10.0, traj_t / 10.0, mask_t) \
+                + _mse(act_p * act_w, act_t * act_w)
             if train:
                 opt.zero_grad()
                 loss.backward()
