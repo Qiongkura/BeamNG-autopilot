@@ -115,3 +115,5 @@ def train_synthetic(model: E2ENet, n_samples: int = 128,
     for _ in range(steps):
         last = model.train_step(inputs, targets)
     return last
+from .e2e_torch import E2ENetTorch  # noqa: E402
+from .dataset import ShadowMultimodalDataset  # noqa: E402
