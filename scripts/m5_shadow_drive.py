@@ -55,6 +55,40 @@ from beamng_autopilot.vision.hydra import FrameContext, HydraNet
 from beamng_autopilot.vision.heads.semantic import SemanticHead
 
 
+def _curve_speed_mps(route: np.ndarray | None, pos: np.ndarray,
+                    heading: float, horizon_m: float = 10.0) -> float:
+    """Cap speed ahead of a bend (rule-driver curve governor).
+
+    Measures how much the route direction rotates over the next
+    ``horizon_m`` from the nearest route point and returns a safe speed
+    (2 m/s for a hairpin, 3.5 for a normal bend, 6+ for straight road)
+    so the simple PP driver can round corners instead of wedging into
+    the outside wall.
+    """
+    if route is None or len(route) < 4:
+        return 8.0
+    pos = np.asarray(pos, dtype=float)[:2]
+    d = np.linalg.norm(route - pos, axis=1)
+    i = int(np.argmin(d))
+    seg = 0.0
+    j = i
+    while j + 1 < len(route) and seg < horizon_m:
+        seg += float(np.linalg.norm(route[j + 1] - route[j]))
+        j += 1
+    if j <= i + 1:
+        return 8.0
+    a0 = float(np.arctan2(route[i + 1, 1] - route[i, 1],
+                          route[i + 1, 0] - route[i, 0]))
+    a1 = float(np.arctan2(route[j, 1] - route[j - 1, 1],
+                          route[j, 0] - route[j - 1, 0]))
+    deg = abs(float(np.degrees((a1 - a0 + np.pi) % (2 * np.pi) - np.pi)))
+    if deg >= 70.0:
+        return 2.2
+    if deg >= 40.0:
+        return 3.5
+    return 8.0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="shadow-mode recorder")
     ap.add_argument("--runtime", choices=("auto", "steam", "tech"),
@@ -72,9 +106,14 @@ def main() -> int:
                     metavar=("X", "Y"),
                     help="follow the road-graph A* route to this goal "
                          "(FSD-style) instead of a straight line")
-    ap.add_argument("--min-quality", type=float, default=0.5,
-                    help="drop shadow frames with a gated-out prediction "
-                         "(no feasible trajectory); 0 keeps everything")
+    ap.add_argument("--min-quality", type=float, default=0.0,
+                    help="frames with a gated-out shadow prediction "
+                         "(no feasible trajectory) are still saved for "
+                         "action-only supervision; 0.5 keeps only "
+                         "trajectory-valid frames")
+    ap.add_argument("--lidar-every", type=int, default=1,
+                    help="reuse the last LiDAR scan for N-1 of every N "
+                         "frames (range scan is the per-frame bottleneck)")
     args = ap.parse_args()
 
     conn = BeamNGConnector(
@@ -82,7 +121,7 @@ def main() -> int:
         port=config.runtime_port(args.runtime),
         home=config.runtime_home(args.runtime))
     rec = ShadowRecorder(args.out, f"shadow_{int(time.time())}")
-    pp = PurePursuit(lookahead=5.0)
+    pp = PurePursuit(lookahead=2.5)
     try:
         conn.open(launch=not args.attach)
         try:
@@ -152,9 +191,11 @@ def main() -> int:
                     ndx, ndy = (float(nav_route[i, 0] - nav_route[i - 1, 0]),
                                 float(nav_route[i, 1] - nav_route[i - 1, 1]))
                 h = float(np.arctan2(ndy, ndx))
-                conn.safe_teleport(float(nav_route[i, 0]),
-                                   float(nav_route[i, 1]),
-                                   heading_deg=math.degrees(h))
+                route_start_xy = (float(nav_route[i, 0]),
+                                   float(nav_route[i, 1]))
+                route_start_deg = math.degrees(h)
+                conn.safe_teleport(*route_start_xy,
+                                   heading_deg=route_start_deg)
                 st1 = conn.get_state()
                 print(f"[shadow] snapped onto route "
                       f"({float(st1.pos[0]):.1f}, {float(st1.pos[1]):.1f}, "
@@ -168,6 +209,8 @@ def main() -> int:
         conn.control(throttle=0.0, brake=0.0, steering=0.0,
                      parkingbrake=0.0, gear=fwd_gear)
         conn.step(3)
+        route_start_xy = (float(x0[0]), float(x0[1]))
+        route_start_deg = math.degrees(heading0)
         # straight route ahead of the spawn heading (fallback reference)
         xs = np.linspace(0, 40, 41)
         route = np.column_stack([x0[0] + xs * np.cos(heading0),
@@ -175,11 +218,34 @@ def main() -> int:
 
         t_end = time.time() + args.seconds
         frames = 0
+        rng_last = None
+        stuck_t0 = None
         while time.time() < t_end:
             st = conn.get_state()
             pos = np.asarray(st.pos, dtype=float)
             heading = float(st.heading)
             v = float(st.speed)
+            # Stuck restart: the rule driver can wedge against a bend's
+            # outside wall (first hairpin on the mountain route); rather
+            # than burning the rest of the episode on identical static
+            # frames, teleport back to the route start and attack the
+            # corner again - every episode then contains several
+            # approach/steer attempts.
+            if v < 0.3:
+                if stuck_t0 is None:
+                    stuck_t0 = time.time()
+                elif time.time() - stuck_t0 > 3.0:
+                    print(f"[shadow] stuck at ({float(pos[0]):.1f}, "
+                          f"{float(pos[1]):.1f}) - restarting route")
+                    conn.safe_teleport(*route_start_xy,
+                                       heading_deg=route_start_deg)
+                    conn.control(throttle=0.0, brake=0.0, steering=0.0,
+                                 parkingbrake=0.0, gear=fwd_gear)
+                    conn.step(3)
+                    stuck_t0 = None
+                    continue
+            else:
+                stuck_t0 = None
 
             grid = OccupancyGrid(60, 60, 0.5,
                                  origin=(float(pos[0]), float(pos[1])),
@@ -201,7 +267,12 @@ def main() -> int:
                 label_map = np.zeros((h, w), dtype=np.uint8)
                 label_map[out.masks["road"]] = 1
                 label_map[out.masks["line"]] = 2
-            rng = range_prov.scan(pos)
+            if args.lidar_every > 1 and frames > 0 and \
+                    frames % args.lidar_every != 0:
+                rng = rng_last
+            else:
+                rng = range_prov.scan(pos)
+                rng_last = rng
             fuse_obstacles_to_grid(grid, rng.obstacles, rng.ray_hits)
 
             scene_route = nav_route if nav_route is not None else route
@@ -225,8 +296,10 @@ def main() -> int:
                 res = pp.steering(
                     pos, heading, np.asarray(route_ref, dtype=float))
                 steer = float(res[0]) if isinstance(res, tuple) else float(res)
-            throttle = 0.35 if v < args.speed else 0.0
-            brake = 1.0 if v > args.speed + 1.5 else 0.0
+            v_target = min(args.speed,
+                           _curve_speed_mps(drive_route, pos, heading))
+            throttle = 0.35 if v < v_target else 0.0
+            brake = 1.0 if v > v_target + 1.5 else 0.0
             if args.drive:
                 conn.control(throttle=throttle, brake=brake,
                              steering=steer, parkingbrake=0.0,
