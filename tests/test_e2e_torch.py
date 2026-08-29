@@ -105,18 +105,46 @@ def test_torch_checkpoint_roundtrip(tmp_path) -> None:
 
 def test_dataset_filters_and_shapes(tmp_path) -> None:
     p = _tiny_episode(tmp_path, n=4)
-    ds = ShadowMultimodalDataset([p], min_quality=0.5, min_speed=0.0,
+    ds = ShadowMultimodalDataset([p], min_quality=0.0, min_speed=0.0,
                                  img_h=32, img_w=48)
     assert len(ds) == 4
-    ds2 = ShadowMultimodalDataset([p], min_quality=0.5, min_speed=9.0,
-                                  img_h=32, img_w=48)
-    assert len(ds2) == 0  # every frame filtered by the speed gate
-    obs, traj, act = ds[0]
+    obs, traj, mask, act = ds[0]
     rgb, label, bev = obs
     assert rgb.shape == (3, 32, 48)
     assert label.shape == (1, 32, 48)
     assert bev.shape == (1, GRID_N, GRID_N)
     assert traj.shape == (N_WAYPOINTS, 2)
+    assert mask.shape == (N_WAYPOINTS,)
+    assert act.shape == (2,)
+    ds2 = ShadowMultimodalDataset([p], min_quality=0.0, min_speed=9.0,
+                                  img_h=32, img_w=48)
+    assert len(ds2) == 0  # every frame filtered by the speed gate
+
+
+def test_dataset_keeps_action_only_frames(tmp_path) -> None:
+    """A frame without a feasible trajectory is kept (action-only)."""
+    p = _tiny_episode(tmp_path, n=4)
+    # rewrite one frame's trajectory to all-NaN (trajectory_ok=False)
+    with np.load(p, allow_pickle=True) as z:
+        data = {k: z[k] for k in z.files}
+    data["trajectory"][2] = np.nan
+    data["trajectory_ok"][2] = False
+    p2 = tmp_path / "ep_bad.npz"
+    np.savez_compressed(p2, **data)
+    ds = ShadowMultimodalDataset([p2], min_quality=0.0, min_speed=0.0,
+                                 img_h=32, img_w=48)
+    assert len(ds) == 4
+    obs, traj, mask, act = ds[2]
+    assert float(mask.sum()) == 0.0   # no valid waypoints
+    assert torch.isfinite(traj).all()
+    assert act.shape == (2,)
+    obs, traj, mask0, act = ds[0]
+    rgb, label, bev = obs
+    assert rgb.shape == (3, 32, 48)
+    assert label.shape == (1, 32, 48)
+    assert bev.shape == (1, GRID_N, GRID_N)
+    assert traj.shape == (N_WAYPOINTS, 2)
+    assert float(mask0.sum()) == N_WAYPOINTS  # healthy frame fully valid
     assert act.shape == (2,)
 
 
@@ -124,11 +152,12 @@ def test_dataset_collate(tmp_path) -> None:
     p = _tiny_episode(tmp_path, n=4)
     ds = ShadowMultimodalDataset([p], min_quality=0.0,
                                  img_h=32, img_w=48)
-    obs, trajs, acts = ShadowMultimodalDataset.collate(
+    obs, trajs, masks, acts = ShadowMultimodalDataset.collate(
         [ds[i] for i in range(2)])
     rgb, label, bev = obs
     assert rgb.shape == (2, 3, 32, 48)
     assert label.shape == (2, 1, 32, 48)
     assert bev.shape == (2, 1, GRID_N, GRID_N)
     assert trajs.shape == (2, N_WAYPOINTS, 2)
+    assert masks.shape == (2, N_WAYPOINTS)
     assert acts.shape == (2, 2)
