@@ -61,6 +61,9 @@ def main() -> int:
     ap.add_argument("--out", default="logs/live_runs/shadow_episodes")
     ap.add_argument("--drive", action="store_true",
                     help="actually drive with the rule autopilot")
+    ap.add_argument("--min-quality", type=float, default=0.5,
+                    help="drop shadow frames with a gated-out prediction "
+                         "(no feasible trajectory); 0 keeps everything")
     args = ap.parse_args()
 
     conn = BeamNGConnector(
@@ -107,8 +110,11 @@ def main() -> int:
                                  origin=(float(pos[0]), float(pos[1])),
                                  heading=heading)
             snap = ring.grab_ring()
+            frame_rgb = None
+            label_map = None
             if "front_main" in snap:
                 frame, cam = snap["front_main"]
+                frame_rgb = np.ascontiguousarray(frame, dtype=np.uint8)
                 ctx = FrameContext(frame_rgb=frame, cam=cam, pos=pos,
                                    heading=heading, ground_z=float(pos[2]),
                                    role="front_main")
@@ -116,6 +122,10 @@ def main() -> int:
                 if out is not None and "road" in out.masks:
                     project_road_mask_to_grid(grid, out.masks["road"], cam,
                                               pos, heading, step=4)
+                    h, w = frame.shape[:2]
+                    label_map = np.zeros((h, w), dtype=np.uint8)
+                    label_map[out.masks["road"]] = 1
+                    label_map[out.masks["line"]] = 2
             rng = range_prov.scan(pos)
             fuse_obstacles_to_grid(grid, rng.obstacles, rng.ray_hits)
 
@@ -144,6 +154,13 @@ def main() -> int:
                              steering=steer)
             conn.step(3)
 
+            # Shadow-prediction quality gate: only frames with a feasible
+            # shadow trajectory are worth training on; bad predictions
+            # would otherwise poison the end-to-end dataset.
+            cost = float(meta.get("cost", -1.0))
+            quality = 1.0 if best is not None else 0.0
+            if args.min_quality > 0.0 and quality < args.min_quality:
+                continue
             rec.add(ShadowFrame(
                 x=float(pos[0]), y=float(pos[1]), heading=heading,
                 speed=v, throttle=throttle, brake=brake, steer=float(steer),
@@ -152,8 +169,11 @@ def main() -> int:
                 trajectory=None if best is None else best,
                 target_speed=float(args.speed),
                 lane_src="semantic" if net.names() else "",
-                cost=float(meta.get("cost", -1.0)),
-                kind=meta.get("kind", "")))
+                cost=cost,
+                kind=meta.get("kind", ""),
+                rgb=frame_rgb,
+                label=label_map,
+                quality=quality))
             frames += 1
         out = rec.save()
         print(f"[shadow] runtime={mode} frames={frames}")
