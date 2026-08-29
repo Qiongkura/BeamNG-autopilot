@@ -178,6 +178,11 @@ class FSDStack:
         # auto-mode max lateral gap between the sensor lane centre and the
         # map-prior own-lane centre before the map takes over.
         self.lane_consistency_m = 1.5
+        # sensor-mode consistency is looser (the perception lane may lead
+        # through corners), but a sensor centre that sits > this far from
+        # the map-prior lane is a different road / whole-road corridor,
+        # not the ego lane.
+        self.lane_consistency_sensor_m = 2.5
         if self.temporal:
             from beamng_autopilot.temporal import TemporalOccupancyFilter
             self.occ_filter = TemporalOccupancyFilter(
@@ -488,12 +493,17 @@ class FSDStack:
                 # jump frame to frame and must never be the hard rule.
                 lane_left = ml
                 lane_right = mr
-                if lane_mode == "auto" and sensor_paired \
-                        and lane_ref is not None:
-                    # Only let the sensor lane lead when it agrees with
-                    # the map-prior own lane; otherwise the map lane is
-                    # the reference (perception-led but consistency
-                    # gated - the first rung towards full sensor mode).
+                if sensor_paired and lane_ref is not None:
+                    # Only a PAIRED sensor lane may lead, and only when
+                    # it agrees laterally with the map-prior own lane.
+                    # An UNPAIRED sensor centre is the whole-road free
+                    # corridor - on a two-way road that IS the centre
+                    # line, never the ego lane (fsd sensor run 2026-08-29:
+                    # an unpaired centre at the end zone sat 2.5 m off and
+                    # stopped the car; corner reads steered it off the
+                    # road edge).  auto = 1.5 m gate (perception-led but
+                    # map-consistent); sensor = looser 2.5 m gate so the
+                    # perception lane can lead through corners.
                     try:
                         _lr2 = np.asarray(lane_ref[:, :2], dtype=float)
                         _mc2 = np.asarray(mc[:, :2], dtype=float)
@@ -505,14 +515,23 @@ class FSDStack:
                             _dm = np.linalg.norm(
                                 _lr2[_sel2][:, None, :]
                                 - _mc2[None, :, :], axis=2).min(axis=1)
-                            if float(np.median(_dm)) > \
-                                    getattr(self, "lane_consistency_m",
-                                            1.5):
+                            _max_c = (getattr(
+                                self, "lane_consistency_sensor_m", 2.5)
+                                if lane_mode == "sensor"
+                                else getattr(self, "lane_consistency_m",
+                                             1.5))
+                            if float(np.median(_dm)) > _max_c:
                                 lane_ref = mc
                                 lane_src_sel = "map"
                     except Exception:
                         lane_ref = mc
                         lane_src_sel = "map"
+                else:
+                    # Unpaired sensor centre / no sensor lane: keep the
+                    # map-prior own-lane centre as the reference.  The
+                    # map boundaries are already the hard guard-rail.
+                    lane_ref = mc
+                    lane_src_sel = "map"
             else:
                 # An unpaired sensor centre is often the whole-road centre
                 # (LiDAR free corridor / single-edge mirror) - never trust
