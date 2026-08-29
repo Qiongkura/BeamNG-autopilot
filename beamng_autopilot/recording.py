@@ -30,7 +30,7 @@ from pathlib import Path
 
 import numpy as np
 
-EPISODE_VERSION = 1
+EPISODE_VERSION = 2
 
 
 @dataclass
@@ -54,6 +54,10 @@ class ShadowFrame:
     lane_src: str = ""                         # which head produced the lane
     cost: float = -1.0
     kind: str = ""                             # which trajectory was chosen
+    # camera observations (image end-to-end / multi-modal training)
+    rgb: np.ndarray | None = None              # (H, W, 3) uint8 front camera
+    label: np.ndarray | None = None            # (H, W) uint8 0=bg 1=road 2=line
+    quality: float = 1.0                       # 0..1 shadow-prediction gate
 
 
 class ShadowRecorder:
@@ -96,6 +100,15 @@ class ShadowRecorder:
         traj_ok = np.zeros(n, dtype=bool)
         bev = np.zeros((n, 60, 60), dtype=np.float32)  # fixed-size grid
         drv = np.zeros((n, 60, 60), dtype=np.uint8)
+        # Camera observations are variable-size: pack into one fixed
+        # (n, H, W, 3) / (n, H, W) array using the first frame's size.
+        cam_h = cam_w = 0
+        for f in self.frames:
+            if f.rgb is not None:
+                cam_h, cam_w = f.rgb.shape[:2]
+                break
+        rgb = np.zeros((n, cam_h, cam_w, 3), dtype=np.uint8)
+        label = np.zeros((n, cam_h, cam_w), dtype=np.uint8)
         for i, f in enumerate(self.frames):
             if f.trajectory is not None and len(f.trajectory):
                 m = min(len(f.trajectory), max(2, max_traj))
@@ -105,6 +118,12 @@ class ShadowRecorder:
                 bev[i] = np.asarray(f.bev_raster, dtype=np.float32)
             if f.drivable is not None:
                 drv[i] = np.asarray(f.drivable, dtype=np.uint8)
+            if f.rgb is not None and cam_h and cam_w:
+                rgb[i, :cam_h, :cam_w] = np.asarray(
+                    f.rgb[:cam_h, :cam_w], dtype=np.uint8)
+            if f.label is not None and cam_h and cam_w:
+                label[i, :cam_h, :cam_w] = np.asarray(
+                    f.label[:cam_h, :cam_w], dtype=np.uint8)
 
         np.savez_compressed(
             out,
@@ -126,9 +145,15 @@ class ShadowRecorder:
                               dtype=object),
             cost=np.array([f.cost for f in self.frames]),
             kind=np.array([f.kind for f in self.frames], dtype=object),
+            rgb=rgb,
+            label=label,
+            quality=np.array([f.quality for f in self.frames],
+                             dtype=np.float32),
             meta=json.dumps({
                 "sequence": self.sequence,
                 "frames": n,
+                "cam_h": int(cam_h),
+                "cam_w": int(cam_w),
             }).encode("utf-8"),
         )
         return out
@@ -137,37 +162,61 @@ class ShadowRecorder:
 class EpisodeDataset:
     """torch Dataset over recorded shadow episodes.
 
-    Yields ``(bev_raster, action)`` where ``action`` is
-    ``(steer, throttle)`` - the contract the end-to-end skeleton trains
-    against: observation = fused vector space, action = executed control.
+    ``modalities`` selects the observation contract:
+      * ``"bev"``   - 60x60 occupancy raster (vector-space end-to-end)
+      * ``"rgb"``   - front camera image (image end-to-end, DAVE-2 style)
+      * ``"label"`` - 3-class segmentation label (0=bg 1=road 2=line)
+    ``action`` is always ``(steer, throttle)`` - the executed control.
+    ``min_quality`` drops shadow frames whose prediction was gated out
+    at recording time, so bad shadow samples never poison training.
     """
 
-    def __init__(self, ep_files):
+    def __init__(self, ep_files, modalities=("bev",), min_quality: float = 0.0):
         import torch  # noqa: F401  (lazy import: only needed to train)
 
         if isinstance(ep_files, (str, Path)):
             ep_files = [Path(ep_files)]
         self.files = [Path(p) for p in ep_files if Path(p).exists()]
-        self._n = 0
-        for p in self.files:
+        self.modalities = tuple(modalities)
+        for m in self.modalities:
+            if m not in ("bev", "rgb", "label", "drivable"):
+                raise KeyError(f"unknown modality: {m}")
+        # Pre-filter by the recorded quality gate so the index stays
+        # stable across iterations.
+        self._idx: list[tuple[int, int]] = []
+        for fi, p in enumerate(self.files):
             with np.load(p, allow_pickle=True) as z:
-                self._n += int(z["t"].shape[0])
+                n = int(z["t"].shape[0])
+                q = np.asarray(z["quality"], dtype=np.float32) \
+                    if "quality" in z else np.ones(n, dtype=np.float32)
+                for i in range(n):
+                    if float(q[i]) >= min_quality:
+                        self._idx.append((fi, i))
 
     def __len__(self) -> int:
-        return self._n
+        return len(self._idx)
 
     def __getitem__(self, idx: int):
         import torch
-        for p in self.files:
-            with np.load(p, allow_pickle=True) as z:
-                n = int(z["t"].shape[0])
-                if idx < n:
-                    bev = torch.from_numpy(
-                        np.asarray(z["bev"][idx], dtype=np.float32))
-                    act = torch.tensor(
-                        [float(z["steer"][idx]),
-                         float(z["throttle"][idx])],
-                        dtype=torch.float32)
-                    return bev, act
-                idx -= n
-        raise IndexError(idx)
+        fi, i = self._idx[idx]
+        with np.load(self.files[fi], allow_pickle=True) as z:
+            obs = []
+            for m in self.modalities:
+                if m == "bev":
+                    obs.append(torch.from_numpy(
+                        np.asarray(z["bev"][i], dtype=np.float32)))
+                elif m == "drivable":
+                    obs.append(torch.from_numpy(
+                        np.asarray(z["drivable"][i], dtype=np.uint8)))
+                elif m == "rgb":
+                    obs.append(torch.from_numpy(
+                        np.asarray(z["rgb"][i], dtype=np.uint8)))
+                elif m == "label":
+                    obs.append(torch.from_numpy(
+                        np.asarray(z["label"][i], dtype=np.uint8)))
+            act = torch.tensor(
+                [float(z["steer"][i]), float(z["throttle"][i])],
+                dtype=torch.float32)
+            if len(obs) == 1:
+                return obs[0], act
+            return tuple(obs), act
