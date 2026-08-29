@@ -55,6 +55,53 @@ from beamng_autopilot.vision.hydra import FrameContext, HydraNet
 from beamng_autopilot.vision.heads.semantic import SemanticHead
 
 
+def _lateral_guard_steer(pos, drive_route, gate_m: float = 1.5,
+                         gain: float = 0.7, max_corr: float = 0.40,
+                         max_turn_deg: float = 55.0) -> float:
+    """Steering correction that pulls the car back toward the road centre.
+
+    Returns a NORMALIZED steer input (negative = left).  Positive cross
+    track = car left of the route direction -> steer right (+), and vice
+    versa; nothing is added while ``|lat| <= gate_m`` so normal lane
+    tracking is untouched.  Disabled inside sharper bends (route turn
+    over the next 8 m > ``max_turn_deg``): there the nearest-point cross
+    track is ambiguous and the correction fights the cornering arc,
+    which wedged the car into a hairpin.
+    """
+    if drive_route is None or len(drive_route) < 4:
+        return 0.0
+    r = np.asarray(drive_route[:, :2], dtype=float)
+    p = np.asarray(pos[:2], dtype=float)
+    d = np.linalg.norm(r - p, axis=1)
+    i = int(np.argmin(d))
+    a, b = max(0, i - 1), min(len(r) - 1, i + 1)
+    v = r[b] - r[a]
+    L = float(np.linalg.norm(v))
+    if L < 1e-9:
+        return 0.0
+    v = v / L
+    rel = p - r[i]
+    lat = float(v[0] * rel[1] - v[1] * rel[0])   # + = left of route
+    if abs(lat) <= gate_m:
+        return 0.0
+    # route turn over the next ~8 m
+    arc = np.concatenate(
+        [[0.0], np.cumsum(np.linalg.norm(np.diff(r, axis=0), axis=1))])
+    base = float(arc[i])
+    j = i
+    while j < len(r) - 1 and float(arc[j]) - base < 8.0:
+        j += 1
+    if j > i + 1:
+        a1 = float(np.arctan2(r[i + 1, 1] - r[i, 1], r[i + 1, 0] - r[i, 0]))
+        a2 = float(np.arctan2(r[j, 1] - r[j - 1, 1], r[j, 0] - r[j - 1, 0]))
+        turn_deg = abs(float(np.degrees(
+            (a2 - a1 + np.pi) % (2 * np.pi) - np.pi)))
+        if turn_deg > max_turn_deg:
+            return 0.0
+    k = min((abs(lat) - gate_m) * gain, max_corr)
+    return float(np.sign(lat) * k)
+
+
 def _path_curvature_ff(path, pos, heading, near_m: float = 1.5,
                        horizon_m: float = 8.0, wheelbase: float = 2.9,
                        ratio: float = 0.6, max_ff: float = 0.40) -> float:
@@ -278,13 +325,28 @@ def main() -> int:
             pos = np.asarray(st.pos, dtype=float)
             heading = float(st.heading)
             v = float(st.speed)
+            drive_route = nav_route if nav_route is not None else route
+            # End-stop: once the remaining route is short, brake to a
+            # standstill in the lane instead of driving off the route end
+            # onto the roadside grass (the route ends at a junction and
+            # the simple driver kept going past it).
+            if drive_route is None or len(drive_route) < 4:
+                near_end = False
+            else:
+                d_end = np.linalg.norm(drive_route - pos[:2], axis=1)
+                i_end = int(np.argmin(d_end))
+                arc = np.concatenate([[0.0], np.cumsum(
+                    np.linalg.norm(np.diff(drive_route, axis=0), axis=1))])
+                near_end = float(arc[-1] - arc[i_end]) < 12.0
             # Stuck restart: the rule driver can wedge against a bend's
             # outside wall (first hairpin on the mountain route); rather
             # than burning the rest of the episode on identical static
             # frames, teleport back to the route start and attack the
             # corner again - every episode then contains several
             # approach/steer attempts.
-            if v < 0.3:
+            if near_end:
+                stuck_t0 = None
+            elif v < 0.3:
                 if stuck_t0 is None:
                     stuck_t0 = time.time()
                 elif time.time() - stuck_t0 > 3.0:
@@ -336,14 +398,11 @@ def main() -> int:
                               max_steer=0.4, n_curv=9)
             best, meta = select_trajectory(scene, fans, cons)
 
-            # executed control: rule PP toward the route (road graph when
-            # available, else straight ahead) + cruise
-            drive_route = nav_route if nav_route is not None else route
-            if best is not None:
-                # prefer the shadow path when it is within the lane budget
-                route_ref = best
-            else:
-                route_ref = drive_route
+            # executed control: follow the shadow planner's ``best`` arc
+            # when it exists (it is smooth through bends) and fall back
+            # to the road graph otherwise; the lateral guard below keeps
+            # the car inside the road instead of cutting onto grass.
+            route_ref = best if best is not None else drive_route
             steer = 0.0
             if route_ref is not None and len(route_ref) >= 2:
                 res = pp.steering(
@@ -356,12 +415,22 @@ def main() -> int:
                 # instead of run wide into the outside wall.
                 steer = float(np.clip(
                     -steer_rad / 0.6 +
-                    _path_curvature_ff(route_ref, pos, heading),
+                    _path_curvature_ff(route_ref, pos, heading) +
+                    _lateral_guard_steer(pos, drive_route),
                     -1.0, 1.0))
             v_target = min(args.speed,
                            _curve_speed_mps(drive_route, pos, heading))
-            throttle = 0.35 if v < v_target else 0.0
-            brake = 1.0 if v > v_target + 1.5 else 0.0
+            # Without a shadow arc the rule fallback follows the raw
+            # road-graph polyline, which kinks too sharply to track at
+            # speed (wedged a right bend at 6.6 m/s); crawl instead.
+            if best is None:
+                v_target = min(v_target, 3.0)
+            if near_end:
+                throttle = 0.0
+                brake = 1.0 if v > 0.2 else 0.3
+            else:
+                throttle = 0.35 if v < v_target else 0.0
+                brake = 1.0 if v > v_target + 1.5 else 0.0
             if args.drive:
                 conn.control(throttle=throttle, brake=brake,
                              steering=steer, parkingbrake=0.0,
