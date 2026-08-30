@@ -51,6 +51,10 @@ from beamng_autopilot.runtime import (
     build_range_provider,
 )
 from beamng_autopilot.vision.hydra import FrameContext, HydraNet
+from beamng_autopilot.fsd_realism import (
+    SRC_SENSOR,
+    SRC_UNAVAILABLE,
+)
 
 
 # Heading gate threshold for a PAIRED sensor lane against the nav
@@ -110,7 +114,8 @@ class FSDStack:
                  range_every_n: int = 1,
                  semantic_every_n: int = 1,
                  object_every_n: int = 1,
-                 lane_mode: str = "map"):
+                 lane_mode: str = "map",
+                 strict_sensor: bool = False):
         self.conn = conn
         self.grid_n = int(grid_n)
         self.grid_res = float(grid_res)
@@ -175,6 +180,7 @@ class FSDStack:
         #            safety monitor can always stop.
         self.lane_mode = str(lane_mode) if lane_mode in (
             "map", "auto", "sensor") else "map"
+        self.strict_sensor = bool(strict_sensor)
         # auto-mode max lateral gap between the sensor lane centre and the
         # map-prior own-lane centre before the map takes over.
         self.lane_consistency_m = 1.5
@@ -560,6 +566,25 @@ class FSDStack:
                 lane_width = (_w if _w > 0.0
                               else float(getattr(self, "map_lane_width_m", 0.0)
                                          or LANE_WIDTH_DEFAULT_M))
+        # FSD realism (strict sensor): the lane-keep reference and hard
+        # boundaries must come from PERCEPTION only (docs/fsd_realism.md
+        # §4).  When no PAIRED sensor lane is available (or it was
+        # rejected), the car degrades to no-lane - safety stops/coasts -
+        # instead of silently riding map lane geometry.
+        if lane_mode == "sensor" and self.strict_sensor:
+            if sensor_paired and lane_ref is not None \
+                    and len(lane_ref) >= 3:
+                lane_src_sel = SRC_SENSOR
+            else:
+                lane_ref = None
+                lane_left = None
+                lane_right = None
+                lane_width = 0.0
+                lane_src_sel = SRC_UNAVAILABLE
+                map_lane = None   # no map lane may reach the planner
+            out.meta["lane_src_sel"] = lane_src_sel
+            out.meta["lane_strict"] = 1
+
         if lane_ref is None or len(lane_ref) < 4:
             # BEV drivable-space fallback when there is NO nav route to
             # derive a map-prior own lane from (standalone probes / unit

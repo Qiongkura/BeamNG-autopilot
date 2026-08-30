@@ -353,6 +353,10 @@ def main() -> int:
                          "default), auto (sensor leads only when it agrees "
                          "with the map lane), sensor (perception-led; map "
                          "prior stays the hard guard-rail)")
+    ap.add_argument("--strict", action="store_true",
+                    help="FSD realism mode (docs/fsd_realism.md): with "
+                         "--lane-mode sensor the map lane may NEVER lead; "
+                         "no paired perception lane -> no-lane degradation")
     ap.add_argument("--goal", nargs=2, type=float, default=None,
                     metavar=("X", "Y"),
                     help="set an in-game navigation route to this goal "
@@ -534,6 +538,7 @@ def main() -> int:
                                 ObjectHead()],
                          ring_roles=('front_main',),
                          lane_mode=args.lane_mode,
+                         strict_sensor=args.strict,
                          cam_w=args.cam_w, cam_h=args.cam_h,
                          temporal=True, range_every_n=3,
                          # LiDAR every 3rd tick: a fresh scan costs
