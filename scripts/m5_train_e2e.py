@@ -59,11 +59,20 @@ def main() -> int:
                     help="drop near-static frames from training")
     ap.add_argument("--val-split", type=float, default=0.15)
     ap.add_argument("--augment", action="store_true")
+    ap.add_argument("--dedup", action="store_true",
+                    help="skip near-duplicate consecutive frames "
+                         "(speed/steer/throttle almost unchanged)")
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--out", type=str, default="logs/m5_e2e/best.pt")
     ap.add_argument("--history", type=int, default=2,
                     help="temporal context: stack this many past frames "
                          "(0 = single frame)")
+    ap.add_argument("--drop-takeover-ge", type=float, default=None,
+                    help="exclude episodes whose batch-replay takeover "
+                         "rate >= this threshold (reads --report)")
+    ap.add_argument("--report", type=str,
+                    default="logs/m5_e2e/report.json",
+                    help="batch-replay report used by --drop-takeover-ge")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -74,6 +83,29 @@ def main() -> int:
         print(f"[train-e2e] no episodes under {data}")
         return 1
 
+    if args.drop_takeover_ge is not None:
+        report = Path(args.report)
+        if report.is_file():
+            rep = json.loads(report.read_text(encoding="utf-8"))
+            rates = {Path(e["episode"]).name: float(e["takeover_rate"])
+                     for e in rep.get("episodes", [])}
+            keep = [p for p in files
+                    if rates.get(p.name, 0.0) < args.drop_takeover_ge]
+            dropped = [p for p in files if p not in keep]
+            if dropped:
+                print(f"[train-e2e] 剔除 {len(dropped)} 个高接管率坏集 "
+                      f"(>= {args.drop_takeover_ge:.2f}):")
+                for p in dropped:
+                    print(f"  drop {p.name} "
+                          f"(takeover={rates.get(p.name, 0.0) * 100:.0f}%)")
+                files = keep
+                if not files:
+                    print("[train-e2e] 全部 episode 都被接管率过滤剔除")
+                    return 1
+        else:
+            print(f"[train-e2e] WARNING: --drop-takeover-ge 已给但报告 "
+                  f"{report} 不存在，未剔除任何集（先跑一次回放评测）")
+
     device = args.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -82,7 +114,7 @@ def main() -> int:
         files, min_quality=args.min_quality, min_speed=args.min_speed,
         history=args.history,
         img_h=args.img_h, img_w=args.img_w, augment=args.augment,
-        seed=args.seed)
+        seed=args.seed, dedup=args.dedup)
     n = len(ds)
     if n == 0:
         print("[train-e2e] no usable frames (quality/trajectory filter)")
