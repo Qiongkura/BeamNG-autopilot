@@ -55,37 +55,42 @@ def _load_trained(weights: str, device: str):
     return net_torch, ckpt, int(ckpt["img_h"]), int(ckpt["img_w"])
 
 
-def _prep(i, z, img_h: int, img_w: int):
-    """Resize one recorded frame for the trained CNN."""
+def _prep_arr(i: int, rgb, label, bev, img_h: int, img_w: int):
+    """Resize one recorded frame for the trained CNN.
+
+    Arrays are already loaded in memory (indexing a compressed npz
+    member decompresses the whole array on every access, which turns a
+    batch replay into O(n^2) decompression work).
+    """
     import torch.nn.functional as F
-    rgb = np.asarray(z["rgb"][i], dtype=np.uint8) \
-        if "rgb" in z else np.zeros((img_h, img_w, 3), dtype=np.uint8)
-    label = np.asarray(z["label"][i], dtype=np.uint8) \
-        if "label" in z else None
+    rgb_i = np.asarray(rgb[i], dtype=np.uint8) if rgb is not None \
+        else np.zeros((img_h, img_w, 3), dtype=np.uint8)
+    label_i = np.asarray(label[i], dtype=np.uint8) if label is not None \
+        else None
     t_rgb = torch.from_numpy(
-        rgb.astype(np.float32)).permute(2, 0, 1)[None]
+        rgb_i.astype(np.float32)).permute(2, 0, 1)[None]
     t_rgb = F.interpolate(t_rgb, size=(img_h, img_w),
                           mode="bilinear",
                           align_corners=False)[0] / 255.0
     t_label = None
-    if label is not None:
+    if label_i is not None:
         t_label = torch.from_numpy(
-            label.astype(np.float32))[None, None]
+            label_i.astype(np.float32))[None, None]
         t_label = F.interpolate(t_label, size=(img_h, img_w),
                                 mode="nearest")[0]
-    t_bev = torch.from_numpy(
-        np.asarray(z["bev"][i], dtype=np.float32))[None]
+    t_bev = torch.from_numpy(np.asarray(bev[i], dtype=np.float32))[None]
     return t_rgb, t_label, t_bev
 
 
-def _predict(net_torch, net, z, i: int, device: str,
-             img_h: int, img_w: int):
+def _predict(net_torch, net, rgb, label, bev, speed, i: int,
+             device: str, img_h: int, img_w: int):
     """Run one frame; return (steer, throttle, traj_ego, valid_len)."""
     if net_torch is not None:
         h = net_torch.history
         need = h + 1
         i0 = max(0, i - h)
-        frames = [_prep(j, z, img_h, img_w) for j in range(i0, i + 1)]
+        frames = [_prep_arr(j, rgb, label, bev, img_h, img_w)
+                  for j in range(i0, i + 1)]
         pads = need - len(frames)  # missing at the episode start
         if pads:
             frames = [frames[0]] * pads + frames
@@ -95,12 +100,12 @@ def _predict(net_torch, net, z, i: int, device: str,
                                for f in frames])[None].to(device)
         t_bev = torch.stack([f[2] for f in frames])[None].to(device)
         t_speed = torch.tensor(
-            [[float(z["speed"][i])]], dtype=torch.float32, device=device)
+            [[float(speed[i])]], dtype=torch.float32, device=device)
         with torch.no_grad():
             traj, action = net_torch(t_rgb, t_label, t_bev, t_speed)
         return (float(action[0, 0].cpu()), float(action[0, 1].cpu()),
                 traj[0].cpu().numpy(), int(traj.shape[1]))
-    traj, action = net.forward(np.asarray(z["bev"][i], dtype=np.float32))
+    traj, action = net.forward(np.asarray(bev[i], dtype=np.float32))
     return (float(action[0]), float(action[1]),
             np.asarray(traj, dtype=float), len(traj))
 
@@ -150,13 +155,31 @@ def _evaluate_episode(ep: Path, net_torch, net, device: str,
     curvs: list[float] = []
     with np.load(ep, allow_pickle=True) as z:
         n = int(z["t"].shape[0])
+        # Load every array once: npz member access decompresses the whole
+        # array each time, and per-frame indexing is O(n^2) on big runs.
+        steer = np.asarray(z["steer"], dtype=np.float64)
+        throttle = np.asarray(z["throttle"], dtype=np.float64)
+        speed = np.asarray(z["speed"], dtype=np.float64)
+        bev = np.asarray(z["bev"], dtype=np.float32)
+        rgb = np.asarray(z["rgb"], dtype=np.uint8) if "rgb" in z else None
+        label = np.asarray(z["label"], dtype=np.uint8) \
+            if "label" in z else None
         has_traj = all(k in z for k in
                        ("trajectory", "trajectory_ok", "heading", "x", "y"))
+        traj_world = np.asarray(z["trajectory"], dtype=np.float64) \
+            if has_traj else None
+        traj_ok = np.asarray(z["trajectory_ok"], dtype=bool) \
+            if has_traj else None
+        xs = np.asarray(z["x"], dtype=np.float64) if has_traj else None
+        ys = np.asarray(z["y"], dtype=np.float64) if has_traj else None
+        hdgs = np.asarray(z["heading"], dtype=np.float64) \
+            if has_traj else None
         for i in range(n):
             ps, pt, traj_pred, _ = _predict(
-                net_torch, net, z, i, device, img_h, img_w)
-            gs = float(z["steer"][i])
-            gt = float(z["throttle"][i])
+                net_torch, net, rgb, label, bev, speed, i,
+                device, img_h, img_w)
+            gs = float(steer[i])
+            gt = float(throttle[i])
             steer_err.append(ps - gs)
             thr_err.append(pt - gt)
             if abs(ps - gs) > th_steer or abs(pt - gt) > th_thr:
@@ -167,11 +190,10 @@ def _evaluate_episode(ep: Path, net_torch, net, device: str,
             else:
                 extents.append(ext)
                 curvs.append(curv)
-            if has_traj and bool(z["trajectory_ok"][i]):
+            if has_traj and bool(traj_ok[i]):
                 gt_ego = _traj_ego_gt(
-                    float(z["x"][i]), float(z["y"][i]),
-                    float(z["heading"][i]),
-                    np.asarray(z["trajectory"][i]))
+                    float(xs[i]), float(ys[i]), float(hdgs[i]),
+                    traj_world[i])
                 if gt_ego is not None and np.isfinite(traj_pred).all():
                     m = min(len(gt_ego), len(traj_pred), n_wp)
                     if m >= 2:
@@ -299,12 +321,20 @@ def main() -> int:
 
     with np.load(args.episode, allow_pickle=True) as z:
         n = int(z["t"].shape[0])
+        steer = np.asarray(z["steer"], dtype=np.float64)
+        throttle = np.asarray(z["throttle"], dtype=np.float64)
+        speed = np.asarray(z["speed"], dtype=np.float64)
+        bev = np.asarray(z["bev"], dtype=np.float32)
+        rgb = np.asarray(z["rgb"], dtype=np.uint8) if "rgb" in z else None
+        label = np.asarray(z["label"], dtype=np.uint8) \
+            if "label" in z else None
         print(f"[e2e] episode {Path(args.episode).name}: {n} frames")
         for i in range(n):
             ps, pt, traj_pred, traj_len = _predict(
-                net_torch, net, z, i, device, img_h, img_w)
-            gs = float(z["steer"][i])
-            gt = float(z["throttle"][i])
+                net_torch, net, rgb, label, bev, speed, i,
+                device, img_h, img_w)
+            gs = float(steer[i])
+            gt = float(throttle[i])
             print(f"  frame {i}: executed steer={gs:+.2f} "
                   f"throttle={gt:.2f} | "
                   f"pred steer={ps:+.3f} thr={pt:.3f} "
