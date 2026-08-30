@@ -66,10 +66,24 @@ as the execution layer during the transition.
 - **Live FSD driving** - `fsd_stack.py` + `scripts/m5_fsd_drive.py`
   (plan -> safety arbitration -> PurePursuit/SpeedController, with rule
   fallback and reverse guard).
-- **Shadow recording + e2e skeleton** - `recording.py`
-  (`ShadowRecorder`/`EpisodeDataset`) and `neural/` (`E2ENet`:
-  BEV -> trajectory + action, forward/backward + synthetic training
-  verified; not trained on real data yet).
+- **Shadow recording + trained E2E** - `recording.py`
+  (`ShadowRecorder`/`EpisodeDataset`) and `neural/` (`E2ENetTorch`:
+  temporal multimodal CNN, RGB + seg label + BEV + speed -> trajectory +
+  action; trained on real shadow data, val 0.0599; batch replay report
+  and worst-frame images under `logs/m5_e2e/`).
+
+## Offline Eval & Data Tools
+
+- `m5_e2e_probe.py --data <dir> --weights <ckpt>`: batch replay eval -
+  action error / takeover rate / trajectory error written to
+  `logs/m5_e2e/report.json`, plus top-N worst frames in
+  `logs/m5_e2e/worst/`.
+- `m5_train_e2e.py --drop-takeover-ge 0.5 --dedup`: auto-exclude
+  high-takeover bad episodes and skip near-duplicate frames.
+- `m5_collect_seg.py --town`: collect segmentation ground truth from the
+  marking-dense town area (`--area-center/--area-radius` to customise).
+- `m5_pipeline.py --cycles N --dedup --drop-takeover-ge 0.5`:
+  collect -> train -> replay-eval loop with an auto-persisted report.
 
 The Chinese `README.md` documents each layer in more detail, including
 run commands for the FSD probes and the live drive.
