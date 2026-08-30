@@ -42,6 +42,9 @@ def main() -> int:
                     help="shadow episodes per cycle")
     ap.add_argument("--collect-seconds", type=float, default=60.0)
     ap.add_argument("--speed", type=float, default=6.0)
+    ap.add_argument("--town", action="store_true",
+                    help="collect on the italy town route "
+                         "(start 729.6,763.9 -> goal 832.55,731.59)")
     ap.add_argument("--teleport", nargs=3, type=float, default=None)
     ap.add_argument("--goal", nargs=2, type=float, default=None)
     ap.add_argument("--epochs", type=int, default=120)
@@ -57,6 +60,13 @@ def main() -> int:
 
     data = Path(args.data)
     weights = Path(args.weights)
+    if args.town:
+        if args.teleport is None:
+            args.teleport = [729.6, 763.9, 45.0]
+        if args.goal is None:
+            args.goal = [832.55, 731.59]
+        print(f"[pipeline] town preset: teleport={args.teleport} "
+              f"goal={args.goal}")
     data.mkdir(parents=True, exist_ok=True)
     weights.parent.mkdir(parents=True, exist_ok=True)
 
