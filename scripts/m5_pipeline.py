@@ -76,11 +76,11 @@ def main() -> int:
             _run(["scripts/m5_train_e2e.py", "--data", str(data),
                   "--epochs", str(args.epochs), "--history",
                   str(args.history), "--out", str(weights)])
-            episodes = sorted(data.glob("*.npz"),
-                              key=lambda p: p.stat().st_mtime)
-            if episodes:
-                _run(["scripts/m5_e2e_probe.py", "--episode",
-                      str(episodes[-1]), "--weights", str(weights)])
+            report = ROOT / "logs" / "m5_e2e" / "report.json"
+            # 批量回放评测：对所有录到的 episodes 跑一次，报告落盘
+            # logs/m5_e2e/report.json，方便跨轮次对比接管率/动作误差。
+            _run(["scripts/m5_e2e_probe.py", "--data", str(data),
+                  "--weights", str(weights), "--report", str(report)])
     print("[pipeline] done")
     return 0
 
