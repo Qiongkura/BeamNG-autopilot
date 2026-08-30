@@ -59,6 +59,9 @@ def main() -> None:
     n_correct = n_pix = 0
     n_frames = 0
     per_frame = []
+    # 近场标线 IoU：只统计画面下半（贴近车头 10-15m 内的路面），
+    # 远场细线/小目标对驾驶几乎无影响，分开报才能看出感知到底可不可用。
+    line_iou_near = 0.0
     for idx, f in enumerate(files):
         d = np.load(f)
         colour, label = d["colour"], d["label"]
@@ -75,6 +78,12 @@ def main() -> None:
             inter = int((p & t).sum())
             union = int((p | t).sum())
             ious[c] += inter / union if union else 1.0
+        y0 = label.shape[0] // 2
+        p_n = pred[y0:] == 2
+        t_n = label[y0:] == 2
+        inter_n = int((p_n & t_n).sum())
+        union_n = int((p_n | t_n).sum())
+        line_iou_near += inter_n / union_n if union_n else 1.0
         n_frames += 1
         if args.save and idx % step == 0:
             vis_true = (colour.copy(),)
@@ -95,6 +104,8 @@ def main() -> None:
     print("=" * 56)
     for c in range(N_CLASSES):
         print(f"  {CLASS_NAMES[c]:<12} IoU = {ious[c]:.4f}")
+    print(f"  {'line IoU(近场)':<12} = {line_iou_near / max(1, n_frames):.4f} "
+          f"(下半画面)")
     print(f"  {'mIoU':<12}      = {ious.mean():.4f}")
     print(f"  像素准确率          = {n_correct / max(1, n_pix):.4f}")
     print(f"  帧数               = {n_frames}")
