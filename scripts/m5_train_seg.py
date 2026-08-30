@@ -101,6 +101,29 @@ def _augment(frame, rng: np.random.Generator):
                             interpolation=cv2.INTER_AREA)
         label = cv2.resize(label[y0:y0 + ch, x0:x0 + cw], (w, h),
                            interpolation=cv2.INTER_NEAREST)
+    if rng.random() < 0.45 and (label == 2).any():
+        # 标线形态扰动：模拟远距离细线/断线/磨损，逼模型学标线结构
+        # 而不是记住粗线。粗线->弥合（dilate），细线->收缩（erode），
+        # 或随机擦除几段（虚线/磨损），三种都以真实物理为约束：
+        # 擦除掉的标线底下是沥青路面（1），不是背景。
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        line = (label == 2).astype(np.uint8)
+        r = rng.random()
+        if r < 0.4:                             # 弥合断裂：标线变粗/连上
+            line2 = cv2.dilate(line, k, iterations=1).astype(bool)
+            label[line2] = 2
+        elif r < 0.75:                          # 远处细线：标线收缩变细
+            line2 = cv2.erode(line, k, iterations=1).astype(bool)
+            label[line.astype(bool) & ~line2] = 1
+        else:                                   # 随机擦除段：虚线/磨损
+            erase = np.zeros_like(label, dtype=bool)
+            for _ in range(int(rng.integers(1, 4))):
+                ys = int(rng.integers(0, label.shape[0] - 6))
+                xs = int(rng.integers(0, label.shape[1] - 6))
+                hh = int(rng.integers(2, 12))
+                ww = int(rng.integers(2, 12))
+                erase[ys:ys + hh, xs:xs + ww] = True
+            label[erase & line.astype(bool)] = 1
     return colour, label
 
 
