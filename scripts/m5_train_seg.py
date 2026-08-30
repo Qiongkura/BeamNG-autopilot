@@ -43,7 +43,8 @@ def load_frames(run_dirs: list[Path]) -> list[tuple[np.ndarray, np.ndarray]]:
     return frames
 
 
-def median_freq_weights(labels: list[np.ndarray]) -> torch.Tensor:
+def median_freq_weights(labels: list[np.ndarray],
+                       line_weight: float = 2.0) -> torch.Tensor:
     """Median frequency balancing：权重与类别频率成反比。"""
     hist = np.zeros(N_CLASSES, dtype=np.float64)
     for _, lab in labels:
@@ -52,7 +53,7 @@ def median_freq_weights(labels: list[np.ndarray]) -> torch.Tensor:
     med = float(np.median(hist[hist > 0]))
     w = np.array([med / max(h, 1e-6) for h in hist])
     w = np.clip(w, 0.1, 20.0)
-    w[2] *= 2.0  # line 类再翻倍：细线目标需要更强的监督
+    w[2] *= line_weight  # line 类再放大：细线目标需要更强的监督
     return torch.tensor(w, dtype=torch.float32)
 
 
@@ -111,6 +112,8 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val-frac", type=float, default=0.2)
+    ap.add_argument("--line-weight", type=float, default=2.0,
+                    help="extra multiplier on the line class loss weight")
     ap.add_argument("--out", default=str(config.LOGS_DIR / "m5_seg" / "seg_model"))
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--vram-frac", type=float, default=0.6,
@@ -142,7 +145,8 @@ def main() -> None:
     print(f"[train] 共 {n} 帧: 训练 {len(train_frames)} / 验证 {len(val_frames)}")
     print(f"[train] 类别: {CLASS_NAMES}")
 
-    weights = median_freq_weights(train_frames)
+    weights = median_freq_weights(train_frames,
+                                   line_weight=args.line_weight)
     print(f"[train] 类别权重: {weights.tolist()}")
 
     model = SegUNet().to(device)
