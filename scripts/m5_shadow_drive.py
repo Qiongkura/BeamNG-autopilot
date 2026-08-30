@@ -45,6 +45,7 @@ from beamng_autopilot.planning import (
     sample_arc,
     select_trajectory,
 )
+from beamng_autopilot.lane import perception_lateral_guard
 from beamng_autopilot.recording import ShadowFrame, ShadowRecorder
 from beamng_autopilot.roadnet import RoadNetwork
 from beamng_autopilot.runtime import (
@@ -53,53 +54,6 @@ from beamng_autopilot.runtime import (
 )
 from beamng_autopilot.vision.hydra import FrameContext, HydraNet
 from beamng_autopilot.vision.heads.semantic import SemanticHead
-
-
-def _lateral_guard_steer(pos, drive_route, gate_m: float = 1.5,
-                         gain: float = 0.7, max_corr: float = 0.40,
-                         max_turn_deg: float = 55.0) -> float:
-    """Steering correction that pulls the car back toward the road centre.
-
-    Returns a NORMALIZED steer input (negative = left).  Positive cross
-    track = car left of the route direction -> steer right (+), and vice
-    versa; nothing is added while ``|lat| <= gate_m`` so normal lane
-    tracking is untouched.  Disabled inside sharper bends (route turn
-    over the next 8 m > ``max_turn_deg``): there the nearest-point cross
-    track is ambiguous and the correction fights the cornering arc,
-    which wedged the car into a hairpin.
-    """
-    if drive_route is None or len(drive_route) < 4:
-        return 0.0
-    r = np.asarray(drive_route[:, :2], dtype=float)
-    p = np.asarray(pos[:2], dtype=float)
-    d = np.linalg.norm(r - p, axis=1)
-    i = int(np.argmin(d))
-    a, b = max(0, i - 1), min(len(r) - 1, i + 1)
-    v = r[b] - r[a]
-    L = float(np.linalg.norm(v))
-    if L < 1e-9:
-        return 0.0
-    v = v / L
-    rel = p - r[i]
-    lat = float(v[0] * rel[1] - v[1] * rel[0])   # + = left of route
-    if abs(lat) <= gate_m:
-        return 0.0
-    # route turn over the next ~8 m
-    arc = np.concatenate(
-        [[0.0], np.cumsum(np.linalg.norm(np.diff(r, axis=0), axis=1))])
-    base = float(arc[i])
-    j = i
-    while j < len(r) - 1 and float(arc[j]) - base < 8.0:
-        j += 1
-    if j > i + 1:
-        a1 = float(np.arctan2(r[i + 1, 1] - r[i, 1], r[i + 1, 0] - r[i, 0]))
-        a2 = float(np.arctan2(r[j, 1] - r[j - 1, 1], r[j, 0] - r[j - 1, 0]))
-        turn_deg = abs(float(np.degrees(
-            (a2 - a1 + np.pi) % (2 * np.pi) - np.pi)))
-        if turn_deg > max_turn_deg:
-            return 0.0
-    k = min((abs(lat) - gate_m) * gain, max_corr)
-    return float(np.sign(lat) * k)
 
 
 def _path_curvature_ff(path, pos, heading, near_m: float = 1.5,
@@ -413,10 +367,14 @@ def main() -> int:
                 # ratio (and flip sign to BeamNG's left-negative input) and
                 # add the curvature feed-forward so bends are pre-turned
                 # instead of run wide into the outside wall.
+                # Stay-on-road is PERCEPTION-only: the BEV drivable mask
+                # (semantic road back-projection + LiDAR free space) says
+                # where the road is.  No map, no nav route - the same
+                # guard runs on any map from the sensors alone.
                 steer = float(np.clip(
                     -steer_rad / 0.6 +
                     _path_curvature_ff(route_ref, pos, heading) +
-                    _lateral_guard_steer(pos, drive_route),
+                    perception_lateral_guard(grid),
                     -1.0, 1.0))
             v_target = min(args.speed,
                            _curve_speed_mps(drive_route, pos, heading))
