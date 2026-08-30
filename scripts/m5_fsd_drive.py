@@ -38,6 +38,7 @@ from beamng_autopilot.control.speed import (
     SpeedController, rate_limit_pedal,
 )
 from beamng_autopilot.fsd_stack import FSDStack
+from beamng_autopilot.lane import perception_curve_speed
 from beamng_autopilot.occupancy import OccupancyGrid
 from beamng_autopilot.planning import (
     Scene, anchored_rule_ref, arbitrate, local_route,
@@ -1207,6 +1208,23 @@ def main() -> int:
                             out.best_speed = float(min(
                                 out.best_speed, math.sqrt(1.3 * _rmin)))
                             out.meta["plan_src"] = "nav_round+gov"
+                except Exception:
+                    pass
+                # FSD-realism speed cap: slow on what the sensors SEE.
+                # The nav-route profile above is navigation intent; when
+                # the BEV road mask curves ahead, the plan is capped from
+                # PERCEPTION only (docs/fsd_realism.md §2).
+                try:
+                    if out.drivable is not None:
+                        _pg = OccupancyGrid(
+                            60, 60, 0.5,
+                            origin=(float(pos[0]), float(pos[1])),
+                            heading=float(heading))
+                        _pg.drivable = np.asarray(out.drivable, dtype=float)
+                        _pcap = perception_curve_speed(_pg, out.best_speed)
+                        if _pcap < out.best_speed:
+                            out.best_speed = _pcap
+                            out.meta["plan_src"] = "perception-curve"
                 except Exception:
                     pass
             # control from the (possibly degraded) target speed, but never

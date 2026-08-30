@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from beamng_autopilot.lane import perception_lateral_guard
+from beamng_autopilot.lane import perception_curve_speed, perception_lateral_guard
 from beamng_autopilot.occupancy import OccupancyGrid
 
 
@@ -66,6 +66,31 @@ def test_perceived_corner_disables_guard() -> None:
     c0, c1 = _cols(0.0, 6.0)   # far road shifted left
     g.drivable[r0f:r1f + 1, c0:c1 + 1] = 1.0
     assert perception_lateral_guard(g, gate_m=1.0) == 0.0
+
+
+def test_curve_speed_keeps_cruise_on_straight_road() -> None:
+    g = _grid_with_road(-3.0, 3.0)   # straight slab
+    assert perception_curve_speed(g, cruise=6.0) == 6.0
+
+
+def test_curve_speed_caps_on_perceived_bend() -> None:
+    g = OccupancyGrid(60, 60, 0.5, origin=(0.0, 0.0), heading=0.0)
+    ext = g.extent
+    r0n = int((ext - 4.0) / g.res); r1n = int((ext - 2.0) / g.res)
+    r0f = int((ext - 9.0) / g.res); r1f = int((ext - 6.0) / g.res)
+    def _cols(y_lo, y_hi):
+        return int((ext - y_hi) / g.res), int((ext - y_lo) / g.res)
+    c0, c1 = _cols(-3.0, 3.0)          # near: centred
+    g.drivable[r0n:r1n + 1, c0:c1 + 1] = 1.0
+    c0, c1 = _cols(0.0, 6.0)           # far: shifted 3 m left
+    g.drivable[r0f:r1f + 1, c0:c1 + 1] = 1.0
+    cap = perception_curve_speed(g, cruise=6.0)
+    assert cap < 6.0 and cap >= 1.5
+
+
+def test_curve_speed_no_road_keeps_cruise() -> None:
+    g = OccupancyGrid(60, 60, 0.5, origin=(0.0, 0.0), heading=0.0)
+    assert perception_curve_speed(g, cruise=6.0) == 6.0
 
 
 def test_sparse_road_returns_zero() -> None:
