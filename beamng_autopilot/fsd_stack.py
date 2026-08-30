@@ -486,7 +486,8 @@ class FSDStack:
                     lane_width = 0.0
             except Exception:
                 pass
-        if map_lane is not None:
+        if map_lane is not None and not (
+                lane_mode == "sensor" and self.strict_sensor):
             mc, ml, mr = map_lane
             lane_src_sel = "map"
             if sensor_paired and lane_ref is not None \
@@ -583,16 +584,20 @@ class FSDStack:
                 lane_src_sel = SRC_UNAVAILABLE
                 map_lane = None   # no map lane may reach the planner
             out.meta["lane_src_sel"] = lane_src_sel
+            out.meta["lane_src"] = lane_src_sel
             out.meta["lane_strict"] = 1
 
+        bev_ref = None
         if lane_ref is None or len(lane_ref) < 4:
             # BEV drivable-space fallback when there is NO nav route to
             # derive a map-prior own lane from (standalone probes / unit
             # stubs): the lateral centre of the FREE corridor.  In real
             # nav runs the map lane (or a paired sensor lane) takes
             # priority, so this whole-road centre never reaches the
-            # planner's lateral reference there.
-            bev_ref = self._bev_drivable_center(grid, pos, heading)
+            # planner's lateral reference there.  Strict sensor mode
+            # skips it too: the whole-road centre is not the ego lane.
+            if not (lane_mode == "sensor" and self.strict_sensor):
+                bev_ref = self._bev_drivable_center(grid, pos, heading)
             if bev_ref is not None and len(bev_ref) >= 4:
                 lane_ref = bev_ref
         out.lane_ref = (np.asarray(lane_ref, dtype=float)
@@ -633,7 +638,8 @@ class FSDStack:
                           and len(lane_ref) >= 4 else _base_route)
         if plan_route is None or len(plan_route) < 2:
             plan_route = _base_route
-        if lane_ref is None:
+        if lane_ref is None and not (
+                lane_mode == "sensor" and self.strict_sensor):
             lane_ref = plan_route
         # out.lane_ref drives the *lateral* lane-keep reference (sensor
         # lane centre when available); plan_route stays the navigational

@@ -878,6 +878,15 @@ def main() -> int:
             # FSD safety monitor re-verifies it below (and can stop).
             rule_ref = None
             _need_rule = (best is None or len(best) < 2 or not verd.safe)
+            # FSD realism (strict): with no PAIRED perception lane the
+            # car must stop, not drive the map/nav route through the rule
+            # fallback (docs/fsd_realism.md §4).  The rule planner below
+            # is exactly that map fallback, so it is disabled here.
+            _strict_no_lane = bool(args.strict and
+                                   str(out.meta.get("lane_src_sel", ""))
+                                   != "sensor")
+            if _strict_no_lane:
+                _need_rule = False
             if _need_rule and nav_route is not None and len(nav_route) >= 2:
                 try:
                     _fwd = (np.asarray(st.dir[:2], dtype=float)
@@ -1233,6 +1242,10 @@ def main() -> int:
             # band) must govern the actual pedals.
             plan_speed = out.best_speed if out.best_speed > 0.0 \
                 else float(args.speed)
+            if _strict_no_lane:
+                # no perception lane -> minimal-risk stop (never map-drive)
+                plan_speed = 0.0
+                plan_sm = 0.0
             # a rule fallback does not get the FSD plan speed; cap it to a
             # cautious creep so the L2 fallback is gentle
             if chosen.source == "rule":
