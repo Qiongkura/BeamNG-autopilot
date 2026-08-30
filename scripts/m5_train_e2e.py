@@ -28,6 +28,25 @@ if str(ROOT) not in sys.path:
 from beamng_autopilot.neural import E2ENetTorch, ShadowMultimodalDataset
 
 
+def filter_high_takeover(files, report_path, threshold):
+    """Split episode files by the batch-replay takeover report.
+
+    Returns ``(keep, dropped, rates)`` where ``rates`` maps episode name
+    to takeover rate (empty when the report is missing).  Episodes
+    missing from the report are kept (no information).
+    """
+    files = list(files)
+    report = Path(report_path)
+    if not report.is_file():
+        return files, [], {}
+    rep = json.loads(report.read_text(encoding="utf-8"))
+    rates = {Path(e["episode"]).name: float(e["takeover_rate"])
+             for e in rep.get("episodes", [])}
+    keep = [p for p in files if rates.get(p.name, 0.0) < threshold]
+    dropped = [p for p in files if p not in keep]
+    return keep, dropped, rates
+
+
 def _mse(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
     return torch.mean((a - b) ** 2)
 
@@ -74,6 +93,9 @@ def main() -> int:
                     default="logs/m5_e2e/report.json",
                     help="batch-replay report used by --drop-takeover-ge")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--patience", type=int, default=8,
+                    help="early stop after this many epochs without val "
+                         "improvement (0 disables)")
     ap.add_argument("--no-eval", action="store_true",
                     help="skip the automatic batch-replay eval after "
                          "training (pipeline runs its own)")
@@ -89,12 +111,8 @@ def main() -> int:
     if args.drop_takeover_ge is not None:
         report = Path(args.report)
         if report.is_file():
-            rep = json.loads(report.read_text(encoding="utf-8"))
-            rates = {Path(e["episode"]).name: float(e["takeover_rate"])
-                     for e in rep.get("episodes", [])}
-            keep = [p for p in files
-                    if rates.get(p.name, 0.0) < args.drop_takeover_ge]
-            dropped = [p for p in files if p not in keep]
+            keep, dropped, rates = filter_high_takeover(
+                files, args.report, args.drop_takeover_ge)
             if dropped:
                 print(f"[train-e2e] 剔除 {len(dropped)} 个高接管率坏集 "
                       f"(>= {args.drop_takeover_ge:.2f}):")
@@ -175,6 +193,7 @@ def main() -> int:
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
     best_val, best_epoch = 1e18, -1
+    no_improve = 0
     t0 = time.time()
     for ep in range(1, args.epochs + 1):
         tr = run_epoch(train_dl, True)
@@ -182,6 +201,7 @@ def main() -> int:
         sched.step()
         if va < best_val:
             best_val, best_epoch = va, ep
+            no_improve = 0
             torch.save({"model": model.state_dict(),
                         "epoch": ep, "val_loss": best_val,
                         "grid_n": model.grid_n,
@@ -191,7 +211,8 @@ def main() -> int:
                         "min_quality": args.min_quality,
                         # 超参随模型落盘：复现/对比不同轮次有据可查
                         "train_args": {
-                            "epochs": args.epochs, "batch": args.batch,
+                            "epochs": args.epochs, "patience": args.patience,
+                            "batch": args.batch,
                             "lr": args.lr, "val_split": args.val_split,
                             "seed": args.seed, "augment": args.augment,
                             "dedup": args.dedup,
@@ -201,9 +222,16 @@ def main() -> int:
                        out)
         print(f"[train-e2e] epoch {ep:3d}  train={tr:.4f}  "
               f"val={va:.4f}  best={best_val:.4f}@{best_epoch}")
+        if va >= best_val:
+            no_improve += 1
+        if args.patience > 0 and no_improve >= args.patience:
+            print(f"[train-e2e] early stop @ epoch {ep} "
+                  f"(no val improvement for {args.patience} epochs)")
+            break
     stats = {"episodes": [str(p) for p in files], "frames": n,
              "best_val_loss": float(best_val), "best_epoch": int(best_epoch),
-             "epochs": args.epochs, "device": device,
+             "epochs": args.epochs, "patience": args.patience,
+             "stopped_epoch": ep, "device": device,
              "seconds": float(time.time() - t0)}
     (out.with_suffix(".json")).write_text(
         json.dumps(stats, indent=2), encoding="utf-8")
