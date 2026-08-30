@@ -33,10 +33,44 @@ N_WAYPOINTS = 16
 N_ACTION = 2
 
 
-def _load_frames(ep_files, min_quality: float, min_speed: float):
-    """Load (and quality/speed-filter) one episode into frame dicts."""
-    out = []
-    for p in ep_files:
+def _has_wedge_restart(spd: np.ndarray, min_static: int = 4,
+                      min_after: int = 3) -> bool:
+    """True when an episode has a mid-run stop followed by more driving.
+
+    The recorder teleports back to the route start when the rule driver
+    wedges into a wall; those episodes contain bad labels (full-lock
+    steer into the obstacle).  A stop at the END of the route (the
+    end-zone brake) has no driving after it and must NOT be treated as a
+    wedge.
+    """
+    v = np.asarray(spd, dtype=float) < 0.3
+    n = len(v)
+    i = 0
+    while i < n:
+        if not v[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and v[j]:
+            j += 1
+        if j - i >= min_static and j + min_after <= n and \
+                bool(np.any(~v[j:j + min_after])):
+            return True
+        i = j
+    return False
+
+
+def _build_index(ep_files, min_quality: float, min_speed: float,
+                 drop_wedge_episodes: bool):
+    """Index (file, frame) pairs from the lightweight scalar fields only.
+
+    The camera arrays are megabytes per frame and reading them all up
+    front blew past memory once recordings grew (ArrayMemoryError on
+    ~1200 frames); the dataset now loads each frame lazily in
+    ``__getitem__``.
+    """
+    idx = []
+    for fi, p in enumerate(ep_files):
         with np.load(p, allow_pickle=True) as z:
             n = int(z["t"].shape[0])
             q = np.asarray(z["quality"], dtype=np.float32) \
@@ -44,34 +78,20 @@ def _load_frames(ep_files, min_quality: float, min_speed: float):
             ok = np.asarray(z["trajectory_ok"], dtype=bool) \
                 if "trajectory_ok" in z else np.ones(n, dtype=bool)
             spd = np.asarray(z["speed"], dtype=np.float64)
+            has_rgb = "rgb" in z
+            has_label = "label" in z
+            has_bev = "bev" in z
+            if drop_wedge_episodes and _has_wedge_restart(spd):
+                continue
             for i in range(n):
                 if float(q[i]) < min_quality:
                     continue
                 if float(spd[i]) < min_speed:
                     continue
-                traj = np.asarray(z["trajectory"][i], dtype=np.float64)
-                rgb = np.asarray(z["rgb"][i], dtype=np.uint8) \
-                    if "rgb" in z else None
-                label = np.asarray(z["label"][i], dtype=np.uint8) \
-                    if "label" in z else None
-                bev = np.asarray(z["bev"][i], dtype=np.float32) \
-                    if "bev" in z else None
-                if rgb is None and label is None and bev is None:
+                if not (has_rgb or has_label or has_bev):
                     continue
-                out.append({
-                    "x": float(z["x"][i]),
-                    "y": float(z["y"][i]),
-                    "heading": float(z["heading"][i]),
-                    "rgb": rgb,
-                    "label": label,
-                    "bev": bev,
-                    "traj_world": traj,
-                    "traj_ok": bool(ok[i]) and traj.ndim == 2
-                        and traj.shape[0] >= 2,
-                    "steer": float(z["steer"][i]),
-                    "throttle": float(z["throttle"][i]),
-                })
-    return out
+                idx.append((fi, i, bool(ok[i])))
+    return idx
 
 
 class ShadowMultimodalDataset(torch.utils.data.Dataset):
@@ -79,6 +99,7 @@ class ShadowMultimodalDataset(torch.utils.data.Dataset):
 
     def __init__(self, ep_files, min_quality: float = 0.0,
                  min_speed: float = 0.5,
+                 drop_wedge_episodes: bool = True,
                  img_h: int = 120, img_w: int = 160,
                  n_waypoints: int = N_WAYPOINTS,
                  augment: bool = False, seed: int = 0) -> None:
@@ -91,15 +112,18 @@ class ShadowMultimodalDataset(torch.utils.data.Dataset):
         self.img_w = int(img_w)
         self.n_waypoints = int(n_waypoints)
         self.augment = bool(augment)
-        self.frames = _load_frames(self.files, self.min_quality,
-                                   self.min_speed)
+        self.index = _build_index(self.files, self.min_quality,
+                                  self.min_speed,
+                                  drop_wedge_episodes)
+        self._cache: dict[int, list[dict]] = {}
         if self.augment:
             self.rng = np.random.default_rng(seed)
 
     def __len__(self) -> int:
-        return len(self.frames)
+        return len(self.index)
 
-    def _traj_ego(self, f: dict) -> tuple[torch.Tensor, torch.Tensor]:
+    def _traj_ego(self, x: float, y: float, heading: float,
+                 traj_world: np.ndarray) -> tuple[torch.Tensor, torch.Tensor]:
         """World trajectory -> ego frame + validity mask.
 
         Recorded trajectories are variable length and NaN-padded to the
@@ -109,10 +133,10 @@ class ShadowMultimodalDataset(torch.utils.data.Dataset):
         no feasible trajectory returns an all-zero mask (action-only
         supervision).
         """
-        h = float(f["heading"])
+        h = float(heading)
         c, s = np.cos(h), np.sin(h)
-        rel = np.asarray(f["traj_world"], dtype=np.float32) - \
-            np.array([f["x"], f["y"]], dtype=np.float32)
+        rel = np.asarray(traj_world, dtype=np.float32) - \
+            np.array([x, y], dtype=np.float32)
         finite = np.isfinite(rel).all(axis=1)
         rel = rel[finite]
         valid = int(finite.sum())
@@ -132,36 +156,93 @@ class ShadowMultimodalDataset(torch.utils.data.Dataset):
         return (torch.from_numpy(ego),
                 torch.from_numpy(mask))
 
+    def _episode(self, fi: int) -> list[dict]:
+        """Process one episode once and cache the small tensors.
+
+        The raw camera arrays are resized to ``(img_h, img_w)`` at load
+        time and stored as float tensors, so the whole corpus fits in a
+        few hundred MB and every epoch reads plain in-memory tensors
+        instead of decompressing .npz per frame (which took ~20 min per
+        training run).
+        """
+        ep = self._cache.get(fi)
+        if ep is not None:
+            return ep
+        z = np.load(self.files[fi], allow_pickle=True)
+        n = int(z["t"].shape[0])
+        # Read each sensor array ONCE (compressed npz decompresses the
+        # whole key per access, so per-frame z["rgb"][i] is quadratic -
+        # 88 frames took ~13 s); process from the in-memory arrays.
+        rgb = np.asarray(z["rgb"], dtype=np.uint8) if "rgb" in z else None
+        label = np.asarray(z["label"], dtype=np.uint8) \
+            if "label" in z else None
+        bev = np.asarray(z["bev"], dtype=np.float32) \
+            if "bev" in z else None
+        traj = np.asarray(z["trajectory"], dtype=np.float64)
+        xs = np.asarray(z["x"], dtype=np.float64)
+        ys = np.asarray(z["y"], dtype=np.float64)
+        hdgs = np.asarray(z["heading"], dtype=np.float64)
+        steers = np.asarray(z["steer"], dtype=np.float64)
+        thr = np.asarray(z["throttle"], dtype=np.float64)
+        frames = []
+        for i in range(n):
+            if rgb is not None:
+                t = torch.from_numpy(rgb[i].astype(np.float32)).permute(2, 0, 1)
+                # Store resized uint8 (19 KB/frame) so the whole corpus
+                # fits in ~100 MB; float conversion happens per item.
+                t_rgb = F.interpolate(
+                    t[None], size=(self.img_h, self.img_w),
+                    mode="bilinear", align_corners=False)[0]
+                t_rgb = t_rgb.clamp(0.0, 255.0).round().to(torch.uint8)
+            else:
+                t_rgb = torch.zeros(3, self.img_h, self.img_w,
+                                    dtype=torch.uint8)
+            if label is not None:
+                t = torch.from_numpy(label[i].astype(np.float32))[None]
+                t_label = F.interpolate(
+                    t[None], size=(self.img_h, self.img_w),
+                    mode="nearest")[0].to(torch.uint8)
+            else:
+                t_label = torch.zeros(1, self.img_h, self.img_w,
+                                      dtype=torch.uint8)
+            if bev is not None:
+                t_bev = torch.from_numpy(bev[i])[None]
+            else:
+                t_bev = torch.zeros(1, GRID_N, GRID_N, dtype=torch.float32)
+            traj_ego, mask = self._traj_ego(
+                float(xs[i]), float(ys[i]), float(hdgs[i]), traj[i])
+            frames.append({
+                "mods": [t_rgb, t_label, t_bev],
+                "traj": traj_ego,
+                "mask": mask,
+                "steer": float(steers[i]),
+                "throttle": float(thr[i]),
+            })
+        z.close()
+        self._cache[fi] = frames
+        return frames
+
+    def close(self) -> None:
+        self._cache = {}
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def __getitem__(self, idx: int):
-        f = self.frames[idx]
-        # Fixed modality order (rgb, label, bev); a missing modality is
-        # zero-filled so the batch collate never misaligns tensors.
-        if f["rgb"] is not None:
-            t_rgb = torch.from_numpy(
-                np.asarray(f["rgb"], dtype=np.float32)).permute(2, 0, 1)
-            t_rgb = F.interpolate(
-                t_rgb[None], size=(self.img_h, self.img_w),
-                mode="bilinear", align_corners=False)[0] / 255.0
-        else:
-            t_rgb = torch.zeros(3, self.img_h, self.img_w,
-                                dtype=torch.float32)
-        if f["label"] is not None:
-            t_label = torch.from_numpy(
-                np.asarray(f["label"], dtype=np.float32))[None]
-            t_label = F.interpolate(
-                t_label[None], size=(self.img_h, self.img_w),
-                mode="nearest")[0]
-        else:
-            t_label = torch.zeros(1, self.img_h, self.img_w,
-                                  dtype=torch.float32)
-        if f["bev"] is not None:
-            t_bev = torch.from_numpy(
-                np.asarray(f["bev"], dtype=np.float32))[None]
-        else:
-            t_bev = torch.zeros(1, GRID_N, GRID_N, dtype=torch.float32)
-        mods = [t_rgb, t_label, t_bev]
+        fi, i, _ok = self.index[idx]
+        f = self._episode(fi)[i]
+        mods = list(f["mods"])
+        traj = f["traj"]
+        mask = f["mask"]
 
         flip = False
+        # uint8 -> float for the network (rgb 0..1, label 0..2)
+        mods[0] = mods[0].float() / 255.0
+        mods[1] = mods[1].float()
+
         if self.augment:
             if self.rng.random() < 0.5:
                 # horizontal flip: mirror every modality; steer and the
@@ -173,7 +254,6 @@ class ShadowMultimodalDataset(torch.utils.data.Dataset):
                 gain = float(self.rng.uniform(0.85, 1.15))
                 mods[0] = torch.clamp(mods[0] * gain, 0.0, 1.0)
 
-        traj, mask = self._traj_ego(f)
         steer = float(f["steer"])
         if flip:
             steer = -steer

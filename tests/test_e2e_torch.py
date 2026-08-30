@@ -10,7 +10,7 @@ from beamng_autopilot.neural import (
     E2ENetTorch,
     ShadowMultimodalDataset,
 )
-from beamng_autopilot.neural.dataset import GRID_N, N_WAYPOINTS
+from beamng_autopilot.neural.dataset import GRID_N, N_WAYPOINTS, _has_wedge_restart
 
 
 def _tiny_episode(tmp_path, n=4, with_rgb=True):
@@ -146,6 +146,46 @@ def test_dataset_keeps_action_only_frames(tmp_path) -> None:
     assert traj.shape == (N_WAYPOINTS, 2)
     assert float(mask0.sum()) == N_WAYPOINTS  # healthy frame fully valid
     assert act.shape == (2,)
+
+
+def test_wedge_restart_detection() -> None:
+    # mid-run stop followed by more driving = wedge restart -> bad
+    spd_wedge = np.array([0.0, 0.0, 0.0, 5.0, 6.0, 0.0, 0.0, 0.0, 0.0,
+                          5.0, 6.0, 6.0], dtype=float)
+    assert _has_wedge_restart(spd_wedge)
+    # end-zone stop with no driving after it = good (end-stop)
+    spd_end = np.array([5.0, 6.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+                       dtype=float)
+    assert not _has_wedge_restart(spd_end)
+    # pure cruise, no stops
+    spd_cruise = np.full(20, 6.0)
+    assert not _has_wedge_restart(spd_cruise)
+
+
+def test_dataset_drops_wedge_episodes(tmp_path) -> None:
+    p_good = _tiny_episode(tmp_path, n=4)
+    # a second episode with a mid-run stop followed by more driving
+    n = 10
+    p2 = tmp_path / "ep_wedge.npz"
+    np.savez_compressed(
+        p2,
+        version=np.int64(2), t=np.arange(n, dtype=np.float64),
+        x=np.zeros(n), y=np.zeros(n), heading=np.zeros(n),
+        speed=np.array([6, 6, 0, 0, 0, 0, 6, 6, 6, 6], dtype=np.float64),
+        throttle=np.full(n, 0.35), brake=np.zeros(n), steer=np.zeros(n),
+        bev=np.zeros((n, GRID_N, GRID_N), dtype=np.float32),
+        drivable=np.ones((n, GRID_N, GRID_N), dtype=np.uint8),
+        trajectory=np.zeros((n, 25, 2)), trajectory_ok=np.ones(n, bool),
+        target_speed=np.full(n, 5.0),
+        lane_src=np.array(["semantic"] * n, dtype=object),
+        cost=np.zeros(n), kind=np.array(["arc"] * n, dtype=object),
+        rgb=np.zeros((n, 32, 48, 3), dtype=np.uint8),
+        label=np.zeros((n, 32, 48), dtype=np.uint8),
+        quality=np.ones(n, dtype=np.float32), meta=b"{}")
+    ds = ShadowMultimodalDataset([p_good, p2], min_quality=0.0,
+                                 min_speed=0.0, drop_wedge_episodes=True,
+                                 img_h=32, img_w=48)
+    assert len(ds) == 4  # only the good episode survives
 
 
 def test_dataset_collate(tmp_path) -> None:
