@@ -245,6 +245,18 @@ def main() -> None:
                 "val_ious": [round(float(v), 4) for v in va_ious],
                 "val_acc": round(float(va_acc), 4),
                 "weights": weights.tolist(),
+                # 超参随模型落盘：复现/对比不同 --line-weight 轮次有据可查
+                "train_args": {
+                    "line_weight": args.line_weight,
+                    "epochs": args.epochs,
+                    "batch": args.batch,
+                    "lr": args.lr,
+                    "val_frac": args.val_frac,
+                    "seed": args.seed,
+                    "runs": [str(p) for p in args.runs],
+                    "n_train": len(train_frames),
+                    "n_val": len(val_frames),
+                },
             }, out_dir / "best.pt")
             print(f"[train] 保存最优 mIoU={m_iou:.4f} -> "
                   f"{out_dir / 'best.pt'}")
