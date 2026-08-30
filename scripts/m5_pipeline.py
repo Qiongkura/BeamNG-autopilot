@@ -84,6 +84,8 @@ def main() -> int:
                 cmd.append("--dedup")
             if args.drop_takeover_ge is not None:
                 cmd += ["--drop-takeover-ge", str(args.drop_takeover_ge)]
+            # pipeline 自己跑回放评测，避免 train_e2e 自动评测重复一次
+            cmd.append("--no-eval")
             _run(cmd)
             report = ROOT / "logs" / "m5_e2e" / "report.json"
             # 批量回放评测：对所有录到的 episodes 跑一次，报告落盘

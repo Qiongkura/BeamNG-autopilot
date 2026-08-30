@@ -74,6 +74,9 @@ def main() -> int:
                     default="logs/m5_e2e/report.json",
                     help="batch-replay report used by --drop-takeover-ge")
     ap.add_argument("--seed", type=int, default=0)
+    ap.add_argument("--no-eval", action="store_true",
+                    help="skip the automatic batch-replay eval after "
+                         "training (pipeline runs its own)")
     args = ap.parse_args()
 
     data = Path(args.data)
@@ -185,7 +188,16 @@ def main() -> int:
                         "n_waypoints": model.n_waypoints,
                         "history": model.history,
                         "img_h": args.img_h, "img_w": args.img_w,
-                        "min_quality": args.min_quality},
+                        "min_quality": args.min_quality,
+                        # 超参随模型落盘：复现/对比不同轮次有据可查
+                        "train_args": {
+                            "epochs": args.epochs, "batch": args.batch,
+                            "lr": args.lr, "val_split": args.val_split,
+                            "seed": args.seed, "augment": args.augment,
+                            "dedup": args.dedup,
+                            "min_speed": args.min_speed,
+                            "n_episodes": len(files), "n_frames": n,
+                        }},
                        out)
         print(f"[train-e2e] epoch {ep:3d}  train={tr:.4f}  "
               f"val={va:.4f}  best={best_val:.4f}@{best_epoch}")
@@ -197,6 +209,18 @@ def main() -> int:
         json.dumps(stats, indent=2), encoding="utf-8")
     print(f"[train-e2e] best val {best_val:.4f} @ epoch {best_epoch} "
           f"-> {out}")
+    if not args.no_eval:
+        import subprocess
+        report = ROOT / "logs" / "m5_e2e" / "report.json"
+        cmd = [sys.executable,
+               str(ROOT / "scripts" / "m5_e2e_probe.py")]
+        if data.is_dir():
+            cmd += ["--data", str(data)]
+        else:
+            cmd += ["--episode", str(data)]
+        cmd += ["--weights", str(out), "--report", str(report)]
+        print(f"[train-e2e] 自动批量回放评测 -> {report}")
+        subprocess.run(cmd, check=False)
     return 0
 
 
