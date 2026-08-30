@@ -61,6 +61,9 @@ def main() -> int:
     ap.add_argument("--augment", action="store_true")
     ap.add_argument("--device", type=str, default="auto")
     ap.add_argument("--out", type=str, default="logs/m5_e2e/best.pt")
+    ap.add_argument("--history", type=int, default=2,
+                    help="temporal context: stack this many past frames "
+                         "(0 = single frame)")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
@@ -77,6 +80,7 @@ def main() -> int:
 
     ds = ShadowMultimodalDataset(
         files, min_quality=args.min_quality, min_speed=args.min_speed,
+        history=args.history,
         img_h=args.img_h, img_w=args.img_w, augment=args.augment,
         seed=args.seed)
     n = len(ds)
@@ -99,7 +103,7 @@ def main() -> int:
         torch.utils.data.Subset(ds, val_idx.tolist()),
         batch_size=args.batch, shuffle=False, collate_fn=collate)
 
-    model = E2ENetTorch().to(device)
+    model = E2ENetTorch(history=args.history).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -109,15 +113,16 @@ def main() -> int:
     def run_epoch(dl, train: bool) -> float:
         model.train(train)
         total = 0.0
-        for obs, traj_t, mask_t, act_t in dl:
+        for obs, traj_t, mask_t, act_t, speed_t in dl:
             rgb, label, bev = obs
             rgb = rgb.to(device)
             label = label.to(device) if label is not None else None
             bev = bev.to(device) if bev is not None else None
+            speed_t = speed_t.to(device)
             traj_t = traj_t.to(device)
             mask_t = mask_t.to(device)
             act_t = act_t.to(device)
-            traj_p, act_p = model(rgb, label, bev)
+            traj_p, act_p = model(rgb, label, bev, speed_t)
             # Trajectory error is normalised to metres/10 so the action
             # head is not starved by the much larger absolute waypoint
             # scale; frames without a feasible trajectory only pay the
@@ -146,6 +151,7 @@ def main() -> int:
                         "epoch": ep, "val_loss": best_val,
                         "grid_n": model.grid_n,
                         "n_waypoints": model.n_waypoints,
+                        "history": model.history,
                         "img_h": args.img_h, "img_w": args.img_w,
                         "min_quality": args.min_quality},
                        out)

@@ -61,13 +61,14 @@ def _has_wedge_restart(spd: np.ndarray, min_static: int = 4,
 
 
 def _build_index(ep_files, min_quality: float, min_speed: float,
-                 drop_wedge_episodes: bool):
+                 drop_wedge_episodes: bool, history: int = 0):
     """Index (file, frame) pairs from the lightweight scalar fields only.
 
     The camera arrays are megabytes per frame and reading them all up
     front blew past memory once recordings grew (ArrayMemoryError on
     ~1200 frames); the dataset now loads each frame lazily in
-    ``__getitem__``.
+    ``__getitem__``.  ``history`` reserves that many earlier frames in
+    the same episode so temporal windows never cross episodes.
     """
     idx = []
     for fi, p in enumerate(ep_files):
@@ -84,6 +85,8 @@ def _build_index(ep_files, min_quality: float, min_speed: float,
             if drop_wedge_episodes and _has_wedge_restart(spd):
                 continue
             for i in range(n):
+                if i < history:
+                    continue
                 if float(q[i]) < min_quality:
                     continue
                 if float(spd[i]) < min_speed:
@@ -100,6 +103,7 @@ class ShadowMultimodalDataset(torch.utils.data.Dataset):
     def __init__(self, ep_files, min_quality: float = 0.0,
                  min_speed: float = 0.5,
                  drop_wedge_episodes: bool = True,
+                 history: int = 0,
                  img_h: int = 120, img_w: int = 160,
                  n_waypoints: int = N_WAYPOINTS,
                  augment: bool = False, seed: int = 0) -> None:
@@ -111,10 +115,12 @@ class ShadowMultimodalDataset(torch.utils.data.Dataset):
         self.img_h = int(img_h)
         self.img_w = int(img_w)
         self.n_waypoints = int(n_waypoints)
+        self.history = int(history)
         self.augment = bool(augment)
         self.index = _build_index(self.files, self.min_quality,
                                   self.min_speed,
-                                  drop_wedge_episodes)
+                                  drop_wedge_episodes,
+                                  self.history)
         self._cache: dict[int, list[dict]] = {}
         if self.augment:
             self.rng = np.random.default_rng(seed)
@@ -184,6 +190,7 @@ class ShadowMultimodalDataset(torch.utils.data.Dataset):
         hdgs = np.asarray(z["heading"], dtype=np.float64)
         steers = np.asarray(z["steer"], dtype=np.float64)
         thr = np.asarray(z["throttle"], dtype=np.float64)
+        spds = np.asarray(z["speed"], dtype=np.float64)
         frames = []
         for i in range(n):
             if rgb is not None:
@@ -217,6 +224,7 @@ class ShadowMultimodalDataset(torch.utils.data.Dataset):
                 "mask": mask,
                 "steer": float(steers[i]),
                 "throttle": float(thr[i]),
+                "speed": float(spds[i]),
             })
         z.close()
         self._cache[fi] = frames
@@ -233,8 +241,19 @@ class ShadowMultimodalDataset(torch.utils.data.Dataset):
 
     def __getitem__(self, idx: int):
         fi, i, _ok = self.index[idx]
-        f = self._episode(fi)[i]
-        mods = list(f["mods"])
+        ep = self._episode(fi)
+        f = ep[i]
+        if self.history > 0:
+            # Temporal window: stack the last ``history+1`` frames of the
+            # same episode along a new time axis (T, C, H, W).
+            mods = [torch.stack([ep[j]["mods"][m]
+                                 for j in range(i - self.history, i + 1)],
+                                dim=0)
+                    for m in range(3)]
+            speed = torch.tensor([f["speed"]], dtype=torch.float32)
+        else:
+            mods = list(f["mods"])
+            speed = torch.tensor([f["speed"]], dtype=torch.float32)
         traj = f["traj"]
         mask = f["mask"]
 
@@ -260,7 +279,7 @@ class ShadowMultimodalDataset(torch.utils.data.Dataset):
             traj = traj * torch.tensor([-1.0, 1.0])
         action = torch.tensor([steer, float(f["throttle"])],
                               dtype=torch.float32)
-        return tuple(mods), traj, mask, action
+        return tuple(mods), traj, mask, action, speed
 
     @staticmethod
     def collate(batch):
@@ -271,4 +290,5 @@ class ShadowMultimodalDataset(torch.utils.data.Dataset):
         trajs = torch.stack([b[1] for b in batch])
         masks = torch.stack([b[2] for b in batch])
         acts = torch.stack([b[3] for b in batch])
-        return tuple(out), trajs, masks, acts
+        speeds = torch.stack([b[4] for b in batch])
+        return tuple(out), trajs, masks, acts, speeds

@@ -108,7 +108,7 @@ def test_dataset_filters_and_shapes(tmp_path) -> None:
     ds = ShadowMultimodalDataset([p], min_quality=0.0, min_speed=0.0,
                                  img_h=32, img_w=48)
     assert len(ds) == 4
-    obs, traj, mask, act = ds[0]
+    obs, traj, mask, act, speed = ds[0]
     rgb, label, bev = obs
     assert rgb.shape == (3, 32, 48)
     assert label.shape == (1, 32, 48)
@@ -116,6 +116,7 @@ def test_dataset_filters_and_shapes(tmp_path) -> None:
     assert traj.shape == (N_WAYPOINTS, 2)
     assert mask.shape == (N_WAYPOINTS,)
     assert act.shape == (2,)
+    assert speed.shape == (1,)
     ds2 = ShadowMultimodalDataset([p], min_quality=0.0, min_speed=9.0,
                                   img_h=32, img_w=48)
     assert len(ds2) == 0  # every frame filtered by the speed gate
@@ -134,11 +135,11 @@ def test_dataset_keeps_action_only_frames(tmp_path) -> None:
     ds = ShadowMultimodalDataset([p2], min_quality=0.0, min_speed=0.0,
                                  img_h=32, img_w=48)
     assert len(ds) == 4
-    obs, traj, mask, act = ds[2]
+    obs, traj, mask, act, speed = ds[2]
     assert float(mask.sum()) == 0.0   # no valid waypoints
     assert torch.isfinite(traj).all()
     assert act.shape == (2,)
-    obs, traj, mask0, act = ds[0]
+    obs, traj, mask0, act, speed = ds[0]
     rgb, label, bev = obs
     assert rgb.shape == (3, 32, 48)
     assert label.shape == (1, 32, 48)
@@ -192,7 +193,7 @@ def test_dataset_collate(tmp_path) -> None:
     p = _tiny_episode(tmp_path, n=4)
     ds = ShadowMultimodalDataset([p], min_quality=0.0,
                                  img_h=32, img_w=48)
-    obs, trajs, masks, acts = ShadowMultimodalDataset.collate(
+    obs, trajs, masks, acts, speeds = ShadowMultimodalDataset.collate(
         [ds[i] for i in range(2)])
     rgb, label, bev = obs
     assert rgb.shape == (2, 3, 32, 48)
@@ -201,3 +202,54 @@ def test_dataset_collate(tmp_path) -> None:
     assert trajs.shape == (2, N_WAYPOINTS, 2)
     assert masks.shape == (2, N_WAYPOINTS)
     assert acts.shape == (2, 2)
+    assert speeds.shape == (2, 1)
+
+
+def test_temporal_forward_shapes() -> None:
+    net = E2ENetTorch(history=2)
+    t = 3
+    rgb = torch.zeros(2, t, 3, 64, 64)
+    label = torch.zeros(2, t, 1, 64, 64)
+    bev = torch.zeros(2, t, 1, GRID_N, GRID_N)
+    speed = torch.tensor([[3.0], [4.0]])
+    traj, action = net(rgb, label, bev, speed)
+    assert traj.shape == (2, N_WAYPOINTS, 2)
+    assert action.shape == (2, 2)
+    assert torch.isfinite(traj).all() and torch.isfinite(action).all()
+
+
+def test_temporal_trains_steps() -> None:
+    net = E2ENetTorch(history=1).eval()
+    opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=1e-4)
+    t = 2
+    rgb = torch.rand(4, t, 3, 64, 64)
+    label = (torch.rand(4, t, 1, 64, 64) > 0.5).float()
+    bev = torch.rand(4, t, 1, GRID_N, GRID_N)
+    speed = torch.rand(4, 1)
+    traj_t = torch.randn(4, N_WAYPOINTS, 2) * 2.0
+    act_t = torch.randn(4, 2) * 0.5
+    def loss():
+        traj_p, act_p = net(rgb, label, bev, speed)
+        return ((traj_p - traj_t) ** 2).mean() + \
+            ((act_p - act_t) ** 2).mean()
+    l0 = float(loss().detach())
+    for _ in range(5):
+        opt.zero_grad()
+        loss().backward()
+        torch.nn.utils.clip_grad_norm_(net.parameters(), 1.0)
+        opt.step()
+    l1 = float(loss().detach())
+    assert l1 < l0, (l0, l1)
+
+
+def test_dataset_history_window(tmp_path) -> None:
+    p = _tiny_episode(tmp_path, n=6)
+    ds = ShadowMultimodalDataset([p], min_quality=0.0, min_speed=0.0,
+                                 history=2, img_h=32, img_w=48)
+    assert len(ds) == 4   # frames 2..5 (each needs 2 prior frames)
+    obs, traj, mask, act, speed = ds[0]
+    rgb, label, bev = obs
+    assert rgb.shape == (3, 3, 32, 48)
+    assert label.shape == (3, 1, 32, 48)
+    assert bev.shape == (3, 1, GRID_N, GRID_N)
+    assert speed.shape == (1,)

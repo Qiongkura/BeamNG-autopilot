@@ -58,10 +58,11 @@ class E2ENetTorch(nn.Module):
     """
 
     def __init__(self, grid_n: int = GRID_N, n_waypoints: int = N_WAYPOINTS,
-                 latent: int = 256) -> None:
+                 latent: int = 256, history: int = 0) -> None:
         super().__init__()
         self.grid_n = int(grid_n)
         self.n_waypoints = int(n_waypoints)
+        self.history = int(history)
         self.rgb_enc = nn.Sequential(
             _ConvBlock(3, 16), _ConvBlock(16, 32), _ConvBlock(32, 64))
         self.label_enc = nn.Sequential(
@@ -72,8 +73,20 @@ class E2ENetTorch(nn.Module):
         self.label_pool = nn.AdaptiveAvgPool2d((4, 4))
         self.bev_pool = nn.AdaptiveAvgPool2d((4, 4))
         in_dim = 64 * 16 + 16 * 16 + 64 * 16
+        # Temporal encoder: fuses ``history+1`` consecutive frames with a
+        # 1-D conv over time; the current speed is appended afterwards so
+        # the net can condition braking/acceleration on ego velocity.
+        self.temporal: nn.Module | None = None
+        head_in = in_dim
+        if self.history > 0:
+            self.temporal = nn.Conv1d(in_dim, in_dim // 2,
+                                      kernel_size=self.history + 1)
+            self.temporal_norm = nn.LayerNorm(in_dim // 2)
+            head_in = in_dim // 2 + 1
+        else:
+            self.temporal_norm = None
         self.head = nn.Sequential(
-            nn.Linear(in_dim, latent),
+            nn.Linear(head_in, latent),
             nn.ReLU(inplace=True),
             nn.Dropout(0.2),
             nn.Linear(latent, latent // 2),
@@ -83,26 +96,54 @@ class E2ENetTorch(nn.Module):
 
     def forward(self, rgb: torch.Tensor, label: torch.Tensor | None = None,
                 bev: torch.Tensor | None = None,
+                speed: torch.Tensor | None = None,
                 ) -> tuple[torch.Tensor, torch.Tensor]:
         """Return (trajectory (B, N, 2), action (B, 2)).
 
-        ``rgb`` is ``(B, 3, H, W)`` float 0..1; ``label`` is
-        ``(B, 1, H, W)`` float (same spatial size as rgb); ``bev`` is
-        ``(B, 1, grid_n, grid_n)`` float.  Missing optional modalities
-        are zero-filled so subsets still run.
+        Single-frame mode: ``rgb`` is ``(B, 3, H, W)`` float 0..1,
+        ``label`` ``(B, 1, H, W)``, ``bev`` ``(B, 1, grid_n, grid_n)``.
+        Temporal mode (``history > 0``): each modality is
+        ``(B, T, C, H, W)`` with T = history+1 consecutive frames, and
+        ``speed`` is ``(B,)`` or ``(B, 1)`` ego velocity.  Missing
+        optional modalities are zero-filled so subsets still run.
         """
         b = int(rgb.shape[0])
         dev = rgb.device
+        if rgb.dim() == 4:
+            rgb = rgb.unsqueeze(1)
         if label is None:
-            label = torch.zeros(b, 1, *rgb.shape[2:], device=dev,
+            label = torch.zeros(b, 1, 1, *rgb.shape[3:], device=dev,
                                 dtype=rgb.dtype)
+        elif label.dim() == 4:
+            label = label.unsqueeze(1)
         if bev is None:
-            bev = torch.zeros(b, 1, self.grid_n, self.grid_n, device=dev,
-                              dtype=rgb.dtype)
-        xr = self.rgb_pool(self.rgb_enc(rgb)).flatten(1)
-        xl = self.label_pool(self.label_enc(label)).flatten(1)
-        xb = self.bev_pool(self.bev_enc(bev)).flatten(1)
-        out = self.head(torch.cat([xr, xl, xb], dim=1))
+            bev = torch.zeros(b, 1, 1, self.grid_n, self.grid_n,
+                              device=dev, dtype=rgb.dtype)
+        elif bev.dim() == 4:
+            bev = bev.unsqueeze(1)
+        t = int(rgb.shape[1])
+        btc = (b * t,)
+        xr = self.rgb_pool(self.rgb_enc(
+            rgb.reshape(*btc, *rgb.shape[2:]))).flatten(1)
+        xl = self.label_pool(self.label_enc(
+            label.reshape(*btc, *label.shape[2:]))).flatten(1)
+        xb = self.bev_pool(self.bev_enc(
+            bev.reshape(*btc, *bev.shape[2:]))).flatten(1)
+        x = torch.cat([xr, xl, xb], dim=1).reshape(b, t, -1)
+        if self.temporal is not None:
+            x = self.temporal(x.permute(0, 2, 1)).squeeze(-1)
+            x = self.temporal_norm(x)
+            if speed is None:
+                speed = torch.zeros(b, 1, device=dev, dtype=x.dtype)
+            else:
+                speed = speed.reshape(b, 1).to(x.dtype)
+            # ego velocity in m/s: normalise to ~0..0.7 so the raw value
+            # never dominates the fused features (throttle blew up to 6.8
+            # when a 0-7 m/s input hit the head directly).
+            x = torch.cat([x, speed / 10.0], dim=1)
+        else:
+            x = x.reshape(b, -1)
+        out = self.head(x)
         traj = out[:, : self.n_waypoints * 2].reshape(
             -1, self.n_waypoints, 2)
         action = out[:, self.n_waypoints * 2:]
