@@ -143,7 +143,8 @@ def _path_metrics(traj_pred: np.ndarray) -> tuple[float, float]:
 
 def _evaluate_episode(ep: Path, net_torch, net, device: str,
                       img_h: int, img_w: int,
-                      th_steer: float, th_thr: float) -> dict:
+                      th_steer: float, th_thr: float,
+                      worst: list | None = None) -> dict:
     n_wp = net_torch.n_waypoints if net_torch is not None else 16
     steer_err: list[float] = []
     thr_err: list[float] = []
@@ -184,6 +185,9 @@ def _evaluate_episode(ep: Path, net_torch, net, device: str,
             thr_err.append(pt - gt)
             if abs(ps - gs) > th_steer or abs(pt - gt) > th_thr:
                 takeovers += 1
+            if worst is not None:
+                worst.append((max(abs(ps - gs), abs(pt - gt)),
+                              ep, i, gs, gt, ps, pt))
             ext, curv = _path_metrics(traj_pred)
             if np.isnan(ext):
                 traj_nan += 1
@@ -219,6 +223,41 @@ def _evaluate_episode(ep: Path, net_torch, net, device: str,
     }
 
 
+def _save_worst(worst: list, top: int, out_dir: Path) -> None:
+    """Save the top-N most-deviating frames with an overlay annotation."""
+    import cv2
+    worst = sorted(worst, key=lambda w: -w[0])[:top]
+    out_dir.mkdir(parents=True, exist_ok=True)
+    meta = []
+    for rank, (dev, ep, i, gs, gt, ps, pt) in enumerate(worst):
+        with np.load(ep, allow_pickle=True) as z:
+            rgb = np.asarray(z["rgb"][i], dtype=np.uint8) \
+                if "rgb" in z else None
+        if rgb is None:
+            continue
+        img = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+        lines = [f"{ep.name} frame {i}  dev={dev:.2f}",
+                 f"gt    steer={gs:+.2f} thr={gt:.2f}",
+                 f"pred  steer={ps:+.3f} thr={pt:.3f}"]
+        for k, ln in enumerate(lines):
+            cv2.putText(img, ln, (8, 22 + k * 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                        (0, 255, 255), 1, cv2.LINE_AA)
+        fn = out_dir / f"worst_{rank:03d}_{ep.stem}_f{i:05d}.png"
+        cv2.imwrite(str(fn), img)
+        meta.append({"file": fn.name, "episode": ep.name, "frame": i,
+                     "deviation": round(float(dev), 3),
+                     "gt_steer": round(float(gs), 3),
+                     "gt_throttle": round(float(gt), 3),
+                     "pred_steer": round(float(ps), 3),
+                     "pred_throttle": round(float(pt), 3)})
+    if meta:
+        (out_dir / "worst.json").write_text(
+            json.dumps(meta, ensure_ascii=False, indent=1),
+            encoding="utf-8")
+        print(f"[e2e] worst {len(meta)} frames -> {out_dir}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="E2E probe")
     ap.add_argument("--episode", type=str, default=None,
@@ -234,6 +273,10 @@ def main() -> int:
                     help="|pred-gt| steer deviation counted as takeover")
     ap.add_argument("--takeover-throttle", type=float, default=0.3,
                     help="|pred-gt| throttle deviation counted as takeover")
+    ap.add_argument("--worst-dir", type=str, default="logs/m5_e2e/worst",
+                    help="save top-N worst frames here (batch mode)")
+    ap.add_argument("--worst-top", type=int, default=20,
+                    help="number of worst frames to save (0 disables)")
     ap.add_argument("--device", type=str, default="auto")
     args = ap.parse_args()
 
@@ -266,13 +309,15 @@ def main() -> int:
             return 1
         report_path = Path(args.report or (ROOT / "logs" / "m5_e2e"
                                            / "report.json"))
+        worst: list = []
         per = []
         t0 = time.time()
         for ep in eps:
             r = _evaluate_episode(ep, net_torch, net, device,
                                   img_h, img_w,
                                   args.takeover_steer,
-                                  args.takeover_throttle)
+                                  args.takeover_throttle,
+                                  worst=worst)
             per.append(r)
             traj_txt = "--" if r["traj_mae"] is None \
                 else f"{r['traj_mae']:.2f}m"
@@ -309,6 +354,8 @@ def main() -> int:
         report_path.write_text(
             json.dumps(report, ensure_ascii=False, indent=1),
             encoding="utf-8")
+        if args.worst_top > 0:
+            _save_worst(worst, args.worst_top, Path(args.worst_dir))
         traj_txt = "--" if agg["traj_mae"] is None \
             else f"{agg['traj_mae']:.2f}m"
         print(f"[e2e] {agg['episodes']} episodes / {agg['frames']} frames, "
