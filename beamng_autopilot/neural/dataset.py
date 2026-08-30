@@ -61,7 +61,8 @@ def _has_wedge_restart(spd: np.ndarray, min_static: int = 4,
 
 
 def _build_index(ep_files, min_quality: float, min_speed: float,
-                 drop_wedge_episodes: bool, history: int = 0):
+                 drop_wedge_episodes: bool, history: int = 0,
+                 dedup: bool = False):
     """Index (file, frame) pairs from the lightweight scalar fields only.
 
     The camera arrays are megabytes per frame and reading them all up
@@ -69,6 +70,11 @@ def _build_index(ep_files, min_quality: float, min_speed: float,
     ~1200 frames); the dataset now loads each frame lazily in
     ``__getitem__``.  ``history`` reserves that many earlier frames in
     the same episode so temporal windows never cross episodes.
+
+    ``dedup`` skips near-duplicate consecutive frames (speed / steer /
+    throttle almost unchanged): shadow runs contain long static stretches
+    whose repeated frames only slow training and over-fit the net to the
+    same image.
     """
     idx = []
     for fi, p in enumerate(ep_files):
@@ -79,11 +85,16 @@ def _build_index(ep_files, min_quality: float, min_speed: float,
             ok = np.asarray(z["trajectory_ok"], dtype=bool) \
                 if "trajectory_ok" in z else np.ones(n, dtype=bool)
             spd = np.asarray(z["speed"], dtype=np.float64)
+            steer = np.asarray(z["steer"], dtype=np.float64) \
+                if "steer" in z else np.zeros(n, dtype=np.float64)
+            throttle = np.asarray(z["throttle"], dtype=np.float64) \
+                if "throttle" in z else np.zeros(n, dtype=np.float64)
             has_rgb = "rgb" in z
             has_label = "label" in z
             has_bev = "bev" in z
             if drop_wedge_episodes and _has_wedge_restart(spd):
                 continue
+            last = None  # (speed, steer, throttle) of the last kept frame
             for i in range(n):
                 if i < history:
                     continue
@@ -93,6 +104,13 @@ def _build_index(ep_files, min_quality: float, min_speed: float,
                     continue
                 if not (has_rgb or has_label or has_bev):
                     continue
+                if dedup and last is not None and \
+                        abs(float(spd[i]) - last[0]) < 0.15 and \
+                        abs(float(steer[i]) - last[1]) < 0.02 and \
+                        abs(float(throttle[i]) - last[2]) < 0.02:
+                    continue
+                last = (float(spd[i]), float(steer[i]),
+                        float(throttle[i]))
                 idx.append((fi, i, bool(ok[i])))
     return idx
 
@@ -106,7 +124,8 @@ class ShadowMultimodalDataset(torch.utils.data.Dataset):
                  history: int = 0,
                  img_h: int = 120, img_w: int = 160,
                  n_waypoints: int = N_WAYPOINTS,
-                 augment: bool = False, seed: int = 0) -> None:
+                 augment: bool = False, seed: int = 0,
+                 dedup: bool = False) -> None:
         if isinstance(ep_files, (str, Path)):
             ep_files = [Path(ep_files)]
         self.files = [Path(p) for p in ep_files if Path(p).exists()]
@@ -120,7 +139,8 @@ class ShadowMultimodalDataset(torch.utils.data.Dataset):
         self.index = _build_index(self.files, self.min_quality,
                                   self.min_speed,
                                   drop_wedge_episodes,
-                                  self.history)
+                                  self.history,
+                                  dedup=bool(dedup))
         self._cache: dict[int, list[dict]] = {}
         if self.augment:
             self.rng = np.random.default_rng(seed)

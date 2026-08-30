@@ -46,6 +46,10 @@ def main() -> int:
     ap.add_argument("--goal", nargs=2, type=float, default=None)
     ap.add_argument("--epochs", type=int, default=120)
     ap.add_argument("--history", type=int, default=2)
+    ap.add_argument("--dedup", action="store_true",
+                    help="skip near-duplicate consecutive frames in training")
+    ap.add_argument("--drop-takeover-ge", type=float, default=None,
+                    help="exclude high-takeover episodes from training")
     ap.add_argument("--data", type=str,
                     default="logs/live_runs/shadow_episodes")
     ap.add_argument("--weights", type=str, default="logs/m5_e2e/best.pt")
@@ -73,9 +77,14 @@ def main() -> int:
                 print(f"[pipeline] cycle {cycle}/{args.cycles} "
                       f"episode {ep}/{args.episodes} recorded", flush=True)
         if args.mode in ("all", "train"):
-            _run(["scripts/m5_train_e2e.py", "--data", str(data),
-                  "--epochs", str(args.epochs), "--history",
-                  str(args.history), "--out", str(weights)])
+            cmd = ["scripts/m5_train_e2e.py", "--data", str(data),
+                   "--epochs", str(args.epochs), "--history",
+                   str(args.history), "--out", str(weights)]
+            if args.dedup:
+                cmd.append("--dedup")
+            if args.drop_takeover_ge is not None:
+                cmd += ["--drop-takeover-ge", str(args.drop_takeover_ge)]
+            _run(cmd)
             report = ROOT / "logs" / "m5_e2e" / "report.json"
             # 批量回放评测：对所有录到的 episodes 跑一次，报告落盘
             # logs/m5_e2e/report.json，方便跨轮次对比接管率/动作误差。
