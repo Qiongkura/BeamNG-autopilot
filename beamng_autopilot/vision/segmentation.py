@@ -86,7 +86,7 @@ def default_model_path() -> Path | None:
 class Segmenter:
     """UNet segmentation over an RGB frame, with mask post-processing."""
 
-    def __init__(self, model_path=None, device=None):
+    def __init__(self, model_path=None, device=None, use_half: bool = True):
         path = Path(model_path) if model_path else default_model_path()
         if path is None:
             raise FileNotFoundError(
@@ -100,6 +100,17 @@ class Segmenter:
             n_classes=int(ckpt.get("n_classes", N_CLASSES)))
         self.model.load_state_dict(ckpt["state_dict"])
         self.model.to(self.device).eval()
+        # GPU 上半精度推理：显存/延迟都减半，训练好的 BN 运行统计在
+        # eval 模式下不受影响。CPU 保持 fp32。
+        self.half = bool(use_half) and self.device == "cuda"
+        if self.half:
+            self.model.half()
+            # 预热：第一次 CUDA 推理会触发 kernel 编译/显存分配，放在
+            # init 里做掉，避免驾驶循环首帧卡顿。
+            with torch.no_grad():
+                self.model(torch.zeros(
+                    1, 3, _INFER_H, _INFER_W, device=self.device,
+                    dtype=torch.float16))
         self.class_names = list(ckpt.get(
             "class_names", CLASS_NAMES))
         self._line_idx = self.class_names.index("line") \
@@ -114,6 +125,8 @@ class Segmenter:
                            interpolation=cv2.INTER_AREA)
         x = torch.from_numpy(small).permute(2, 0, 1).float().div_(255.0)
         x = x.unsqueeze(0).to(self.device)
+        if self.half:
+            x = x.half()
         with torch.no_grad():
             logits = self.model(x)
         pred = logits.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
