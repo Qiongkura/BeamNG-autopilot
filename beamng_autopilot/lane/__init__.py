@@ -20,6 +20,7 @@ from .pairing import (  # noqa: F401
 )
 from .lidar import build_lidar_corridor  # noqa: F401
 from .fusion import choose_sensor_lane  # noqa: F401
+from .perception_guard import perception_lateral_guard  # noqa: F401
 from .tracking import (  # noqa: F401
     LaneTracker,
     lane_frame_usable,
