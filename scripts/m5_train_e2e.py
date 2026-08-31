@@ -96,6 +96,8 @@ def main() -> int:
     ap.add_argument("--patience", type=int, default=8,
                     help="early stop after this many epochs without val "
                          "improvement (0 disables)")
+    ap.add_argument("--no-amp", action="store_true",
+                    help="disable mixed-precision (AMP) training")
     ap.add_argument("--no-eval", action="store_true",
                     help="skip the automatic batch-replay eval after "
                          "training (pipeline runs its own)")
@@ -162,6 +164,8 @@ def main() -> int:
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=args.epochs)
     act_w = torch.tensor([1.0, 0.3], dtype=torch.float32, device=device)
+    use_amp = (device == "cuda") and not args.no_amp
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     def run_epoch(dl, train: bool) -> float:
         model.train(train)
@@ -175,18 +179,21 @@ def main() -> int:
             traj_t = traj_t.to(device)
             mask_t = mask_t.to(device)
             act_t = act_t.to(device)
-            traj_p, act_p = model(rgb, label, bev, speed_t)
-            # Trajectory error is normalised to metres/10 so the action
-            # head is not starved by the much larger absolute waypoint
-            # scale; frames without a feasible trajectory only pay the
-            # action term (masked trajectory loss).
-            loss = _masked_mse(traj_p / 10.0, traj_t / 10.0, mask_t) \
-                + _mse(act_p * act_w, act_t * act_w)
+            with torch.autocast("cuda", enabled=use_amp):
+                traj_p, act_p = model(rgb, label, bev, speed_t)
+                # Trajectory error is normalised to metres/10 so the
+                # action head is not starved by the much larger absolute
+                # waypoint scale; frames without a feasible trajectory
+                # only pay the action term (masked trajectory loss).
+                loss = _masked_mse(traj_p / 10.0, traj_t / 10.0, mask_t) \
+                    + _mse(act_p * act_w, act_t * act_w)
             if train:
                 opt.zero_grad()
-                loss.backward()
+                scaler.scale(loss).backward()
+                scaler.unscale_(opt)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                opt.step()
+                scaler.step(opt)
+                scaler.update()
             total += float(loss.detach().cpu()) * len(act_t)
         return total / max(1, len(dl.dataset))
 
@@ -212,6 +219,7 @@ def main() -> int:
                         # 超参随模型落盘：复现/对比不同轮次有据可查
                         "train_args": {
                             "epochs": args.epochs, "patience": args.patience,
+                            "amp": use_amp,
                             "batch": args.batch,
                             "lr": args.lr, "val_split": args.val_split,
                             "seed": args.seed, "augment": args.augment,

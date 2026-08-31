@@ -145,6 +145,8 @@ def main() -> None:
     ap.add_argument("--line-morph", action="store_true",
                     help="enable line morphology augmentation (default "
                          "off: v7 ablation showed it hurts line IoU)")
+    ap.add_argument("--no-amp", action="store_true",
+                    help="disable mixed-precision (AMP) training")
     ap.add_argument("--out", default=str(config.LOGS_DIR / "m5_seg" / "seg_model"))
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--vram-frac", type=float, default=0.6,
@@ -184,6 +186,8 @@ def main() -> None:
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
     crit = nn.CrossEntropyLoss(weight=weights.to(device))
+    use_amp = (device == "cuda") and not args.no_amp
+    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
 
     def to_tensor(frame, dev):
         colour, label = frame
@@ -207,12 +211,14 @@ def main() -> None:
                 opt.zero_grad()
             # Validation must not build autograd graphs: it halves the
             # peak VRAM and keeps a concurrently running game rendering.
-            with torch.set_grad_enabled(train):
+            with torch.set_grad_enabled(train), \
+                    torch.autocast("cuda", enabled=use_amp):
                 logits = model(xs)
                 loss = crit(logits, ys)
             if train:
-                loss.backward()
-                opt.step()
+                scaler.scale(loss).backward()
+                scaler.step(opt)
+                scaler.update()
             total_loss += float(loss.item()) * len(batch)
             pred = logits.argmax(dim=1)
             correct += int((pred == ys).sum())
@@ -258,6 +264,7 @@ def main() -> None:
                 "train_args": {
                     "line_weight": args.line_weight,
                     "line_morph": args.line_morph,
+                    "amp": use_amp,
                     "epochs": args.epochs,
                     "batch": args.batch,
                     "lr": args.lr,
