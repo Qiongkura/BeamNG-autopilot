@@ -47,7 +47,7 @@ def main() -> int:
                          "(start 729.6,763.9 -> goal 832.55,731.59)")
     ap.add_argument("--teleport", nargs=3, type=float, default=None)
     ap.add_argument("--goal", nargs=2, type=float, default=None)
-    ap.add_argument("--epochs", type=int, default=120)
+    ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--history", type=int, default=2)
     ap.add_argument("--dedup", action="store_true",
                     help="skip near-duplicate consecutive frames in training")

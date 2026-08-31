@@ -68,9 +68,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description="train the multimodal E2E net")
     ap.add_argument("--data", type=str, required=True,
                     help="dir of shadow .npz episodes, or a single file")
-    ap.add_argument("--epochs", type=int, default=80)
+    ap.add_argument("--epochs", type=int, default=200)
     ap.add_argument("--batch", type=int, default=8)
-    ap.add_argument("--lr", type=float, default=1e-3)
+    ap.add_argument("--lr", type=float, default=3e-4)
     ap.add_argument("--img-h", type=int, default=120)
     ap.add_argument("--img-w", type=int, default=160)
     ap.add_argument("--min-quality", type=float, default=0.5)
@@ -93,7 +93,7 @@ def main() -> int:
                     default="logs/m5_e2e/report.json",
                     help="batch-replay report used by --drop-takeover-ge")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--patience", type=int, default=8,
+    ap.add_argument("--patience", type=int, default=20,
                     help="early stop after this many epochs without val "
                          "improvement (0 disables)")
     ap.add_argument("--no-amp", action="store_true",
