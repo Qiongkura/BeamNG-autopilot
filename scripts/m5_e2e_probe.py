@@ -149,6 +149,7 @@ def _evaluate_episode(ep: Path, net_torch, net, device: str,
     steer_err: list[float] = []
     thr_err: list[float] = []
     takeovers = 0
+    speed_rows: list[tuple[float, float, float, bool]] = []  # (mps, |se|, |te|, took)
     traj_mae: list[float] = []
     traj_frames = 0
     traj_nan = 0
@@ -183,7 +184,10 @@ def _evaluate_episode(ep: Path, net_torch, net, device: str,
             gt = float(throttle[i])
             steer_err.append(ps - gs)
             thr_err.append(pt - gt)
-            if abs(ps - gs) > th_steer or abs(pt - gt) > th_thr:
+            took = abs(ps - gs) > th_steer or abs(pt - gt) > th_thr
+            speed_rows.append((float(speed[i]), abs(ps - gs),
+                               abs(pt - gt), took))
+            if took:
                 takeovers += 1
             if worst is not None:
                 worst.append((max(abs(ps - gs), abs(pt - gt)),
@@ -207,6 +211,21 @@ def _evaluate_episode(ep: Path, net_torch, net, device: str,
     n = max(1, n)
     se = np.asarray(steer_err, dtype=float)
     te = np.asarray(thr_err, dtype=float)
+    # 按车速分桶：定位模型在哪类工况（低速路口/中速巡航/高速）接管率高
+    edges = [0.0, 2.0, 4.0, 6.0, 8.0, 1e9]
+    labels = ["0-2", "2-4", "4-6", "6-8", "8+"]
+    bins: list[dict] = []
+    for b in range(len(labels)):
+        rows = [r for r in speed_rows if edges[b] <= r[0] < edges[b + 1]]
+        if not rows:
+            continue
+        bins.append({
+            "bin": labels[b],
+            "frames": len(rows),
+            "steer_mae": float(np.mean([r[1] for r in rows])),
+            "throttle_mae": float(np.mean([r[2] for r in rows])),
+            "takeover_rate": sum(1 for r in rows if r[3]) / len(rows),
+        })
     return {
         "episode": ep.name,
         "frames": int(n),
@@ -220,6 +239,7 @@ def _evaluate_episode(ep: Path, net_torch, net, device: str,
         "traj_nan_frames": traj_nan,
         "traj_extent_mean": float(np.mean(extents)) if extents else None,
         "traj_curv_mean": float(np.mean(curvs)) if curvs else None,
+        "speed_bins": bins,
     }
 
 
@@ -328,6 +348,23 @@ def main() -> int:
                   f"traj_mae={traj_txt} "
                   f"nan={r['traj_nan_frames']}")
         n_all = int(sum(r["frames"] for r in per))
+        # 聚合速度分桶
+        bin_agg: dict[str, dict] = {}
+        for r in per:
+            for b in r.get("speed_bins", []):
+                key = b["bin"]
+                d = bin_agg.setdefault(key, {"frames": 0, "se": 0.0,
+                                             "te": 0.0, "took": 0})
+                d["frames"] += b["frames"]
+                d["se"] += b["steer_mae"] * b["frames"]
+                d["te"] += b["throttle_mae"] * b["frames"]
+                d["took"] += b["takeover_rate"] * b["frames"]
+        bin_rows = sorted(bin_agg.items(),
+                          key=lambda kv: float(kv[0].split("-")[0]))
+        if bin_rows:
+            print("[e2e] 速度分桶 (接管率): "
+                  + ", ".join(f"{k}m/s {v['took'] / max(1, v['frames']) * 100:.0f}%"
+                              for k, v in bin_rows))
         agg = {
             "episodes": len(per),
             "frames": n_all,
@@ -339,6 +376,13 @@ def main() -> int:
             "traj_mae": float(np.mean(
                 [r["traj_mae"] for r in per if r["traj_mae"] is not None]))
             if any(r["traj_mae"] is not None for r in per) else None,
+            "speed_bins": [
+                {"bin": k, "frames": v["frames"],
+                 "steer_mae": v["se"] / max(1, v["frames"]),
+                 "throttle_mae": v["te"] / max(1, v["frames"]),
+                 "takeover_rate": v["took"] / max(1, v["frames"])}
+                for k, v in bin_rows
+            ],
         }
         report = {
             "weights": args.weights,
