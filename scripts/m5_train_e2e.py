@@ -98,6 +98,10 @@ def main() -> int:
                          "improvement (0 disables)")
     ap.add_argument("--no-amp", action="store_true",
                     help="disable mixed-precision (AMP) training")
+    ap.add_argument("--workers", type=int, default=2,
+                    help="DataLoader worker processes (0 = main thread)")
+    ap.add_argument("--prefetch", type=int, default=2,
+                    help="prefetch factor per worker")
     ap.add_argument("--no-eval", action="store_true",
                     help="skip the automatic batch-replay eval after "
                          "training (pipeline runs its own)")
@@ -151,12 +155,16 @@ def main() -> int:
           f"(train {len(train_idx)} / val {len(val_idx)}), device={device}")
 
     collate = ShadowMultimodalDataset.collate
+    n_workers = max(0, args.workers)
+    dl_kw = dict(num_workers=n_workers, collate_fn=collate,
+                 persistent_workers=n_workers > 0,
+                 prefetch_factor=args.prefetch if n_workers > 0 else None)
     train_dl = torch.utils.data.DataLoader(
         torch.utils.data.Subset(ds, train_idx.tolist()),
-        batch_size=args.batch, shuffle=True, collate_fn=collate)
+        batch_size=args.batch, shuffle=True, **dl_kw)
     val_dl = torch.utils.data.DataLoader(
         torch.utils.data.Subset(ds, val_idx.tolist()),
-        batch_size=args.batch, shuffle=False, collate_fn=collate)
+        batch_size=args.batch, shuffle=False, **dl_kw)
 
     model = E2ENetTorch(history=args.history).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
