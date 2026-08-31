@@ -57,11 +57,16 @@ def median_freq_weights(labels: list[np.ndarray],
     return torch.tensor(w, dtype=torch.float32)
 
 
-def _augment(frame, rng: np.random.Generator):
+def _augment(frame, rng: np.random.Generator,
+            line_morph: bool = False):
     """在线数据增强（colour/label 同步变换），提升路段泛化。
 
     关键：色相/饱和度扰动 + 模糊，逼模型学"标线结构"而不是记住
     特定路段的颜色纹理（旧模型过拟合训练路段：换路 recall 0%）。
+
+    ``line_morph`` 开启标线形态扰动（dilate/erode/随机擦除）。实验
+    （v7）证明它对标线 IoU 是负优化（0.33 -> 0.03，训练/留出集都是），
+    默认关闭；仅作消融保留。
     """
     import cv2
 
@@ -101,7 +106,7 @@ def _augment(frame, rng: np.random.Generator):
                             interpolation=cv2.INTER_AREA)
         label = cv2.resize(label[y0:y0 + ch, x0:x0 + cw], (w, h),
                            interpolation=cv2.INTER_NEAREST)
-    if rng.random() < 0.45 and (label == 2).any():
+    if line_morph and rng.random() < 0.45 and (label == 2).any():
         # 标线形态扰动：模拟远距离细线/断线/磨损，逼模型学标线结构
         # 而不是记住粗线。粗线->弥合（dilate），细线->收缩（erode），
         # 或随机擦除几段（虚线/磨损），三种都以真实物理为约束：
@@ -137,6 +142,9 @@ def main() -> None:
     ap.add_argument("--val-frac", type=float, default=0.2)
     ap.add_argument("--line-weight", type=float, default=2.0,
                     help="extra multiplier on the line class loss weight")
+    ap.add_argument("--line-morph", action="store_true",
+                    help="enable line morphology augmentation (default "
+                         "off: v7 ablation showed it hurts line IoU)")
     ap.add_argument("--out", default=str(config.LOGS_DIR / "m5_seg" / "seg_model"))
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--vram-frac", type=float, default=0.6,
@@ -191,7 +199,8 @@ def main() -> None:
         for i in range(0, len(fr), args.batch):
             batch = fr[i:i + args.batch]
             if train:
-                batch = [_augment(f, rng) for f in batch]
+                batch = [_augment(f, rng, line_morph=args.line_morph)
+                         for f in batch]
             xs = torch.stack([to_tensor(f, device)[0] for f in batch])
             ys = torch.stack([to_tensor(f, device)[1] for f in batch])
             if train:
@@ -248,6 +257,7 @@ def main() -> None:
                 # 超参随模型落盘：复现/对比不同 --line-weight 轮次有据可查
                 "train_args": {
                     "line_weight": args.line_weight,
+                    "line_morph": args.line_morph,
                     "epochs": args.epochs,
                     "batch": args.batch,
                     "lr": args.lr,
