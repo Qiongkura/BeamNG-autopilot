@@ -29,6 +29,10 @@ def main() -> None:
     ap.add_argument("--runs", nargs="+", required=True,
                     help="数据目录（可多个）")
     ap.add_argument("--model", required=True, help="模型路径 best.pt")
+    ap.add_argument("--temporal", action="store_true",
+                    help="enable Segmenter temporal line-mask smoothing "
+                         "(component hysteresis; ablation: slightly "
+                         "negative on pixel line IoU)")
     ap.add_argument("--save", action="store_true",
                     help="保存可视化对比帧")
     ap.add_argument("--save-n", type=int, default=12,
@@ -47,8 +51,10 @@ def main() -> None:
         raise SystemExit(f"没有找到数据: {args.runs}")
     print(f"[eval] 数据 {len(files)} 帧")
 
-    seg = Segmenter(model_path=args.model)
-    print(f"[eval] 模型加载完成: {args.model}")
+    seg = Segmenter(model_path=args.model,
+                    temporal_smooth=args.temporal)
+    print(f"[eval] 模型加载完成: {args.model} "
+          f"(temporal_smooth={args.temporal})")
 
     if args.save:
         out_dir = config.LOGS_DIR / "m5_seg" / "eval"

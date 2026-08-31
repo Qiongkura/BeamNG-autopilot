@@ -86,7 +86,8 @@ def default_model_path() -> Path | None:
 class Segmenter:
     """UNet segmentation over an RGB frame, with mask post-processing."""
 
-    def __init__(self, model_path=None, device=None, use_half: bool = True):
+    def __init__(self, model_path=None, device=None, use_half: bool = True,
+                 temporal_smooth: bool = False):
         path = Path(model_path) if model_path else default_model_path()
         if path is None:
             raise FileNotFoundError(
@@ -111,6 +112,11 @@ class Segmenter:
                 self.model(torch.zeros(
                     1, 3, _INFER_H, _INFER_W, device=self.device,
                     dtype=torch.float16))
+        # 标线时序一致性（组件滞回，默认关闭）：消融显示它对像素 line
+        # IoU 略负（近场 0.333 -> 0.323），但对车道配对的稳定价值无法
+        # 离线验证，保留为 opt-in 选项。
+        self.temporal_smooth = bool(temporal_smooth)
+        self._prev_line: np.ndarray | None = None
         self.class_names = list(ckpt.get(
             "class_names", CLASS_NAMES))
         self._line_idx = self.class_names.index("line") \
@@ -137,6 +143,25 @@ class Segmenter:
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         line = cv2.morphologyEx(line.astype(np.uint8), cv2.MORPH_CLOSE,
                                 k).astype(bool)
+        # 时序组件滞回：只保留与上一帧标线（小膨胀容忍车体移动）重叠的
+        # 连通域。单帧闪现的假线（草边/阴影/石头）会被丢弃；整帧都无
+        # 稳定组件时（快速转弯/急变场景）保留原结果，避免误清空。这样
+        # 只删不增，不会像补间隙那样把线加粗。
+        if self.temporal_smooth and self._prev_line is not None and line.any() \
+                and self._prev_line.shape == line.shape:
+            k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+            prev_d = cv2.dilate(
+                self._prev_line.astype(np.uint8), k3).astype(bool)
+            n, labels, stats, _ = cv2.connectedComponentsWithStats(
+                line.astype(np.uint8), 8)
+            keep = np.zeros_like(line)
+            for i in range(1, n):
+                comp = labels == i
+                if float(comp[prev_d].mean()) >= 0.3:
+                    keep[comp] = True
+            if keep.any():
+                line = keep
+        self._prev_line = line.copy()
         # 物理约束：标线必须位于路面上。石头/护墙/草地边缘与标线视觉
         # 特征相似，模型常把它们误检为线；这些物体不在沥青路面上，用
         # 膨胀后的路面掩码约束即可滤掉（标线紧贴路面，边缘容忍 ~3px）。
