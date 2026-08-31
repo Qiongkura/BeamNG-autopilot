@@ -442,6 +442,11 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
 - `m5_pipeline.py --cycles N --dedup --drop-takeover-ge 0.5`：录 → 训 → 回放评测
   一键循环，报告自动落盘。
 
+- 实验记录（2026-08-31）：`--line-morph`（分割标线形态扰动）、`--dedup` 与
+  `--drop-takeover-ge`（E2E）在离线指标上目前均为**负优化**（v7 标线
+  line IoU 0.33→0.03；E2E v2/v3 接管率 ≥ 默认全量 v1），故默认关闭/不用，
+  保留为数据量增大后的消融选项。
+
 
 ### 架构层面
 
