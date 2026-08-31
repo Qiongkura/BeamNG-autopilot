@@ -360,7 +360,8 @@ def main() -> int:
                 d["te"] += b["throttle_mae"] * b["frames"]
                 d["took"] += b["takeover_rate"] * b["frames"]
         bin_rows = sorted(bin_agg.items(),
-                          key=lambda kv: float(kv[0].split("-")[0]))
+                          key=lambda kv: float(
+                              kv[0].split("-")[0].rstrip("+")))
         if bin_rows:
             print("[e2e] 速度分桶 (接管率): "
                   + ", ".join(f"{k}m/s {v['took'] / max(1, v['frames']) * 100:.0f}%"
