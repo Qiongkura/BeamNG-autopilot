@@ -515,7 +515,7 @@ scripts/
 | **超车决策基于规则状态机**：`OvertakeStateMachine` 的阈值（1.5s 持续、0.4s 确认）是硬编码的 | 不同道路场景下超车行为可能过于保守或过于激进 | 中 |
 | **A* 路径规划网格分辨率固定 0.5m**：`GRID_RES = 0.5`，网格范围 55m × 40m | 密集场景下计算量大；稀疏场景下精度浪费 | 低 |
 | **实线检测的噪声过滤参数多且脆弱**：`SOLID_*` 系列有 12 个常量，用于过滤误检 | 换地图或光照变化后可能需要重新调参 | 中 |
-| **PurePursuit `find_target` 未使用 `adaptive_lookahead`**：`adaptive_lookahead(speed)` 方法存在但 `find_target` 仍用固定 `self.lookahead` | 高速时预瞄距离不足，S 弯/缓弯中转向指令可能剧烈抖动 | 中 |
+| **PurePursuit 预瞄自适应** | `find_target`/`steering` 现接受 `speed=`，内部走 `adaptive_lookahead`（向后兼容，不传仍用固定值） | 高速 S 弯/缓弯转向平稳 | ✅ 已接线（API + 测试）；rule/FSD 驾驶循环此前已手动设置 lookahead |
 
 ### 模仿学习（M3）
 
