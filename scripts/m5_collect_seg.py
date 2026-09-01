@@ -36,7 +36,8 @@ MIN_SEGMENT_DIST_M = 200.0  # 新段起点至少离当前位置这么远
 
 
 def _random_road_point(roadnet: RoadNetwork, cur_xy, rng,
-                       center=None, radius: float | None = None) -> tuple:
+                       center=None, radius: float | None = None,
+                       min_dist: float = MIN_SEGMENT_DIST_M) -> tuple:
     """随机选一个离当前点足够远（且在限定区域内）的路网节点。
 
     返回 (x, y, z, heading)。``center``/``radius`` 用于把采集限定在
@@ -46,7 +47,7 @@ def _random_road_point(roadnet: RoadNetwork, cur_xy, rng,
         idx = int(rng.integers(0, roadnet.node_count))
         xy = roadnet.nodes[idx]
         if np.hypot(*(xy - np.asarray(cur_xy[:2], dtype=float))) \
-                < MIN_SEGMENT_DIST_M:
+                < min_dist:
             continue
         if center is not None and np.hypot(
                 *(xy - np.asarray(center, dtype=float))) > radius:
@@ -119,9 +120,14 @@ def main() -> None:
     elif args.area_center is not None:
         area_center = np.asarray(args.area_center, dtype=float)
     area_radius = args.area_radius if area_center is not None else None
+    # 限定区域内段间距按半径缩放（城镇半径 160m 内不可能有 200m 远
+    # 的第二个节点，段间距跟着缩小才不会失败）
+    min_seg_dist = (min(80.0, max(60.0, area_radius * 0.5))
+                    if area_center is not None else MIN_SEGMENT_DIST_M)
     if area_center is not None:
         print(f"[collect] 采集区域中心=({area_center[0]:.0f}, "
-              f"{area_center[1]:.0f}) 半径={area_radius:.0f}m")
+              f"{area_center[1]:.0f}) 半径={area_radius:.0f}m "
+              f"段间距>={min_seg_dist:.0f}m")
     per_seg = max(20, args.frames_per_seg)
     total = args.frames or segments * per_seg
 
@@ -178,7 +184,8 @@ def main() -> None:
             st = conn.get_state()
             x, y, z, hdg = _random_road_point(
                 roadnet, st.pos[:2], rng,
-                center=area_center, radius=area_radius)
+                center=area_center, radius=area_radius,
+                min_dist=min_seg_dist)
             _teleport_to(conn, (x, y, z), hdg, no_step=args.no_step)
             print(f"[collect] segment {seg}: teleport -> "
                   f"({x:.0f}, {y:.0f})")
