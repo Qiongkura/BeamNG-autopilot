@@ -147,6 +147,11 @@ ROAD_RETURN_STEER_MAX = 0.55
 # Blend the new centre with the previous one (arc-aligned) so the
 # reference stays smooth; boundaries are left untouched.
 MAP_LANE_EMA = 0.6
+# Snap/restart offset into the RIGHT lane: spawning ON the route centre
+# line lets the first left hairpin carry the car into the oncoming lane,
+# and the no-cross gate then blocks every path back (the car rides the
+# wrong side the whole run).  Place starts 1.6 m right of the route.
+SNAP_LANE_OFFSET_M = 1.6
 # End-of-route handling: the nav route is finite.  When the local
 # forward window reaches the route END, the car has arrived; without
 # an explicit stop it creeps onto the road end / kerb and parks over
@@ -518,7 +523,11 @@ def main() -> int:
                 h = float(np.arctan2(ndy, ndx))
                 # Ground-safe snap: same connector helper as --teleport, so
                 # the car is always placed on the real surface (never below
-                # terrain) and facing the route direction.
+                # terrain) and facing the route direction.  Offset into the
+                # right lane (right normal = (sin h, -cos h)) instead of
+                # starting on the centre line (see SNAP_LANE_OFFSET_M).
+                rx = rx + SNAP_LANE_OFFSET_M * math.sin(h)
+                ry = ry - SNAP_LANE_OFFSET_M * math.cos(h)
                 conn.safe_teleport(rx, ry, heading_deg=math.degrees(h))
                 st1 = conn.get_state()
                 print(f"[fsd-drive] snapped onto nav route "

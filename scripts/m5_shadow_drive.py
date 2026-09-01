@@ -56,6 +56,12 @@ from beamng_autopilot.vision.hydra import FrameContext, HydraNet
 from beamng_autopilot.vision.heads.semantic import SemanticHead
 
 
+# Snap/restart offset into the RIGHT lane (same as fsd_drive): the
+# recorder must label a car in its OWN lane, not one riding the route
+# centre line into the oncoming lane.
+SNAP_LANE_OFFSET_M = 1.6
+
+
 def _path_curvature_ff(path, pos, heading, near_m: float = 1.5,
                        horizon_m: float = 8.0, wheelbase: float = 2.9,
                        ratio: float = 0.6, max_ff: float = 0.40) -> float:
@@ -245,8 +251,12 @@ def main() -> int:
                     ndx, ndy = (float(nav_route[i, 0] - nav_route[i - 1, 0]),
                                 float(nav_route[i, 1] - nav_route[i - 1, 1]))
                 h = float(np.arctan2(ndy, ndx))
-                route_start_xy = (float(nav_route[i, 0]),
-                                   float(nav_route[i, 1]))
+                # Right-lane start: right normal = (sin h, -cos h).  A
+                # recorder starting on the centre line labels a car that
+                # rides the line / cuts the hairpin into oncoming.
+                route_start_xy = (
+                    float(nav_route[i, 0]) + SNAP_LANE_OFFSET_M * math.sin(h),
+                    float(nav_route[i, 1]) - SNAP_LANE_OFFSET_M * math.cos(h))
                 route_start_deg = math.degrees(h)
                 conn.safe_teleport(*route_start_xy,
                                    heading_deg=route_start_deg)
