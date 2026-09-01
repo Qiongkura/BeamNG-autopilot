@@ -43,8 +43,10 @@ from beamng_autopilot.planning import (
     Constraints,
     Scene,
     sample_arc,
+    sample_lane_shift,
     select_trajectory,
 )
+from beamng_autopilot.planning.local_route import map_lane_edges
 from beamng_autopilot.lane import perception_lateral_guard
 from beamng_autopilot.recording import ShadowFrame, ShadowRecorder
 from beamng_autopilot.roadnet import RoadNetwork
@@ -216,6 +218,8 @@ def main() -> int:
         # so when --goal is given build the same A* route the FSD drive
         # uses and snap the car onto it, facing its direction.
         nav_route = None
+        road_left = None
+        road_right = None
         if args.goal is not None:
             rn = RoadNetwork()
             t_road = time.time()
@@ -232,6 +236,10 @@ def main() -> int:
                     n0, np.asarray(args.goal, dtype=float))
                 if _rwe[0] is not None and len(_rwe[0]) >= 4:
                     nav_route = np.asarray(_rwe[0][:, :2], dtype=float)
+                    road_left = (np.asarray(_rwe[1][:, :2], dtype=float)
+                                 if _rwe[1] is not None else None)
+                    road_right = (np.asarray(_rwe[2][:, :2], dtype=float)
+                                  if _rwe[2] is not None else None)
                     dseg = np.linalg.norm(np.diff(nav_route, axis=0),
                                           axis=1)
                     print(f"[shadow] road-graph route: {len(nav_route)} "
@@ -355,18 +363,60 @@ def main() -> int:
             fuse_obstacles_to_grid(grid, rng.obstacles, rng.ray_hits)
 
             scene_route = nav_route if nav_route is not None else route
+            # Own-lane map reference (same as the FSD drive): the recorder
+            # must label a car in ITS OWN lane, not one riding the route
+            # centre line (which wedges on hairpins and labels centre-line
+            # driving).  The map lane centre is the lane_center candidate
+            # and the fallback when the arc fan declines.
+            scene_lane_ref = None
+            lane_left = lane_right = None
+            lane_width = 0.0
+            if nav_route is not None and road_left is not None \
+                    and road_right is not None:
+                try:
+                    map_lane = map_lane_edges(
+                        nav_route, road_left, road_right, pos, heading)
+                except Exception:
+                    map_lane = None
+                if map_lane is not None:
+                    mc, ml, mr = map_lane
+                    scene_lane_ref = np.asarray(mc, dtype=float)[:, :2]
+                    lane_left = np.asarray(ml, dtype=float)[:, :2]
+                    lane_right = np.asarray(mr, dtype=float)[:, :2]
+                    _n2 = min(len(lane_right), len(lane_left))
+                    _wa = np.linalg.norm(
+                        lane_right[:_n2] - lane_left[:_n2], axis=1)
+                    _wf = _wa[np.isfinite(_wa)]
+                    if _wf.size:
+                        lane_width = float(np.median(_wf))
             scene = Scene(pos=pos, heading=heading, grid=grid,
-                          route=scene_route, obstacles=rng.obstacles,
+                          route=scene_route, lane_ref=scene_lane_ref,
+                          lane_left=lane_left, lane_right=lane_right,
+                          lane_width=lane_width,
+                          obstacles=rng.obstacles,
                           target_speed=args.speed)
             fans = sample_arc(pos, heading, speed=max(2.0, v),
                               max_steer=0.4, n_curv=9)
+            if scene_lane_ref is not None and len(scene_lane_ref) >= 4:
+                fans.add(np.asarray(scene_lane_ref, dtype=float)[:, :2],
+                         "lane_center", offset=0.0)
+                _sh = sample_lane_shift(scene_lane_ref,
+                                        offsets=(-1.5, 1.5))
+                for _c in _sh.candidates:
+                    fans.add(_c.path, _c.meta.get("kind", "shift"),
+                             offset=_c.meta.get("offset", 0.0))
             best, meta = select_trajectory(scene, fans, cons)
 
             # executed control: follow the shadow planner's ``best`` arc
             # when it exists (it is smooth through bends) and fall back
-            # to the road graph otherwise; the lateral guard below keeps
-            # the car inside the road instead of cutting onto grass.
-            route_ref = best if best is not None else drive_route
+            # to the own-lane centre (or the road graph when no map lane
+            # is available) otherwise; the lateral guard below keeps the
+            # car inside the road instead of cutting onto grass.
+            fallback_ref = drive_route
+            if best is None and scene_lane_ref is not None \
+                    and len(scene_lane_ref) >= 4:
+                fallback_ref = np.asarray(scene_lane_ref)[:, :2]
+            route_ref = best if best is not None else fallback_ref
             steer = 0.0
             if route_ref is not None and len(route_ref) >= 2:
                 res = pp.steering(
