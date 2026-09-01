@@ -37,14 +37,16 @@ MIN_SEGMENT_DIST_M = 200.0  # 新段起点至少离当前位置这么远
 
 def _random_road_point(roadnet: RoadNetwork, cur_xy, rng,
                        center=None, radius: float | None = None,
-                       min_dist: float = MIN_SEGMENT_DIST_M) -> tuple:
+                       min_dist: float = MIN_SEGMENT_DIST_M,
+                       pool=None) -> tuple:
     """随机选一个离当前点足够远（且在限定区域内）的路网节点。
 
     返回 (x, y, z, heading)。``center``/``radius`` 用于把采集限定在
     某个区域（城镇/高速），否则全图随机。
     """
     for _ in range(200):
-        idx = int(rng.integers(0, roadnet.node_count))
+        idxs = pool if pool is not None else range(roadnet.node_count)
+        idx = idxs[int(rng.integers(0, len(idxs)))]
         xy = roadnet.nodes[idx]
         if np.hypot(*(xy - np.asarray(cur_xy[:2], dtype=float))) \
                 < min_dist:
@@ -120,6 +122,7 @@ def main() -> None:
     elif args.area_center is not None:
         area_center = np.asarray(args.area_center, dtype=float)
     area_radius = args.area_radius if area_center is not None else None
+    node_pool = None  # 限定区域时的路网节点池（reject 采样太稀）
     # 限定区域内段间距按半径缩放（城镇半径 160m 内不可能有 200m 远
     # 的第二个节点，段间距跟着缩小才不会失败）
     min_seg_dist = (min(80.0, max(60.0, area_radius * 0.5))
@@ -169,6 +172,14 @@ def main() -> None:
             print(f"[collect] WARNING: roadnet 不可用，"
                   f"退回单段采集（{roadnet.info}）")
             segments = 1
+        elif area_center is not None:
+            node_pool = [i for i in range(roadnet.node_count)
+                         if np.hypot(*(roadnet.nodes[i] - area_center))
+                         <= area_radius]
+            print(f"[collect] 区域内路网节点 {len(node_pool)}")
+            if not node_pool:
+                raise SystemExit(
+                    f"区域内没有路网节点: {area_center} 半径 {area_radius}")
 
     meta = {"port": args.port, "speed": args.speed, "w": W, "h": H,
             "classes": ["background", "asphalt", "line"],
@@ -185,7 +196,7 @@ def main() -> None:
             x, y, z, hdg = _random_road_point(
                 roadnet, st.pos[:2], rng,
                 center=area_center, radius=area_radius,
-                min_dist=min_seg_dist)
+                min_dist=min_seg_dist, pool=node_pool)
             _teleport_to(conn, (x, y, z), hdg, no_step=args.no_step)
             print(f"[collect] segment {seg}: teleport -> "
                   f"({x:.0f}, {y:.0f})")
