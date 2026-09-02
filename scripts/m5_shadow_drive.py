@@ -118,36 +118,45 @@ def _path_curvature_ff(path, pos, heading, near_m: float = 1.5,
 
 
 def _curve_speed_mps(route: np.ndarray | None, pos: np.ndarray,
-                    heading: float, horizon_m: float = 10.0) -> float:
+                    heading: float, horizon_m: float = 14.0) -> float:
     """Cap speed ahead of a bend (rule-driver curve governor).
 
-    Measures how much the route direction rotates over the next
-    ``horizon_m`` from the nearest route point and returns a safe speed
-    (2 m/s for a hairpin, 3.5 for a normal bend, 6+ for straight road)
-    so the simple PP driver can round corners instead of wedging into
-    the outside wall.
+    Sums the |direction change| over the next ``horizon_m`` of route arc
+    from the nearest point and returns a safe speed (a hairpin nets
+    ~110-180 deg and is capped to a crawl, a normal bend to a slower
+    cruise) so the simple PP driver can round corners instead of
+    wedging into the outside wall.  A longer horizon than the old
+    endpoint-only measure catches a hairpin whose net turn is spread
+    over more than 10 m of arc.
     """
     if route is None or len(route) < 4:
         return 8.0
     pos = np.asarray(pos, dtype=float)[:2]
     d = np.linalg.norm(route - pos, axis=1)
     i = int(np.argmin(d))
+    tot = 0.0
     seg = 0.0
+    prev = None
     j = i
     while j + 1 < len(route) and seg < horizon_m:
-        seg += float(np.linalg.norm(route[j + 1] - route[j]))
+        v = route[j + 1] - route[j]
+        a = float(math.atan2(v[1], v[0]))
+        if prev is not None:
+            da = abs(float((a - prev + math.pi) % (2.0 * math.pi)
+                           - math.pi))
+            tot += da
+        prev = a
+        seg += float(np.linalg.norm(v))
         j += 1
-    if j <= i + 1:
-        return 8.0
-    a0 = float(np.arctan2(route[i + 1, 1] - route[i, 1],
-                          route[i + 1, 0] - route[i, 0]))
-    a1 = float(np.arctan2(route[j, 1] - route[j - 1, 1],
-                          route[j, 0] - route[j - 1, 0]))
-    deg = abs(float(np.degrees((a1 - a0 + np.pi) % (2 * np.pi) - np.pi)))
-    if deg >= 70.0:
-        return 2.2
-    if deg >= 40.0:
-        return 3.5
+    deg = math.degrees(tot)
+    if deg >= 85.0:
+        return 1.8
+    if deg >= 55.0:
+        return 2.5
+    if deg >= 30.0:
+        return 3.2
+    if deg >= 15.0:
+        return 4.5
     return 8.0
 
 
@@ -442,7 +451,7 @@ def main() -> int:
             # road-graph polyline, which kinks too sharply to track at
             # speed (wedged a right bend at 6.6 m/s); crawl instead.
             if best is None:
-                v_target = min(v_target, 3.0)
+                v_target = min(v_target, 2.0)
             if near_end:
                 throttle = 0.0
                 brake = 1.0 if v > 0.2 else 0.3
