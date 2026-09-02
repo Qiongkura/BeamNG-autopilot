@@ -1795,14 +1795,31 @@ class AutopilotSession:
                 except Exception as exc:
                     print(f'[m5] FSD frontend init failed: {exc}')
                     self._use_fsd = False
-            if (self.fsd_stack is not None and len(drive_route) >= 2):
+            # FSD frontend is only trusted with a REAL nav route and a
+            # corridor-consistent path: a blind best_path on a no-route /
+            # lane-fallback session drove the car off the road (the
+            # session's obstacle/blocked checks run on the rule path, not
+            # the FSD override).  Adopt the FSD path only when it stays
+            # within ~3.5 m of the rule route; otherwise keep the rule path.
+            if (self.fsd_stack is not None and self.route is not None
+                    and len(drive_route) >= 4):
                 try:
                     _ft = self.fsd_stack.tick(
                         st=st,
                         route_ref=np.asarray(
                             drive_route, dtype=float)[:, :2])
-                    if _ft.best_path is not None and len(_ft.best_path) >= 2:
-                        drive_route = np.asarray(_ft.best_path, dtype=float)
+                    if _ft.best_path is not None and len(_ft.best_path) >= 4:
+                        _bp = np.asarray(_ft.best_path, dtype=float)[:, :2]
+                        _rd = np.asarray(drive_route, dtype=float)[:, :2]
+                        _p2 = np.asarray(st.pos[:2], dtype=float)
+                        _dd = np.linalg.norm(_bp - _p2[None, :], axis=1)
+                        _near = _bp[_dd <= 15.0]
+                        if len(_near) >= 3:
+                            from beamng_autopilot.planning.geometry import (
+                                polyline_point_distances)
+                            _dist = polyline_point_distances(_near, _rd)
+                            if float(np.median(_dist)) <= 3.5:
+                                drive_route = _bp
                 except Exception:
                     pass
             if len(drive_route) >= 2:
