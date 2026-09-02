@@ -151,7 +151,9 @@ MAP_LANE_EMA = 0.6
 # line lets the first left hairpin carry the car into the oncoming lane,
 # and the no-cross gate then blocks every path back (the car rides the
 # wrong side the whole run).  Place starts 1.6 m right of the route.
-SNAP_LANE_OFFSET_M = 1.6
+SNAP_LANE_OFFSET_M = 2.2  # right of the route centre: the painted
+                           # line sits ~0.5m LEFT of the route, so 1.6m
+                           # parked the left wheel ON the line (2026-09-02)
 # End-of-route handling: the nav route is finite.  When the local
 # forward window reaches the route END, the car has arrived; without
 # an explicit stop it creeps onto the road end / kerb and parks over

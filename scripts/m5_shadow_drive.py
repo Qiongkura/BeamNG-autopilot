@@ -61,7 +61,9 @@ from beamng_autopilot.vision.heads.semantic import SemanticHead
 # Snap/restart offset into the RIGHT lane (same as fsd_drive): the
 # recorder must label a car in its OWN lane, not one riding the route
 # centre line into the oncoming lane.
-SNAP_LANE_OFFSET_M = 1.6
+SNAP_LANE_OFFSET_M = 2.2  # right of the route centre: the painted
+                           # line sits ~0.5m LEFT of the route, so 1.6m
+                           # parked the left wheel ON the line (2026-09-02)
 
 
 def _path_curvature_ff(path, pos, heading, near_m: float = 1.5,
