@@ -51,6 +51,9 @@ def main() -> None:
     ap.add_argument("--port", type=int, default=None,
                     help="comms port (default: per-runtime - Steam 64256 / "
                          "Tech 64257)")
+    ap.add_argument("--fsd", action="store_true",
+                    help="use the FSD layered planner as the steering "
+                         "frontend (rule path stays the fallback)")
     ap.add_argument("--runtime", choices=("auto", "steam", "tech"),
                     default=config.RUNTIME_MODE,
                     help="game runtime: auto detects Steam/tech after connect")

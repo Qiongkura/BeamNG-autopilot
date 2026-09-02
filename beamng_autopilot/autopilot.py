@@ -383,6 +383,13 @@ class AutopilotSession:
         self.corner_hold_until = 0.0
         self.corner_held_speed: float | None = None
         self.cached_drive_route: np.ndarray | None = None
+        # Optional FSD frontend (opt-in via --fsd): when enabled the FSD
+        # stack's planned path replaces the rule path as the PurePursuit
+        # steering reference; the rule path stays the fallback whenever
+        # the layered planner declines.  Off by default - the proven rule
+        # autopilot remains untouched.
+        self._use_fsd = bool(getattr(args, 'use_fsd', False))
+        self.fsd_stack = None
         self.cached_blocked = False
         self.blocked_streak = 0
         self.last_vision = 0.0
@@ -1008,6 +1015,11 @@ class AutopilotSession:
             print(f"[m5] camera provider init failed: {exc}")
             self.hotkeys.close()
             self.telemetry.close()
+            if self.fsd_stack is not None:
+                try:
+                    self.fsd_stack.close()
+                except Exception:
+                    pass
             self.conn.close()
             return False
         try:
@@ -1772,6 +1784,27 @@ class AutopilotSession:
                 if (start_i > 0
                         and len(drive_route) - start_i >= 2):
                     drive_route = drive_route[start_i:]
+            # Optional FSD frontend: replace the steering reference with the
+            # layered planner's chosen path when available (lazy-built so a
+            # session that never enables --fsd pays no startup cost).
+            if self._use_fsd and self.fsd_stack is None:
+                try:
+                    from beamng_autopilot.fsd_stack import FSDStack
+                    self.fsd_stack = FSDStack(self.conn, mode='tech')
+                    print('[m5] FSD frontend enabled')
+                except Exception as exc:
+                    print(f'[m5] FSD frontend init failed: {exc}')
+                    self._use_fsd = False
+            if (self.fsd_stack is not None and len(drive_route) >= 2):
+                try:
+                    _ft = self.fsd_stack.tick(
+                        st=st,
+                        route_ref=np.asarray(
+                            drive_route, dtype=float)[:, :2])
+                    if _ft.best_path is not None and len(_ft.best_path) >= 2:
+                        drive_route = np.asarray(_ft.best_path, dtype=float)
+                except Exception:
+                    pass
             if len(drive_route) >= 2:
                 display_route = drive_route
                 speed_route = (
