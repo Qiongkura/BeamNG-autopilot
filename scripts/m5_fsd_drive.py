@@ -218,6 +218,41 @@ def _trim_backtrack(route):
     return r
 
 
+def _painted_line_lat(out, pos, heading):
+    """Painted centre-line lateral relative to the ego (left = +).
+
+    Projects the semantic LINE mask's near-field pixels to the ground
+    with the tick's own camera model, so every run self-reports whether
+    the car sits LEFT (oncoming) or RIGHT (own lane) of the painted
+    line - the objective check that replaces eyeballing telemetry.
+    Returns None when no line is detected this frame.
+    """
+    if out is None or out.frame is None or out.cam is None:
+        return None
+    sem = out.head_outputs.get("semantic")
+    if sem is None or "line" not in getattr(sem, "masks", {}):
+        return None
+    try:
+        from beamng_autopilot.vision.lanes import _mask_to_markings
+        mask = np.asarray(sem.masks["line"], dtype=np.uint8) * 255
+        ground_z = (float(pos[2]) - config.EGO_ORIGIN_GROUND_GAP_M
+                    if len(pos) > 2 else None)
+        marks = _mask_to_markings(mask, "white", out.cam, pos, heading,
+                                  ground_z=ground_z)
+        fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
+        left = np.array([-fwd[1], fwd[0]])
+        lats = []
+        p2 = np.asarray(pos[:2], dtype=float)
+        for m in marks:
+            pts = np.asarray(m.world[:, :2], dtype=float)
+            near = pts[np.linalg.norm(pts - p2, axis=1) < 25.0]
+            if len(near):
+                lats.append(float(((near - p2) @ left).mean()))
+        return round(float(np.mean(lats)), 3) if lats else None
+    except Exception:
+        return None
+
+
 def _ref_bearing(ref, pos, min_m: float = 1.5, max_m: float = 20.0):
     """Bearing (deg) of the near-ahead part of a reference polyline."""
     if ref is None or len(ref) < 2:
@@ -824,6 +859,8 @@ def main() -> int:
                                    map_lane_override=map_lane)
             _tb = time.time()
             best = out.best_path
+            # Painted centre-line lateral (objective lane-side check)
+            line_lat = _painted_line_lat(out, pos, heading)
 
             # safety arbitration on the chosen path: evaluate against the
             # tick's FUSED occupancy (the planner's own vector space), not
@@ -1700,6 +1737,7 @@ def main() -> int:
                                 if verd.closest_obs_m < 900.0 else None),
                 "pp_tgt": ([round(float(v), 2) for v in pp_tgt[:2]]
                            if pp_tgt is not None else None),
+                "line_lat": line_lat,
                 "lane_bear": _ref_bearing(out.lane_ref, pos),
                 "route_bear": _ref_bearing(route_local, pos),
                 "best_bear": _ref_bearing(out.best_path, pos),
@@ -1722,6 +1760,14 @@ def main() -> int:
                       f"lane={out.meta.get('lane_src', '?')}/"
                       f"{'P' if out.meta.get('lane_paired') else '1'} "
                       f"dev={getattr(verd, 'lane_dev_m', 0.0):.2f}")
+        _ll = [f["line_lat"] for f in hist if f.get("line_lat") is not None]
+        if _ll:
+            _arr = np.asarray(_ll, dtype=float)
+            print(f"[fsd-drive] painted line lateral (left=+): "
+                  f"mean={_arr.mean():+.2f}m p50="
+                  f"{np.percentile(_arr, 50):+.2f}m "
+                  f"min={_arr.min():+.2f} max={_arr.max():+.2f} "
+                  f"({int((_arr < -0.5).sum())} frames car left of line)")
         print(f"[fsd-drive] done: {frames} frames, {stopps} stops")
     finally:
         # ensure the car stops

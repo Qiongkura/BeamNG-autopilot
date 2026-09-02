@@ -97,6 +97,8 @@ class FSDTick:
         self.n_candidates: int = 0
         self.meta: dict = {}
         self.head_outputs: dict = {}
+        self.frame: np.ndarray | None = None   # front frame used this tick
+        self.cam = None                        # its CameraModel
         self.errors: dict = {}
         self.ray_hits: list = []
         self.forward_clearance: float = float("inf")
@@ -223,6 +225,8 @@ class FSDStack:
             role = "front_main" if "front_main" in snap \
                 else next(iter(snap))
             frame, cam = snap[role]
+            out.frame = frame
+            out.cam = cam
             ctx = FrameContext(
                 frame_rgb=frame, cam=cam, pos=pos, heading=heading,
                 ground_z=float(pos[2]) if len(pos) > 2 else 0.0,
