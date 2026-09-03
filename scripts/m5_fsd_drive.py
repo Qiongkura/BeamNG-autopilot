@@ -62,6 +62,7 @@ from beamng_autopilot.safety_monitor import SafetyMonitor
 from beamng_autopilot.vision.heads import (
     ObjectHead, SemanticHead, TrafficSignalHead,
 )
+from beamng_autopilot.vision.lanes import painted_line_lane_center
 
 # Reverse guard: the car must never drive backwards under the FSD mode.
 # A real factory stack has lane/gear protections - m5_autopilot does too
@@ -147,13 +148,13 @@ ROAD_RETURN_STEER_MAX = 0.55
 # Blend the new centre with the previous one (arc-aligned) so the
 # reference stays smooth; boundaries are left untouched.
 MAP_LANE_EMA = 0.6
-# Snap/restart offset into the RIGHT lane: spawning ON the route centre
-# line lets the first left hairpin carry the car into the oncoming lane,
-# and the no-cross gate then blocks every path back (the car rides the
-# wrong side the whole run).  Place starts 1.6 m right of the route.
-SNAP_LANE_OFFSET_M = 2.2  # right of the route centre: the painted
-                           # line sits ~0.5m LEFT of the route, so 1.6m
-                           # parked the left wheel ON the line (2026-09-02)
+# Start placement is PERCEPTION ONLY: after the semantic head warms up,
+# the drive re-positions itself into its own lane by measuring the
+# painted line (line right side + own-lane half width).  The pre-warm
+# ground snap must not ride the route centre line, and it must not use a
+# fixed "route centre + offset" constant either - that is the map-prior
+# shortcut the FSD realism rules forbid.  (2026-09-03: SNAP_LANE_OFFSET_M
+# removed; placement now comes from painted-line perception.)
 # End-of-route handling: the nav route is finite.  When the local
 # forward window reaches the route END, the car has arrived; without
 # an explicit stop it creeps onto the road end / kerb and parks over
@@ -560,11 +561,10 @@ def main() -> int:
                 h = float(np.arctan2(ndy, ndx))
                 # Ground-safe snap: same connector helper as --teleport, so
                 # the car is always placed on the real surface (never below
-                # terrain) and facing the route direction.  Offset into the
-                # right lane (right normal = (sin h, -cos h)) instead of
-                # starting on the centre line (see SNAP_LANE_OFFSET_M).
-                rx = rx + SNAP_LANE_OFFSET_M * math.sin(h)
-                ry = ry - SNAP_LANE_OFFSET_M * math.cos(h)
+                # terrain) and facing the route direction.  No lateral
+                # offset constant here: once the semantic head is warm, the
+                # perception placement below moves the car into its own
+                # lane from the painted line.
                 conn.safe_teleport(rx, ry, heading_deg=math.degrees(h))
                 st1 = conn.get_state()
                 print(f"[fsd-drive] snapped onto nav route "
@@ -612,6 +612,7 @@ def main() -> int:
         # tick).  Running that with the car braked means the long tick
         # cannot drive the car open-loop off the road; release once the
         # object head is live (or WARMUP_S elapsed).
+        _pw_out = None
         try:
             conn.control(throttle=0.0, brake=1.0, steering=0.0,
                          parkingbrake=1.0, gear=fwd_gear)
@@ -635,6 +636,38 @@ def main() -> int:
             conn.step(3)
         except Exception as _pw_e:
             print(f"[fsd-drive] pre-warm skipped: {_pw_e}")
+        # Perception-only lane placement (NO map-centre / offset constant):
+        # if the warmed semantic head saw the painted line, put the car in
+        # its OWN lane - line right side + lane half width - so a start or
+        # restart never parks on (or straddles) the centre line.
+        _percep_ok = False
+        try:
+            if _pw_out is not None and _pw_out.frame is not None:
+                _st_sp = conn.get_state()
+                _sp_tgt = painted_line_lane_center(
+                    _pw_out.head_outputs.get("semantic"), _pw_out.cam,
+                    _st_sp.pos, float(_st_sp.heading),
+                    ground_z=(float(_st_sp.pos[2])
+                              - config.EGO_ORIGIN_GROUND_GAP_M))
+                if _sp_tgt is not None:
+                    conn.safe_teleport(
+                        _sp_tgt[0], _sp_tgt[1],
+                        heading_deg=math.degrees(float(_st_sp.heading)))
+                    _st_sp2 = conn.get_state()
+                    _percep_ok = True
+                    print(f"[fsd-drive] perception lane placement -> "
+                          f"({float(_st_sp2.pos[0]):.1f}, "
+                          f"{float(_st_sp2.pos[1]):.1f}, "
+                          f"{float(_st_sp2.pos[2]):.1f}) "
+                          f"(painted line right lane, no offset constant)")
+        except Exception as _spe:
+            print(f"[fsd-drive] perception lane placement failed: {_spe}")
+        if not _percep_ok:
+            print("[fsd-drive] painted line not perceived; keeping the "
+                  "ground-safe route snap")
+        conn.control(throttle=0.0, brake=0.0, steering=0.0,
+                     parkingbrake=0.0, gear=fwd_gear)
+        conn.step(3)
         print(f"[fsd-drive] gearbox realistic, forward gear input = {fwd_gear}")
         rguard = ReverseGuard(threshold_mps=REVERSE_THRESHOLD_MPS,
                               clear_mps=REVERSE_CLEAR_MPS)

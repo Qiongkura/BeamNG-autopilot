@@ -56,14 +56,7 @@ from beamng_autopilot.runtime import (
 )
 from beamng_autopilot.vision.hydra import FrameContext, HydraNet
 from beamng_autopilot.vision.heads.semantic import SemanticHead
-
-
-# Snap/restart offset into the RIGHT lane (same as fsd_drive): the
-# recorder must label a car in its OWN lane, not one riding the route
-# centre line into the oncoming lane.
-SNAP_LANE_OFFSET_M = 2.2  # right of the route centre: the painted
-                           # line sits ~0.5m LEFT of the route, so 1.6m
-                           # parked the left wheel ON the line (2026-09-02)
+from beamng_autopilot.vision.lanes import painted_line_lane_center
 
 
 def _path_curvature_ff(path, pos, heading, near_m: float = 1.5,
@@ -270,12 +263,12 @@ def main() -> int:
                     ndx, ndy = (float(nav_route[i, 0] - nav_route[i - 1, 0]),
                                 float(nav_route[i, 1] - nav_route[i - 1, 1]))
                 h = float(np.arctan2(ndy, ndx))
-                # Right-lane start: right normal = (sin h, -cos h).  A
-                # recorder starting on the centre line labels a car that
-                # rides the line / cuts the hairpin into oncoming.
-                route_start_xy = (
-                    float(nav_route[i, 0]) + SNAP_LANE_OFFSET_M * math.sin(h),
-                    float(nav_route[i, 1]) - SNAP_LANE_OFFSET_M * math.cos(h))
+                # Ground-safe start on the route point, facing its
+                # direction: the perception placement below moves the car
+                # into its OWN lane from the painted line - no fixed
+                # "route centre + offset" constant (2026-09-03).
+                route_start_xy = (float(nav_route[i, 0]),
+                                  float(nav_route[i, 1]))
                 route_start_deg = math.degrees(h)
                 conn.safe_teleport(*route_start_xy,
                                    heading_deg=route_start_deg)
@@ -285,6 +278,43 @@ def main() -> int:
                       f"{float(st1.pos[2]):.1f})")
                 heading0 = float(st1.heading)
                 x0 = np.asarray(st1.pos[:2], dtype=float)
+        # Perception-only start placement (same rule as the FSD drive, no
+        # map-centre / offset constant): if the semantic head sees the
+        # painted line, put the car in its OWN lane - line right side +
+        # lane half width - so a start / restart never parks on (or
+        # straddles) the centre line; otherwise keep the ground-safe pose.
+        p_snap_ok = False
+        try:
+            st_p = conn.get_state()
+            frame_rgb = np.ascontiguousarray(ring.grab(), dtype=np.uint8)
+            cam_p = ring.camera_model(st_p.pos, float(st_p.heading),
+                                      ring.width, ring.height)
+            ctx_p = FrameContext(frame_rgb=frame_rgb, cam=cam_p,
+                                 pos=st_p.pos, heading=float(st_p.heading),
+                                 ground_z=float(st_p.pos[2]),
+                                 role="front_main")
+            sem_p = net.run(ctx_p).get("semantic")
+            tgt_p = painted_line_lane_center(
+                sem_p, cam_p, st_p.pos, float(st_p.heading),
+                ground_z=float(st_p.pos[2]))
+            if tgt_p is not None:
+                conn.safe_teleport(
+                    tgt_p[0], tgt_p[1],
+                    heading_deg=math.degrees(float(st_p.heading)))
+                st1 = conn.get_state()
+                p_snap_ok = True
+                print(f"[shadow] perception lane placement -> "
+                      f"({float(st1.pos[0]):.1f}, {float(st1.pos[1]):.1f}, "
+                      f"{float(st1.pos[2]):.1f}) "
+                      f"(painted line right lane, no offset constant)")
+        except Exception as _spe:
+            print(f"[shadow] perception lane placement failed: {_spe}")
+        if not p_snap_ok:
+            print("[shadow] painted line not perceived; keeping the "
+                  "ground-safe start pose")
+        if p_snap_ok:
+            heading0 = float(st1.heading)
+            x0 = np.asarray(st1.pos[:2], dtype=float)
         # Lock the box into a forward gear (D on the etk800) so a teleport
         # can never leave the car in park/reverse and the recorder actually
         # drives; release the parking brake the helper engages.
