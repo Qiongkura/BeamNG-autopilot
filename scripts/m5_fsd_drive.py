@@ -64,6 +64,7 @@ from beamng_autopilot.vision.heads import (
 )
 from beamng_autopilot.vision.lanes import (
     PaintedLineLateralCorrector,
+    painted_line_correction_active,
     painted_line_direction,
     painted_line_lane_center,
     painted_line_markings,
@@ -1186,25 +1187,27 @@ def main() -> int:
             # avoidance shape, so the shift just holds then decays.
             _plc_shift = 0.0
             _plc_desired = None
-            if (rem_end is None or rem_end >= END_PULL_START_M) \
-                    and chosen.source != "rule":
+            _plc_active = painted_line_correction_active(
+                str(out.meta.get("lane_src_sel", "")),
+                str(chosen.source),
+                rem_end, END_PULL_START_M)
+            if _plc_active:
                 try:
-                    if str(out.meta.get("lane_src_sel", "")) != "sensor":
-                        _sem0 = (out.head_outputs.get("semantic")
-                                 if out is not None
-                                 and getattr(out, "head_outputs", None)
-                                 else None)
-                        if _sem0 is not None and out.cam is not None:
-                            _olc = painted_line_lane_center(
-                                _sem0, out.cam, pos, float(heading),
-                                ground_z=(float(pos[2])
-                                          - config.EGO_ORIGIN_GROUND_GAP_M
-                                          if len(pos) > 2 else None),
-                                marks=_plmarks)
-                            if _olc is not None:
-                                _plc_desired = plc_corr.desired_shift(
-                                    _olc, pos, float(heading),
-                                    max_shift_m=PLC_MAX_SHIFT_M)
+                    _sem0 = (out.head_outputs.get("semantic")
+                             if out is not None
+                             and getattr(out, "head_outputs", None)
+                             else None)
+                    if _sem0 is not None and out.cam is not None:
+                        _olc = painted_line_lane_center(
+                            _sem0, out.cam, pos, float(heading),
+                            ground_z=(float(pos[2])
+                                      - config.EGO_ORIGIN_GROUND_GAP_M
+                                      if len(pos) > 2 else None),
+                            marks=_plmarks)
+                        if _olc is not None:
+                            _plc_desired = plc_corr.desired_shift(
+                                _olc, pos, float(heading),
+                                max_shift_m=PLC_MAX_SHIFT_M)
                 except Exception:
                     pass
                 _plc_shift = plc_corr.update(_plc_desired, dt, v)
@@ -1857,6 +1860,7 @@ def main() -> int:
                 "pp_tgt": ([round(float(v), 2) for v in pp_tgt[:2]]
                            if pp_tgt is not None else None),
                 "line_lat": line_lat,
+                "plc_active": int(_plc_active),
                 "plc_shift": round(float(_plc_shift), 3),
                 "plc_desired": (round(float(_plc_desired), 3)
                                 if _plc_desired is not None else None),
