@@ -22,6 +22,7 @@ Usage::
 
 from __future__ import annotations
 
+from dataclasses import replace
 import math
 import time
 
@@ -47,9 +48,63 @@ from beamng_autopilot.lane import (
     choose_sensor_lane,
 )
 from beamng_autopilot.runtime import (
+    RangeSample,
     build_camera_ring_provider,
     build_range_provider,
 )
+
+
+# Dynamic obstacles picked up by the range channel (other vehicles) carry
+# a world velocity.  With ``range_every_n > 1`` the last scan is reused
+# for a few ticks; without compensation a moving car's box stays exactly
+# where it was scanned and lags behind by up to ~3 ticks while the ego
+# plans against a ghost (or misses a car that already moved into its
+# path).  FSD-style dynamic occupancy predicts the box into the present
+# with its measured velocity over the reuse gap, plus a safety margin for
+# the unmeasured acceleration in between - never trusting a stale pose as
+# ground truth.
+RANGE_REUSE_MAX_DT_S = 2.0
+RANGE_REUSE_MAX_PREDICT_M = 10.0
+RANGE_REUSE_INFLATE_FRAC = 0.25
+RANGE_REUSE_INFLATE_MAX_M = 1.5
+
+
+def compensate_range_motion(sample: RangeSample | None,
+                            dt_s: float) -> RangeSample | None:
+    """Predict where dynamic boxes are now, after ``dt_s`` of reuse.
+
+    Static boxes (walls, lidar clusters, scenario props) carry no
+    ``velocity`` and are returned unchanged; the raw ray hits are
+    world-frame static surfaces and are also untouched.
+    """
+    if sample is None or dt_s <= 0.0:
+        return sample
+    dt = min(float(dt_s), RANGE_REUSE_MAX_DT_S)
+    out: list = []
+    for ob in getattr(sample, "obstacles", []) or []:
+        vel = getattr(ob, "velocity", None)
+        if vel is None:
+            out.append(ob)
+            continue
+        v = np.asarray(vel, dtype=float)
+        if not np.isfinite(v).all():
+            out.append(ob)
+            continue
+        shift = v * dt
+        mag = float(np.hypot(*shift))
+        if mag > RANGE_REUSE_MAX_PREDICT_M:
+            shift = shift * (RANGE_REUSE_MAX_PREDICT_M / max(mag, 1e-9))
+            mag = RANGE_REUSE_MAX_PREDICT_M
+        grow = min(RANGE_REUSE_INFLATE_FRAC * mag,
+                   RANGE_REUSE_INFLATE_MAX_M)
+        out.append(replace(
+            ob, x=float(ob.x) + float(shift[0]),
+            y=float(ob.y) + float(shift[1]),
+            half_w=float(ob.half_w) + grow,
+            half_h=float(ob.half_h) + grow))
+    return RangeSample(
+        obstacles=out,
+        ray_hits=list(getattr(sample, "ray_hits", []) or []))
 from beamng_autopilot.vision.hydra import FrameContext, HydraNet
 from beamng_autopilot.fsd_realism import (
     SRC_SENSOR,
@@ -136,6 +191,7 @@ class FSDStack:
         self.range_every_n = max(1, int(range_every_n))
         self._range_skip = 0
         self._last_range = None
+        self._last_range_t = 0.0
         # Per-head throttling: the expensive heads (semantic UNet
         # ~100-300 ms, YOLO object ~100-200 ms on the live 400x300
         # front frame) run every ``semantic_every_n`` / ``object_every_n``
@@ -323,16 +379,23 @@ class FSDStack:
                             and (time.time() - _tick_cost0) > _budget
                             and getattr(self, '_last_range', None)
                             is not None):
-                        rng = self._last_range
+                        _dt = (time.time()
+                               - float(getattr(self, '_last_range_t', 0.0)))
+                        rng = compensate_range_motion(
+                            self._last_range, _dt)
                         _budget_skips.append("range")
                     else:
                         rng = self.range_prov.scan(pos)
                         self._last_range = rng
+                        self._last_range_t = time.time()
                         self._range_skip = max(
                             0, int(getattr(self, 'range_every_n', 1)) - 1)
                 else:
                     self._range_skip -= 1
-                    rng = getattr(self, '_last_range', None)
+                    _dt = (time.time()
+                           - float(getattr(self, '_last_range_t', 0.0)))
+                    rng = compensate_range_motion(
+                        getattr(self, '_last_range', None), _dt)
                 if rng is None:
                     raise RuntimeError("no range sample")
                 out.ray_hits = list(getattr(rng, "ray_hits", []) or [])

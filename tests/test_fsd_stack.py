@@ -5,7 +5,13 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from beamng_autopilot.fsd_stack import FSDStack, FSDTick, semantic_to_meta
+from beamng_autopilot.fsd_stack import (
+    FSDStack,
+    FSDTick,
+    RANGE_REUSE_MAX_PREDICT_M,
+    compensate_range_motion,
+    semantic_to_meta,
+)
 
 
 class _StubRange:
@@ -251,6 +257,35 @@ class _CountingObject(_FakeSemantic):
             category="vehicle")])
 
 
+def _range_with_moving_car():
+    from beamng_autopilot.perception import Obstacle
+    from beamng_autopilot.runtime import RangeSample
+    return RangeSample(
+        obstacles=[
+            Obstacle(x=10.0, y=0.0, half_w=1.0, half_h=2.0,
+                     category="vehicle", label="car",
+                     velocity=np.array([5.0, 0.0]),
+                     heading=0.0,
+                     axis=np.array([1.0, 0.0]),
+                     half_len=2.0, half_thick=1.0,
+                     vehicle_id="v0"),
+            Obstacle(x=6.0, y=0.0, half_w=1.0, half_h=1.0,
+                     category="lidar"),
+        ],
+        ray_hits=[(6.0, -1.0), (6.0, 1.0)])
+
+
+class _MovingCarRange:
+    """Range stub returning one moving car; counts real scans."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def scan(self, pos):
+        self.calls += 1
+        return _range_with_moving_car()
+
+
 def test_fsd_tick_object_throttle_reuses_last_output() -> None:
     st = _stack()
     from beamng_autopilot.vision.hydra import HydraNet
@@ -311,6 +346,21 @@ def test_fsd_tick_budget_defers_heavy_head_then_catches_up() -> None:
     """time_budget_s caps a tick: a due heavy head is deferred to a later
     affordable tick instead of freezing the control loop, and stays due
     until it actually runs."""
+    import beamng_autopilot.fsd_stack as fs
+
+    class _FakeClock:
+        """Deterministic clock: advances 1 s between calls, so the tiny
+        budget is always exceeded regardless of Windows timer jitter."""
+
+        def __init__(self) -> None:
+            self.t = 1000.0
+
+        def __call__(self) -> float:
+            self.t += 1.0
+            return self.t
+
+    _real_time = fs.time.time
+    fs.time.time = _FakeClock()
     st = _stack()
     from beamng_autopilot.vision.hydra import HydraNet
     st.hydra = HydraNet()
@@ -319,13 +369,16 @@ def test_fsd_tick_budget_defers_heavy_head_then_catches_up() -> None:
     st.semantic_every_n = 2
     st._head_skip = {}
     st._last_heads = {}
-    out0 = st.tick(time_budget_s=1e-12)
-    assert sem.calls == 0                    # deferred, not run
-    assert out0.meta.get("tick_budget_skips") == ["semantic"]
-    out1 = st.tick()                         # no budget: catch-up runs it
-    assert sem.calls == 1
-    assert out1.head_outputs["semantic"] is not None
-    assert "semantic" not in st._head_retry  # retry set is cleared
+    try:
+        out0 = st.tick(time_budget_s=1e-12)
+        assert sem.calls == 0                # deferred, not run
+        assert out0.meta.get("tick_budget_skips") == ["semantic"]
+        out1 = st.tick()                     # no budget: catch-up runs it
+        assert sem.calls == 1
+        assert out1.head_outputs["semantic"] is not None
+        assert "semantic" not in st._head_retry  # retry set is cleared
+    finally:
+        fs.time.time = _real_time
 
 
 def test_fsd_tick_equal_heavy_cadences_stagger_ticks() -> None:
@@ -348,3 +401,69 @@ def test_fsd_tick_equal_heavy_cadences_stagger_ticks() -> None:
     # cadence 2 -> each head runs on 2 of the 4 ticks, never together
     assert sem.calls == 2
     assert obj.calls == 2
+
+
+def test_compensate_range_motion_predicts_dynamic_box_ahead() -> None:
+    """A moving vehicle box is shifted by its world velocity over the
+    reuse gap and inflated with a small safety margin."""
+    out = compensate_range_motion(_range_with_moving_car(), 1.0)
+    car = [o for o in out.obstacles
+           if getattr(o, "vehicle_id", None) == "v0"][0]
+    assert car.x == pytest.approx(15.0, abs=1e-6)   # 10 + 5 m/s * 1 s
+    assert car.y == pytest.approx(0.0, abs=1e-6)
+    assert car.half_w > 1.0                          # inflated for safety
+    assert car.velocity is not None                  # keep track identity
+
+
+def test_compensate_range_motion_leaves_static_boxes_untouched() -> None:
+    """Walls / lidar clusters have no velocity and never move."""
+    out = compensate_range_motion(_range_with_moving_car(), 1.0)
+    lidar = [o for o in out.obstacles if o.category == "lidar"][0]
+    assert lidar.x == 6.0 and lidar.y == 0.0
+    assert out.ray_hits == [(6.0, -1.0), (6.0, 1.0)]
+    assert compensate_range_motion(None, 5.0) is None
+
+
+def test_compensate_range_motion_caps_stale_velocity() -> None:
+    """Stale/erroneous velocities cannot teleport the box absurdly far."""
+    from beamng_autopilot.perception import Obstacle
+    from beamng_autopilot.runtime import RangeSample
+    sample = RangeSample(
+        obstacles=[
+            Obstacle(x=10.0, y=0.0, half_w=1.0, half_h=2.0,
+                     category="vehicle",
+                     velocity=np.array([40.0, 0.0]),
+                     half_len=2.0, half_thick=1.0),
+        ],
+        ray_hits=[])
+    out = compensate_range_motion(sample, 10.0)      # dt capped at 2 s
+    car = out.obstacles[0]
+    assert (car.x - 10.0) <= RANGE_REUSE_MAX_PREDICT_M + 1e-9
+
+
+def test_fsd_tick_range_reuse_compensates_vehicle_motion() -> None:
+    """A reused LiDAR scan predicts moving boxes forward instead of
+    replaying the stale scan pose."""
+    st = _stack()
+    st.range_prov = _MovingCarRange()
+    st.range_every_n = 3
+    st._range_skip = 0
+    st._last_range = None
+    import beamng_autopilot.fsd_stack as fs
+    orig = fs.compensate_range_motion
+    seen: list[float] = []
+    try:
+        fs.compensate_range_motion = (
+            lambda s, dt: (seen.append(float(dt)),
+                           orig(s, dt))[1])
+        out1 = st.tick()
+        assert st.range_prov.calls == 1
+        assert not seen                       # fresh scan: no compensation
+        st._last_range_t -= 1.0               # simulate a 1 s reuse gap
+        out2 = st.tick()
+        assert st.range_prov.calls == 1       # reuse, no new scan
+        assert len(seen) == 1 and seen[0] >= 0.99
+        assert out2.ray_hits == out1.ray_hits
+        assert out2.meta.get("n_obstacles", 0) >= 2
+    finally:
+        fs.compensate_range_motion = orig
