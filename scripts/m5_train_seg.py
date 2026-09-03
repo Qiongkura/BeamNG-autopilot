@@ -187,7 +187,7 @@ def main() -> None:
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
     crit = nn.CrossEntropyLoss(weight=weights.to(device))
     use_amp = (device == "cuda") and not args.no_amp
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     def to_tensor(frame, dev):
         colour, label = frame
