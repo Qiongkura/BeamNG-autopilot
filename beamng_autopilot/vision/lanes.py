@@ -265,13 +265,35 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
     return markings
 
 
+def painted_line_markings(sem, cam_model, pos, heading,
+                          ground_z: float | None = None
+                          ) -> list[LaneMarking] | None:
+    """Back-project the semantic LINE mask to world LaneMarking polylines.
+
+    Shared by ``painted_line_lane_center`` / ``painted_line_direction``
+    and the steady lateral corrector so one frame of mask processing
+    serves every painted-line consumer.  Returns None when no LINE mask is
+    present (no line to measure), [] when the mask exists but nothing
+    confident survived back-projection.
+    """
+    if sem is None or "line" not in getattr(sem, "masks", {}):
+        return None
+    try:
+        mask = np.asarray(sem.masks["line"], dtype=np.uint8) * 255
+        return _mask_to_markings(mask, "white", cam_model, pos, heading,
+                                 ground_z=ground_z)
+    except Exception:
+        return None
+
+
 def painted_line_lane_center(sem, cam_model, pos, heading,
                              ground_z: float | None = None,
                              lane_half_m: float = 1.5,
                              max_lat_m: float = 4.0,
                              max_shift_m: float = 2.5,
                              min_pts: int = 6,
-                             near_lon_m: float = 14.0
+                             near_lon_m: float = 14.0,
+                             marks: list | None = None
                              ) -> tuple[float, float] | None:
     """Own-lane centre (world xy) from the painted-line mask - perception only.
 
@@ -287,12 +309,12 @@ def painted_line_lane_center(sem, cam_model, pos, heading,
     centre), and a clamped lateral shift.  Returns None when the line is
     not seen confidently, so callers keep their ground-safe fallback.
     """
-    if sem is None or "line" not in getattr(sem, "masks", {}):
+    if marks is None:
+        marks = painted_line_markings(sem, cam_model, pos, heading,
+                                      ground_z=ground_z)
+    if not marks:
         return None
     try:
-        mask = np.asarray(sem.masks["line"], dtype=np.uint8) * 255
-        marks = _mask_to_markings(mask, "white", cam_model, pos, heading,
-                                  ground_z=ground_z)
         p = np.asarray(pos[:2], dtype=float)
         fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
         left = np.array([-fwd[1], fwd[0]])
@@ -336,7 +358,8 @@ def painted_line_direction(sem, cam_model, pos, heading,
                            near_lon_m: float = 14.0,
                            min_pts: int = 6,
                            min_resultant: float = 0.5,
-                           min_fwd_dot: float = 0.35
+                           min_fwd_dot: float = 0.35,
+                           marks: list | None = None
                            ) -> tuple[float, float] | None:
     """Forward unit direction (world xy) of the painted LINE near the ego.
 
@@ -357,12 +380,12 @@ def painted_line_direction(sem, cam_model, pos, heading,
     gates the circular mean: zigzag noise gives a small resultant and
     returns None, so callers keep their orientation fallback.
     """
-    if sem is None or "line" not in getattr(sem, "masks", {}):
+    if marks is None:
+        marks = painted_line_markings(sem, cam_model, pos, heading,
+                                      ground_z=ground_z)
+    if not marks:
         return None
     try:
-        mask = np.asarray(sem.masks["line"], dtype=np.uint8) * 255
-        marks = _mask_to_markings(mask, "white", cam_model, pos, heading,
-                                  ground_z=ground_z)
         p = np.asarray(pos[:2], dtype=float)
         fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
         left = np.array([-fwd[1], fwd[0]])
@@ -406,6 +429,106 @@ def painted_line_direction(sem, cam_model, pos, heading,
         return (float(v[0]), float(v[1]))
     except Exception:
         return None
+
+
+class PaintedLineLateralCorrector:
+    """Steady-state painted-line lateral correction (perception only).
+
+    The planner normally keeps the MAP/nav own lane, which can sit on (or
+    too close to) the painted centre line when the road-graph geometry is
+    coarse - live telemetry shows ``lane_src_sel=map`` for the whole run
+    while the semantic LINE mask gives a confident own-lane centre.  A
+    real FSD stack places the car where its sensors say the lane is, so
+    this corrector nudges the near part of the chosen path laterally
+    toward the perceived own-lane centre (line right side + lane half
+    width) at a bounded rate - never a nav-centreline + offset constant.
+
+    The applied shift is rate-limited so it cannot fight the planner,
+    blends to zero at the horizon so the far path is untouched, holds
+    briefly when the line flickers so a single dropout does not jerk the
+    car back to the map prior, and freezes while parked.  ``shift_m`` is
+    the current applied lateral displacement (positive = right of the
+    ego heading).
+    """
+
+    def __init__(self, max_shift_m: float = 1.0, horizon_m: float = 12.0,
+                 rate_m_s: float = 1.2, hold_s: float = 2.0,
+                 min_speed_mps: float = 0.5):
+        self.max_shift_m = float(max_shift_m)
+        self.horizon_m = float(horizon_m)
+        self.rate_m_s = float(rate_m_s)
+        self.hold_s = float(hold_s)
+        self.min_speed_mps = float(min_speed_mps)
+        self.shift_m = 0.0
+        self._desired = 0.0
+        self._last_seen = -1e9
+
+    @staticmethod
+    def desired_shift(own_lane_centre, pos, heading,
+                      max_shift_m: float = 1.0) -> float:
+        """Signed lateral move (right=+) that puts the ego on the target.
+
+        ``own_lane_centre`` is the perceived own-lane centre in world xy;
+        the returned value is the perpendicular displacement from the ego
+        to it, clamped to ``max_shift_m``.  Small offsets (< 5 cm) are
+        treated as "already centred" so a line jitter never nudges the
+        path.
+        """
+        p = np.asarray(pos[:2], dtype=float)
+        tgt = np.asarray(own_lane_centre[:2], dtype=float)
+        fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
+        right = np.array([fwd[1], -fwd[0]])
+        off = float((tgt - p) @ right)
+        if abs(off) < 0.05:
+            return 0.0
+        return float(np.clip(off, -max_shift_m, max_shift_m))
+
+    def update(self, desired: float | None, dt: float, speed: float,
+               now: float | None = None) -> float:
+        """Rate-limit ``self.shift_m`` toward ``desired``; returns it.
+
+        ``desired`` None means the perception lane centre was unavailable
+        this frame: the last desired shift is held for ``hold_s`` (a line
+        dropout must not jerk the car back to the map prior) and then
+        decays to zero.  While the car is parked the shift freezes so a
+        standstill never accumulates a launch-worthy offset.
+        """
+        dt = max(0.0, min(float(dt), 0.5))
+        now = float(now) if now is not None else time.time()
+        if desired is not None:
+            self._desired = float(desired)
+            self._last_seen = now
+        elif now - self._last_seen > self.hold_s:
+            self._desired = 0.0
+        if float(speed) < self.min_speed_mps:
+            return self.shift_m
+        step = self.rate_m_s * dt
+        self.shift_m = float(np.clip(
+            self.shift_m + float(np.clip(self._desired - self.shift_m,
+                                         -step, step)),
+            -self.max_shift_m, self.max_shift_m))
+        return self.shift_m
+
+    def apply(self, path, pos, heading) -> np.ndarray | None:
+        """Shift the near part of ``path`` laterally by ``self.shift_m``.
+
+        The displacement is applied only to the part of the path up to
+        ``horizon_m`` ahead of the ego, blending to zero at the horizon,
+        so the far path (corner / obstacle geometry) is untouched while
+        the near section pulls the car back into its own lane.
+        """
+        if path is None or len(path) < 2 or abs(self.shift_m) < 0.01:
+            return path
+        pts = np.asarray(path, dtype=float)
+        p = np.asarray(pos[:2], dtype=float)
+        fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
+        right = np.array([fwd[1], -fwd[0]])
+        lon = pts[:, :2] @ fwd - float(p @ fwd)
+        w = np.clip(1.0 - lon / max(self.horizon_m, 1e-3), 0.0, 1.0)
+        out = np.array(pts, dtype=float, copy=True)
+        out[:, 0] += right[0] * self.shift_m * w
+        out[:, 1] += right[1] * self.shift_m * w
+        return out
 
 
 def polyline_dir_at(ref, pos, window: int = 2,
