@@ -8,6 +8,9 @@
 用法:
     .venv\Scripts\python.exe scripts\m5_train_seg.py --runs logs\m5_seg\run_*
         --epochs 40 --out logs\m5_seg\seg_model
+    中断后续训（每轮结束自动落盘 checkpoint_last.pt）:
+    .venv\Scripts\python.exe scripts\m5_train_seg.py --runs logs\m5_seg\run_*
+        --epochs 40 --out logs\m5_seg\seg_model --resume logs\m5_seg\seg_model\checkpoint_last.pt
 """
 
 from __future__ import annotations
@@ -148,6 +151,8 @@ def main() -> None:
     ap.add_argument("--no-amp", action="store_true",
                     help="disable mixed-precision (AMP) training")
     ap.add_argument("--out", default=str(config.LOGS_DIR / "m5_seg" / "seg_model"))
+    ap.add_argument("--resume", default=None, metavar="CHECKPOINT",
+                    help="从 checkpoint_last.pt 续训（跳过已完成的 epoch）")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--vram-frac", type=float, default=0.6,
                     help="max fraction of GPU VRAM training may use; keeps "
@@ -162,7 +167,7 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"[train] device={device}")
+    print(f"[train] device={device}", flush=True)
     if device == "cuda":
         # Cap training VRAM so a concurrently running game keeps enough
         # memory to render.  Without this, batch 16 training filled the
@@ -175,12 +180,13 @@ def main() -> None:
     n_val = max(1, int(n * args.val_frac))
     train_frames = frames[:n - n_val]   # 时间序：前段训练
     val_frames = frames[n - n_val:]
-    print(f"[train] 共 {n} 帧: 训练 {len(train_frames)} / 验证 {len(val_frames)}")
-    print(f"[train] 类别: {CLASS_NAMES}")
+    print(f"[train] 共 {n} 帧: 训练 {len(train_frames)} / 验证 {len(val_frames)}",
+          flush=True)
+    print(f"[train] 类别: {CLASS_NAMES}", flush=True)
 
     weights = median_freq_weights(train_frames,
                                    line_weight=args.line_weight)
-    print(f"[train] 类别权重: {weights.tolist()}")
+    print(f"[train] 类别权重: {weights.tolist()}", flush=True)
 
     model = SegUNet().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
@@ -235,9 +241,23 @@ def main() -> None:
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
+    start_ep = 0
     best_miou = -1.0
     hist = {"epoch": [], "train_loss": [], "val_miou": [], "val_acc": []}
-    for ep in range(args.epochs):
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        model.load_state_dict(ckpt["state_dict"])
+        opt.load_state_dict(ckpt["optimizer"])
+        sched.load_state_dict(ckpt["scheduler"])
+        if "scaler" in ckpt and ckpt.get("scaler") is not None and use_amp:
+            scaler.load_state_dict(ckpt["scaler"])
+        start_ep = int(ckpt.get("next_epoch", args.epochs))
+        best_miou = float(ckpt.get("best_miou", -1.0))
+        hist = ckpt.get("hist", hist)
+        print(f"[train] 从 {args.resume} 续训, 从 epoch {start_ep} 继续 "
+              f"(共 {args.epochs})", flush=True)
+
+    for ep in range(start_ep, args.epochs):
         t0 = time.time()
         tr_loss, tr_acc, _ = run_epoch(train_frames, train=True)
         sched.step()
@@ -249,7 +269,7 @@ def main() -> None:
         hist["val_acc"].append(round(va_acc, 4))
         print(f"[train] ep {ep:02d}  loss={tr_loss:.4f} "
               f"val_acc={va_acc:.3f} val_mIoU={m_iou:.4f} "
-              f"({time.time() - t0:.0f}s)")
+              f"({time.time() - t0:.0f}s)", flush=True)
         if m_iou > best_miou:
             best_miou = m_iou
             torch.save({
@@ -276,7 +296,30 @@ def main() -> None:
                 },
             }, out_dir / "best.pt")
             print(f"[train] 保存最优 mIoU={m_iou:.4f} -> "
-                  f"{out_dir / 'best.pt'}")
+                  f"{out_dir / 'best.pt'}", flush=True)
+        ckpt = {
+            "state_dict": model.state_dict(),
+            "optimizer": opt.state_dict(),
+            "scheduler": sched.state_dict(),
+            "scaler": scaler.state_dict() if use_amp else None,
+            "next_epoch": ep + 1,
+            "best_miou": best_miou,
+            "hist": hist,
+            "train_args": {
+                "line_weight": args.line_weight,
+                "line_morph": args.line_morph,
+                "amp": use_amp,
+                "epochs": args.epochs,
+                "batch": args.batch,
+                "lr": args.lr,
+                "val_frac": args.val_frac,
+                "seed": args.seed,
+                "runs": [str(p) for p in args.runs],
+                "n_train": len(train_frames),
+                "n_val": len(val_frames),
+            },
+        }
+        torch.save(ckpt, out_dir / "checkpoint_last.pt")
 
     (out_dir / "train_hist.json").write_text(
         json.dumps(hist, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -291,12 +334,12 @@ def main() -> None:
         plt.legend()
         plt.tight_layout()
         plt.savefig(str(out_dir / "curve.png"), dpi=110)
-        print(f"[train] 曲线 -> {out_dir / 'curve.png'}")
+        print(f"[train] 曲线 -> {out_dir / 'curve.png'}", flush=True)
     except Exception as exc:
-        print(f"[train] 曲线保存失败: {exc}")
+        print(f"[train] 曲线保存失败: {exc}", flush=True)
 
     print(f"[train] 完成: 最优验证 mIoU={best_miou:.4f} "
-          f"-> {out_dir / 'best.pt'}")
+          f"-> {out_dir / 'best.pt'}", flush=True)
 
 
 if __name__ == "__main__":
