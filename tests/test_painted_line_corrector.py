@@ -12,7 +12,10 @@ from __future__ import annotations
 
 import numpy as np
 
-from beamng_autopilot.vision.lanes import PaintedLineLateralCorrector
+from beamng_autopilot.vision.lanes import (
+    PaintedLineLateralCorrector,
+    painted_line_correction_active,
+)
 
 
 def _rightward_target(pos, right_m: float, heading: float = 0.0):
@@ -117,3 +120,28 @@ def test_apply_noop_without_shift():
     corr.shift_m = 0.0
     assert corr.apply(path, (0.0, 0.0, 1.5), 0.0) is path
     assert corr.apply(None, (0.0, 0.0, 1.5), 0.0) is None
+
+
+def test_gate_active_on_map_lane_fsd_source():
+    assert painted_line_correction_active(
+        "map", "fsd", rem_end=50.0, end_pull_start_m=20.0)
+
+
+def test_gate_off_when_sensor_lane_selected():
+    assert not painted_line_correction_active(
+        "sensor", "fsd", rem_end=None, end_pull_start_m=20.0)
+
+
+def test_gate_off_on_rule_source_fallback():
+    assert not painted_line_correction_active(
+        "map", "rule", rem_end=None, end_pull_start_m=20.0)
+
+
+def test_gate_off_inside_end_zone():
+    assert not painted_line_correction_active(
+        "map", "fsd", rem_end=5.0, end_pull_start_m=20.0)
+
+
+def test_gate_active_without_route_remaining():
+    assert painted_line_correction_active(
+        "map", "fsd", rem_end=None, end_pull_start_m=20.0)

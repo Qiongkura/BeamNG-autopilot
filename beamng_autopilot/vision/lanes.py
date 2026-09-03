@@ -531,6 +531,31 @@ class PaintedLineLateralCorrector:
         return out
 
 
+def painted_line_correction_active(
+        lane_src_sel: str,
+        arbiter_source: str,
+        rem_end: float | None,
+        end_pull_start_m: float,
+) -> bool:
+    """Policy gate for the painted-line steady-state corrector.
+
+    The corrector shifts the near steer path toward the perceived
+    own-lane centre while the planner is running on the map/nav lane
+    prior (``lane_src_sel != "sensor"``) and an FSD path is actually
+    being steered (``arbiter_source != "rule"`` - a rule fallback
+    already carries its own obstacle-avoidance shape and must not get
+    a superimposed centring pull).  Inside the end-zone the dedicated
+    stop ray owns the steering reference, so the corrector is off.
+    """
+    if str(lane_src_sel) == "sensor":
+        return False
+    if str(arbiter_source) == "rule":
+        return False
+    if rem_end is not None and float(rem_end) < float(end_pull_start_m):
+        return False
+    return True
+
+
 def polyline_dir_at(ref, pos, window: int = 2,
                     min_pts: int = 3) -> np.ndarray | None:
     """Unit forward direction (world xy) of a polyline at the ego.
