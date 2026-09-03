@@ -21,6 +21,26 @@
 - `logs/`：运行产物、遥测、训练输出，全部 gitignore，不提交。
 - `weights/`、`.yolo/`：模型与 YOLO 配置，属于运行时产物，不提交。
 
+## 铁律（不可违反）
+
+**禁止「导航线/地图线 + 固定偏移」作为横向定位逻辑**。横向参考（车应该处在
+车道内的哪个横向位置、压没压线、终点停在哪）只能来自感知 —— 语义分割 / 漆画线
+投影 / 可行驶边界等传感器输出（如 `painted_line_lane_center`：标线右侧
+`lane_half_m` = 本车道中心）。以下写法一律禁止：
+
+- 用导航路线中心线、地图车道中心线 + 固定偏移（`RIGHT_OFFSET_M`、
+  `SNAP_LANE_OFFSET_M`、`route + 2.0m` 等同类常量/表达式）做横向落点、
+  转向参考或压线判定；
+- 感知不可用时回退到地图/导航线做横向兜底。
+
+感知不可用时的合法降级只有：刹停、保持当前航向直行、落到路面安全点。
+
+旧 M5 规则驾驶（`LocalPlanner` / `m5_autopilot` 的 `right_offset`）是唯一例外，
+仅作兼容兜底保留，FSD 栈及其入口（`m5_fsd_drive`、`m5_shadow_drive`）不得使用或
+重新引入同类逻辑；新代码不得新增任何"导航线/地图线 + 偏移"常量。横向逻辑是否合规
+以此为准：能否用感知指标（如 `line_lat`）回答"车相对感知标线在哪一侧"，而不是
+相对导航中线/偏移。
+
 ## 关键约定
 
 1. 复用优先。已有 `PurePursuit`、`SpeedController`、`LocalPlanner`、`LaneTracker`、`VisionDetector`、`BeamNGConnector`、`ControlBridge` 等组件，先搜索再实现，不要重复造轮子。
