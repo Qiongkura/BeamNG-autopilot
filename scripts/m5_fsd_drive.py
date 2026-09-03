@@ -63,8 +63,10 @@ from beamng_autopilot.vision.heads import (
     ObjectHead, SemanticHead, TrafficSignalHead,
 )
 from beamng_autopilot.vision.lanes import (
+    PaintedLineLateralCorrector,
     painted_line_direction,
     painted_line_lane_center,
+    painted_line_markings,
     polyline_dir_at,
 )
 
@@ -197,6 +199,22 @@ END_BRAKE = 0.7
 END_PLC_HOLD_S = 2.0
 END_PLC_MAX_LAT_M = 3.0
 END_PLC_MAX_FWD_M = 15.0
+# Steady painted-line lateral corrector (FSD realism, perception only):
+# telemetry showed ``lane_src_sel=map`` for 100% of a run while the
+# semantic LINE mask gave a confident own-lane centre - the map-prior
+# own lane rides on (or too close to) the painted centre line and the
+# car never uses its perception lateral reference in steady driving.  A
+# real FSD stack places the car where ITS sensors say the lane is: while
+# cruising with the map lane leading, nudge the near path toward the
+# perceived own-lane centre (line right side + lane half width) at a
+# bounded rate.  No nav-centreline + offset constant anywhere - the
+# target is the same perception rule as start placement / end zone.
+PLC_MAX_SHIFT_M = 1.0
+PLC_RATE_MPS = 1.2
+PLC_HORIZON_M = 12.0
+PLC_HOLD_S = 2.0
+PLC_MIN_SPEED_MPS = 0.5
+PLC_MIN_ENGAGE_M = 0.02
 GOV_ON_MPS = 0.8
 GOV_OFF_MPS = 0.4
 GOV_BRAKE = 0.25
@@ -245,7 +263,7 @@ def _trim_backtrack(route):
     return r
 
 
-def _painted_line_lat(out, pos, heading):
+def _painted_line_lat(out, pos, heading, marks=None):
     """Painted centre-line lateral relative to the ego (left = +).
 
     Projects the semantic LINE mask's near-field pixels to the ground
@@ -260,12 +278,13 @@ def _painted_line_lat(out, pos, heading):
     if sem is None or "line" not in getattr(sem, "masks", {}):
         return None
     try:
-        from beamng_autopilot.vision.lanes import _mask_to_markings
-        mask = np.asarray(sem.masks["line"], dtype=np.uint8) * 255
-        ground_z = (float(pos[2]) - config.EGO_ORIGIN_GROUND_GAP_M
-                    if len(pos) > 2 else None)
-        marks = _mask_to_markings(mask, "white", out.cam, pos, heading,
-                                  ground_z=ground_z)
+        if marks is None:
+            ground_z = (float(pos[2]) - config.EGO_ORIGIN_GROUND_GAP_M
+                        if len(pos) > 2 else None)
+            marks = painted_line_markings(sem, out.cam, pos, heading,
+                                          ground_z=ground_z)
+        if not marks:
+            return None
         fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
         left = np.array([-fwd[1], fwd[0]])
         lats = []
@@ -704,6 +723,10 @@ def main() -> int:
         map_mc_smooth = None   # EMA-smoothed map-prior lane centre
         end_plc_cache = None   # (own-lane centre xy, t_seen) last-good
                                # perception anchor for the end zone
+        plc_corr = PaintedLineLateralCorrector(
+            max_shift_m=PLC_MAX_SHIFT_M, horizon_m=PLC_HORIZON_M,
+            rate_m_s=PLC_RATE_MPS, hold_s=PLC_HOLD_S,
+            min_speed_mps=PLC_MIN_SPEED_MPS)
         last_h = None      # previous heading for the yaw-rate steering damper
         climb_t = 0.0      # seconds spent in slope-creep assist
         stuck_t = 0.0    # seconds at near-standstill with a "safe" plan
@@ -870,8 +893,25 @@ def main() -> int:
             _ema_tick = (TICK_BUDGET_EMA * (_tb - _f0)
                          + (1.0 - TICK_BUDGET_EMA) * _ema_tick)
             best = out.best_path
-            # Painted centre-line lateral (objective lane-side check)
-            line_lat = _painted_line_lat(out, pos, heading)
+            # Painted centre-line lateral (objective lane-side check).
+            # The semantic LINE mask is back-projected to world markings
+            # ONCE per frame and shared with the steady lateral corrector
+            # below, so a frame of line detection is never done twice.
+            _plmarks = None
+            if out is not None and out.cam is not None and \
+                    getattr(out, "head_outputs", None):
+                try:
+                    _semx = out.head_outputs.get("semantic")
+                    if _semx is not None and \
+                            "line" in getattr(_semx, "masks", {}):
+                        _plmarks = painted_line_markings(
+                            _semx, out.cam, pos, float(heading),
+                            ground_z=(float(pos[2])
+                                      - config.EGO_ORIGIN_GROUND_GAP_M
+                                      if len(pos) > 2 else None))
+                except Exception:
+                    _plmarks = None
+            line_lat = _painted_line_lat(out, pos, heading, _plmarks)
 
             # safety arbitration on the chosen path: evaluate against the
             # tick's FUSED occupancy (the planner's own vector space), not
@@ -1039,7 +1079,7 @@ def main() -> int:
                             ground_z=(float(pos[2])
                                       - config.EGO_ORIGIN_GROUND_GAP_M
                                       if len(pos) > 2 else None),
-                            lane_half_m=_lh)
+                            lane_half_m=_lh, marks=_plmarks)
                 except Exception:
                     _plc = None
                 # Travel orientation for the stop ray - PERCEPTION FIRST,
@@ -1131,6 +1171,43 @@ def main() -> int:
                 _f3 = np.array([math.cos(_bear), math.sin(_bear)])
                 steer_path = _anchor + _f3 * np.arange(
                     0.0, 8.0, 0.8)[:, None]
+            # Steady painted-line lateral corrector (cruising only): the
+            # end zone above already owns its perception reference, so the
+            # nudge engages while the car is driving normally.  When the
+            # map lane keeps leading (lane_src_sel != sensor) but the
+            # semantic LINE mask gives a confident own-lane centre, shift
+            # the near path toward it at a bounded rate - perception pulls
+            # the car into its own lane instead of hugging the centre
+            # line.  The corrector holds the last perceived shift across a
+            # line dropout and decays it, so the car never jerks back to
+            # the map prior mid-line.
+            _plc_shift = 0.0
+            _plc_desired = None
+            if rem_end is None or rem_end >= END_PULL_START_M:
+                try:
+                    if str(out.meta.get("lane_src_sel", "")) != "sensor":
+                        _sem0 = (out.head_outputs.get("semantic")
+                                 if out is not None
+                                 and getattr(out, "head_outputs", None)
+                                 else None)
+                        if _sem0 is not None and out.cam is not None:
+                            _olc = painted_line_lane_center(
+                                _sem0, out.cam, pos, float(heading),
+                                ground_z=(float(pos[2])
+                                          - config.EGO_ORIGIN_GROUND_GAP_M
+                                          if len(pos) > 2 else None),
+                                marks=_plmarks)
+                            if _olc is not None:
+                                _plc_desired = plc_corr.desired_shift(
+                                    _olc, pos, float(heading),
+                                    max_shift_m=PLC_MAX_SHIFT_M)
+                except Exception:
+                    pass
+                _plc_shift = plc_corr.update(_plc_desired, dt, v)
+                if steer_path is not None \
+                        and abs(_plc_shift) >= PLC_MIN_ENGAGE_M:
+                    steer_path = plc_corr.apply(
+                        steer_path, pos, float(heading))
             steer = 0.0
             pp_alpha = None
             pp_tgt = None
@@ -1776,6 +1853,9 @@ def main() -> int:
                 "pp_tgt": ([round(float(v), 2) for v in pp_tgt[:2]]
                            if pp_tgt is not None else None),
                 "line_lat": line_lat,
+                "plc_shift": round(float(_plc_shift), 3),
+                "plc_desired": (round(float(_plc_desired), 3)
+                                if _plc_desired is not None else None),
                 "end_ref": _end_ref,
                 "end_dir_src": _dir_src,
                 "lane_bear": _ref_bearing(out.lane_ref, pos),
@@ -1808,6 +1888,13 @@ def main() -> int:
                   f"{np.percentile(_arr, 50):+.2f}m "
                   f"min={_arr.min():+.2f} max={_arr.max():+.2f} "
                   f"({int((_arr < -0.5).sum())} frames car left of line)")
+        _ps = [float(f.get("plc_shift", 0.0)) for f in hist]
+        _nplc = sum(1 for f in hist
+                    if abs(f.get("plc_shift", 0.0)) > PLC_MIN_ENGAGE_M)
+        if _nplc:
+            print(f"[fsd-drive] painted-line steady corrector: "
+                  f"active {_nplc}/{len(hist)} frames, "
+                  f"mean|shift|={np.mean(np.abs(_ps)):.2f}m")
         _er = [(f.get("end_ref", 0), f.get("rem_end")) for f in hist
                if f.get("rem_end") is not None
                and f["rem_end"] < END_PULL_START_M]
