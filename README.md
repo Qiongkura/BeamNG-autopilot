@@ -458,6 +458,11 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
   `end_ref`（live-perception / last-good-hold / straight-hold）可区分是哪一种。
   `m5_fsd_drive` 驾驶路径已无「导航线+偏移」残留（唯一保留的 `right_offset`
   在旧 M5 规则驾驶 `LocalPlanner` 里，作为兼容兜底，FSD 栈不使用）。
+- 稳态标线修正（2026-09-03）：新增 `PaintedLineLateralCorrector`
+  （`vision/lanes.py`）——行驶中每个 tick 复用语义标线反投影，把近端 12m
+  转向路径按"感知本车道中心"限速拉正（死区 5cm / 限幅 1.0m / 速率 1.2m/s，
+  感知掉线先 hold 2s 再衰减），遥测新增 `plc_shift/plc_desired`；全链路
+  仍是纯感知横向，无导航线/地图线偏移。
 - `m5_pipeline.py --cycles N --dedup --drop-takeover-ge 0.5`：录 → 训 → 回放评测
   一键循环，报告自动落盘。
 
