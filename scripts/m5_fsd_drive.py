@@ -1180,10 +1180,14 @@ def main() -> int:
             # the car into its own lane instead of hugging the centre
             # line.  The corrector holds the last perceived shift across a
             # line dropout and decays it, so the car never jerks back to
-            # the map prior mid-line.
+            # the map prior mid-line.  Rule-source frames (FSD declined,
+            # obstacle/unsafe fallback) must not get a superimposed
+            # centring pull - the fallback path already carries its own
+            # avoidance shape, so the shift just holds then decays.
             _plc_shift = 0.0
             _plc_desired = None
-            if rem_end is None or rem_end >= END_PULL_START_M:
+            if (rem_end is None or rem_end >= END_PULL_START_M) \
+                    and chosen.source != "rule":
                 try:
                     if str(out.meta.get("lane_src_sel", "")) != "sensor":
                         _sem0 = (out.head_outputs.get("semantic")
