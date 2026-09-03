@@ -91,6 +91,18 @@ WARMUP_SPEED_MPS = 1.5
 # stale controls.
 STALE_CTRL_S = 1.2
 STALE_CTRL_SPEED_MPS = 2.0
+# Tick time-budget governor (smoothness): the FSD tick cost swings
+# widely - a semantic + YOLO + fresh-LiDAR tick can hit 0.5-0.7 s while
+# a reuse tick is ~40-100 ms, so without a bound the control loop
+# visibly stutters every few frames.  The stack defers a due heavy head
+# once the tick exceeds the budget and serves the cached output instead
+# (the head stays due and runs on the next affordable tick).  The budget
+# adapts to the measured frame time: fast runs never constrain a head,
+# slow runs stay bounded.
+TICK_BUDGET_MIN_S = 0.25
+TICK_BUDGET_MAX_S = 0.45
+TICK_BUDGET_FRAC = 0.85          # of the EMA frame time
+TICK_BUDGET_EMA = 0.30           # EMA weight for the frame-time tracker
 # Target-speed smoothing: the plan speed changes by whole m/s between
 # ticks (corner governor, obstacle caps).  Feeding it straight into the
 # SpeedController made the pedals oscillate throttle -> brake -> throttle
@@ -741,6 +753,8 @@ def main() -> int:
             except Exception:
                 route_round = route_arc = route_rad = None
         hist: list[dict] = []
+        _ema_tick = 0.35          # adaptive tick-budget EMA (seeded: a
+                                  # typical warm tick is ~0.3-0.4 s)
         while time.time() < t_end:
             _f0 = time.time()
             st = conn.get_state()
@@ -838,9 +852,19 @@ def main() -> int:
                 except Exception:
                     rem_end = None
             _ta = time.time()  # local route / map lane / FSD tick split
+            # Adaptive shared time budget for the whole FSD tick (see
+            # TICK_BUDGET_* above): the stack drops to cached outputs
+            # once the tick exceeds the budget so one heavy tick cannot
+            # freeze the control loop.
+            _budget = float(np.clip(
+                _ema_tick * TICK_BUDGET_FRAC,
+                TICK_BUDGET_MIN_S, TICK_BUDGET_MAX_S))
             out = stack.tick(st=st, route_ref=route_local,
-                                   map_lane_override=map_lane)
+                             map_lane_override=map_lane,
+                             time_budget_s=_budget)
             _tb = time.time()
+            _ema_tick = (TICK_BUDGET_EMA * (_tb - _f0)
+                         + (1.0 - TICK_BUDGET_EMA) * _ema_tick)
             best = out.best_path
             # Painted centre-line lateral (objective lane-side check)
             line_lat = _painted_line_lat(out, pos, heading)
@@ -1646,6 +1670,10 @@ def main() -> int:
                 "target_sm": round(float(target_sm), 2),
                 "plan_src": str(out.meta.get("plan_src", "?")),
                 "tick_ms": out.meta.get("tick_ms"),
+                "tick_wall_ms": round((_tb - _f0) * 1000.0, 1),
+                "budget_s": round(float(_budget), 3),
+                "budget_skips": list(
+                    out.meta.get("tick_budget_skips") or []),
                 'frame_ms': {
                     'local': round((_ta - _f0) * 1000.0, 1),
                     'tick': round((_tb - _ta) * 1000.0, 1),
@@ -1733,6 +1761,15 @@ def main() -> int:
             print(f"[fsd-drive] end-zone ref: live-perception={_n_live} "
                   f"last-good-hold={_n_hold} straight-hold={_n_flat}")
         print(f"[fsd-drive] done: {frames} frames, {stopps} stops")
+        _n_skip_fr = sum(1 for f in hist if f.get("budget_skips"))
+        if _n_skip_fr:
+            _n_skip_hd = sum(len(f.get("budget_skips") or [])
+                             for f in hist)
+            _max_budget = max(float(f.get("budget_s") or 0.0)
+                              for f in hist)
+            print(f"[fsd-drive] tick budget: {_n_skip_fr} frames "
+                  f"deferred {_n_skip_hd} heavy head(s) "
+                  f"(budget capped at {_max_budget:.2f}s)")
     finally:
         # ensure the car stops
         try:

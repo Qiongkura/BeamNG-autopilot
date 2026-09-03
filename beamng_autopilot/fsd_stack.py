@@ -146,6 +146,18 @@ class FSDStack:
         self.object_every_n = max(1, int(object_every_n))
         self._head_skip: dict[str, int] = {}
         self._last_heads: dict = {}
+        self._tick_num = 0
+        self._head_phase: dict[str, int] = {}
+        self._head_retry: set[str] = set()
+        # Equal heavy cadences (semantic UNet + object YOLO both at n=2/4)
+        # would collide on the SAME tick and double the tick cost - the
+        # "stutter every few frames" pattern.  Offset the object head by
+        # half a cycle so each tick carries at most one expensive head;
+        # per-head freshness is unchanged (each still refreshes every n
+        # ticks).
+        if (self.semantic_every_n > 1 and self.object_every_n > 1
+                and self.semantic_every_n == self.object_every_n):
+            self._head_phase["object"] = self.object_every_n // 2
 
         self.hydra = HydraNet()
         for head in self.heads:
@@ -199,7 +211,8 @@ class FSDStack:
     # ------------------------------------------------------------------
     def tick(self, st=None, route_ref: np.ndarray | None = None,
              include_bev: bool = True,
-             map_lane_override=None) -> FSDTick:
+             map_lane_override=None,
+             time_budget_s: float | None = None) -> FSDTick:
         """Run one full perception + planning tick.
 
         ``st`` is a vehicle state with ``.pos`` / ``.heading`` / ``.speed``
@@ -213,6 +226,11 @@ class FSDStack:
         heading = float(st.heading)
         _tw = time.time()
         _times: dict[str, float] = {}
+        _tick_cost0 = time.time()
+        _budget = (float(time_budget_s)
+                   if time_budget_s is not None and time_budget_s > 0.0
+                   else None)
+        _budget_skips: list[str] = []
 
         # --- 1) camera ring -> HydraNet heads ---------------------------
         snap: dict = {}
@@ -232,10 +250,15 @@ class FSDStack:
                 ground_z=float(pos[2]) if len(pos) > 2 else 0.0,
                 role=role)
             heads: dict = {}
-            _skip = getattr(self, '_head_skip', None)
-            if _skip is None:
-                _skip = {}
-                self._head_skip = _skip
+            _tick_num = int(getattr(self, '_tick_num', 0))
+            _phase = getattr(self, '_head_phase', None)
+            if _phase is None:
+                _phase = {}
+                self._head_phase = _phase
+            _retry = getattr(self, '_head_retry', None)
+            if _retry is None:
+                _retry = set()
+                self._head_retry = _retry
             _last = getattr(self, '_last_heads', None)
             if _last is None:
                 _last = {}
@@ -247,17 +270,35 @@ class FSDStack:
                     _n = int(getattr(self, 'object_every_n', 1))
                 else:
                     _n = 1
-                if _skip.get(_name, 0) > 0 and _last.get(_name) is not None:
-                    _skip[_name] = _skip.get(_name, 0) - 1
-                    heads[_name] = _last[_name]
+                _n = max(1, _n)
+                _due = ((_tick_num + int(_phase.get(_name, 0))) % _n == 0
+                        or _name in _retry)
+                if not _due:
+                    if _last.get(_name) is not None:
+                        heads[_name] = _last[_name]
+                    continue
+                # Tick time-budget governor (smoothness): when a heavy
+                # head is due but this tick has already consumed its time
+                # budget, defer it and serve the last cached output.  The
+                # head stays due (`_head_retry`) and runs on the first
+                # later tick the budget allows, so a semantic + YOLO +
+                # fresh-LiDAR collision can never freeze the control loop
+                # ("stutter every few frames, car barely moves").
+                if (_n > 1 and _budget is not None
+                        and (time.time() - _tick_cost0) > _budget):
+                    if _last.get(_name) is not None:
+                        heads[_name] = _last[_name]
+                    _retry.add(_name)
+                    _budget_skips.append(_name)
                     continue
                 try:
-                    heads[_name] = _head.run(ctx)
-                    _last[_name] = heads[_name]
-                    if _n > 1:
-                        _skip[_name] = _n - 1
+                    out_head = _head.run(ctx)
+                    heads[_name] = out_head
+                    _last[_name] = out_head
+                    _retry.discard(_name)
                 except Exception as _exc:
                     self.hydra.errors[_name] = str(_exc)
+            self._tick_num = _tick_num + 1
             out.head_outputs = heads
             out.meta["object_head"] = int("object" in self.hydra._heads)
             _times['ring'] = round((time.time() - _tw) * 1000.0, 1)
@@ -278,10 +319,17 @@ class FSDStack:
                 # getattr defaults keep __new__-built test stubs
                 # (no __init__) working: they always scan.
                 if getattr(self, '_range_skip', 0) <= 0:
-                    rng = self.range_prov.scan(pos)
-                    self._last_range = rng
-                    self._range_skip = max(
-                        0, int(getattr(self, 'range_every_n', 1)) - 1)
+                    if (_budget is not None
+                            and (time.time() - _tick_cost0) > _budget
+                            and getattr(self, '_last_range', None)
+                            is not None):
+                        rng = self._last_range
+                        _budget_skips.append("range")
+                    else:
+                        rng = self.range_prov.scan(pos)
+                        self._last_range = rng
+                        self._range_skip = max(
+                            0, int(getattr(self, 'range_every_n', 1)) - 1)
                 else:
                     self._range_skip -= 1
                     rng = getattr(self, '_last_range', None)
@@ -324,6 +372,8 @@ class FSDStack:
                     out.errors["object"] = str(exc)
         _times['range'] = round((time.time() - _tw) * 1000.0, 1)
         _tw = time.time()
+        if _budget_skips:
+            out.meta["tick_budget_skips"] = list(_budget_skips)
         out.bev = grid.as_raster()
         out.drivable = grid.drivable
         out.observed = getattr(grid, "observed", None)

@@ -305,3 +305,46 @@ def test_fsd_tick_range_throttle_reuses_last_scan() -> None:
     assert st.range_prov.calls == 1
     out4 = st.tick()
     assert st.range_prov.calls == 2          # fresh scan on the 4th tick
+
+
+def test_fsd_tick_budget_defers_heavy_head_then_catches_up() -> None:
+    """time_budget_s caps a tick: a due heavy head is deferred to a later
+    affordable tick instead of freezing the control loop, and stays due
+    until it actually runs."""
+    st = _stack()
+    from beamng_autopilot.vision.hydra import HydraNet
+    st.hydra = HydraNet()
+    sem = _CountingSemantic()
+    st.hydra.add(sem)
+    st.semantic_every_n = 2
+    st._head_skip = {}
+    st._last_heads = {}
+    out0 = st.tick(time_budget_s=1e-12)
+    assert sem.calls == 0                    # deferred, not run
+    assert out0.meta.get("tick_budget_skips") == ["semantic"]
+    out1 = st.tick()                         # no budget: catch-up runs it
+    assert sem.calls == 1
+    assert out1.head_outputs["semantic"] is not None
+    assert "semantic" not in st._head_retry  # retry set is cleared
+
+
+def test_fsd_tick_equal_heavy_cadences_stagger_ticks() -> None:
+    """semantic_every_n == object_every_n offsets the object head by half
+    a cycle so one tick never runs both heavy heads (the stutter source)."""
+    st = _stack()
+    from beamng_autopilot.vision.hydra import HydraNet
+    st.hydra = HydraNet()
+    sem = _CountingSemantic()
+    obj = _CountingObject()
+    st.hydra.add(sem)
+    st.hydra.add(obj)
+    st.semantic_every_n = 2
+    st.object_every_n = 2
+    st._head_phase = {"object": 1}
+    st._head_skip = {}
+    st._last_heads = {}
+    for _ in range(4):
+        st.tick()
+    # cadence 2 -> each head runs on 2 of the 4 ticks, never together
+    assert sem.calls == 2
+    assert obj.calls == 2
