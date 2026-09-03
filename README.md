@@ -453,9 +453,11 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
   哪侧，结束汇总）。`m5_autopilot --fsd` 可把 FSD 分层规划作为转向前端（规则
   路径兜底，默认关闭）。2026-09-03 终点刹停同样改为**纯感知**：最后 20m 的
   横向参考来自漆画线投影（本车道中心），感知不可见时**不加任何地图/导航线横向
-  拉拽**，只保持当前航向直行刹停；`m5_fsd_drive` 驾驶路径已无「导航线+偏移」
-  残留（唯一保留的 `right_offset` 在旧 M5 规则驾驶 `LocalPlanner` 里，作为兼容
-  兜底，FSD 栈不使用）。
+  拉拽**，只保持当前航向直行刹停；标线在终点段闪烁/消失时会短时沿用**最近一次
+  感知到的本车道中心**（≤2s 且车仍在该线附近）继续横向收敛，telemetry 新增
+  `end_ref`（live-perception / last-good-hold / straight-hold）可区分是哪一种。
+  `m5_fsd_drive` 驾驶路径已无「导航线+偏移」残留（唯一保留的 `right_offset`
+  在旧 M5 规则驾驶 `LocalPlanner` 里，作为兼容兜底，FSD 栈不使用）。
 - `m5_pipeline.py --cycles N --dedup --drop-takeover-ge 0.5`：录 → 训 → 回放评测
   一键循环，报告自动落盘。
 

@@ -173,6 +173,14 @@ END_PULL_START_M = 20.0
 END_STOP_M = 6.0
 END_SLOW_MPS = 1.0
 END_BRAKE = 0.7
+# End-zone last-good perception anchor: if the painted line flickers
+# or fades inside the final stop zone, keep converging to the LAST
+# perceived own-lane centre (still perception - never a map prior)
+# for a short window, so a line dropout does not silently drop the
+# lateral pull and park the car wherever it entered the zone.
+END_PLC_HOLD_S = 2.0
+END_PLC_MAX_LAT_M = 3.0
+END_PLC_MAX_FWD_M = 15.0
 GOV_ON_MPS = 0.8
 GOV_OFF_MPS = 0.4
 GOV_BRAKE = 0.25
@@ -678,6 +686,8 @@ def main() -> int:
 
         prev_steer = 0.0  # rate-limited steering state (rule-autopilot convention)
         map_mc_smooth = None   # EMA-smoothed map-prior lane centre
+        end_plc_cache = None   # (own-lane centre xy, t_seen) last-good
+                               # perception anchor for the end zone
         last_h = None      # previous heading for the yaw-rate steering damper
         climb_t = 0.0      # seconds spent in slope-creep assist
         stuck_t = 0.0    # seconds at near-standstill with a "safe" plan
@@ -952,6 +962,8 @@ def main() -> int:
             # no line is visible, so the car brakes to a stop centred
             # in its lane instead of turning onto the line.
             steer_path = chosen.path
+            _end_ref = 0  # 0=straight hold 1=last-good perception hold
+                          # 2=live perception (telemetry)
             if rem_end is not None and rem_end < END_PULL_START_M:
                 _bear = None
                 _anchor = np.asarray(pos[:2], dtype=float)
@@ -965,10 +977,11 @@ def main() -> int:
                 # the same perception helper as the start placement),
                 # so the final stop converges into the lane instead of
                 # riding the route centreline.  If the line is
-                # invisible (faded / degenerate road end) there is NO
-                # map lateral pull: hold the current heading straight
-                # and brake - the car keeps the lane-relative position
-                # it entered the stop zone with.
+                # invisible (faded / degenerate road end) the car keeps
+                # converging to the LAST perceived own-lane centre for
+                # a short window, and only falls back to holding the
+                # current heading straight when that expires - still no
+                # map lateral pull anywhere in the chain.
                 _plc = None
                 try:
                     _sem = (out.head_outputs.get("semantic")
@@ -983,32 +996,55 @@ def main() -> int:
                                       if len(pos) > 2 else None))
                 except Exception:
                     _plc = None
+                # Travel orientation from the local nav route -
+                # ORIENTATION ONLY, never a lateral offset.  The
+                # lateral target comes from the perceived line.
+                _dir3 = None
+                _nav_ref = nav_route_ref if nav_route_ref is not None \
+                    else nav_route
+                if _nav_ref is not None and len(_nav_ref) >= 4:
+                    _r3 = np.asarray(_nav_ref[:, :2], dtype=float)
+                    _d3 = np.linalg.norm(_r3 - _anchor[None, :], axis=1)
+                    _i3 = int(np.argmin(_d3))
+                    _i3a = max(0, _i3 - 2)
+                    _i3b = min(len(_r3) - 1, _i3 + 2)
+                    _tv3 = _r3[_i3b] - _r3[_i3a]
+                    _L3 = float(np.linalg.norm(_tv3))
+                    if _L3 > 1e-9:
+                        _dir3 = _tv3 / _L3
+                if _dir3 is None:
+                    _dir3 = np.array([math.cos(float(heading)),
+                                      math.sin(float(heading))])
+                _ref_xy = None
                 if _plc is not None:
-                    # Travel orientation from the local nav route -
-                    # ORIENTATION ONLY, never a lateral offset.  The
-                    # lateral target comes from the perceived line.
-                    _dir3 = None
-                    _nav_ref = nav_route_ref if nav_route_ref is not None \
-                        else nav_route
-                    if _nav_ref is not None and len(_nav_ref) >= 4:
-                        _r3 = np.asarray(_nav_ref[:, :2], dtype=float)
-                        _d3 = np.linalg.norm(_r3 - _anchor[None, :], axis=1)
-                        _i3 = int(np.argmin(_d3))
-                        _i3a = max(0, _i3 - 2)
-                        _i3b = min(len(_r3) - 1, _i3 + 2)
-                        _tv3 = _r3[_i3b] - _r3[_i3a]
-                        _L3 = float(np.linalg.norm(_tv3))
-                        if _L3 > 1e-9:
-                            _dir3 = _tv3 / _L3
-                    if _dir3 is None:
-                        _dir3 = np.array([math.cos(float(heading)),
-                                          math.sin(float(heading))])
-                    _tgt3 = np.asarray(_plc, dtype=float)[:2] + _dir3 * 5.0
+                    _ref_xy = np.asarray(_plc, dtype=float)[:2]
+                    end_plc_cache = (_ref_xy, time.time())
+                    _end_ref = 2
+                elif end_plc_cache is not None:
+                    # Line dropout: reuse the last perceived own-lane
+                    # centre while it is still fresh AND the car is
+                    # still near the same lane line (pedal to the
+                    # cached straight reference, projected ahead of the
+                    # ego), so the stop keeps converging instead of
+                    # freezing at the entry offset.
+                    _cxy, _t_seen = end_plc_cache
+                    _age = time.time() - float(_t_seen)
+                    _s_proj = float((_anchor - _cxy) @ _dir3)
+                    _perp = float((_anchor - _cxy)
+                                  @ np.array([-_dir3[1], _dir3[0]]))
+                    if _age <= END_PLC_HOLD_S \
+                            and _s_proj >= -1.0 \
+                            and _s_proj <= END_PLC_MAX_FWD_M \
+                            and abs(_perp) <= END_PLC_MAX_LAT_M:
+                        _ref_xy = _cxy
+                        _end_ref = 1
+                if _ref_xy is not None:
+                    _tgt3 = _ref_xy + _dir3 * 5.0
                     _v3 = _tgt3 - _anchor
                     if float(np.linalg.norm(_v3)) > 1e-6:
                         _bear = float(math.atan2(_v3[1], _v3[0]))
                 if _bear is None:
-                    # Perception unavailable at the road end: hold the
+                    # No live line, no fresh last-good anchor: hold the
                     # current heading straight instead of following the
                     # degenerate tail or any map prior.
                     _bear = float(heading)
@@ -1656,6 +1692,7 @@ def main() -> int:
                 "pp_tgt": ([round(float(v), 2) for v in pp_tgt[:2]]
                            if pp_tgt is not None else None),
                 "line_lat": line_lat,
+                "end_ref": _end_ref,
                 "lane_bear": _ref_bearing(out.lane_ref, pos),
                 "route_bear": _ref_bearing(route_local, pos),
                 "best_bear": _ref_bearing(out.best_path, pos),
@@ -1686,6 +1723,15 @@ def main() -> int:
                   f"{np.percentile(_arr, 50):+.2f}m "
                   f"min={_arr.min():+.2f} max={_arr.max():+.2f} "
                   f"({int((_arr < -0.5).sum())} frames car left of line)")
+        _er = [(f.get("end_ref", 0), f.get("rem_end")) for f in hist
+               if f.get("rem_end") is not None
+               and f["rem_end"] < END_PULL_START_M]
+        if _er:
+            _n_live = sum(1 for _r, _ in _er if _r == 2)
+            _n_hold = sum(1 for _r, _ in _er if _r == 1)
+            _n_flat = sum(1 for _r, _ in _er if _r == 0)
+            print(f"[fsd-drive] end-zone ref: live-perception={_n_live} "
+                  f"last-good-hold={_n_hold} straight-hold={_n_flat}")
         print(f"[fsd-drive] done: {frames} frames, {stopps} stops")
     finally:
         # ensure the car stops
