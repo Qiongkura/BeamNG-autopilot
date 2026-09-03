@@ -62,7 +62,11 @@ from beamng_autopilot.safety_monitor import SafetyMonitor
 from beamng_autopilot.vision.heads import (
     ObjectHead, SemanticHead, TrafficSignalHead,
 )
-from beamng_autopilot.vision.lanes import painted_line_lane_center
+from beamng_autopilot.vision.lanes import (
+    painted_line_direction,
+    painted_line_lane_center,
+    polyline_dir_at,
+)
 
 # Reverse guard: the car must never drive backwards under the FSD mode.
 # A real factory stack has lane/gear protections - m5_autopilot does too
@@ -988,6 +992,7 @@ def main() -> int:
             steer_path = chosen.path
             _end_ref = 0  # 0=straight hold 1=last-good perception hold
                           # 2=live perception (telemetry)
+            _dir_src = "none"
             if rem_end is not None and rem_end < END_PULL_START_M:
                 _bear = None
                 _anchor = np.asarray(pos[:2], dtype=float)
@@ -1013,29 +1018,80 @@ def main() -> int:
                             and getattr(out, "head_outputs", None)
                             else None)
                     if _sem is not None and out.cam is not None:
+                        # Own-lane centre = line right side + measured
+                        # lane half width.  The half width comes from the
+                        # PAIRED sensor lane when it is live (perception),
+                        # else the same 1.5 m default as start placement -
+                        # never a map-centre offset constant.
+                        _lh = 1.5
+                        try:
+                            if out is not None:
+                                _lw = float(getattr(out, "lane_width",
+                                                    0.0) or 0.0)
+                                _sel = str(out.meta.get("lane_src_sel", ""))
+                                if _lw >= 2.4 and _sel == "sensor":
+                                    _lh = float(np.clip(_lw / 2.0,
+                                                        1.2, 2.6))
+                        except Exception:
+                            _lh = 1.5
                         _plc = painted_line_lane_center(
                             _sem, out.cam, pos, float(heading),
                             ground_z=(float(pos[2])
                                       - config.EGO_ORIGIN_GROUND_GAP_M
-                                      if len(pos) > 2 else None))
+                                      if len(pos) > 2 else None),
+                            lane_half_m=_lh)
                 except Exception:
                     _plc = None
-                # Travel orientation from the local nav route -
-                # ORIENTATION ONLY, never a lateral offset.  The
-                # lateral target comes from the perceived line.
+                # Travel orientation for the stop ray - PERCEPTION FIRST,
+                # never a lateral offset.  1) the painted line's own
+                # direction (the sensors' answer to "which way is my
+                # lane"); 2) the paired sensor lane centreline's local
+                # heading; 3) the nav route tangent as a plain
+                # orientation fallback (the route tail folds onto the
+                # centreline at road ends, which is exactly why the nose
+                # used to park angled); 4) the current heading.
                 _dir3 = None
-                _nav_ref = nav_route_ref if nav_route_ref is not None \
-                    else nav_route
-                if _nav_ref is not None and len(_nav_ref) >= 4:
-                    _r3 = np.asarray(_nav_ref[:, :2], dtype=float)
-                    _d3 = np.linalg.norm(_r3 - _anchor[None, :], axis=1)
-                    _i3 = int(np.argmin(_d3))
-                    _i3a = max(0, _i3 - 2)
-                    _i3b = min(len(_r3) - 1, _i3 + 2)
-                    _tv3 = _r3[_i3b] - _r3[_i3a]
-                    _L3 = float(np.linalg.norm(_tv3))
-                    if _L3 > 1e-9:
-                        _dir3 = _tv3 / _L3
+                if out is not None:
+                    try:
+                        if _sem is not None and out.cam is not None:
+                            _pd = painted_line_direction(
+                                _sem, out.cam, pos, float(heading),
+                                ground_z=(float(pos[2])
+                                          - config.EGO_ORIGIN_GROUND_GAP_M
+                                          if len(pos) > 2 else None))
+                            if _pd is not None:
+                                _dir3 = np.asarray(_pd[:2], dtype=float)
+                                _dir_src = "painted"
+                        if _dir3 is None and \
+                                str(out.meta.get("lane_src_sel", "")) \
+                                == "sensor":
+                            # Sensor lane centreline local heading; sanity-
+                            # gate it to the travel direction so a stray
+                            # geometry read cannot aim the stop sideways.
+                            _dl = polyline_dir_at(out.lane_ref, _anchor)
+                            _hf = np.array([math.cos(float(heading)),
+                                            math.sin(float(heading))])
+                            if _dl is not None and \
+                                    float(_dl @ _hf) >= 0.5:
+                                _dir3 = _dl
+                                _dir_src = "sensor_lane"
+                    except Exception:
+                        _dir3 = None
+                if _dir3 is None:
+                    _nav_ref = nav_route_ref if nav_route_ref is not None \
+                        else nav_route
+                    if _nav_ref is not None and len(_nav_ref) >= 4:
+                        _r3 = np.asarray(_nav_ref[:, :2], dtype=float)
+                        _d3 = np.linalg.norm(
+                            _r3 - _anchor[None, :], axis=1)
+                        _i3 = int(np.argmin(_d3))
+                        _i3a = max(0, _i3 - 2)
+                        _i3b = min(len(_r3) - 1, _i3 + 2)
+                        _tv3 = _r3[_i3b] - _r3[_i3a]
+                        _L3 = float(np.linalg.norm(_tv3))
+                        if _L3 > 1e-9:
+                            _dir3 = _tv3 / _L3
+                            _dir_src = "route"
                 if _dir3 is None:
                     _dir3 = np.array([math.cos(float(heading)),
                                       math.sin(float(heading))])
@@ -1721,6 +1777,7 @@ def main() -> int:
                            if pp_tgt is not None else None),
                 "line_lat": line_lat,
                 "end_ref": _end_ref,
+                "end_dir_src": _dir_src,
                 "lane_bear": _ref_bearing(out.lane_ref, pos),
                 "route_bear": _ref_bearing(route_local, pos),
                 "best_bear": _ref_bearing(out.best_path, pos),

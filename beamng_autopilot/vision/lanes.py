@@ -330,6 +330,106 @@ def painted_line_lane_center(sem, cam_model, pos, heading,
         return None
 
 
+def painted_line_direction(sem, cam_model, pos, heading,
+                           ground_z: float | None = None,
+                           max_lat_m: float = 4.0,
+                           near_lon_m: float = 14.0,
+                           min_pts: int = 6,
+                           min_resultant: float = 0.5,
+                           min_fwd_dot: float = 0.35
+                           ) -> tuple[float, float] | None:
+    """Forward unit direction (world xy) of the painted LINE near the ego.
+
+    Perception-only heading for the end-zone stop ray: the sensors'
+    answer to "which way does my lane go here".  The map route tail
+    folds onto the centreline at road ends, so aiming the straight
+    stop reference along it parks the nose angled across the lane;
+    the line direction keeps the nose on the travel way all the way
+    to the stop.
+
+    Each near-field line SEGMENT contributes its own unit direction
+    (flipped into the forward half-plane), weighted by segment length
+    and 1/(1+lon) so the section passing the car leads - measuring the
+    line's travel direction directly, so a line beside the ego reads
+    straight no matter where the car sits laterally.  Segments running
+    across the road (a stop line, ``fwd_dot`` below ``min_fwd_dot``)
+    are ignored - they are not a lane-keeping edge.  ``min_resultant``
+    gates the circular mean: zigzag noise gives a small resultant and
+    returns None, so callers keep their orientation fallback.
+    """
+    if sem is None or "line" not in getattr(sem, "masks", {}):
+        return None
+    try:
+        mask = np.asarray(sem.masks["line"], dtype=np.uint8) * 255
+        marks = _mask_to_markings(mask, "white", cam_model, pos, heading,
+                                  ground_z=ground_z)
+        p = np.asarray(pos[:2], dtype=float)
+        fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
+        left = np.array([-fwd[1], fwd[0]])
+        vecs: list[np.ndarray] = []
+        weights: list[float] = []
+        for m in marks:
+            if m.kind not in _REAL_KINDS:
+                continue
+            wpts = np.asarray(m.world, dtype=float)
+            for k in range(len(wpts) - 1):
+                rel = (wpts[k][:2] + wpts[k + 1][:2]) * 0.5 - p
+                lon = float(rel @ fwd)
+                if -2.0 <= lon <= near_lon_m:
+                    lat = float(rel @ left)
+                    if abs(lat) <= max_lat_m:
+                        seg = wpts[k + 1][:2] - wpts[k][:2]
+                        L = float(np.linalg.norm(seg))
+                        if L < 0.05:
+                            continue
+                        u = seg / L
+                        fd = float(u @ fwd)
+                        if fd < 0.0:
+                            u = -u
+                            fd = -fd
+                        if fd < min_fwd_dot:
+                            continue
+                        vecs.append(u)
+                        weights.append(L / (1.0 + max(0.0, lon)))
+        if len(vecs) < min_pts:
+            return None
+        w = np.asarray(weights, dtype=float)
+        v = (w[:, None] * np.asarray(vecs, dtype=float)).sum(axis=0)
+        total = float(np.sum(w))
+        if total <= 1e-9:
+            return None
+        if float(np.linalg.norm(v)) / total < min_resultant:
+            return None
+        v = v / float(np.linalg.norm(v))
+        if v @ fwd < 0.0:
+            v = -v
+        return (float(v[0]), float(v[1]))
+    except Exception:
+        return None
+
+
+def polyline_dir_at(ref, pos, window: int = 2,
+                    min_pts: int = 3) -> np.ndarray | None:
+    """Unit forward direction (world xy) of a polyline at the ego.
+
+    Used to read a sensor lane centreline's local heading (e.g. for
+    the end-zone stop ray) from the nearest polyline point plus a
+    small index window.  Returns None for degenerate inputs.
+    """
+    if ref is None or len(ref) < min_pts:
+        return None
+    r = np.asarray(ref[:, :2], dtype=float)
+    p = np.asarray(pos[:2], dtype=float)
+    i = int(np.argmin(np.linalg.norm(r - p, axis=1)))
+    i0 = max(0, i - max(1, int(window)))
+    i1 = min(len(r) - 1, i + max(1, int(window)))
+    v = r[i1] - r[i0]
+    L = float(np.linalg.norm(v))
+    if L < 1e-9:
+        return None
+    return v / L
+
+
 class LaneDetector:
     """Classic-CV lane-marking detector with ground-plane back-projection."""
 

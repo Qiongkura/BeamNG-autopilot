@@ -9,12 +9,16 @@ so the tests exercise the selection / confidence / shift logic directly.
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
 
 from beamng_autopilot.vision import lanes
 from beamng_autopilot.vision.lanes import (
     LaneMarking,
+    painted_line_direction,
     painted_line_lane_center,
+    polyline_dir_at,
 )
 
 
@@ -92,3 +96,69 @@ def test_ignores_non_line_kinds_and_far_lats():
     assert painted_line_lane_center(_Sem({"line": np.zeros((8, 8), np.uint8)}),
                                     cam_model=None,
                                     pos=(10.0, 20.0, 1.5), heading=0.0) is None
+
+
+def _heading_line(angle_deg, lat, pos=(10.0, 20.0), n=24,
+                  lon0=2.0, lon1=14.0):
+    """A straight painted line at lateral ``lat`` rotated by ``angle_deg``."""
+    a = math.radians(float(angle_deg))
+    u = np.array([math.cos(a), math.sin(a)])
+    lon = np.linspace(lon0, lon1, n)
+    base = np.asarray(pos[:2], dtype=float) + np.array([0.0, lat])
+    world = base[None, :] + lon[:, None] * u[None, :]
+    return LaneMarking(world=world, pixels=world.copy(), color="white",
+                       kind="solid", confidence=0.9)
+
+
+def test_painted_line_direction_straight_ahead():
+    """Line running straight ahead -> the stop ray points along travel."""
+    lanes._mask_to_markings = _fake_masks_to_markings(
+        [_heading_line(0.0, 1.0)])
+    d = painted_line_direction(_Sem({"line": np.zeros((8, 8), np.uint8)}),
+                               cam_model=None,
+                               pos=(10.0, 20.0, 1.5), heading=0.0)
+    assert d is not None
+    assert abs(d[0] - 1.0) < 1e-6
+    assert abs(d[1]) < 1e-6
+
+
+def test_painted_line_direction_follows_bend():
+    """Line bending 30 deg right -> direction carries that yaw."""
+    lanes._mask_to_markings = _fake_masks_to_markings(
+        [_heading_line(30.0, 1.0)])
+    d = painted_line_direction(_Sem({"line": np.zeros((8, 8), np.uint8)}),
+                               cam_model=None,
+                               pos=(10.0, 20.0, 1.5), heading=0.0)
+    assert d is not None
+    assert abs(d[1] / max(1e-9, abs(d[0])) - math.tan(math.radians(30.0))) \
+        < 0.05
+    assert d[0] > 0.0
+
+
+def test_painted_line_direction_no_line_returns_none():
+    lanes._mask_to_markings = _fake_masks_to_markings([])
+    assert painted_line_direction(_Sem({"road": np.zeros((8, 8), np.uint8)}),
+                                  cam_model=None,
+                                  pos=(10.0, 20.0, 1.5), heading=0.0) is None
+
+
+def test_painted_line_direction_scattered_returns_none():
+    """Dis-agreeing line points (no clear lane heading) must bail out."""
+    lanes._mask_to_markings = _fake_masks_to_markings([_heading_line(
+        90.0, 0.0, lon0=-4.0, lon1=4.0)])
+    assert painted_line_direction(_Sem({"line": np.zeros((8, 8), np.uint8)}),
+                                  cam_model=None,
+                                  pos=(10.0, 20.0, 1.5), heading=0.0) is None
+
+
+def test_polyline_dir_at_local_heading():
+    """Nearest-segment heading of a lane centreline at the ego."""
+    r = np.column_stack([
+        np.linspace(0.0, 20.0, 21),
+        np.full(21, 20.0),
+    ])
+    d = polyline_dir_at(r, (10.0, 20.0))
+    assert d is not None
+    assert abs(d[0] - 1.0) < 1e-9
+    assert abs(d[1]) < 1e-9
+    assert polyline_dir_at(r[:2], (10.0, 20.0)) is None
