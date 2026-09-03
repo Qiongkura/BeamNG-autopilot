@@ -162,7 +162,7 @@ BEV/向量空间 → 占用 → 规划 → 安全 → 影子数据闭环**。现
 
 ### 实车验证已知注意
 
-- LiDAR 隔帧复用暂无运动补偿：静态墙安全，动态障碍（来车）最多延迟 ~3 tick。
+- LiDAR 隔帧复用已带 egomotion 运动补偿：复用框按自身位移外推，动态障碍（来车）不再滞后整帧。
 - 城镇路线目标必须是 road-graph 上的点，否则 A* 尾段是跨草地的直线（上草是路线问题而非控制问题）。
 - 逐轮详细日志保留在 `logs/`（`fsd_eval_*.json` / `fsd_town_*.json`），此处不再展开。
 
@@ -252,6 +252,11 @@ GPU 显存 6GB 以上（YOLO 检测 + HUD 可视化需要）
 # 2. 训练（可多个 run 一起训；增强 + 类别加权已内置）
 .venv\Scripts\python.exe scripts\m5_train_seg.py --runs logs\m5_seg\run_* `
     --epochs 60 --lr 5e-4 --out logs\m5_seg\seg_model
+
+# 中断后续训（每轮自动落盘 checkpoint_last.pt，不会白训）
+.venv\Scripts\python.exe scripts\m5_train_seg.py --runs logs\m5_seg\run_* `
+    --epochs 60 --lr 5e-4 --out logs\m5_seg\seg_model `
+    --resume logs\m5_seg\seg_model\checkpoint_last.pt
 
 # 3. 离线评估（无需游戏，直接验证模型）
 .venv\Scripts\python.exe scripts\m5_eval_seg.py --runs logs\m5_seg\run_* `
