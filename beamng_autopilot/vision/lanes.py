@@ -265,6 +265,71 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
     return markings
 
 
+def painted_line_lane_center(sem, cam_model, pos, heading,
+                             ground_z: float | None = None,
+                             lane_half_m: float = 1.5,
+                             max_lat_m: float = 4.0,
+                             max_shift_m: float = 2.5,
+                             min_pts: int = 6,
+                             near_lon_m: float = 14.0
+                             ) -> tuple[float, float] | None:
+    """Own-lane centre (world xy) from the painted-line mask - perception only.
+
+    Back-projects the semantic LINE mask and measures the painted line's
+    lateral offset at the ego (left = +).  Returns the world position that
+    puts the car ``lane_half_m`` to the RIGHT of that line: the centre of
+    its own lane on a ~2*lane_half_m road.  No map-centre / offset constant
+    is involved - the same projection the online line_lat metric uses,
+    asked to place the car instead of just reporting where it sits.
+
+    Confidence guards: at least ``min_pts`` near-field points, a bounded
+    lateral spread (edge lines on both sides would cancel to a bogus
+    centre), and a clamped lateral shift.  Returns None when the line is
+    not seen confidently, so callers keep their ground-safe fallback.
+    """
+    if sem is None or "line" not in getattr(sem, "masks", {}):
+        return None
+    try:
+        mask = np.asarray(sem.masks["line"], dtype=np.uint8) * 255
+        marks = _mask_to_markings(mask, "white", cam_model, pos, heading,
+                                  ground_z=ground_z)
+        p = np.asarray(pos[:2], dtype=float)
+        fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
+        left = np.array([-fwd[1], fwd[0]])
+        lats: list[float] = []
+        lons: list[float] = []
+        for m in marks:
+            if m.kind not in _REAL_KINDS:
+                continue
+            wpts = np.asarray(m.world, dtype=float)
+            for wp in wpts:
+                rel = wp[:2] - p
+                lon = float(rel @ fwd)
+                if -2.0 <= lon <= near_lon_m:
+                    lat = float(rel @ left)
+                    if abs(lat) <= max_lat_m:
+                        lats.append(lat)
+                        lons.append(lon)
+        if len(lats) < min_pts:
+            return None
+        # Emphasise the line where it passes the ego: wider points ahead
+        # of a bend carry less weight than the near-car section.
+        w = 1.0 / (1.0 + np.asarray(lons, dtype=float))
+        line_lat = float(np.average(lats, weights=w))
+        spread = float(np.percentile(lats, 90) - np.percentile(lats, 10))
+        if spread > 2.2:
+            # Lines on both sides of the car would cancel; ambiguous.
+            return None
+        shift = float(np.clip(lane_half_m - line_lat,
+                              -max_shift_m, max_shift_m))
+        if abs(shift) < 0.2:
+            return None
+        tgt = p + np.array([fwd[1], -fwd[0]]) * shift
+        return (float(tgt[0]), float(tgt[1]))
+    except Exception:
+        return None
+
+
 class LaneDetector:
     """Classic-CV lane-marking detector with ground-plane back-projection."""
 
