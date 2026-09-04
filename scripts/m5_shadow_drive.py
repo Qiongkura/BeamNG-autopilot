@@ -31,6 +31,7 @@ if str(ROOT) not in sys.path:
 import math
 
 from beamng_autopilot import config
+from beamng_autopilot.bev_fusion import fuse_front_frame_vector_space
 from beamng_autopilot.connector import BeamNGConnector
 from beamng_autopilot.control import gearbox
 from beamng_autopilot.control.pure_pursuit import PurePursuit
@@ -48,7 +49,11 @@ from beamng_autopilot.planning import (
 )
 from beamng_autopilot.planning.local_route import map_lane_edges
 from beamng_autopilot.lane import perception_lateral_guard
-from beamng_autopilot.recording import ShadowFrame, ShadowRecorder
+from beamng_autopilot.recording import (
+    FMAP_CHANNELS,
+    ShadowFrame,
+    ShadowRecorder,
+)
 from beamng_autopilot.roadnet import RoadNetwork
 from beamng_autopilot.runtime import (
     build_camera_ring_provider,
@@ -403,6 +408,18 @@ def main() -> int:
                 rng_last = rng
             fuse_obstacles_to_grid(grid, rng.obstacles, rng.ray_hits)
 
+            # Fused vector-space feature map (same channel stack the FSD
+            # drive records from ``out.feature_map``): semantic road ->
+            # drivable, painted line -> lane, LiDAR hits -> obstacle.
+            # Recorded so the end-to-end network is trained on the fused
+            # perception, not just the raw occupancy raster.
+            fmap = fuse_front_frame_vector_space(
+                masks=(out.masks if out is not None else {}),
+                cam=cam, pos=pos, heading=heading,
+                ground_z=float(pos[2]),
+                obstacles=rng.obstacles,
+                n=grid.n, res=grid.res)
+
             scene_route = nav_route if nav_route is not None else route
             # Own-lane map reference (same as the FSD drive): the recorder
             # must label a car in ITS OWN lane, not one riding the route
@@ -508,6 +525,9 @@ def main() -> int:
                 speed=v, throttle=throttle, brake=brake, steer=float(steer),
                 bev_raster=grid.as_raster(),
                 drivable=grid.drivable,
+                fmap=(np.stack([np.asarray(fmap.get(c), dtype=np.float32)
+                                for c in FMAP_CHANNELS]).astype(np.float32)
+                      if fmap is not None else None),
                 trajectory=None if best is None else best,
                 target_speed=float(args.speed),
                 lane_src="semantic" if net.names() else "",

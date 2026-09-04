@@ -9,8 +9,10 @@ from beamng_autopilot.bev_fusion import (
     BEVFeatureMap,
     CameraFeature,
     fuse_camera_features,
+    fuse_front_frame_vector_space,
     project_mask_to_ego,
 )
+from beamng_autopilot.recording import FMAP_CHANNELS
 from beamng_autopilot.vision.projection import CameraModel
 
 
@@ -81,3 +83,44 @@ def test_project_mask_returns_ego_points() -> None:
     # projected road points should be ahead (positive x ego), not behind
     assert xs.min() > 0.0
     assert points[0][:, 2].min() >= 0.0
+
+
+def test_fuse_front_frame_vector_space_channels() -> None:
+    """Shadow-recorder vector space carries obstacle/drivable/lane/sign."""
+    cam = _cam()
+    h, w = cam.height, cam.width
+    road = np.zeros((h, w), dtype=bool)
+    road[h // 2:] = True
+    line = np.zeros((h, w), dtype=bool)
+    line[:, w // 2] = True
+    hits = [type("Hit", (), {"x": 5.0, "y": 1.0})(),
+            type("Hit", (), {"x": -3.0, "y": 2.0})()]
+    fmap = fuse_front_frame_vector_space(
+        {"road": road, "line": line}, cam,
+        np.array([0.0, 0.0, 0.0]), 0.0, ground_z=0.0,
+        obstacles=hits, n=60, res=0.5, step=8)
+    assert fmap is not None
+    # LiDAR hit -> obstacle evidence at its cell
+    cell = fmap._cell(5.0, 1.0)
+    assert fmap.get("obstacle")[cell] > 0.5
+    # semantic road -> drivable evidence projected AHEAD, not behind
+    drv = fmap.get("drivable")
+    rows = np.argwhere(drv > 0.5)
+    assert len(rows) > 0 and rows[:, 0].min() < 30
+    # painted line -> lane evidence
+    assert fmap.get("lane").max() > 0.5
+    # no sign head yet: sign channel stays neutral
+    assert float(np.abs(fmap.get("sign") - 0.5).max()) < 1e-5
+    # recorder contract: (C, N, N) float32 channel stack
+    stacked = np.stack([np.asarray(fmap.get(c), dtype=np.float32)
+                        for c in FMAP_CHANNELS])
+    assert stacked.shape == (4, 60, 60)
+    assert stacked.dtype == np.float32
+
+
+def test_fuse_front_frame_vector_space_none_when_empty() -> None:
+    cam = _cam()
+    fmap = fuse_front_frame_vector_space(
+        {}, cam, np.array([0.0, 0.0, 0.0]), 0.0,
+        ground_z=0.0, obstacles=(), n=60, res=0.5)
+    assert fmap is None

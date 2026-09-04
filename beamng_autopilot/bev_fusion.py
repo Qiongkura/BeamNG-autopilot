@@ -177,3 +177,52 @@ def project_mask_to_ego(mask, cam, pos, heading, ground_z: float = 0.0,
     if not samples:
         return []
     return [np.asarray(samples, dtype=float).reshape(-1, 3)]
+
+
+def fuse_front_frame_vector_space(
+        masks, cam, pos, heading, ground_z: float = 0.0,
+        obstacles=(), n: int = 60, res: float = 0.5,
+        step: int = 6, max_ahead_m: float = 40.0) -> BEVFeatureMap | None:
+    """Fuse one front-camera semantic frame + LiDAR into a vector-space map.
+
+    Mirrors the ``FSDStack.tick`` fusion block so shadow-mode recording
+    produces the same (obstacle / drivable / lane / sign) channel stack
+    the live FSD drive records from ``out.feature_map``: the semantic
+    ROAD mask votes into ``drivable``, the painted LINE mask into
+    ``lane`` (both back-projected to ego via ``project_mask_to_ego``),
+    and the LiDAR obstacle points into ``obstacle``.  ``sign`` stays
+    neutral (the shadow recorder has no sign head yet).
+
+    ``masks`` is a dict-like of semantic boolean masks (``road`` /
+    ``line``); ``obstacles`` an iterable of objects with ``.x`` / ``.y``
+    (range-provider hits).  Returns a fresh ego-centred map, or None when
+    nothing was perceived this frame.
+    """
+    fmap = BEVFeatureMap(n=n, res=res)
+    seen = False
+    if masks:
+        if "road" in masks:
+            pts = project_mask_to_ego(
+                masks["road"], cam, pos, heading, ground_z=ground_z,
+                channel="drivable", step=step, max_ahead_m=max_ahead_m)
+            for p in pts:
+                fmap.accumulate(CameraFeature(
+                    "front_main", "drivable", p, confidence=0.7))
+            if pts:
+                seen = True
+        if "line" in masks:
+            pts = project_mask_to_ego(
+                masks["line"], cam, pos, heading, ground_z=ground_z,
+                channel="lane", step=step, max_ahead_m=max_ahead_m)
+            for p in pts:
+                fmap.accumulate(CameraFeature(
+                    "front_main", "lane", p, confidence=0.75))
+            if pts:
+                seen = True
+    obs = [(float(o.x), float(o.y), 0.0) for o in (obstacles or ())]
+    if obs:
+        fmap.accumulate(CameraFeature(
+            "sensor_fusion", "obstacle",
+            np.asarray(obs, dtype=float).reshape(-1, 3), confidence=0.85))
+        seen = True
+    return fmap if seen else None
