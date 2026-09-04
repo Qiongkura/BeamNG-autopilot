@@ -53,6 +53,7 @@ from beamng_autopilot.planning.local_route import (
 from beamng_autopilot.planning.speed_profile import \
     MIN_SPEED as _PROF_MIN_SPEED, \
     speed_profile_for_path as _spf_raw
+from beamng_autopilot.recording import ShadowFrame, ShadowRecorder
 from beamng_autopilot.roadnet import RoadNetwork
 from beamng_autopilot.autopilot import nearest_route_point, smooth_steer
 from beamng_autopilot.planner import (
@@ -63,7 +64,12 @@ from beamng_autopilot.planner import (
 )
 from beamng_autopilot.safety_monitor import SafetyMonitor
 from beamng_autopilot.vision.heads import (
-    ObjectHead, SemanticHead, TrafficSignalHead,
+    LaneTopologyHead, ObjectHead, SemanticHead, TrafficSignalHead,
+)
+from beamng_autopilot.watchdog import (
+    arm as wd_arm,
+    disarm as wd_disarm,
+    heartbeat as wd_heartbeat,
 )
 from beamng_autopilot.vision.lanes import (
     PaintedLineLateralCorrector,
@@ -84,6 +90,11 @@ REVERSE_CLEAR_MPS = 0.2
 # allowed to reverse (a car stopped at the bottom of a dip facing uphill
 # is not wedged - it needs torque, not a backward roll).
 CLIMB_ASSIST_S = 3.5
+# Traffic-light action: the traffic head emits a colour + confidence
+# (pure perception, never a map/route prior).  A confident RED light
+# stops the car at the line; below this confidence the colour is
+# ignored (a dusky frame must not park the car).
+SIGNAL_CONF_MIN = 0.6
 # Real-time control loop: the sim runs continuously and the loop paces
 # itself to ~REALTIME_CTRL_HZ, so the car never freezes between ticks
 # (the old paused-step design moved 0.33 s then froze ~1.2 s - the
@@ -458,6 +469,11 @@ def main() -> int:
                     metavar=("X", "Y"),
                     help="set an in-game navigation route to this goal "
                          "before driving (else reuse the active nav route)")
+    ap.add_argument("--no-signal", action="store_true",
+                    help="disable the perception traffic-light stop "
+                         "(a confident red light normally stops the car)")
+    ap.add_argument("--no-shadow", action="store_true",
+                    help="disable shadow-episode recording during the drive")
     args = ap.parse_args()
 
     conn = BeamNGConnector(
@@ -635,8 +651,11 @@ def main() -> int:
         rule_planner = LocalPlanner()
         stack = FSDStack(conn, args.runtime,
                          heads=[SemanticHead(), TrafficSignalHead(),
-                                ObjectHead()],
-                         ring_roles=('front_main',),
+                                ObjectHead(), LaneTopologyHead()],
+                         # Full 8-camera ring (roles=None -> every camera
+                         # in CAMERA_RING): the FSD stack polls the whole
+                         # surround view, not just the front camera.
+                         ring_roles=None,
                          lane_mode=args.lane_mode,
                          strict_sensor=args.strict,
                          cam_w=args.cam_w, cam_h=args.cam_h,
@@ -680,6 +699,16 @@ def main() -> int:
         conn.control(throttle=0.0, brake=0.0, steering=0.0,
                      parkingbrake=0.0, gear=fwd_gear)
         conn.step(3)
+        # Game-side input watchdog: if this Python process dies or is
+        # killed, the game keeps applying the last controls - the Lua
+        # watchdog stops the car once the heartbeat goes stale.
+        try:
+            if wd_arm(conn):
+                print("[fsd-drive] input watchdog armed")
+            else:
+                print("[fsd-drive] WARNING: input watchdog failed to arm")
+        except Exception as _wd_e:
+            print(f"[fsd-drive] WARNING: input watchdog error: {_wd_e}")
         # Real-time control: DO NOT pause the sim.  With ticks now
         # ~0.4-0.6 s (after warm-up) the stale-control window is a few
         # metres at cruise and a fraction of a metre at bend speeds, so
@@ -697,6 +726,10 @@ def main() -> int:
                          parkingbrake=1.0, gear=fwd_gear)
             _pw_t0 = time.time()
             while time.time() - _pw_t0 < WARMUP_S:
+                try:
+                    wd_heartbeat(conn)
+                except Exception:
+                    pass
                 _pw_state = conn.get_state()
                 _pw_route = local_route(
                     np.asarray(_pw_state.pos[:2], dtype=float),
@@ -713,6 +746,10 @@ def main() -> int:
             conn.control(throttle=0.0, brake=0.0, steering=0.0,
                          parkingbrake=0.0, gear=fwd_gear)
             conn.step(3)
+            try:
+                wd_heartbeat(conn)
+            except Exception:
+                pass
         except Exception as _pw_e:
             print(f"[fsd-drive] pre-warm skipped: {_pw_e}")
         # Perception-only lane placement (NO map-centre / offset constant):
@@ -816,9 +853,19 @@ def main() -> int:
             except Exception:
                 route_round = route_arc = route_rad = None
         hist: list[dict] = []
+        # Shadow episode: the FSD drive records its own (rgb + label +
+        # BEV + trajectory + executed control) frames for later
+        # end-to-end training - the same ShadowFrame contract
+        # m5_shadow_drive uses, so a drive IS a labelled run.
+        rec = None if args.no_shadow else ShadowRecorder(
+            config.LOGS_DIR / "m5_e2e", f"fsd_{int(time.time())}")
         _ema_tick = 0.35          # adaptive tick-budget EMA (seeded: a
                                   # typical warm tick is ~0.3-0.4 s)
         while time.time() < t_end:
+            try:
+                wd_heartbeat(conn)
+            except Exception:
+                pass
             _f0 = time.time()
             st = conn.get_state()
             pos = np.asarray(st.pos, dtype=float)
@@ -1486,6 +1533,17 @@ def main() -> int:
                 # keep rolling on the learned trajectory.
                 plan_speed = 0.0
                 plan_sm = 0.0
+            # Traffic-light action (perception rule, never a map/route
+            # prior): a confident RED light stops the car at the line.
+            # A green light never forces motion - the planner / safety
+            # monitor still own the pedals, so the car simply resumes
+            # when the light turns green.
+            if not args.no_signal and \
+                    out.meta.get("signal_state") == "red" and \
+                    float(out.meta.get("signal_conf", 0.0) or 0.0) \
+                    >= SIGNAL_CONF_MIN:
+                plan_speed = 0.0
+                plan_sm = 0.0
             # a rule fallback does not get the FSD plan speed; cap it to a
             # cautious creep so the L2 fallback is gentle
             if chosen.source == "rule":
@@ -1849,6 +1907,48 @@ def main() -> int:
             prev_thr, prev_brk = thr, brk
             conn.control(throttle=thr, brake=brk, steering=steer,
                          gear=gear_use, parkingbrake=pb)
+            # Shadow-frame recording (same ShadowFrame contract as
+            # m5_shadow_drive): a drive tick IS one labelled episode
+            # sample - executed controls + the perception/planning
+            # evidence (BEV, drivable, trajectory, camera + semantic
+            # label) that produced them, for image / BEV end-to-end
+            # training later.  A bad tick (no plan) is labelled with
+            # quality=0 so it can be gated out of the dataset.
+            if rec is not None:
+                try:
+                    _sem_r = out.head_outputs.get("semantic")
+                    _label = None
+                    if _sem_r is not None and out.frame is not None \
+                            and "road" in getattr(_sem_r, "masks", {}):
+                        _label = np.zeros(out.frame.shape[:2], dtype=np.uint8)
+                        _label[_sem_r.masks["road"]] = 1
+                        if "line" in getattr(_sem_r, "masks", {}):
+                            _label[_sem_r.masks["line"]] = 2
+                    _traj = (chosen.path if chosen.path is not None
+                             else out.best_path)
+                    rec.add(ShadowFrame(
+                        x=float(pos[0]), y=float(pos[1]),
+                        heading=heading, speed=v,
+                        throttle=thr, brake=brk, steer=steer,
+                        bev_raster=(np.asarray(out.bev, dtype=np.float32)
+                                    if out.bev is not None else None),
+                        drivable=(np.asarray(out.drivable, dtype=np.uint8)
+                                  if out.drivable is not None else None),
+                        trajectory=(np.asarray(_traj, dtype=float)[:, :2]
+                                    if _traj is not None
+                                    and len(_traj) >= 2 else None),
+                        target_speed=float(plan_speed),
+                        lane_src=str(out.meta.get("lane_src", "")),
+                        cost=float(out.meta.get("planner", {})
+                                   .get("cost", -1.0)),
+                        kind=str(out.meta.get("planner", {})
+                                 .get("kind", "")),
+                        rgb=(np.ascontiguousarray(out.frame, dtype=np.uint8)
+                             if out.frame is not None else None),
+                        label=_label,
+                        quality=1.0 if chosen.path is not None else 0.0))
+                except Exception as _rec_e:
+                    print(f"[fsd-drive] shadow frame dropped: {_rec_e}")
             # Lane-position telemetry: signed lateral offset of the ego from
             # each DETECTED lane boundary (left: + = inside oncoming traffic;
             # right: - = off the road edge).  None when the boundary does
@@ -1924,6 +2024,15 @@ def main() -> int:
                 "n_object_obstacles": int(
                     out.meta.get("n_object_obstacles", 0)),
                 "object_head": int(out.meta.get("object_head", 0)),
+                "signal_state": str(out.meta.get("signal_state", "")),
+                "signal_conf": (round(float(out.meta["signal_conf"]), 3)
+                                if out.meta.get("signal_conf") else None),
+                "intent": str(out.meta.get("intent", "")),
+                "intent_turn_deg": out.meta.get("intent_turn_deg"),
+                "change_left": int(out.meta.get("change_left", 0)),
+                "change_right": int(out.meta.get("change_right", 0)),
+                "n_tracks": int(out.meta.get("n_tracks", 0)),
+                "fmap": int(out.feature_map is not None),
                 "lane_dev_m": round(float(getattr(verd, "lane_dev_m", 0.0)), 3),
                 "lat_left": lat_left,
                 "lat_right": lat_right,
@@ -2008,7 +2117,22 @@ def main() -> int:
             print(f"[fsd-drive] tick budget: {_n_skip_fr} frames "
                   f"deferred {_n_skip_hd} heavy head(s) "
                   f"(budget capped at {_max_budget:.2f}s)")
+        if rec is not None:
+            try:
+                _rec_out = rec.save()
+                if _rec_out:
+                    print(f"[fsd-drive] shadow episode saved -> {_rec_out}")
+                else:
+                    print("[fsd-drive] nothing recorded")
+            except Exception as _rec_e:
+                print(f"[fsd-drive] shadow episode save failed: {_rec_e}")
     finally:
+        # input watchdog must always be lifted, even on a crash, so a
+        # later attach is not blocked by a stale Lua-frame timer
+        try:
+            wd_disarm(conn)
+        except Exception:
+            pass
         # ensure the car stops
         try:
             conn.control(throttle=0.0, brake=1.0, steering=0.0,
