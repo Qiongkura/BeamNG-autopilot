@@ -467,3 +467,54 @@ def test_fsd_tick_range_reuse_compensates_vehicle_motion() -> None:
         assert out2.meta.get("n_obstacles", 0) >= 2
     finally:
         fs.compensate_range_motion = orig
+
+
+def test_fsd_tick_produces_fused_feature_map() -> None:
+    """The FSD tick also emits the persistent multi-camera BEV feature
+    map: the stub LiDAR obstacle votes into the obstacle channel and the
+    semantic road mask into the drivable channel."""
+    st = _stack()
+    out = st.tick()
+    assert out.feature_map is not None
+    obs = out.feature_map.get("obstacle")
+    assert obs is not None and obs.shape == (60, 60)
+    r = int((st.grid_n * st.grid_res * 0.5 - 6.0) / st.grid_res)
+    assert 0 <= r < st.grid_n
+    assert float(obs[r, st.grid_n // 2]) > 0.5
+    drv = out.feature_map.get("drivable")
+    assert drv is not None and drv.shape == (60, 60)
+    assert float(np.asarray(drv).max()) > 0.0
+
+
+def test_fsd_tick_world_object_tracks_lidar_obstacle() -> None:
+    """With the tracker wired in, LiDAR/YOLO detections are matched into
+    persistent world-object tracks."""
+    st = _stack()
+    from beamng_autopilot.temporal import WorldObjectTracker
+    st.tracker = WorldObjectTracker()
+    out = st.tick()
+    assert len(out.tracks) >= 1
+    assert out.meta.get("n_tracks") >= 1
+    t = out.tracks[0]
+    assert abs(float(t.x) - 6.0) < 2.0
+    assert abs(float(t.y)) < 2.0
+
+
+def test_fsd_tick_route_intent_from_nav_route() -> None:
+    """A nav route ahead is classified into a RoutingIntent (straight vs
+    turn) that lowers the plan cruise speed for an upcoming bend."""
+    st = _stack()
+    xs = np.linspace(0.0, 40.0, 41)
+    straight = np.column_stack([xs, np.zeros_like(xs)])
+    out = st.tick(route_ref=straight)
+    assert out.intent is not None
+    assert out.meta.get("intent") == "straight"
+    # right turn ~33 deg ahead is picked up and slows the plan target
+    turn = np.array([[0.0, 0.0], [3.0, 0.0], [6.0, 0.0],
+                     [10.0, 0.0], [14.0, 0.0], [20.0, 0.0],
+                     [30.0, -10.0], [40.0, -26.0]])
+    out2 = st.tick(route_ref=turn)
+    assert out2.intent is not None
+    assert out2.meta.get("intent") == "right"
+    assert out2.meta.get("intent_turn_deg") is not None
+    assert float(out2.meta.get("intent_speed", 12.0)) < 12.0
