@@ -253,6 +253,13 @@ GPU 显存 6GB 以上（YOLO 检测 + HUD 可视化需要）
 .venv\Scripts\python.exe scripts\m5_train_seg.py --runs logs\m5_seg\run_* `
     --epochs 60 --lr 5e-4 --out logs\m5_seg\seg_model
 
+# 推荐（v10 起）：只保留标线密集帧 + 每个 run 各取尾部做验证。
+# 全局时间尾部分割会让"拼接后最后几个稀疏 run"主导验证集、line IoU 失真；
+# 标线稀疏帧（无标线路段）混进训练只会稀释 line 监督。
+.venv\Scripts\python.exe scripts\m5_train_seg.py `
+    --runs logs\m5_seg\run_dense_* --min-line-frac 0.003 `
+    --split per-run --epochs 60 --out logs\m5_seg\seg_model
+
 # 中断后续训（每轮自动落盘 checkpoint_last.pt，不会白训）
 .venv\Scripts\python.exe scripts\m5_train_seg.py --runs logs\m5_seg\run_* `
     --epochs 60 --lr 5e-4 --out logs\m5_seg\seg_model `
@@ -261,6 +268,9 @@ GPU 显存 6GB 以上（YOLO 检测 + HUD 可视化需要）
 # 3. 离线评估（无需游戏，直接验证模型）
 .venv\Scripts\python.exe scripts\m5_eval_seg.py --runs logs\m5_seg\run_* `
     --model logs\m5_seg\seg_model\best.pt --save
+#    除总体指标外还会按 run 分组报告 line IoU / 标线像素占比，
+#    一眼看出哪类路段弱、哪个 run 是劣质稀疏数据；训练占用 GPU 时
+#    追加 --device cpu 避免互抢。
 
 # 4. 实车真值对比（CV vs 学习式，需 Tech 实例）
 .venv\Scripts\python.exe scripts\m5_lane_truth_probe.py --frames 60 --drive

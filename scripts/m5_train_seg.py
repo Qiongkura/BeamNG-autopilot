@@ -2,8 +2,15 @@
 
 数据：scripts/m5_collect_seg.py 采集的 npz 帧（colour + label）。
 划分：按帧序时间划分（前 80% 训练，后 20% 验证，与 M3 相同做法）。
+      --split per-run 时改为"每个 run 各取时间尾部 20% 做验证"——
+      避免多 run 拼接后全局尾部集中在最后几个 run（标线稀疏段），
+      让验证集被某一类路段主导、line IoU 失真。
 损失：交叉熵 + 中位频率类别加权（标线像素极少，不加权学不动）。
 指标：mIoU + 各类 IoU + 像素准确率。自动保存最优模型与训练曲线。
+
+--min-line-frac <x>：丢弃标线像素占比低于 x 的帧（x 常用 0.003）。
+标线稀疏帧大多是无标线路段，混进训练只稀释 line 监督；held-out 评估
+（run_navroute_town / run_bridge）显示密集 run 训练的模型泛化才有效。
 
 用法:
     .venv\Scripts\python.exe scripts\m5_train_seg.py --runs logs\m5_seg\run_*
@@ -32,18 +39,44 @@ from beamng_autopilot import config
 from beamng_autopilot.vision.segmentation import SegUNet, N_CLASSES, CLASS_NAMES
 
 
-def load_frames(run_dirs: list[Path]) -> list[tuple[np.ndarray, np.ndarray]]:
-    """读取所有 npz 帧，按文件名排序（时间序）。"""
-    files = []
+def load_frames(
+    run_dirs: list[Path], min_line_frac: float = 0.0,
+) -> tuple[list[tuple[np.ndarray, np.ndarray]], dict]:
+    """读取所有 npz 帧，按文件名排序（时间序）。
+
+    ``min_line_frac > 0`` 时丢弃标线像素占比低于阈值的帧。返回
+    (frames, per_run)：per_run[run_name] 记录该 run 的帧总数/保留数/
+    标线像素占比/在拼接列表中的 [start, end) 下标，供 per-run 验证划分。
+    """
+    frames: list[tuple[np.ndarray, np.ndarray]] = []
+    per_run: dict[str, dict] = {}
     for rd in run_dirs:
-        files.extend(sorted(glob.glob(str(rd / "frame_*.npz"))))
-    if not files:
-        raise SystemExit(f"没有找到数据: {run_dirs}")
-    frames = []
-    for f in files:
-        d = np.load(f)
-        frames.append((d["colour"], d["label"]))
-    return frames
+        fs = sorted(glob.glob(str(rd / "frame_*.npz")))
+        if not fs:
+            raise SystemExit(f"没有找到数据: {rd}")
+        run_name = rd.name
+        n_run = n_kept = 0
+        n_pix = 0
+        line_px = 0
+        rec = {"frames": len(fs), "kept": 0,
+               "line_px_frac": 0.0, "start": len(frames), "end": len(frames)}
+        for f in fs:
+            d = np.load(f)
+            colour, label = d["colour"], d["label"]
+            n_pix = colour.shape[0] * colour.shape[1]
+            line_px += int((label == 2).sum())
+            n_run += 1
+            if min_line_frac > 0 and (label == 2).mean() < min_line_frac:
+                continue
+            frames.append((colour, label))
+            n_kept += 1
+        rec["kept"] = n_kept
+        rec["line_px_frac"] = line_px / max(1, n_run * n_pix)
+        rec["end"] = len(frames)
+        per_run[run_name] = rec
+    if not frames:
+        raise SystemExit(f"过滤后没有数据（min_line_frac={min_line_frac}）")
+    return frames, per_run
 
 
 def median_freq_weights(labels: list[np.ndarray],
@@ -143,6 +176,13 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val-frac", type=float, default=0.2)
+    ap.add_argument("--split", choices=["tail", "per-run"], default="tail",
+                    help="验证划分：tail=全部 run 拼接后取全局尾部 "
+                         "(默认，历史行为)；per-run=每个 run 各取尾部 "
+                         "val_frac 做验证，避免稀疏 run 主导验证集")
+    ap.add_argument("--min-line-frac", type=float, default=0.0,
+                    help="丢弃标线像素占比低于该值的帧（如 0.003），"
+                         "防止无标线路段稀释 line 监督")
     ap.add_argument("--line-weight", type=float, default=2.0,
                     help="extra multiplier on the line class loss weight")
     ap.add_argument("--line-morph", action="store_true",
@@ -175,14 +215,33 @@ def main() -> None:
         torch.cuda.set_per_process_memory_fraction(
             max(0.1, min(1.0, args.vram_frac)))
 
-    frames = load_frames([Path(p) for p in args.runs])
+    frames, per_run = load_frames([Path(p) for p in args.runs],
+                                  args.min_line_frac)
     n = len(frames)
-    n_val = max(1, int(n * args.val_frac))
-    train_frames = frames[:n - n_val]   # 时间序：前段训练
-    val_frames = frames[n - n_val:]
+    if args.split == "per-run":
+        train_frames: list = []
+        val_frames: list = []
+        for rec in per_run.values():
+            k = rec["kept"]
+            if k <= 1:
+                train_frames.extend(frames[rec["start"]:rec["end"]])
+                continue
+            n_val = max(1, int(k * args.val_frac))
+            seg = frames[rec["start"]:rec["end"]]
+            train_frames.extend(seg[:k - n_val])
+            val_frames.extend(seg[k - n_val:])
+    else:
+        n_val = max(1, int(n * args.val_frac))
+        train_frames = frames[:n - n_val]   # 时间序：前段训练
+        val_frames = frames[n - n_val:]
     print(f"[train] 共 {n} 帧: 训练 {len(train_frames)} / 验证 {len(val_frames)}",
           flush=True)
     print(f"[train] 类别: {CLASS_NAMES}", flush=True)
+    for name, rec in sorted(per_run.items()):
+        drop = rec["frames"] - rec["kept"]
+        print(f"[train] run {name:<24} 帧{rec['frames']:>4} "
+              f"保留{rec['kept']:>4} 丢弃{drop:>4} "
+              f"line_px_frac={rec['line_px_frac']:.5f}", flush=True)
 
     weights = median_freq_weights(train_frames,
                                    line_weight=args.line_weight)
@@ -291,6 +350,8 @@ def main() -> None:
                     "val_frac": args.val_frac,
                     "seed": args.seed,
                     "runs": [str(p) for p in args.runs],
+                    "split": args.split,
+                    "min_line_frac": args.min_line_frac,
                     "n_train": len(train_frames),
                     "n_val": len(val_frames),
                 },
@@ -315,6 +376,8 @@ def main() -> None:
                 "val_frac": args.val_frac,
                 "seed": args.seed,
                 "runs": [str(p) for p in args.runs],
+                "split": args.split,
+                "min_line_frac": args.min_line_frac,
                 "n_train": len(train_frames),
                 "n_val": len(val_frames),
             },
