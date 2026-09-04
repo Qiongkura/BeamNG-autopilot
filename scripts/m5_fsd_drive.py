@@ -39,6 +39,9 @@ from beamng_autopilot.control.speed import (
 )
 from beamng_autopilot.fsd_stack import FSDStack
 from beamng_autopilot.lane import perception_curve_speed
+from beamng_autopilot.neural.e2e_runtime import (
+    DEFAULT_E2E_WEIGHTS, E2ERuntime,
+)
 from beamng_autopilot.occupancy import OccupancyGrid
 from beamng_autopilot.planning import (
     Scene, anchored_rule_ref, arbitrate, local_route,
@@ -445,6 +448,12 @@ def main() -> int:
                     help="FSD realism mode (docs/fsd_realism.md): with "
                          "--lane-mode sensor the map lane may NEVER lead; "
                          "no paired perception lane -> no-lane degradation")
+    ap.add_argument("--e2e-model", type=str, default=None,
+                    help="trained E2ENetTorch checkpoint to rank as the "
+                         "neural planning candidate (default: "
+                         "logs/m5_e2e/best_temporal.pt)")
+    ap.add_argument("--no-e2e", action="store_true",
+                    help="disable the E2E neural planning candidate")
     ap.add_argument("--goal", nargs=2, type=float, default=None,
                     metavar=("X", "Y"),
                     help="set an in-game navigation route to this goal "
@@ -638,6 +647,32 @@ def main() -> int:
                          # temporal occupancy filter bridges the gap.
                          semantic_every_n=2, object_every_n=2)
         stack.reset_temporal()  # stale occupancy before start must not leak
+        # Neural (E2E) planner candidate: a trained end-to-end network
+        # over the same perception (rgb + segmentation label + BEV)
+        # provides the second planning layer a real FSD stack has -
+        # ranked below the layered planner but above the map/rule
+        # fallback.  Loading failure (missing weights / bad checkpoint)
+        # disables the candidate silently; the drive never depends on it.
+        e2e_rt = None
+        if not args.no_e2e:
+            try:
+                e2e_rt = E2ERuntime(args.e2e_model or DEFAULT_E2E_WEIGHTS,
+                                    device=None)
+                if e2e_rt.loaded:
+                    _ck = e2e_rt.ckpt or {}
+                    print(f"[fsd-drive] E2E neural planner: "
+                          f"{e2e_rt.weights} "
+                          f"(img={e2e_rt.img_w}x{e2e_rt.img_h}, "
+                          f"history={e2e_rt.history}, "
+                          f"epoch={_ck.get('epoch', '?')}, "
+                          f"device={e2e_rt.device})")
+                else:
+                    e2e_rt = None
+            except Exception as _e2e_e:
+                print(f"[fsd-drive] E2E planner disabled: {_e2e_e}")
+                e2e_rt = None
+        if e2e_rt is not None:
+            e2e_rt.reset()   # no stale frames from before the run
         # Realistic gearbox locked into a forward gear (D).  A real stack
         # never leaves the car in reverse; keep the D input on every
         # control frame so an impact can never leave the gearbox in R.
@@ -954,6 +989,37 @@ def main() -> int:
                                         best)
             _tc = time.time()
 
+            # Neural (E2E) planner candidate: the trained end-to-end
+            # network consumes the same perception the layered planner
+            # saw (front RGB + segmentation label + BEV) and regresses
+            # an ego-relative trajectory, inverse-transformed to world
+            # here.  It is arbitrated BELOW the layered planner but
+            # ABOVE the map/rule fallback - a real FSD stack ranks its
+            # neural planner over the kinematic backup.  Only the
+            # trajectory steers the car; the net's raw action is
+            # telemetry-only, and the safety monitor re-verifies the
+            # path before arbitration can select it.
+            e2e_path = None
+            e2e_safe = False
+            e2e_ms = None
+            e2e_act = None
+            e2e_ext = None
+            _ve = None
+            if e2e_rt is not None:
+                try:
+                    e2e_path, e2e_act, e2e_ms = e2e_rt.step(
+                        out, pos, heading, float(v))
+                    if e2e_path is not None and len(e2e_path) >= 2:
+                        _ve = monitor.evaluate(scene, e2e_path,
+                                               planner_age_s=0.0)
+                        e2e_safe = bool(_ve.safe)
+                        e2e_ext = float(np.hypot(
+                            e2e_path[-1, 0] - pos[0],
+                            e2e_path[-1, 1] - pos[1]))
+                except Exception:
+                    e2e_path = None
+                    e2e_safe = False
+
             # planner arbitration: FSD path first; when the layered
             # planner declined (even to minimal risk) fall back to the
             # rule straight-ahead reference IN WORLD COORDINATES - the
@@ -1003,6 +1069,8 @@ def main() -> int:
             chosen = arbitrate(
                 best, rule_ref,
                 fsd_safe=verd.safe and best is not None and len(best) >= 2,
+                e2e_path=e2e_path,
+                e2e_safe=e2e_safe,
                 prefer_rule=False)
             # Re-verify the verdict against the path the car actually
             # runs: the FSD verdict above was computed on the FSD best
@@ -1014,8 +1082,13 @@ def main() -> int:
             if chosen.path is not None and len(chosen.path) >= 2 and \
                     (best is None or len(best) < 2 or not verd.safe):
                 try:
-                    verd = monitor.evaluate(scene, chosen.path,
-                                            planner_age_s=0.0)
+                    if chosen.source == "e2e" and _ve is not None:
+                        # already verified this tick against the same
+                        # scene; reuse to avoid a second evaluation
+                        verd = _ve
+                    else:
+                        verd = monitor.evaluate(scene, chosen.path,
+                                                planner_age_s=0.0)
                 except Exception:
                     pass
             # End-zone steering reference: inside the final stop zone the
@@ -1406,8 +1479,11 @@ def main() -> int:
             # band) must govern the actual pedals.
             plan_speed = out.best_speed if out.best_speed > 0.0 \
                 else float(args.speed)
-            if _strict_no_lane:
-                # no perception lane -> minimal-risk stop (never map-drive)
+            if _strict_no_lane and chosen.source != "e2e":
+                # no perception lane -> minimal-risk stop (never map-drive).
+                # The E2E neural path is perception-driven (not the map
+                # fallback), so when the monitor green-lit it the car may
+                # keep rolling on the learned trajectory.
                 plan_speed = 0.0
                 plan_sm = 0.0
             # a rule fallback does not get the FSD plan speed; cap it to a
@@ -1805,6 +1881,14 @@ def main() -> int:
                 "level": str(verd.level),
                 "reason": verd.reason or "-",
                 "source": str(chosen.source),
+                "e2e": int(e2e_path is not None and len(e2e_path) >= 2),
+                "e2e_safe": int(bool(e2e_safe)),
+                "e2e_ms": (round(float(e2e_ms), 1)
+                           if e2e_ms is not None else None),
+                "e2e_extent": (round(float(e2e_ext), 2)
+                               if e2e_ext is not None else None),
+                "e2e_act": ([round(float(a), 3) for a in e2e_act]
+                            if e2e_act is not None else None),
                 "plan_speed": round(float(plan_speed), 2),
                 "plan_raw": round(float(plan_raw_speed), 2),
                 "target_sm": round(float(target_sm), 2),
@@ -1879,11 +1963,13 @@ def main() -> int:
                 time.sleep(_slack)
             frames += 1
             if frames % 4 == 1:
+                _e2e_s = (f"e2e={e2e_ms:.0f}ms "
+                          if e2e_ms is not None else "")
                 print(f"[fsd-drive] t={time.time()-t0:5.1f} v={v:4.1f} "
                       f"level={verd.level} src={chosen.source:4s} "
                       f"reason={verd.reason or '-':22s} "
                       f"steer={steer:+.2f} thr={thr:.2f} "
-                      f"plan_v={plan_speed:.1f} "
+                      f"plan_v={plan_speed:.1f} {_e2e_s}"
                       f"rev={int(reversing)} signed={signed:+.2f} "
                       f"lane={out.meta.get('lane_src', '?')}/"
                       f"{'P' if out.meta.get('lane_paired') else '1'} "

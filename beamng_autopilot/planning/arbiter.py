@@ -7,13 +7,17 @@ backup or a minimal-risk manoeuvre.  This module puts that *arbitration*
 into the planning package as pure, testable logic:
 
 * ``ArbiterOutcome``: the final path + source + why.
-* ``arbitrate``: given the FSD stack's chosen trajectory and a rule
-  reference path, pick which to actually steer by:
+* ``arbitrate``: given the layered FSD stack's chosen trajectory, a
+  trained E2E neural trajectory and a rule reference path, pick which to
+  actually steer by:
 
-    1. FSD path when it is feasible (not empty) and the safety monitor
-       marks it safe/degraded-but-drivable.
-    2. Otherwise the rule reference (the proven route planner output).
-    3. Else None -> the caller executes a minimal-risk stop.
+    1. the layered FSD path when it is feasible (not empty) and the
+       safety monitor marks it safe/degraded-but-drivable;
+    2. otherwise the E2E neural path when it is feasible AND safe (the
+       trained end-to-end planner ranks above the kinematic backup,
+       exactly like FSD's own neural-vs-rule ordering);
+    3. otherwise the rule reference (the proven route planner output);
+    4. else None -> the caller executes a minimal-risk stop.
 
 The source labels feed telemetry so you can see whether the car was on
 the FSD trajectory or on the rule fallback at any moment - the same
@@ -31,34 +35,46 @@ import numpy as np
 @dataclass
 class ArbiterOutcome:
     path: np.ndarray | None
-    source: str          # "fsd" | "rule" | "none"
+    source: str          # "fsd" | "e2e" | "rule" | "none"
     why: str = ""
 
 
 def arbitrate(fsd_path, rule_path, fsd_safe: bool = True,
+              e2e_path=None, e2e_safe: bool = False,
               prefer_rule: bool = False) -> ArbiterOutcome:
     """Choose the path to steer.
 
     ``fsd_path`` is the layered planner's chosen trajectory (None when
-    it produced nothing feasible).  ``rule_path`` is the rule autopilot's
-    reference (route/drive path).  ``fsd_safe`` is the safety monitor's
-    green light for the FSD path.  ``prefer_rule`` forces the rule path
-    (used by "rule mode" / shadow tests).
+    it produced nothing feasible).  ``e2e_path`` is the trained neural
+    planner's trajectory (None when the network is not loaded or its
+    frame was unusable); ``e2e_safe`` is the safety monitor's green
+    light for it.  ``rule_path`` is the rule autopilot's reference
+    (route/drive path).  ``fsd_safe`` is the safety monitor's green
+    light for the layered FSD path.  ``prefer_rule`` forces the rule
+    path (used by "rule mode" / shadow tests).
     """
     if prefer_rule:
         if rule_path is not None and len(rule_path) >= 2:
             return ArbiterOutcome(rule_path, "rule", "forced")
         return ArbiterOutcome(None, "none", "forced rule empty")
 
-    # FSD path wins when feasible and green-lit.
+    # Layered FSD path wins when feasible and green-lit.
     if fsd_path is not None and len(fsd_path) >= 2 and fsd_safe:
         return ArbiterOutcome(fsd_path, "fsd", "fsd feasible+safe")
 
+    # Neural (E2E) planner next: a trained end-to-end trajectory is a
+    # perception-driven candidate ranked above the map/rule backup - the
+    # same neural-above-kinematic ordering FSD exposes in its telemetry.
+    if e2e_path is not None and len(e2e_path) >= 2 and e2e_safe:
+        return ArbiterOutcome(np.asarray(e2e_path, dtype=float), "e2e",
+                              "fsd unavailable; e2e feasible+safe")
+
     # Rule fallback so the car does not stop dead when FSD declined.
     if rule_path is not None and len(rule_path) >= 2:
-        return ArbiterOutcome(rule_path, "rule", "fsd unavailable")
+        return ArbiterOutcome(rule_path, "rule",
+                              "fsd unavailable; e2e declined")
 
-    return ArbiterOutcome(None, "none", "no fsd and no rule path")
+    return ArbiterOutcome(None, "none", "no fsd/e2e/rule path")
 
 
 def _ref_blocked_fraction(ref, pos, heading, grid,

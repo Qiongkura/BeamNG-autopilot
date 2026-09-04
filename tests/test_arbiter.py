@@ -35,6 +35,42 @@ def test_rule_kept_when_fsd_unsafe() -> None:
     assert "fsd unavailable" in out.why
 
 
+def test_e2e_wins_when_fsd_unavailable() -> None:
+    e2e = _path()
+    rule = np.array([[0.0, 0.0], [0.0, 1.0], [0.0, 2.0]])
+    out = arbitrate(None, rule, fsd_safe=False,
+                    e2e_path=e2e, e2e_safe=True)
+    assert out.source == "e2e"
+    assert out.path is not None
+    assert np.allclose(out.path, e2e)
+
+
+def test_fsd_still_wins_over_e2e() -> None:
+    fsd = _path()
+    e2e = np.array([[0.0, 0.0], [3.0, 0.0], [6.0, 0.0]])
+    out = arbitrate(fsd, None, fsd_safe=True,
+                    e2e_path=e2e, e2e_safe=True)
+    assert out.source == "fsd"
+
+
+def test_rule_fallback_when_e2e_unsafe() -> None:
+    e2e = _path()
+    rule = np.array([[0.0, 0.0], [0.0, 1.0]])
+    out = arbitrate(None, rule, fsd_safe=False,
+                    e2e_path=e2e, e2e_safe=False)
+    assert out.source == "rule"
+
+
+def test_e2e_ignored_when_unsafe_or_empty() -> None:
+    e2e = _path()
+    out = arbitrate(None, None, fsd_safe=False,
+                    e2e_path=e2e, e2e_safe=False)
+    assert out.source == "none"
+    out = arbitrate(None, None, fsd_safe=False,
+                    e2e_path=None, e2e_safe=True)
+    assert out.source == "none"
+
+
 def test_prefer_rule_forces_rule() -> None:
     fsd = _path()
     rule = np.array([[3.0, 3.0], [4.0, 4.0]])
