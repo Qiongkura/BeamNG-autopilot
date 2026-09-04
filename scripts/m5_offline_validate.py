@@ -2037,8 +2037,11 @@ def test_lane_boundary_guards() -> None:
         y = float(np.median(wide.center[:, 1]))
         check("lane-guard: 5 m pair centre on the middle",
               abs(y) < 0.05, f"y={y:.2f}")
+        # The paired width is the physical distance between the MATCHED
+        # boundary points (world road-station pairing for curves), so
+        # discrete arc sampling leaves a small epsilon vs the exact 5 m.
         check("lane-guard: 5 m pair keeps its width",
-              abs(wide.width - 5.0) < 1e-9, f"w={wide.width:.2f}")
+              abs(wide.width - 5.0) < 0.2, f"w={wide.width:.2f}")
 
     near_left = LaneMarking(
         world=np.column_stack([wide_xs, np.full_like(wide_xs, 1.75)]),

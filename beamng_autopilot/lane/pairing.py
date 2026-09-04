@@ -146,6 +146,7 @@ class _LineCandidate:
     color: str
     med_lat: float
     score: float
+    world: np.ndarray | None = None   # (M, 2) original world polyline
 
 
 def _collect_candidates(markings, pos: np.ndarray, fwd: np.ndarray,
@@ -162,7 +163,13 @@ def _collect_candidates(markings, pos: np.ndarray, fwd: np.ndarray,
         world = np.asarray(mk.world, dtype=float)
         if world.ndim != 2 or world.shape[1] < 2 or len(world) < 2:
             continue
-        axis, _ = _marking_axis(world)
+        # The LOCAL direction beside the car is the honest alignment on
+        # a bend: the far arc of a tight curve swings around the car
+        # frame, so the whole-line chord deviates from the travel
+        # direction and would drop a real boundary below the gate.
+        near_w = world[((world[:, :2] - pos) @ fwd)
+                       <= LANE_SINGLE_NEAR_REQUIRE_M]
+        axis, _ = _marking_axis(near_w if len(near_w) >= 2 else world)
         if float(axis @ fwd) < 0:
             axis = -axis
         if abs(float(axis @ fwd)) < MARKING_ALIGNMENT_MIN:
@@ -174,12 +181,20 @@ def _collect_candidates(markings, pos: np.ndarray, fwd: np.ndarray,
         if span < _boundary_min_span(mk, min_span):
             continue
         med_lat = float(np.median(proj[:, 1]))
-        if abs(med_lat) > LANE_EDGE_MAX_M:
+        # On a bend the WHOLE-line median swings metres outward as the
+        # far arc curves around the car frame (a r<=13 centre line reads
+        # lat ~5-7 even though it is only ~2 m beside the car).  The
+        # near-field stations are the honest side read for the edge
+        # gate; the far swing must not drop the boundary entirely.
+        near_pts = proj[proj[:, 0] <= LANE_SINGLE_NEAR_REQUIRE_M]
+        side_lat = (float(np.median(near_pts[:, 1]))
+                    if len(near_pts) >= 2 else med_lat)
+        if abs(side_lat) > LANE_EDGE_MAX_M:
             continue
         cands.append(_LineCandidate(
             proj=proj, span=span, conf=float(mk.confidence),
             kind=mk.kind, color=mk.color, med_lat=med_lat,
-            score=_marking_score(mk, span)))
+            score=_marking_score(mk, span), world=world[:, :2]))
     return cands
 
 
@@ -222,6 +237,115 @@ def _axis_candidates(cands: list[_LineCandidate], station_step: float,
                 med_lat=float(np.median(lat[valid])),
                 score=0.5 * min(ci.score, cj.score)))
     return axes
+
+
+def _pair_world_geometry(l: _LineCandidate, r: _LineCandidate,
+                         pos: np.ndarray, fwd: np.ndarray,
+                         station_step: float,
+                         max_stations: int):
+    """Match two painted boundaries by ROAD STATION in world space.
+
+    On a bend the car-frame forward axis is not the road axis: the two
+    lines sampled at the same car-frame ``s`` sit at DIFFERENT road
+    stations (the inner arc is shorter than the outer one), so
+    averaging their lateral offsets builds a centre that drifts out of
+    the lane.  Instead the longer boundary is used as the reference
+    road arc and every reference station is paired with the NEAREST
+    point on the other boundary (for a concentric painted pair that is
+    the same road station across the lane); the lane centre is the
+    midpoint of the two matched points and therefore keeps following
+    the bend.
+
+    Returns ``(s, center, left, right, valid)``:
+      s      - car-frame along-track of each centre point (ascending)
+      center - (N, 2) world lane-centre points
+      left   - (N, 2) world left-boundary points at the same stations
+      right  - (N, 2) world right-boundary points at the same stations
+      valid  - bool mask: stations where BOTH lines genuinely cover the
+               road (a reference station beyond the other line's ends is
+               clamped to its endpoint and would pull the midpoint off
+               the road)
+
+    Returns ``None`` when a candidate has no world polyline (a merged
+    axis built from the two edges of one straddled line); callers fall
+    back to the car-frame reconstruction for those.
+    """
+    lw = np.asarray(l.world, dtype=float)[:, :2]
+    rw = np.asarray(r.world, dtype=float)[:, :2]
+    if len(lw) < 2 or len(rw) < 2:
+        return None
+    if len(lw) >= len(rw):
+        ref, other, ref_is_left = lw, rw, True
+    else:
+        ref, other, ref_is_left = rw, lw, False
+    seg = np.linalg.norm(np.diff(ref, axis=0), axis=1)
+    total = float(np.sum(seg))
+    if total <= 0.0:
+        return None
+    n = max(3, min(max_stations, int(round(total / station_step)) + 1))
+    ticks = np.linspace(0.0, total, n)
+    arc = np.concatenate([[0.0], np.cumsum(seg)])
+    idx = np.searchsorted(arc, ticks)
+    idx = np.clip(idx, 1, len(ref) - 1)
+    w = (ticks - arc[idx - 1]) / np.maximum(
+        arc[idx] - arc[idx - 1], 1e-12)
+    ref_pts = ref[idx - 1] + w[:, None] * (ref[idx] - ref[idx - 1])
+    oseg = np.linalg.norm(np.diff(other, axis=0), axis=1)
+    oarc = np.concatenate([[0.0], np.cumsum(oseg)])
+    olen2 = np.maximum(oseg * oseg, 1e-12)
+    rel = ref_pts[:, None, :] - other[None, :-1, :]
+    t = np.einsum("nki,k->nk", rel, oseg) / olen2[None, :]
+    t = np.clip(t, 0.0, 1.0)
+    dseg = other[1:] - other[:-1]
+    proj = other[None, :-1, :] + t[..., None] * dseg[None, :, :]
+    d2 = np.sum((proj - ref_pts[:, None, :]) ** 2, axis=2)
+    bi = np.argmin(d2, axis=1)
+    rows = np.arange(n)
+    other_pts = proj[rows, bi]
+    other_pos = oarc[bi] + t[rows, bi] * oseg[bi]
+    # Only stations whose nearest point really sits ON the other line
+    # (inside its arc span) are a true two-sided read.
+    keep = (other_pos >= 0.5) & (other_pos <= float(oarc[-1]) - 0.5)
+    if ref_is_left:
+        left_w, right_w = ref_pts, other_pts
+    else:
+        left_w, right_w = other_pts, ref_pts
+    center_w = 0.5 * (left_w + right_w)
+    left_ax = np.array([-fwd[1], fwd[0]])
+    s = (center_w - pos) @ fwd
+    order = np.argsort(s)
+    return (s[order], center_w[order], left_w[order], right_w[order],
+            keep[order])
+
+
+def _pair_carframe_geometry(l: _LineCandidate, r: _LineCandidate,
+                            pos: np.ndarray, fwd: np.ndarray,
+                            station_step: float,
+                            max_stations: int):
+    """Car-frame interpolation fallback (candidates without a world
+    polyline, e.g. an ``axis`` merged from the two edges of one line).
+
+    This is the original straight-road behaviour: both boundaries are
+    sampled at common car-frame stations and the centre is their
+    midpoint, reconstructed into world points along the ego frame.  On a
+    bend this approximation drifts, which is exactly why the world-space
+    matcher above is preferred whenever both boundaries carry real world
+    polylines.
+    """
+    s_lo = max(0.0, float(l.proj[0, 0]), float(r.proj[0, 0]))
+    s_hi = min(float(l.proj[-1, 0]), float(r.proj[-1, 0]))
+    if s_hi - s_lo < LANE_PAIR_OVERLAP_M:
+        return None
+    stations = _overlap_stations(s_lo, s_hi, station_step, max_stations)
+    left_lat = _interp_lat(l.proj, stations)
+    right_lat = _interp_lat(r.proj, stations)
+    valid = ~(np.isnan(left_lat) | np.isnan(right_lat))
+    if int(np.sum(valid)) < 3:
+        return None
+    center_lat = 0.5 * (left_lat + right_lat)
+    center, left, right = _frame_from_stations(
+        pos, fwd, stations, center_lat, left_lat, right_lat)
+    return stations, center, left, right, valid
 
 
 def _yellow_right_ok(c: _LineCandidate) -> bool:
@@ -274,8 +398,22 @@ def _near_stats(c: _LineCandidate) -> tuple[int, float | None]:
     return int(len(near)), float(np.median(near[:, 1]))
 
 
+def _cand_near_lat(c: _LineCandidate) -> float:
+    """Lateral read of a marking from the stations NEXT TO THE CAR.
+
+    On a bend the whole-line median swings metres outward as the far
+    arc curves around the car frame, so it over-reports how far the
+    line really is from the ego.  The near-field stations sit beside
+    the car and are the honest side read; far-only reads (no valid
+    near points) fall back to the whole-line median.
+    """
+    near = _near_stats(c)[1]
+    return c.med_lat if near is None else near
+
+
 def _best_vision_pair(cands: list[_LineCandidate],
                       axes: list[_LineCandidate],
+                      pos: np.ndarray, fwd: np.ndarray,
                       station_step: float, max_stations: int):
     """Choose the most plausible single-lane boundary pair.
 
@@ -285,6 +423,20 @@ def _best_vision_pair(cands: list[_LineCandidate],
     beating the real edge of the current lane.  One exception is a far
     dashed/thin centre line paired with a real right line: when the two
     form a wide lane the midpoint is still the best read (run 84).
+
+    The width / centre used for the checks and the score are read NEXT
+    TO THE CAR (stations up to ``LANE_SINGLE_NEAR_REQUIRE_M``): on a bend
+    the far end of a curved marking swings around in the car frame, so a
+    whole-overlap median sits metres on the wrong side and drops a
+    correct tight-curve pair (r<=20 runs 2026-09-04 - the paired centre
+    was rejected and the mirror fallback drove over the centre line).
+    Pairs with no near points (far two-sided reads, e.g. run 84) fall
+    back to the whole-overlap median.
+
+    The winning pair carries its geometry too (last tuple element): when
+    BOTH boundaries have real world polylines the centre is matched by
+    road station in world space (``_pair_world_geometry``) so it follows
+    the bend, otherwise the car-frame straight reconstruction is used.
     """
     left_pool = [c for c in cands if _cand_side(c) > 0.08]
     left_pool += [a for a in axes if _cand_side(a) >= 0.0]
@@ -347,9 +499,15 @@ def _best_vision_pair(cands: list[_LineCandidate],
             valid = ~(np.isnan(left_lat) | np.isnan(right_lat))
             if int(np.sum(valid)) < 3:
                 continue
-            width = float(np.median(left_lat[valid] - right_lat[valid]))
-            center = float(np.median(
-                0.5 * (left_lat[valid] + right_lat[valid])))
+            width_vals = left_lat[valid] - right_lat[valid]
+            center_vals = 0.5 * (left_lat[valid] + right_lat[valid])
+            near_mask = (stations[valid] <= LANE_SINGLE_NEAR_REQUIRE_M)
+            if bool(np.any(near_mask)):
+                width = float(np.median(width_vals[near_mask]))
+                center = float(np.median(center_vals[near_mask]))
+            else:
+                width = float(np.median(width_vals))
+                center = float(np.median(center_vals))
             if abs(center) > LANE_PAIR_CENTER_PREFER_M \
                     and width > LANE_OFF_CENTER_WIDTH_MAX_M:
                 continue
@@ -371,8 +529,8 @@ def _best_vision_pair(cands: list[_LineCandidate],
             avg_conf = 0.5 * (l.conf + r.conf)
             center_ok = math.exp(
                 -0.5 * (center / LANE_PAIR_CENTER_PREFER_M) ** 2)
-            near_ok = 1.0 / (1.0 + 0.35 * max(abs(l.med_lat),
-                                              abs(r.med_lat)))
+            near_ok = 1.0 / (1.0 + 0.35 * max(abs(_cand_near_lat(l)),
+                                              abs(_cand_near_lat(r))))
             near_ok *= 0.55 if min(ln, rn) < 2 else 1.0
             if ln < 2 and rn < 2:
                 near_ok *= 0.75
@@ -381,8 +539,27 @@ def _best_vision_pair(cands: list[_LineCandidate],
             score = avg_conf * span_ok * center_ok * near_ok * width_ok
             if score > best_score:
                 best_score = score
+                geom = None
+                if (l.world is not None and r.world is not None
+                        and len(l.world) >= 2 and len(r.world) >= 2):
+                    geom = _pair_world_geometry(
+                        l, r, pos, fwd, station_step, max_stations)
+                    if geom is not None:
+                        _, cw, lw, rw, vg = geom
+                        if int(np.sum(vg)) < 3:
+                            # Too little overlapping arc (e.g. run 84's
+                            # short far centre line): keep the car-frame
+                            # reconstruction that the old code produced.
+                            geom = None
+                        else:
+                            # The frame width is the physical distance
+                            # between the matched boundaries (3.5 m for a
+                            # painted pair); the car-frame lateral read
+                            # widens on a bend and must not leak out.
+                            dw = np.linalg.norm(lw - rw, axis=1)
+                            width = float(np.median(dw[vg]))
                 best = (l, r, stations, valid, width, center, span,
-                        avg_conf, score)
+                        avg_conf, score, geom)
     return best
 
 
@@ -411,10 +588,12 @@ def _best_single_boundary(cands: list[_LineCandidate],
         # A mirror fallback assumes the line is the near edge of the lane.
         # A line whose median sits on top of the car (or on the far side
         # of it) is not the current lane edge, so it can never seed a
-        # mirror centre.
-        if abs(c.med_lat) < LANE_SINGLE_MED_MIN_M:
+        # mirror centre.  The near-field read keeps a curved line whose
+        # far arc swings out of the car frame from being rejected.
+        near_lat = _cand_near_lat(c)
+        if abs(near_lat) < LANE_SINGLE_MED_MIN_M:
             continue
-        if abs(c.med_lat) > LANE_SINGLE_NEAR_MAX_M:
+        if abs(near_lat) > LANE_SINGLE_NEAR_MAX_M:
             continue
         proj = c.proj
         near = proj[proj[:, 0] <= LANE_SINGLE_NEAR_REQUIRE_M]
@@ -441,7 +620,7 @@ def _best_single_boundary(cands: list[_LineCandidate],
         if side < 0 and not _yellow_right_ok(c):
             continue
         if len(near) >= 2:
-            near_factor = 1.0 / (1.0 + 0.6 * abs(c.med_lat))
+            near_factor = 1.0 / (1.0 + 0.6 * abs(near_lat))
         else:
             start_penalty = 1.0 / (1.0 + 0.12 * c.proj[0, 0])
             near_factor = 0.35 * start_penalty
@@ -578,6 +757,13 @@ def pair_lane_markings(
     chosen, resampled onto common longitudinal stations, and the centre
     is the midpoint of the two boundaries.  When only one side is
     visible the other side is mirrored at ``lane_width``.
+
+    When both paired boundaries carry real world polylines the centre is
+    matched by ROAD STATION in world space instead of by car-frame ``s``:
+    on a bend the same car-frame forward distance sits at different road
+    stations on the inner and outer arcs, so averaging car-frame lateral
+    offsets builds a centre that drifts across the road.  Road-station
+    matching keeps the centre on the bend (the ego lane centre).
     """
     if not markings:
         return None
@@ -607,9 +793,10 @@ def pair_lane_markings(
 
         debug["cands"] = [_cand_summary(c) for c in cands]
         debug["axes"] = [_cand_summary(a) for a in axes]
-    pair = _best_vision_pair(cands, axes, station_step, max_stations)
+    pair = _best_vision_pair(cands, axes, pos, fwd,
+                             station_step, max_stations)
     if pair is not None:
-        l, r, stations, valid, width, center, span, avg_conf, _ = pair
+        l, r, stations, valid, width, center, span, avg_conf, _, geom = pair
         left_lat = _interp_lat(l.proj, stations)
         right_lat = _interp_lat(r.proj, stations)
         center_lat = 0.5 * (left_lat + right_lat)
@@ -625,7 +812,7 @@ def pair_lane_markings(
                 or width > LANE_VISION_PAIR_WIDTH_MAX_M):
             pair = None
     if pair is not None:
-        l, r, stations, valid, width, center, span, avg_conf, _ = pair
+        l, r, stations, valid, width, center, span, avg_conf, _, geom = pair
         left_lat = _interp_lat(l.proj, stations)
         right_lat = _interp_lat(r.proj, stations)
         center_lat = 0.5 * (left_lat + right_lat)
@@ -636,13 +823,26 @@ def pair_lane_markings(
         right_near_n = int(np.sum(r.proj[:, 0] <= LANE_SINGLE_NEAR_REQUIRE_M))
         if left_near_n < 2 and right_near_n < 2:
             conf = min(conf, LANE_FAR_CENTER_PAIR_CONF_MAX)
-        center_pts, left_pts, right_pts = _frame_from_stations(
-            pos, fwd, stations, center_lat, left_lat, right_lat)
+        if geom is not None:
+            s_g, center_w, left_w, right_w, valid_g = geom
+            keep = (valid_g & (s_g >= 0.0)
+                    & np.isfinite(center_w).all(axis=1))
+            center_pts = center_w[keep]
+            left_pts = left_w[keep]
+            right_pts = right_w[keep]
+        else:
+            center_pts, left_pts, right_pts = _frame_from_stations(
+                pos, fwd, stations, center_lat, left_lat, right_lat)
         if debug is not None:
             debug["mode"] = "pair"
             if left_near_n < 2 and right_near_n < 2:
                 debug["far_center_pair"] = True
-            debug["center0"] = round(float(center_lat[0]), 2)
+            if geom is not None and len(center_pts):
+                left_ax = np.array([-fwd[1], fwd[0]])
+                debug["center0"] = round(float(
+                    (center_pts[0] - pos) @ left_ax), 2)
+            else:
+                debug["center0"] = round(float(center_lat[0]), 2)
             debug["width"] = round(float(width), 2)
             debug["conf"] = round(float(conf), 2)
             debug["span"] = round(float(span), 1)
