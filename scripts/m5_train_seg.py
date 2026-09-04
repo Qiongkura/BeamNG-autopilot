@@ -1,4 +1,4 @@
-"""M5 路面/标线分割训练：轻量 UNet（beamng_autopilot.vision.segmentation）。
+r"""M5 路面/标线分割训练：轻量 UNet（beamng_autopilot.vision.segmentation）。
 
 数据：scripts/m5_collect_seg.py 采集的 npz 帧（colour + label）。
 划分：按帧序时间划分（前 80% 训练，后 20% 验证，与 M3 相同做法）。
@@ -91,6 +91,35 @@ def median_freq_weights(labels: list[np.ndarray],
     w = np.clip(w, 0.1, 20.0)
     w[2] *= line_weight  # line 类再放大：细线目标需要更强的监督
     return torch.tensor(w, dtype=torch.float32)
+
+
+def split_frames(
+    frames: list[tuple[np.ndarray, np.ndarray]], per_run: dict,
+    split: str, val_frac: float,
+) -> tuple[list[tuple[np.ndarray, np.ndarray]],
+           list[tuple[np.ndarray, np.ndarray]]]:
+    """把帧列表划分成训练/验证。
+
+    ``tail``：全部 run 拼接后取全局尾部（历史行为）。
+    ``per-run``：每个 run 各取时间尾部 val_frac 做验证——避免拼接后
+    全局尾部集中在最后几个 run（往往是标线稀疏段），让验证集被某一类
+    路段主导、line IoU 失真。
+    """
+    if split == "per-run":
+        train_frames: list = []
+        val_frames: list = []
+        for rec in per_run.values():
+            k = rec["kept"]
+            seg = frames[rec["start"]:rec["end"]]
+            if k <= 1:
+                train_frames.extend(seg)
+                continue
+            n_val = max(1, int(k * val_frac))
+            train_frames.extend(seg[:k - n_val])
+            val_frames.extend(seg[k - n_val:])
+        return train_frames, val_frames
+    n_val = max(1, int(len(frames) * val_frac))
+    return frames[:len(frames) - n_val], frames[len(frames) - n_val:]
 
 
 def _augment(frame, rng: np.random.Generator,
@@ -218,22 +247,8 @@ def main() -> None:
     frames, per_run = load_frames([Path(p) for p in args.runs],
                                   args.min_line_frac)
     n = len(frames)
-    if args.split == "per-run":
-        train_frames: list = []
-        val_frames: list = []
-        for rec in per_run.values():
-            k = rec["kept"]
-            if k <= 1:
-                train_frames.extend(frames[rec["start"]:rec["end"]])
-                continue
-            n_val = max(1, int(k * args.val_frac))
-            seg = frames[rec["start"]:rec["end"]]
-            train_frames.extend(seg[:k - n_val])
-            val_frames.extend(seg[k - n_val:])
-    else:
-        n_val = max(1, int(n * args.val_frac))
-        train_frames = frames[:n - n_val]   # 时间序：前段训练
-        val_frames = frames[n - n_val:]
+    train_frames, val_frames = split_frames(
+        frames, per_run, args.split, args.val_frac)
     print(f"[train] 共 {n} 帧: 训练 {len(train_frames)} / 验证 {len(val_frames)}",
           flush=True)
     print(f"[train] 类别: {CLASS_NAMES}", flush=True)
