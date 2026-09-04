@@ -33,6 +33,10 @@ class Scene:
     lane_width: float = 0.0
     road_rule: object = None
     target_speed: float = 12.0
+    # RoutingIntent of the nav route ahead (straight / left / right /
+    # u-turn) - the "why we are going this way" the FSD Routing layer
+    # hands to the planner and the HUD.
+    intent: object = None
     # obstacle boxes for legacy checks (the grid is the canonical source,
     # but existing code reads boxes; carry both).
     obstacles: list = field(default_factory=list)

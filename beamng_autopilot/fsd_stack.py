@@ -33,6 +33,11 @@ from beamng_autopilot.occupancy import (
     fuse_obstacles_to_grid,
     project_road_mask_to_grid,
 )
+from beamng_autopilot.bev_fusion import (
+    BEVFeatureMap,
+    CameraFeature,
+    project_mask_to_ego,
+)
 from beamng_autopilot.planning import (
     Constraints,
     Scene,
@@ -40,6 +45,8 @@ from beamng_autopilot.planning import (
     sample_lane_shift,
     select_trajectory,
 )
+from beamng_autopilot.planning.intent import infer_route_intent
+from beamng_autopilot.temporal import WorldObjectTracker
 from beamng_autopilot.planner import CAR_HALF_WIDTH, forward_clearance_m, path_forward_clearance_m
 from beamng_autopilot.lane import (
     LANE_WIDTH_DEFAULT_M,
@@ -158,6 +165,10 @@ class FSDTick:
         self.ray_hits: list = []
         self.forward_clearance: float = float("inf")
         self.path_forward_clearance: float = float("inf")
+        self.feature_map = None                # fused multi-camera BEV
+                                               # feature map (vector space)
+        self.intent = None                     # RoutingIntent of the nav route
+        self.tracks: list = []                 # active world-object tracks
 
 
 class FSDStack:
@@ -263,6 +274,13 @@ class FSDStack:
             from beamng_autopilot.temporal import TemporalOccupancyFilter
             self.occ_filter = TemporalOccupancyFilter(
                 n=int(grid_n), res=float(grid_res), tau_s=float(tau_s))
+            self.tracker = WorldObjectTracker()
+        else:
+            self.tracker = None
+        # Multi-camera BEV feature map (vector-space channel stack); built
+        # lazily on the first tick so __new__-built test stubs stay valid.
+        self.fmap: BEVFeatureMap | None = None
+        self._trk_t0: float | None = None
 
     # ------------------------------------------------------------------
     def tick(self, st=None, route_ref: np.ndarray | None = None,
@@ -433,6 +451,56 @@ class FSDStack:
                     out.meta["n_object_obstacles"] = len(_obs)
                 except Exception as exc:
                     out.errors["object"] = str(exc)
+            # Multi-camera BEV feature map (the FSD vector-space channel
+            # stack).  The semantic road / lane masks are back-projected
+            # into ego space and accumulated per channel together with the
+            # LiDAR + YOLO obstacle points, so the stack keeps a persistent
+            # fused feature map (later the learning input) instead of only
+            # the transient occupancy grid.
+            try:
+                fmap = getattr(self, "fmap", None)
+                if fmap is None:
+                    fmap = BEVFeatureMap(
+                        n=int(getattr(self, "grid_n", 60)),
+                        res=float(getattr(self, "grid_res", 0.5)))
+                    self.fmap = fmap
+                _gnd = float(pos[2]) if len(pos) > 2 else 0.0
+                _role0 = "front_main" if "front_main" in snap \
+                    else (next(iter(snap)) if snap else None)
+                if semantic is not None and _role0 is not None:
+                    if "road" in semantic.masks:
+                        _pts = project_mask_to_ego(
+                            semantic.masks["road"], snap[_role0][1], pos,
+                            heading, ground_z=_gnd, channel="drivable",
+                            step=8, max_ahead_m=40.0)
+                        for _p in _pts:
+                            fmap.accumulate(CameraFeature(
+                                _role0, "drivable", _p, confidence=0.7))
+                    if "line" in semantic.masks:
+                        _pts = project_mask_to_ego(
+                            semantic.masks["line"], snap[_role0][1], pos,
+                            heading, ground_z=_gnd, channel="lane",
+                            step=8, max_ahead_m=40.0)
+                        for _p in _pts:
+                            fmap.accumulate(CameraFeature(
+                                _role0, "lane", _p, confidence=0.75))
+                _obs_pts: list[tuple[float, float, float]] = []
+                _rng = locals().get("rng", None)
+                _obs_pts.extend(
+                    (float(_o.x), float(_o.y), 0.0)
+                    for _o in (getattr(_rng, "obstacles", None) or []))
+                if obj is not None:
+                    _obs_pts.extend(
+                        (float(_o.x), float(_o.y), 0.0)
+                        for _o in (getattr(obj, "obstacles", None) or []))
+                if _obs_pts:
+                    fmap.accumulate(CameraFeature(
+                        "sensor_fusion", "obstacle",
+                        np.asarray(_obs_pts, dtype=float).reshape(-1, 3),
+                        confidence=0.85))
+                out.feature_map = fmap
+            except Exception as exc:
+                out.errors["bev_fusion"] = str(exc)
         _times['range'] = round((time.time() - _tw) * 1000.0, 1)
         _tw = time.time()
         if _budget_skips:
@@ -460,6 +528,45 @@ class FSDStack:
             if isinstance(grid, _OG):
                 grid.obstacle[:] = (out.bev >= 0.6).astype(np.uint8)
                 grid.occupancy[:] = np.asarray(out.bev, dtype=np.float32)
+
+        # World-object tracking: match LiDAR + YOLO detections frame to
+        # frame into persistent velocity tracks (the FSD object-tracking
+        # layer).  The tracks fill the gap between throttled raw sweeps -
+        # their extrapolated positions keep occupying cells so a vehicle
+        # does not vanish from vector space between updates.
+        tracker = getattr(self, "tracker", None)
+        if tracker is not None:
+            try:
+                _now = time.time()
+                _t0 = getattr(self, "_trk_t0", None)
+                _dt = (_now - _t0) if _t0 is not None else None
+                self._trk_t0 = _now
+                _dets: list[tuple[float, float, str]] = []
+                _rng = locals().get("rng", None)
+                for _o in (getattr(_rng, "obstacles", None) or []):
+                    _dets.append((float(_o.x), float(_o.y),
+                                  str(getattr(_o, "category", "object")
+                                      or "object")))
+                _obj = out.head_outputs.get("object")
+                for _o in (getattr(_obj, "obstacles", None) or []):
+                    _dets.append((float(_o.x), float(_o.y),
+                                  str(getattr(_o, "category", "object")
+                                      or "object")))
+                _active = tracker.update(_dets, dt=_dt)
+                out.tracks = list(_active)
+                out.meta["n_tracks"] = len(_active)
+                if _active:
+                    from beamng_autopilot.occupancy import (
+                        OccupancyGrid as _OG2)
+                    if isinstance(grid, _OG2):
+                        from beamng_autopilot.perception import Obstacle
+                        _boxes = [
+                            Obstacle(float(t.x), float(t.y), 1.0, 1.0,
+                                     category=t.category)
+                            for t in _active]
+                        fuse_obstacles_to_grid(grid, _boxes)
+            except Exception as exc:
+                out.errors["tracker"] = str(exc)
 
         # --- 3) layered planner -----------------------------------------
         # ``has_nav_route``: only a caller-supplied map/nav route carries
@@ -784,11 +891,33 @@ class FSDStack:
         # planner's lateral alignment; the BEV whole-road centre must not.
         scene_lane_ref = (lane_ref if lane_frame is not None
                           or map_lane is not None else None)
+        # Routing intent: classify what the nav route does ahead (turn /
+        # straight / u-turn) - the FSD Routing layer output.  It does not
+        # steer by itself; it only informs the longitudinal plan (slow
+        # down for an up-coming turn) and the HUD.
+        intent = None
+        try:
+            if has_nav_route and len(route_ref) >= 8 and \
+                    len(np.asarray(route_ref, dtype=float)[:, :2]) >= 8:
+                intent = infer_route_intent(route_ref, pos, heading)
+        except Exception:
+            intent = None
+        out.intent = intent
+        if intent is not None:
+            out.meta["intent"] = intent.label
+            out.meta["intent_turn_deg"] = round(float(intent.turn_deg), 1)
+            out.meta["intent_speed"] = round(float(intent.suggested_speed), 2)
+        # A turn ahead lowers the plan cruise speed (never raises it);
+        # the curvature-based profile in speed_profile.py still does the
+        # fine-grained braking into the bend.
+        _target = float(getattr(self, "target_speed", 8.0))
+        if intent is not None and getattr(intent, "is_turn", False):
+            _target = min(_target, float(intent.suggested_speed))
         scene = Scene(pos=pos, heading=heading, grid=grid,
                       route=plan_route, lane_ref=scene_lane_ref,
                       lane_left=lane_left, lane_right=lane_right,
                       lane_width=lane_width,
-                      target_speed=getattr(self, "target_speed", 8.0))
+                      target_speed=_target, intent=intent)
         # Town corners need a tighter arc fan than a highway fan: a
         # 5-8 m radius bend is 0.12-0.2 rad/m, and the old 0.10 rad/m
         # cap (10 m radius) could not turn away from a corner wall
@@ -847,7 +976,7 @@ class FSDStack:
         try:
             from .speed_profile import speed_profile_for_path as _spf
             _sr = _spf(np.asarray(route_ref, dtype=float)[:, :2], scene,
-                       target_speed=getattr(self, "target_speed", 8.0))
+                       target_speed=_target)
             if len(_sr):
                 out.best_speed = float(_sr[0])
                 out.min_speed = float(np.asarray(_sr).min())
@@ -1027,6 +1156,16 @@ class FSDStack:
             self.occ_filter.clear()
         self._tick_t0 = None
         self._lane_fusion_state.clear()
+        # world-object tracks and the fused feature map are location-bound
+        # too: an object tracked at the old teleport can ghost into the
+        # new scene as a false obstacle.
+        _trk = getattr(self, "tracker", None)
+        if _trk is not None:
+            _trk.tracks = []
+        self._trk_t0 = None
+        _fm = getattr(self, "fmap", None)
+        if _fm is not None:
+            _fm.clear()
 
     def close(self) -> None:
         if self.ring is not None:
