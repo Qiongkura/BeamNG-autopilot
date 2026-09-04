@@ -50,8 +50,19 @@ def test_torch_forward_shapes() -> None:
     net = E2ENetTorch()
     rgb = torch.zeros(2, 3, 240, 320)
     label = torch.zeros(2, 1, 240, 320)
-    bev = torch.zeros(2, 1, GRID_N, GRID_N)
+    bev = torch.zeros(2, 4, GRID_N, GRID_N)
     traj, action = net(rgb, label, bev)
+    assert traj.shape == (2, N_WAYPOINTS, 2)
+    assert action.shape == (2, 2)
+    assert torch.isfinite(traj).all() and torch.isfinite(action).all()
+
+
+def test_torch_legacy_single_channel_bev() -> None:
+    """A bev_channels=1 net still consumes the old occupancy raster."""
+    net = E2ENetTorch(bev_channels=1)
+    rgb = torch.zeros(2, 3, 64, 64)
+    bev = torch.zeros(2, 1, GRID_N, GRID_N)
+    traj, action = net(rgb, None, bev)
     assert traj.shape == (2, N_WAYPOINTS, 2)
     assert action.shape == (2, 2)
     assert torch.isfinite(traj).all() and torch.isfinite(action).all()
@@ -70,7 +81,7 @@ def test_torch_trains_steps(tmp_path) -> None:
     opt = torch.optim.AdamW(net.parameters(), lr=1e-3, weight_decay=1e-4)
     rgb = torch.rand(4, 3, 64, 64)
     label = (torch.rand(4, 1, 64, 64) > 0.5).float()
-    bev = torch.rand(4, 1, GRID_N, GRID_N)
+    bev = torch.rand(4, 4, GRID_N, GRID_N)
     traj_t = torch.randn(4, N_WAYPOINTS, 2) * 2.0
     act_t = torch.randn(4, 2) * 0.5
     def loss():
@@ -112,7 +123,7 @@ def test_dataset_filters_and_shapes(tmp_path) -> None:
     rgb, label, bev = obs
     assert rgb.shape == (3, 32, 48)
     assert label.shape == (1, 32, 48)
-    assert bev.shape == (1, GRID_N, GRID_N)
+    assert bev.shape == (4, GRID_N, GRID_N)
     assert traj.shape == (N_WAYPOINTS, 2)
     assert mask.shape == (N_WAYPOINTS,)
     assert act.shape == (2,)
@@ -143,7 +154,7 @@ def test_dataset_keeps_action_only_frames(tmp_path) -> None:
     rgb, label, bev = obs
     assert rgb.shape == (3, 32, 48)
     assert label.shape == (1, 32, 48)
-    assert bev.shape == (1, GRID_N, GRID_N)
+    assert bev.shape == (4, GRID_N, GRID_N)
     assert traj.shape == (N_WAYPOINTS, 2)
     assert float(mask0.sum()) == N_WAYPOINTS  # healthy frame fully valid
     assert act.shape == (2,)
@@ -198,7 +209,7 @@ def test_dataset_collate(tmp_path) -> None:
     rgb, label, bev = obs
     assert rgb.shape == (2, 3, 32, 48)
     assert label.shape == (2, 1, 32, 48)
-    assert bev.shape == (2, 1, GRID_N, GRID_N)
+    assert bev.shape == (2, 4, GRID_N, GRID_N)
     assert trajs.shape == (2, N_WAYPOINTS, 2)
     assert masks.shape == (2, N_WAYPOINTS)
     assert acts.shape == (2, 2)
@@ -210,7 +221,7 @@ def test_temporal_forward_shapes() -> None:
     t = 3
     rgb = torch.zeros(2, t, 3, 64, 64)
     label = torch.zeros(2, t, 1, 64, 64)
-    bev = torch.zeros(2, t, 1, GRID_N, GRID_N)
+    bev = torch.zeros(2, t, 4, GRID_N, GRID_N)
     speed = torch.tensor([[3.0], [4.0]])
     traj, action = net(rgb, label, bev, speed)
     assert traj.shape == (2, N_WAYPOINTS, 2)
@@ -224,7 +235,7 @@ def test_temporal_trains_steps() -> None:
     t = 2
     rgb = torch.rand(4, t, 3, 64, 64)
     label = (torch.rand(4, t, 1, 64, 64) > 0.5).float()
-    bev = torch.rand(4, t, 1, GRID_N, GRID_N)
+    bev = torch.rand(4, t, 4, GRID_N, GRID_N)
     speed = torch.rand(4, 1)
     traj_t = torch.randn(4, N_WAYPOINTS, 2) * 2.0
     act_t = torch.randn(4, 2) * 0.5
@@ -251,5 +262,28 @@ def test_dataset_history_window(tmp_path) -> None:
     rgb, label, bev = obs
     assert rgb.shape == (3, 3, 32, 48)
     assert label.shape == (3, 1, 32, 48)
-    assert bev.shape == (3, 1, GRID_N, GRID_N)
+    assert bev.shape == (3, 4, GRID_N, GRID_N)
     assert speed.shape == (1,)
+
+
+def test_dataset_reads_recorded_fmap(tmp_path) -> None:
+    """v3 episodes feed back the recorded fused vector-space channels."""
+    p = _tiny_episode(tmp_path, n=2)
+    with np.load(p, allow_pickle=True) as z:
+        data = {k: z[k] for k in z.files}
+    data["version"] = np.int64(3)
+    fmap = np.zeros((2, 4, GRID_N, GRID_N), dtype=np.float32)
+    fmap[:, 1] = 0.25                 # drivable channel
+    fmap[:, 2, 10:20, 30:40] = 0.9    # lane channel
+    data["fmap"] = fmap
+    p2 = tmp_path / "ep_v3.npz"
+    np.savez_compressed(p2, **data)
+    ds = ShadowMultimodalDataset([p2], min_quality=0.0, min_speed=0.0,
+                                 img_h=32, img_w=48)
+    obs, _, _, _, _ = ds[0]
+    _, _, grid = obs
+    assert grid.shape == (4, GRID_N, GRID_N)
+    assert abs(float(grid[1, 0, 0]) - 0.25) < 1e-5
+    assert abs(float(grid[2, 10, 30]) - 0.9) < 1e-5
+    # the recorded fmap wins over the legacy bev+drivable synthesis
+    assert abs(float(grid[2, 0, 0])) < 1e-6

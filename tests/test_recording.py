@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import numpy as np
 import pytest
 
@@ -18,10 +20,14 @@ def test_recorder_roundtrip(tmp_path) -> None:
     lab = np.zeros((8, 16), dtype=np.uint8)
     lab[2:6, 4:12] = 1
     lab[3:5, 6:10] = 2
+    fmap = np.zeros((4, 60, 60), dtype=np.float32)
+    fmap[0, 10:20, 20:30] = 1.0
+    fmap[2, :, 30] = 0.8
     rec.add(ShadowFrame(x=1.0, y=2.0, heading=0.1, speed=5.0,
                         throttle=0.4, brake=0.0, steer=0.2,
                         bev_raster=np.zeros((60, 60), dtype=np.float32),
                         drivable=np.ones((60, 60), dtype=np.uint8),
+                        fmap=fmap,
                         trajectory=np.array([[1.0, 2.0], [2.0, 2.0]]),
                         target_speed=8.0, lane_src="semantic",
                         cost=0.3, kind="arc", rgb=rgb, label=lab,
@@ -31,17 +37,22 @@ def test_recorder_roundtrip(tmp_path) -> None:
     out = rec.save()
     assert out is not None and out.exists()
     with np.load(out, allow_pickle=True) as z:
-        assert int(z["version"]) == 2
+        assert int(z["version"]) == 3
         assert z["t"].shape[0] == 2
         assert z["steer"][0] == 0.2
         assert z["lane_src"][0] == "semantic"
         assert bool(z["trajectory_ok"][0]) and not bool(z["trajectory_ok"][1])
         assert z["bev"].shape == (2, 60, 60)
+        assert z["fmap"].shape == (2, 4, 60, 60)
+        assert abs(float(z["fmap"][0, 2, :, 30].max()) - 0.8) < 1e-5
         assert z["rgb"].shape == (2, 8, 16, 3)
         assert z["label"].shape == (2, 8, 16)
         assert int((z["label"][0] == 2).sum()) == 8
         assert abs(float(z["quality"][0]) - 0.9) < 1e-5
         assert abs(float(z["quality"][1]) - 0.2) < 1e-5
+        _meta = json.loads(np.asarray(z["meta"]).item().decode("utf-8"))
+        assert _meta["fmap_channels"] == 4
+        assert _meta["episode_version"] == 3
 
 
 def test_recorder_empty_save_returns_none(tmp_path) -> None:
