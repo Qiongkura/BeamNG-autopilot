@@ -53,14 +53,15 @@ def _color_mask(hsv: np.ndarray) -> dict[str, np.ndarray]:
     return masks
 
 
-def suggest_signal_state(frame_rgb: np.ndarray,
-                         bottom_share: float = 0.30) -> tuple[str, float]:
-    """Return ``(state, confidence)`` for the light visible in the frame.
+def suggest_signal_state_px(frame_rgb: np.ndarray,
+                            bottom_share: float = 0.30
+                            ) -> tuple[str, float, tuple[float, float] | None]:
+    """Return ``(state, confidence, centroid_px)`` for the visible light.
 
-    Scans the frame for the largest colour blob; ``bottom_share`` limits
-    the scan to the upper part of the frame (lights hang overhead) to
-    avoid asphalt/brake-light contamination.  state is one of
-    "red"/"yellow"/"green"/"none".
+    Same scan as :func:`suggest_signal_state` but also returns the
+    winning colour blob's centroid ``(u, v)`` in pixel coordinates
+    (None when no lamp is found) so callers can place the signal in
+    space (the BEV ``sign`` channel stamps the lamp's bearing).
     """
     import cv2
     if frame_rgb is None or frame_rgb.size == 0:
@@ -99,7 +100,25 @@ def suggest_signal_state(frame_rgb: np.ndarray,
         conf = min(1.0, 0.4 + 0.4 * share)
         if conf > best_conf:
             best_state, best_conf = state, conf
-    return best_state, best_conf
+    centroid = None
+    if best_state != "none":
+        ys, xs = np.nonzero(masks[best_state])
+        if len(xs):
+            centroid = (float(xs.mean()), float(ys.mean()))
+    return best_state, best_conf, centroid
+
+
+def suggest_signal_state(frame_rgb: np.ndarray,
+                         bottom_share: float = 0.30) -> tuple[str, float]:
+    """Return ``(state, confidence)`` for the light visible in the frame.
+
+    Scans the frame for the largest colour blob; ``bottom_share`` limits
+    the scan to the upper part of the frame (lights hang overhead) to
+    avoid asphalt/brake-light contamination.  state is one of
+    "red"/"yellow"/"green"/"none".
+    """
+    state, conf, _ = suggest_signal_state_px(frame_rgb, bottom_share)
+    return state, conf
 
 
 class TrafficSignalHead:
@@ -112,10 +131,11 @@ class TrafficSignalHead:
 
     def run(self, ctx: FrameContext) -> TaskOutput:
         out = TaskOutput()
-        state, conf = suggest_signal_state(
+        state, conf, px = suggest_signal_state_px(
             ctx.frame_rgb, bottom_share=self.bottom_share)
         out.meta["signal_state"] = state
         out.meta["signal_conf"] = conf
+        out.meta["signal_px"] = px
         return out
 
 

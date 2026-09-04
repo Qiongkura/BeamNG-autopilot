@@ -37,6 +37,7 @@ from beamng_autopilot.bev_fusion import (
     BEVFeatureMap,
     CameraFeature,
     project_mask_to_ego,
+    stamp_signal_bearing,
 )
 from beamng_autopilot.planning import (
     Constraints,
@@ -140,6 +141,25 @@ LANE_HEADING_MAX_YAW_DEG = 35.0
 # the car S-curved 2.7 m left then 5.2 m right of the centreline).
 LANE_ROUTE_TURN_MAX_DEG = 25.0
 LANE_ROUTE_TURN_LOOK_M = 12.0
+
+
+# Minimum traffic-head confidence before the lamp is stamped into the
+# BEV "sign" channel (below this the colour read is noise and vector
+# space stays neutral).
+SIGN_MIN_CONF = 0.5
+
+
+# One-shot diagnostics for guarded blocks: a formerly silent
+# ``except Exception`` now warns ONCE per failure kind, so a masked
+# error is visible without spamming a per-tick loop.
+_WARNED: set[str] = set()
+
+
+def _warn_once(key: str, msg: str) -> None:
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    print(f"[fsd-stack] {msg}", flush=True)
 
 
 class FSDTick:
@@ -338,6 +358,13 @@ class FSDStack:
                 _last = {}
                 self._last_heads = _last
             for _name, _head in self.hydra._heads.items():
+                if _name == "topology":
+                    # The topology head needs the PAIRED sensor lane,
+                    # which only exists after perception fusion - it runs
+                    # once at end-of-tick with the real LaneFrame.
+                    # Running it here always feeds sensor_lane=None
+                    # (has_lane=False) and wastes a lane-graph build.
+                    continue
                 if _name == "semantic":
                     _n = int(getattr(self, 'semantic_every_n', 1))
                 elif _name == "object":
@@ -484,6 +511,22 @@ class FSDStack:
                         for _p in _pts:
                             fmap.accumulate(CameraFeature(
                                 _role0, "lane", _p, confidence=0.75))
+                # Traffic-signal head -> "sign" channel: a confidently
+                # detected lamp is stamped along its pixel bearing so the
+                # vector space carries "traffic control ahead" instead of
+                # a dead (never-written) channel.
+                _sig = out.head_outputs.get("traffic")
+                if _sig is not None and _role0 is not None:
+                    _smeta = getattr(_sig, "meta", {}) or {}
+                    _sst = str(_smeta.get("signal_state") or "none")
+                    _scf = float(_smeta.get("signal_conf", 0.0) or 0.0)
+                    _spx = _smeta.get("signal_px")
+                    if (_sst in ("red", "yellow", "green")
+                            and _scf >= SIGN_MIN_CONF
+                            and _spx is not None):
+                        stamp_signal_bearing(
+                            fmap, snap[_role0][1], _spx,
+                            confidence=0.5 + 0.5 * _scf)
                 _obs_pts: list[tuple[float, float, float]] = []
                 _rng = locals().get("rng", None)
                 _obs_pts.extend(
@@ -625,8 +668,10 @@ class FSDStack:
                 from beamng_autopilot.planning.local_route import (
                     map_lane_local)
                 map_lane = map_lane_local(route_ref, pos, heading)
-            except Exception:
+            except Exception as exc:
                 map_lane = None
+                _warn_once("map_lane_local",
+                           f"map-lane builder failed: {exc}")
         # Heading gate: a PAIRED sensor lane is only trustworthy when its
         # near-ahead direction agrees with the nav route (or the ego
         # heading).  At a junction the vision/LiDAR pairing can lock onto a
@@ -708,8 +753,9 @@ class FSDStack:
                     lane_left = None
                     lane_right = None
                     lane_width = 0.0
-            except Exception:
-                pass
+            except Exception as exc:
+                _warn_once("lane_gates",
+                           f"lane gate checks failed: {exc}")
         if map_lane is not None and not (
                 lane_mode == "sensor" and self.strict_sensor):
             mc, ml, mr = map_lane
@@ -754,9 +800,11 @@ class FSDStack:
                             if float(np.median(_dm)) > _max_c:
                                 lane_ref = mc
                                 lane_src_sel = "map"
-                    except Exception:
+                    except Exception as exc:
                         lane_ref = mc
                         lane_src_sel = "map"
+                        _warn_once("lane_consistency",
+                                   f"lane consistency check failed: {exc}")
                 else:
                     # Unpaired sensor centre / no sensor lane: keep the
                     # map-prior own-lane centre as the reference.  The
@@ -786,8 +834,10 @@ class FSDStack:
                     _wf = _wa[np.isfinite(_wa)]
                     if _wf.size:
                         _w = float(np.median(_wf))
-                except Exception:
+                except Exception as exc:
                     _w = 0.0
+                    _warn_once("lane_width",
+                               f"lane width read failed: {exc}")
                 lane_width = (_w if _w > 0.0
                               else float(getattr(self, "map_lane_width_m", 0.0)
                                          or LANE_WIDTH_DEFAULT_M))
@@ -900,7 +950,8 @@ class FSDStack:
             if has_nav_route and len(route_ref) >= 8 and \
                     len(np.asarray(route_ref, dtype=float)[:, :2]) >= 8:
                 intent = infer_route_intent(route_ref, pos, heading)
-        except Exception:
+        except Exception as exc:
+            _warn_once("intent", f"route intent failed: {exc}")
             intent = None
         out.intent = intent
         if intent is not None:
@@ -983,8 +1034,9 @@ class FSDStack:
                 out.meta["best_speed"] = out.best_speed
                 out.meta["min_speed"] = out.min_speed
                 out.meta["plan_src"] = "route"
-        except Exception:
+        except Exception as exc:
             out.meta["plan_src"] = "candidate"
+            _warn_once("plan_speed", f"route speed profile failed: {exc}")
 
 
         # Run the topology head over the sensor lane derived from the
@@ -1002,8 +1054,8 @@ class FSDStack:
             try:
                 topo_out = topology.run(ctx, sensor_lane=lane_frame)
                 out.head_outputs["topology"] = topo_out
-            except Exception:
-                pass
+            except Exception as exc:
+                _warn_once("topology", f"topology head failed: {exc}")
         out.meta.update(semantic_to_meta(out.head_outputs))
         _times['plan'] = round((time.time() - _tw) * 1000.0, 1)
         _times['total'] = round(sum(_times.values()), 1)
@@ -1022,19 +1074,23 @@ class FSDStack:
         try:
             vision = self._sensor_lane_from_semantic(
                 out.head_outputs, pos, heading)
-        except Exception:
+        except Exception as exc:
+            _warn_once("sensor_lane_vision", f"vision lane failed: {exc}")
             vision = None
         lidar = None
         if out.ray_hits:
             try:
                 lidar = build_lidar_corridor(out.ray_hits, pos, heading)
-            except Exception:
+            except Exception as exc:
+                _warn_once("sensor_lane_lidar",
+                           f"lidar corridor failed: {exc}")
                 lidar = None
         try:
             frame = choose_sensor_lane(
                 vision, lidar, pos, heading,
                 state=getattr(self, "_lane_fusion_state", None))
-        except Exception:
+        except Exception as exc:
+            _warn_once("sensor_lane_fusion", f"lane fusion failed: {exc}")
             frame = vision or lidar
         if frame is None:
             return None
@@ -1072,7 +1128,9 @@ class FSDStack:
             if not markings:
                 return None
             return pair_lane_markings(markings, pos, heading)
-        except Exception:
+        except Exception as exc:
+            _warn_once("pair_lane_markings",
+                       f"vision lane pairing failed: {exc}")
             return None
 
     def _bev_drivable_center(self, grid, pos, heading):

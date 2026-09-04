@@ -9,6 +9,7 @@ from beamng_autopilot.vision.heads.traffic import (
     TrafficSignalHead,
     merge_signal_vision,
     suggest_signal_state,
+    suggest_signal_state_px,
 )
 from beamng_autopilot.vision.hydra import FrameContext
 
@@ -40,6 +41,16 @@ def test_suggest_none_on_plain_frame() -> None:
     assert conf == 0.0
 
 
+def test_suggest_signal_px_centroid() -> None:
+    # the blob is stamped at rows 5:15, cols 60:75 of the 80x60 frame
+    state, conf, px = suggest_signal_state_px(_signal_frame(0))
+    assert state == "red" and conf > 0.5
+    assert px is not None and 60.0 < px[0] < 75.0 and 5.0 < px[1] < 15.0
+    state, conf, px = suggest_signal_state_px(
+        np.zeros((60, 80, 3), dtype=np.uint8))
+    assert state == "none" and conf == 0.0 and px is None
+
+
 def test_signal_head_meta() -> None:
     from beamng_autopilot.vision.projection import CameraModel
     head = TrafficSignalHead()
@@ -50,6 +61,7 @@ def test_signal_head_meta() -> None:
     out = head.run(ctx)
     assert out.meta["signal_state"] == "red"
     assert out.meta["signal_conf"] > 0.5
+    assert out.meta["signal_px"] is not None
 
 
 def test_merge_rule_authoritative() -> None:
