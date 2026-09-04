@@ -53,7 +53,11 @@ from beamng_autopilot.planning.local_route import (
 from beamng_autopilot.planning.speed_profile import \
     MIN_SPEED as _PROF_MIN_SPEED, \
     speed_profile_for_path as _spf_raw
-from beamng_autopilot.recording import ShadowFrame, ShadowRecorder
+from beamng_autopilot.recording import (
+    FMAP_CHANNELS,
+    ShadowFrame,
+    ShadowRecorder,
+)
 from beamng_autopilot.roadnet import RoadNetwork
 from beamng_autopilot.autopilot import nearest_route_point, smooth_steer
 from beamng_autopilot.planner import (
@@ -1926,6 +1930,12 @@ def main() -> int:
                             _label[_sem_r.masks["line"]] = 2
                     _traj = (chosen.path if chosen.path is not None
                              else out.best_path)
+                    _fmap = None
+                    _fm = getattr(out, "feature_map", None)
+                    if _fm is not None:
+                        _fmap = np.stack([
+                            np.asarray(_fm.get(c), dtype=np.float32)
+                            for c in FMAP_CHANNELS]).astype(np.float32)
                     rec.add(ShadowFrame(
                         x=float(pos[0]), y=float(pos[1]),
                         heading=heading, speed=v,
@@ -1934,6 +1944,7 @@ def main() -> int:
                                     if out.bev is not None else None),
                         drivable=(np.asarray(out.drivable, dtype=np.uint8)
                                   if out.drivable is not None else None),
+                        fmap=_fmap,
                         trajectory=(np.asarray(_traj, dtype=float)[:, :2]
                                     if _traj is not None
                                     and len(_traj) >= 2 else None),

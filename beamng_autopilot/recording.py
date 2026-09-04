@@ -30,7 +30,11 @@ from pathlib import Path
 
 import numpy as np
 
-EPISODE_VERSION = 2
+EPISODE_VERSION = 3
+
+# Channel order of the fused vector-space feature map (mirrors
+# ``BEVFeatureMap.CHANNELS``): obstacle / drivable / lane / sign.
+FMAP_CHANNELS = ("obstacle", "drivable", "lane", "sign")
 
 
 @dataclass
@@ -49,6 +53,7 @@ class ShadowFrame:
     # shadow stack predictions
     bev_raster: np.ndarray | None = None      # (N, N) occupancy 0..1
     drivable: np.ndarray | None = None        # (N, N) free-space flag
+    fmap: np.ndarray | None = None            # (C, N, N) fused vector space
     trajectory: np.ndarray | None = None      # (M, 2) chosen world path
     target_speed: float = 0.0
     lane_src: str = ""                         # which head produced the lane
@@ -100,6 +105,17 @@ class ShadowRecorder:
         traj_ok = np.zeros(n, dtype=bool)
         bev = np.zeros((n, 60, 60), dtype=np.float32)  # fixed-size grid
         drv = np.zeros((n, 60, 60), dtype=np.uint8)
+        # Fused vector-space feature map (C, N, N) channel-first; older
+        # episodes have no fmap and stay empty (the dataset synthesises
+        # the channels from bev + drivable).
+        fmap_c = fmap_n = 0
+        for f in self.frames:
+            if f.fmap is not None:
+                fmap_c = int(np.asarray(f.fmap).shape[0])
+                fmap_n = int(np.asarray(f.fmap).shape[1])
+                break
+        fmap = np.zeros((n, fmap_c, max(0, fmap_n), max(0, fmap_n)),
+                        dtype=np.float32)
         # Camera observations are variable-size: pack into one fixed
         # (n, H, W, 3) / (n, H, W) array using the first frame's size.
         cam_h = cam_w = 0
@@ -118,6 +134,10 @@ class ShadowRecorder:
                 bev[i] = np.asarray(f.bev_raster, dtype=np.float32)
             if f.drivable is not None:
                 drv[i] = np.asarray(f.drivable, dtype=np.uint8)
+            if f.fmap is not None:
+                _fm = np.asarray(f.fmap, dtype=np.float32)
+                if _fm.shape[:2] == (fmap_c, fmap_n):
+                    fmap[i] = _fm
             if f.rgb is not None and cam_h and cam_w:
                 rgb[i, :cam_h, :cam_w] = np.asarray(
                     f.rgb[:cam_h, :cam_w], dtype=np.uint8)
@@ -138,6 +158,7 @@ class ShadowRecorder:
             steer=np.array([f.steer for f in self.frames]),
             bev=bev,
             drivable=drv,
+            fmap=fmap,
             trajectory=traj,
             trajectory_ok=traj_ok,
             target_speed=np.array([f.target_speed for f in self.frames]),
@@ -154,6 +175,8 @@ class ShadowRecorder:
                 "frames": n,
                 "cam_h": int(cam_h),
                 "cam_w": int(cam_w),
+                "fmap_channels": int(fmap_c),
+                "episode_version": int(EPISODE_VERSION),
             }).encode("utf-8"),
         )
         return out
