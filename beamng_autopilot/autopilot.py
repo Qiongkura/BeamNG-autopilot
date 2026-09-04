@@ -111,6 +111,19 @@ from beamng_autopilot.visionview import (
 # Module-level constants
 # ---------------------------------------------------------------------------
 
+# One-shot diagnostics for guarded blocks: a formerly silent
+# ``except Exception`` now warns ONCE per failure kind, so a masked
+# error is visible without spamming a live loop.
+_WARNED: set[str] = set()
+
+
+def _warn_once(key: str, msg: str) -> None:
+    if key in _WARNED:
+        return
+    _WARNED.add(key)
+    print(f"[m5] WARNING: {msg}", flush=True)
+
+
 CAM_W, CAM_H = 1076, 806
 GOAL_RADIUS_M = 8.0
 RAMP_ACCEL = 2.5
@@ -710,8 +723,9 @@ class AutopilotSession:
                                   encoding="utf-8") as fh:
                             fh.write(json.dumps(
                                 row, ensure_ascii=False) + "\n")
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _warn_once("lane_debug_write",
+                                   f"lane debug write failed: {exc}")
                 if lanes_worker:
                     last_lanes_worker = lanes_worker
                     last_lanes_ts_worker = now
@@ -880,8 +894,9 @@ class AutopilotSession:
                     with self.conn.io_lock:
                         wd_arm(self.conn)
                     print("[m5] watchdog re-armed by daemon")
-            except Exception:
-                pass
+            except Exception as exc:
+                _warn_once("wd_heartbeat",
+                           f"watchdog heartbeat failed: {exc}")
 
     def _atexit_safety(self) -> None:
         """Last-ditch safety so a normal/Ctrl+C exit never leaves the car
@@ -894,8 +909,9 @@ class AutopilotSession:
                     self.conn.control(throttle=0.0, brake=0.0,
                                       steering=0.0, parkingbrake=1.0, gear=0)
                     self.conn.step(5)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _warn_once("emergency_stop_cmd",
+                               f"emergency stop command failed: {exc}")
                 with self.conn.io_lock:
                     gearbox.set_gearbox_mode(self.conn.vehicle,
                                              self.saved_gearbox)
@@ -903,8 +919,9 @@ class AutopilotSession:
             self.conn.control(throttle=0.0, brake=0.0, steering=0.0,
                               parkingbrake=1.0)
             self.conn.step(3)
-        except Exception:
-            pass
+        except Exception as exc:
+            _warn_once("shutdown_stop",
+                       f"shutdown stop sequence failed: {exc}")
         try:
             with self.conn.io_lock:
                 wd_disarm(self.conn)
@@ -1258,8 +1275,9 @@ class AutopilotSession:
                             self.last_rearm = now
                             with conn.io_lock:
                                 wd_arm(conn)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        _warn_once("wd_heartbeat",
+                                   f"watchdog heartbeat failed: {exc}")
                 display_route = self.route
 
                 if self.autopilot:
@@ -1542,8 +1560,9 @@ class AutopilotSession:
             try:
                 with conn.io_lock:
                     wd_heartbeat(conn)
-            except Exception:
-                pass
+            except Exception as exc:
+                _warn_once("wd_heartbeat",
+                           f"watchdog heartbeat failed: {exc}")
         _mark("scan")
 
         # --- Vision snapshot --------------------------------------------------
@@ -1820,8 +1839,9 @@ class AutopilotSession:
                             _dist = polyline_point_distances(_near, _rd)
                             if float(np.median(_dist)) <= 3.5:
                                 drive_route = _bp
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _warn_once("fsd_frontend_tick",
+                               f"fsd frontend tick failed: {exc}")
             if len(drive_route) >= 2:
                 display_route = drive_route
                 speed_route = (
