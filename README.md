@@ -468,6 +468,24 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
   转向路径按"感知本车道中心"限速拉正（死区 5cm / 限幅 1.0m / 速率 1.2m/s，
   感知掉线先 hold 2s 再衰减），遥测新增 `plc_shift/plc_desired`；全链路
   仍是纯感知横向，无导航线/地图线偏移。
+- PLC 激活门控（2026-09-04）：`PaintedLineLateralCorrector` 增加策略门控
+  （`vision/lanes.py::painted_line_correction_active`）——只在感知标线可信、
+  当前不是规则来源兜底帧、且未进入终点停靠段的帧才介入，门控状态写入
+  telemetry 并接进 `m5_fsd_drive` 的 engage 判定，避免在感知漂移/兜底帧
+  里把车往错误方向拉。
+- 分割训练流水线（2026-09-04）：断点续训落地（每轮自动落盘
+  `checkpoint_last.pt`，`--resume` 可从中断轮次续训，不再白跑 2h+）、
+  实时日志改进、`torch.amp.GradScaler` API 清理弃用告警。
+- 分割模型 v8/v9 对照与 held-out 评估（2026-09-04）：v9 用 10 个 run /
+  6532 帧（train 5226 / val 1306）训 40 epochs，val mIoU **0.6277**、val acc
+  **0.976**；但用**完全不参与 v9 训练**的城镇/桥上两个 run 做 held-out 评估
+  （925 帧）line IoU 仅 **0.110**，且 v9 自身 val line IoU（0.103）< v8
+  （0.205），说明 v9 标线整体退步而非数据构成问题。**同时发现此前 v8 的
+  line IoU 0.2218 是训练集泄漏**（v8 训练 run 包含这两个评估 run，数字不可信）；
+  推测 v9 混入大量标线稀疏 run（line 像素占比 ~0.0006-0.0025）拉低了学习。
+  部署目录 `logs/m5_seg/seg_model/best.pt` **保持 v8 不覆盖**，v9 仅作记录；
+  下一步用标注密集 run 重训 v10 + 评估按标注密度分组，held-out line IoU
+  达标（≥0.35）才部署。
 - `m5_pipeline.py --cycles N --dedup --drop-takeover-ge 0.5`：录 → 训 → 回放评测
   一键循环，报告自动落盘。
 
