@@ -423,6 +423,109 @@ def test_fsd_closed_loop_curve_stays_in_own_lane() -> None:
     assert max_dsteer <= 0.25, f"steering oscillation: {max_dsteer:.3f} rad"
 
 
+def test_fsd_closed_loop_tight_curve_stays_in_own_lane() -> None:
+    """TIGHT (r=15) left bend regression: the painted boundaries must be
+    paired by world road station so the perception lane keeps leading
+    through the bend.
+
+    On a tight curve the old whole-line car-frame median swings metres
+    outward as the far arc curves around the car, so the real pair was
+    gated out and the mirror fallback parked the lane on the centre line
+    (``lane_paired=0`` from tick 0, ``lane_src='bev/route'``).  This test
+    feeds the ego-anchored forward route exactly like the product
+    (``m5_fsd_drive`` calls ``local_route`` before ``stack.tick``): every
+    tick must keep the PAIRED sensor lane as the lateral reference, and
+    the path / ego must stay in the ego lane (road latitude
+    [-3.55, 0]) through the bend.
+    """
+    from beamng_autopilot.planning.local_route import local_route
+
+    st = _stack()
+    st.lane_mode = "sensor"
+    st.strict_sensor = False
+    st.hydra._heads = {}
+    st.hydra.add(_CurveWorldSemantic(radius_m=15.0))
+    st.target_speed = 5.0
+    r = 15.0
+    # ~0.55 m vertex spacing (coarser than r=30's 140-point arc): the
+    # tighter arc must NOT collapse under map_lane_local's dedup.
+    tt = np.linspace(0.0, 2.2, 60)
+    route = np.column_stack([r * np.sin(tt), r - r * np.cos(tt)])
+    pos = np.array([0.0, -1.75, 0.0])     # ego lane centre on the curve
+    heading = 0.0
+    speed = 0.0
+    dt = 0.25
+    wheelbase = 2.9
+    pp = PurePursuit(lookahead=6.0, wheelbase=wheelbase)
+    guard = ReverseGuard()
+
+    total = 0.0
+    prev_steer = 0.0
+    max_dsteer = 0.0
+    min_path_lat = 1e9
+    max_path_lat = -1e9
+    min_ego_lat = 1e9
+    max_ego_lat = -1e9
+    # Stop well inside the 33 m route so the map-prior lane stays
+    # available every tick (the end-zone handling is a separate concern).
+    for i in range(22):
+        route_ref = local_route(pos, heading, route)
+        out = st.tick(
+            st=SimpleNamespace(pos=pos, heading=heading, speed=speed),
+            route_ref=route_ref)
+        # the lateral reference is the paired perception lane every tick
+        assert out.meta.get("lane_paired") == 1, out.meta
+        assert out.meta.get("lane_src") == "sensor", out.meta
+        assert out.meta.get("lane_src_sel") == "sensor", out.meta
+        assert out.best_path is not None, out.meta
+        path = np.asarray(out.best_path[:, :2], dtype=float)
+        # road latitude from the pure curve geometry (left = +)
+        path_lat = r - np.hypot(path[:, 0], r - path[:, 1])
+        fwd = np.array([np.cos(heading), np.sin(heading)])
+        ahead = ((path - pos[:2]) @ fwd) >= 2.5
+        if ahead.any():
+            min_path_lat = min(min_path_lat,
+                               float(path_lat[ahead].min()))
+            max_path_lat = max(max_path_lat,
+                               float(path_lat[ahead].max()))
+        ego_lat = r - math.hypot(float(pos[0]), r - float(pos[1]))
+        min_ego_lat = min(min_ego_lat, ego_lat)
+        max_ego_lat = max(max_ego_lat, ego_lat)
+
+        v = float(out.best_speed or 0.0)
+        assert v >= 0.0, out.meta
+        steer, _, _ = pp.steering(pos, heading, path, speed=v)
+        assert abs(steer) <= 0.5, f"steer out of range: {steer:.3f}"
+        if i > 0:
+            max_dsteer = max(max_dsteer, abs(steer - prev_steer))
+        prev_steer = steer
+
+        brake, reverse = guard.decide(v, dt=dt)
+        assert not reverse, "car must never drive backwards"
+        assert brake == 0.0
+
+        total += v * dt
+        pos = pos + v * dt * np.array([fwd[0], fwd[1], 0.0])
+        heading = heading + steer * v * dt / wheelbase
+        speed = v
+
+    # real forward progress through the bend
+    assert total >= 15.0, f"only drove {total:.1f} m in 22 ticks"
+    # the car actually turned left with the tight curve
+    assert heading > 0.3, f"heading did not follow the bend: {heading:.3f}"
+    # planned path never crossed the centre line (lat 0) nor left the edge
+    assert max_path_lat <= -0.05, \
+        f"path crossed the centre line: {max_path_lat:.2f}"
+    assert min_path_lat >= -3.55, \
+        f"path left the road edge: {min_path_lat:.2f}"
+    # the car's own body also stayed inside the ego lane
+    assert max_ego_lat <= -0.05, \
+        f"ego crossed the centre line: {max_ego_lat:.2f}"
+    assert min_ego_lat >= -3.55, f"ego left the road edge: {min_ego_lat:.2f}"
+    # steering never flapped tick to tick (smooth curve control)
+    assert max_dsteer <= 0.25, f"steering oscillation: {max_dsteer:.3f} rad"
+
+
 def test_fsd_closed_loop_wall_stop() -> None:
     """Full-width wall across the ego lane: the longitudinal safety layers
     (speed profile + grid/raw emergency stop) must halt the car before
