@@ -506,22 +506,35 @@ def _local_ground_z(cloud: np.ndarray, ox: float, oy: float,
     cells) and range (5 m rings); the 5th percentile of z inside each bin
     is that bin's ground reference, which follows hills and valleys.
     Returns one ground-z value per input point.
+
+    One ``lexsort`` makes the bins contiguous AND z-ordered inside each
+    bin, so every bin's percentile is a vectorised rank gather - the
+    original called ``np.percentile`` once per bin (~600 calls, each
+    dominated by numpy call overhead: 32 ms of a 38 ms pipeline).
     """
     ang = np.degrees(np.arctan2(cloud[:, 1] - oy, cloud[:, 0] - ox)) % 360.0
     ai = np.clip((ang / (360.0 / n_ang)).astype(np.int64), 0, n_ang - 1)
     dist = np.hypot(cloud[:, 0] - ox, cloud[:, 1] - oy)
     ri = np.clip((dist / ring).astype(np.int64), 0, 100000)
     key = ai * 1000003 + ri
-    order = np.argsort(key, kind="stable")
+    order = np.lexsort((cloud[:, 2], key))
     ks = key[order]
     zs = cloud[order, 2]
     starts = np.r_[0, np.flatnonzero(np.diff(ks)) + 1]
     ends = np.r_[starts[1:], len(ks)]
-    ground = np.empty(len(ks), dtype=float)
-    for s, e in zip(starts, ends):
-        ground[s:e] = np.percentile(zs[s:e], 5.0)
+    n = (ends - starts).astype(np.int64)
+    # numpy's linear-interpolation percentile, vectorised per bin:
+    # virtual index q*(n-1), lerped between the floor/ceil order stats.
+    virt = 0.05 * (n - 1)
+    lo = np.floor(virt).astype(np.int64)
+    frac = virt - lo
+    a = zs[starts + lo]
+    b = zs[starts + np.minimum(lo + 1, n - 1)]
+    diff = b - a
+    ground_bin = np.where(frac >= 0.5, b - diff * (1.0 - frac),
+                          a + diff * frac)
     out = np.empty(len(cloud), dtype=float)
-    out[order] = ground
+    out[order] = np.repeat(ground_bin, n)
     return out
 
 

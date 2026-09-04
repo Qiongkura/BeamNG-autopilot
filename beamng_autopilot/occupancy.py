@@ -142,6 +142,51 @@ class OccupancyGrid:
             # evidence below the permanent barrier threshold
             self.occupancy[r, c] = max(0.0, self.occupancy[r, c] - 0.15)
 
+    # ------------------------------------------------------------------
+    def _cells_for_points(self, wxs, wys):
+        """Vectorised ``world_to_cell`` for arrays of world points.
+
+        Returns ``(rows, cols)`` int arrays containing ONLY the points
+        that land inside the grid (out-of-bounds points are dropped),
+        using the exact same rotation + quantisation as
+        ``world_to_cell``.
+        """
+        dx = np.asarray(wxs, dtype=float) - self.origin[0]
+        dy = np.asarray(wys, dtype=float) - self.origin[1]
+        ch, sh = math.cos(self.heading), math.sin(self.heading)
+        ex = dx * ch + dy * sh
+        ey = -dx * sh + dy * ch
+        inside = (np.abs(ex) < self.extent) & (np.abs(ey) < self.extent)
+        r = ((self.max_x - ex) / self.res).astype(np.int64)
+        c = ((self.max_y - ey) / self.res).astype(np.int64)
+        inside &= (r >= 0) & (r < self.n_rows) & (c >= 0) & (c < self.n_cols)
+        return r[inside], c[inside]
+
+    def add_observed_points(self, wxs, wys) -> None:
+        """Batch ``add_observed_point`` (same semantics, one stamp)."""
+        rs, cs = self._cells_for_points(wxs, wys)
+        if len(rs):
+            self.observed[rs, cs] = 1.0
+
+    def add_drivable_points(self, wxs, wys) -> None:
+        """Batch ``add_drivable_point`` (same semantics, one stamp).
+
+        Per-hit decay semantics are preserved: a cell hit by ``k`` road
+        pixels loses exactly ``0.15 * k`` occupancy (sequential
+        ``max(0, x - 0.15)`` applied k times equals the batched form).
+        """
+        rs, cs = self._cells_for_points(wxs, wys)
+        if not len(rs):
+            return
+        flat = rs * self.n_cols + cs
+        hits = np.bincount(
+            flat, minlength=self.n_rows * self.n_cols
+        ).reshape(self.n_rows, self.n_cols)
+        free = (hits > 0) & (self.obstacle == 0)
+        self.drivable[free] = 1.0
+        self.occupancy[free] = np.maximum(
+            0.0, self.occupancy[free] - 0.15 * hits[free])
+
     def mark_obstacle_region(self, wx: float, wy: float, hw: float,
                              hh: float, z: float = 1.0,
                              axis=None, half_len: float = 0.0,
@@ -177,30 +222,23 @@ class OccupancyGrid:
             x1 = float(max(pt[0] for pt in corner_pts))
             y0 = float(min(pt[1] for pt in corner_pts))
             y1 = float(max(pt[1] for pt in corner_pts))
-            hit: list[tuple[int, int]] = []
-            for wx_c in np.arange(x0, x1 + self.res, self.res):
-                for wy_c in np.arange(y0, y1 + self.res, self.res):
-                    dx = wx_c - ctr[0]
-                    dy = wy_c - ctr[1]
-                    if abs(dx * ax[0] + dy * ax[1]) > hl:
-                        continue
-                    if abs(dx * px[0] + dy * px[1]) > ht:
-                        continue
-                    cdx = wx_c - self.origin[0]
-                    cdy = wy_c - self.origin[1]
-                    ch = math.cos(self.heading)
-                    sh = math.sin(self.heading)
-                    ex = cdx * ch + cdy * sh
-                    ey = -cdx * sh + cdy * ch
-                    cell = self.ego_to_cell(ex, ey)
-                    if cell is not None:
-                        hit.append(cell)
-            if not hit:
+            # Vectorised footprint sampling: same world-sample grid as the
+            # scalar loop, same rotated-rect membership test, cells via
+            # the shared batched world_to_cell (only the min/max of the
+            # hit cells feeds the stamp, so order is irrelevant).
+            gx, gy = np.meshgrid(np.arange(x0, x1 + self.res, self.res),
+                                 np.arange(y0, y1 + self.res, self.res))
+            dx = gx - ctr[0]
+            dy = gy - ctr[1]
+            sel = ((np.abs(dx * ax[0] + dy * ax[1]) <= hl)
+                   & (np.abs(dx * px[0] + dy * px[1]) <= ht))
+            if not sel.any():
                 return
-            rs = [c[0] for c in hit]
-            cs = [c[1] for c in hit]
-            r0, r1 = max(0, min(rs)), min(self.n_rows - 1, max(rs))
-            c0, c1 = max(0, min(cs)), min(self.n_cols - 1, max(cs))
+            rs, cs = self._cells_for_points(gx[sel], gy[sel])
+            if not len(rs):
+                return
+            r0, r1 = int(rs.min()), int(rs.max())
+            c0, c1 = int(cs.min()), int(cs.max())
             self.obstacle[r0:r1 + 1, c0:c1 + 1] = 1
             self.occupancy[r0:r1 + 1, c0:c1 + 1] = np.maximum(
                 self.occupancy[r0:r1 + 1, c0:c1 + 1], 0.9)
@@ -250,6 +288,11 @@ class OccupancyGrid:
         A trajectory scorer uses this to reject or penalise paths that run
         through occupied cells.  Out-of-grid samples count as occupied
         (unknown space is not drivable).
+
+        NOTE: the live trajectory scoring does NOT call this -
+        ``planning.constraints`` has its own grid scans tuned for the
+        planner (corridor bands, drivable/observed gating).  This is the
+        standalone occupancy-cost API, kept for tools and tests.
         """
         if path_xy is None or len(path_xy) == 0:
             return 0.0
@@ -281,44 +324,47 @@ def project_road_mask_to_grid(grid: OccupancyGrid, road_mask: np.ndarray,
     corresponding grid cell drivable.  This is the camera->BEV "lift"
     primitive of a vector-space stack.  ``road_mask`` is a bool mask of
     drivable surface pixels (the semantic head's road mask).
+
+    Fully vectorised (meshgrid over the sampled pixels): the per-pixel
+    ray math is identical to the original scalar loop, only evaluated
+    for every sampled pixel at once.
     """
     h, w = road_mask.shape[:2]
     C, r_vec, f_vec, u_vec = cam.camera_pose(pos, heading)
     ground_z = float(pos[2]) if len(np.asarray(pos)) > 2 else 0.0
     fx, fy = cam.fx, cam.fy
     cx, cy = cam.cx, cam.cy
-    for v in range(0, h, step):
-        for u in range(0, w, step):
-            # ray from camera through pixel (u, v)
-            x_cam = (u - cx) / fx
-            y_cam = (v - cy) / fy
-            d_cam = np.empty(3)
-            # camera coords: x right, y down, z forward (pinhole)
-            d_cam[0] = x_cam
-            d_cam[1] = y_cam
-            d_cam[2] = 1.0
-            D = (d_cam[0] * r_vec + d_cam[1] * -u_vec + d_cam[2] * f_vec)
-            # The ray must point downward toward the ground plane.  In the
-            # (right, fwd, up) convention f_vec is up-ish; +y image (lower
-            # half) points along -u_vec (down), so a ray meeting the ground
-            # has a negative z component.  Rays pointing up or level never
-            # hit the ground (sky / horizon pixels).
-            if D[2] >= -1e-6:
-                continue
-            t = (ground_z - C[2]) / D[2]
-            if t <= 0.0 or t > max_ahead_m:
-                continue
-            wx = C[0] + t * D[0]
-            wy = C[1] + t * D[1]
-            if (wx - pos[0]) ** 2 + (wy - pos[1]) ** 2 > max_ahead_m ** 2:
-                continue
-            # Every back-projected pixel (road OR non-road) is "observed";
-            # only road pixels are drivable.  The observed layer lets the
-            # planner distinguish grass/terrain (seen, not drivable) from
-            # unknown space beyond the sensor footprint.
-            grid.add_observed_point(wx, wy)
-            if road_mask[v, u]:
-                grid.add_drivable_point(wx, wy)
+    us = np.arange(0, w, step)
+    vs = np.arange(0, h, step)
+    uu, vv = np.meshgrid(us, vs)
+    # ray from camera through pixel (u, v); camera coords: x right,
+    # y down, z forward (pinhole)
+    xc = (uu - cx) / fx
+    yc = (vv - cy) / fy
+    D = xc[..., None] * r_vec - yc[..., None] * u_vec + f_vec
+    Dz = D[..., 2]
+    # The ray must point downward toward the ground plane.  In the
+    # (right, fwd, up) convention f_vec is up-ish; +y image (lower half)
+    # points along -u_vec (down), so a ray meeting the ground has a
+    # negative z component.  Rays pointing up or level never hit the
+    # ground (sky / horizon pixels).
+    ok = Dz < -1e-6
+    t = np.zeros_like(Dz)
+    np.divide(ground_z - C[2], Dz, out=t, where=ok)
+    good = ok & (t > 0.0) & (t <= max_ahead_m)
+    wx = C[0] + t * D[..., 0]
+    wy = C[1] + t * D[..., 1]
+    good &= (wx - pos[0]) ** 2 + (wy - pos[1]) ** 2 <= max_ahead_m ** 2
+    if not good.any():
+        return
+    # Every back-projected pixel (road OR non-road) is "observed";
+    # only road pixels are drivable.  The observed layer lets the
+    # planner distinguish grass/terrain (seen, not drivable) from
+    # unknown space beyond the sensor footprint.
+    grid.add_observed_points(wx[good], wy[good])
+    road = good & road_mask[vv, uu]
+    if road.any():
+        grid.add_drivable_points(wx[road], wy[road])
 
 
 def fuse_obstacles_to_grid(grid: OccupancyGrid, obstacles,

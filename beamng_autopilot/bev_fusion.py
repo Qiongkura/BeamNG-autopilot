@@ -84,21 +84,41 @@ class BEVFeatureMap:
         return r, c
 
     def accumulate(self, feature: CameraFeature) -> None:
-        """Add one camera's votes into the map (log-odds accumulation)."""
+        """Add one camera's votes into the map (log-odds accumulation).
+
+        Vectorised: cells for all points are computed at once and hit
+        counts are folded in per cell.  Sequential clamped updates with a
+        CONSTANT per-feature delta equal one clipped linear step per cell
+        (the accumulators are always kept inside [-8, 8], so intermediate
+        clamps can never bind), which is what the scalar loop produced.
+        """
         ch = feature.channel if feature.channel in self.CHANNELS \
             else "obstacle"
+        pts = np.asarray(feature.points, dtype=float).reshape(-1, 3)
+        if not len(pts):
+            return
+        ex = pts[:, 0]
+        ey = pts[:, 1]
+        inside = (np.abs(ex) < self.extent) & (np.abs(ey) < self.extent)
+        if not inside.any():
+            return
+        r = ((self.extent - ex[inside]) / self.res).astype(np.int64)
+        c = ((self.extent - ey[inside]) / self.res).astype(np.int64)
+        ok = (r >= 0) & (r < self.n) & (c >= 0) & (c < self.n)
+        if not ok.any():
+            return
+        flat = r[ok] * self.n + c[ok]
+        hits = np.bincount(
+            flat, minlength=self.n * self.n).reshape(self.n, self.n)
         lodds = self.logodds[ch]
         src = self.sources[ch]
-        for px, py, _ in feature.points:
-            cell = self._cell(float(px), float(py))
-            if cell is None:
-                continue
-            r, c = cell
-            # log-odds update: p/(1-p); a hit adds confidence^...; keep a
-            # bounded running log-odds so a lone false positive fades.
-            lodds[r, c] = max(-8.0, min(8.0, lodds[r, c] + 2.0 *
-                                        (feature.confidence - 0.5)))
-            src[r, c] = np.uint16(min(65535, int(src[r, c]) + 1))
+        hit = hits > 0
+        # log-odds update: p/(1-p); a hit adds confidence^...; keep a
+        # bounded running log-odds so a lone false positive fades.
+        delta = 2.0 * (feature.confidence - 0.5)
+        lodds[hit] = np.clip(lodds[hit] + delta * hits[hit], -8.0, 8.0)
+        src[hit] = np.minimum(
+            65535, src[hit].astype(np.int64) + hits[hit]).astype(np.uint16)
 
     def get(self, channel: str) -> np.ndarray:
         """Probability 0..1 raster for a channel (sigmoid of log-odds)."""
@@ -146,37 +166,61 @@ def project_mask_to_ego(mask, cam, pos, heading, ground_z: float = 0.0,
     ego coords so many cameras can be fused by ``fuse_camera_features``.
     Returns a list of (M, 3) arrays - one per role, ready to be wrapped
     in a ``CameraFeature``.
+
+    Fully vectorised (meshgrid over the sampled mask pixels); the
+    per-pixel ray math is identical to the original scalar loop.
     """
-    import numpy as _np
     h, w = mask.shape[:2]
     C, r_vec, f_vec, u_vec = cam.camera_pose(pos, heading)
-    samples = []
     fx, fy = cam.fx, cam.fy
     cx, cy = cam.cx, cam.cy
     ch = math.cos(float(heading))
     sh = math.sin(float(heading))
-    for v in range(0, h, step):
-        for u in range(0, w, step):
-            if not mask[v, u]:
-                continue
-            x_cam = (u - cx) / fx
-            y_cam = (v - cy) / fy
-            D = (x_cam * r_vec + y_cam * -u_vec + 1.0 * f_vec)
-            if D[2] >= -1e-6:
-                continue
-            t = (float(ground_z) - float(C[2])) / float(D[2])
-            if not (0.0 < t <= max_ahead_m):
-                continue
-            wx = float(C[0]) + t * float(D[0])
-            wy = float(C[1]) + t * float(D[1])
-            ex = (wx - float(pos[0])) * ch + (wy - float(pos[1])) * sh
-            ey = -(wx - float(pos[0])) * sh + (wy - float(pos[1])) * ch
-            if ex * ex + ey * ey > max_ahead_m * max_ahead_m:
-                continue
-            samples.append((ex, ey, 0.0))
-    if not samples:
+    us = np.arange(0, w, step)
+    vs = np.arange(0, h, step)
+    uu, vv = np.meshgrid(us, vs)
+    ok = np.asarray(mask[vv, uu], dtype=bool)
+    xc = (uu - cx) / fx
+    yc = (vv - cy) / fy
+    D = xc[..., None] * r_vec - yc[..., None] * u_vec + f_vec
+    Dz = D[..., 2]
+    ok &= Dz < -1e-6
+    t = np.zeros_like(Dz)
+    np.divide(ground_z - C[2], Dz, out=t, where=ok)
+    good = ok & (t > 0.0) & (t <= max_ahead_m)
+    wx = C[0] + t * D[..., 0]
+    wy = C[1] + t * D[..., 1]
+    ex = (wx - float(pos[0])) * ch + (wy - float(pos[1])) * sh
+    ey = -(wx - float(pos[0])) * sh + (wy - float(pos[1])) * ch
+    good &= ex * ex + ey * ey <= max_ahead_m * max_ahead_m
+    if not good.any():
         return []
-    return [np.asarray(samples, dtype=float).reshape(-1, 3)]
+    pts = np.column_stack([ex[good], ey[good], np.zeros(int(good.sum()))])
+    return [pts]
+
+
+def stamp_signal_bearing(fmap: BEVFeatureMap, cam, px, confidence: float,
+                         role: str = "front_main",
+                         d_lo_m: float = 6.0, d_hi_m: float = 24.0,
+                         step_m: float = 2.0) -> None:
+    """Stamp a detected traffic lamp into the ``sign`` channel.
+
+    A signal lamp hangs OVERHEAD, so a ground-plane back-projection of
+    its pixel is meaningless (the ray lands tens of metres past the
+    pole).  The honest spatial read a single front camera can give is
+    the lamp's BEARING (from the pixel column through the pinhole) plus
+    the fact that a signal exists somewhere ahead of it: the lamp is
+    stamped as a distance band along that bearing, so vector space
+    carries "traffic control ahead at this bearing" for the planner and
+    the E2E input instead of a dead channel.
+    """
+    u = (float(px[0]) - float(cam.cx)) / float(cam.fx)
+    ds = np.arange(float(d_lo_m), float(d_hi_m) + 0.5 * float(step_m),
+                   float(step_m))
+    # ego frame: x forward, y LEFT positive - a lamp right of the image
+    # centre (u > 0) must land on negative-y cells.
+    pts = np.column_stack([ds, -ds * u, np.zeros_like(ds)])
+    fmap.accumulate(CameraFeature(role, "sign", pts, confidence=confidence))
 
 
 def fuse_front_frame_vector_space(
@@ -191,7 +235,8 @@ def fuse_front_frame_vector_space(
     ROAD mask votes into ``drivable``, the painted LINE mask into
     ``lane`` (both back-projected to ego via ``project_mask_to_ego``),
     and the LiDAR obstacle points into ``obstacle``.  ``sign`` stays
-    neutral (the shadow recorder has no sign head yet).
+    neutral here (the shadow recorder has no sign head yet; the live
+    FSDStack.tick stamps it via ``stamp_signal_bearing``).
 
     ``masks`` is a dict-like of semantic boolean masks (``road`` /
     ``line``); ``obstacles`` an iterable of objects with ``.x`` / ``.y``

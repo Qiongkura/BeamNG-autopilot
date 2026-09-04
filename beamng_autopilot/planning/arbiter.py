@@ -221,6 +221,10 @@ def lane_side_offset_m(lane, route, pos, max_m: float = 20.0):
     the paired vision/LiDAR lane locked onto the oncoming lane, passed
     the bearing gate - same direction - and the car rode the centre line
     / oncoming lane end to end).  None when no measurable overlap.
+
+    Vectorised point-to-polyline projection (same math as the scalar
+    loop it replaces: nearest route segment per lane point, segments
+    farther than 12 m skipped, first-minimum tie-breaking preserved).
     """
     if route is None or len(route) < 2 or lane is None or len(lane) < 2:
         return None
@@ -233,30 +237,28 @@ def lane_side_offset_m(lane, route, pos, max_m: float = 20.0):
         near = l[dl <= max_m]
     if len(near) < 2:
         return None
-    vals = []
-    for px, py in near:
-        best = None
-        for k in range(len(r) - 1):
-            ax, ay = r[k]
-            bx, by = r[k + 1]
-            tx, ty = bx - ax, by - ay
-            l2 = tx * tx + ty * ty
-            if l2 < 1e-12:
-                continue
-            t = max(0.0, min(1.0, ((px - ax) * tx + (py - ay) * ty) / l2))
-            cx, cy = ax + t * tx, ay + t * ty
-            sx, sy = px - cx, py - cy
-            d = math.hypot(sx, sy)
-            if d > 12.0:
-                continue
-            cross = tx * sy - ty * sx   # >0 = left of travel
-            sign = 1.0 if cross > 0 else -1.0
-            val = sign * d
-            if best is None or d < best[0]:
-                best = (d, val)
-        if best is not None:
-            vals.append(best[1])
-    return float(np.median(vals)) if vals else None
+    seg = r[1:] - r[:-1]                                  # (M-1, 2)
+    raw_l2 = (seg * seg).sum(axis=1)
+    l2 = np.maximum(raw_l2, 1e-12)
+    rel = near[:, None, :] - r[None, :-1, :]              # (K, M-1, 2)
+    t = np.clip(np.einsum("kmi,mi->km", rel, seg) / l2[None, :], 0.0, 1.0)
+    proj = r[None, :-1, :] + t[..., None] * seg[None, :, :]
+    d = np.linalg.norm(proj - near[:, None, :], axis=2)   # (K, M-1)
+    # zero-length segments were skipped entirely by the scalar loop
+    d[:, raw_l2 < 1e-12] = np.inf
+    bi = np.argmin(d, axis=1)
+    rows = np.arange(len(near))
+    dmin = d[rows, bi]
+    # a lane point whose WHOLE route is > 12 m away contributes nothing
+    # (the scalar loop skipped every such segment)
+    keep = dmin <= 12.0
+    if not keep.any():
+        return None
+    sy = near[keep, 1] - proj[rows[keep], bi[keep], 1]
+    sx = near[keep, 0] - proj[rows[keep], bi[keep], 0]
+    cross = seg[bi[keep], 0] * sy - seg[bi[keep], 1] * sx  # >0 = left
+    val = np.where(cross > 0, 1.0, -1.0) * dmin[keep]
+    return float(np.median(val))
 
 
 def lane_side_ok(lane, route, pos, left_max_m: float = 0.0) -> bool:

@@ -124,3 +124,32 @@ def test_fuse_front_frame_vector_space_none_when_empty() -> None:
         {}, cam, np.array([0.0, 0.0, 0.0]), 0.0,
         ground_z=0.0, obstacles=(), n=60, res=0.5)
     assert fmap is None
+
+
+def test_stamp_signal_bearing_places_lamp_by_pixel_bearing() -> None:
+    from types import SimpleNamespace
+
+    from beamng_autopilot.bev_fusion import stamp_signal_bearing
+
+    cam = SimpleNamespace(fx=100.0, cx=80.0)
+    # lamp RIGHT of the image centre (u = +0.4): ego y must be NEGATIVE
+    fmap = BEVFeatureMap(n=40, res=0.5)   # extent 10 m
+    stamp_signal_bearing(fmap, cam, (120.0, 20.0), confidence=0.9,
+                         d_lo_m=6.0, d_hi_m=9.0, step_m=3.0)
+    p = fmap.get("sign")
+    right_cell = fmap._cell(6.0, -6.0 * 0.4)
+    left_cell = fmap._cell(6.0, +6.0 * 0.4)
+    assert right_cell is not None and p[right_cell] > 0.5
+    assert left_cell is None or p[left_cell] <= 0.5
+    # lamp straight ahead (u = 0): the band sits along the y=0 axis
+    fmap2 = BEVFeatureMap(n=40, res=0.5)
+    stamp_signal_bearing(fmap2, cam, (80.0, 20.0), confidence=0.9,
+                         d_lo_m=6.0, d_hi_m=9.0, step_m=3.0)
+    fwd_cell = fmap2._cell(6.0, 0.0)
+    assert fwd_cell is not None and fmap2.get("sign")[fwd_cell] > 0.5
+    # low confidence: the band must stay neutral (no dead-channel noise;
+    # neutral probability is exactly sigmoid(0) = 0.5)
+    fmap3 = BEVFeatureMap(n=40, res=0.5)
+    stamp_signal_bearing(fmap3, cam, (120.0, 20.0), confidence=0.3,
+                         d_lo_m=6.0, d_hi_m=9.0, step_m=3.0)
+    assert float(fmap3.get("sign").max()) <= 0.5
