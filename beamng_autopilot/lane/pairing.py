@@ -243,6 +243,22 @@ def _yellow_right_ok(c: _LineCandidate) -> bool:
     return float(np.median(near[:, 1])) <= -1.5
 
 
+def _cand_side(c: _LineCandidate) -> float:
+    """Lateral offset used for left/right side classification.
+
+    On a bend the far end of a curved marking swings back toward the car,
+    so the whole-polyline median can sit on the wrong side of the car even
+    when the line next to the car is genuinely right/left of it.  The
+    near-field median is the side of the line that defines the current
+    lane, so prefer it and fall back to the whole-line median only when
+    there is nothing reliable beside the car.
+    """
+    near = c.proj[c.proj[:, 0] <= LANE_SINGLE_NEAR_REQUIRE_M]
+    if len(near) >= 2:
+        return float(np.median(near[:, 1]))
+    return float(c.med_lat)
+
+
 def _near_stats(c: _LineCandidate) -> tuple[int, float | None]:
     """Number of valid near points and their median lateral offset.
 
@@ -270,10 +286,10 @@ def _best_vision_pair(cands: list[_LineCandidate],
     dashed/thin centre line paired with a real right line: when the two
     form a wide lane the midpoint is still the best read (run 84).
     """
-    left_pool = [c for c in cands if c.med_lat > 0.08]
-    left_pool += [a for a in axes if a.med_lat >= 0.0]
-    right_pool = [c for c in cands if c.med_lat < -0.08]
-    right_pool += [a for a in axes if a.med_lat < 0.0]
+    left_pool = [c for c in cands if _cand_side(c) > 0.08]
+    left_pool += [a for a in axes if _cand_side(a) >= 0.0]
+    right_pool = [c for c in cands if _cand_side(c) < -0.08]
+    right_pool += [a for a in axes if _cand_side(a) < 0.0]
     right_pool = [c for c in right_pool if _yellow_right_ok(c)]
     # A paired lane usually has to start next to the car on at least one
     # side: real camera lines often begin a few metres ahead on one edge,
@@ -388,9 +404,9 @@ def _best_single_boundary(cands: list[_LineCandidate],
         # otherwise steer the car toward the roadside.
         if c.kind not in ("solid", "dashed", "thin"):
             continue
-        if side > 0 and c.med_lat <= 0.08:
+        if side > 0 and _cand_side(c) <= 0.08:
             continue
-        if side < 0 and c.med_lat >= -0.08:
+        if side < 0 and _cand_side(c) >= -0.08:
             continue
         # A mirror fallback assumes the line is the near edge of the lane.
         # A line whose median sits on top of the car (or on the far side
