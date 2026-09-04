@@ -51,8 +51,47 @@ FSD_INVARIANTS = (
 
 # Module source files that must NEVER import the road graph / map lane
 # geometry (the perception-only rule).  Checked by test_fsd_realism.
+# Every entry is a perception / safety / planning / control pure-logic
+# module (no RoadNetwork, DecalRoad, map lane or nav polyline reference).
+# fsd_stack.py is deliberately NOT listed: it is the integration point
+# that legitimately consumes the nav route as destination intent.
 NO_MAP_GUARDED_FILES = (
+    # lane perception
     "beamng_autopilot/lane/perception_guard.py",
+    "beamng_autopilot/lane/constants.py",
+    "beamng_autopilot/lane/fusion.py",
+    "beamng_autopilot/lane/lidar.py",
+    "beamng_autopilot/lane/pairing.py",
+    "beamng_autopilot/lane/tracking.py",
+    # camera-ring vision perception
+    "beamng_autopilot/vision/ring.py",
+    "beamng_autopilot/vision/lanes.py",
+    "beamng_autopilot/vision/hydra.py",
+    "beamng_autopilot/vision/segmentation.py",
+    "beamng_autopilot/vision/band.py",
+    "beamng_autopilot/vision/detection.py",
+    # BEV / temporal / safety
+    "beamng_autopilot/occupancy.py",
+    "beamng_autopilot/bev_fusion.py",
+    "beamng_autopilot/temporal.py",
+    "beamng_autopilot/safety_monitor.py",
+    # planning pure logic (sensor-space planning, not map polylines)
+    "beamng_autopilot/planning/arbiter.py",
+    "beamng_autopilot/planning/constraints.py",
+    "beamng_autopilot/planning/geometry.py",
+    "beamng_autopilot/planning/intent.py",
+    "beamng_autopilot/planning/scene.py",
+    "beamng_autopilot/planning/selector.py",
+    "beamng_autopilot/planning/speed_profile.py",
+    "beamng_autopilot/planning/trajectory.py",
+    # control pure logic (tracking / gearbox / anti-reverse / speed)
+    "beamng_autopilot/control/gearbox.py",
+    "beamng_autopilot/control/handover.py",
+    "beamng_autopilot/control/pid.py",
+    "beamng_autopilot/control/pure_pursuit.py",
+    "beamng_autopilot/control/reverse_guard.py",
+    "beamng_autopilot/control/reverse_maneuver.py",
+    "beamng_autopilot/control/speed.py",
 )
 
 

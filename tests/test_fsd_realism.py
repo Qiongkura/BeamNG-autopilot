@@ -7,6 +7,7 @@ import pytest
 
 from beamng_autopilot.fsd_realism import (
     FSD_INVARIANTS,
+    NO_MAP_GUARDED_FILES,
     SRC_MAP,
     SRC_SENSOR,
     SRC_UNAVAILABLE,
@@ -48,9 +49,44 @@ def test_invariants_registry_complete() -> None:
 
 
 def test_perception_guard_has_no_map_imports() -> None:
-    # The perception-only lateral guard must never pull in the road
-    # graph / map lane code - the hard rule from docs/fsd_realism.md.
+    # Perception / safety / planning / control pure-logic modules must
+    # never pull in the road graph / map lane code - the hard rule from
+    # docs/fsd_realism.md.
     assert check_no_map_imports() == []
+
+
+def test_no_map_guard_covers_whole_perception_safety_planning_stack() -> None:
+    # The machine-checkable guard must not silently shrink: these are the
+    # modules that are required to stay sensor-only by the FSD invariants.
+    required = [
+        "beamng_autopilot/lane/perception_guard.py",
+        "beamng_autopilot/lane/fusion.py",
+        "beamng_autopilot/lane/lidar.py",
+        "beamng_autopilot/lane/pairing.py",
+        "beamng_autopilot/lane/tracking.py",
+        "beamng_autopilot/vision/lanes.py",
+        "beamng_autopilot/vision/hydra.py",
+        "beamng_autopilot/vision/segmentation.py",
+        "beamng_autopilot/occupancy.py",
+        "beamng_autopilot/bev_fusion.py",
+        "beamng_autopilot/temporal.py",
+        "beamng_autopilot/safety_monitor.py",
+        "beamng_autopilot/planning/constraints.py",
+        "beamng_autopilot/planning/selector.py",
+        "beamng_autopilot/planning/trajectory.py",
+        "beamng_autopilot/planning/scene.py",
+        "beamng_autopilot/control/reverse_guard.py",
+        "beamng_autopilot/control/reverse_maneuver.py",
+        "beamng_autopilot/control/speed.py",
+    ]
+    assert set(required) <= set(NO_MAP_GUARDED_FILES)
+
+
+def test_fsd_stack_is_not_guarded_but_still_split_from_lateral_logic() -> None:
+    # fsd_stack.py is the integration point: it legitimately consumes the
+    # nav route as *destination intent* only.  It must stay out of the
+    # never-map list (that list is for sensor-only modules).
+    assert "beamng_autopilot/fsd_stack.py" not in NO_MAP_GUARDED_FILES
 
 
 def test_fsd_stack_accepts_strict_param() -> None:
