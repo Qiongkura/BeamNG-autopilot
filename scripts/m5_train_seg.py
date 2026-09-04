@@ -11,6 +11,12 @@ r"""M5 路面/标线分割训练：轻量 UNet（beamng_autopilot.vision.segment
 --min-line-frac <x>：丢弃标线像素占比低于 x 的帧（x 常用 0.003）。
 标线稀疏帧大多是无标线路段，混进训练只稀释 line 监督；held-out 评估
 （run_navroute_town / run_bridge）显示密集 run 训练的模型泛化才有效。
+--balance-runs：多 run 等量采样，每个 run 每 epoch 贡献相同帧数
+（小 run 循环补齐），防止帧数多的 run 数值主导梯度——v9 教训：
+标线稀疏 run 帧数多会淹没密集 run，模型被教成"标线很稀有"。
+
+验证/评估指标口径：IoU 用全局累加 inter/union 计算（iou_from_accum），
+未出现的类别不虚高为 1.0、不计入 mIoU。
 
 用法:
     .venv\Scripts\python.exe scripts\m5_train_seg.py --runs logs\m5_seg\run_*
@@ -36,7 +42,9 @@ import torch.nn as nn
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from beamng_autopilot import config
-from beamng_autopilot.vision.segmentation import SegUNet, N_CLASSES, CLASS_NAMES
+from beamng_autopilot.vision.segmentation import (
+    SegUNet, N_CLASSES, CLASS_NAMES, iou_from_accum,
+)
 
 
 def load_frames(
@@ -120,6 +128,58 @@ def split_frames(
         return train_frames, val_frames
     n_val = max(1, int(len(frames) * val_frac))
     return frames[:len(frames) - n_val], frames[len(frames) - n_val:]
+
+
+def train_run_bounds(
+    frames: list[tuple[np.ndarray, np.ndarray]], per_run: dict,
+    split: str, val_frac: float,
+) -> list[tuple[int, int]]:
+    """split_frames 划分后，各 run 在训练帧列表中的 [start, end) 下标。
+
+    与 split_frames 保持同一套逻辑（per-run 取每 run 头部、tail 取
+    全局头部），供 --balance-runs 做逐 run 等量采样。
+    """
+    bounds: list[tuple[int, int]] = []
+    if split == "per-run":
+        off = 0
+        for rec in per_run.values():
+            k = rec["kept"]
+            if k <= 1:
+                bounds.append((off, off + k))
+                off += k
+                continue
+            n_val = max(1, int(k * val_frac))
+            bounds.append((off, off + (k - n_val)))
+            off += k - n_val
+        return bounds
+    end = len(frames) - max(1, int(len(frames) * val_frac))
+    for rec in per_run.values():
+        s, e = rec["start"], rec["end"]
+        bounds.append((min(s, end), min(e, end)))
+    return bounds
+
+
+def balanced_indices(run_bounds: list[tuple[int, int]],
+                     rng: np.random.Generator) -> np.ndarray:
+    """多 run 等量采样：每个 run 每 epoch 贡献相同帧数（小 run 循环补齐）。
+
+    多 run 混训时帧数多的 run 会数值压制其他 run（v9 教训：标线稀疏
+    run 帧数多，淹没密集 run，模型被教成"标线很稀有"，line 召回掉档）。
+    等量采样让每个路段域对梯度贡献相同，稀疏 run 不再靠帧数主导。
+    """
+    nonempty = [(s, e) for s, e in run_bounds if e > s]
+    if not nonempty:
+        return np.array([], dtype=np.int64)
+    n_max = max(e - s for s, e in nonempty)
+    idx = []
+    for s, e in nonempty:
+        n = e - s
+        perm = rng.permutation(n)
+        reps = int(np.ceil(n_max / n))
+        idx.append((np.tile(perm, reps)[:n_max] + s).astype(np.int64))
+    out = np.concatenate(idx)
+    rng.shuffle(out)
+    return out
 
 
 def _augment(frame, rng: np.random.Generator,
@@ -212,6 +272,10 @@ def main() -> None:
     ap.add_argument("--min-line-frac", type=float, default=0.0,
                     help="丢弃标线像素占比低于该值的帧（如 0.003），"
                          "防止无标线路段稀释 line 监督")
+    ap.add_argument("--balance-runs", action="store_true",
+                    help="多 run 等量采样：每个 run 每 epoch 贡献相同帧数"
+                         "（小 run 循环补齐），防止帧数多的 run 数值主导"
+                         "梯度（v9 教训：稀疏 run 淹没密集 run）")
     ap.add_argument("--line-weight", type=float, default=2.0,
                     help="extra multiplier on the line class loss weight")
     ap.add_argument("--line-morph", action="store_true",
@@ -249,8 +313,15 @@ def main() -> None:
     n = len(frames)
     train_frames, val_frames = split_frames(
         frames, per_run, args.split, args.val_frac)
+    train_bounds = train_run_bounds(
+        frames, per_run, args.split, args.val_frac)
     print(f"[train] 共 {n} 帧: 训练 {len(train_frames)} / 验证 {len(val_frames)}",
           flush=True)
+    if args.balance_runs:
+        n_max = max((e - s for s, e in train_bounds if e > s), default=0)
+        print(f"[train] balance_runs: 每轮每 run 等量采样 "
+              f"(各 {n_max} 帧/run, 共 "
+              f"{len(train_bounds) * n_max} 帧/轮)", flush=True)
     print(f"[train] 类别: {CLASS_NAMES}", flush=True)
     for name, rec in sorted(per_run.items()):
         drop = rec["frames"] - rec["kept"]
@@ -275,13 +346,23 @@ def main() -> None:
         y = torch.from_numpy(label).long()
         return x.to(dev), y.to(dev)
 
-    def run_epoch(fr, train: bool):
+    def run_epoch(fr, train: bool, ep: int = 0, balance_runs: bool = False,
+                  run_bounds: list[tuple[int, int]] | None = None):
         model.train(train)
         total_loss, correct, n_pix = 0.0, 0, 0
-        ious = np.zeros(N_CLASSES)
-        rng = np.random.default_rng(args.seed + len(fr))
-        for i in range(0, len(fr), args.batch):
-            batch = fr[i:i + args.batch]
+        inter = np.zeros(N_CLASSES)
+        union = np.zeros(N_CLASSES)
+        # 每轮独立随机种子：旧写法 seed 只看 len(fr) 恒定不变，导致
+        # 每轮增强/洗牌序列完全一致，等于数据没有随机化。
+        rng = np.random.default_rng(args.seed + ep * 1000003 + len(fr))
+        if train and balance_runs and run_bounds:
+            order = balanced_indices(run_bounds, rng)
+        elif train:
+            order = rng.permutation(len(fr))
+        else:
+            order = np.arange(len(fr))
+        for i in range(0, len(order), args.batch):
+            batch = [fr[int(j)] for j in order[i:i + args.batch]]
             if train:
                 batch = [_augment(f, rng, line_morph=args.line_morph)
                          for f in batch]
@@ -306,12 +387,12 @@ def main() -> None:
             for c in range(N_CLASSES):
                 p = (pred == c)
                 t = (ys == c)
-                inter = int((p & t).sum())
-                union = int((p | t).sum())
-                ious[c] += inter / union if union else 1.0
-        n_b = max(1, (len(fr) + args.batch - 1) // args.batch)
-        ious /= n_b
-        return total_loss / max(1, len(fr)), correct / max(1, n_pix), ious
+                inter[c] += int((p & t).sum())
+                union[c] += int((p | t).sum())
+        ious = iou_from_accum(inter, union)
+        present = union > 0
+        return (total_loss / max(1, len(fr)),
+                correct / max(1, n_pix), ious, present)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -333,10 +414,14 @@ def main() -> None:
 
     for ep in range(start_ep, args.epochs):
         t0 = time.time()
-        tr_loss, tr_acc, _ = run_epoch(train_frames, train=True)
+        tr_loss, tr_acc, _, _ = run_epoch(
+            train_frames, train=True, ep=ep,
+            balance_runs=args.balance_runs, run_bounds=train_bounds)
         sched.step()
-        va_loss, va_acc, va_ious = run_epoch(val_frames, train=False)
-        m_iou = float(va_ious.mean())
+        va_loss, va_acc, va_ious, va_present = run_epoch(
+            val_frames, train=False, ep=ep)
+        m_iou = (float(va_ious[va_present].mean())
+                 if va_present.any() else 0.0)
         hist["epoch"].append(ep)
         hist["train_loss"].append(round(tr_loss, 4))
         hist["val_miou"].append(round(m_iou, 4))
@@ -367,6 +452,7 @@ def main() -> None:
                     "runs": [str(p) for p in args.runs],
                     "split": args.split,
                     "min_line_frac": args.min_line_frac,
+                    "balance_runs": args.balance_runs,
                     "n_train": len(train_frames),
                     "n_val": len(val_frames),
                 },
@@ -393,6 +479,7 @@ def main() -> None:
                 "runs": [str(p) for p in args.runs],
                 "split": args.split,
                 "min_line_frac": args.min_line_frac,
+                "balance_runs": args.balance_runs,
                 "n_train": len(train_frames),
                 "n_val": len(val_frames),
             },

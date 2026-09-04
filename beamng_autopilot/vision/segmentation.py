@@ -33,6 +33,22 @@ _INFER_W, _INFER_H = 536, 403  # 训练分辨率
 _LINE_MIN_AREA_PX = 150
 
 
+def iou_from_accum(inter: np.ndarray, union: np.ndarray) -> np.ndarray:
+    """由全局累加的 inter/union 计算各类 IoU，未出现的类别记 0。
+
+    旧写法逐帧 ``inter / union if union else 1.0`` 再平均：对稀疏类
+    （标线）几乎每帧 union==0，被记成满分，line IoU 被显著虚高。
+    全局累加只对真实存在的类别给分：``IoU = total_inter /
+    total_union``，全程没有该类别则记 0。
+    """
+    inter = np.asarray(inter, dtype=np.float64)
+    union = np.asarray(union, dtype=np.float64)
+    present = union > 0
+    ious = np.zeros_like(inter)
+    ious[present] = inter[present] / union[present]
+    return ious
+
+
 class SegUNet(nn.Module):
     """Lightweight UNet: 3 encoder blocks + skip connections (~1.3M params)."""
 
