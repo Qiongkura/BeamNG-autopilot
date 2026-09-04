@@ -58,17 +58,23 @@ class E2ENetTorch(nn.Module):
     """
 
     def __init__(self, grid_n: int = GRID_N, n_waypoints: int = N_WAYPOINTS,
-                 latent: int = 256, history: int = 0) -> None:
+                 latent: int = 256, history: int = 0,
+                 bev_channels: int = 4) -> None:
         super().__init__()
         self.grid_n = int(grid_n)
         self.n_waypoints = int(n_waypoints)
         self.history = int(history)
+        # Vector-space input channels: the fused BEV feature map records
+        # (obstacle, drivable, lane, sign); ``1`` keeps legacy occupancy
+        # checkpoints loadable unchanged.
+        self.bev_channels = int(bev_channels)
         self.rgb_enc = nn.Sequential(
             _ConvBlock(3, 16), _ConvBlock(16, 32), _ConvBlock(32, 64))
         self.label_enc = nn.Sequential(
             _ConvBlock(1, 8), _ConvBlock(8, 16))
         self.bev_enc = nn.Sequential(
-            _ConvBlock(1, 32), _ConvBlock(32, 64), _ConvBlock(64, 64))
+            _ConvBlock(self.bev_channels, 32),
+            _ConvBlock(32, 64), _ConvBlock(64, 64))
         self.rgb_pool = nn.AdaptiveAvgPool2d((4, 4))
         self.label_pool = nn.AdaptiveAvgPool2d((4, 4))
         self.bev_pool = nn.AdaptiveAvgPool2d((4, 4))
@@ -117,7 +123,8 @@ class E2ENetTorch(nn.Module):
         elif label.dim() == 4:
             label = label.unsqueeze(1)
         if bev is None:
-            bev = torch.zeros(b, 1, 1, self.grid_n, self.grid_n,
+            bev = torch.zeros(b, 1, self.bev_channels, self.grid_n,
+                              self.grid_n,
                               device=dev, dtype=rgb.dtype)
         elif bev.dim() == 4:
             bev = bev.unsqueeze(1)
@@ -164,8 +171,15 @@ class E2ENetTorch(nn.Module):
                     np.asarray(label, dtype=np.float32)[None, None])
             t_bev = None
             if bev is not None:
-                t_bev = torch.from_numpy(
-                    np.asarray(bev, dtype=np.float32)[None, None])
+                _b = np.asarray(bev, dtype=np.float32)
+                if _b.ndim == 2:
+                    _b = np.repeat(_b[None], self.bev_channels, axis=0)
+                elif _b.ndim == 3 and _b.shape[0] != self.bev_channels:
+                    if _b.shape[0] == 1:
+                        _b = np.repeat(_b, self.bev_channels, axis=0)
+                    else:
+                        _b = _b[:self.bev_channels]
+                t_bev = torch.from_numpy(_b)[None]
             traj, action = self.forward(
                 t_rgb.to(device), t_label.to(device) if t_label is not None
                 else None,

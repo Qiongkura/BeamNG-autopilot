@@ -48,14 +48,16 @@ def _load_trained(weights: str, device: str):
     ckpt = torch.load(weights, map_location="cpu")
     net_torch = E2ENetTorch(grid_n=ckpt["grid_n"],
                             n_waypoints=ckpt["n_waypoints"],
-                            history=int(ckpt.get("history", 0)))
+                            history=int(ckpt.get("history", 0)),
+                            bev_channels=int(ckpt.get("bev_channels", 1)))
     net_torch.load_state_dict(ckpt["model"])
     net_torch.to(device)
     net_torch.eval()
     return net_torch, ckpt, int(ckpt["img_h"]), int(ckpt["img_w"])
 
 
-def _prep_arr(i: int, rgb, label, bev, img_h: int, img_w: int):
+def _prep_arr(i: int, rgb, label, bev, img_h: int, img_w: int,
+              bev_channels: int = 1):
     """Resize one recorded frame for the trained CNN.
 
     Arrays are already loaded in memory (indexing a compressed npz
@@ -78,7 +80,13 @@ def _prep_arr(i: int, rgb, label, bev, img_h: int, img_w: int):
             label_i.astype(np.float32))[None, None]
         t_label = F.interpolate(t_label, size=(img_h, img_w),
                                 mode="nearest")[0]
-    t_bev = torch.from_numpy(np.asarray(bev[i], dtype=np.float32))[None]
+    _b = np.asarray(bev[i], dtype=np.float32)
+    if _b.ndim == 2:
+        _b = _b[None]
+    if _b.shape[0] != bev_channels:
+        _b = np.repeat(_b, bev_channels, axis=0) if _b.shape[0] == 1 \
+            else _b[:bev_channels]
+    t_bev = torch.from_numpy(_b)  # (C, N, N); _predict adds B/T dims
     return t_rgb, t_label, t_bev
 
 
@@ -89,7 +97,8 @@ def _predict(net_torch, net, rgb, label, bev, speed, i: int,
         h = net_torch.history
         need = h + 1
         i0 = max(0, i - h)
-        frames = [_prep_arr(j, rgb, label, bev, img_h, img_w)
+        bch = int(getattr(net_torch, "bev_channels", 1))
+        frames = [_prep_arr(j, rgb, label, bev, img_h, img_w, bch)
                   for j in range(i0, i + 1)]
         pads = need - len(frames)  # missing at the episode start
         if pads:

@@ -29,6 +29,7 @@ import torch
 import torch.nn.functional as F
 
 from .e2e_torch import E2ENetTorch
+from ..bev_fusion import BEVFeatureMap
 
 DEFAULT_E2E_WEIGHTS = "logs/m5_e2e/best_temporal.pt"
 
@@ -66,6 +67,7 @@ class E2ERuntime:
         self.img_h = 120
         self.img_w = 160
         self.grid_n = 60
+        self.bev_channels = 1
         self._buf: deque | None = None
         if self.weights is not None and self.weights.exists():
             self._load()
@@ -94,12 +96,14 @@ class E2ERuntime:
         net = E2ENetTorch(
             grid_n=int(ckpt.get("grid_n", 60)),
             n_waypoints=int(ckpt.get("n_waypoints", 16)),
-            history=int(ckpt.get("history", 0)))
+            history=int(ckpt.get("history", 0)),
+            bev_channels=int(ckpt.get("bev_channels", 1)))
         net.load_state_dict(ckpt["model"])
         net.to(self.device)
         net.eval()
         self.net = net
         self.ckpt = ckpt
+        self.bev_channels = int(net.bev_channels)
         self.img_h = int(ckpt.get("img_h", 120))
         self.img_w = int(ckpt.get("img_w", 160))
         self.grid_n = int(ckpt.get("grid_n", 60))
@@ -141,6 +145,46 @@ class E2ERuntime:
                 lab[:] = np.where(_mask2d(l, (h, w)), 2, lab)
         return lab
 
+    def _vector_input(self, out, bev) -> np.ndarray:
+        """Multi-channel vector space (C, N, N) for the net's BEV encoder.
+
+        The fused ``feature_map`` carries the FSD-style channel stack
+        (obstacle / drivable / lane / sign); when the tick had no fusion
+        (or the checkpoint predates it) fall back to the occupancy raster
+        in the obstacle channel plus the drivable mask, so a vector-space
+        checkpoint still runs on degraded ticks.
+        """
+        if self.bev_channels <= 1:
+            return np.asarray(bev, dtype=np.float32)
+        n = self.grid_n
+        fm = getattr(out, "feature_map", None)
+        if fm is not None:
+            try:
+                chs = tuple(getattr(fm, "CHANNELS", None)
+                            or BEVFeatureMap.CHANNELS)
+                grid = np.stack(
+                    [np.asarray(fm.get(c), dtype=np.float32)
+                     for c in chs]).astype(np.float32)
+                if grid.ndim == 3 and grid.shape[0] == len(chs):
+                    return grid
+            except Exception:
+                pass
+        grid = np.zeros((len(BEVFeatureMap.CHANNELS), n, n),
+                        dtype=np.float32)
+        occ = np.asarray(bev, dtype=np.float32)
+        if occ.ndim == 3:
+            occ = occ[0] if occ.shape[0] == 1 else occ.mean(axis=0)
+        _o = occ[:n, :n]
+        if _o.shape != (n, n):
+            _o = np.pad(_o, ((0, n - _o.shape[0]), (0, n - _o.shape[1])))
+        grid[0] = _o
+        drv = getattr(out, "drivable", None)
+        if drv is not None:
+            _d = np.asarray(drv, dtype=np.float32)
+            if _d.shape == occ.shape:
+                grid[1] = _d[:n, :n]
+        return grid
+
     def _prep(self, rgb, label, bev):
         """One frame -> (t_rgb, t_label, t_bev) at the checkpoint shapes."""
         t_rgb = torch.from_numpy(
@@ -159,10 +203,18 @@ class E2ERuntime:
             t_label = F.interpolate(t_label, size=(self.img_h, self.img_w),
                                     mode="nearest")[0]
         bev = np.asarray(bev, dtype=np.float32)
-        if bev.ndim == 3:
-            bev = bev[0] if bev.shape[0] == 1 else bev.mean(axis=0)
-        t_bev = torch.from_numpy(bev)[None]
-        if t_bev.shape != (1, self.grid_n, self.grid_n):
+        if bev.ndim == 2:
+            bev = bev[None]  # (1, N, N) single-channel occupancy
+        # (C, N, N) channel-first; step() stacks frames along a new
+        # batch/time axis, so no leading batch dim here (same contract
+        # as t_rgb / t_label).
+        t_bev = torch.from_numpy(bev)
+        if t_bev.shape[0] != self.bev_channels:
+            if t_bev.shape[0] == 1:
+                t_bev = t_bev.repeat(self.bev_channels, 1, 1)
+            else:
+                t_bev = t_bev[:self.bev_channels]
+        if t_bev.shape[1:] != (self.grid_n, self.grid_n):
             t_bev = F.interpolate(t_bev[None],
                                   size=(self.grid_n, self.grid_n),
                                   mode="nearest")[0]
@@ -188,7 +240,8 @@ class E2ERuntime:
             return None, None, 0.0
         label = self._label_from_outputs(
             getattr(out, "head_outputs", None), rgb.shape[:2])
-        t_rgb, t_label, t_bev = self._prep(rgb, label, bev)
+        t_rgb, t_label, t_bev = self._prep(
+            rgb, label, self._vector_input(out, bev))
         assert self._buf is not None
         self._buf.append((t_rgb, t_label, t_bev))
         need = self.history + 1

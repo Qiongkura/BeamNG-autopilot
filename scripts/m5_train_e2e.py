@@ -86,6 +86,10 @@ def main() -> int:
     ap.add_argument("--history", type=int, default=2,
                     help="temporal context: stack this many past frames "
                          "(0 = single frame)")
+    ap.add_argument("--bev-channels", type=int, default=4,
+                    help="vector-space input channels: 4 = fused fmap "
+                         "(obstacle/drivable/lane/sign), "
+                         "1 = legacy occupancy raster")
     ap.add_argument("--drop-takeover-ge", type=float, default=None,
                     help="exclude episodes whose batch-replay takeover "
                          "rate >= this threshold (reads --report)")
@@ -166,7 +170,8 @@ def main() -> int:
         torch.utils.data.Subset(ds, val_idx.tolist()),
         batch_size=args.batch, shuffle=False, **dl_kw)
 
-    model = E2ENetTorch(history=args.history).to(device)
+    model = E2ENetTorch(history=args.history,
+                        bev_channels=args.bev_channels).to(device)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr,
                             weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
@@ -222,6 +227,7 @@ def main() -> int:
                         "grid_n": model.grid_n,
                         "n_waypoints": model.n_waypoints,
                         "history": model.history,
+                        "bev_channels": int(model.bev_channels),
                         "img_h": args.img_h, "img_w": args.img_w,
                         "min_quality": args.min_quality,
                         # 超参随模型落盘：复现/对比不同轮次有据可查

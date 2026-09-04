@@ -5,8 +5,11 @@ by ``ShadowRecorder`` (version 2: rgb + segmentation label + BEV raster
 + quality gate) into ``(rgb, label, bev) -> (trajectory_ego, mask,
 action)`` training pairs:
 
-* the segmentation label and the BEV raster are the two "perception"
-  views of the stack (semantic head and vector-space occupancy);
+* the segmentation label and the vector-space grid are the two
+  "perception" views of the stack (semantic head and fused BEV feature
+  map); the grid carries the FSD-style channel stack - obstacle /
+  drivable / lane / sign in recorded v3 episodes, synthesised from the
+  legacy occupancy + drivable raster when an older episode has no fmap;
 * the RGB frame is the raw-image view (DAVE-2 / image end-to-end);
 * the trajectory is re-expressed in the ego frame using the recorded
   pose so the regression target is well-posed (a single image cannot
@@ -91,7 +94,7 @@ def _build_index(ep_files, min_quality: float, min_speed: float,
                 if "throttle" in z else np.zeros(n, dtype=np.float64)
             has_rgb = "rgb" in z
             has_label = "label" in z
-            has_bev = "bev" in z
+            has_bev = ("bev" in z) or ("fmap" in z)
             if drop_wedge_episodes and _has_wedge_restart(spd):
                 continue
             last = None  # (speed, steer, throttle) of the last kept frame
@@ -204,6 +207,10 @@ class ShadowMultimodalDataset(torch.utils.data.Dataset):
             if "label" in z else None
         bev = np.asarray(z["bev"], dtype=np.float32) \
             if "bev" in z else None
+        fmap = np.asarray(z["fmap"], dtype=np.float32) \
+            if "fmap" in z else None
+        drv = np.asarray(z["drivable"], dtype=np.uint8) \
+            if "drivable" in z else None
         traj = np.asarray(z["trajectory"], dtype=np.float64)
         xs = np.asarray(z["x"], dtype=np.float64)
         ys = np.asarray(z["y"], dtype=np.float64)
@@ -236,10 +243,25 @@ class ShadowMultimodalDataset(torch.utils.data.Dataset):
                 t_bev = torch.from_numpy(bev[i])[None]
             else:
                 t_bev = torch.zeros(1, GRID_N, GRID_N, dtype=torch.float32)
+            if fmap is not None and fmap.shape[1] > 0:
+                t_fmap = torch.from_numpy(fmap[i])          # (C, N, N)
+                if t_fmap.shape[1:] != (GRID_N, GRID_N):
+                    t_fmap = F.interpolate(
+                        t_fmap[None], size=(GRID_N, GRID_N),
+                        mode="nearest")[0]
+            else:
+                # Legacy episode: synthesise the vector-space channels
+                # from the single-channel occupancy + drivable raster.
+                t_fmap = torch.zeros(4, GRID_N, GRID_N,
+                                     dtype=torch.float32)
+                t_fmap[0] = t_bev[0]
+                if drv is not None:
+                    t_fmap[1] = torch.from_numpy(
+                        drv[i].astype(np.float32))
             traj_ego, mask = self._traj_ego(
                 float(xs[i]), float(ys[i]), float(hdgs[i]), traj[i])
             frames.append({
-                "mods": [t_rgb, t_label, t_bev],
+                "mods": [t_rgb, t_label, t_fmap],
                 "traj": traj_ego,
                 "mask": mask,
                 "steer": float(steers[i]),
