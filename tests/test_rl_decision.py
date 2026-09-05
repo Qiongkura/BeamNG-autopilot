@@ -86,12 +86,16 @@ def test_env_slow_action_avoids_collision_better_than_cruise() -> None:
 
 # --- action mapping -------------------------------------------------------
 def test_action_to_target_only_slows() -> None:
+    # five levels: 1.0 / 0.8 / 0.6 / 0.35 / 0.1 of the plan target
     assert action_to_target(0, 6.0) == pytest.approx(6.0)
-    assert action_to_target(1, 6.0) == pytest.approx(3.6)
-    assert action_to_target(2, 6.0) == pytest.approx(1.5)
-    for a in (0, 1, 2, 99):
+    assert action_to_target(1, 6.0) == pytest.approx(4.8)
+    assert action_to_target(2, 6.0) == pytest.approx(3.6)
+    assert action_to_target(3, 6.0) == pytest.approx(2.1)
+    assert action_to_target(4, 6.0) == pytest.approx(0.6)
+    for a in range(5):
         assert action_to_target(a, 6.0) <= 6.0 + 1e-9
         assert action_to_target(a, 6.0) >= 0.5 - 1e-9
+    assert action_to_target(99, 6.0) == pytest.approx(6.0)  # unknown=cruise
 
 
 # --- runtime with a real trained model ------------------------------------
@@ -110,7 +114,7 @@ def test_dqn_runtime_load_and_predict(tmp_path) -> None:
     action, ms = rt.predict(speed=3.0, target_speed=6.0,
                             fwd_clearance=10.0, closest_obs=10.0,
                             lane_dev=0.1, road_off=0.0, n_tracks=1)
-    assert action in (0, 1, 2)
+    assert action in (0, 1, 2, 3, 4)
     assert ms >= 0.0
 
 
@@ -132,3 +136,65 @@ def test_trained_decision_policy_exists_and_evaluates() -> None:
         encoding="utf-8"))
     assert report["policy"]["collision_rate"] <= \
         report["baseline_cruise"]["collision_rate"]
+
+
+# --- sim mode wiring (stubbed conn/stack, no game) ------------------------
+class _StubState:
+    def __init__(self, speed=2.0):
+        self.pos = np.array([0.0, 0.0, 0.0])
+        self.heading = 0.0
+        self.speed = speed
+        self.vel = None
+        self.dir = None
+
+
+class _StubVehicle:
+    vid = "ego"
+
+
+class _StubConn:
+    vehicle = _StubVehicle()
+
+    def __init__(self):
+        self.speed = 2.0
+        self.controls = []
+
+    def get_state(self):
+        self.speed += 0.2
+        return _StubState(self.speed)
+
+    def control(self, **kw):
+        self.controls.append(kw)
+
+    def step(self, n):
+        self.steps = n
+
+
+class _StubOut:
+    best_speed = 4.0
+    forward_clearance = 30.0
+    best_path = np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]])
+    tracks = []
+
+
+class _StubStack:
+    def tick(self, st=None, route_ref=None, **kw):
+        return _StubOut()
+
+
+def test_sim_mode_requires_conn_and_stack() -> None:
+    with pytest.raises(ValueError):
+        DecisionSpeedEnv(mode="sim")
+
+
+def test_sim_step_runs_and_controls_car() -> None:
+    conn = _StubConn()
+    env = DecisionSpeedEnv(mode="sim", conn=conn, stack=_StubStack(),
+                           cruise_speed=4.0)
+    env.reset()
+    obs, reward, terminated, truncated, info = env.step(2)
+    assert obs.shape == (DECISION_OBS_SIZE,)
+    # at least one control frame with a steering command went out
+    assert any("steering" in c for c in conn.controls)
+    assert info["speed"] > 0.0
+    assert terminated in (True, False)

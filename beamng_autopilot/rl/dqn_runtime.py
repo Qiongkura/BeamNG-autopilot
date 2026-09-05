@@ -20,8 +20,13 @@ DEFAULT_DQN_WEIGHTS = "logs/m4_dqn/dqn_decision.zip"
 
 def action_to_target(action: int, target_speed: float,
                      min_speed: float = 0.5) -> float:
-    """Map a discrete decision onto a capped plan target speed."""
-    mult = {0: 1.0, 1: 0.6, 2: 0.25}.get(int(action), 1.0)
+    """Map a discrete decision onto a capped plan target speed.
+
+    Five speed levels (1.0 / 0.8 / 0.6 / 0.35 / 0.1 of the plan target,
+    mirroring the env's ACTION_MULT); unknown actions fall back to
+    cruise.  The mapping can only SLOW the plan.
+    """
+    mult = {0: 1.0, 1: 0.8, 2: 0.6, 3: 0.35, 4: 0.1}.get(int(action), 1.0)
     return max(float(min_speed), float(target_speed) * mult)
 
 

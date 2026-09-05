@@ -61,6 +61,101 @@ def evaluate(model, env, episodes: int = 12) -> dict:
     }
 
 
+def _train_sim(args, out) -> int:
+    """Online training against the live stack: the layered planner
+    steers, the DQN decides the longitudinal level.  Guarded by the
+    input watchdog; every episode ends with a full brake."""
+    import math
+    import time as _time
+
+    import numpy as np
+    from stable_baselines3 import DQN
+
+    from beamng_autopilot.connector import BeamNGConnector
+    from beamng_autopilot.fsd_stack import FSDStack
+    from beamng_autopilot.roadnet import RoadNetwork
+    from beamng_autopilot.vision.heads import (
+        LaneTopologyHead, ObjectHead, SemanticHead, TrafficSignalHead,
+    )
+    from beamng_autopilot.watchdog import arm as wd_arm
+    from beamng_autopilot.watchdog import disarm as wd_disarm
+
+    conn = BeamNGConnector(
+        "italy", "etk800",
+        port=config.runtime_port(args.runtime),
+        home=config.runtime_home(args.runtime))
+    conn.open(launch=False)
+    conn.attach_vehicle(already_open=True)
+    stack = FSDStack(conn, args.runtime,
+                     heads=[SemanticHead(), TrafficSignalHead(),
+                            ObjectHead(), LaneTopologyHead()],
+                     ring_roles=("front_main",),
+                     cam_w=400, cam_h=300,
+                     range_every_n=3, semantic_every_n=2,
+                     object_every_n=2)
+    stack.target_speed = 4.0
+    nav_route = [None]
+
+    def route_provider(pos, heading):
+        if args.sim_goal is None:
+            xs = np.linspace(0, 40, 41)
+            return np.column_stack([pos[0] + xs * math.cos(heading),
+                                    pos[1] + xs * math.sin(heading)])
+        if nav_route[0] is None:
+            rn = RoadNetwork()
+            t0 = _time.time()
+            while not rn.ready and _time.time() - t0 < 90.0:
+                try:
+                    if rn.build(conn.bng):
+                        break
+                except Exception:
+                    pass
+                _time.sleep(1.0)
+            if rn.ready:
+                n0 = rn.nodes[rn._nearest(pos[:2])]
+                rwe = rn.route_with_edges(
+                    n0, np.asarray(args.sim_goal, dtype=float))
+                if rwe[0] is not None and len(rwe[0]) >= 4:
+                    nav_route[0] = np.asarray(rwe[0][:, :2], dtype=float)
+                    print(f"[m4-sim] route: {len(nav_route[0])} pts")
+        r = nav_route[0]
+        if r is None:
+            xs = np.linspace(0, 40, 41)
+            return np.column_stack([pos[0] + xs * math.cos(heading),
+                                    pos[1] + xs * math.sin(heading)])
+        from beamng_autopilot.planning.local_route import local_route
+        return local_route(pos, heading, r)
+
+    env = DecisionSpeedEnv(
+        mode="sim", seed=args.seed, conn=conn, stack=stack,
+        route_provider=route_provider, cruise_speed=4.0,
+        episode_s=args.sim_decisions * 0.25)
+    try:
+        wd_arm(conn)
+        model = DQN("MlpPolicy", env, seed=args.seed, verbose=0,
+                    learning_rate=1e-3, buffer_size=20000,
+                    batch_size=64, train_freq=2,
+                    exploration_fraction=0.2, exploration_final_eps=0.1)
+        print(f"[m4-sim] training {args.steps} decisions live "
+              f"({args.sim_episodes} x {args.sim_decisions} steps)")
+        model.learn(total_timesteps=int(args.steps),
+                    reset_num_timesteps=False)
+        model.save(str(out))
+        print(f"[m4-sim] saved -> {out}")
+    finally:
+        try:
+            conn.control(throttle=0.0, brake=1.0, steering=0.0)
+            conn.step(5)
+        except Exception:
+            pass
+        try:
+            wd_disarm(conn)
+        except Exception:
+            pass
+    print("[m4-sim] done (car braked, watchdog disarmed)")
+    return 0
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="M4 DQN train + evaluate")
     ap.add_argument("--steps", type=int, default=60000,
@@ -73,6 +168,19 @@ def main() -> int:
                     help="skip training, evaluate existing weights")
     ap.add_argument("--eval-episodes", type=int, default=12)
     ap.add_argument("--no-eval", action="store_true")
+    ap.add_argument("--sim", action="store_true",
+                    help="train against the LIVE BeamNG stack (needs the "
+                         "game running; the layered stack steers, the DQN "
+                         "only caps the target speed)")
+    ap.add_argument("--sim-goal", nargs=2, type=float, default=None,
+                    metavar=("X", "Y"),
+                    help="road-graph goal for the sim route (else "
+                         "straight-ahead reference)")
+    ap.add_argument("--sim-decisions", type=int, default=60,
+                    help="decision steps per sim episode (0.25 s each)")
+    ap.add_argument("--sim-episodes", type=int, default=1)
+    ap.add_argument("--runtime", choices=("auto", "steam", "tech"),
+                    default="tech")
     args = ap.parse_args()
 
     from stable_baselines3 import DQN
@@ -80,6 +188,8 @@ def main() -> int:
         config.LOGS_DIR / "m4_dqn" / "dqn_decision.zip")
     out.parent.mkdir(parents=True, exist_ok=True)
 
+    if args.sim:
+        return _train_sim(args, out)
     env = DecisionSpeedEnv(mode="offline", seed=args.seed)
     if not args.eval_only:
         model = DQN(

@@ -1811,6 +1811,7 @@ def run(args) -> int:
             # while the car sat on the centreline).
             road_off = 0.0
             off_recover = False
+            hw_deficit = 0.0   # BEV road width minus the map edge width
             if (nav_route is not None and len(nav_route) >= 2
                     and road_left is not None and road_right is not None):
                 _lat2, _beyond2, _hw2 = _route_lateral_off_m(
@@ -1824,6 +1825,7 @@ def run(args) -> int:
                 _dhw = drivable_half_width_m(
                     out.drivable, getattr(out, "observed", None))
                 if _dhw is not None and _dhw > _hw2:
+                    hw_deficit = _dhw - _hw2
                     _hw2 = _dhw
                     road_off = max(0.0, abs(float(_lat2)) - _hw2)
                 else:
@@ -2205,9 +2207,14 @@ def run(args) -> int:
                 try:
                     _lr, _cr = _boundary_lateral(
                         float(pos[0]), float(pos[1]), out.lane_right, fwd_lane)
+                    _lr = float(_lr) + hw_deficit
                     lat_right = round(float(_lr), 3) if _cr else None
                 except Exception:
                     pass
+            if hw_deficit > 0.0 and lat_left is not None:
+                # the left boundary moves outward (LEFT) by the same
+                # deficit: the map edges are inboard of the real surface
+                lat_left = round(float(lat_left) - hw_deficit, 3)
             # snapshot for offline stability evaluation (safe / degraded
             # ratio over a long route); written once at the end.
             hist.append({
