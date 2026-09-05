@@ -208,7 +208,13 @@ class BeamNGConnector:
             if vid is not None and vid not in vehicles:
                 raise RuntimeError(
                     f"Vehicle '{vid}' not found; available: {sorted(vehicles)}")
-            target_vid = vid if vid is not None else next(iter(vehicles))
+            if vid is None:
+                # Prefer the vehicle the game names 'ego': after the FSD
+                # drive spawns traffic NPCs, dict order may hand back a
+                # parked NPC first and the whole session would then drive
+                # THAT vehicle (town benchmark run 2 attached 'clone').
+                vid = "ego" if "ego" in vehicles else next(iter(vehicles))
+            target_vid = vid
             vehicle = vehicles[target_vid]
             vehicle.connect(self.bng)
             self.vehicle = vehicle

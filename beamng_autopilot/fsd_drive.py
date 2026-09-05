@@ -479,60 +479,64 @@ def _spawn_traffic(conn, nav_route, n: int,
                    first_m: float = 80.0, gap_m: float = 60.0) -> int:
     """Park ``n`` NPC vehicles along the nav route (right roadside).
 
-    Placed just inside the ego lane's right edge (≈ ``offset_right_m``
+    Placed just outside the ego lane's right edge (≈ ``offset_right_m``
     right of the road centreline) so the front camera sees real vehicles
     for the YOLO head / obstacle fusion while a correct drive can still
-    squeeze past.  Best-effort: any Lua/transport failure logs and the
-    function returns how many vehicles actually spawned.  Pure vehicle
-    spawning - no map offsets are used for the EGO's lateral reference.
+    pass within the no-cross policy.  Uses the beamngpy vehicles API
+    (``spawn`` / ``despawn``) and first clears NPCs left over from
+    earlier runs.  Best-effort: failures log and the function returns
+    how many vehicles actually spawned.  Pure vehicle spawning - no map
+    offsets are used for the EGO's lateral reference.
     """
     if nav_route is None or len(nav_route) < 2 or int(n) <= 0:
         return 0
-    r = np.asarray(nav_route, dtype=float)[:, :2]
-    arc = np.concatenate(
-        [[0.0], np.cumsum(np.linalg.norm(np.diff(r, axis=0), axis=1))])
-    total = float(arc[-1])
-    # Remove vehicles left over from earlier runs so NPCs never stack at
-    # the same arc positions (town run 1 left clone/clone0/clone1).
-    try:
-        ego_id = getattr(conn.vehicle, "vid", None)
-        conn.bng.queue_lua_command(
-            "for _, v in ipairs(getAllVehicles() or {}) do "
-            "if tostring(v:getId()) ~= tostring('%s') then v:remove() end "
-            "end" % (ego_id,))
-    except Exception as exc:
-        print(f"[fsd-drive] NPC cleanup failed: {exc}")
+    bng = conn.bng
+    ego_vid = getattr(conn.vehicle, "vid", None)
     placed = 0
-    for k in range(int(n)):
-        s = min(total - 15.0, float(first_m) + float(gap_m) * k)
-        if s < 20.0:
-            continue
-        i = int(np.searchsorted(arc, s))
-        i = min(max(i, 1), len(r) - 2)
-        seg = r[i + 1] - r[i]
-        L = float(np.linalg.norm(seg))
-        if L < 1e-6:
-            continue
-        d = seg / L
-        right = np.array([d[1], -d[0]])       # right of travel
-        px, py = r[i] + float(offset_right_m) * right
-        gz = conn.ground_z_at(float(px), float(py))
-        z = (float(gz) + 0.4) if gz is not None else 1.0
-        yaw_deg = -math.degrees(math.atan2(d[1], d[0])) - 90.0
-        qx, qy, qz, qw = angle_to_quat((0.0, 0.0, yaw_deg))
-        model = models[k % len(models)]
-        chunk = (
-            "core_vehicles.spawnNewVehicle('%s', {pos=vec3(%.3f, %.3f, "
-            "%.3f), rot=quat(%f, %f, %f, %f), clip=0})"
-            % (model, px, py, z, qx, qy, qz, qw))
-        try:
-            conn.bng.queue_lua_command(chunk)
-            placed += 1
-            print(f"[fsd-drive] traffic NPC #{k + 1}: {model} at "
-                  f"({px:.1f}, {py:.1f}) z={z:.1f}")
-        except Exception as exc:
-            print(f"[fsd-drive] traffic NPC #{k + 1} failed: {exc}")
-            break
+    try:
+        from beamngpy import Vehicle
+        r = np.asarray(nav_route, dtype=float)[:, :2]
+        arc = np.concatenate(
+            [[0.0], np.cumsum(np.linalg.norm(np.diff(r, axis=0), axis=1))])
+        total = float(arc[-1])
+        # Remove vehicles left over from earlier runs so NPCs never stack
+        # at the same arc positions (town run 1 left clone/clone0/...).
+        for vid, veh in list(bng.get_current_vehicles().items()):
+            if vid == ego_vid:
+                continue
+            try:
+                bng.vehicles.despawn(veh)
+            except Exception:
+                pass
+        for k in range(int(n)):
+            s = min(total - 15.0, float(first_m) + float(gap_m) * k)
+            if s < 20.0:
+                continue
+            i = int(np.searchsorted(arc, s))
+            i = min(max(i, 1), len(r) - 2)
+            seg = r[i + 1] - r[i]
+            L = float(np.linalg.norm(seg))
+            if L < 1e-6:
+                continue
+            d = seg / L
+            right = np.array([d[1], -d[0]])   # right of travel
+            px, py = r[i] + float(offset_right_m) * right
+            gz = conn.ground_z_at(float(px), float(py))
+            z = (float(gz) + 0.5) if gz is not None else 1.0
+            yaw_deg = -math.degrees(math.atan2(d[1], d[0])) - 90.0
+            npc = Vehicle("npc_%d" % k, model=models[k % len(models)])
+            ok = bng.vehicles.spawn(
+                npc, pos=(float(px), float(py), z),
+                rot_quat=angle_to_quat((0.0, 0.0, yaw_deg)),
+                cling=True, connect=False)
+            if ok:
+                placed += 1
+                print(f"[fsd-drive] traffic NPC #{k + 1}: "
+                      f"{models[k % len(models)]} at ({px:.1f}, {py:.1f})")
+            else:
+                print(f"[fsd-drive] traffic NPC #{k + 1} spawn rejected")
+    except Exception as exc:
+        print(f"[fsd-drive] traffic spawn failed: {exc}")
     return placed
 
 
