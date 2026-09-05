@@ -198,7 +198,9 @@ class DecisionSpeedEnv(gym.Env):
                     speed=float(st.speed))
             except Exception:
                 steer = 0.0
-        thr, brk = self._spd.update(float(st.speed), eff)
+        # NB: update(target_speed, speed) - reversed args would invert
+        # the whole longitudinal control (throttle on slow, brake on go)
+        thr, brk = self._spd.update(eff, float(st.speed))
         if self._fwd_gear is None:
             from beamng_autopilot.control import gearbox
             self._fwd_gear = gearbox.forward_gear_input(self.conn)

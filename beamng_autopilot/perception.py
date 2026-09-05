@@ -702,7 +702,10 @@ class LidarClusterTracker:
     def update(self, boxes: list[Obstacle], t: float) -> None:
         """Attach ``velocity`` / ``heading`` / ``vehicle_id`` to boxes."""
         if not boxes:
-            self._tracks = []
+            # one empty poll (sensor dropout / throttled scan) must not
+            # discard every velocity estimate - TTL expires them instead
+            self._tracks = [tr for tr in self._tracks
+                            if t - tr["t"] <= self.ttl_s]
             return
         for tr in self._tracks:
             tr["matched"] = False
@@ -710,6 +713,8 @@ class LidarClusterTracker:
             best = None
             best_d = self.match_m
             for tr in self._tracks:
+                if tr["matched"]:
+                    continue
                 d = math.hypot(ob.x - tr["x"], ob.y - tr["y"])
                 if d < best_d:
                     best_d = d
@@ -736,8 +741,9 @@ class LidarClusterTracker:
                     ob.heading = float(math.atan2(best["vy"], best["vx"]))
                     ob.vehicle_id = f"lidar-{best['id']}"
             else:
+                self._next_id = getattr(self, "_next_id", 0) + 1
                 self._tracks.append({
-                    "id": len(self._tracks),
+                    "id": self._next_id,
                     "x": ob.x, "y": ob.y, "t": t,
                     "vx": 0.0, "vy": 0.0, "matches": 1, "matched": True,
                 })

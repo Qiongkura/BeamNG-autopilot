@@ -287,3 +287,23 @@ def test_score_rejects_fully_occupied_path_even_if_corridor_open() -> None:
     # collision-infeasible candidates still carry their collected labour
     # cost (existing convention) - feasibility is the hard gate.
     assert cost > 0.0
+
+
+def test_corridor_free_band_ignores_rows_behind_ego() -> None:
+    """A wall BEHIND the car must not close the forward corridor, and a
+    wall ahead must (row-axis semantics pinned by the 2026-09-06 audit:
+    the old window skipped the far-ahead horizon and counted the rear)."""
+    from beamng_autopilot.occupancy import OccupancyGrid
+    from beamng_autopilot.planning.constraints import corridor_free_band
+    from beamng_autopilot.planning import Scene
+
+    g = OccupancyGrid(60, 60, 0.5)
+    scene = Scene(pos=np.array([0.0, 0.0]), heading=0.0, grid=g)
+    # full wall over 3+ sampled bands AHEAD (sampled rows 0,7,14,21)
+    g.obstacle[5:24, :] = 1
+    assert corridor_free_band(scene) is False
+    g.obstacle[5:24, :] = 0
+    # the same wall BEHIND the ego (rows 36-55) must NOT close the
+    # forward corridor - the old window counted the rear half
+    g.obstacle[36:55, :] = 1
+    assert corridor_free_band(scene) is True

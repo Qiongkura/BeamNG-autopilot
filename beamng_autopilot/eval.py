@@ -150,12 +150,16 @@ def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
         1 for i in range(1, n)
         if thr[i] and brk[i - 1] and not thr[i - 1])
 
-    # stalls (away from the end-zone stop)
+    # stalls (away from the end-zone stop).  NB: the speeds are read
+    # PER settled frame - indexing v_v (a filtered list) by the raw
+    # frame index desyncs the moment any speed is non-numeric.
     stalls = 0
     for i in settled:
         rem = _f(hist, "rem_end", i)
         rem = rem if _num(rem) else None
-        if v_v[i] < STALL_SPEED_MPS and (rem is None or rem > STALL_REM_END_M):
+        spd = _f(hist, "speed", i, 0.0)
+        spd = spd if _num(spd) else 0.0
+        if spd < STALL_SPEED_MPS and (rem is None or rem > STALL_REM_END_M):
             stalls += 1
     out["stall_frames"] = stalls
 

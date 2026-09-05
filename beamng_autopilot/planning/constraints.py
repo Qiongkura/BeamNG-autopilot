@@ -617,12 +617,21 @@ def corridor_free_band(scene: Scene, min_clear_m: float = 3.0,
     n_cols = int(grid.n_cols)
     if n_cols < 4:
         return True
-    # longitudinal bands ahead of the ego (top rows of the grid = ahead)
+    # Longitudinal bands AHEAD of the ego.  Row 0 is the most forward
+    # row and the ego sits at row n_rows/2 (ego-centred grid), so the
+    # scan covers rows 0..ego_row and skips the band right around the
+    # ego (the car's own footprint + immediate bumper zone).  The old
+    # window skipped rows 0..12% - the 13.5-15 m FAR AHEAD horizon -
+    # and counted every row from 12 m ahead back to 14 m BEHIND the
+    # car, so rear clutter closed a corridor that was open ahead
+    # (found by the bug audit 2026-09-06).
     step = max(1, int(n_rows / bands))
     min_clear_cells = max(1, int(min_clear_m / max(1e-9, grid.res)))
+    ego_row = int(n_rows / 2)
+    ego_band = max(1, int(n_rows * 0.12))
     blocked = 0
-    for r in range(0, min(n_rows, n_rows - 1), step):
-        if r <= int(n_rows * 0.12):       # skip the ego's own band
+    for r in range(0, ego_row, step):
+        if ego_row - r <= ego_band:       # skip the ego's own band
             continue
         row = occ[r]
         # lateral free cells in this band

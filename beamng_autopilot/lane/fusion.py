@@ -434,10 +434,19 @@ def choose_sensor_lane(vision_frame: LaneFrame | None,
         hold = LANE_FUSION_PAIRED_HOLD_FRAMES
     else:
         hold = LANE_FUSION_HOLD_FRAMES
-    if int(state.get("frames", 0)) >= hold:
+    # Anti-flicker counts CONSECUTIVE frames of the CANDIDATE source.
+    # The old code tested the ACTIVE source's tenure, which in steady
+    # state is always >= hold, so any one-frame glitch adopted instantly
+    # (bug audit 2026-09-06).
+    if state.get("cand_src") == src:
+        state["cand_frames"] = int(state.get("cand_frames", 0)) + 1
+    else:
+        state["cand_src"] = src
+        state["cand_frames"] = 1
+    if int(state.get("cand_frames", 0)) >= hold:
         state["src"] = src
         state["frames"] = 1
         state["last"] = chosen
+        state["cand_frames"] = 0
         return chosen
-    state["frames"] = int(state.get("frames", 0)) + 1
     return state.get("last")

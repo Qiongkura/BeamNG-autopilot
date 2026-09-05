@@ -126,7 +126,7 @@ def _ref_blocked_fraction(ref, pos, heading, grid,
             if cell is not None:
                 rows[i], cols[i] = cell
                 ok[i] = True
-    bad = int(np.count_nonzero(ok & (grid.obstacle[rows, cols] > 0)))
+    bad = int(np.count_nonzero(grid.obstacle[rows[ok], cols[ok]] > 0))
     return bad / tot
 
 

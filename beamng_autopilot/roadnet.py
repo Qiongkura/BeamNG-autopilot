@@ -87,22 +87,31 @@ class RoadNetwork:
             if not edge_rows:
                 continue
             row_pts = []
+            row_heights = []
+            row_lefts = []
+            row_rights = []
             for row in edge_rows:
                 m = row.get("middle")
                 if m is None:
                     continue
                 m3 = np.asarray(m, dtype=float)
                 row_pts.append(m3[:2])
-                heights.append(float(m3[2]) if m3.size >= 3 else math.nan)
+                row_heights.append(float(m3[2]) if m3.size >= 3 else math.nan)
                 _edge2 = lambda k: (np.asarray(row.get(k), dtype=float)[:2]
                                     if row.get(k) is not None
                                     and len(np.asarray(row.get(k), dtype=float)) >= 2
                                     else np.array([np.nan, np.nan]))
-                lefts.append(_edge2("left"))
-                rights.append(_edge2("right"))
+                row_lefts.append(_edge2("left"))
+                row_rights.append(_edge2("right"))
+            # gate BEFORE appending: a road with a single valid row would
+            # push 1 edge row but 0 nodes, desyncing len(lefts) from
+            # len(nodes) and discarding the WHOLE map's edge data
             if len(row_pts) >= 2:
                 base = len(pts)
                 pts.extend(row_pts)
+                heights.extend(row_heights)
+                lefts.extend(row_lefts)
+                rights.extend(row_rights)
                 for i in range(len(row_pts) - 1):
                     edges.append((base + i, base + i + 1))
                 n_used += 1

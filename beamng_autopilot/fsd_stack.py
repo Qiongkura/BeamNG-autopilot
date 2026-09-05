@@ -109,7 +109,13 @@ def compensate_range_motion(sample: RangeSample | None,
             ob, x=float(ob.x) + float(shift[0]),
             y=float(ob.y) + float(shift[1]),
             half_w=float(ob.half_w) + grow,
-            half_h=float(ob.half_h) + grow))
+            half_h=float(ob.half_h) + grow,
+            # the oriented footprint is what mark_obstacle_region uses
+            # when axis is set - inflate it too, or the reuse-gap safety
+            # margin silently does not apply to moving vehicles
+            half_len=float(getattr(ob, "half_len", 0.0) or 0.0) + grow,
+            half_thick=float(getattr(ob, "half_thick", 0.0) or 0.0)
+            + grow))
     return RangeSample(
         obstacles=out,
         ray_hits=list(getattr(sample, "ray_hits", []) or []))
@@ -839,12 +845,17 @@ class FSDStack:
                 # to the fixed map-prior lane width otherwise.
                 _w = 0.0
                 try:
+                    from beamng_autopilot.planning.geometry import (
+                        polyline_point_distances)
                     _ml = np.asarray(ml, dtype=float)[:, :2]
                     _mr = np.asarray(mr, dtype=float)[:, :2]
-                    # edge rows can be missing (NaN rows skipped by
-                    # map_lane_edges): pair only the min common length
-                    _n = min(len(_ml), len(_mr))
-                    _wa = np.linalg.norm(_ml[:_n] - _mr[:_n], axis=1)
+                    # the left/right polylines can carry DIFFERENT arc
+                    # parametrisations (map_lane_edges resamples the
+                    # centreline but keeps raw edge spacing, and corner
+                    # interpolation inserts extra points) - element-wise
+                    # pairing reads an inflated width on any curve.
+                    # Nearest-point distances are alignment-robust.
+                    _wa = polyline_point_distances(_ml, _mr)
                     _wf = _wa[np.isfinite(_wa)]
                     if _wf.size:
                         _w = float(np.median(_wf))
@@ -1252,6 +1263,13 @@ class FSDStack:
         _fm = getattr(self, "fmap", None)
         if _fm is not None:
             _fm.clear()
+        # The LiDAR reuse cache is location-bound too: compensate_range_
+        # motion only shifts boxes that carry a velocity, so a cached
+        # pre-teleport scan would flood the NEW grid with static boxes
+        # at their OLD world coordinates for up to range_every_n ticks.
+        self._last_range = None
+        self._last_range_t = 0.0
+        self._range_skip = 0
 
     def close(self) -> None:
         if self.ring is not None:
