@@ -30,6 +30,18 @@ OFF_ROAD_M = 0.05           # road_off > 0 means outside a DecalRoad edge
 STALL_SPEED_MPS = 0.5
 STALL_REM_END_M = 8.0       # only count stalls away from the end zone
 
+# --- benchmark hard targets -------------------------------------------
+# The FSD realism bar (README "FSD 结构栈现状"): a benchmark scenario
+# passes only with ZERO crossings, ZERO off-road frames, ZERO reversing
+# and ZERO stalls; a goal scenario additionally must actually reach the
+# goal (same tolerance as the rule autopilot's GOAL_RADIUS_M).
+BENCH_MAX_REVERSING_FRAMES = 0
+BENCH_MAX_CROSS_CENTRE = 0
+BENCH_MAX_CROSS_RIGHT = 0
+BENCH_MAX_OFF_ROAD_FRAMES = 0
+BENCH_MAX_STALL_FRAMES = 0
+BENCH_GOAL_TOL_M = 8.0
+
 
 def _num(x):
     return isinstance(x, (int, float)) and not isinstance(x, bool)
@@ -162,3 +174,44 @@ def assess_many(runs: Iterable[list[dict]], goal=None,
                 cruise: float | None = None) -> list[dict]:
     """Assess several runs; returns a list of result dicts."""
     return [assess_run(h, goal=goal, cruise=cruise) for h in runs]
+
+
+def score_run(assessed: dict, require_goal: bool = False) -> dict:
+    """Verdict on one assessed run against the benchmark hard targets.
+
+    ``assessed`` is an :func:`assess_run` result.  Returns
+    ``{"checks": {name: bool}, "pass": bool}`` — ``pass`` is True only
+    when every hard target holds (and, for goal scenarios, the goal was
+    reached within :data:`BENCH_GOAL_TOL_M`).  A run with no frames can
+    never pass.
+    """
+    checks = {
+        "has_frames": int(assessed.get("frames", 0) or 0) > 0,
+        "no_reversing": int(assessed.get("reversing_frames", 0) or 0)
+        <= BENCH_MAX_REVERSING_FRAMES,
+        "no_centre_crossing": int(assessed.get("cross_centre_frames", 0) or 0)
+        <= BENCH_MAX_CROSS_CENTRE,
+        "no_edge_crossing": int(assessed.get("cross_right_frames", 0) or 0)
+        <= BENCH_MAX_CROSS_RIGHT,
+        "on_road": int(assessed.get("off_road_frames", 0) or 0)
+        <= BENCH_MAX_OFF_ROAD_FRAMES,
+        "no_stall": int(assessed.get("stall_frames", 0) or 0)
+        <= BENCH_MAX_STALL_FRAMES,
+    }
+    if require_goal:
+        gd = assessed.get("goal_dist_m")
+        checks["reached_goal"] = (
+            _num(gd) and float(gd) <= BENCH_GOAL_TOL_M)
+    return {"checks": checks, "pass": all(bool(v) for v in checks.values())}
+
+
+def score_many(assessed: list[dict], require_goal: bool = False) -> dict:
+    """Aggregate benchmark verdicts over several assessed runs.
+
+    Returns ``{"runs": [verdict...], "pass": bool, "n_pass": int}`` —
+    the aggregate passes only when EVERY run passes.
+    """
+    verdicts = [score_run(a, require_goal=require_goal) for a in assessed]
+    n_pass = sum(1 for v in verdicts if v["pass"])
+    return {"runs": verdicts, "n_pass": n_pass,
+            "pass": bool(verdicts) and n_pass == len(verdicts)}
