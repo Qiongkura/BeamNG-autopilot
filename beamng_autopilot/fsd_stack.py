@@ -839,9 +839,12 @@ class FSDStack:
                 # to the fixed map-prior lane width otherwise.
                 _w = 0.0
                 try:
-                    _wa = np.linalg.norm(
-                        np.asarray(ml, dtype=float)[:, :2]
-                        - np.asarray(mr, dtype=float)[:, :2], axis=1)
+                    _ml = np.asarray(ml, dtype=float)[:, :2]
+                    _mr = np.asarray(mr, dtype=float)[:, :2]
+                    # edge rows can be missing (NaN rows skipped by
+                    # map_lane_edges): pair only the min common length
+                    _n = min(len(_ml), len(_mr))
+                    _wa = np.linalg.norm(_ml[:_n] - _mr[:_n], axis=1)
                     _wf = _wa[np.isfinite(_wa)]
                     if _wf.size:
                         _w = float(np.median(_wf))

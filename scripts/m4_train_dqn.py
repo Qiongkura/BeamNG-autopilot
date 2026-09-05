@@ -132,10 +132,17 @@ def _train_sim(args, out) -> int:
         episode_s=args.sim_decisions * 0.25)
     try:
         wd_arm(conn)
-        model = DQN("MlpPolicy", env, seed=args.seed, verbose=0,
-                    learning_rate=1e-3, buffer_size=20000,
-                    batch_size=64, train_freq=2,
-                    exploration_fraction=0.2, exploration_final_eps=0.1)
+        if out.exists():
+            # continue from the existing (offline-pretrained) policy so a
+            # sim session refines it instead of overwriting it with a
+            # fresh 120-decision model
+            model = DQN.load(str(out), env=env)
+            print(f"[m4-sim] continuing from {out}")
+        else:
+            model = DQN("MlpPolicy", env, seed=args.seed, verbose=0,
+                        learning_rate=1e-3, buffer_size=20000,
+                        batch_size=64, train_freq=2,
+                        exploration_fraction=0.2, exploration_final_eps=0.1)
         print(f"[m4-sim] training {args.steps} decisions live "
               f"({args.sim_episodes} x {args.sim_decisions} steps)")
         model.learn(total_timesteps=int(args.steps),
