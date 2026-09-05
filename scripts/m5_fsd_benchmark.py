@@ -87,6 +87,8 @@ _DRIVE_ARG_DEFAULTS = {
     "strict": False,
     "e2e_model": None,
     "no_e2e": False,
+    "bc_model": None,
+    "no_bc": False,
     "goal": None,
     "no_signal": False,
     "ring": "front",
@@ -158,6 +160,7 @@ def main() -> int:
                     default="map")
     ap.add_argument("--strict", action="store_true")
     ap.add_argument("--no-e2e", action="store_true")
+    ap.add_argument("--no-bc", action="store_true")
     ap.add_argument("--no-signal", action="store_true")
     ap.add_argument("--goal", nargs=2, type=float, default=None,
                     metavar=("X", "Y"))
@@ -177,6 +180,7 @@ def main() -> int:
         "lane_mode": args.lane_mode,
         "strict": args.strict,
         "no_e2e": args.no_e2e,
+        "no_bc": args.no_bc,
         "no_signal": args.no_signal,
         "goal": (list(args.goal) if args.goal is not None else None),
     }

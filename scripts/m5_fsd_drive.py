@@ -58,6 +58,12 @@ def main() -> int:
                          "logs/m5_e2e/best_temporal.pt)")
     ap.add_argument("--no-e2e", action="store_true",
                     help="disable the E2E neural planning candidate")
+    ap.add_argument("--bc-model", type=str, default=None,
+                    help="trained DAVE-2 BC steering checkpoint to rank "
+                         "as a neural candidate (default: "
+                         "logs/m3_bc/bc_tech_smallgrid.pt)")
+    ap.add_argument("--no-bc", action="store_true",
+                    help="disable the DAVE-2 BC steering candidate")
     ap.add_argument("--goal", nargs=2, type=float, default=None,
                     metavar=("X", "Y"),
                     help="set an in-game navigation route to this goal "

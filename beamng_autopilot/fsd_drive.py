@@ -27,6 +27,9 @@ from beamng_autopilot.control.speed import (
 )
 from beamng_autopilot.fsd_stack import FSDStack
 from beamng_autopilot.lane import perception_curve_speed
+from beamng_autopilot.neural.bc_runtime import (
+    DEFAULT_BC_WEIGHTS, BCRuntime, steer_to_path,
+)
 from beamng_autopilot.neural.e2e_runtime import (
     DEFAULT_E2E_WEIGHTS, E2ERuntime,
 )
@@ -694,6 +697,29 @@ def run(args) -> int:
                 e2e_rt = None
         if e2e_rt is not None:
             e2e_rt.reset()   # no stale frames from before the run
+        # DAVE-2 imitation-learned steering (M3 BC): the third neural
+        # candidate, ranked below the E2E planner and above the rule
+        # backup; the safety monitor verifies its rolled-out arc every
+        # tick.  Loading failure disables the candidate silently - the
+        # drive never depends on it.
+        bc_rt = None
+        if not args.no_bc:
+            try:
+                bc_rt = BCRuntime(args.bc_model or DEFAULT_BC_WEIGHTS,
+                                  device=None)
+                if bc_rt.loaded:
+                    print(f"[fsd-drive] DAVE-2 BC steering: "
+                          f"{bc_rt.weights} "
+                          f"(img={bc_rt.img_w}x{bc_rt.img_h}, "
+                          f"val_mae={float((bc_rt.ckpt or {}).get('val_mae', -1)):.4f}, "
+                          f"device={bc_rt.device})")
+                else:
+                    print(f"[fsd-drive] BC steering disabled: "
+                          f"{bc_rt.error or 'weights not found'}")
+                    bc_rt = None
+            except Exception as _bc_e:
+                print(f"[fsd-drive] BC steering disabled: {_bc_e}")
+                bc_rt = None
         # Realistic gearbox locked into a forward gear (D).  A real stack
         # never leaves the car in reverse; keep the D input on every
         # control frame so an impact can never leave the gearbox in R.
@@ -1072,6 +1098,33 @@ def run(args) -> int:
                     e2e_path = None
                     e2e_safe = False
 
+            # DAVE-2 imitation-learned steering (M3 BC): the net predicts
+            # a normalized steering value from the front frame; rolled
+            # into a constant-curvature arc it becomes a regular candidate
+            # path the safety monitor verifies, ranked below the E2E
+            # planner and above the rule backup (same neural-above-rule
+            # ordering).
+            bc_path = None
+            bc_safe = False
+            bc_ms = None
+            bc_steer = None
+            if bc_rt is not None:
+                try:
+                    bc_steer, bc_ms = bc_rt.predict_steer(out.frame)
+                    if bc_steer is not None:
+                        bc_path = steer_to_path(
+                            bc_steer, pos, heading,
+                            wheelbase=float(pp.wheelbase))
+                        if bc_path is not None and len(bc_path) >= 2:
+                            _vb = monitor.evaluate(scene, bc_path,
+                                                   planner_age_s=0.0)
+                            bc_safe = bool(_vb.safe)
+                        else:
+                            bc_path = None
+                except Exception:
+                    bc_path = None
+                    bc_safe = False
+
             # planner arbitration: FSD path first; when the layered
             # planner declined (even to minimal risk) fall back to the
             # rule straight-ahead reference IN WORLD COORDINATES - the
@@ -1123,6 +1176,8 @@ def run(args) -> int:
                 fsd_safe=verd.safe and best is not None and len(best) >= 2,
                 e2e_path=e2e_path,
                 e2e_safe=e2e_safe,
+                bc_path=bc_path,
+                bc_safe=bc_safe,
                 prefer_rule=False)
             # Re-verify the verdict against the path the car actually
             # runs: the FSD verdict above was computed on the FSD best
@@ -1531,11 +1586,12 @@ def run(args) -> int:
             # band) must govern the actual pedals.
             plan_speed = out.best_speed if out.best_speed > 0.0 \
                 else float(args.speed)
-            if _strict_no_lane and chosen.source != "e2e":
+            if _strict_no_lane and chosen.source not in ("e2e", "bc"):
                 # no perception lane -> minimal-risk stop (never map-drive).
-                # The E2E neural path is perception-driven (not the map
-                # fallback), so when the monitor green-lit it the car may
-                # keep rolling on the learned trajectory.
+                # The E2E neural path and the BC steering arc are
+                # perception-driven (not the map fallback), so when the
+                # monitor green-lit them the car may keep rolling on the
+                # learned trajectory.
                 plan_speed = 0.0
                 plan_sm = 0.0
             # Traffic-light action: vision head (colour blob) fused with
@@ -2029,6 +2085,12 @@ def run(args) -> int:
                            if e2e_ms is not None else None),
                 "e2e_extent": (round(float(e2e_ext), 2)
                                if e2e_ext is not None else None),
+                "bc": int(bc_path is not None and len(bc_path) >= 2),
+                "bc_safe": int(bool(bc_safe)),
+                "bc_steer": (round(float(bc_steer), 3)
+                             if bc_steer is not None else None),
+                "bc_ms": (round(float(bc_ms), 1)
+                          if bc_ms is not None else None),
                 "e2e_act": ([round(float(a), 3) for a in e2e_act]
                             if e2e_act is not None else None),
                 "plan_speed": round(float(plan_speed), 2),

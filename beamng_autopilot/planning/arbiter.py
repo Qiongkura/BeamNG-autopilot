@@ -35,20 +35,23 @@ import numpy as np
 @dataclass
 class ArbiterOutcome:
     path: np.ndarray | None
-    source: str          # "fsd" | "e2e" | "rule" | "none"
+    source: str          # "fsd" | "e2e" | "bc" | "rule" | "none"
     why: str = ""
 
 
 def arbitrate(fsd_path, rule_path, fsd_safe: bool = True,
               e2e_path=None, e2e_safe: bool = False,
+              bc_path=None, bc_safe: bool = False,
               prefer_rule: bool = False) -> ArbiterOutcome:
     """Choose the path to steer.
 
     ``fsd_path`` is the layered planner's chosen trajectory (None when
-    it produced nothing feasible).  ``e2e_path`` is the trained neural
-    planner's trajectory (None when the network is not loaded or its
-    frame was unusable); ``e2e_safe`` is the safety monitor's green
-    light for it.  ``rule_path`` is the rule autopilot's reference
+    it produced nothing feasible).  ``e2e_path`` is the trained end-to-end
+    planner's trajectory and ``bc_path`` the DAVE-2 imitation-learned
+    steering rolled into an arc (``neural.bc_runtime.steer_to_path``);
+    both rank above the rule backup when the safety monitor green-lights
+    them - the same neural-above-kinematic ordering FSD exposes in its
+    telemetry.  ``rule_path`` is the rule autopilot's reference
     (route/drive path).  ``fsd_safe`` is the safety monitor's green
     light for the layered FSD path.  ``prefer_rule`` forces the rule
     path (used by "rule mode" / shadow tests).
@@ -62,12 +65,15 @@ def arbitrate(fsd_path, rule_path, fsd_safe: bool = True,
     if fsd_path is not None and len(fsd_path) >= 2 and fsd_safe:
         return ArbiterOutcome(fsd_path, "fsd", "fsd feasible+safe")
 
-    # Neural (E2E) planner next: a trained end-to-end trajectory is a
-    # perception-driven candidate ranked above the map/rule backup - the
-    # same neural-above-kinematic ordering FSD exposes in its telemetry.
+    # Neural candidates next: the end-to-end planner first - it predicts
+    # full trajectories - then the DAVE-2 imitation steering, both only
+    # when the safety monitor green-lights them.
     if e2e_path is not None and len(e2e_path) >= 2 and e2e_safe:
         return ArbiterOutcome(np.asarray(e2e_path, dtype=float), "e2e",
                               "fsd unavailable; e2e feasible+safe")
+    if bc_path is not None and len(bc_path) >= 2 and bc_safe:
+        return ArbiterOutcome(np.asarray(bc_path, dtype=float), "bc",
+                              "fsd unavailable; bc feasible+safe")
 
     # Rule fallback so the car does not stop dead when FSD declined.
     if rule_path is not None and len(rule_path) >= 2:
