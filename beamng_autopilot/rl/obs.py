@@ -10,7 +10,7 @@ constraint"):
   2 closest tracked obstacle distance / 30 m
   3 lane deviation / 2 m
   4 road-edge overshoot / 2 m
-  5 tracked-object count / 10
+  5 tracked-object count / 100
 
 `decision_observation` is pure so the offline env, the live drive loop
 and the tests share one definition.
@@ -25,7 +25,7 @@ DECISION_OBS_SIZE = 6
 CLEARANCE_NORM_M = 30.0
 LANE_DEV_NORM_M = 2.0
 ROAD_OFF_NORM_M = 2.0
-TRACKS_NORM = 10.0
+TRACKS_NORM = 100.0     # live town scene carries ~60-120 tracks
 
 
 def decision_observation(speed: float, target_speed: float,

@@ -36,7 +36,9 @@ from beamng_autopilot.rl.dqn_runtime import (
 from beamng_autopilot.neural.e2e_runtime import (
     DEFAULT_E2E_WEIGHTS, E2ERuntime,
 )
-from beamng_autopilot.occupancy import OccupancyGrid
+from beamng_autopilot.occupancy import (
+    OccupancyGrid, drivable_half_width_m,
+)
 from beamng_autopilot.planning import (
     Scene, anchored_rule_ref, arbitrate, local_route,
 )
@@ -1813,7 +1815,19 @@ def run(args) -> int:
                     and road_left is not None and road_right is not None):
                 _lat2, _beyond2, _hw2 = _route_lateral_off_m(
                     pos, nav_route, road_left, road_right)
-                road_off = float(_beyond2)
+                # Perception-first road width (iron rule): where the
+                # BEV drivable extent disagrees with the DecalRoad edge
+                # reference (town link: the mapped right edge sits
+                # 0.3-0.6 m INBOARD of the real surface, so every
+                # in-lane frame read as off-road), the measurement the
+                # semantic camera made of the actual road surface wins.
+                _dhw = drivable_half_width_m(
+                    out.drivable, getattr(out, "observed", None))
+                if _dhw is not None and _dhw > _hw2:
+                    _hw2 = _dhw
+                    road_off = max(0.0, abs(float(_lat2)) - _hw2)
+                else:
+                    road_off = float(_beyond2)
                 if road_off > ROAD_OFF_STOP_M:
                     # Hard stop + return steering (recovery block
                     # below), not a 0.5 m/s grass cruise.

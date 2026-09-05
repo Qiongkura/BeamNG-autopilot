@@ -317,6 +317,50 @@ class OccupancyGrid:
         return self.occupancy.copy()
 
 
+def drivable_half_width_m(drivable, observed=None, res: float = 0.5,
+                          extent: float = 15.0, max_ahead_m: float = 14.0,
+                          min_ahead_m: float = 2.0, min_frac: float = 0.03,
+                          ) -> float | None:
+    """Road half-width measured from the BEV drivable raster (perception).
+
+    The ego-centred raster spans ``[-extent, +extent]`` on both axes with
+    row 0 the most forward row: ``ex(r) = extent - (r+0.5) * res``.  Over
+    the ``[min_ahead_m, max_ahead_m]`` band the function takes the
+    2.5-97.5th percentile of the drivable cells' lateral coordinates and
+    returns half that span - the actual road surface width as SEEN by the
+    semantic camera, not the (sometimes inboard) DecalRoad edge
+    reference.  Returns None when the drivable evidence is too sparse to
+    be trusted (the caller then keeps the map-prior width).
+    """
+    drv = np.asarray(drivable, dtype=np.float32)
+    if drv.ndim != 2 or drv.size == 0:
+        return None
+    n_rows, n_cols = drv.shape
+    r_hi = (extent - min_ahead_m) / res
+    r_lo = (extent - max_ahead_m) / res
+    r0 = max(0, int(math.floor(min(r_lo, r_hi))))
+    r1 = min(n_rows - 1, int(math.ceil(max(r_lo, r_hi))))
+    if r1 < r0:
+        return None
+    band = drv[r0:r1 + 1]
+    if observed is not None:
+        obs = np.asarray(observed, dtype=np.float32)
+        if obs.shape == drv.shape:
+            band_obs = obs[r0:r1 + 1]
+            seen = float((band_obs > 0).sum())
+            if seen < min_frac * band_obs.size:
+                return None
+    ys, xs = np.nonzero(band > 0)
+    if len(xs) < 12:
+        return None
+    ey = extent - (xs + 0.5) * res
+    lo, hi = np.percentile(ey, [2.5, 97.5])
+    width = float(hi - lo)
+    if width <= 0.5:                      # noise, not a road surface
+        return None
+    return round(width / 2.0, 2)
+
+
 def project_road_mask_to_grid(grid: OccupancyGrid, road_mask: np.ndarray,
                               cam, pos, heading: float,
                               max_ahead_m: float = 45.0,

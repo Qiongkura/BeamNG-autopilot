@@ -77,6 +77,13 @@ class DecisionSpeedEnv(gym.Env):
         self.plan_target = self.cruise_speed
         self.eff_target = self.cruise_speed
         self.collided = False
+        # Live scenes carry constant roadside clutter (trees / walls sit
+        # 3-10 m away, ~60-120 tracked clusters) that must NOT read as
+        # urgency - the policy learns to react to the LEAD gap dynamics
+        # and ignore the clutter channels, matching the live
+        # observation distribution.
+        self.clutter_d = float(self.rng.uniform(3.0, 10.0))
+        self.clutter_tracks = float(self.rng.uniform(60.0, 120.0))
         # lead vehicle: (distance ahead m, speed m/s); respawns when it
         # drives out of range
         self.lead_d = float(self.rng.uniform(15.0, 60.0))
@@ -145,8 +152,9 @@ class DecisionSpeedEnv(gym.Env):
             speed=self.v,
             target_speed=self.plan_target,
             fwd_clearance=self.lead_d,
-            closest_obs=self.lead_d,
+            closest_obs=min(self.lead_d, self.clutter_d),
             lane_dev=0.0,
             road_off=0.0,
-            n_tracks=1 if self.lead_d < 60.0 else 0,
+            n_tracks=self.clutter_tracks + (1.0 if self.lead_d < 60.0
+                                            else 0.0),
         )
