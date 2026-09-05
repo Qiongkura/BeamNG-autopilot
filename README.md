@@ -471,6 +471,19 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
   `scripts/m4_train_dqn.py --steps 150000` 离线训练+评估闭环完成：
   策略 12 回合**零碰撞**（reward 95.4）vs 永远巡航基线 100% 碰撞
   （reward 36.4），模型+报告在 `logs/m4_dqn/`。
+  **LiDAR 逐类分类（2026-09-05）**：`perception.classify_lidar_obstacle`
+  按几何特征给聚类标记 tree（细长+高）/ guardrail（低矮长条）/
+  wall（大面高墙），类别进 label（category 保持 lidar 供下游过滤），
+  遥测导出逐类计数与最近距离（cls_tree/cls_guardrail/cls_wall + *_d）。
+  town 实车（224 帧，带 NPC）：guardrail 224 帧（峰值 20 簇、最近
+  3.44m）、wall 221 帧（峰值 17、最近 2.66m）、tree 27 帧（最近
+  9.42m）；同轮 dqn_act 223/224 帧在环（cruise/slow 决策）、
+  bc_steer 224/224 帧、YOLO 54 帧检出 NPC——四条感知/决策链路同一
+  实车轮次在环的直接证据。已知限制：① DQN 离线观测分布（n_tracks≤1）
+  与实车（≈90）失配导致 town 全程 slow 封顶，需分布匹配重训；
+  ② town 路段 DecalRoad 右缘参考比实际路面内收 0.3-0.6m，map 边缘
+  参考与漆画线冲突时 road_off/lat_right 计假阳性——按铁律应以感知
+  为准，修正方案待定。
   **DAVE-2 BC 已接入仲裁链**：`neural/bc_runtime.py` 加载 M3
   checkpoint，`steer_to_path` 把转向预测 roll out 成恒曲率弧，
   safety monitor 逐帧核验后按 fsd → e2e → bc → rule 排序参与仲裁
