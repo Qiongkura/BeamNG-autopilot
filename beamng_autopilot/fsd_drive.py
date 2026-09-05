@@ -34,6 +34,9 @@ from beamng_autopilot.occupancy import OccupancyGrid
 from beamng_autopilot.planning import (
     Scene, anchored_rule_ref, arbitrate, local_route,
 )
+from beamng_autopilot.planning.arbiter import (
+    bearing_diff_deg, polyline_bearing,
+)
 from beamng_autopilot.planning.constraints import _boundary_lateral
 from beamng_autopilot.planning.local_route import (
     map_lane_edges, _project_arc, _route_turn_deg,
@@ -442,6 +445,31 @@ def _path_curvature_ff(path, pos, heading, near_m: float = 1.5,
 
 
 
+def _snap_heading(nav_route, rx: float, ry: float, h_seg: float,
+                  max_diff_deg: float = 45.0) -> float:
+    """Heading the spawn snap should face the car along.
+
+    ``h_seg`` is the bearing of the route's FIRST interpolated segment
+    (nearest vertex -> next vertex).  On a road-graph A* route that
+    first segment can be a graph diagonal - the chain zigzags between
+    nodes before settling onto the road - while the road itself runs a
+    very different way (fsd_benchmark mountain 2026-09-05: first
+    segment 250 deg, road 172 deg; the car spawned 78 deg across its
+    own lane and the tightened no-cross tolerance correctly refused
+    every recovery arc, locking the run out).  The snap therefore faces
+    the car along the route's near-ahead bearing (1.5-20 m window,
+    which averages out the start zigzag) whenever the two disagree by
+    more than ``max_diff_deg``.
+    """
+    b = polyline_bearing(np.asarray(nav_route, dtype=float)[:, :2],
+                         np.array([rx, ry], dtype=float))
+    if b is None:
+        return h_seg
+    if abs(bearing_diff_deg(b, h_seg)) > max_diff_deg:
+        return b
+    return h_seg
+
+
 def run(args) -> int:
 
     conn = BeamNGConnector(
@@ -596,6 +624,7 @@ def run(args) -> int:
                     ndx, ndy = (float(rx - nav_route[i - 1, 0]),
                                 float(ry - nav_route[i - 1, 1]))
                 h = float(np.arctan2(ndy, ndx))
+                h = _snap_heading(nav_route, rx, ry, h)
                 # Ground-safe snap: same connector helper as --teleport, so
                 # the car is always placed on the real surface (never below
                 # terrain) and facing the route direction.  No lateral

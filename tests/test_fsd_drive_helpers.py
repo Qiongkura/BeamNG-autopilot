@@ -152,3 +152,28 @@ def test_painted_line_lat_none_cases() -> None:
     out = SimpleNamespace(frame=None, cam=None, head_outputs={})
     assert fsd_drive._painted_line_lat(
         out, np.array([0.0, 0.0, 0.0]), 0.0, marks=[]) is None
+
+
+# --- _snap_heading ------------------------------------------------------
+def test_snap_heading_rejects_graph_diagonal_start() -> None:
+    # route: first interpolated step points 250 deg (graph zigzag),
+    # then the road runs ~172 deg - the snap must face the ROAD way
+    road = np.column_stack([np.linspace(0, 60, 41), np.zeros(41)])
+    route = np.vstack([[[0.0, 0.0]],
+                       [[-0.8, -1.9]],          # diagonal lead-in (250 deg)
+                       road + np.array([1.7, 0.6])])
+    h = fsd_drive._snap_heading(route, 0.0, 0.0, math.radians(250.0))
+    assert abs(math.degrees(h)) < 30.0          # along the road, not 250
+
+
+def test_snap_heading_keeps_agreeing_segment() -> None:
+    # first segment already runs along the road: keep it
+    route = np.column_stack([np.linspace(0, 40, 41), np.zeros(41)])
+    h = fsd_drive._snap_heading(route, 0.0, 0.0, 0.0)
+    assert abs(math.degrees(h)) < 1e-6
+
+
+def test_snap_heading_falls_back_without_bearing() -> None:
+    # a degenerate route with no measurable forward extent keeps h_seg
+    route = np.array([[0.0, 0.0], [0.5, 0.0]])
+    assert fsd_drive._snap_heading(route, 0.0, 0.0, 1.23) == 1.23
