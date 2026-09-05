@@ -36,9 +36,7 @@ from beamng_autopilot.rl.dqn_runtime import (
 from beamng_autopilot.neural.e2e_runtime import (
     DEFAULT_E2E_WEIGHTS, E2ERuntime,
 )
-from beamng_autopilot.occupancy import (
-    OccupancyGrid, drivable_half_width_m,
-)
+from beamng_autopilot.occupancy import OccupancyGrid
 from beamng_autopilot.planning import (
     Scene, anchored_rule_ref, arbitrate, local_route,
 )
@@ -248,8 +246,15 @@ END_PLC_MAX_FWD_M = 15.0
 # perceived own-lane centre (line right side + lane half width) at a
 # bounded rate.  No nav-centreline + offset constant anywhere - the
 # target is the same perception rule as start placement / end zone.
-PLC_MAX_SHIFT_M = 1.0
+# The painted line IS the lateral authority (iron rule).  The town link
+# runs with the map lane offset ~0.7-1.0 m RIGHT of the painted lane
+# (line_lat +0.7..+1.25 vs +1.75 centred), so the corrector must be
+# able to shift the FULL measured offset, and hold it through the
+# line-visibility gaps (the semantic line class is sparse on this
+# link: visible ~20-25% of frames).
+PLC_MAX_SHIFT_M = 1.6
 PLC_RATE_MPS = 1.2
+PLC_HOLD_S = 4.0
 PLC_HORIZON_M = 12.0
 PLC_HOLD_S = 2.0
 PLC_MIN_SPEED_MPS = 0.5
@@ -1843,20 +1848,15 @@ def run(args) -> int:
                     and road_left is not None and road_right is not None):
                 _lat2, _beyond2, _hw2 = _route_lateral_off_m(
                     pos, nav_route, road_left, road_right)
-                # Perception-first road width (iron rule): where the
-                # BEV drivable extent disagrees with the DecalRoad edge
-                # reference (town link: the mapped right edge sits
-                # 0.3-0.6 m INBOARD of the real surface, so every
-                # in-lane frame read as off-road), the measurement the
-                # semantic camera made of the actual road surface wins.
-                _dhw = drivable_half_width_m(
-                    out.drivable, getattr(out, "observed", None))
-                if _dhw is not None and _dhw > _hw2:
-                    hw_deficit = _dhw - _hw2
-                    _hw2 = _dhw
-                    road_off = max(0.0, abs(float(_lat2)) - _hw2)
-                else:
-                    road_off = float(_beyond2)
+                # NB: a previous "perception-first road width" correction
+                # (measure the width from the BEV drivable raster and
+                # widen the map edges) was REVERTED: the semantic road
+                # mask on the town link INCLUDES the gravel shoulder, so
+                # the measured width ran ~1-3 m wide and the off-road
+                # guard went blind while the car rode the shoulder
+                # (town 2026-09-06, user screenshot: car on the gravel,
+                # road_off 0.00).  The mask needs shoulder-exclusive
+                # training data before any width widening is sound.
                 if road_off > ROAD_OFF_STOP_M:
                     # Hard stop + return steering (recovery block
                     # below), not a 0.5 m/s grass cruise.
@@ -2234,14 +2234,10 @@ def run(args) -> int:
                 try:
                     _lr, _cr = _boundary_lateral(
                         float(pos[0]), float(pos[1]), out.lane_right, fwd_lane)
-                    _lr = float(_lr) + hw_deficit
+                    _lr = float(_lr)
                     lat_right = round(float(_lr), 3) if _cr else None
                 except Exception:
                     pass
-            if hw_deficit > 0.0 and lat_left is not None:
-                # the left boundary moves outward (LEFT) by the same
-                # deficit: the map edges are inboard of the real surface
-                lat_left = round(float(lat_left) - hw_deficit, 3)
             # BODY-aware lateral position: a yawed car crosses the line
             # with its body while the centre point still reads in-lane
             # (town run 2026-09-06: crossC=0 while the user photographed

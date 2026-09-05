@@ -59,6 +59,13 @@ SCENARIOS: dict[str, dict] = {
         "teleport": (779.7, 735.6, -13.0),
         "goal": (868.3, 744.9),
         "require_goal": True,
+        # The iron rule: the lateral reference comes from PERCEPTION
+        # ONLY (painted lines + LiDAR corridor) - the map answers "where
+        # to", never "where the lane is".  sensor+strict = perception
+        # lane leads, no paired perception lane -> minimal-risk stop,
+        # never a map-lane drive.
+        "lane_mode": "sensor",
+        "strict": True,
         "note": "town route (start node 22209, goal ~90 m along the "
                 "road graph); --traffic adds parked NPC vehicles for "
                 "YOLO / obstacle-fusion verification",
@@ -115,6 +122,13 @@ def scenario_args(name: str, base: dict, out_path: Path):
     if vals.get("goal") is None and scen.get("goal") is not None:
         g = scen["goal"]
         vals["goal"] = [float(g[0]), float(g[1])]
+    # scenario-owned lane policy: the scenario IS the specification
+    # (town runs perception-led per the iron rule unless the CLI
+    # explicitly overrides)
+    if scen.get("lane_mode") is not None:
+        vals["lane_mode"] = scen["lane_mode"]
+    if scen.get("strict") is not None:
+        vals["strict"] = bool(scen["strict"])
     from types import SimpleNamespace
     return SimpleNamespace(**vals)
 
