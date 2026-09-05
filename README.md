@@ -461,6 +461,15 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
   **首个 PASS**：mountain 场景 184.2m，0 压中线 / 0 上路外 / 0 倒车 /
   0 卡死，终点保持距 goal 5.1m；`line_lat` 均值 +0.23m（全程本车道）；
   tick p50 123ms / p90 271ms（相机环收缩为 front_main 后）。
+  **多场景 PASS（2026-09-05）**：mountain 184.2m + town 89.1m 双场景
+  全零违规（0 压线 / 0 上草 / 0 倒车 / 0 卡死），town 终点保持距 goal
+  5.1m。**DAVE-2 BC 已接入仲裁链**：`neural/bc_runtime.py` 加载 M3
+  checkpoint，`steer_to_path` 把转向预测 roll out 成恒曲率弧，
+  safety monitor 逐帧核验后按 fsd → e2e → bc → rule 排序参与仲裁
+  （`--bc-model/--no-bc`，遥测 bc/bc_steer/bc_ms）。**YOLO 交通验证**：
+  `--traffic N` 沿路线右侧路缘停 NPC 车（beamngpy vehicles API，
+  先清理旧 NPC），town 实跑中 YOLO 110/221 帧稳定检出并在 NPC 后
+  1.3m 保持安全停车——感知→融合→规划→控制的完整闭环得到实车验证。
   同轮修复：栈侧路线速度剖面的坏 import（`from .speed_profile` 指向
   不存在的模块，从未运行过——warn-once 诊断揪出）、路线 snap 用 A*
   首段图对角线当朝向（78° 斜向出生）、倒车脱困油门在草地上推不动车

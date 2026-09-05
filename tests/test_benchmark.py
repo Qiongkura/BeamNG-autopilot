@@ -99,14 +99,14 @@ def test_scenario_args_override_and_namespace_complete() -> None:
 
 def test_score_telemetry_roundtrip(tmp_path) -> None:
     p = tmp_path / "run.json"
-    p.write_text(
-        __import__("json").dumps(_hist(10, lat_left=0.5)),
-        encoding="utf-8")
+    rows = _hist(24, lat_left=0.5)   # t = 0 .. 11.5 s
+    p.write_text(__import__("json").dumps(rows), encoding="utf-8")
     r = m5_fsd_benchmark.score_telemetry(p, require_goal=False)
     assert r["pass"] is False
-    # 10 frames at t=0..4.5: the first 6 sit inside the 3 s settle
-    # window, the last 4 are real driving violations
-    assert r["assessed"]["cross_centre_frames"] == 4
+    # settle_s=8.0 mirrors the drive's WARMUP_S: the first 16 frames
+    # (t < 8) are excluded, the remaining 8 are real violations
+    assert r["assessed"]["settled_frames"] == 8
+    assert r["assessed"]["cross_centre_frames"] == 8
 
 
 def test_settle_window_excludes_spawn_transient() -> None:

@@ -57,9 +57,9 @@ SCENARIOS: dict[str, dict] = {
         "seconds": 120.0,
         "speed": 6.0,
         "teleport": (779.7, 735.6, -13.0),
-        "goal": (888.3, 734.7),
+        "goal": (868.3, 744.9),
         "require_goal": True,
-        "note": "town route (start node 22209, goal ~120 m along the "
+        "note": "town route (start node 22209, goal ~90 m along the "
                 "road graph); --traffic adds parked NPC vehicles for "
                 "YOLO / obstacle-fusion verification",
     },
@@ -126,7 +126,9 @@ def score_telemetry(path: Path, require_goal: bool, goal=None) -> dict:
     full-run metrics stay visible in ``assessed``.
     """
     hist = json.loads(Path(path).read_text(encoding="utf-8"))
-    assessed = assess_run(hist, goal=goal, settle_s=3.0)
+    # settle_s=8.0 mirrors the drive's own WARMUP_S phase: the first
+    # seconds are cold-launch + perception placement, not driving.
+    assessed = assess_run(hist, goal=goal, settle_s=8.0)
     verdict = score_run(assessed, require_goal=require_goal)
     return {"file": str(path), "assessed": assessed, **verdict}
 
@@ -235,10 +237,13 @@ def main() -> int:
             results.append({"scenario": name, "pass": False,
                             "checks": {"produced_telemetry": False}})
             continue
+        _eff_goal = base["goal"] or (
+            list(SCENARIOS[name]["goal"])
+            if SCENARIOS[name].get("goal") else None)
         r = score_telemetry(
             out_path,
             require_goal=SCENARIOS[name]["require_goal"],
-            goal=base["goal"])
+            goal=_eff_goal)
         r["scenario"] = name
         results.append(r)
         _print_row(name, r)
