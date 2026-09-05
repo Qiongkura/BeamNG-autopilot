@@ -80,6 +80,13 @@ from beamng_autopilot.vision.lanes import (
 # reversed into walls after an impact ("dumb reversing" seen on probes).
 REVERSE_THRESHOLD_MPS = -0.35
 REVERSE_CLEAR_MPS = 0.2
+# Reverse-escape throttle ramp (see the rm.active branch): base is the
+# gentle graded-road value; on grass the ramp lifts it until the car
+# actually rolls back.  Both bounded by the -0.4 m/s target brake and
+# the rear-clearance stop.
+REV_THR_BASE = 0.06
+REV_THR_STEP = 0.05
+REV_THR_MAX = 0.45
 # Slope-creep assist: seconds of full throttle before a "stuck" car is
 # allowed to reverse (a car stopped at the bottom of a dip facing uphill
 # is not wedged - it needs torque, not a backward roll).
@@ -771,6 +778,7 @@ def run(args) -> int:
         stuck_t = 0.0    # seconds at near-standstill with a "safe" plan
         sig_rule_state = None   # game signal state on the current link
         sig_rule_t = 0.0        # last road-link signal poll time
+        rev_thr = REV_THR_BASE  # reverse-escape throttle ramp state
         t_end = time.time() + args.seconds
         frames = 0
         stopps = 0
@@ -1807,6 +1815,8 @@ def run(args) -> int:
                              signed_speed=signed,
                              pos2d=pos[:2], dt=dt)
             gear_use = fwd_gear
+            if not rm.active:
+                rev_thr = REV_THR_BASE   # reset the escape ramp
             if rm.active:
                 # Bounded reverse: gear R, slow, straight back (steering
                 # centred) until the state machine releases the attempt.
@@ -1822,7 +1832,15 @@ def run(args) -> int:
                     # (signed < -0.05): on a downhill slope gravity does
                     # the backing, adding throttle only rolls it further
                     # before the brake catches (east-side roll-back).
-                    thr, brk = 0.06, 0.0
+                    # ON GRASS 0.06 cannot overcome rolling resistance:
+                    # the escape then pulses forever without moving
+                    # (fsd_benchmark mountain 2026-09-05: 28 s stuck at
+                    # road_off ~0.9 with rev_state cycling).  Ramp the
+                    # throttle while the car is not yet rolling back;
+                    # the -0.4 m/s target brake + rear_clear stop keep
+                    # the ramp bounded.
+                    rev_thr = min(REV_THR_MAX, rev_thr + REV_THR_STEP)
+                    thr, brk = rev_thr, 0.0
                 elif signed > rm.target_speed_mps:
                     # Approaching the reverse target: back off the
                     # throttle and brake softly instead of waiting for a

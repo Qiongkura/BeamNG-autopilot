@@ -487,6 +487,15 @@ def lane_cross_dist_m(scene: Scene, path, max_cross_m: float = 0.35) -> float:
     right = getattr(scene, "lane_right", None)
     if left is None and right is None:
         return 0.0
+    # Speed-aware violation tolerance: the 0.35 m slack absorbs boundary
+    # noise at crawl speed, but at cruise the tyres overshoot a
+    # boundary-grazing path by over a metre (fsd_benchmark mountain
+    # 2026-09-05: a +1.5 m lane shift allowed AT the right boundary at
+    # 5.9 m/s ran the car 1.6 m off the road).  Shrink the tolerance as
+    # the planned speed rises; low-speed behaviour is unchanged.
+    if max_cross_m > 0.0:
+        _tsp = float(getattr(scene, "target_speed", 0.0) or 0.0)
+        max_cross_m = float(max_cross_m) * max(0.0, 1.0 - _tsp / 14.0)
     path = np.asarray(path, dtype=float)[:, :2]
     if len(path) < 2:
         return 0.0
