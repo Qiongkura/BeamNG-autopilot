@@ -1025,9 +1025,23 @@ class FSDStack:
         # route carries the real curvature; v[0] becomes the bend speed
         # via the look-ahead propagation.
         try:
-            from .speed_profile import speed_profile_for_path as _spf
-            _sr = _spf(np.asarray(route_ref, dtype=float)[:, :2], scene,
-                       target_speed=_target)
+            # NB: the speed_profile module lives in planning/ - the old
+            # ``from .speed_profile import ...`` here never resolved and
+            # this whole block silently never ran (surfaced by the
+            # warn-once diagnostics, real run 2026-09-05).
+            from .planning import speed_profile_for_path as _spf
+            _rr = np.asarray(route_ref, dtype=float)[:, :2]
+            # Skip the ego-anchor dogleg: local_route prepends the ego
+            # pose, and the lateral jump onto the road reads as a
+            # sub-metre hairpin for the curvature profile, pinning
+            # best_speed to ~1.5 m/s on an r=15 bend (offline r15 closed
+            # loop 2026-09-05).  Profile the road geometry from ~2.5 m
+            # ahead - the same footprint skip the collision layers use.
+            _keep = np.hypot(_rr[:, 0] - float(pos[0]),
+                             _rr[:, 1] - float(pos[1])) >= 2.5
+            if int(np.count_nonzero(_keep)) >= 4:
+                _rr = _rr[_keep]
+            _sr = _spf(_rr, scene, target_speed=_target)
             if len(_sr):
                 out.best_speed = float(_sr[0])
                 out.min_speed = float(np.asarray(_sr).min())
