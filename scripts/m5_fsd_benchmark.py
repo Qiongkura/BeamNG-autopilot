@@ -47,13 +47,17 @@ SCENARIOS: dict[str, dict] = {
         "seconds": 90.0,
         "speed": 6.0,
         "teleport": (729.6, 763.9, 45.0),
+        "goal": (616.2, 894.5),
         "require_goal": False,
-        "note": "mountain hairpin start (README real-vehicle record)",
+        "note": "mountain hairpin start (README real-vehicle record); "
+                "goal ~200 m along the road graph so a nav route exists "
+                "on a fresh game (no-route = known crawl behaviour)",
     },
     "town": {
         "seconds": 120.0,
         "speed": 6.0,
         "teleport": None,
+        "goal": None,
         "require_goal": True,
         "note": "town route; --goal must be a road-graph point",
     },
@@ -61,6 +65,7 @@ SCENARIOS: dict[str, dict] = {
         "seconds": 60.0,
         "speed": 6.0,
         "teleport": None,
+        "goal": None,
         "require_goal": False,
         "note": "drive from the current pose on the active nav route",
     },
@@ -99,6 +104,10 @@ def scenario_args(name: str, base: dict, out_path: Path):
     tp = scen.get("teleport")
     vals["teleport"] = [float(tp[0]), float(tp[1]), float(tp[2])] if tp else None
     vals["out"] = str(out_path)
+    # scenario-embedded goal when the CLI did not supply one
+    if vals.get("goal") is None and scen.get("goal") is not None:
+        g = scen["goal"]
+        vals["goal"] = [float(g[0]), float(g[1])]
     from types import SimpleNamespace
     return SimpleNamespace(**vals)
 
@@ -189,7 +198,8 @@ def main() -> int:
             print(f"[benchmark] unknown scenario '{name}' "
                   f"(known: {', '.join(SCENARIOS)})")
             return 2
-        if SCENARIOS[name]["require_goal"] and base["goal"] is None:
+        if SCENARIOS[name]["require_goal"] and base["goal"] is None \
+                and SCENARIOS[name].get("goal") is None:
             print(f"[benchmark] scenario '{name}' requires --goal "
                   f"(a road-graph point)")
             return 2
