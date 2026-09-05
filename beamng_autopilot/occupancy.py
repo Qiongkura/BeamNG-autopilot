@@ -143,13 +143,13 @@ class OccupancyGrid:
             self.occupancy[r, c] = max(0.0, self.occupancy[r, c] - 0.15)
 
     # ------------------------------------------------------------------
-    def _cells_for_points(self, wxs, wys):
+    def world_to_cells(self, wxs, wys):
         """Vectorised ``world_to_cell`` for arrays of world points.
 
-        Returns ``(rows, cols)`` int arrays containing ONLY the points
-        that land inside the grid (out-of-bounds points are dropped),
-        using the exact same rotation + quantisation as
-        ``world_to_cell``.
+        Returns ``(rows, cols, ok)`` int/bool arrays: ``rows``/``cols``
+        are the cell indices (meaningful only where ``ok`` is True),
+        ``ok`` marks points that land inside the grid.  Uses the exact
+        same rotation + quantisation as ``world_to_cell``.
         """
         dx = np.asarray(wxs, dtype=float) - self.origin[0]
         dy = np.asarray(wys, dtype=float) - self.origin[1]
@@ -159,8 +159,13 @@ class OccupancyGrid:
         inside = (np.abs(ex) < self.extent) & (np.abs(ey) < self.extent)
         r = ((self.max_x - ex) / self.res).astype(np.int64)
         c = ((self.max_y - ey) / self.res).astype(np.int64)
-        inside &= (r >= 0) & (r < self.n_rows) & (c >= 0) & (c < self.n_cols)
-        return r[inside], c[inside]
+        ok = inside & (r >= 0) & (r < self.n_rows) & (c >= 0) & (c < self.n_cols)
+        return r, c, ok
+
+    def _cells_for_points(self, wxs, wys):
+        """Vectorised ``world_to_cell`` returning ONLY in-grid points."""
+        r, c, ok = self.world_to_cells(wxs, wys)
+        return r[ok], c[ok]
 
     def add_observed_points(self, wxs, wys) -> None:
         """Batch ``add_observed_point`` (same semantics, one stamp)."""

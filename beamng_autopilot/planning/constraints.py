@@ -240,30 +240,52 @@ class Constraints:
 
 
 
+def _grid_cells(grid, xs, ys):
+    """Vectorised world_to_cell for arrays, tolerant of duck-typed grids.
+
+    Prefers ``OccupancyGrid.world_to_cells``; grids that only expose the
+    scalar ``world_to_cell`` (test stubs) fall back to a per-point loop
+    with identical results: returns ``(rows, cols, ok)`` with rows/cols
+    meaningful only where ``ok``.
+    """
+    fn = getattr(grid, "world_to_cells", None)
+    if fn is not None:
+        return fn(xs, ys)
+    xs = np.asarray(xs, dtype=float)
+    ys = np.asarray(ys, dtype=float)
+    rows = np.full(len(xs), -1, dtype=np.int64)
+    cols = np.full(len(xs), -1, dtype=np.int64)
+    ok = np.zeros(len(xs), dtype=bool)
+    w2c = grid.world_to_cell
+    for i, (x, y) in enumerate(zip(xs, ys)):
+        cell = w2c(float(x), float(y))
+        if cell is not None:
+            rows[i], cols[i] = cell
+            ok[i] = True
+    return rows, cols, ok
+
+
 def _path_infractions(scene: Scene, path, span: float = 2.0) -> list:
     """Sample the path (skip the car's own footprint) and return the
-    fraction of samples inside an occupied grid cell."""
+    fraction of samples inside an occupied grid cell.
+
+    Vectorised: all sample distances and grid cells are computed at
+    once (identical window + quantisation to the scalar loop).
+    """
     path = np.asarray(path, dtype=float)[:, :2]
     if scene.grid is None or len(path) < 2:
         return []
     pos = np.asarray(scene.pos[:2], dtype=float)
     extent = float(getattr(scene.grid, "extent", 0.0) or 0.0)
-    bad = 0
-    total = 0
-    for x, y in path:
-        d = math.hypot(x - pos[0], y - pos[1])
-        if d < 2.5:
-            continue
-        # Only cells inside the sensor grid carry collision evidence;
-        # beyond the FOV horizon is unknown, not a wall.
-        if extent > 0.0 and d > extent:
-            continue
-        total += 1
-        cell = scene.grid.world_to_cell(x, y)
-        if cell is None:
-            continue
-        if scene.grid.obstacle[cell] > 0:
-            bad += 1
+    d = np.hypot(path[:, 0] - pos[0], path[:, 1] - pos[1])
+    # Only cells inside the sensor grid carry collision evidence;
+    # beyond the FOV horizon is unknown, not a wall.
+    cand = (d >= 2.5) & ((extent <= 0.0) | (d <= extent))
+    total = int(np.count_nonzero(cand))
+    if total == 0:
+        return [0, 0]
+    r, c, ok = _grid_cells(scene.grid, path[cand, 0], path[cand, 1])
+    bad = int(np.count_nonzero(ok & (scene.grid.obstacle[r, c] > 0)))
     return [bad, total]
 
 def _path_off_drivable(scene: Scene, path, near_m: float = 8.0,
@@ -300,18 +322,21 @@ def _path_off_drivable(scene: Scene, path, near_m: float = 8.0,
                     math.sin(float(scene.heading))])
     left = getattr(scene, "lane_left", None)
     right = getattr(scene, "lane_right", None)
-    bad = near_bad = total = near_total = 0
-    for x, y in path:
-        d = math.hypot(x - pos[0], y - pos[1])
-        if d < 2.5 or (extent > 0.0 and d > extent):
-            continue
-        total += 1
-        if d <= near_m:
-            near_total += 1
-        cell = grid.world_to_cell(x, y)
-        if cell is None:
-            continue
-        if drv[cell] <= 0:
+    d = np.hypot(path[:, 0] - pos[0], path[:, 1] - pos[1])
+    cand = (d >= 2.5) & ((extent <= 0.0) | (d <= extent))
+    idx = np.flatnonzero(cand)
+    total = len(idx)
+    near_mask = d[idx] <= near_m
+    near_total = int(np.count_nonzero(near_mask))
+    bad = near_bad = 0
+    if total:
+        r, c, ok = _grid_cells(grid, path[idx, 0], path[idx, 1])
+        for k, i in enumerate(idx):
+            x, y = path[i]
+            di = d[i]
+            ri, ci, oki = r[k], c[k], bool(ok[k])
+            if not oki or drv[ri, ci] > 0:
+                continue
             # The camera road mask is partial/noisy; a cell the map-prior
             # lane corridor covers (between lane_left / lane_right) is
             # ROAD even when this frame's mask missed it - only a cell
@@ -333,10 +358,10 @@ def _path_off_drivable(scene: Scene, path, near_m: float = 8.0,
                     continue
             # Only a cell the sensor actually SAW as non-road counts as
             # grass/terrain; unobserved cells are unknown, not a wall.
-            if obs is not None and obs.size == drv.size and obs[cell] <= 0:
+            if obs is not None and obs.size == drv.size and obs[ri, ci] <= 0:
                 continue
             bad += 1
-            if d <= near_m:
+            if di <= near_m:
                 near_bad += 1
     return [bad, total, near_bad, near_total]
 
@@ -365,15 +390,16 @@ def _path_known(scene: Scene, path, near_m: float = 10.0) -> list:
     if float(np.asarray(evid).sum()) < 0.03 * evid.size:
         return [1, 1]      # sparse footprint: unknown, gate not enforced
     pos = np.asarray(scene.pos[:2], dtype=float)
-    known = total = 0
-    for x, y in path:
-        d = math.hypot(x - pos[0], y - pos[1])
-        if d < 2.5 or d > near_m:
-            continue
-        total += 1
-        cell = grid.world_to_cell(x, y)
-        if cell is not None and (obs is None or obs.size == 0 or obs[cell] > 0):
-            known += 1
+    d = np.hypot(path[:, 0] - pos[0], path[:, 1] - pos[1])
+    cand = (d >= 2.5) & (d <= near_m)
+    total = int(np.count_nonzero(cand))
+    if total == 0:
+        return [0, 0]
+    r, c, ok = _grid_cells(grid, path[cand, 0], path[cand, 1])
+    if obs is None or obs.size == 0:
+        known = int(np.count_nonzero(ok))
+    else:
+        known = int(np.count_nonzero(ok & (obs[r, c] > 0)))
     return [known, total]
 
 
@@ -598,24 +624,26 @@ def corridor_free_band(scene: Scene, min_clear_m: float = 3.0,
 
 
 def cost_curvature(path, jerk_w: float = 0.0) -> float:
-    """Mean curvature of the path (rad/m), a comfort cost."""
+    """Mean curvature of the path (rad/m), a comfort cost.
+
+    Vectorised turn-angle computation; identical formula to the scalar
+    loop (per-vertex angle between incoming/outgoing segments divided by
+    the longer segment length, zero-length segments skipped).
+    """
     path = np.asarray(path, dtype=float)[:, :2]
     if len(path) < 4:
         return 0.0
-    angles = []
-    for i in range(1, len(path) - 1):
-        a = path[i - 1]
-        b = path[i]
-        c = path[i + 1]
-        v1 = b - a
-        v2 = c - b
-        n1 = float(np.linalg.norm(v1))
-        n2 = float(np.linalg.norm(v2))
-        if n1 < 1e-9 or n2 < 1e-9:
-            continue
-        cos_a = np.clip(np.dot(v1, v2) / (n1 * n2), -1.0, 1.0)
-        angles.append(abs(math.acos(float(cos_a))) / max(n1, 1e-6))
-    return float(np.mean(angles)) if angles else 0.0
+    v1 = path[1:-1] - path[:-2]
+    v2 = path[2:] - path[1:-1]
+    n1 = np.linalg.norm(v1, axis=1)
+    n2 = np.linalg.norm(v2, axis=1)
+    ok = (n1 >= 1e-9) & (n2 >= 1e-9)
+    if not ok.any():
+        return 0.0
+    cos_a = np.clip(
+        np.sum(v1[ok] * v2[ok], axis=1) / (n1[ok] * n2[ok]), -1.0, 1.0)
+    angles = np.arccos(cos_a) / np.maximum(n1[ok], 1e-6)
+    return float(np.mean(np.abs(angles)))
 
 
 def cost_lane_align(scene: Scene, path) -> float:

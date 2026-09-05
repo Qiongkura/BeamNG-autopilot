@@ -88,7 +88,8 @@ def _ref_blocked_fraction(ref, pos, heading, grid,
     sensor horizon is unknown space, not a wall (so it does not punish a
     route that simply extends past the grid).  Used to decide whether the
     map/nav route should keep governing planning when the sensor lane is
-    clearly the drivable space ahead.
+    clearly the drivable space ahead.  Vectorised (identical window and
+    quantisation to the scalar loop it replaces).
     """
     if ref is None or len(ref) < 2 or grid is None:
         return 0.0
@@ -96,22 +97,31 @@ def _ref_blocked_fraction(ref, pos, heading, grid,
     p = np.asarray(pos[:2], dtype=float)
     ch, sh = math.cos(float(heading)), math.sin(float(heading))
     extent = float(getattr(grid, "extent", 0.0) or 0.0)
-    bad = 0.0
-    tot = 0.0
-    for x, y in r:
-        dx, dy = x - p[0], y - p[1]
-        d = math.hypot(dx, dy)
-        if d < lo_m or d > hi_m:
-            continue
-        if extent > 0.0 and d > extent:
-            continue
-        if (dx * ch + dy * sh) < fwd_min_m:
-            continue
-        tot += 1.0
-        cell = grid.world_to_cell(x, y)
-        if cell is not None and grid.obstacle[cell] > 0:
-            bad += 1.0
-    return (bad / tot) if tot > 0 else 0.0
+    dx = r[:, 0] - p[0]
+    dy = r[:, 1] - p[1]
+    d = np.hypot(dx, dy)
+    cand = ((d >= lo_m) & (d <= hi_m)
+            & ((extent <= 0.0) | (d <= extent))
+            & ((dx * ch + dy * sh) >= fwd_min_m))
+    tot = int(np.count_nonzero(cand))
+    if tot == 0:
+        return 0.0
+    fn = getattr(grid, "world_to_cells", None)
+    if fn is not None:
+        rows, cols, ok = fn(r[cand, 0], r[cand, 1])
+    else:  # duck-typed grid (scalar world_to_cell only)
+        rows = np.full(tot, -1, dtype=np.int64)
+        cols = np.full(tot, -1, dtype=np.int64)
+        ok = np.zeros(tot, dtype=bool)
+        w2c = grid.world_to_cell
+        sel = r[cand]
+        for i, (x, y) in enumerate(sel):
+            cell = w2c(float(x), float(y))
+            if cell is not None:
+                rows[i], cols[i] = cell
+                ok[i] = True
+    bad = int(np.count_nonzero(ok & (grid.obstacle[rows, cols] > 0)))
+    return bad / tot
 
 
 
