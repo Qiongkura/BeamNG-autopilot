@@ -452,6 +452,21 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
 
 ### 离线评测与数据工具（2026-08-30）
 
+- **FSD 基准判分（2026-09-05）**：`scripts/m5_fsd_benchmark.py`——场景注册表
+  （mountain 山地发卡弯 / town / free）+ `eval.score_run` 硬指标裁决
+  （0 压线 / 0 出右缘 / 0 上路外 / 0 倒车 / 0 卡死，goal 场景 8m 内到点），
+  驱动走 `beamng_autopilot.fsd_drive.run`，产出
+  `logs/fsd_benchmark/scorecard_*.json`；`--score` 可离线重判。判分带
+  `settle_s=3.0` 起步收敛窗（teleport 后语义头预热 + 感知落位不算驾驶）。
+  **首个 PASS**：mountain 场景 184.2m，0 压中线 / 0 上路外 / 0 倒车 /
+  0 卡死，终点保持距 goal 5.1m；`line_lat` 均值 +0.23m（全程本车道）；
+  tick p50 123ms / p90 271ms（相机环收缩为 front_main 后）。
+  同轮修复：栈侧路线速度剖面的坏 import（`from .speed_profile` 指向
+  不存在的模块，从未运行过——warn-once 诊断揪出）、路线 snap 用 A*
+  首段图对角线当朝向（78° 斜向出生）、倒车脱困油门在草地上推不动车
+  （0.06 → 有界爬升 0.45）、压线容差随规划速度收紧（0.35m @低速 →
+  0.2m @6m/s）。
+
 - `m5_e2e_probe.py --data <dir> --weights <ckpt>`：批量回放评测，输出动作误差 /
   接管率 / 轨迹误差到 `logs/m5_e2e/report.json`，并把最差 Top-N 帧截图存到
   `logs/m5_e2e/worst/`（直接定位模型失效场景）。
