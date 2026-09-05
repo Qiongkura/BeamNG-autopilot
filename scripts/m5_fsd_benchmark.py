@@ -56,10 +56,12 @@ SCENARIOS: dict[str, dict] = {
     "town": {
         "seconds": 120.0,
         "speed": 6.0,
-        "teleport": None,
-        "goal": None,
+        "teleport": (779.7, 735.6, -13.0),
+        "goal": (888.3, 734.7),
         "require_goal": True,
-        "note": "town route; --goal must be a road-graph point",
+        "note": "town route (start node 22209, goal ~120 m along the "
+                "road graph); --traffic adds parked NPC vehicles for "
+                "YOLO / obstacle-fusion verification",
     },
     "free": {
         "seconds": 60.0,
@@ -89,6 +91,7 @@ _DRIVE_ARG_DEFAULTS = {
     "no_e2e": False,
     "bc_model": None,
     "no_bc": False,
+    "traffic": 0,
     "goal": None,
     "no_signal": False,
     "ring": "front",
@@ -161,6 +164,8 @@ def main() -> int:
     ap.add_argument("--strict", action="store_true")
     ap.add_argument("--no-e2e", action="store_true")
     ap.add_argument("--no-bc", action="store_true")
+    ap.add_argument("--traffic", type=int, default=0, metavar="N",
+                    help="park N NPC vehicles along the route")
     ap.add_argument("--no-signal", action="store_true")
     ap.add_argument("--goal", nargs=2, type=float, default=None,
                     metavar=("X", "Y"))
@@ -181,6 +186,7 @@ def main() -> int:
         "strict": args.strict,
         "no_e2e": args.no_e2e,
         "no_bc": args.no_bc,
+        "traffic": int(args.traffic),
         "no_signal": args.no_signal,
         "goal": (list(args.goal) if args.goal is not None else None),
     }

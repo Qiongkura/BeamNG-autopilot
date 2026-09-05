@@ -76,6 +76,9 @@ def main() -> int:
                     help="camera ring to poll: front = front_main only "
                          "(the only frame the live tick consumes), "
                          "all = full 8-camera surround ring")
+    ap.add_argument("--traffic", type=int, default=0, metavar="N",
+                    help="park N NPC vehicles along the route (YOLO / "
+                         "obstacle-fusion verification; best-effort)")
     ap.add_argument("--no-shadow", action="store_true",
                     help="disable shadow-episode recording during the drive")
     args = ap.parse_args()

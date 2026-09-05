@@ -473,6 +473,59 @@ def _snap_heading(nav_route, rx: float, ry: float, h_seg: float,
     return h_seg
 
 
+def _spawn_traffic(conn, nav_route, n: int,
+                   models=("pessima", "etk800", "pickuptd"),
+                   offset_right_m: float = 3.0,
+                   first_m: float = 80.0, gap_m: float = 60.0) -> int:
+    """Park ``n`` NPC vehicles along the nav route (right roadside).
+
+    Placed just inside the ego lane's right edge (≈ ``offset_right_m``
+    right of the road centreline) so the front camera sees real vehicles
+    for the YOLO head / obstacle fusion while a correct drive can still
+    squeeze past.  Best-effort: any Lua/transport failure logs and the
+    function returns how many vehicles actually spawned.  Pure vehicle
+    spawning - no map offsets are used for the EGO's lateral reference.
+    """
+    if nav_route is None or len(nav_route) < 2 or int(n) <= 0:
+        return 0
+    r = np.asarray(nav_route, dtype=float)[:, :2]
+    arc = np.concatenate(
+        [[0.0], np.cumsum(np.linalg.norm(np.diff(r, axis=0), axis=1))])
+    total = float(arc[-1])
+    placed = 0
+    for k in range(int(n)):
+        s = min(total - 15.0, float(first_m) + float(gap_m) * k)
+        if s < 20.0:
+            continue
+        i = int(np.searchsorted(arc, s))
+        i = min(max(i, 1), len(r) - 2)
+        seg = r[i + 1] - r[i]
+        L = float(np.linalg.norm(seg))
+        if L < 1e-6:
+            continue
+        d = seg / L
+        right = np.array([d[1], -d[0]])       # right of travel
+        px, py = r[i] + float(offset_right_m) * right
+        gz = conn.ground_z_at(float(px), float(py))
+        z = (float(gz) + 0.4) if gz is not None else 1.0
+        yaw_deg = -math.degrees(math.atan2(d[1], d[0])) - 90.0
+        qx, qy, qz, qw = angle_to_quat((0.0, 0.0, yaw_deg))
+        model = models[k % len(models)]
+        chunk = (
+            "core_vehicles.spawnNewVehicle('%s', {pos=vec3(%.3f, %.3f, "
+            "%.3f), rot=quat(%f, %f, %f, %f), clip=0})"
+            % (model, px, py, z, qx, qy, qz, qw))
+        try:
+            conn.bng.queue_lua_command(chunk)
+            placed += 1
+            print(f"[fsd-drive] traffic NPC #{k + 1}: {model} at "
+                  f"({px:.1f}, {py:.1f}) z={z:.1f}")
+        except Exception as exc:
+            print(f"[fsd-drive] traffic NPC #{k + 1} failed: {exc}")
+            break
+    return placed
+
+
 def run(args) -> int:
 
     conn = BeamNGConnector(
@@ -640,6 +693,13 @@ def run(args) -> int:
                       f"({float(st1.pos[0]):.1f}, {float(st1.pos[1]):.1f}, "
                       f"{float(st1.pos[2]):.1f}) "
                       f"(was {d0[i]:.1f} m off route)")
+            # Town traffic: parked NPC vehicles along the route give the
+            # YOLO head / obstacle fusion real vehicles to see and the
+            # planner real dodges to make (verification of the
+            # perception chain under live multi-object conditions).
+            if getattr(args, "traffic", 0):
+                _n = _spawn_traffic(conn, nav_route, int(args.traffic))
+                print(f"[fsd-drive] traffic NPCs spawned: {_n}/{args.traffic}")
         else:
             print("[fsd-drive] no nav route set; falling back to "
                   "straight-ahead reference")
