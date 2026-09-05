@@ -183,7 +183,7 @@ ROAD_EDGE_SLOW_MPS = 2.0
 # steer back to the road centre (town opt24: after a 90-deg corner cut
 # the car drove 20 m on grass because route_local anchors at the car
 # and the old guard only capped at 0.5 m/s).
-ROAD_OFF_STOP_M = 3.0   # beyond this = definitely off-road (hard stop);
+ROAD_OFF_STOP_M = 2.0   # beyond this = definitely off-road (hard stop);
                     # junction/start offsets stay ~2 m and only crawl
 ROAD_RETURN_LOOK_M = 40.0  # road-centre target for the return steering
 ROAD_RETURN_STEER_MAX = 0.55
@@ -475,7 +475,7 @@ def _snap_heading(nav_route, rx: float, ry: float, h_seg: float,
 
 def _spawn_traffic(conn, nav_route, n: int,
                    models=("pessima", "etk800", "pickuptd"),
-                   offset_right_m: float = 3.0,
+                   offset_right_m: float = 3.4,
                    first_m: float = 80.0, gap_m: float = 60.0) -> int:
     """Park ``n`` NPC vehicles along the nav route (right roadside).
 
@@ -492,6 +492,16 @@ def _spawn_traffic(conn, nav_route, n: int,
     arc = np.concatenate(
         [[0.0], np.cumsum(np.linalg.norm(np.diff(r, axis=0), axis=1))])
     total = float(arc[-1])
+    # Remove vehicles left over from earlier runs so NPCs never stack at
+    # the same arc positions (town run 1 left clone/clone0/clone1).
+    try:
+        ego_id = getattr(conn.vehicle, "vid", None)
+        conn.bng.queue_lua_command(
+            "for _, v in ipairs(getAllVehicles() or {}) do "
+            "if tostring(v:getId()) ~= tostring('%s') then v:remove() end "
+            "end" % (ego_id,))
+    except Exception as exc:
+        print(f"[fsd-drive] NPC cleanup failed: {exc}")
     placed = 0
     for k in range(int(n)):
         s = min(total - 15.0, float(first_m) + float(gap_m) * k)
