@@ -57,8 +57,19 @@ def _f(hist, key, i, default=None):
 
 
 def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
-               ) -> dict:
-    """Compute driving-quality metrics for one telemetry run."""
+               settle_s: float = 0.0) -> dict:
+    """Compute driving-quality metrics for one telemetry run.
+
+    ``settle_s`` excludes the first ``settle_s`` seconds from the
+    DISCIPLINE counts (crossings / off-road / reversing / stalls).  A
+    teleport spawn needs a couple of seconds to settle - the semantic
+    head warms up and the perception placement converges onto the own
+    lane - so the very first frames read as boundary noise, not driving
+    (fsd_benchmark mountain run 4: lat_right -0.26 m at t=2.4 with the
+    car ON the road, gone by t=3.5).  Default 0 keeps the historical
+    (no-settle) numbers; the benchmark passes 3.0.  All other metrics
+    (frames, duration, speed, travel) always cover the whole run.
+    """
     n = len(hist)
     out: dict = {
         "frames": n,
@@ -66,6 +77,10 @@ def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
     }
     if n == 0:
         return out
+    t = [_f(hist, "t", i, 0.0) or 0.0 for i in range(n)]
+    settled = [i for i in range(n) if float(t[i]) >= float(settle_s)]
+    ns = len(settled)
+    out["settled_frames"] = ns
 
     # sources / safety levels
     src: dict = {}
@@ -78,18 +93,18 @@ def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
     out["source"] = src
     out["level"] = lvl
     out["reversing_frames"] = int(sum(
-        int(bool(_f(hist, "reversing", i, 0))) for i in range(n)))
+        int(bool(_f(hist, "reversing", i, 0))) for i in settled))
     out["stuck_frames"] = int(sum(
-        int(bool(_f(hist, "stuck", i, 0))) for i in range(n)))
+        int(bool(_f(hist, "stuck", i, 0))) for i in settled))
     out["emergency_frames"] = int(sum(
-        int(bool(_f(hist, "emergency", i, 0))) for i in range(n)))
+        int(bool(_f(hist, "emergency", i, 0))) for i in settled))
     out["stopps"] = int(sum(
-        1 for i in range(n)
+        1 for i in settled
         if (_f(hist, "stuck", i, 0) or _f(hist, "emergency", i, 0))))
 
     # lane discipline
-    ll = [_f(hist, "lat_left", i) for i in range(n)]
-    lr = [_f(hist, "lat_right", i) for i in range(n)]
+    ll = [_f(hist, "lat_left", i) for i in settled]
+    lr = [_f(hist, "lat_right", i) for i in settled]
     ll_v = [v for v in ll if _num(v)]
     lr_v = [v for v in lr if _num(v)]
     crossed_centre = sum(1 for v in ll_v if v > CROSS_CENTRE_M)
@@ -105,7 +120,7 @@ def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
     out["lat_frames"] = len(ll_v)
 
     # off-road
-    ro = [_f(hist, "road_off", i) for i in range(n)]
+    ro = [_f(hist, "road_off", i) for i in settled]
     ro_v = [v for v in ro if _num(v)]
     out["off_road_frames"] = sum(1 for v in ro_v if v > OFF_ROAD_M)
     out["max_road_off_m"] = round(max(ro_v), 3) if ro_v else 0.0
@@ -137,7 +152,7 @@ def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
 
     # stalls (away from the end-zone stop)
     stalls = 0
-    for i in range(n):
+    for i in settled:
         rem = _f(hist, "rem_end", i)
         rem = rem if _num(rem) else None
         if v_v[i] < STALL_SPEED_MPS and (rem is None or rem > STALL_REM_END_M):
@@ -159,9 +174,9 @@ def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
     out["final_rem_end"] = (_f(hist, "rem_end", n - 1)
                             if _num(_f(hist, "rem_end", n - 1)) else None)
     out["final_lat_left"] = (round(float(ll[-1]), 3)
-                             if _num(ll[-1]) else None)
+                             if ll and _num(ll[-1]) else None)
     out["final_lat_right"] = (round(float(lr[-1]), 3)
-                              if _num(lr[-1]) else None)
+                              if lr and _num(lr[-1]) else None)
     if goal is not None:
         gx, gy = float(goal[0]), float(goal[1])
         out["goal_dist_m"] = round(math.hypot(
@@ -171,9 +186,11 @@ def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
 
 
 def assess_many(runs: Iterable[list[dict]], goal=None,
-                cruise: float | None = None) -> list[dict]:
+                cruise: float | None = None,
+                settle_s: float = 0.0) -> list[dict]:
     """Assess several runs; returns a list of result dicts."""
-    return [assess_run(h, goal=goal, cruise=cruise) for h in runs]
+    return [assess_run(h, goal=goal, cruise=cruise, settle_s=settle_s)
+            for h in runs]
 
 
 def score_run(assessed: dict, require_goal: bool = False) -> dict:
@@ -186,7 +203,10 @@ def score_run(assessed: dict, require_goal: bool = False) -> dict:
     never pass.
     """
     checks = {
-        "has_frames": int(assessed.get("frames", 0) or 0) > 0,
+        "has_frames": (
+            int(assessed.get("frames", 0) or 0) > 0
+            and int(assessed.get("settled_frames",
+                                 assessed.get("frames", 0)) or 0) > 0),
         "no_reversing": int(assessed.get("reversing_frames", 0) or 0)
         <= BENCH_MAX_REVERSING_FRAMES,
         "no_centre_crossing": int(assessed.get("cross_centre_frames", 0) or 0)

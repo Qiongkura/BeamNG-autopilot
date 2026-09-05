@@ -100,8 +100,32 @@ def test_scenario_args_override_and_namespace_complete() -> None:
 def test_score_telemetry_roundtrip(tmp_path) -> None:
     p = tmp_path / "run.json"
     p.write_text(
-        __import__("json").dumps(_hist(5, lat_left=0.5)),
+        __import__("json").dumps(_hist(10, lat_left=0.5)),
         encoding="utf-8")
     r = m5_fsd_benchmark.score_telemetry(p, require_goal=False)
     assert r["pass"] is False
-    assert r["assessed"]["cross_centre_frames"] == 5
+    # 10 frames at t=0..4.5: the first 6 sit inside the 3 s settle
+    # window, the last 4 are real driving violations
+    assert r["assessed"]["cross_centre_frames"] == 4
+
+
+def test_settle_window_excludes_spawn_transient() -> None:
+    # a violation in the first 3 s counts with settle_s=0 but is
+    # excluded with the benchmark's settle_s=3.0
+    rows = _hist(12)
+    rows[2]["lat_right"] = -0.5          # t = 1.0 s: spawn transient
+    a0 = assess_run(rows)
+    a3 = assess_run(rows, settle_s=3.0)
+    assert a0["cross_right_frames"] == 1
+    assert a3["cross_right_frames"] == 0
+    assert a3["settled_frames"] == len(rows) - sum(
+        1 for r in rows if r["t"] < 3.0)
+    # score flips on the settle window alone
+    assert score_run(a0)["pass"] is False
+    assert score_run(a3)["pass"] is True
+
+
+def test_score_run_requires_settled_frames() -> None:
+    a = assess_run(_hist(2), settle_s=3.0)   # both frames inside window
+    assert a["frames"] == 2 and a["settled_frames"] == 0
+    assert score_run(a)["pass"] is False

@@ -113,9 +113,15 @@ def scenario_args(name: str, base: dict, out_path: Path):
 
 
 def score_telemetry(path: Path, require_goal: bool, goal=None) -> dict:
-    """Assess + score one ``--out`` telemetry JSON file."""
+    """Assess + score one ``--out`` telemetry JSON file.
+
+    ``settle_s=3.0``: the first seconds after a teleport spawn are
+    settling (semantic head warm-up + perception placement onto the own
+    lane), not driving - discipline counts exclude them while the raw
+    full-run metrics stay visible in ``assessed``.
+    """
     hist = json.loads(Path(path).read_text(encoding="utf-8"))
-    assessed = assess_run(hist, goal=goal)
+    assessed = assess_run(hist, goal=goal, settle_s=3.0)
     verdict = score_run(assessed, require_goal=require_goal)
     return {"file": str(path), "assessed": assessed, **verdict}
 
