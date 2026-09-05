@@ -511,8 +511,13 @@ def _spawn_traffic(conn, nav_route, n: int,
                 bng.vehicles.despawn(veh)
             except Exception:
                 pass
+        # Spread over the route: a short route would cap every NPC onto
+        # the same arc position (town: two stacked cars formed a
+        # mid-lane barrier the no-cross policy correctly refuses to
+        # pass), so the start shrinks to half the usable route first.
+        first = min(float(first_m), max(20.0, (total - 15.0) * 0.5))
         for k in range(int(n)):
-            s = min(total - 15.0, float(first_m) + float(gap_m) * k)
+            s = min(total - 15.0, first + float(gap_m) * k)
             if s < 20.0:
                 continue
             i = int(np.searchsorted(arc, s))
