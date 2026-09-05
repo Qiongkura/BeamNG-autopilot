@@ -463,6 +463,13 @@ class FSDStack:
                 # real walls/vehicles, the drivable layer keeps the road.
                 fuse_obstacles_to_grid(grid, rng.obstacles)
                 out.meta["n_obstacles"] = len(rng.obstacles)
+                # Geometric obstacle identity (tree / guardrail / wall):
+                # per-class counts + nearest distance, refreshed on every
+                # fresh scan and cached between scans so every tick's
+                # telemetry carries the last-known read.
+                from beamng_autopilot.perception import obstacle_class_counts
+                self._cls_counts, self._cls_nearest = obstacle_class_counts(
+                    rng.obstacles, pos)
             except Exception as exc:
                 out.errors["range"] = str(exc)
             # YOLO object head: fuse detected vehicles/pedestrians into
@@ -544,6 +551,10 @@ class FSDStack:
                 out.feature_map = fmap
             except Exception as exc:
                 out.errors["bev_fusion"] = str(exc)
+        _cc = getattr(self, "_cls_counts", None)
+        if _cc:
+            out.meta["cls_counts"] = dict(_cc)
+            out.meta["cls_nearest"] = dict(getattr(self, "_cls_nearest", {}))
         _times['range'] = round((time.time() - _tw) * 1000.0, 1)
         _tw = time.time()
         if _budget_skips:

@@ -406,6 +406,62 @@ def _cluster_points(pts, cell: float = 2.0, min_size: float = 0.9,
     return out
 
 
+# --- geometric obstacle classes ---------------------------------------
+# LiDAR clusters get a best-effort geometric identity so the telemetry
+# can report WHAT the perception sees, not just how many cells lit up:
+# a slender+tall cluster is a tree trunk, a long+low strip a guardrail,
+# a long+tall face a wall.  Purely geometric - no training data needed.
+TREE_MAX_HALF_M = 1.2       # trunk footprint half-extent
+TREE_MIN_TOP_M = 2.5        # top well above the ground = trunk+canopy
+GUARD_MIN_HALF_M = 1.5      # a continuous rail (>= 3 m long)
+GUARD_MAX_TOP_M = 1.6       # rails sit low
+WALL_MIN_HALF_M = 1.2
+WALL_MIN_TOP_M = 1.8        # a face that rises well above a rail
+
+
+def classify_lidar_obstacle(half_len: float, half_thick: float,
+                            z_top: float, ground_z: float) -> str | None:
+    """Geometric class of one cluster footprint ('tree'/'guardrail'/
+    'wall'), or None when the shape matches no class.
+
+    ``half_len``/``half_thick`` are the oriented half extents of the
+    footprint, ``z_top`` the cluster's highest hit and ``ground_z`` the
+    local ground reference - top-above-ground separates a low rail from
+    a tall wall and a slender trunk from a boulder.
+    """
+    top = float(z_top) - float(ground_z)
+    slender = max(float(half_len), float(half_thick)) <= TREE_MAX_HALF_M
+    if slender and top >= TREE_MIN_TOP_M:
+        return "tree"
+    if float(half_len) >= GUARD_MIN_HALF_M and top < GUARD_MAX_TOP_M:
+        return "guardrail"
+    if float(half_len) >= WALL_MIN_HALF_M and top >= WALL_MIN_TOP_M:
+        return "wall"
+    return None
+
+
+def obstacle_class_counts(obstacles, pos) -> tuple[dict, dict]:
+    """Per-class counts + nearest distance (m) from classified obstacles.
+
+    Returns ``({'tree': n, 'guardrail': n, 'wall': n},
+    {'tree': d, 'guardrail': d, 'wall': d})`` - distances are None when
+    the class was not seen this frame.
+    """
+    counts = {"tree": 0, "guardrail": 0, "wall": 0}
+    nearest = {"tree": None, "guardrail": None, "wall": None}
+    px, py = float(pos[0]), float(pos[1])
+    for ob in obstacles or []:
+        cls = getattr(ob, "label", "") or ""
+        if cls not in counts:
+            continue
+        counts[cls] += 1
+        d = math.hypot(float(ob.x) - px, float(ob.y) - py)
+        cur = nearest[cls]
+        if cur is None or d < cur:
+            nearest[cls] = round(float(d), 2)
+    return counts, nearest
+
+
 def _split_raycast_sectors(pts, origin, max_gap_deg: float = 30.0):
     """Split lidar hits into angular sectors seen from the sensor origin.
 
@@ -578,7 +634,8 @@ def lidar_obstacles(cloud: np.ndarray, pos, radius: float = 45.0,
     ground = _local_ground_z(pts, ox, oy)
     keep = ((pts[:, 2] - ground >= ground_clearance)
             & (pts[:, 2] - ground <= max_height))
-    pts2d = [(float(x), float(y)) for x, y, _ in pts[keep]]
+    pts3d = np.asarray(pts[keep], dtype=float)
+    pts2d = [(float(x), float(y)) for x, y, _ in pts3d]
     if len(pts2d) < 2:
         return []
     out: list[Obstacle] = []
@@ -588,6 +645,34 @@ def lidar_obstacles(cloud: np.ndarray, pos, radius: float = 45.0,
         # box instead of dozens of 0.9 m specks that clutter the planner.
         out.extend(_cluster_points(sector, cell=3.0, split_walls=True,
                                    category="lidar"))
+    # Geometric identity per cluster: the z stats of the cloud points
+    # inside the oriented footprint give top-above-ground, which splits
+    # tree / guardrail / wall (category stays "lidar" - downstream code
+    # filters on it - the class goes into the human-readable label).
+    if pts3d.shape[0] and out:
+        rel = pts3d[:, :2] - np.array([ox, oy])
+        for ob in out:
+            ax = np.asarray(ob.axis, dtype=float)[:2]
+            n = float(np.linalg.norm(ax))
+            ax = ax / n if n > 1e-9 else np.array([1.0, 0.0])
+            ac = np.array([-ax[1], ax[0]])
+            # the footprint is centred on the CLUSTER (not the sensor
+            # origin): project the centre offset into the oriented frame
+            # first, then mask the members around it
+            dc = np.array([ob.x - ox, ob.y - oy])
+            along = rel @ ax - float(dc @ ax)
+            across = rel @ ac - float(dc @ ac)
+            m = ((np.abs(along) <= ob.half_len + 0.4)
+                 & (np.abs(across) <= ob.half_thick + 0.4))
+            if not m.any():
+                continue
+            zg = _local_ground_z(pts3d[m], ob.x, ob.y)
+            z_top = float(np.max(pts3d[m, 2]))
+            g_ref = float(np.median(zg))
+            cls = classify_lidar_obstacle(ob.half_len, ob.half_thick,
+                                          z_top, g_ref)
+            if cls is not None:
+                ob.label = cls
     return out
 
 

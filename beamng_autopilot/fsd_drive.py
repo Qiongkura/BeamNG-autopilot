@@ -1220,6 +1220,8 @@ def run(args) -> int:
                     bc_path = None
                     bc_safe = False
 
+            _cls = out.meta.get("cls_counts", {})
+            _cls_near = out.meta.get("cls_nearest", {})
             # planner arbitration: FSD path first; when the layered
             # planner declined (even to minimal risk) fall back to the
             # rule straight-ahead reference IN WORLD COORDINATES - the
@@ -2211,6 +2213,12 @@ def run(args) -> int:
                 "bc_ms": (round(float(bc_ms), 1)
                           if bc_ms is not None else None),
                 "dqn_act": dqn_action,
+                "cls_tree": int(_cls.get("tree", 0)),
+                "cls_guardrail": int(_cls.get("guardrail", 0)),
+                "cls_wall": int(_cls.get("wall", 0)),
+                "cls_tree_d": _cls_near.get("tree"),
+                "cls_guardrail_d": _cls_near.get("guardrail"),
+                "cls_wall_d": _cls_near.get("wall"),
                 "dqn_ms": (round(float(dqn_ms), 1)
                            if dqn_ms is not None else None),
                 "e2e_act": ([round(float(a), 3) for a in e2e_act]
