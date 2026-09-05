@@ -35,6 +35,13 @@ STALL_REM_END_M = 8.0       # only count stalls away from the end zone
 # passes only with ZERO crossings, ZERO off-road frames, ZERO reversing
 # and ZERO stalls; a goal scenario additionally must actually reach the
 # goal (same tolerance as the rule autopilot's GOAL_RADIUS_M).
+# ego body footprint halves (etk800): used for BODY-aware line-crossing
+# detection - a yawed car crosses the line with its body while the ego
+# CENTRE point still reads in-lane (fsd_benchmark town 2026-09-06: the
+# user photographed left wheels ON the line while crossC reported 0;
+# body-left was over the line by 0.14-0.22 m for 3 frames).
+BODY_HALF_W_M = 0.9
+BODY_HALF_L_M = 2.2
 BENCH_MAX_REVERSING_FRAMES = 0
 BENCH_MAX_CROSS_CENTRE = 0
 BENCH_MAX_CROSS_RIGHT = 0
@@ -118,6 +125,41 @@ def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
     out["max_cross_centre_m"] = round(max(ll_v), 3) if ll_v else 0.0
     out["max_cross_right_m"] = round(min(lr_v), 3) if lr_v else 0.0
     out["lat_frames"] = len(ll_v)
+
+    # BODY-aware crossing: the car's yawed footprint extends its lateral
+    # reach by half_w*|cos(dyaw)| + half_len*|sin(dyaw)|; the centre
+    # point alone is blind to a yawed car crossing with its body.
+    hd = [_f(hist, "heading", i) for i in settled]
+    rb = [_f(hist, "route_bear", i) for i in settled]
+    body_cross_centre = 0
+    body_cross_right = 0
+    max_body_left = None
+    max_body_right = None
+    for k, i in enumerate(settled):
+        if not (_num(hd[k]) and _num(rb[k])):
+            continue
+        dyaw = math.radians((float(hd[k]) - float(rb[k]) + 180.0)
+                            % 360.0 - 180.0)
+        ext = (BODY_HALF_W_M * abs(math.cos(dyaw))
+               + BODY_HALF_L_M * abs(math.sin(dyaw)))
+        if _num(ll[k]):
+            body_l = float(ll[k]) + ext
+            max_body_left = (max(max_body_left, body_l)
+                             if max_body_left is not None else body_l)
+            if body_l > CROSS_CENTRE_M:
+                body_cross_centre += 1
+        if _num(lr[k]):
+            body_r = float(lr[k]) - ext
+            max_body_right = (min(max_body_right, body_r)
+                              if max_body_right is not None else body_r)
+            if body_r < CROSS_RIGHT_M:
+                body_cross_right += 1
+    out["body_cross_centre_frames"] = body_cross_centre
+    out["body_cross_right_frames"] = body_cross_right
+    out["max_body_left_m"] = (round(max_body_left, 3)
+                              if max_body_left is not None else None)
+    out["max_body_right_m"] = (round(max_body_right, 3)
+                               if max_body_right is not None else None)
 
     # off-road
     ro = [_f(hist, "road_off", i) for i in settled]
@@ -213,10 +255,16 @@ def score_run(assessed: dict, require_goal: bool = False) -> dict:
                                  assessed.get("frames", 0)) or 0) > 0),
         "no_reversing": int(assessed.get("reversing_frames", 0) or 0)
         <= BENCH_MAX_REVERSING_FRAMES,
-        "no_centre_crossing": int(assessed.get("cross_centre_frames", 0) or 0)
-        <= BENCH_MAX_CROSS_CENTRE,
-        "no_edge_crossing": int(assessed.get("cross_right_frames", 0) or 0)
-        <= BENCH_MAX_CROSS_RIGHT,
+        "no_centre_crossing": (
+            int(assessed.get("cross_centre_frames", 0) or 0)
+            <= BENCH_MAX_CROSS_CENTRE
+            and int(assessed.get("body_cross_centre_frames", 0) or 0)
+            <= BENCH_MAX_CROSS_CENTRE),
+        "no_edge_crossing": (
+            int(assessed.get("cross_right_frames", 0) or 0)
+            <= BENCH_MAX_CROSS_RIGHT
+            and int(assessed.get("body_cross_right_frames", 0) or 0)
+            <= BENCH_MAX_CROSS_RIGHT),
         "on_road": int(assessed.get("off_road_frames", 0) or 0)
         <= BENCH_MAX_OFF_ROAD_FRAMES,
         "no_stall": int(assessed.get("stall_frames", 0) or 0)

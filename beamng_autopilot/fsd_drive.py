@@ -2215,6 +2215,22 @@ def run(args) -> int:
                 # the left boundary moves outward (LEFT) by the same
                 # deficit: the map edges are inboard of the real surface
                 lat_left = round(float(lat_left) - hw_deficit, 3)
+            # BODY-aware lateral position: a yawed car crosses the line
+            # with its body while the centre point still reads in-lane
+            # (town run 2026-09-06: crossC=0 while the user photographed
+            # the left wheels ON the line).  Boundary heading ~= route
+            # bearing; footprint halves are the etk800's.
+            body_lat_left = body_lat_right = None
+            if route_bear is not None:
+                _dy = math.radians(
+                    (heading * 57.29577951308232 - route_bear + 180.0)
+                    % 360.0 - 180.0)
+                _ext = (0.9 * abs(math.cos(_dy))
+                        + 2.2 * abs(math.sin(_dy)))
+                if lat_left is not None:
+                    body_lat_left = round(float(lat_left) + _ext, 3)
+                if lat_right is not None:
+                    body_lat_right = round(float(lat_right) - _ext, 3)
             # snapshot for offline stability evaluation (safe / degraded
             # ratio over a long route); written once at the end.
             hist.append({
@@ -2243,6 +2259,8 @@ def run(args) -> int:
                 "cls_guardrail": int(_cls.get("guardrail", 0)),
                 "cls_wall": int(_cls.get("wall", 0)),
                 "cls_tree_d": _cls_near.get("tree"),
+                "body_lat_left": body_lat_left,
+                "body_lat_right": body_lat_right,
                 "cls_guardrail_d": _cls_near.get("guardrail"),
                 "cls_wall_d": _cls_near.get("wall"),
                 "dqn_ms": (round(float(dqn_ms), 1)

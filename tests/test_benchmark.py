@@ -6,6 +6,8 @@ import importlib.util
 import sys
 from pathlib import Path
 
+import math
+
 import numpy as np
 import pytest
 
@@ -129,3 +131,37 @@ def test_score_run_requires_settled_frames() -> None:
     a = assess_run(_hist(2), settle_s=3.0)   # both frames inside window
     assert a["frames"] == 2 and a["settled_frames"] == 0
     assert score_run(a)["pass"] is False
+
+
+def test_body_aware_crossing_catches_yawed_car() -> None:
+    """A yawed car crosses the line with its BODY while the ego centre
+    point still reads in-lane - the centre-only metric reported 0
+    crossings while the user photographed left wheels ON the line
+    (fsd_benchmark town 2026-09-06)."""
+    rows = _hist(20)
+    # straight and centred except one yawed segment 1 m right of the
+    # lane centre with 12 deg of yaw: centre passes, body crosses
+    for r in rows:
+        r["lat_left"] = -1.0
+        r["route_bear"] = 0.0
+        r["heading"] = 0.0
+    rows[10]["lat_left"] = -1.0
+    rows[10]["heading"] = 12.0     # hist stores degrees
+    rows[10]["route_bear"] = 0.0
+    a = assess_run(rows)
+    assert a["cross_centre_frames"] == 0
+    assert a["body_cross_centre_frames"] >= 1
+    assert a["max_body_left_m"] is not None and a["max_body_left_m"] > 0.1
+    v = score_run(a)
+    assert v["checks"]["no_centre_crossing"] is False
+
+
+def test_body_aware_no_false_positive_when_straight() -> None:
+    rows = _hist(20)
+    for r in rows:
+        r["lat_left"] = -1.0
+        r["route_bear"] = 0.0
+        r["heading"] = 0.0
+    a = assess_run(rows)
+    assert a["body_cross_centre_frames"] == 0
+    assert score_run(a)["checks"]["no_centre_crossing"] is True
