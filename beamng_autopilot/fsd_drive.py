@@ -124,6 +124,12 @@ REALTIME_CTRL_HZ = 2.0
 # (observed 4-6 s); in real time the car would otherwise run open-loop
 # during that.  Crawl until the object head is live, capped at WARMUP_S.
 WARMUP_S = 8.0
+# Lane-placement hold: the car stays BRAKED at spawn until the semantic
+# head has placed it in its own lane (painted-line projection) or this
+# deadline expires.  A start from the road-graph node sits ON the road
+# centre line - driving unplaced rides the left line from metre one
+# (town 2026-09-06, user-reported).  An unplaced run aborts instead.
+PLACEMENT_HOLD_S = 25.0
 WARMUP_SPEED_MPS = 1.5
 # If a tick ever takes longer than this, the car has been driving
 # open-loop for that long - keep this frame slow instead of trusting
@@ -851,11 +857,19 @@ def run(args) -> int:
         # cannot drive the car open-loop off the road; release once the
         # object head is live (or WARMUP_S elapsed).
         _pw_out = None
+        _percep_ok = False
+        _pl_t0 = time.time()
         try:
             conn.control(throttle=0.0, brake=1.0, steering=0.0,
                          parkingbrake=1.0, gear=fwd_gear)
             _pw_t0 = time.time()
-            while time.time() - _pw_t0 < WARMUP_S:
+            # Hold at standstill until BOTH the pipeline is warm AND the
+            # painted-line placement has put the car in its own lane.
+            # The old flow attempted the placement ONCE and drove from
+            # the road-graph-node snap (= the road centre line) on any
+            # miss, riding the left line from metre one.
+            while True:
+                _elapsed = time.time() - _pw_t0
                 try:
                     wd_heartbeat(conn)
                 except Exception:
@@ -866,13 +880,52 @@ def run(args) -> int:
                     float(_pw_state.heading), nav_route)
                 try:
                     _pw_out = stack.tick(st=_pw_state, route_ref=_pw_route)
-                    if _pw_out.meta.get("object_head"):
-                        break
                 except Exception:
-                    pass
+                    _pw_out = None
+                _head_live = bool(
+                    _pw_out is not None
+                    and _pw_out.meta.get("object_head"))
+                if _pw_out is not None and _pw_out.frame is not None:
+                    try:
+                        _st_sp = _pw_state
+                        _sp_tgt = painted_line_lane_center(
+                            _pw_out.head_outputs.get("semantic"),
+                            _pw_out.cam, _st_sp.pos, float(_st_sp.heading),
+                            ground_z=(float(_st_sp.pos[2])
+                                      - config.EGO_ORIGIN_GROUND_GAP_M))
+                        if _sp_tgt is not None:
+                            conn.safe_teleport(
+                                _sp_tgt[0], _sp_tgt[1],
+                                heading_deg=math.degrees(
+                                    float(_st_sp.heading)))
+                            _st_sp2 = conn.get_state()
+                            _percep_ok = True
+                            print(f"[fsd-drive] perception lane placement "
+                                  f"-> ({float(_st_sp2.pos[0]):.1f}, "
+                                  f"{float(_st_sp2.pos[1]):.1f}, "
+                                  f"{float(_st_sp2.pos[2]):.1f}) "
+                                  f"after {_elapsed:.1f}s "
+                                  f"(painted line, no offset constant)")
+                            break
+                    except Exception as _spe:
+                        print(f"[fsd-drive] placement attempt failed: "
+                              f"{_spe}")
+                if _elapsed > PLACEMENT_HOLD_S and _head_live:
+                    break
+                conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                             parkingbrake=1.0, gear=fwd_gear)
             print(f"[fsd-drive] pipeline warm: "
                   f"{time.time() - _pw_t0:.1f}s, "
-                  f"object_head={bool(_pw_out.meta.get('object_head'))}")
+                  f"object_head={bool(_pw_out is not None and _pw_out.meta.get('object_head'))}, "
+                  f"placed={_percep_ok}")
+            if not _percep_ok:
+                print("[fsd-drive] ABORT: lane placement failed after "
+                      f"{PLACEMENT_HOLD_S:.0f}s - the car will NOT drive "
+                      "unplaced from the road centre line")
+                conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                             parkingbrake=1.0, gear=fwd_gear)
+                conn.step(3)
+                return 2
             conn.control(throttle=0.0, brake=0.0, steering=0.0,
                          parkingbrake=0.0, gear=fwd_gear)
             conn.step(3)
@@ -882,32 +935,6 @@ def run(args) -> int:
                 pass
         except Exception as _pw_e:
             print(f"[fsd-drive] pre-warm skipped: {_pw_e}")
-        # Perception-only lane placement (NO map-centre / offset constant):
-        # if the warmed semantic head saw the painted line, put the car in
-        # its OWN lane - line right side + lane half width - so a start or
-        # restart never parks on (or straddles) the centre line.
-        _percep_ok = False
-        try:
-            if _pw_out is not None and _pw_out.frame is not None:
-                _st_sp = conn.get_state()
-                _sp_tgt = painted_line_lane_center(
-                    _pw_out.head_outputs.get("semantic"), _pw_out.cam,
-                    _st_sp.pos, float(_st_sp.heading),
-                    ground_z=(float(_st_sp.pos[2])
-                              - config.EGO_ORIGIN_GROUND_GAP_M))
-                if _sp_tgt is not None:
-                    conn.safe_teleport(
-                        _sp_tgt[0], _sp_tgt[1],
-                        heading_deg=math.degrees(float(_st_sp.heading)))
-                    _st_sp2 = conn.get_state()
-                    _percep_ok = True
-                    print(f"[fsd-drive] perception lane placement -> "
-                          f"({float(_st_sp2.pos[0]):.1f}, "
-                          f"{float(_st_sp2.pos[1]):.1f}, "
-                          f"{float(_st_sp2.pos[2]):.1f}) "
-                          f"(painted line right lane, no offset constant)")
-        except Exception as _spe:
-            print(f"[fsd-drive] perception lane placement failed: {_spe}")
         if not _percep_ok:
             print("[fsd-drive] painted line not perceived; keeping the "
                   "ground-safe route snap")
