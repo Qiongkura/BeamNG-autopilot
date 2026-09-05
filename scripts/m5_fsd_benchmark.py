@@ -91,6 +91,8 @@ _DRIVE_ARG_DEFAULTS = {
     "no_e2e": False,
     "bc_model": None,
     "no_bc": False,
+    "dqn_model": None,
+    "no_dqn": False,
     "traffic": 0,
     "goal": None,
     "no_signal": False,
@@ -166,6 +168,7 @@ def main() -> int:
     ap.add_argument("--strict", action="store_true")
     ap.add_argument("--no-e2e", action="store_true")
     ap.add_argument("--no-bc", action="store_true")
+    ap.add_argument("--no-dqn", action="store_true")
     ap.add_argument("--traffic", type=int, default=0, metavar="N",
                     help="park N NPC vehicles along the route")
     ap.add_argument("--no-signal", action="store_true")
@@ -188,6 +191,7 @@ def main() -> int:
         "strict": args.strict,
         "no_e2e": args.no_e2e,
         "no_bc": args.no_bc,
+        "no_dqn": args.no_dqn,
         "traffic": int(args.traffic),
         "no_signal": args.no_signal,
         "goal": (list(args.goal) if args.goal is not None else None),

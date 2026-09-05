@@ -30,6 +30,9 @@ from beamng_autopilot.lane import perception_curve_speed
 from beamng_autopilot.neural.bc_runtime import (
     DEFAULT_BC_WEIGHTS, BCRuntime, steer_to_path,
 )
+from beamng_autopilot.rl.dqn_runtime import (
+    DEFAULT_DQN_WEIGHTS, DQNRuntime, action_to_target,
+)
 from beamng_autopilot.neural.e2e_runtime import (
     DEFAULT_E2E_WEIGHTS, E2ERuntime,
 )
@@ -794,6 +797,24 @@ def run(args) -> int:
             except Exception as _bc_e:
                 print(f"[fsd-drive] BC steering disabled: {_bc_e}")
                 bc_rt = None
+        # M4 DQN decision policy: caps the plan's target speed with
+        # discrete cruise/ease/slow decisions learned offline.  It can
+        # only SLOW the plan - steering and every safety layer stay
+        # authoritative - so a bad policy costs comfort, never safety.
+        dqn_rt = None
+        if not args.no_dqn:
+            try:
+                dqn_rt = DQNRuntime(args.dqn_model or DEFAULT_DQN_WEIGHTS)
+                if dqn_rt.loaded:
+                    print(f"[fsd-drive] DQN decision policy: "
+                          f"{dqn_rt.weights}")
+                else:
+                    print(f"[fsd-drive] DQN policy disabled: "
+                          f"{dqn_rt.error or 'weights not found'}")
+                    dqn_rt = None
+            except Exception as _dqn_e:
+                print(f"[fsd-drive] DQN policy disabled: {_dqn_e}")
+                dqn_rt = None
         # Realistic gearbox locked into a forward gear (D).  A real stack
         # never leaves the car in reverse; keep the D input on every
         # control frame so an impact can never leave the gearbox in R.
@@ -1704,6 +1725,30 @@ def run(args) -> int:
             if chosen.source == "rule":
                 plan_speed = min(plan_speed, 3.0)
             plan_raw_speed = float(plan_speed)
+            # M4 DQN decision layer: cap the plan target with the learned
+            # cruise/ease/slow decision from the stack's own perception.
+            # It can only SLOW the plan - steering and every safety layer
+            # stay authoritative - so a bad policy costs comfort, never
+            # safety.
+            dqn_action = None
+            dqn_ms = None
+            if dqn_rt is not None:
+                try:
+                    dqn_action, dqn_ms = dqn_rt.predict(
+                        speed=v,
+                        target_speed=max(0.5, float(plan_speed)),
+                        fwd_clearance=out.forward_clearance,
+                        closest_obs=(None if verd.closest_obs_m > 900.0
+                                     else float(verd.closest_obs_m)),
+                        lane_dev=float(getattr(verd, "lane_dev_m", 0.0)),
+                        road_off=road_off,
+                        n_tracks=len(out.tracks))
+                    plan_speed = min(
+                        plan_speed,
+                        action_to_target(dqn_action, plan_speed))
+                except Exception:
+                    dqn_action = None
+                    dqn_ms = None
             # Rate-limit the plan (PLAN_* constants): transient LiDAR
             # clutter at junctions/end zones must not snap the plan
             # 6.0 <-> 1.0 between ticks and make the controller brake
@@ -2165,6 +2210,9 @@ def run(args) -> int:
                              if bc_steer is not None else None),
                 "bc_ms": (round(float(bc_ms), 1)
                           if bc_ms is not None else None),
+                "dqn_act": dqn_action,
+                "dqn_ms": (round(float(dqn_ms), 1)
+                           if dqn_ms is not None else None),
                 "e2e_act": ([round(float(a), 3) for a in e2e_act]
                             if e2e_act is not None else None),
                 "plan_speed": round(float(plan_speed), 2),

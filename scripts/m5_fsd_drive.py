@@ -64,6 +64,11 @@ def main() -> int:
                          "logs/m3_bc/bc_tech_smallgrid.pt)")
     ap.add_argument("--no-bc", action="store_true",
                     help="disable the DAVE-2 BC steering candidate")
+    ap.add_argument("--dqn-model", type=str, default=None,
+                    help="trained SB3 DQN decision policy (default: "
+                         "logs/m4_dqn/dqn_decision.zip)")
+    ap.add_argument("--no-dqn", action="store_true",
+                    help="disable the DQN decision layer")
     ap.add_argument("--goal", nargs=2, type=float, default=None,
                     metavar=("X", "Y"),
                     help="set an in-game navigation route to this goal "

@@ -463,7 +463,15 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
   tick p50 123ms / p90 271ms（相机环收缩为 front_main 后）。
   **多场景 PASS（2026-09-05）**：mountain 184.2m + town 89.1m 双场景
   全零违规（0 压线 / 0 上草 / 0 倒车 / 0 卡死），town 终点保持距 goal
-  5.1m。**DAVE-2 BC 已接入仲裁链**：`neural/bc_runtime.py` 加载 M3
+  5.1m。**M4 DQN 决策层落地（2026-09-05）**：`beamng_autopilot/rl/`——
+  gym 风格 `DecisionSpeedEnv`（离散 cruise/ease/slow 目标速度决策，
+  offline 跟车仿真与实车同观测契约）、`DQNRuntime` 把已训 SB3 DQN 接进
+  FSD 驾驶决策层（只允许降低 plan 目标速度，转向与安全层保持权威；
+  `--dqn-model/--no-dqn`，遥测 dqn_act/dqn_ms）。
+  `scripts/m4_train_dqn.py --steps 150000` 离线训练+评估闭环完成：
+  策略 12 回合**零碰撞**（reward 95.4）vs 永远巡航基线 100% 碰撞
+  （reward 36.4），模型+报告在 `logs/m4_dqn/`。
+  **DAVE-2 BC 已接入仲裁链**：`neural/bc_runtime.py` 加载 M3
   checkpoint，`steer_to_path` 把转向预测 roll out 成恒曲率弧，
   safety monitor 逐帧核验后按 fsd → e2e → bc → rule 排序参与仲裁
   （`--bc-model/--no-bc`，遥测 bc/bc_steer/bc_ms）。**YOLO 交通验证**：
