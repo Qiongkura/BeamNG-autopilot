@@ -28,6 +28,7 @@ from .scene import Scene
 from .trajectory import CandidateSet, sample_arc, sample_lane_shift
 from .constraints import (
     lane_cross_dist_m,
+    body_lane_cross_dist_m,
     Constraints,
     corridor_free_band,
     cost_collision,
@@ -58,6 +59,7 @@ __all__ = [
     "cost_collision",
     "cost_curvature",
     "lane_cross_dist_m",
+    "body_lane_cross_dist_m",
     "cost_lane_align",
     "local_route",
     "AHEAD_M",

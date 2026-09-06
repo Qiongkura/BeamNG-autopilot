@@ -179,6 +179,11 @@ class Constraints:
                     return 1e9, False
         if lane_cross_dist_m(scene, path, max_cross_m=self.lane_cross_max_m) > 0.0:
             return 1e9, False
+        # Hard body envelope: no candidate is allowed to place any ego
+        # corner across a detected boundary, even when its centreline is
+        # still inside (full-vehicle projection, not centre-point proxy).
+        if body_lane_cross_dist_m(scene, path) > 0.0:
+            return 1e9, False
         # Hard drivable-surface gate: never leave the road (grass/terrain
         # is not an obstacle cell, so the collision layer cannot catch it).
         _bdrv, _tdrv, _nbdrv, _ntdrv = _path_off_drivable(
@@ -460,6 +465,66 @@ def _boundary_lateral(wx, wy, ref, fwd):
     # only had cross-lot arcs left and drove off the road).
     return sign, covered
 
+
+
+def body_lane_cross_dist_m(scene: Scene, path,
+                           half_len: float = 2.2,
+                           half_width: float = 0.9,
+                           max_cross_m: float = 0.05) -> float:
+    """First along-path distance where the FULL ego footprint crosses
+    a detected lane boundary.
+
+    The centreline-only gate is insufficient: a path can keep its centre
+    inside the lane while a yawed car's front/rear corner crosses the
+    line.  Each sampled path pose carries a rectangle aligned to the
+    local path tangent; every corner is tested against both world-space
+    boundaries.  Returns 0 when no corner crosses or no boundaries exist.
+    """
+    left = getattr(scene, "lane_left", None)
+    right = getattr(scene, "lane_right", None)
+    if (left is None and right is None) or path is None:
+        return 0.0
+    pth = np.asarray(path, dtype=float)[:, :2]
+    if len(pth) < 2:
+        return 0.0
+    pos = np.asarray(scene.pos[:2], dtype=float)
+    cum = 0.0
+    for i, p in enumerate(pth):
+        d0 = float(np.linalg.norm(p - pos))
+        if d0 < 2.5 or d0 > 15.0:
+            if i < len(pth) - 1:
+                cum += float(np.linalg.norm(pth[i + 1] - p))
+            continue
+        if i == 0:
+            tv = pth[1] - pth[0]
+        elif i == len(pth) - 1:
+            tv = pth[-1] - pth[-2]
+        else:
+            tv = pth[i + 1] - pth[i - 1]
+        ln = float(np.linalg.norm(tv))
+        if ln < 1e-9:
+            continue
+        fwd = tv / ln
+        lft = np.array([-fwd[1], fwd[0]])
+        corners = (p + half_len * fwd + half_width * lft,
+                   p + half_len * fwd - half_width * lft,
+                   p - half_len * fwd + half_width * lft,
+                   p - half_len * fwd - half_width * lft)
+        if left is not None:
+            for corner in corners:
+                lat, covered = _boundary_lateral(
+                    float(corner[0]), float(corner[1]), left, fwd)
+                if covered and lat > max_cross_m:
+                    return max(cum, 0.1)
+        if right is not None:
+            for corner in corners:
+                lat, covered = _boundary_lateral(
+                    float(corner[0]), float(corner[1]), right, fwd)
+                if covered and lat < -max_cross_m:
+                    return max(cum, 0.1)
+        if i < len(pth) - 1:
+            cum += float(np.linalg.norm(pth[i + 1] - p))
+    return 0.0
 
 
 def lane_cross_dist_m(scene: Scene, path, max_cross_m: float = 0.35) -> float:

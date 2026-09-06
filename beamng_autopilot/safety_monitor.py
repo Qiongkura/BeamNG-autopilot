@@ -26,6 +26,7 @@ from dataclasses import dataclass
 import numpy as np
 
 from beamng_autopilot.planning.geometry import polyline_point_distances
+from beamng_autopilot.planning.constraints import body_lane_cross_dist_m
 
 # How old a range/vision snapshot can be before the monitor distrusts it.
 STALE_SNAPSHOT_S = 0.8
@@ -192,6 +193,7 @@ class SafetyMonitor:
         closed_loop_steer = float(closed_loop_steer)
         path_occ = self._path_occupied_fraction(scene, path)
         lane_dev = self._lane_deviation(scene, path)
+        body_cross = body_lane_cross_dist_m(scene, path)
         stale_sensor = snapshot_age_s > self.stale_s
         stale_planner = planner_age_s > self.stale_s
 
@@ -263,6 +265,14 @@ class SafetyMonitor:
             return v
 
         # --- lane keep --------------------------------------------------
+        # Full-body envelope is a hard safety condition: a path whose
+        # centre is inside but whose projected corner crosses a boundary
+        # must stop before steering it (not merely degrade its speed).
+        if body_cross > 0.0:
+            v.level = "minimal_risk"
+            v.reason = "vehicle body crosses lane boundary"
+            v.target_speed = 0.0
+            return v
         if lane_dev >= self.lane_stop_m:
             v.level = "minimal_risk"
             v.reason = "path off-lane"

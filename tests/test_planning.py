@@ -307,3 +307,21 @@ def test_corridor_free_band_ignores_rows_behind_ego() -> None:
     # forward corridor - the old window counted the rear half
     g.obstacle[36:55, :] = 1
     assert corridor_free_band(scene) is True
+
+
+def test_body_lane_cross_rejects_corner_even_when_center_inside() -> None:
+    from beamng_autopilot.planning import body_lane_cross_dist_m
+    sc = _lane_scene()
+    # centre y=3.2 remains below left boundary y=4; the full 0.9 m body
+    # crosses it, so the envelope must reject the path.
+    path = np.array([[0.0, 0.0], [5.0, 3.2], [10.0, 3.2],
+                     [15.0, 3.2]], dtype=float)
+    assert body_lane_cross_dist_m(sc, path) > 0.0
+
+
+def test_body_lane_cross_accepts_centered_straight_path() -> None:
+    from beamng_autopilot.planning import body_lane_cross_dist_m
+    sc = _lane_scene()
+    path = np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0],
+                     [15.0, 0.0]], dtype=float)
+    assert body_lane_cross_dist_m(sc, path) == 0.0
