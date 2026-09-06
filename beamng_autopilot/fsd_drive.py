@@ -562,6 +562,12 @@ def _spawn_traffic(conn, nav_route, n: int,
 
 
 def run(args) -> int:
+    # initialised FIRST: the end-of-run finally touches these even when
+    # the connection fails before the drive section (2026-09-06:
+    # BNGDisconnectedError at connect -> UnboundLocalError in finally
+    # masked the real error)
+    hist: list[dict] = []
+    rec = None
 
     conn = BeamNGConnector(
         "italy", "etk800",
@@ -856,6 +862,12 @@ def run(args) -> int:
         # the sim runs continuously - the car is always moving, which
         # removes the paused-step stutter.  The warm-up crawl and
         # stale-tick scrub below bound the open-loop windows.
+        # Shadow episode: the FSD drive records its own (rgb + label +
+        # BEV + trajectory + executed control) frames for later
+        # end-to-end training - the same ShadowFrame contract
+        # m5_shadow_drive uses, so a drive IS a labelled run.
+        rec = None if args.no_shadow else ShadowRecorder(
+            config.LOGS_DIR / "m5_e2e", f"fsd_{int(time.time())}")
         # Pre-warm the pipeline BEFORE driving: the first FSD ticks load
         # YOLO and settle camera/LiDAR (observed 4-6 s, opt11: a 5.3 s
         # tick).  Running that with the car braked means the long tick
@@ -1017,13 +1029,11 @@ def run(args) -> int:
                 route_rad[1:-1][_rm] = 1.0 / _rcurv[_rm]
             except Exception:
                 route_round = route_arc = route_rad = None
-        hist: list[dict] = []
-        # Shadow episode: the FSD drive records its own (rgb + label +
-        # BEV + trajectory + executed control) frames for later
-        # end-to-end training - the same ShadowFrame contract
-        # m5_shadow_drive uses, so a drive IS a labelled run.
-        rec = None if args.no_shadow else ShadowRecorder(
-            config.LOGS_DIR / "m5_e2e", f"fsd_{int(time.time())}")
+        # Shadow episode + telemetry history are initialised HERE (before
+        # the placement/pre-warm section): the end-of-run finally writes
+        # telemetry, so these must exist even when the placement aborts
+        # the run early (the 2026-09-06 UnboundLocalError masked the real
+        # placement failure).
         _ema_tick = 0.35          # adaptive tick-budget EMA (seeded: a
                                   # typical warm tick is ~0.3-0.4 s)
         while time.time() < t_end:
@@ -1146,19 +1156,33 @@ def run(args) -> int:
             # ONCE per frame and shared with the steady lateral corrector
             # below, so a frame of line detection is never done twice.
             _plmarks = None
-            if out is not None and out.cam is not None and \
-                    getattr(out, "head_outputs", None):
-                try:
-                    _semx = out.head_outputs.get("semantic")
-                    if _semx is not None and \
-                            "line" in getattr(_semx, "masks", {}):
+            # funnel counters: WHERE do painted-line frames drop?
+            # (mask -> world markings -> near field) 2026-09-06 diagnosis
+            _pl_mask = _pl_marks = _pl_near = False
+            if out is not None and out.cam is not None and                     getattr(out, "head_outputs", None):
+                _semx = out.head_outputs.get("semantic")
+                _linem = (getattr(_semx, "masks", {}) or {}).get("line")                     if _semx is not None else None
+                _pl_mask = _linem is not None and bool(
+                    np.asarray(_linem).any())
+                if _pl_mask:
+                    try:
                         _plmarks = painted_line_markings(
                             _semx, out.cam, pos, float(heading),
                             ground_z=(float(pos[2])
                                       - config.EGO_ORIGIN_GROUND_GAP_M
                                       if len(pos) > 2 else None))
-                except Exception:
-                    _plmarks = None
+                        _pl_marks = bool(_plmarks)
+                    except Exception as _ple:
+                        _plmarks = None
+                        print(f"[fsd-drive] painted-line projection "
+                              f"error: {_ple}")
+                    if _pl_marks:
+                        _p2 = np.asarray(pos[:2], dtype=float)
+                        for _mk in _plmarks:
+                            _mw = np.asarray(_mk.world, dtype=float)
+                            if np.linalg.norm(_mw[0, :2] - _p2) < 25.0:
+                                _pl_near = True
+                                break
             line_lat = _painted_line_lat(out, pos, heading, _plmarks)
 
             # safety arbitration on the chosen path: evaluate against the
@@ -2288,6 +2312,9 @@ def run(args) -> int:
                 "cls_tree_d": _cls_near.get("tree"),
                 "body_lat_left": body_lat_left,
                 "body_lat_right": body_lat_right,
+                "pl_mask": int(_pl_mask),
+                "pl_marks": int(_pl_marks),
+                "pl_near": int(_pl_near),
                 "cls_guardrail_d": _cls_near.get("guardrail"),
                 "cls_wall_d": _cls_near.get("wall"),
                 "dqn_ms": (round(float(dqn_ms), 1)
