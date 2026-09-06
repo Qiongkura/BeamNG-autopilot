@@ -138,7 +138,7 @@ def main() -> int:
                          interpolation=cv2.INTER_NEAREST)
         tool_txt = f"tool={tool} class={CLASS_NAME[cls]} " \
                    f"undo={len(undo_stack)}"
-        for row, txt in (
+        for txt, row in (
                 (f"[{fi + 1}/{len(frames)}] src#{fidx} {tool_txt}", 20),
                 ("1/2/3 class  b=tool  u=undo  c=clear  s=save+next  "
                  "q=quit", 40)):
