@@ -368,8 +368,25 @@ def painted_line_lane_center(sem, cam_model, pos, heading,
         has_left = any(c[0] > 0.15 for c in clusters)
         has_right = any(c[0] < -0.15 for c in clusters)
         if has_left and has_right:
-            return None
-        best = min(clusters, key=lambda c: abs(c[0] - lane_half_m))
+            # Spawn/restart special case: the ego is placed at a road-graph
+            # node (the road centre), and two same-road lines straddle it.
+            # The NEAREST line is therefore the painted centre line; when
+            # the pair is a plausible two-lane width, use that line and
+            # place the ego lane to its right.  Do NOT resolve arbitrary
+            # opposite-side reads this way: require the near line to be
+            # substantially nearer and the separation to be road-sized.
+            ordered = sorted(clusters, key=lambda c: c[0])
+            near_line = min(clusters, key=lambda c: abs(c[0]))
+            far_line = max(clusters, key=lambda c: abs(c[0]))
+            sep = abs(float(far_line[0]) - float(near_line[0]))
+            if (abs(float(near_line[0])) <= 0.9
+                    and 2.5 <= sep <= 5.0
+                    and abs(float(far_line[0])) >= 2.5):
+                best = near_line
+            else:
+                return None
+        else:
+            best = min(clusters, key=lambda c: abs(c[0] - lane_half_m))
         line_lat = best[0]
         c_spread = (float(np.percentile(best[2], 90)
                           - np.percentile(best[2], 10))

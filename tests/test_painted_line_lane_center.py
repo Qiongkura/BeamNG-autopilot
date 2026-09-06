@@ -162,3 +162,19 @@ def test_polyline_dir_at_local_heading():
     assert abs(d[0] - 1.0) < 1e-9
     assert abs(d[1]) < 1e-9
     assert polyline_dir_at(r[:2], (10.0, 20.0)) is None
+
+
+def test_two_same_side_lines_at_spawn_use_nearest_centre_line() -> None:
+    """At a road-graph-node spawn the ego sits at the road centre and
+    sees two same-road lines: nearest line is the centre line, farther
+    line is the left edge.  Resolve the pair for perception-only lane
+    placement instead of rejecting it as a straddle."""
+    lanes._mask_to_markings = _fake_masks_to_markings(
+        [_line(-0.35), _line(3.25)])
+    tgt = painted_line_lane_center(
+        _Sem({"line": np.zeros((8, 8), np.uint8)}),
+        cam_model=None, pos=(10.0, 20.0, 1.5), heading=0.0)
+    assert tgt is not None
+    # heading 0 uses +left as -y in world; target is ~1.85m to the
+    # right of the centre line (-0.35 -> -2.20 in this coordinate setup)
+    assert tgt[1] < 19.0
