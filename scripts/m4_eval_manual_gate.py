@@ -65,6 +65,12 @@ def main() -> int:
             m = cv2.resize(m.astype(np.uint8),
                            (user_line.shape[1], user_line.shape[0]),
                            interpolation=cv2.INTER_NEAREST) > 0
+        # tolerance-based recall: the model emits a THIN mask while the
+        # hand strokes are 4-6 px wide - raw pixel IoU would cap recall
+        # at ~1/3 for a PERFECT detection.  Dilate the model mask by
+        # 3 px so coverage within +-3 px of the paint counts as hit.
+        kern = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7))
+        m = cv2.dilate(m.astype(np.uint8), kern, iterations=1) > 0
         hit = int((user_line & m).sum())
         u = int(user_line.sum())
         tot_hit += hit
