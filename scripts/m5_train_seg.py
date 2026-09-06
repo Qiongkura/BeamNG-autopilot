@@ -49,6 +49,7 @@ from beamng_autopilot.vision.segmentation import (
 
 def load_frames(
     run_dirs: list[Path], min_line_frac: float = 0.0,
+    line_only_dirs: set[str] | None = None,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], dict]:
     """读取所有 npz 帧，按文件名排序（时间序）。
 
@@ -58,6 +59,7 @@ def load_frames(
     """
     frames: list[tuple[np.ndarray, np.ndarray]] = []
     per_run: dict[str, dict] = {}
+    line_only_dirs = line_only_dirs or set()
     for rd in run_dirs:
         fs = sorted(glob.glob(str(rd / "frame_*.npz")))
         if not fs:
@@ -71,6 +73,12 @@ def load_frames(
         for f in fs:
             d = np.load(f)
             colour, label = d["colour"], d["label"]
+            colour = np.asarray(colour, dtype=np.uint8)
+            label = np.asarray(label, dtype=np.uint8)
+            if rd.name in line_only_dirs:
+                # hand annotations mark ONLY line pixels; every other
+                # pixel is unknown, not background/road
+                label = np.where(label == 2, 2, 255).astype(np.uint8)
             n_pix = colour.shape[0] * colour.shape[1]
             line_px += int((label == 2).sum())
             n_run += 1
@@ -92,7 +100,9 @@ def median_freq_weights(labels: list[np.ndarray],
     """Median frequency balancing：权重与类别频率成反比。"""
     hist = np.zeros(N_CLASSES, dtype=np.float64)
     for _, lab in labels:
-        hist += np.bincount(lab.ravel(), minlength=N_CLASSES)
+        known = np.asarray(lab).ravel()
+        known = known[known < N_CLASSES]
+        hist += np.bincount(known, minlength=N_CLASSES)
     hist /= max(1.0, hist.sum())
     med = float(np.median(hist[hist > 0]))
     w = np.array([med / max(h, 1e-6) for h in hist])
@@ -261,6 +271,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="分割训练")
     ap.add_argument("--runs", nargs="+", required=True,
                     help="数据目录（可多个，如 logs/m5_seg/run_*）")
+    ap.add_argument("--line-only-runs", nargs="*", default=[],
+                    help="只标了标线的人工标注目录；非 line 像素忽略(255)，不当作背景")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -308,8 +320,10 @@ def main() -> None:
         torch.cuda.set_per_process_memory_fraction(
             max(0.1, min(1.0, args.vram_frac)))
 
+    line_only_dirs = {Path(p).name for p in args.line_only_runs}
     frames, per_run = load_frames([Path(p) for p in args.runs],
-                                  args.min_line_frac)
+                                  args.min_line_frac,
+                                  line_only_dirs=line_only_dirs)
     n = len(frames)
     train_frames, val_frames = split_frames(
         frames, per_run, args.split, args.val_frac)
@@ -336,12 +350,26 @@ def main() -> None:
     model = SegUNet().to(device)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
-    crit = nn.CrossEntropyLoss(weight=weights.to(device))
+    crit = nn.CrossEntropyLoss(weight=weights.to(device),
+                               ignore_index=255)
     use_amp = (device == "cuda") and not args.no_amp
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     def to_tensor(frame, dev):
         colour, label = frame
+        # All sources must share one batch shape: Tech captures are
+        # 536x403 while the user's manual line frames are 400x300.
+        # Resize RGB smoothly and labels with nearest-neighbour so class
+        # ids (including ignore=255) remain intact.
+        import cv2
+        colour = np.asarray(colour, dtype=np.uint8)
+        label = np.asarray(label, dtype=np.uint8)
+        if colour.shape[:2] != (403, 536):
+            colour = cv2.resize(colour, (536, 403),
+                                interpolation=cv2.INTER_AREA)
+        if label.shape[:2] != (403, 536):
+            label = cv2.resize(label, (536, 403),
+                               interpolation=cv2.INTER_NEAREST)
         x = torch.from_numpy(colour).permute(2, 0, 1).float() / 255.0
         y = torch.from_numpy(label).long()
         return x.to(dev), y.to(dev)
@@ -382,11 +410,12 @@ def main() -> None:
                 scaler.update()
             total_loss += float(loss.item()) * len(batch)
             pred = logits.argmax(dim=1)
-            correct += int((pred == ys).sum())
-            n_pix += int(ys.numel())
+            valid = ys != 255
+            correct += int(((pred == ys) & valid).sum())
+            n_pix += int(valid.sum())
             for c in range(N_CLASSES):
-                p = (pred == c)
-                t = (ys == c)
+                p = (pred == c) & valid
+                t = (ys == c) & valid
                 inter[c] += int((p & t).sum())
                 union[c] += int((p | t).sum())
         ious = iou_from_accum(inter, union)
