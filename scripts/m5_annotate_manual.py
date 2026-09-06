@@ -44,6 +44,7 @@ import numpy as np
 from beamng_autopilot import config
 
 CLS_LINE, CLS_ROAD, CLS_BG = 2, 1, 0
+CLASS_NAME = {CLS_LINE: "line", CLS_ROAD: "road", CLS_BG: "erase"}
 WIN = "annotate"
 
 
