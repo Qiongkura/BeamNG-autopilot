@@ -298,6 +298,8 @@ def main() -> None:
     ap.add_argument("--out", default=str(config.LOGS_DIR / "m5_seg" / "seg_model"))
     ap.add_argument("--resume", default=None, metavar="CHECKPOINT",
                     help="从 checkpoint_last.pt 续训（跳过已完成的 epoch）")
+    ap.add_argument("--init", default=None, metavar="CHECKPOINT",
+                    help="只加载模型权重作为初始化；优化器/学习率/epoch 从头开始")
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--vram-frac", type=float, default=0.6,
                     help="max fraction of GPU VRAM training may use; keeps "
@@ -348,6 +350,12 @@ def main() -> None:
     print(f"[train] 类别权重: {weights.tolist()}", flush=True)
 
     model = SegUNet().to(device)
+    if args.init:
+        init_ckpt = torch.load(args.init, map_location=device,
+                               weights_only=False)
+        model.load_state_dict(init_ckpt["state_dict"])
+        print(f"[train] 初始化模型权重: {args.init}（优化器从头开始）",
+              flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
     crit = nn.CrossEntropyLoss(weight=weights.to(device),

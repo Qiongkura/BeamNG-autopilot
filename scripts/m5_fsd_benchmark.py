@@ -90,6 +90,7 @@ _DRIVE_ARG_DEFAULTS = {
     "steps": 3,
     "cam_w": 536,
     "cam_h": 403,
+    "seg_model": None,
     "teleport": None,
     "out": None,
     "lane_mode": "map",
@@ -183,6 +184,8 @@ def main() -> int:
     ap.add_argument("--no-e2e", action="store_true")
     ap.add_argument("--no-bc", action="store_true")
     ap.add_argument("--no-dqn", action="store_true")
+    ap.add_argument("--seg-model", type=str, default=None,
+                    help="segmentation checkpoint override")
     ap.add_argument("--traffic", type=int, default=0, metavar="N",
                     help="park N NPC vehicles along the route")
     ap.add_argument("--no-signal", action="store_true")
@@ -206,6 +209,7 @@ def main() -> int:
         "no_e2e": args.no_e2e,
         "no_bc": args.no_bc,
         "no_dqn": args.no_dqn,
+        "seg_model": args.seg_model,
         "traffic": int(args.traffic),
         "no_signal": args.no_signal,
         "goal": (list(args.goal) if args.goal is not None else None),

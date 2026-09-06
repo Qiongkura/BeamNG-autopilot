@@ -40,6 +40,8 @@ def main() -> int:
     # recovered by upscaling (town far-line misses 2026-09-06)
     ap.add_argument("--cam-w", type=int, default=536)
     ap.add_argument("--cam-h", type=int, default=403)
+    ap.add_argument("--seg-model", type=str, default=None,
+                    help="segmentation checkpoint override (default deployed model)")
     ap.add_argument("--teleport", nargs=3, type=float, default=None,
                     metavar=("X", "Y", "YAW_DEG"),
                     help="teleport to an open stretch before driving")

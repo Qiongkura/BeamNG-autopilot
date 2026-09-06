@@ -757,8 +757,16 @@ def run(args) -> int:
         # path), so the FSD drive never stops dead at a hairpin apex or
         # full-locks across a kinked map-prior lane.
         rule_planner = LocalPlanner()
+        _seg = None
+        if getattr(args, "seg_model", None):
+            try:
+                from beamng_autopilot.vision.segmentation import Segmenter
+                _seg = Segmenter(model_path=args.seg_model)
+                print(f"[fsd-drive] segmentation model: {args.seg_model}")
+            except Exception as _seg_e:
+                print(f"[fsd-drive] segmentation model disabled: {_seg_e}")
         stack = FSDStack(conn, args.runtime,
-                         heads=[SemanticHead(), TrafficSignalHead(),
+                         heads=[SemanticHead(segmenter=_seg), TrafficSignalHead(),
                                 ObjectHead(), LaneTopologyHead()],
                          # The live tick consumes ONLY the front frame:
                          # semantic world markings, road-mask projection,
