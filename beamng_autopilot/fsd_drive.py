@@ -226,6 +226,13 @@ END_START_SLOW_M = 12.0
 # starts at END_START_SLOW_M.
 END_PULL_START_M = 20.0
 END_STOP_M = 6.0
+# End-zone final alignment: a mid-turn full-hold parks the car diagonal
+# across the road (town 2026-09-06, user screenshot: ~35 deg yaw across
+# both lanes).  Creep forward straightening until the body yaw is within
+# ALIGN_YAW_DEG of the route, then hold.
+ALIGN_YAW_DEG = 6.0
+ALIGN_CREEP_MPS = 0.5
+ALIGN_CREEP_THR = 0.25
 END_SLOW_MPS = 1.0
 END_BRAKE = 0.7
 # End-zone last-good perception anchor: if the painted line flickers
@@ -2166,15 +2173,36 @@ def run(args) -> int:
             if rem_end is not None and rem_end < END_STOP_M:
                 thr = 0.0
                 brk = max(brk, END_BRAKE)
+                # Final ALIGNMENT before the hold: brake to a crawl, then
+                # creep straight until the body yaw is within
+                # ALIGN_YAW_DEG of the route - a mid-turn full-hold parks
+                # the car diagonal across both lanes (town 2026-09-06,
+                # user screenshot).  Bounded by rem_end > 2 m so the
+                # creep never pushes past the road end.
+                _yaw_dev = None
+                try:
+                    _r_bear = _ref_bearing(route_local, pos)
+                    if _r_bear is not None:
+                        _yaw_dev = math.radians(
+                            (heading * 57.29577951308232 - _r_bear + 180.0)
+                            % 360.0 - 180.0)
+                except Exception:
+                    _yaw_dev = None
                 if v < 0.5:
-                    # Already stopped: centre the wheel.  The pursuit
-                    # reference is gone / points sideways once the car
-                    # sits in the stop zone, and holding its steering
-                    # parks the nose angled across the lane (opt32/33:
-                    # hdg -146 vs lane -133, steer pinned at -0.47).
-                    steer = 0.0
-                if v < 0.4:
-                    pb = 1.0
+                    if (_yaw_dev is not None
+                            and abs(_yaw_dev) > math.radians(ALIGN_YAW_DEG)
+                            and rem_end > 2.0):
+                        # creep forward while straightening toward the
+                        # route direction (positive steer = right =
+                        # heading decreases)
+                        thr = ALIGN_CREEP_THR
+                        brk = 0.0
+                        pb = 0.0
+                        steer = float(np.clip(
+                            _yaw_dev * 1.2, -0.4, 0.4))
+                    else:
+                        steer = 0.0
+                        pb = 1.0
             # Pedal rate limit: the branches above (downhill cap, taper,
             # governor, climb/reverse/hard-stop) can step thr/brk by a
             # whole pedal in one tick - a relaunch then reads as a speed
@@ -2267,6 +2295,62 @@ def run(args) -> int:
             # (town run 2026-09-06: crossC=0 while the user photographed
             # the left wheels ON the line).  Boundary heading ~= route
             # bearing; footprint halves are the etk800's.
+            # FULL-BODY projection: the four corners of the ego footprint
+            # (half 2.2 x 0.9 m) in world space, each tested against the
+            # detected lane boundaries - ANY corner beyond a boundary is
+            # a body crossing (the centre point + lateral-extent
+            # approximation missed yawed-body crossings).
+            body_cross_l = body_cross_r = 0
+            try:
+                _cy, _sy = math.cos(heading), math.sin(heading)
+                _fwd = np.array([_cy, _sy])
+                _lft = np.array([-_sy, _cy])
+                _p2 = np.asarray(pos[:2], dtype=float)
+                _corners = [_p2 + _fwd * 2.2 + _lft * 0.9,
+                            _p2 + _fwd * 2.2 - _lft * 0.9,
+                            _p2 - _fwd * 2.2 + _lft * 0.9,
+                            _p2 - _fwd * 2.2 - _lft * 0.9]
+                if out.lane_left is not None:
+                    for _c in _corners:
+                        _lc, _cov = _boundary_lateral(
+                            float(_c[0]), float(_c[1]), out.lane_left,
+                            _fwd)
+                        if _cov and _lc > 0.05:
+                            body_cross_l += 1
+                if out.lane_right is not None:
+                    for _c in _corners:
+                        _rc, _cov = _boundary_lateral(
+                            float(_c[0]), float(_c[1]), out.lane_right,
+                            _fwd)
+                        if _cov and _rc < -0.05:
+                            body_cross_r += 1
+            except Exception:
+                pass
+            body_road_off = None
+            try:
+                _r_bear2 = _ref_bearing(route_local, pos)
+                if _r_bear2 is not None:
+                    _dy2 = math.radians(
+                        (heading * 57.29577951308232 - _r_bear2 + 180.0)
+                        % 360.0 - 180.0)
+                    _ext2 = (0.9 * abs(math.cos(_dy2))
+                             + 2.2 * abs(math.sin(_dy2)))
+                    _lat_r = _hw_r = None
+                    try:
+                        if (nav_route is not None
+                                and road_left is not None
+                                and road_right is not None):
+                            _la, _be, _hw_r = _route_lateral_off_m(
+                                pos, nav_route, road_left, road_right)
+                            _lat_r = _la
+                    except Exception:
+                        _lat_r = None
+                    if _lat_r is not None and _hw_r:
+                        body_road_off = round(
+                            max(0.0, abs(float(_lat_r)) + _ext2
+                                - float(_hw_r)), 3)
+            except Exception:
+                body_road_off = None
             body_lat_left = body_lat_right = None
             try:
                 _r_bear = _ref_bearing(route_local, pos)
@@ -2312,6 +2396,9 @@ def run(args) -> int:
                 "cls_tree_d": _cls_near.get("tree"),
                 "body_lat_left": body_lat_left,
                 "body_lat_right": body_lat_right,
+                "body_road_off": body_road_off,
+                "body_cross_l": int(body_cross_l > 0),
+                "body_cross_r": int(body_cross_r > 0),
                 "pl_mask": int(_pl_mask),
                 "pl_marks": int(_pl_marks),
                 "pl_near": int(_pl_near),

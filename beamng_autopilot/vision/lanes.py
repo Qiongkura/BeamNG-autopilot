@@ -334,13 +334,50 @@ def painted_line_lane_center(sem, cam_model, pos, heading,
                         lons.append(lon)
         if len(lats) < min_pts:
             return None
-        # Emphasise the line where it passes the ego: wider points ahead
-        # of a bend carry less weight than the near-car section.
-        w = 1.0 / (1.0 + np.asarray(lons, dtype=float))
-        line_lat = float(np.average(lats, weights=w))
-        spread = float(np.percentile(lats, 90) - np.percentile(lats, 10))
-        if spread > 2.2:
-            # Lines on both sides of the car would cancel; ambiguous.
+        # CLUSTER the near points by lateral position and pick the
+        # cluster closest to the expected lane_half_m: on a road with
+        # BOTH boundary lines painted (centre line + left edge), the old
+        # single-average + spread gate averaged the two lines into a
+        # bogus centre and then rejected the whole read (spread 2.8 >
+        # 2.2) - the placement gave up exactly when perception got GOOD
+        # enough to see both lines (town 2026-09-06, 536x403).
+        lats_a = np.asarray(lats, dtype=float)
+        w_a = 1.0 / (1.0 + np.asarray(lons, dtype=float))
+        order = np.argsort(lats_a)
+        sl = lats_a[order]
+        sw = w_a[order]
+        clusters: list[tuple[float, float, np.ndarray]] = []
+        start = 0
+        for i in range(1, len(sl) + 1):
+            if i == len(sl) or sl[i] - sl[i - 1] > 1.2:
+                c_lats = sl[start:i]
+                c_w = sw[start:i]
+                clusters.append((
+                    float(np.average(c_lats, weights=c_w)),
+                    float(i - start),
+                    c_lats))
+                start = i
+        if not clusters:
+            return None
+        # Straddle guard: clusters on OPPOSITE sides of the ego (one
+        # left, one right) cannot be disambiguated single-frame - the
+        # +lat line may be the centre line or the left road edge.  All-
+        # same-side clusters (the spawn case: centre line +0.5, left
+        # edge +3.3, both left of the ego) resolve cleanly: the lane's
+        # left boundary is the cluster closest to lane_half_m.
+        has_left = any(c[0] > 0.15 for c in clusters)
+        has_right = any(c[0] < -0.15 for c in clusters)
+        if has_left and has_right:
+            return None
+        best = min(clusters, key=lambda c: abs(c[0] - lane_half_m))
+        line_lat = best[0]
+        c_spread = (float(np.percentile(best[2], 90)
+                          - np.percentile(best[2], 10))
+                    if len(best[2]) >= 2 else 0.0)
+        if c_spread > 1.5:
+            # the chosen cluster itself straddles two lines; ambiguous
+            return None
+        if best[1] < min_pts:
             return None
         shift = float(np.clip(lane_half_m - line_lat,
                               -max_shift_m, max_shift_m))
