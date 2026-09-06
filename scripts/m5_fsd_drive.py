@@ -35,8 +35,11 @@ def main() -> int:
     ap.add_argument("--seconds", type=float, default=20.0)
     ap.add_argument("--speed", type=float, default=6.0)
     ap.add_argument("--steps", type=int, default=3)
-    ap.add_argument("--cam-w", type=int, default=400)
-    ap.add_argument("--cam-h", type=int, default=300)
+    # 536x403 = segmentation training resolution: live frames feed the
+    # UNet upscaled, and far-line pixels lost at 400x300 cannot be
+    # recovered by upscaling (town far-line misses 2026-09-06)
+    ap.add_argument("--cam-w", type=int, default=536)
+    ap.add_argument("--cam-h", type=int, default=403)
     ap.add_argument("--teleport", nargs=3, type=float, default=None,
                     metavar=("X", "Y", "YAW_DEG"),
                     help="teleport to an open stretch before driving")
