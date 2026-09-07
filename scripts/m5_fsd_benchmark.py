@@ -66,6 +66,11 @@ SCENARIOS: dict[str, dict] = {
         # never a map-lane drive.
         "lane_mode": "sensor",
         "strict": True,
+        # Domain-specific segmentation: v13b carries the user's manual
+        # town line annotations (85.1% tolerance recall vs 71.6% v12)
+        # but regresses mountain (0.02 IoU) - town only, mountain keeps
+        # the deployed v8/v12 checkpoint.
+        "seg_model": "logs/m5_seg/seg_model_v13b/best.pt",
         "note": "town route (start node 22209, goal ~90 m along the "
                 "road graph); --traffic adds parked NPC vehicles for "
                 "YOLO / obstacle-fusion verification",
@@ -130,6 +135,8 @@ def scenario_args(name: str, base: dict, out_path: Path):
         vals["lane_mode"] = scen["lane_mode"]
     if scen.get("strict") is not None:
         vals["strict"] = bool(scen["strict"])
+    if scen.get("seg_model") is not None and not vals.get("seg_model"):
+        vals["seg_model"] = scen["seg_model"]
     from types import SimpleNamespace
     return SimpleNamespace(**vals)
 
