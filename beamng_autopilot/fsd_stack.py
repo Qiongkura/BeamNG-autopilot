@@ -868,20 +868,35 @@ class FSDStack:
                                          or LANE_WIDTH_DEFAULT_M))
         # FSD realism (strict sensor): the lane-keep reference and hard
         # boundaries must come from PERCEPTION only (docs/fsd_realism.md
-        # §4).  When no PAIRED sensor lane is available (or it was
-        # rejected), the car degrades to no-lane - safety stops/coasts -
-        # instead of silently riding map lane geometry.
+        # §4).  A PAIRED sensor lane is ideal, but a TRUSTED SINGLE
+        # PAINTED boundary is also a perception lane: the missing side is
+        # inferred from the painted-line lane-width contract, never from
+        # the map.  Ambiguous/no-vision reads still stop.
         if lane_mode == "sensor" and self.strict_sensor:
-            if sensor_paired and lane_ref is not None \
-                    and len(lane_ref) >= 3:
+            _single_vision = bool(
+                lane_frame is not None
+                and not sensor_paired
+                and "vision" in tuple(getattr(
+                    lane_frame, "sources", ()) or ())
+                and float(getattr(lane_frame, "confidence", 0.0) or 0.0)
+                >= 0.50
+                and lane_ref is not None and len(lane_ref) >= 3)
+            if sensor_paired and lane_ref is not None                     and len(lane_ref) >= 3:
                 lane_src_sel = SRC_SENSOR
+            elif _single_vision:
+                lane_src_sel = SRC_SENSOR
+                lane_left = getattr(lane_frame, "left", None)
+                lane_right = getattr(lane_frame, "right", None)
+                lane_width = float(getattr(lane_frame, "width", 0.0) or 0.0)
             else:
                 lane_ref = None
                 lane_left = None
                 lane_right = None
                 lane_width = 0.0
                 lane_src_sel = SRC_UNAVAILABLE
-                map_lane = None   # no map lane may reach the planner
+                map_lane = None
+            if lane_src_sel == SRC_SENSOR:
+                map_lane = None
             out.meta["lane_src_sel"] = lane_src_sel
             out.meta["lane_src"] = lane_src_sel
             out.meta["lane_strict"] = 1
