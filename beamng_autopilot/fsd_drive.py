@@ -1199,6 +1199,44 @@ def run(args) -> int:
                                 _pl_near = True
                                 break
             line_lat = _painted_line_lat(out, pos, heading, _plmarks)
+            # Painted centre-line body gate: when the visible marking is
+            # the line LEFT of the ego, project all four body corners
+            # against that actual painted polyline.  This catches the
+            # screenshot case where the left wheel/body is over the line
+            # even though lane_left is absent or not covered.
+            painted_body_cross = False
+            if _plmarks:
+                try:
+                    _fbody = np.array([math.cos(heading), math.sin(heading)])
+                    _lbody = np.array([-_fbody[1], _fbody[0]])
+                    _pbody = np.asarray(pos[:2], dtype=float)
+                    _corners_body = (
+                        _pbody + 2.2 * _fbody + 0.9 * _lbody,
+                        _pbody + 2.2 * _fbody - 0.9 * _lbody,
+                        _pbody - 2.2 * _fbody + 0.9 * _lbody,
+                        _pbody - 2.2 * _fbody - 0.9 * _lbody)
+                    for _mk in _plmarks:
+                        _mw = np.asarray(_mk.world, dtype=float)[:, :2]
+                        _nearw = _mw[np.linalg.norm(_mw - _pbody, axis=1) < 25.0]
+                        if len(_nearw) < 4:
+                            continue
+                        _mlat = float(np.mean((_nearw - _pbody) @ _lbody))
+                        # A marking visibly left of the ego is the centre/
+                        # left boundary under right-hand traffic.  Do not
+                        # treat a right-edge marking as a centreline.
+                        if _mlat <= 0.1:
+                            continue
+                        for _corner in _corners_body:
+                            _clat, _cov = _boundary_lateral(
+                                float(_corner[0]), float(_corner[1]), _mw,
+                                _fbody)
+                            if _cov and _clat > 0.05:
+                                painted_body_cross = True
+                                break
+                        if painted_body_cross:
+                            break
+                except Exception:
+                    painted_body_cross = False
 
             # safety arbitration on the chosen path: evaluate against the
             # tick's FUSED occupancy (the planner's own vector space), not
@@ -1937,7 +1975,9 @@ def run(args) -> int:
             # 0.19 m at a town corner and parked a car that was steering
             # fine).  The raw-sensor heading corridor is only the last
             # line when there is NO planned path at all.
-            force_stop = False
+            force_stop = bool(painted_body_cross)
+            if force_stop:
+                target = 0.0
             fwd_clear = float("inf")
             if chosen.path is not None and len(chosen.path) >= 2:
                 fwd_clear = path_grid_clearance_m(chosen.path, grid)
@@ -2409,6 +2449,7 @@ def run(args) -> int:
                 "body_road_off": body_road_off,
                 "body_cross_l": int(body_cross_l > 0),
                 "body_cross_r": int(body_cross_r > 0),
+                "painted_body_cross": int(painted_body_cross),
                 "pl_mask": int(_pl_mask),
                 "pl_marks": int(_pl_marks),
                 "pl_near": int(_pl_near),
