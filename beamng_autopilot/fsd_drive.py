@@ -1761,12 +1761,14 @@ def run(args) -> int:
             # band) must govern the actual pedals.
             plan_speed = out.best_speed if out.best_speed > 0.0 \
                 else float(args.speed)
-            if _strict_no_lane and chosen.source not in ("e2e", "bc"):
-                # no perception lane -> minimal-risk stop (never map-drive).
-                # The E2E neural path and the BC steering arc are
-                # perception-driven (not the map fallback), so when the
-                # monitor green-lit them the car may keep rolling on the
-                # learned trajectory.
+            if _strict_no_lane:
+                # No current perception lane means NO MOTION in strict
+                # mode, regardless of which candidate won arbitration.
+                # E2E/BC are perception-driven models, but neither gives
+                # a reliable current lane boundary when the painted/LiDAR
+                # lane is unavailable; allowing them here let the car
+                # drift half outside the road (user screenshot,
+                # town 2026-09-07).
                 plan_speed = 0.0
                 plan_sm = 0.0
             # Traffic-light action: vision head (colour blob) fused with

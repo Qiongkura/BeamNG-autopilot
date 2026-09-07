@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import numpy as np
 import pytest
 
@@ -325,3 +326,18 @@ def test_body_lane_cross_accepts_centered_straight_path() -> None:
     path = np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0],
                      [15.0, 0.0]], dtype=float)
     assert body_lane_cross_dist_m(sc, path) == 0.0
+
+
+def test_body_pose_crosses_lane_catches_current_yawed_body() -> None:
+    from beamng_autopilot.planning import body_pose_crosses_lane
+    sc = _lane_scene()
+    # Centre is 3.0 m below the left boundary, but a yawed front corner
+    # reaches past y=4.0; current-pose check must catch it.
+    assert body_pose_crosses_lane(sc, np.array([10.0, 3.0]),
+                                  math.radians(18.0)) is True
+
+
+def test_body_pose_crosses_lane_accepts_current_centred_body() -> None:
+    from beamng_autopilot.planning import body_pose_crosses_lane
+    sc = _lane_scene()
+    assert body_pose_crosses_lane(sc, np.array([10.0, 0.0]), 0.0) is False

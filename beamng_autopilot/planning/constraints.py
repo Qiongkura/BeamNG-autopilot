@@ -467,6 +467,47 @@ def _boundary_lateral(wx, wy, ref, fwd):
 
 
 
+def body_pose_crosses_lane(scene: Scene, pos, heading: float,
+                           half_len: float = 2.2,
+                           half_width: float = 0.9,
+                           max_cross_m: float = 0.05) -> bool:
+    """Whether the CURRENT full ego rectangle crosses a detected boundary.
+
+    This is separate from :func:`body_lane_cross_dist_m`, which checks
+    future candidate poses.  A car can already be half outside while its
+    next path is harmless; the current four corners must still trigger an
+    immediate stop.  Only boundaries present in ``scene`` are consulted -
+    no map fallback is invented here.
+    """
+    left = getattr(scene, "lane_left", None)
+    right = getattr(scene, "lane_right", None)
+    if left is None and right is None:
+        return False
+    p = np.asarray(pos, dtype=float).ravel()
+    if p.size < 2 or not np.isfinite(p[:2]).all():
+        return False
+    fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
+    lft = np.array([-fwd[1], fwd[0]])
+    centre = p[:2]
+    corners = (centre + half_len * fwd + half_width * lft,
+               centre + half_len * fwd - half_width * lft,
+               centre - half_len * fwd + half_width * lft,
+               centre - half_len * fwd - half_width * lft)
+    if left is not None:
+        for c in corners:
+            lat, covered = _boundary_lateral(
+                float(c[0]), float(c[1]), left, fwd)
+            if covered and lat > max_cross_m:
+                return True
+    if right is not None:
+        for c in corners:
+            lat, covered = _boundary_lateral(
+                float(c[0]), float(c[1]), right, fwd)
+            if covered and lat < -max_cross_m:
+                return True
+    return False
+
+
 def body_lane_cross_dist_m(scene: Scene, path,
                            half_len: float = 2.2,
                            half_width: float = 0.9,

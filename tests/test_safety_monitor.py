@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import numpy as np
 import pytest
 
@@ -165,3 +166,20 @@ def test_path_inside_grid_still_blocked() -> None:
     path = np.column_stack([np.linspace(0, 10, 30), np.zeros(30)])
     v = mon.evaluate(scene, path)
     assert v.level in ("minimal_risk", "degraded")
+
+
+def test_safety_monitor_stops_when_current_body_corner_is_over_boundary() -> None:
+    from beamng_autopilot.planning import Scene
+    from beamng_autopilot.occupancy import OccupancyGrid
+    from beamng_autopilot.safety_monitor import SafetyMonitor
+    grid = OccupancyGrid(60, 60, 0.5)
+    left = np.array([[0., 4.], [20., 4.]])
+    right = np.array([[0., -4.], [20., -4.]])
+    scene = Scene(pos=np.array([10., 3.0]), heading=math.radians(18.),
+                  grid=grid, route=np.array([[0., 0.], [20., 0.]]),
+                  lane_ref=np.array([[0., 0.], [20., 0.]]),
+                  lane_left=left, lane_right=right, lane_width=8.)
+    verdict = SafetyMonitor(max_speed=6.).evaluate(
+        scene, np.array([[10., 3.], [15., 3.]]))
+    assert verdict.level == "minimal_risk"
+    assert "vehicle body" in verdict.reason
