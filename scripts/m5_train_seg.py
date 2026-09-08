@@ -114,6 +114,7 @@ def median_freq_weights(labels: list[np.ndarray],
 def split_frames(
     frames: list[tuple[np.ndarray, np.ndarray]], per_run: dict,
     split: str, val_frac: float,
+    train_only_runs: set[str] | None = None,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]],
            list[tuple[np.ndarray, np.ndarray]]]:
     """把帧列表划分成训练/验证。
@@ -123,11 +124,15 @@ def split_frames(
     全局尾部集中在最后几个 run（往往是标线稀疏段），让验证集被某一类
     路段主导、line IoU 失真。
     """
+    train_only_runs = train_only_runs or set()
     if split == "per-run":
         train_frames: list = []
         val_frames: list = []
-        for rec in per_run.values():
+        for name, rec in per_run.items():
             k = rec["kept"]
+            if name in train_only_runs:
+                train_frames.extend(frames[rec["start"]:rec["end"]])
+                continue
             seg = frames[rec["start"]:rec["end"]]
             if k <= 1:
                 train_frames.extend(seg)
@@ -143,6 +148,7 @@ def split_frames(
 def train_run_bounds(
     frames: list[tuple[np.ndarray, np.ndarray]], per_run: dict,
     split: str, val_frac: float,
+    train_only_runs: set[str] | None = None,
 ) -> list[tuple[int, int]]:
     """split_frames 划分后，各 run 在训练帧列表中的 [start, end) 下标。
 
@@ -150,10 +156,15 @@ def train_run_bounds(
     全局头部），供 --balance-runs 做逐 run 等量采样。
     """
     bounds: list[tuple[int, int]] = []
+    train_only_runs = train_only_runs or set()
     if split == "per-run":
         off = 0
-        for rec in per_run.values():
+        for name, rec in per_run.items():
             k = rec["kept"]
+            if name in train_only_runs:
+                bounds.append((off, off + k))
+                off += k
+                continue
             if k <= 1:
                 bounds.append((off, off + k))
                 off += k
@@ -273,6 +284,8 @@ def main() -> None:
                     help="数据目录（可多个，如 logs/m5_seg/run_*）")
     ap.add_argument("--line-only-runs", nargs="*", default=[],
                     help="只标了标线的人工标注目录；非 line 像素忽略(255)，不当作背景")
+    ap.add_argument("--train-only-runs", nargs="*", default=[],
+                    help="只进训练、不切到验证集的人工标注目录")
     ap.add_argument("--epochs", type=int, default=40)
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-3)
@@ -323,14 +336,17 @@ def main() -> None:
             max(0.1, min(1.0, args.vram_frac)))
 
     line_only_dirs = {Path(p).name for p in args.line_only_runs}
+    train_only_runs = {Path(p).name for p in args.train_only_runs}
     frames, per_run = load_frames([Path(p) for p in args.runs],
                                   args.min_line_frac,
                                   line_only_dirs=line_only_dirs)
     n = len(frames)
     train_frames, val_frames = split_frames(
-        frames, per_run, args.split, args.val_frac)
+        frames, per_run, args.split, args.val_frac,
+        train_only_runs=train_only_runs)
     train_bounds = train_run_bounds(
-        frames, per_run, args.split, args.val_frac)
+        frames, per_run, args.split, args.val_frac,
+        train_only_runs=train_only_runs)
     print(f"[train] 共 {n} 帧: 训练 {len(train_frames)} / 验证 {len(val_frames)}",
           flush=True)
     if args.balance_runs:
@@ -540,6 +556,33 @@ def main() -> None:
     except Exception as exc:
         print(f"[train] 曲线保存失败: {exc}", flush=True)
 
+    if not val_frames:
+        # With train-only manual runs there is no validation split; the
+        # normal best_miou=0.0 comparison would leave best.pt at epoch 0
+        # while checkpoint_last.pt contains the learned final weights.
+        final_ckpt = torch.load(out_dir / "checkpoint_last.pt",
+                                map_location=device, weights_only=False)
+        torch.save({
+            "state_dict": final_ckpt["state_dict"],
+            "n_classes": N_CLASSES,
+            "class_names": CLASS_NAMES,
+            "val_miou": None, "val_ious": [], "val_acc": None,
+            "weights": weights.tolist(),
+            "train_args": {"line_weight": args.line_weight,
+                           "line_morph": args.line_morph,
+                           "amp": use_amp, "epochs": args.epochs,
+                           "batch": args.batch, "lr": args.lr,
+                           "val_frac": args.val_frac, "seed": args.seed,
+                           "runs": [str(p) for p in args.runs],
+                           "split": args.split,
+                           "min_line_frac": args.min_line_frac,
+                           "balance_runs": args.balance_runs,
+                           "line_only_runs": list(args.line_only_runs),
+                           "train_only_runs": list(args.train_only_runs),
+                           "n_train": len(train_frames), "n_val": 0},
+        }, out_dir / "best.pt")
+        print(f"[train] 无验证集，best.pt 使用最终 epoch 权重 -> "
+              f"{out_dir / 'best.pt'}", flush=True)
     print(f"[train] 完成: 最优验证 mIoU={best_miou:.4f} "
           f"-> {out_dir / 'best.pt'}", flush=True)
 
