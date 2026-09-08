@@ -14,6 +14,8 @@ Tools:
 Controls:
     1 / 2 / 3   class = line / road / background(erase)
     b           toggle pen / bucket
+    f           switch directly to bucket
+    p           switch directly to pen
     u           undo (last stroke / fill / clear)
     c           clear the whole label
     trackbar    brush size 1-40
@@ -215,6 +217,8 @@ def main() -> int:
             tool = "bucket" if tool == "pen" else "pen"
         elif key == ord("f"):
             tool = "bucket"
+        elif key == ord("p"):
+            tool = "pen"
         elif key == ord("u") and undo_stack:
             label[:] = undo_stack.pop()
         elif key == ord("c"):
