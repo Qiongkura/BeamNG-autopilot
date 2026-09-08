@@ -76,6 +76,8 @@ def main() -> int:
     ap.add_argument("--grab", type=int, default=0,
                     help="capture N fresh frames from the live game first")
     ap.add_argument("--out", type=str, default=None)
+    ap.add_argument("--prefill-model", type=str, default=None,
+                    help="用分割模型预填 road/line，人工只需修正误检/漏检")
     args = ap.parse_args()
 
     frames = []
@@ -106,6 +108,15 @@ def main() -> int:
         print("no frames to annotate (use --episode / --frames-dir / --grab)")
         return 1
 
+    prefill = None
+    if args.prefill_model:
+        try:
+            from beamng_autopilot.vision.segmentation import Segmenter
+            prefill = Segmenter(model_path=args.prefill_model)
+            print(f"[annotate] prefill model -> {args.prefill_model}")
+        except Exception as exc:
+            print(f"[annotate] prefill disabled: {exc}")
+
     stamp = time.strftime("%Y%m%d_%H%M%S")
     out_dir = (Path(args.out) if args.out
                else config.LOGS_DIR / "m5_seg" / f"manual_{stamp}")
@@ -119,8 +130,21 @@ def main() -> int:
     save_i = [0]
     undo_stack: list = []
 
+    def _initial_label(frame):
+        if prefill is None:
+            return np.zeros(frame.shape[:2], dtype=np.uint8)
+        try:
+            road, line = prefill.predict(frame)
+            lab = np.zeros(frame.shape[:2], dtype=np.uint8)
+            lab[np.asarray(road, dtype=bool)] = CLS_ROAD
+            lab[np.asarray(line, dtype=bool)] = CLS_LINE
+            return lab
+        except Exception as exc:
+            print(f"[annotate] prefill frame failed: {exc}")
+            return np.zeros(frame.shape[:2], dtype=np.uint8)
+
     rgb, fidx = frames[0]
-    label = np.zeros(rgb.shape[:2], dtype=np.uint8)
+    label = _initial_label(rgb)
     painting = False
     last_pt = None
 
@@ -243,7 +267,7 @@ def main() -> int:
                 print("[annotate] all frames done")
                 break
             rgb, fidx = frames[fi]
-            label = np.zeros(rgb.shape[:2], dtype=np.uint8)
+            label = _initial_label(rgb)
             undo_stack.clear()
         _render()
     cv2.destroyAllWindows()
