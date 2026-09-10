@@ -310,7 +310,17 @@ def lane_frame_usable(frame: LaneFrame | None,
     """A sensor lane only counts as a single drivable lane when it is
     long, confident and roughly one lane wide.  A wider corridor is the
     whole road (or road + verge), so centring it would not keep the car
-    in one lane under right-hand traffic."""
+    in one lane under right-hand traffic.
+
+    The span floor is deliberately strict even for a two-sided painted
+    pair.  A 3.2 m pair can have its centre metres off the nav route
+    while every point is "near" the car, which dragged the car sideways
+    in runs 42/47/52 (see the ``lane-guard`` checks in
+    scripts/m5_offline_validate.py).  Measured over 654 shadow frames
+    this rejects essentially every vision pair on the 2026-09-07 town
+    runs - that is the intended behaviour, and the fix belongs in making
+    the detected line longer, not in lowering this floor.
+    """
     if frame is None:
         return False
     min_w = (LANE_PAIR_WIDTH_MIN_M if frame.paired

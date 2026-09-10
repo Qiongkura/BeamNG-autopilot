@@ -12,6 +12,14 @@ LANE_MIN_SPAN_M = 4.0
 LANE_BOUNDARY_SPAN_M = 1.5
 LANE_PAIR_OVERLAP_M = 1.5
 LANE_FRAME_MIN_SPAN_M = 3.0
+# How long a vision pair / vision+LiDAR overlap must be before it may
+# replace the nav route as the driving centre.  Deliberately strict even
+# for a two-sided painted pair: a 3.2 m pair can have its centre metres
+# off the route while every point is "near" the car, which dragged the
+# car sideways in runs 42/47/52 (lane-guard checks in
+# m5_offline_validate.py).  Measured over 654 shadow frames this rejects
+# almost every vision pair on the 2026-09-07 town runs - that is the
+# intended behaviour; the fix is a longer detected line, not a lower floor.
 LANE_PAIRED_VISION_MIN_SPAN_M = 6.0
 LANE_EDGE_MAX_M = 5.0
 LANE_SINGLE_MIRROR_MAX_M = 3.5
