@@ -34,9 +34,24 @@ def test_collinear_dashes_merge_into_one_chain() -> None:
 
 
 def test_dash_gap_beyond_the_limit_stays_separate() -> None:
-    """A 12 m hole is a different marking, not the same dashed line."""
-    groups = group_world_fragments([_seg(2.0, 5.0), _seg(17.0, 20.0)])
+    """A gap wider than the limit is a different marking, not one dashes.
+
+    The gap is derived from the constant so changing the threshold cannot
+    silently rot this expectation.
+    """
+    from beamng_autopilot.vision.lanes import DASHED_FRAG_GAP_MAX_M
+    gap = DASHED_FRAG_GAP_MAX_M
+    groups = group_world_fragments(
+        [_seg(2.0, 5.0), _seg(5.0 + gap + 4.0, 5.0 + gap + 7.0)])
     assert groups == []
+
+
+def test_dash_gap_inside_the_limit_still_merges() -> None:
+    from beamng_autopilot.vision.lanes import DASHED_FRAG_GAP_MAX_M
+    gap = DASHED_FRAG_GAP_MAX_M
+    groups = group_world_fragments(
+        [_seg(2.0, 5.0), _seg(5.0 + gap - 1.0, 5.0 + gap + 2.0)])
+    assert len(groups) == 1
 
 
 def test_laterally_offset_fragments_never_merge() -> None:

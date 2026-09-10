@@ -332,8 +332,15 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
 # is genuinely LONG, so it passes LANE_PAIRED_VISION_MIN_SPAN_M on its own
 # merits - the span floor is not lowered.
 DASHED_FRAG_MIN_AREA_PX = 12
-DASHED_FRAG_GAP_MAX_M = 8.0
-DASHED_FRAG_LAT_TOL_M = 0.45
+# Gap and lateral tolerance are deliberately loose: a detection gap is
+# wider than the physical dash gap (a missed dash is normal), and on a
+# bend the successive dashes of one lane line are NOT collinear with the
+# near dash under a straight-line fit, so 0.45 m rejected real merges.
+# Swept on the 2026-09-07 town episode (v13b): paired own-lane 37.8% at
+# gap 8 / lat 0.45, 41.5% at gap 12 / lat 0.60, with the paired centre
+# staying in the ego lane (-0.95 m -> -0.98 m).
+DASHED_FRAG_GAP_MAX_M = 12.0
+DASHED_FRAG_LAT_TOL_M = 0.60
 DASHED_FRAG_DIR_MIN = 0.94
 DASHED_FRAG_MAX_SPAN_M = 60.0
 DASHED_FRAG_MAX_SAMPLES = 24
