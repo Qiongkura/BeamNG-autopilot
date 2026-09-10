@@ -165,6 +165,11 @@ def _collect_candidates(markings, pos: np.ndarray, fwd: np.ndarray,
     cands: list[_LineCandidate] = []
     drops = debug.setdefault("collect_drops", {}) if debug is not None else None
     stats = debug.setdefault("collect_stats", []) if debug is not None else None
+    # Optional GT line mask (``debug["gt"]``): when present each rejected
+    # marking also reports how much of its own pixel trace sits on
+    # annotated paint, so "the gate dropped a real line" is measurable
+    # rather than inferred from its lateral offset.
+    _gt = debug.get("gt") if debug is not None else None
 
     def _drop(mk, reason: str, span: float = 0.0, align: float = 0.0,
               side: float = 0.0) -> None:
@@ -173,7 +178,19 @@ def _collect_candidates(markings, pos: np.ndarray, fwd: np.ndarray,
         key = f"{getattr(mk, 'kind', '?')}:{reason}"
         drops[key] = int(drops.get(key, 0)) + 1
         if stats is not None and len(stats) < 4000:
-            stats.append((key, float(span), float(align), float(side)))
+            n_px = gt_px = 0
+            if _gt is not None:
+                pix = np.asarray(getattr(mk, "pixels", None), dtype=float)
+                if pix.ndim == 2 and pix.shape[1] >= 2:
+                    u = np.rint(pix[:, 0]).astype(int)
+                    v = np.rint(pix[:, 1]).astype(int)
+                    ok = ((u >= 0) & (u < _gt.shape[1])
+                          & (v >= 0) & (v < _gt.shape[0]))
+                    n_px = int(ok.sum())
+                    if n_px:
+                        gt_px = int(np.asarray(_gt)[v[ok], u[ok]].sum())
+            stats.append((key, float(span), float(align), float(side),
+                          n_px, gt_px))
 
     for mk in markings:
         # A dark pavement patch / tree shadow comes back as ``unknown``.

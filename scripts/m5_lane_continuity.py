@@ -73,6 +73,10 @@ SIDE_BAND_M = 0.08
 # Near-field paint pixels on one image half before that side counts as
 # "painted" (a real line contributes hundreds; speckle does not).
 SIDE_PAINT_MIN_PX = 40
+# Fraction of a dropped component's / rejected marking's own pixels that
+# must sit on annotated paint before it counts as a REAL lane line rather
+# than noise (judged against the recorded GT label).
+GT_REAL_LINE_FRAC = 0.5
 
 
 def _episodes(data_dir: Path, pattern: str) -> list[str]:
@@ -276,6 +280,9 @@ def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
         n_marks.append(len(markings))
 
         dbg: dict = {}
+        _gt = ((labels[i] == LABEL_LINE) if labels is not None else None)
+        if _gt is not None:
+            dbg["gt"] = _gt
         frame = None
         if markings:
             frame = pair_lane_markings(markings, pos, heading, debug=dbg)
@@ -329,6 +336,8 @@ def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
                 # Ask the extractor itself why the paint it can see did not
                 # become a marking.
                 md: dict = {}
+                if _gt is not None:
+                    md["gt"] = _gt
                 _mask_to_markings(
                     np.asarray(out.masks.get("line"), dtype=np.uint8) * 255,
                     "white", cam, pos, heading, ground_z=0.0, debug=md)
@@ -390,36 +399,57 @@ def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
         res["gate_drops"] = gate_hist
     if gate_stats:
         by_gate: dict[str, list] = {}
-        for key, span, align, side in gate_stats:
-            by_gate.setdefault(key, []).append((span, align, side))
+        for row in gate_stats:
+            key, span, align, side = row[0], row[1], row[2], row[3]
+            n_px = int(row[4]) if len(row) > 4 else 0
+            gt_px = int(row[5]) if len(row) > 5 else 0
+            by_gate.setdefault(key, []).append((span, align, side,
+                                                n_px, gt_px))
 
         def _p50(rows, i):
             vals = [r[i] for r in rows if r[i] == r[i]]
             return round(float(np.median(vals)), 2) if vals else None
 
-        res["gate_by_reason"] = {
-            k: {"n": len(v), "span_p50": _p50(v, 0),
-                "align_p50": _p50(v, 1), "side_p50": _p50(v, 2)}
-            for k, v in by_gate.items()}
+        res["gate_by_reason"] = {}
+        for k, v in by_gate.items():
+            n_px = sum(r[3] for r in v)
+            gt_px = sum(r[4] for r in v)
+            real = sum(1 for r in v
+                       if r[3] and r[4] / r[3] >= GT_REAL_LINE_FRAC)
+            res["gate_by_reason"][k] = {
+                "n": len(v), "span_p50": _p50(v, 0),
+                "align_p50": _p50(v, 1), "side_p50": _p50(v, 2),
+                "gt_px_frac": round(gt_px / n_px, 3) if n_px else None,
+                "n_real_line": real}
     if drop_stats:
-        arr = np.asarray([(w, h, a) for _s, _r, w, h, a in drop_stats],
+        arr = np.asarray([(r[2], r[3], r[4]) for r in drop_stats],
                          dtype=float)
         res["drop_stats_n"] = int(len(arr))
         res["drop_wh_p50"] = [round(float(np.median(arr[:, 0])), 1),
                               round(float(np.median(arr[:, 1])), 1)]
         res["drop_wh_p90"] = [round(float(np.percentile(arr[:, 0], 90)), 1),
                               round(float(np.percentile(arr[:, 1], 90)), 1)]
-        by_reason: dict[str, list[tuple[float, float, float]]] = {}
-        for _s, reason, w, h, a in drop_stats:
-            by_reason.setdefault(reason, []).append((float(w), float(h),
-                                                     float(a)))
-        res["drop_by_reason"] = {
-            k: {"n": len(v),
+        by_reason: dict[str, list[tuple[float, float, float, int, int]]] = {}
+        for row in drop_stats:
+            # key by "<side>:<reason>" so it lines up with extractor_drops
+            by_reason.setdefault(f"{row[0]}:{row[1]}", []).append(
+                (float(row[2]), float(row[3]), float(row[4]),
+                 int(row[5]), int(row[6])))
+        res["drop_by_reason"] = {}
+        for k, v in by_reason.items():
+            n_px = sum(r[3] for r in v)
+            gt_px = sum(r[4] for r in v)
+            real = sum(1 for r in v
+                       if r[3] and r[4] / r[3] >= GT_REAL_LINE_FRAC)
+            res["drop_by_reason"][k] = {
+                "n": len(v),
                 "w_p50": round(float(np.median([r[0] for r in v])), 1),
                 "h_p50": round(float(np.median([r[1] for r in v])), 1),
                 "area_p50": round(float(np.median([r[2] for r in v])), 1),
-                "area_p90": round(float(np.percentile([r[2] for r in v], 90)), 1)}
-            for k, v in by_reason.items()}
+                "area_p90": round(float(np.percentile(
+                    [r[2] for r in v], 90)), 1),
+                "gt_px_frac": round(gt_px / n_px, 3) if n_px else None,
+                "n_real_line": real}
     if lat_paired:
         res["lat_paired_mean_m"] = round(float(np.mean(lat_paired)), 3)
     if gt_acc:
@@ -525,19 +555,28 @@ def main() -> int:
                                key=lambda kv: -kv[1]):
                 print(f"      {v:4d}  {k}")
         if r.get("extractor_drops"):
-            print("  extractor losses on those frames (L/R:reason):")
+            print("  extractor losses (L/R:reason, gt = share of the "
+                  "dropped pixels that are annotated paint):")
             for k, v in sorted(r["extractor_drops"].items(),
                                key=lambda kv: -kv[1])[:8]:
-                print(f"      {v:4d}  {k}")
+                extra = (r.get("drop_by_reason") or {}).get(k, {})
+                gf = extra.get("gt_px_frac")
+                print(f"      {v:4d}  {k:20s} gt="
+                      f"{'-' if gf is None else f'{gf:.0%}':>5} "
+                      f"real_line={extra.get('n_real_line')}")
         if r.get("extractor_kinds"):
             print(f"  extractor kept kinds : {r['extractor_kinds']}")
         if r.get("gate_drops"):
-            print("  candidate gate dropped these markings:")
+            print("  candidate gate dropped these markings "
+                  "(gt = share of the marking's own pixels on annotated paint):")
             for k, v in sorted(r["gate_drops"].items(),
                                key=lambda kv: -kv[1])[:8]:
                 extra = (r.get("gate_by_reason") or {}).get(k, {})
-                print(f"      {v:4d}  {k}  span_p50={extra.get('span_p50')} "
-                      f"align_p50={extra.get('align_p50')} "
+                gf = extra.get("gt_px_frac")
+                print(f"      {v:4d}  {k:20s} gt="
+                      f"{'-' if gf is None else f'{gf:.0%}':>5} "
+                      f"real_line={extra.get('n_real_line')} "
+                      f"span_p50={extra.get('span_p50')} "
                       f"side_p50={extra.get('side_p50')}")
         if r.get("dropout_runs"):
             print(f"  dropout runs         : {r['dropout_runs']} "

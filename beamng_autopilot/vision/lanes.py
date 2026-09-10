@@ -195,9 +195,14 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
         debug["kinds"] = {}
         debug["kept"] = 0
     _cx = float(getattr(cam_model, "cx", 0.0) or 0.0)
+    # Optional GT line mask (``debug["gt"]``): when present every dropped
+    # component also reports how many of its pixels actually sit on
+    # annotated paint, which is what separates "the filter dropped a real
+    # lane line" from "the filter dropped noise".
+    _gt = debug.get("gt") if debug is not None else None
 
     def _drop(x: float, w: float, reason: str, h: float = 0.0,
-              area: float = 0.0) -> None:
+              area: float = 0.0, label_id: int = -1) -> None:
         if debug is None:
             return
         side = "L" if (float(x) + 0.5 * float(w)) < _cx else "R"
@@ -205,7 +210,13 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
         debug["drops"][key] = int(debug["drops"].get(key, 0)) + 1
         stats = debug.setdefault("drop_stats", [])
         if len(stats) < 4000:
-            stats.append((side, reason, int(w), int(h), int(area)))
+            n_px = gt_px = 0
+            if _gt is not None and label_id >= 0:
+                comp = labels == label_id
+                n_px = int(comp.sum())
+                gt_px = int(np.logical_and(comp, _gt).sum())
+            stats.append((side, reason, int(w), int(h), int(area),
+                          n_px, gt_px))
 
     mask = cv2.morphologyEx(mask0, cv2.MORPH_OPEN, kernel)
     mask = cv2.dilate(mask, kernel, iterations=1)
@@ -216,17 +227,17 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
             debug["components"] += 1
         if area < min_area or h < min_height or w < 3:
             if area < min_area:
-                _drop(x, w, "small_area", h, area)
+                _drop(x, w, "small_area", h, area, i)
             if h < min_height:
-                _drop(x, w, "small_h", h, area)
+                _drop(x, w, "small_h", h, area, i)
             if w < 3:
-                _drop(x, w, "small_w", h, area)
+                _drop(x, w, "small_w", h, area, i)
             continue
         if w > max(8, h * 2.5):
-            _drop(x, w, "too_wide", h, area)
+            _drop(x, w, "too_wide", h, area, i)
             continue
         if w * h <= 0 or area / (w * h) < 0.10:
-            _drop(x, w, "too_sparse", h, area)
+            _drop(x, w, "too_sparse", h, area, i)
             continue
         ys, xs = np.where(labels == i)
         order = np.argsort(ys)
@@ -246,7 +257,7 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
             world.append(wp)
             pixels.append((float(u), float(v)))
         if len(world) < 4:
-            _drop(x, w, "too_few_world_pts", h, area)
+            _drop(x, w, "too_few_world_pts", h, area, i)
             continue
         wpts = np.asarray(world, dtype=float)
         ppts = np.asarray(pixels, dtype=float)
