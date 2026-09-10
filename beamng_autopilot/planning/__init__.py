@@ -50,7 +50,9 @@ from .arbiter import (
     ArbiterOutcome,
     anchored_rule_ref,
     arbitrate,
+    arbitrate_fsd_tick,
     choose_plan_route,
+    strict_lane_unavailable,
 )
 from .speed_profile import speed_profile_for_path
 from .path_validation import PathValidation, validate_learned_path
@@ -88,7 +90,9 @@ __all__ = [
     "ArbiterOutcome",
     "anchored_rule_ref",
     "arbitrate",
+    "arbitrate_fsd_tick",
     "choose_plan_route",
+    "strict_lane_unavailable",
     "speed_profile_for_path",
     "PathValidation",
     "validate_learned_path",

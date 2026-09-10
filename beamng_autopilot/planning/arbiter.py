@@ -83,6 +83,49 @@ def arbitrate(fsd_path, rule_path, fsd_safe: bool = True,
     return ArbiterOutcome(None, "none", "no fsd/e2e/rule path")
 
 
+def strict_lane_unavailable(strict: bool, plan_blocked,
+                            lane_src_sel) -> bool:
+    """True when a strict FSD tick has no perception lane to drive by.
+
+    The layered planner owns the fail-closed decision: for a strict scene
+    without a perception lane ``Constraints.score`` declines every
+    candidate (including raw kinematic arcs, which carry no lane geometry)
+    and the stack publishes ``plan_blocked == "no_perception_lane"``.
+    The runtime CONSUMES that contract here instead of re-deriving the
+    lateral policy.  The lane lock (``lane_src_sel``) is read as a
+    second, independent signal: a missing lock must not unblock motion
+    even when the block flag is absent (docs/fsd_realism.md §4).
+    """
+    if not strict:
+        return False
+    if str(plan_blocked or "") == "no_perception_lane":
+        return True
+    return str(lane_src_sel or "") != "sensor"
+
+
+def arbitrate_fsd_tick(fsd_path, rule_path, *, fsd_safe: bool = True,
+                       e2e_path=None, e2e_safe: bool = False,
+                       bc_path=None, bc_safe: bool = False,
+                       strict: bool = False, plan_blocked="",
+                       lane_src_sel="",
+                       prefer_rule: bool = False) -> ArbiterOutcome:
+    """Runtime arbitration with the strict perception-lane gate applied.
+
+    Same ranking as :func:`arbitrate` (FSD -> E2E -> BC -> rule), but in
+    strict FSD mode a tick with no perception lane must not fall through
+    to the rule/map route: the nav route is navigation intent, never a
+    driving trajectory.  Neural candidates stay eligible - they are
+    perception-derived, not map geometry - while the legal degradations
+    remain stop / hold current heading / drop to a safe point.
+    """
+    if strict_lane_unavailable(strict, plan_blocked, lane_src_sel):
+        rule_path = None
+    return arbitrate(fsd_path, rule_path, fsd_safe=fsd_safe,
+                     e2e_path=e2e_path, e2e_safe=e2e_safe,
+                     bc_path=bc_path, bc_safe=bc_safe,
+                     prefer_rule=prefer_rule)
+
+
 def _ref_blocked_fraction(ref, pos, heading, grid,
                           lo_m: float = 3.0, hi_m: float = 25.0,
                           fwd_min_m: float = 0.5) -> float:

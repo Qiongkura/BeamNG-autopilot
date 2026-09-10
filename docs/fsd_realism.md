@@ -47,6 +47,10 @@
   只能在合法降级集合内动作(刹停 / 保持航向 / 落到路面安全点)。
   这一决定以 `FSDTick.meta["plan_blocked"]="no_perception_lane"` 发布,
   `m5_fsd_drive` 消费该裁决而不是自己再实现一遍车道策略。
+  运行时仲裁只有一条入口:`planning/arbiter.py::arbitrate_fsd_tick`
+  (裁决读取用 `strict_lane_unavailable`);它在严格模式下丢弃 rule/map 兜底,
+  但保留 E2E/BC 这类**感知派生**的候选。`fsd_realism.check_fail_closed_consumers`
+  机器校验转向入口不存在绕开该门的裸 `arbitrate(...)` 调用。
 
 - **单一世界模型**:`FSDTick.scene` 发布本 tick 规划器实际使用的
   `Scene`(occupancy、感知车道、strict 标记、快照/freshness)。

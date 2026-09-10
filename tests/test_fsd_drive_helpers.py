@@ -9,6 +9,9 @@ import numpy as np
 import pytest
 
 from beamng_autopilot import fsd_drive
+from beamng_autopilot.planning import (
+    arbitrate_fsd_tick, strict_lane_unavailable,
+)
 from beamng_autopilot.perception_snapshot import PerceptionSnapshot
 
 
@@ -17,6 +20,15 @@ def test_fs_drive_session_keeps_args_and_compat_wrapper():
     session = fsd_drive.FSDriveSession(args)
     assert session.args is args
     assert callable(fsd_drive.run)
+
+
+def test_fs_drive_consumes_the_shared_fail_closed_contract():
+    # The runtime must consume the planner's no-perception-lane decision
+    # through the shared arbiter contract, not a local re-implementation
+    # (docs/fsd_realism.md §4).  ``check_fail_closed_consumers`` proves
+    # the other half: no bare ``arbitrate`` call remains in this module.
+    assert fsd_drive.arbitrate_fsd_tick is arbitrate_fsd_tick
+    assert fsd_drive.strict_lane_unavailable is strict_lane_unavailable
 
 
 def test_fs_drive_session_build_route_without_goal_is_safe():

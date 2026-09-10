@@ -37,7 +37,8 @@ from beamng_autopilot.neural.e2e_runtime import (
 )
 from beamng_autopilot.occupancy import OccupancyGrid
 from beamng_autopilot.planning import (
-    Scene, anchored_rule_ref, arbitrate, local_route,
+    Scene, anchored_rule_ref, arbitrate_fsd_tick, local_route,
+    strict_lane_unavailable,
     validate_learned_path,
 )
 from beamng_autopilot.planning.arbiter import (
@@ -1617,16 +1618,13 @@ class FSDriveSession:
                 # FSD realism (strict): with no PAIRED perception lane the
                 # car must stop, not drive the map/nav route through the rule
                 # fallback (docs/fsd_realism.md §4).  The rule planner below
-                # is exactly that map fallback, so it is disabled here.
-                # The verdict itself is owned by the planner, which declines
-                # every candidate for a strict scene without a perception
-                # lane and publishes ``plan_blocked``; the runtime consumes
-                # that decision instead of re-implementing the lane policy.
-                # ``lane_src_sel`` is kept as the second, independent read of
-                # the same contract (a missing lock must not unblock motion).
-                _strict_no_lane = bool(args.strict and (
-                    out.meta.get("plan_blocked") == "no_perception_lane"
-                    or str(out.meta.get("lane_src_sel", "")) != "sensor"))
+                # is exactly that map fallback, so it is disabled here; the
+                # verdict itself is owned by the planner (``plan_blocked``)
+                # and consumed - not re-derived - by the runtime contract.
+                _strict_no_lane = strict_lane_unavailable(
+                    bool(args.strict),
+                    out.meta.get("plan_blocked"),
+                    out.meta.get("lane_src_sel", ""))
                 if _strict_no_lane:
                     _need_rule = False
                 if _need_rule and nav_route is not None and len(nav_route) >= 2:
@@ -1644,13 +1642,16 @@ class FSDriveSession:
                                 pos, heading, np.asarray(_rd, dtype=float)[:, :2])
                     except Exception:
                         rule_ref = None
-                chosen = arbitrate(
+                chosen = arbitrate_fsd_tick(
                     best, rule_ref,
                     fsd_safe=verd.safe and best is not None and len(best) >= 2,
                     e2e_path=e2e_path,
                     e2e_safe=e2e_safe,
                     bc_path=bc_path,
                     bc_safe=bc_safe,
+                    strict=bool(args.strict),
+                    plan_blocked=out.meta.get("plan_blocked"),
+                    lane_src_sel=out.meta.get("lane_src_sel", ""),
                     prefer_rule=False)
                 # Re-verify the verdict against the path the car actually
                 # runs: the FSD verdict above was computed on the FSD best

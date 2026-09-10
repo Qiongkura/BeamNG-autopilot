@@ -5,7 +5,10 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from beamng_autopilot.planning import anchored_rule_ref, arbitrate
+from beamng_autopilot.planning import (
+    anchored_rule_ref, arbitrate, arbitrate_fsd_tick,
+    strict_lane_unavailable,
+)
 
 
 def _path():
@@ -116,3 +119,90 @@ def test_anchored_rule_ref_none_for_empty() -> None:
     assert anchored_rule_ref(np.array([0.0, 0.0]), 0.0, None) is None
     assert anchored_rule_ref(np.array([0.0, 0.0]), 0.0,
                              np.zeros((1, 2))) is None
+
+
+# --- strict fail-closed contract consumed by the runtime ---------------
+def test_strict_lane_unavailable_reads_the_planner_decision() -> None:
+    # The planner's block flag is the primary signal.
+    assert strict_lane_unavailable(True, "no_perception_lane", "sensor")
+    # A missing sensor lane LOCK is the second, independent read: a lost
+    # lock must not unblock motion even without the block flag.
+    assert strict_lane_unavailable(True, "", "map")
+    assert strict_lane_unavailable(True, None, "bev/route")
+    assert strict_lane_unavailable(True, "", "")
+    # Locked onto a perception lane and nothing declared blocked: usable.
+    assert not strict_lane_unavailable(True, "", "sensor")
+    assert not strict_lane_unavailable(True, None, "sensor")
+
+
+def test_strict_lane_unavailable_never_fires_outside_strict_mode() -> None:
+    # Legacy rule-compatibility mode keeps its map fallback.
+    for blocked, src in (("no_perception_lane", "sensor"),
+                         ("", "map"), ("", ""), (None, None)):
+        assert not strict_lane_unavailable(False, blocked, src), (blocked, src)
+
+
+def test_arbitrate_fsd_tick_blocks_rule_fallback_without_lane() -> None:
+    rule = _path()
+    strict = dict(strict=True, plan_blocked="no_perception_lane",
+                  lane_src_sel="sensor")
+    out = arbitrate_fsd_tick(None, rule, fsd_safe=False, **strict)
+    # The rule path is map/nav geometry: a strict tick without a perception
+    # lane must stop, not be steered by it.
+    assert out.source == "none"
+    assert out.path is None
+    # Same inputs, legacy mode: the fallback is still available.
+    out = arbitrate_fsd_tick(None, rule, fsd_safe=False, strict=False,
+                             plan_blocked="no_perception_lane",
+                             lane_src_sel="map")
+    assert out.source == "rule"
+    assert out.path is rule
+
+
+def test_arbitrate_fsd_tick_blocks_rule_when_sensor_lock_is_lost() -> None:
+    rule = _path()
+    out = arbitrate_fsd_tick(None, rule, fsd_safe=False, strict=True,
+                             plan_blocked="", lane_src_sel="map")
+    assert out.source == "none"
+    assert out.path is None
+
+
+def test_arbitrate_fsd_tick_fail_closed_beats_forced_rule() -> None:
+    # Even "rule mode" cannot override the strict no-lane gate.
+    rule = _path()
+    out = arbitrate_fsd_tick(None, rule, fsd_safe=False, strict=True,
+                             plan_blocked="no_perception_lane",
+                             lane_src_sel="sensor", prefer_rule=True)
+    assert out.source == "none"
+    assert out.path is None
+
+
+def test_arbitrate_fsd_tick_keeps_neural_candidates_eligible() -> None:
+    # E2E / BC are perception-derived (they do not need a lane polyline),
+    # so they stay inside the legal degradation set.
+    rule = _path()
+    e2e = np.array([[0.0, 0.0], [2.0, 0.0], [4.0, 0.0]])
+    out = arbitrate_fsd_tick(None, rule, fsd_safe=False,
+                             e2e_path=e2e, e2e_safe=True, strict=True,
+                             plan_blocked="no_perception_lane",
+                             lane_src_sel="sensor")
+    assert out.source == "e2e"
+    bc = np.array([[0.0, 0.0], [1.0, 0.5], [2.0, 1.0]])
+    out = arbitrate_fsd_tick(None, rule, fsd_safe=False,
+                             bc_path=bc, bc_safe=True, strict=True,
+                             plan_blocked="no_perception_lane",
+                             lane_src_sel="sensor")
+    assert out.source == "bc"
+
+
+def test_arbitrate_fsd_tick_normal_ranking_with_lane_lock() -> None:
+    fsd = _path()
+    rule = np.array([[0.0, 0.0], [0.0, 1.0], [0.0, 2.0]])
+    out = arbitrate_fsd_tick(fsd, rule, fsd_safe=True, strict=True,
+                             plan_blocked="", lane_src_sel="sensor")
+    assert out.source == "fsd"
+    # A strict tick WITH a lane lock keeps the ordinary rule fallback when
+    # the layered planner declines.
+    out = arbitrate_fsd_tick(None, rule, fsd_safe=False, strict=True,
+                             plan_blocked="", lane_src_sel="sensor")
+    assert out.source == "rule"

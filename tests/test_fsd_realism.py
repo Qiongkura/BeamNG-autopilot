@@ -6,12 +6,14 @@ import numpy as np
 import pytest
 
 from beamng_autopilot.fsd_realism import (
+    FAIL_CLOSED_CONSUMER_FILES,
     FSD_INVARIANTS,
     NO_MAP_GUARDED_FILES,
     SRC_MAP,
     SRC_SENSOR,
     SRC_UNAVAILABLE,
     assert_realistic_lane,
+    check_fail_closed_consumers,
     check_no_map_imports,
     lane_source_ok,
 )
@@ -88,6 +90,30 @@ def test_fsd_stack_is_not_guarded_but_still_split_from_lateral_logic() -> None:
     # nav route as *destination intent* only.  It must stay out of the
     # never-map list (that list is for sensor-only modules).
     assert "beamng_autopilot/fsd_stack.py" not in NO_MAP_GUARDED_FILES
+
+
+def test_runtime_steering_never_calls_bare_arbitrate() -> None:
+    # The fail-closed decision has a single owner.  A runtime steering
+    # entry point that calls the bare ``arbitrate`` helper bypasses the
+    # strict no-lane gate and can steer on map/nav geometry
+    # (docs/fsd_realism.md §4).
+    assert check_fail_closed_consumers() == []
+    assert "beamng_autopilot/fsd_drive.py" in FAIL_CLOSED_CONSUMER_FILES
+
+
+def test_fail_closed_consumer_guard_detects_a_bypass(tmp_path,
+                                                     monkeypatch) -> None:
+    import beamng_autopilot.fsd_realism as fr
+
+    bad = tmp_path / "fake_drive.py"
+    bad.write_text(
+        "from beamng_autopilot.planning import arbitrate\n"
+        "def go(a, b):\n"
+        "    return arbitrate(a, b, fsd_safe=False)\n",
+        encoding="utf-8")
+    monkeypatch.setattr(fr, "FAIL_CLOSED_CONSUMER_FILES", ("fake_drive.py",))
+    found = fr.check_fail_closed_consumers(tmp_path)
+    assert found and found[0].endswith(":3")
 
 
 def test_fsd_stack_accepts_strict_param() -> None:

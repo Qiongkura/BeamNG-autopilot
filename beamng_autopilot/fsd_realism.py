@@ -44,7 +44,8 @@ FSD_INVARIANTS = (
      "a strict scene without a perception lane must publish no trajectory at "
      "all (not even a lane-less kinematic arc); one layer owns the decision "
      "and every consumer reads it",
-     "planning/constraints.py score -> fsd_stack meta plan_blocked"),
+     "planning/constraints.py score -> fsd_stack meta plan_blocked -> "
+     "planning/arbiter.arbitrate_fsd_tick"),
     ("no-simulator-privilege-in-inference",
      "Lua ground truth / annotations must not enter the inference path",
      "vision/ + runtime providers"),
@@ -99,6 +100,15 @@ NO_MAP_GUARDED_FILES = (
     "beamng_autopilot/control/speed.py",
 )
 
+# Runtime entry points that steer the car.  They must reach planner
+# arbitration through the strict-gated contract (``arbitrate_fsd_tick`` /
+# ``strict_lane_unavailable``) instead of the bare ``arbitrate`` helper,
+# which would let a perception-less strict tick fall through to rule/map
+# geometry.  Checked by ``check_fail_closed_consumers``.
+FAIL_CLOSED_CONSUMER_FILES = (
+    "beamng_autopilot/fsd_drive.py",
+)
+
 
 def lane_source_ok(src: str | None, strict: bool = False) -> bool:
     """True when a lane source satisfies the given realism level."""
@@ -145,4 +155,31 @@ def check_no_map_imports() -> list[str]:
                                           "roadgraph", "decalroad",
                                           "map_lane", "nav_route")):
             bad.append(rel)
+    return bad
+
+
+def check_fail_closed_consumers(root: Path | None = None) -> list[str]:
+    """List runtime call sites that bypass the strict fail-closed gate.
+
+    Parses the steering entry points and reports every call to the bare
+    ``arbitrate`` helper (``arbitrate(...)`` or ``<mod>.arbitrate(...)``).
+    Runtime code must call ``arbitrate_fsd_tick`` so a strict tick that
+    published ``plan_blocked="no_perception_lane"`` cannot fall through to
+    the rule/map fallback (docs/fsd_realism.md §4).
+    """
+    import ast
+
+    if root is None:
+        root = Path(__file__).resolve().parents[1]
+    bad = []
+    for rel in FAIL_CLOSED_CONSUMER_FILES:
+        tree = ast.parse((Path(root) / rel).read_text(encoding="utf-8"))
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            fn = node.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else (
+                fn.id if isinstance(fn, ast.Name) else "")
+            if name == "arbitrate":
+                bad.append(f"{rel}:{node.lineno}")
     return bad
