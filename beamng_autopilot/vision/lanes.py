@@ -160,7 +160,8 @@ def _color_masks(frame_rgb):
 def _mask_to_markings(mask0, color, cam_model, pos, heading,
                       ground_z: float | None = None,
                       min_area: int = 30, min_height: int = 18,
-                      max_dist: float = 45.0, solid_len: float = 6.0
+                      max_dist: float = 45.0, solid_len: float = 6.0,
+                      debug: dict | None = None
                       ) -> list[LaneMarking]:
     """Turn a binary mask into LaneMarking polylines (shared pipeline).
 
@@ -169,6 +170,13 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
     ground-plane back-projection -> dominant-axis ordering -> kind
     classification.  ``mask0`` is a uint8 mask (0/255), ``color`` the
     label ("white" / "yellow") attached to the resulting markings.
+
+    ``debug`` (optional) records where components are lost, split by the
+    image half they sit in: this extractor is the dominant loss point for
+    perception lane continuity (60% of unpaired shadow frames have paint
+    in the mask and no marking), and without it the reason is invisible.
+    Sets ``components``, ``drops`` (``"<L|R>:<reason>"``), ``kept`` and
+    ``kinds``.
     """
     import cv2
 
@@ -181,17 +189,44 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
         ground_z = float(p[2]) if p.size > 2 else 0.0
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     markings: list[LaneMarking] = []
+    if debug is not None:
+        debug["components"] = 0
+        debug["drops"] = {}
+        debug["kinds"] = {}
+        debug["kept"] = 0
+    _cx = float(getattr(cam_model, "cx", 0.0) or 0.0)
+
+    def _drop(x: float, w: float, reason: str, h: float = 0.0,
+              area: float = 0.0) -> None:
+        if debug is None:
+            return
+        side = "L" if (float(x) + 0.5 * float(w)) < _cx else "R"
+        key = f"{side}:{reason}"
+        debug["drops"][key] = int(debug["drops"].get(key, 0)) + 1
+        stats = debug.setdefault("drop_stats", [])
+        if len(stats) < 4000:
+            stats.append((side, reason, int(w), int(h), int(area)))
 
     mask = cv2.morphologyEx(mask0, cv2.MORPH_OPEN, kernel)
     mask = cv2.dilate(mask, kernel, iterations=1)
     n, labels, stats, _ = cv2.connectedComponentsWithStats(mask, 8)
     for i in range(1, n):
         x, y, w, h, area = stats[i]
+        if debug is not None:
+            debug["components"] += 1
         if area < min_area or h < min_height or w < 3:
+            if area < min_area:
+                _drop(x, w, "small_area", h, area)
+            if h < min_height:
+                _drop(x, w, "small_h", h, area)
+            if w < 3:
+                _drop(x, w, "small_w", h, area)
             continue
         if w > max(8, h * 2.5):
+            _drop(x, w, "too_wide", h, area)
             continue
         if w * h <= 0 or area / (w * h) < 0.10:
+            _drop(x, w, "too_sparse", h, area)
             continue
         ys, xs = np.where(labels == i)
         order = np.argsort(ys)
@@ -211,6 +246,7 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
             world.append(wp)
             pixels.append((float(u), float(v)))
         if len(world) < 4:
+            _drop(x, w, "too_few_world_pts", h, area)
             continue
         wpts = np.asarray(world, dtype=float)
         ppts = np.asarray(pixels, dtype=float)
@@ -262,6 +298,10 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
         markings.append(LaneMarking(
             world=wpts, pixels=ppts, color=color, kind=kind,
             confidence=float(conf)))
+        if debug is not None:
+            debug["kinds"][kind] = int(debug["kinds"].get(kind, 0)) + 1
+    if debug is not None:
+        debug["kept"] = len(markings)
     return markings
 
 

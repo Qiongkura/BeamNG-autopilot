@@ -52,6 +52,7 @@ from beamng_autopilot.fsd_realism import SRC_SENSOR, SRC_UNAVAILABLE
 from beamng_autopilot.lane import pair_lane_markings, select_lane_reference
 from beamng_autopilot.vision.heads.semantic import SemanticHead
 from beamng_autopilot.vision.hydra import FrameContext
+from beamng_autopilot.vision.lanes import _mask_to_markings
 from beamng_autopilot.vision.ring import CAMERA_RING, FRONT_MAIN
 
 # Semantic GT class for painted lines (recording.py writes 0=bg 1=road 2=line).
@@ -63,6 +64,15 @@ LABEL_LINE = 2
 GT_NEAR_MIN_PX = 60
 # Lower part of the image = near field (the preview the own lane lives in).
 GT_NEAR_ROW_FRAC = 0.55
+# Raw marking side read: forward window used to decide which side a
+# marking sits on (matches the pairing module's near-field band).
+SIDE_READ_AHEAD_M = 6.0
+# The pairing module classifies a candidate as left/right only outside
+# this lateral band (``_cand_side``).
+SIDE_BAND_M = 0.08
+# Near-field paint pixels on one image half before that side counts as
+# "painted" (a real line contributes hundreds; speckle does not).
+SIDE_PAINT_MIN_PX = 40
 
 
 def _episodes(data_dir: Path, pattern: str) -> list[str]:
@@ -77,8 +87,107 @@ def _near_gt_line_px(label: np.ndarray) -> int:
     return int((near == LABEL_LINE).sum())
 
 
+def _marking_sides(markings, pos, heading: float) -> list[float]:
+    """Near-field lateral offset of every detected marking (left = +).
+
+    This is the raw detection read, BEFORE ``_collect_candidates`` drops
+    anything, so it can tell "the other side was never seen" apart from
+    "it was seen and then filtered out".
+    """
+    fwd = np.array([np.cos(float(heading)), np.sin(float(heading))])
+    left = np.array([-fwd[1], fwd[0]])
+    p = np.asarray(pos[:2], dtype=float)
+    out: list[float] = []
+    for mk in markings:
+        w = np.asarray(getattr(mk, "world", None), dtype=float)
+        if w.ndim != 2 or w.shape[1] < 2 or len(w) < 2:
+            continue
+        rel = w[:, :2] - p
+        lon = rel @ fwd
+        lat = rel @ left
+        near = lat[(lon >= 0.0) & (lon <= SIDE_READ_AHEAD_M)]
+        out.append(float(np.median(near)) if len(near) >= 2
+                   else float(np.median(lat)))
+    return out
+
+
+def _side_counts(sides: list[float]) -> tuple[int, int]:
+    """(left, right) counts using the pairing module's own side band."""
+    return (sum(1 for v in sides if v > SIDE_BAND_M),
+            sum(1 for v in sides if v < -SIDE_BAND_M))
+
+
+def _near_paint_px_by_half(mask, cx: int) -> tuple[int, int]:
+    """Near-field paint pixels left / right of the principal point."""
+    m = np.asarray(mask, dtype=bool)
+    if m.ndim != 2 or not m.any():
+        return 0, 0
+    near = m[int(m.shape[0] * GT_NEAR_ROW_FRAC):]
+    return int(near[:, :cx].sum()), int(near[:, cx:].sum())
+
+
+def _refine_missing_side(markings, pos, heading: float, line_mask,
+                         label, cx: int) -> str:
+    """Split "one side not detected" into where the paint was lost.
+
+    The image half of a lane side is what the forward camera sees, so a
+    near-field paint count per half says whether the MISSING side was
+    never painted (a dashed gap / an unmarked edge), was painted but the
+    model's line mask missed it, or was in the mask and the marking
+    extractor dropped it.  Those three need completely different fixes.
+    """
+    sides = _marking_sides(markings, pos, heading)
+    left_n, right_n = _side_counts(sides)
+    if left_n == 0 and right_n > 0:
+        half, name = 0, "left"
+    elif right_n == 0 and left_n > 0:
+        half, name = 1, "right"
+    else:
+        return "one_side_not_detected"
+    if line_mask is not None:
+        ml, mr = _near_paint_px_by_half(line_mask, cx)
+        if (ml if half == 0 else mr) >= SIDE_PAINT_MIN_PX:
+            return f"missing_{name}__mask_has_paint_marking_dropped"
+    if label is not None:
+        gl, gr = _near_paint_px_by_half(
+            np.asarray(label) == LABEL_LINE, cx)
+        if (gl if half == 0 else gr) >= SIDE_PAINT_MIN_PX:
+            return f"missing_{name}__paint_visible_model_missed"
+        return f"missing_{name}__no_paint_on_that_side"
+    return f"missing_{name}__unknown"
+
+
+def _single_cause(markings, pos, heading: float, dbg: dict) -> str:
+    """Why a frame that DID detect paint produced no paired lane frame.
+
+    The candidates are read with the same near-field side rule the pairing
+    uses (``debug['cands'][*]['near_med']``), so a bend whose far arc
+    swings into the car frame is not misclassified.
+    """
+    mode = str(dbg.get("mode", "") or "")
+    cands = dbg.get("cands") or []
+    if mode == "none":
+        return "all_markings_filtered"          # collector dropped every one
+    if not mode and not cands:
+        return "all_markings_filtered"
+
+    def _side(c: dict) -> float:
+        v = c.get("near_med")
+        return float(c.get("med_lat", 0.0)) if v is None else float(v)
+
+    cl, cr = _side_counts([_side(c) for c in cands])
+    rl, rr = _side_counts(_marking_sides(markings, pos, heading))
+    if rl == 0 or rr == 0:
+        return "one_side_not_detected"
+    if cl == 0 or cr == 0:
+        return "one_side_filtered_by_candidate_gate"
+    if not mode:
+        return "pair_rejected_mirror_refused"
+    return "both_sides_but_no_pair"
+
+
 def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
-                    verbose: bool) -> dict:
+                    verbose: bool, diagnose: bool = False) -> dict:
     d = np.load(ep, allow_pickle=True)
     meta = json.loads(bytes(d["meta"]).decode("utf-8")) if "meta" in d.files \
         else {}
@@ -111,6 +220,10 @@ def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
     }
     rec_hist: dict[str, int] = {}
     off_hist: dict[str, int] = {}
+    cause_hist: dict[str, int] = {}
+    drop_hist: dict[str, int] = {}
+    kind_hist: dict[str, int] = {}
+    drop_stats: list[tuple] = []
     n_marks: list[int] = []
     lat_paired: list[float] = []
 
@@ -124,9 +237,10 @@ def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
         markings = list(out.meta.get("markings") or [])
         n_marks.append(len(markings))
 
+        dbg: dict = {}
         frame = None
         if markings:
-            frame = pair_lane_markings(markings, pos, heading)
+            frame = pair_lane_markings(markings, pos, heading, debug=dbg)
         paired = bool(frame is not None and getattr(frame, "paired", False))
 
         gt_px = _near_gt_line_px(
@@ -151,6 +265,28 @@ def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
                 counts["single_edge"] += 1
         else:
             counts["no_markings"] += 1
+        if diagnose and markings and not paired:
+            cause = _single_cause(markings, pos, heading, dbg)
+            if cause == "one_side_not_detected":
+                cause = _refine_missing_side(
+                    markings, pos, heading,
+                    out.masks.get("line"),
+                    labels[i] if labels is not None else None,
+                    int(cam.cx))
+            cause_hist[cause] = cause_hist.get(cause, 0) + 1
+            if cause.endswith("mask_has_paint_marking_dropped"):
+                # Ask the extractor itself why the paint it can see did not
+                # become a marking.
+                md: dict = {}
+                _mask_to_markings(
+                    np.asarray(out.masks.get("line"), dtype=np.uint8) * 255,
+                    "white", cam, pos, heading, ground_z=0.0, debug=md)
+                for k, v in (md.get("drops") or {}).items():
+                    drop_hist[k] = drop_hist.get(k, 0) + int(v)
+                for k, v in (md.get("kinds") or {}).items():
+                    kind_hist[k] = kind_hist.get(k, 0) + int(v)
+                for row in (md.get("drop_stats") or []):
+                    drop_stats.append(row)
         if not markings and gt_px >= GT_NEAR_MIN_PX:
             counts["model_miss"] += 1
         if gt_px < GT_NEAR_MIN_PX:
@@ -193,6 +329,31 @@ def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
         "offline_src_hist": off_hist,
         "recorded_lane_src_hist": rec_hist,
     }
+    if cause_hist:
+        res["single_causes"] = cause_hist
+    if drop_hist:
+        res["extractor_drops"] = drop_hist
+    if kind_hist:
+        res["extractor_kinds"] = kind_hist
+    if drop_stats:
+        arr = np.asarray([(w, h, a) for _s, _r, w, h, a in drop_stats],
+                         dtype=float)
+        res["drop_stats_n"] = int(len(arr))
+        res["drop_wh_p50"] = [round(float(np.median(arr[:, 0])), 1),
+                              round(float(np.median(arr[:, 1])), 1)]
+        res["drop_wh_p90"] = [round(float(np.percentile(arr[:, 0], 90)), 1),
+                              round(float(np.percentile(arr[:, 1], 90)), 1)]
+        by_reason: dict[str, list[tuple[float, float, float]]] = {}
+        for _s, reason, w, h, a in drop_stats:
+            by_reason.setdefault(reason, []).append((float(w), float(h),
+                                                     float(a)))
+        res["drop_by_reason"] = {
+            k: {"n": len(v),
+                "w_p50": round(float(np.median([r[0] for r in v])), 1),
+                "h_p50": round(float(np.median([r[1] for r in v])), 1),
+                "area_p50": round(float(np.median([r[2] for r in v])), 1),
+                "area_p90": round(float(np.percentile([r[2] for r in v], 90)), 1)}
+            for k, v in by_reason.items()}
     if lat_paired:
         res["lat_paired_mean_m"] = round(float(np.mean(lat_paired)), 3)
     return res
@@ -213,6 +374,8 @@ def main() -> int:
                     help="segmentation checkpoint (default: deployed best.pt)")
     ap.add_argument("--out", type=str, default=None,
                     help="write the report JSON here")
+    ap.add_argument("--diagnose", action="store_true",
+                    help="classify WHY each unpaired frame missed its pair")
     args = ap.parse_args()
 
     data_dir = Path(args.data) if args.data else config.LOGS_DIR / "m5_e2e"
@@ -236,7 +399,8 @@ def main() -> int:
     reports = []
     for ep in eps:
         r = measure_episode(ep, frames=frames, sem=sem,
-                            verbose=os.environ.get("LANE_CONT_VERBOSE") == "1")
+                            verbose=os.environ.get("LANE_CONT_VERBOSE") == "1",
+                            diagnose=args.diagnose)
         reports.append(r)
         print(f"\n=== {r['episode']} (cam {r['cam'][0]}x{r['cam'][1]}) ===")
         print(f"  frames measured      : {r['frames']}")
@@ -255,6 +419,21 @@ def main() -> int:
             print(f"  own-lane centre lat  : {r['lat_paired_mean_m']:+.3f} m")
         print(f"  offline src hist     : {r['offline_src_hist']}")
         print(f"  recorded lane_src    : {r['recorded_lane_src_hist']}")
+        if r.get("single_causes"):
+            print("  why unpaired frames missed a pair:")
+            for k, v in sorted(r["single_causes"].items(),
+                               key=lambda kv: -kv[1]):
+                print(f"      {v:4d}  {k}")
+        if r.get("extractor_drops"):
+            print("  extractor losses on those frames (L/R:reason):")
+            for k, v in sorted(r["extractor_drops"].items(),
+                               key=lambda kv: -kv[1])[:8]:
+                print(f"      {v:4d}  {k}")
+        if r.get("extractor_kinds"):
+            print(f"  extractor kept kinds : {r['extractor_kinds']}")
+        if r.get("drop_stats_n"):
+            print(f"  dropped comps n={r['drop_stats_n']} "
+                  f"(w,h) p50={r['drop_wh_p50']} p90={r['drop_wh_p90']}")
 
     if len(reports) > 1:
         tot = sum(r["frames"] for r in reports)
