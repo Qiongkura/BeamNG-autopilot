@@ -568,6 +568,30 @@ def _spawn_traffic(conn, nav_route, n: int,
     return placed
 
 
+def _sensor_snapshot_age(out) -> float:
+    """Max age of the data used by one FSD tick."""
+    if out is None:
+        return float("inf")
+    ages = list((getattr(out, "meta", {}) or {}).get(
+        "head_age_s", {}).values())
+    meta = getattr(out, "meta", {}) or {}
+    for key in ("range_age_s", "bev_age_s"):
+        if key in meta:
+            ages.append(meta.get(key))
+    envelope = getattr(out, "lane_envelope", None)
+    if envelope is not None:
+        ages.append(envelope.age_s)
+    # None means a required modality has no valid sample; treat it as
+    # stale rather than silently converting it to zero age.
+    if any(x is None for x in ages):
+        return float("inf")
+    # A tick with no frame and no head outputs has no fresh camera evidence.
+    if getattr(out, "frame", None) is None \
+            and not getattr(out, "head_outputs", None):
+        return float("inf")
+    return max([0.0] + [float(x) for x in ages])
+
+
 def run(args) -> int:
     # initialised FIRST: the end-of-run finally touches these even when
     # the connection fails before the drive section (2026-09-06:
@@ -1298,9 +1322,13 @@ def run(args) -> int:
                               lane_left=out.lane_left,
                               lane_right=out.lane_right,
                               lane_width=out.lane_width,
+                              lane_envelope=getattr(out, "lane_envelope", None),
+                              perception_snapshot=getattr(out, "snapshot", None),
+                              meta=dict(getattr(out, "meta", {}) or {}),
                               target_speed=args.speed)
                 verd = monitor.evaluate(scene, best,
-                                        planner_age_s=0.0)
+                                        planner_age_s=0.0,
+                                        snapshot_age_s=_sensor_snapshot_age(out))
             else:
                 verd = monitor.evaluate(Scene(pos=pos, heading=heading),
                                         best)
@@ -1325,10 +1353,13 @@ def run(args) -> int:
             if e2e_rt is not None:
                 try:
                     e2e_path, e2e_act, e2e_ms = e2e_rt.step(
-                        out, pos, heading, float(v))
+                        getattr(out, "snapshot", None) or out,
+                        pos, heading, float(v))
                     if e2e_path is not None and len(e2e_path) >= 2:
                         _ve = monitor.evaluate(scene, e2e_path,
-                                               planner_age_s=0.0)
+                                               planner_age_s=0.0,
+                                               snapshot_age_s=
+                                               _sensor_snapshot_age(out))
                         e2e_safe = bool(_ve.safe)
                         e2e_ext = float(np.hypot(
                             e2e_path[-1, 0] - pos[0],
@@ -1356,7 +1387,9 @@ def run(args) -> int:
                             wheelbase=float(pp.wheelbase))
                         if bc_path is not None and len(bc_path) >= 2:
                             _vb = monitor.evaluate(scene, bc_path,
-                                                   planner_age_s=0.0)
+                                                   planner_age_s=0.0,
+                                                   snapshot_age_s=
+                                                   _sensor_snapshot_age(out))
                             bc_safe = bool(_vb.safe)
                         else:
                             bc_path = None
@@ -1436,7 +1469,9 @@ def run(args) -> int:
                         verd = _ve
                     else:
                         verd = monitor.evaluate(scene, chosen.path,
-                                                planner_age_s=0.0)
+                                                planner_age_s=0.0,
+                                                snapshot_age_s=
+                                                _sensor_snapshot_age(out))
                 except Exception:
                     pass
             # End-zone steering reference: inside the final stop zone the
@@ -1608,6 +1643,7 @@ def run(args) -> int:
             # avoidance shape, so the shift just holds then decays.
             _plc_shift = 0.0
             _plc_desired = None
+            plc_rejected = False
             _plc_active = painted_line_correction_active(
                 str(out.meta.get("lane_src_sel", "")),
                 str(chosen.source),
@@ -1636,6 +1672,17 @@ def run(args) -> int:
                         and abs(_plc_shift) >= PLC_MIN_ENGAGE_M:
                     steer_path = plc_corr.apply(
                         steer_path, pos, float(heading))
+                    # PLC is a post-processing transform.  Re-run the same
+                    # full-body/occupancy safety contract after shifting;
+                    # the monitor verdict made on the pre-shift path is no
+                    # longer sufficient.
+                    try:
+                        _plc_v = monitor.evaluate(
+                            scene, steer_path, planner_age_s=0.0,
+                            snapshot_age_s=_sensor_snapshot_age(out))
+                        plc_rejected = _plc_v.level == "minimal_risk"
+                    except Exception:
+                        plc_rejected = True
             steer = 0.0
             pp_alpha = None
             pp_tgt = None
@@ -2003,7 +2050,7 @@ def run(args) -> int:
             # 0.19 m at a town corner and parked a car that was steering
             # fine).  The raw-sensor heading corridor is only the last
             # line when there is NO planned path at all.
-            force_stop = bool(painted_body_cross)
+            force_stop = bool(painted_body_cross or plc_rejected)
             if force_stop:
                 target = 0.0
             fwd_clear = float("inf")
@@ -2478,6 +2525,7 @@ def run(args) -> int:
                 "body_cross_l": int(body_cross_l > 0),
                 "body_cross_r": int(body_cross_r > 0),
                 "painted_body_cross": int(painted_body_cross),
+                "plc_rejected": int(plc_rejected),
                 "pl_mask": int(_pl_mask),
                 "pl_marks": int(_pl_marks),
                 "pl_near": int(_pl_near),

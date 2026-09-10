@@ -113,6 +113,20 @@ def test_ff_short_path_zero() -> None:
         path, np.array([0.0, 0.0, 0.0]), 0.0) == 0.0
 
 
+def test_snapshot_age_uses_oldest_head_and_range():
+    out = SimpleNamespace(
+        frame=np.zeros((4, 4, 3), dtype=np.uint8),
+        head_outputs={"semantic": object()},
+        meta={"head_age_s": {"semantic": 0.2, "object": 0.7},
+              "range_age_s": 0.5})
+    assert fsd_drive._sensor_snapshot_age(out) == pytest.approx(0.7)
+
+
+def test_snapshot_age_no_sensor_is_infinite():
+    out = SimpleNamespace(frame=None, head_outputs={}, meta={})
+    assert math.isinf(fsd_drive._sensor_snapshot_age(out))
+
+
 # --- _painted_line_lat -------------------------------------------------
 def _tick_with_marks(world):
     marks = [SimpleNamespace(world=np.asarray(world, dtype=float))]

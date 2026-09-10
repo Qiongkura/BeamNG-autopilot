@@ -11,6 +11,7 @@ from beamng_autopilot.bev_fusion import (
     fuse_camera_features,
     fuse_front_frame_vector_space,
     project_mask_to_ego,
+    world_points_to_ego,
 )
 from beamng_autopilot.recording import FMAP_CHANNELS
 from beamng_autopilot.vision.projection import CameraModel
@@ -153,3 +154,13 @@ def test_stamp_signal_bearing_places_lamp_by_pixel_bearing() -> None:
     stamp_signal_bearing(fmap3, cam, (120.0, 20.0), confidence=0.3,
                          d_lo_m=6.0, d_hi_m=9.0, step_m=3.0)
     assert float(fmap3.get("sign").max()) <= 0.5
+
+
+def test_world_points_to_ego_nonzero_origin_and_heading() -> None:
+    # ego at (10, 20), heading north: world point 5m north is ego x=5;
+    # world point 2m east is ego y=-2 (right).
+    p = world_points_to_ego(
+        np.array([[10.0, 25.0, 3.0], [12.0, 20.0, 1.0]]),
+        np.array([10.0, 20.0, 2.0]), np.pi / 2)
+    assert np.allclose(p[0], [5.0, 0.0, 1.0], atol=1e-8)
+    assert np.allclose(p[1], [0.0, -2.0, -1.0], atol=1e-8)

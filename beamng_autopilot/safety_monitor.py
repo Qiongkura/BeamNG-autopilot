@@ -66,6 +66,11 @@ class SafetyVerdict:
     closest_obs_m: float = 999.0
     stale_sensor: bool = False
     stale_planner: bool = False
+    sensor_age_s: float = 0.0
+    head_age_s: dict | None = None
+    bev_age_s: float | None = None
+    lane_age_s: float | None = None
+    range_age_s: float | None = None
     corridor_open: bool = True
 
     @property
@@ -111,6 +116,63 @@ def _corridor_ahead_distance(occ_pts, path, half_width_m: float,
     if not np.any(sel):
         return None
     return float(np.min(along_best[sel]))
+
+
+def _perception_freshness(scene, snapshot_age_s: float) -> dict:
+    """Collect one age contract from Scene metadata and lane envelope.
+
+    When a canonical ``PerceptionSnapshot`` is present it is authoritative;
+    the metadata path remains for legacy/mock scenes.
+
+    Missing/None ages are unknown rather than fresh.  The caller can use
+    the returned ``max_s`` for a single stale decision while retaining the
+    individual values for telemetry.
+    """
+    snapshot = getattr(scene, "perception_snapshot", None)
+    if snapshot is not None:
+        fresh = snapshot.freshness()
+        return {
+            "head_age_s": dict(snapshot.head_age_s),
+            "head_max_s": fresh.get("head_max_s"),
+            "range_age_s": fresh.get("range_s"),
+            "bev_age_s": fresh.get("bev_s"),
+            "lane_age_s": fresh.get("lane_s"),
+            "max_s": max(float(snapshot_age_s or 0.0),
+                         float(fresh.get("max_s", 0.0))),
+        }
+
+    meta = getattr(scene, "meta", {}) or {}
+    raw_heads = meta.get("head_age_s", {}) or {}
+    heads = {str(k): (None if v is None else float(v))
+             for k, v in raw_heads.items()}
+    vals = [float(snapshot_age_s)] if snapshot_age_s is not None else []
+    if any(v is None for v in heads.values()):
+        vals.append(float("inf"))
+    else:
+        vals.extend(heads.values())
+    range_age = meta.get("range_age_s")
+    bev_age = meta.get("bev_age_s")
+    if range_age is None and "range_age_s" in meta:
+        vals.append(float("inf"))
+    elif range_age is not None:
+        vals.append(float(range_age))
+    if bev_age is None and "bev_age_s" in meta:
+        vals.append(float("inf"))
+    elif bev_age is not None:
+        vals.append(float(bev_age))
+    lane = getattr(scene, "lane_envelope", None)
+    lane_age = None
+    if lane is not None:
+        lane_age = float(lane.age_s)
+        vals.append(lane_age)
+    return {"head_age_s": heads,
+            "head_max_s": (max(heads.values()) if heads
+                           and all(v is not None for v in heads.values())
+                           else None),
+            "range_age_s": (None if range_age is None else float(range_age)),
+            "bev_age_s": (None if bev_age is None else float(bev_age)),
+            "lane_age_s": lane_age,
+            "max_s": max(vals, default=0.0)}
 
 
 class SafetyMonitor:
@@ -168,6 +230,10 @@ class SafetyMonitor:
         """Median lateral distance of the near path from the lane ref."""
         ref = getattr(scene, "lane_ref", None)
         if ref is None or len(ref) < 2:
+            envelope = getattr(scene, "lane_envelope", None)
+            ref = (getattr(envelope, "center", None)
+                   if envelope is not None else None)
+        if ref is None or len(ref) < 2:
             ref = getattr(scene, "route", None)
         if ref is None or len(ref) < 2 or path is None or len(path) < 2:
             return 0.0
@@ -198,7 +264,9 @@ class SafetyMonitor:
         body_cross = body_lane_cross_dist_m(scene, path)
         body_now_cross = body_pose_crosses_lane(
             scene, scene.pos, float(scene.heading))
-        stale_sensor = snapshot_age_s > self.stale_s
+        freshness = _perception_freshness(scene, snapshot_age_s)
+        sensor_age = float(freshness["max_s"])
+        stale_sensor = sensor_age > self.stale_s
         stale_planner = planner_age_s > self.stale_s
 
         closest = 999.0
@@ -231,7 +299,12 @@ class SafetyMonitor:
             level="safe", reason="", target_speed=self.max_speed,
             path_occupied_frac=path_occ, lane_dev_m=lane_dev,
             closest_obs_m=closest, stale_sensor=stale_sensor,
-            stale_planner=stale_planner)
+            stale_planner=stale_planner,
+            sensor_age_s=sensor_age,
+            head_age_s=freshness["head_age_s"],
+            bev_age_s=freshness["bev_age_s"],
+            lane_age_s=freshness["lane_age_s"],
+            range_age_s=freshness["range_age_s"])
 
         # --- stale sensors / planner -> degrade to minimal risk --------
         if stale_sensor or stale_planner:

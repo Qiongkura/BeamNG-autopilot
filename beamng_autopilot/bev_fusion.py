@@ -156,6 +156,32 @@ def fuse_camera_features(features, n: int = 60, res: float = 0.5,
     return fmap
 
 
+def world_points_to_ego(points, pos, heading: float) -> np.ndarray:
+    """Transform world ``(x, y[, z])`` points to ego ``(forward,left,up)``.
+
+    BEVFeatureMap stores ego-frame points.  Keeping this transform in the
+    fusion module prevents world-space detections from being stamped as
+    if their absolute world coordinates were ego coordinates.
+    """
+    p = np.asarray(points, dtype=float)
+    if p.size == 0:
+        return np.empty((0, 3), dtype=float)
+    p = p.reshape(-1, p.shape[-1] if p.ndim > 1 else 1)
+    if p.shape[1] < 2:
+        return np.empty((0, 3), dtype=float)
+    xy = p[:, :2]
+    origin = np.asarray(pos[:2], dtype=float)
+    dx = xy[:, 0] - origin[0]
+    dy = xy[:, 1] - origin[1]
+    ch, sh = math.cos(float(heading)), math.sin(float(heading))
+    out = np.zeros((len(xy), 3), dtype=float)
+    out[:, 0] = dx * ch + dy * sh
+    out[:, 1] = -dx * sh + dy * ch
+    if p.shape[1] >= 3:
+        out[:, 2] = p[:, 2] - (float(pos[2]) if len(pos) > 2 else 0.0)
+    return out
+
+
 def project_mask_to_ego(mask, cam, pos, heading, ground_z: float = 0.0,
                         channel: str = "obstacle",
                         step: int = 6, max_ahead_m: float = 45.0,

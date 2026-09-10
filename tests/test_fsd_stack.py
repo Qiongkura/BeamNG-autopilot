@@ -518,3 +518,17 @@ def test_fsd_tick_route_intent_from_nav_route() -> None:
     assert out2.meta.get("intent") == "right"
     assert out2.meta.get("intent_turn_deg") is not None
     assert float(out2.meta.get("intent_speed", 12.0)) < 12.0
+
+
+def test_fsd_feature_map_rebuilds_per_tick() -> None:
+    """A moving ego must not retain old ego-frame fmap evidence."""
+    st = _stack()
+    out1 = st.tick()
+    first = out1.feature_map
+    # Move the stub state and return a fresh tick; the feature-map object
+    # represents the current ego snapshot, not an accumulated old frame.
+    st.conn.get_state = lambda: type("S", (), {
+        "pos": np.array([20.0, 0.0, 0.0]),
+        "heading": 0.0, "speed": 5.0})()
+    out2 = st.tick()
+    assert out2.feature_map is not first

@@ -38,6 +38,7 @@ from beamng_autopilot.bev_fusion import (
     CameraFeature,
     project_mask_to_ego,
     stamp_signal_bearing,
+    world_points_to_ego,
 )
 from beamng_autopilot.planning import (
     Constraints,
@@ -48,6 +49,7 @@ from beamng_autopilot.planning import (
 )
 from beamng_autopilot.planning.intent import infer_route_intent
 from beamng_autopilot.temporal import WorldObjectTracker
+from beamng_autopilot.perception_snapshot import PerceptionSnapshot
 from beamng_autopilot.planner import CAR_HALF_WIDTH, forward_clearance_m, path_forward_clearance_m
 from beamng_autopilot.lane import (
     LANE_WIDTH_DEFAULT_M,
@@ -187,6 +189,7 @@ class FSDTick:
         self.n_candidates: int = 0
         self.meta: dict = {}
         self.head_outputs: dict = {}
+        self.snapshot: PerceptionSnapshot | None = None
         self.frame: np.ndarray | None = None   # front frame used this tick
         self.cam = None                        # its CameraModel
         self.errors: dict = {}
@@ -242,6 +245,7 @@ class FSDStack:
         self.object_every_n = max(1, int(object_every_n))
         self._head_skip: dict[str, int] = {}
         self._last_heads: dict = {}
+        self._head_timestamps: dict[str, float] = {}
         self._tick_num = 0
         self._head_phase: dict[str, int] = {}
         self._head_retry: set[str] = set()
@@ -353,6 +357,7 @@ class FSDStack:
                 ground_z=float(pos[2]) if len(pos) > 2 else 0.0,
                 role=role)
             heads: dict = {}
+            head_ages: dict[str, float] = {}
             _tick_num = int(getattr(self, '_tick_num', 0))
             _phase = getattr(self, '_head_phase', None)
             if _phase is None:
@@ -366,6 +371,10 @@ class FSDStack:
             if _last is None:
                 _last = {}
                 self._last_heads = _last
+            _head_stamps = getattr(self, "_head_timestamps", None)
+            if _head_stamps is None:
+                _head_stamps = {}
+                self._head_timestamps = _head_stamps
             for _name, _head in self.hydra._heads.items():
                 if _name == "topology":
                     # The topology head needs the PAIRED sensor lane,
@@ -386,6 +395,9 @@ class FSDStack:
                 if not _due:
                     if _last.get(_name) is not None:
                         heads[_name] = _last[_name]
+                        _stamp = _head_stamps.get(
+                            _name, _tick_cost0)
+                        head_ages[_name] = max(0.0, time.time() - _stamp)
                     continue
                 # Tick time-budget governor (smoothness): when a heavy
                 # head is due but this tick has already consumed its time
@@ -398,6 +410,9 @@ class FSDStack:
                         and (time.time() - _tick_cost0) > _budget):
                     if _last.get(_name) is not None:
                         heads[_name] = _last[_name]
+                        _stamp = _head_stamps.get(
+                            _name, _tick_cost0)
+                        head_ages[_name] = max(0.0, time.time() - _stamp)
                     _retry.add(_name)
                     _budget_skips.append(_name)
                     continue
@@ -405,11 +420,24 @@ class FSDStack:
                     out_head = _head.run(ctx)
                     heads[_name] = out_head
                     _last[_name] = out_head
+                    _head_stamps[_name] = time.time()
+                    head_ages[_name] = 0.0
                     _retry.discard(_name)
                 except Exception as _exc:
                     self.hydra.errors[_name] = str(_exc)
             self._tick_num = _tick_num + 1
+            # Every registered head gets an explicit age.  A missing output
+            # is not silently "fresh": without a previous result it is
+            # represented as +inf and SafetyMonitor can fail closed.
+            for _name in self.hydra._heads:
+                if _name not in head_ages:
+                    _stamp = _head_stamps.get(_name)
+                    head_ages[_name] = (max(0.0, time.time() - _stamp)
+                                        if _stamp is not None else float("inf"))
             out.head_outputs = heads
+            out.meta["head_age_s"] = {
+                k: round(float(v), 3) if np.isfinite(v) else None
+                for k, v in head_ages.items()}
             out.meta["object_head"] = int("object" in self.hydra._heads)
             _times['ring'] = round((time.time() - _tw) * 1000.0, 1)
             _tw = time.time()
@@ -501,12 +529,14 @@ class FSDStack:
             # fused feature map (later the learning input) instead of only
             # the transient occupancy grid.
             try:
-                fmap = getattr(self, "fmap", None)
-                if fmap is None:
-                    fmap = BEVFeatureMap(
-                        n=int(getattr(self, "grid_n", 60)),
-                        res=float(getattr(self, "grid_res", 0.5)))
-                    self.fmap = fmap
+                # The feature map is a per-tick ego snapshot, not a
+                # persistent world map: semantic points and detections are
+                # already in the CURRENT ego frame, so reusing the old
+                # raster would leave ghosts behind as the car moves.
+                fmap = BEVFeatureMap(
+                    n=int(getattr(self, "grid_n", 60)),
+                    res=float(getattr(self, "grid_res", 0.5)))
+                self.fmap = fmap
                 _gnd = float(pos[2]) if len(pos) > 2 else 0.0
                 _role0 = "front_main" if "front_main" in snap \
                     else (next(iter(snap)) if snap else None)
@@ -553,9 +583,15 @@ class FSDStack:
                         (float(_o.x), float(_o.y), 0.0)
                         for _o in (getattr(obj, "obstacles", None) or []))
                 if _obs_pts:
-                    fmap.accumulate(CameraFeature(
-                        "sensor_fusion", "obstacle",
+                    # obstacle detections are WORLD coordinates; fmap points
+                    # are EGO coordinates.  Transform once before stamping
+                    # so nonzero origin/heading cannot move a wall to a
+                    # fictitious cell (canonical BEV contract).
+                    _ego_obs = world_points_to_ego(
                         np.asarray(_obs_pts, dtype=float).reshape(-1, 3),
+                        pos, heading)
+                    fmap.accumulate(CameraFeature(
+                        "sensor_fusion", "obstacle", _ego_obs,
                         confidence=0.85))
                 out.feature_map = fmap
             except Exception as exc:
@@ -564,6 +600,10 @@ class FSDStack:
         if _cc:
             out.meta["cls_counts"] = dict(_cc)
             out.meta["cls_nearest"] = dict(getattr(self, "_cls_nearest", {}))
+        _range_stamp = float(getattr(self, "_last_range_t", 0.0) or 0.0)
+        if _range_stamp > 0.0:
+            out.meta["range_age_s"] = round(
+                max(0.0, time.time() - _range_stamp), 3)
         _times['range'] = round((time.time() - _tw) * 1000.0, 1)
         _tw = time.time()
         if _budget_skips:
@@ -630,6 +670,14 @@ class FSDStack:
                         fuse_obstacles_to_grid(grid, _boxes)
             except Exception as exc:
                 out.errors["tracker"] = str(exc)
+
+        # Tracker fusion above mutates the canonical planner grid.  Publish
+        # the SAME post-tracker raster to safety/E2E/recorder; otherwise
+        # those consumers see the pre-tracker occupancy and a tracked
+        # moving object vanishes at the safety boundary.
+        out.bev = grid.as_raster()
+        out.drivable = grid.drivable
+        out.observed = getattr(grid, "observed", None)
 
         # --- 3) layered planner -----------------------------------------
         # ``has_nav_route``: only a caller-supplied map/nav route carries
@@ -1016,6 +1064,7 @@ class FSDStack:
                       route=plan_route, lane_ref=scene_lane_ref,
                       lane_left=lane_left, lane_right=lane_right,
                       lane_width=lane_width,
+                      lane_envelope=self.lane_envelope,
                       target_speed=_target, intent=intent)
         # Town corners need a tighter arc fan than a highway fan: a
         # 5-8 m radius bend is 0.12-0.2 rad/m, and the old 0.10 rad/m
@@ -1115,6 +1164,8 @@ class FSDStack:
                 role="front_main")
             try:
                 topo_out = topology.run(ctx, sensor_lane=lane_frame)
+                getattr(self, "_head_timestamps", {})["topology"] = time.time()
+                out.meta.setdefault("head_age_s", {})["topology"] = 0.0
                 out.head_outputs["topology"] = topo_out
             except Exception as exc:
                 _warn_once("topology", f"topology head failed: {exc}")
@@ -1122,6 +1173,23 @@ class FSDStack:
         _times['plan'] = round((time.time() - _tw) * 1000.0, 1)
         _times['total'] = round(sum(_times.values()), 1)
         out.meta['tick_ms'] = _times
+        out.meta.setdefault("bev_age_s", 0.0 if out.bev is not None else None)
+        out.meta.setdefault("range_age_s", None)
+        out.snapshot = PerceptionSnapshot(
+            captured_at=float(_tick_cost0),
+            tick_id=int(getattr(self, "_tick_num", 0)),
+            pos=pos.copy(), heading=heading,
+            frame=out.frame, cam=out.cam,
+            head_outputs=dict(out.head_outputs),
+            head_age_s=dict(out.meta.get("head_age_s", {})),
+            errors=dict(out.errors), ray_hits=list(out.ray_hits),
+            tracks=list(out.tracks), bev=out.bev,
+            drivable=out.drivable, observed=out.observed,
+            feature_map=out.feature_map,
+            lane_envelope=getattr(out, "lane_envelope", None),
+            range_age_s=out.meta.get("range_age_s"),
+            bev_age_s=out.meta.get("bev_age_s"))
+        out.meta["snapshot"] = out.snapshot.meta()
         return out
 
 

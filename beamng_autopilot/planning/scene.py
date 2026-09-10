@@ -31,6 +31,8 @@ class Scene:
     lane_left: np.ndarray | None = None
     lane_right: np.ndarray | None = None
     lane_width: float = 0.0
+    lane_envelope: object = None       # SensorLaneEnvelope | None
+    perception_snapshot: object = None # PerceptionSnapshot | None
     road_rule: object = None
     target_speed: float = 12.0
     # RoutingIntent of the nav route ahead (straight / left / right /

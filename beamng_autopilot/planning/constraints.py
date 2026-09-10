@@ -482,6 +482,11 @@ def body_pose_crosses_lane(scene: Scene, pos, heading: float,
     left = getattr(scene, "lane_left", None)
     right = getattr(scene, "lane_right", None)
     if left is None and right is None:
+        envelope = getattr(scene, "lane_envelope", None)
+        if envelope is not None:
+            left = getattr(envelope, "left", None)
+            right = getattr(envelope, "right", None)
+    if left is None and right is None:
         return False
     p = np.asarray(pos, dtype=float).ravel()
     if p.size < 2 or not np.isfinite(p[:2]).all():
@@ -523,6 +528,11 @@ def body_lane_cross_dist_m(scene: Scene, path,
     """
     left = getattr(scene, "lane_left", None)
     right = getattr(scene, "lane_right", None)
+    if left is None and right is None:
+        envelope = getattr(scene, "lane_envelope", None)
+        if envelope is not None:
+            left = getattr(envelope, "left", None)
+            right = getattr(envelope, "right", None)
     if (left is None and right is None) or path is None:
         return 0.0
     pth = np.asarray(path, dtype=float)[:, :2]
@@ -591,6 +601,11 @@ def lane_cross_dist_m(scene: Scene, path, max_cross_m: float = 0.35) -> float:
     """
     left = getattr(scene, "lane_left", None)
     right = getattr(scene, "lane_right", None)
+    if left is None and right is None:
+        envelope = getattr(scene, "lane_envelope", None)
+        if envelope is not None:
+            left = getattr(envelope, "left", None)
+            right = getattr(envelope, "right", None)
     if left is None and right is None:
         return 0.0
     # Speed-aware violation tolerance: the 0.35 m slack absorbs boundary
