@@ -51,6 +51,7 @@ from beamng_autopilot.temporal import WorldObjectTracker
 from beamng_autopilot.planner import CAR_HALF_WIDTH, forward_clearance_m, path_forward_clearance_m
 from beamng_autopilot.lane import (
     LANE_WIDTH_DEFAULT_M,
+    SensorLaneEnvelope,
     build_lidar_corridor,
     pair_lane_markings,
     choose_sensor_lane,
@@ -179,6 +180,7 @@ class FSDTick:
         self.lane_ref: np.ndarray | None = None  # sensor lane centreline
         self.lane_left: np.ndarray | None = None  # paired lane boundary (world)
         self.lane_right: np.ndarray | None = None  # paired lane boundary (world)
+        self.lane_envelope: SensorLaneEnvelope | None = None
         self.lane_width: float = 0.0
         self.best_speed: float = 0.0            # planned speed at the start
         self.min_speed: float = 0.0             # lowest speed on the path
@@ -214,6 +216,7 @@ class FSDStack:
         self.grid_n = int(grid_n)
         self.grid_res = float(grid_res)
         self.heads = list(heads) if heads else []
+        self.lane_envelope: SensorLaneEnvelope | None = None
 
         ring, self.mode = build_camera_ring_provider(
             conn, mode, cam_w, cam_h, roles=ring_roles)
@@ -646,6 +649,11 @@ class FSDStack:
         # ride.  A real stack keeps to the centre of ITS OWN lane, which
         # is what pair_lane_markings / build_lidar_corridor deliver.
         lane_frame = self._sensor_lane(out, pos, heading)
+        self.lane_envelope = SensorLaneEnvelope.from_lane_frame(
+            lane_frame, captured_at=time.time()) if lane_frame is not None else None
+        out.lane_envelope = self.lane_envelope
+        if self.lane_envelope is not None:
+            out.meta["lane_envelope"] = self.lane_envelope.as_meta()
         sensor_paired = (lane_frame is not None
                          and getattr(lane_frame, "paired", False))
         lane_ref = None
@@ -1268,6 +1276,7 @@ class FSDStack:
             self.occ_filter.clear()
         self._tick_t0 = None
         self._lane_fusion_state.clear()
+        self.lane_envelope = None
         # world-object tracks and the fused feature map are location-bound
         # too: an object tracked at the old teleport can ghost into the
         # new scene as a false obstacle.

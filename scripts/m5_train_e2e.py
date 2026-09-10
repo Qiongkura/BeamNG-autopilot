@@ -77,6 +77,8 @@ def main() -> int:
     ap.add_argument("--min-speed", type=float, default=0.5,
                     help="drop near-static frames from training")
     ap.add_argument("--val-split", type=float, default=0.15)
+    ap.add_argument("--episode-val-split", action="store_true",
+                    help="split validation by whole episode instead of frames")
     ap.add_argument("--augment", action="store_true")
     ap.add_argument("--dedup", action="store_true",
                     help="skip near-duplicate consecutive frames "
@@ -152,9 +154,24 @@ def main() -> int:
         return 1
     n_val = max(1, int(round(n * args.val_split)))
     idx = np.arange(n)
-    rng = np.random.default_rng(args.seed)
-    rng.shuffle(idx)
-    val_idx, train_idx = idx[:n_val], idx[n_val:]
+    if args.episode_val_split:
+        # Keep every frame of an episode on one side.  With history>0,
+        # frame-random splitting leaks adjacent temporal context into val.
+        val_files_n = max(1, int(round(len(ds.files) * args.val_split)))
+        val_file_ids = set(range(max(0, len(ds.files) - val_files_n),
+                              len(ds.files)))
+        val_idx = np.asarray([j for j, (fi, _, _) in enumerate(ds.index)
+                              if fi in val_file_ids], dtype=np.int64)
+        train_idx = np.asarray([j for j in range(n)
+                                 if j not in set(val_idx.tolist())],
+                                dtype=np.int64)
+        if len(val_idx) == 0 or len(train_idx) == 0:
+            raise SystemExit("episode split produced empty train/val group")
+        print(f"[train-e2e] episode-held-out files={sorted(val_file_ids)}")
+    else:
+        rng = np.random.default_rng(args.seed)
+        idx = rng.permutation(idx)
+        val_idx, train_idx = idx[:n_val], idx[n_val:]
     print(f"[train-e2e] {len(files)} episodes, {n} frames "
           f"(train {len(train_idx)} / val {len(val_idx)}), device={device}")
 

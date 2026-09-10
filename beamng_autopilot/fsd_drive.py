@@ -868,9 +868,20 @@ def run(args) -> int:
             if wd_arm(conn):
                 print("[fsd-drive] input watchdog armed")
             else:
-                print("[fsd-drive] WARNING: input watchdog failed to arm")
+                print("[fsd-drive] WATCHDOG FAILED TO ARM; aborting")
+                conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                             parkingbrake=1.0, gear=fwd_gear)
+                conn.step(5)
+                return 2
         except Exception as _wd_e:
-            print(f"[fsd-drive] WARNING: input watchdog error: {_wd_e}")
+            print(f"[fsd-drive] WATCHDOG ARM ERROR; aborting: {_wd_e}")
+            try:
+                conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                             parkingbrake=1.0, gear=fwd_gear)
+                conn.step(5)
+            except Exception:
+                pass
+            return 2
         # Real-time control: DO NOT pause the sim.  With ticks now
         # ~0.4-0.6 s (after warm-up) the stale-control window is a few
         # metres at cruise and a fraction of a metre at bend speeds, so
@@ -982,6 +993,7 @@ def run(args) -> int:
               f"(lane_mode={args.lane_mode})")
 
         prev_steer = 0.0  # rate-limited steering state (rule-autopilot convention)
+        watchdog_lost = False
         map_mc_smooth = None   # EMA-smoothed map-prior lane centre
         end_plc_cache = None   # (own-lane centre xy, t_seen) last-good
                                # perception anchor for the end zone
@@ -1053,9 +1065,25 @@ def run(args) -> int:
                                   # typical warm tick is ~0.3-0.4 s)
         while time.time() < t_end:
             try:
-                wd_heartbeat(conn)
-            except Exception:
-                pass
+                if not wd_heartbeat(conn):
+                    watchdog_lost = True
+                    print("[fsd-drive] WATCHDOG HEARTBEAT LOST; "
+                          "braking and aborting", flush=True)
+                    conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                                 gear=fwd_gear, parkingbrake=1.0)
+                    conn.step(5)
+                    break
+            except Exception as exc:
+                watchdog_lost = True
+                print(f"[fsd-drive] WATCHDOG HEARTBEAT ERROR; "
+                      f"braking and aborting: {exc}", flush=True)
+                try:
+                    conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                                 gear=fwd_gear, parkingbrake=1.0)
+                    conn.step(5)
+                except Exception:
+                    pass
+                break
             _f0 = time.time()
             st = conn.get_state()
             pos = np.asarray(st.pos, dtype=float)
@@ -2626,4 +2654,4 @@ def run(args) -> int:
                 print(f"[fsd-drive] telemetry -> {args.out} ({len(hist)} frames)")
             except Exception as _e:
                 print(f"[fsd-drive] telemetry write failed: {_e}")
-    return 0
+    return 2 if watchdog_lost else 0

@@ -18,6 +18,7 @@ from .pairing import (  # noqa: F401
     LaneFrame,
     pair_lane_markings,
 )
+from .envelope import SensorLaneEnvelope
 from .lidar import build_lidar_corridor  # noqa: F401
 from .fusion import choose_sensor_lane  # noqa: F401
 from .perception_guard import (  # noqa: F401

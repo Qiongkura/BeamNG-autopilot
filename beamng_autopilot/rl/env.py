@@ -70,8 +70,12 @@ class DecisionSpeedEnv(gym.Env):
         self.stack = stack
         self.route_provider = route_provider
         self.sim_steps = max(1, int(sim_steps))
+        self.step_dt = (float(self.sim_steps)
+                         / max(1.0, float(getattr(conn, "sps", 60)))
+                         if mode == "sim" else DT)
         self.cruise_speed = float(cruise_speed)
-        self.episode_steps = int(episode_s / DT)
+        self.episode_steps = max(1, int(math.ceil(
+            float(episode_s) / self.step_dt)))
         self.observation_space = gym.spaces.Box(
             0.0, 1.0, shape=(DECISION_OBS_SIZE,), dtype=np.float32)
         self.action_space = gym.spaces.Discrete(len(ACTION_MULT))
@@ -206,6 +210,29 @@ class DecisionSpeedEnv(gym.Env):
             self._fwd_gear = gearbox.forward_gear_input(self.conn)
         self.conn.control(throttle=float(thr), brake=float(brk),
                           steering=float(steer), gear=self._fwd_gear)
+        # Keep the game-side watchdog alive during live RL stepping.  A
+        # slow perception tick must stop the episode rather than leave a
+        # stale actuator command running.
+        heartbeat = getattr(self.conn, "watchdog_heartbeat", None)
+        if heartbeat is None:
+            try:
+                from beamng_autopilot.watchdog import heartbeat as _heartbeat
+                heartbeat = _heartbeat
+            except Exception:
+                heartbeat = None
+        if heartbeat is not None:
+            try:
+                if heartbeat(self.conn) is False:
+                    self.conn.control(throttle=0.0, brake=1.0,
+                                      steering=0.0, gear=self._fwd_gear)
+                    self.conn.step(5)
+                    return -COLLISION_PENALTY, True, {
+                        "collided": False, "watchdog_lost": True,
+                        "speed": float(st.speed)}
+            except Exception:
+                return -COLLISION_PENALTY, True, {
+                    "collided": False, "watchdog_lost": True,
+                    "speed": float(st.speed)}
         self.conn.step(int(self.sim_steps))
         st2 = self.conn.get_state()
         self.v = max(0.0, float(st2.speed))
@@ -219,9 +246,10 @@ class DecisionSpeedEnv(gym.Env):
                 self.conn.step(5)
             except Exception:
                 pass
-        reward = self.v * DT - ACTION_COST
+        reward = self.v * self.step_dt - ACTION_COST
         if clear > 25.0:
-            reward -= SLOW_PENALTY * max(0.0, plan_target - self.v) * DT
+            reward -= SLOW_PENALTY * max(
+                0.0, plan_target - self.v) * self.step_dt
         if collided:
             reward -= COLLISION_PENALTY
         info = {"collided": collided, "speed": self.v,

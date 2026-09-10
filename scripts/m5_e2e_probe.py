@@ -56,7 +56,7 @@ def _load_trained(weights: str, device: str):
     return net_torch, ckpt, int(ckpt["img_h"]), int(ckpt["img_w"])
 
 
-def _prep_arr(i: int, rgb, label, bev, img_h: int, img_w: int,
+def _prep_arr(i: int, rgb, label, bev, fmap, img_h: int, img_w: int,
               bev_channels: int = 1):
     """Resize one recorded frame for the trained CNN.
 
@@ -80,7 +80,8 @@ def _prep_arr(i: int, rgb, label, bev, img_h: int, img_w: int,
             label_i.astype(np.float32))[None, None]
         t_label = F.interpolate(t_label, size=(img_h, img_w),
                                 mode="nearest")[0]
-    _b = np.asarray(bev[i], dtype=np.float32)
+    _b = np.asarray(fmap[i] if fmap is not None else bev[i],
+                    dtype=np.float32)
     if _b.ndim == 2:
         _b = _b[None]
     if _b.shape[0] != bev_channels:
@@ -90,7 +91,7 @@ def _prep_arr(i: int, rgb, label, bev, img_h: int, img_w: int,
     return t_rgb, t_label, t_bev
 
 
-def _predict(net_torch, net, rgb, label, bev, speed, i: int,
+def _predict(net_torch, net, rgb, label, bev, fmap, speed, i: int,
              device: str, img_h: int, img_w: int):
     """Run one frame; return (steer, throttle, traj_ego, valid_len)."""
     if net_torch is not None:
@@ -98,7 +99,7 @@ def _predict(net_torch, net, rgb, label, bev, speed, i: int,
         need = h + 1
         i0 = max(0, i - h)
         bch = int(getattr(net_torch, "bev_channels", 1))
-        frames = [_prep_arr(j, rgb, label, bev, img_h, img_w, bch)
+        frames = [_prep_arr(j, rgb, label, bev, fmap, img_h, img_w, bch)
                   for j in range(i0, i + 1)]
         pads = need - len(frames)  # missing at the episode start
         if pads:
@@ -172,6 +173,12 @@ def _evaluate_episode(ep: Path, net_torch, net, device: str,
         throttle = np.asarray(z["throttle"], dtype=np.float64)
         speed = np.asarray(z["speed"], dtype=np.float64)
         bev = np.asarray(z["bev"], dtype=np.float32)
+        # v3 recordings contain the exact multi-channel vector-space input
+        # used during training/live inference.  Legacy episodes have no
+        # fmap and deliberately fall back to occupancy only.
+        fmap = np.asarray(z["fmap"], dtype=np.float32) \
+            if "fmap" in z and np.asarray(z["fmap"]).ndim == 4 \
+            and np.asarray(z["fmap"]).shape[1] > 0 else None
         rgb = np.asarray(z["rgb"], dtype=np.uint8) if "rgb" in z else None
         label = np.asarray(z["label"], dtype=np.uint8) \
             if "label" in z else None
@@ -187,7 +194,7 @@ def _evaluate_episode(ep: Path, net_torch, net, device: str,
             if has_traj else None
         for i in range(n):
             ps, pt, traj_pred, _ = _predict(
-                net_torch, net, rgb, label, bev, speed, i,
+                net_torch, net, rgb, label, bev, fmap, speed, i,
                 device, img_h, img_w)
             gs = float(steer[i])
             gt = float(throttle[i])
@@ -426,13 +433,19 @@ def main() -> int:
         throttle = np.asarray(z["throttle"], dtype=np.float64)
         speed = np.asarray(z["speed"], dtype=np.float64)
         bev = np.asarray(z["bev"], dtype=np.float32)
+        # v3 recordings contain the exact multi-channel vector-space input
+        # used during training/live inference.  Legacy episodes have no
+        # fmap and deliberately fall back to occupancy only.
+        fmap = np.asarray(z["fmap"], dtype=np.float32) \
+            if "fmap" in z and np.asarray(z["fmap"]).ndim == 4 \
+            and np.asarray(z["fmap"]).shape[1] > 0 else None
         rgb = np.asarray(z["rgb"], dtype=np.uint8) if "rgb" in z else None
         label = np.asarray(z["label"], dtype=np.uint8) \
             if "label" in z else None
         print(f"[e2e] episode {Path(args.episode).name}: {n} frames")
         for i in range(n):
             ps, pt, traj_pred, traj_len = _predict(
-                net_torch, net, rgb, label, bev, speed, i,
+                net_torch, net, rgb, label, bev, fmap, speed, i,
                 device, img_h, img_w)
             gs = float(steer[i])
             gt = float(throttle[i])

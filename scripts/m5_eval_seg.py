@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import sys
 from pathlib import Path
 
@@ -48,6 +49,8 @@ def main() -> None:
                     help="保存可视化对比帧")
     ap.add_argument("--save-n", type=int, default=12,
                     help="最多保存多少帧（默认 12，均匀采样）")
+    ap.add_argument("--json", type=str, default=None,
+                    help="保存结构化评估报告 JSON")
     args = ap.parse_args()
 
     try:
@@ -86,23 +89,24 @@ def main() -> None:
     for idx, (run_name, f) in enumerate(files):
         d = np.load(f)
         colour, label = d["colour"], d["label"]
+        known = np.asarray(label) != 255
         road, line = seg.predict(colour)
         pred = np.zeros(label.shape, dtype=np.uint8)
         pred[line] = 2
         pred[road] = 1
-        correct = int((pred == label).sum())
+        correct = int(((pred == label) & known).sum())
         n_correct += correct
-        n_pix += int(label.size)
+        n_pix += int(known.sum())
         for c in range(N_CLASSES):
-            p = pred == c
-            t = label == c
+            p = (pred == c) & known
+            t = (label == c) & known
             total_inter[c] += int((p & t).sum())
             total_union[c] += int((p | t).sum())
         # 近场标线 IoU：只统计画面下半（贴近车头 10-15m 内的路面），
         # 远场细线/小目标对驾驶几乎无影响，分开报才能看出感知可不可用。
         y0 = label.shape[0] // 2
-        p_n = pred[y0:] == 2
-        t_n = label[y0:] == 2
+        p_n = (pred[y0:] == 2) & known[y0:]
+        t_n = (label[y0:] == 2) & known[y0:]
         near_inter += int((p_n & t_n).sum())
         near_union += int((p_n | t_n).sum())
         st = run_stat.setdefault(run_name, {
@@ -113,12 +117,12 @@ def main() -> None:
         })
         st["n"] += 1
         for c in range(N_CLASSES):
-            p = pred == c
-            t = label == c
+            p = (pred == c) & known
+            t = (label == c) & known
             st["inter"][c] += int((p & t).sum())
             st["union"][c] += int((p | t).sum())
-        st["correct"] += int((pred == label).sum())
-        st["pix"] += int(label.size)
+        st["correct"] += int(((pred == label) & known).sum())
+        st["pix"] += int(known.sum())
         st["near_inter"] += int((p_n & t_n).sum())
         st["near_union"] += int((p_n | t_n).sum())
         st["line_px"] += int((label == 2).sum())
@@ -164,6 +168,34 @@ def main() -> None:
               f"near={near:.4f} "
               f"mIoU={ri[rp].mean() if rp.any() else 0.0:.4f} "
               f"acc={st['correct'] / max(1, st['pix']):.4f}")
+    if args.json:
+        report_runs = {}
+        for name, st in run_stat.items():
+            ri = iou_from_accum(st["inter"], st["union"])
+            rp = st["union"] > 0
+            report_runs[name] = {
+                "frames": int(st["n"]),
+                "line_px_frac": st["line_px"] / max(1, st["pix"]),
+                "iou": [float(x) for x in ri],
+                "line_iou_near": (st["near_inter"] / st["near_union"]
+                                   if st["near_union"] else 0.0),
+                "miou": (float(ri[rp].mean()) if rp.any() else 0.0),
+                "pixel_accuracy": st["correct"] / max(1, st["pix"]),
+            }
+        Path(args.json).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.json).write_text(json.dumps({
+            "model": str(args.model),
+            "runs": [str(x) for x in args.runs],
+            "frames": int(n_frames),
+            "ignore_value": 255,
+            "iou": [float(x) for x in ious],
+            "line_iou_near": float(near_iou),
+            "miou": (float(ious[present_all].mean())
+                     if present_all.any() else 0.0),
+            "pixel_accuracy": n_correct / max(1, n_pix),
+            "per_run": report_runs,
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"  JSON 报告 -> {args.json}")
     if args.save:
         print(f"  可视化 -> {config.LOGS_DIR / 'm5_seg' / 'eval'}/eval_*.png")
     print("=" * 56)
