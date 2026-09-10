@@ -224,8 +224,12 @@ def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
     drop_hist: dict[str, int] = {}
     kind_hist: dict[str, int] = {}
     drop_stats: list[tuple] = []
+    gate_hist: dict[str, int] = {}
+    gate_stats: list[tuple] = []
     n_marks: list[int] = []
     lat_paired: list[float] = []
+    flags: list[int] = []
+    ts: list[float] = []
 
     for i in idxs:
         pos = np.array([float(xs[i]), float(ys[i]), 0.0])
@@ -242,6 +246,8 @@ def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
         if markings:
             frame = pair_lane_markings(markings, pos, heading, debug=dbg)
         paired = bool(frame is not None and getattr(frame, "paired", False))
+        flags.append(1 if paired else 0)
+        ts.append(float(t[i]))
 
         gt_px = _near_gt_line_px(
             labels[i] if labels is not None else None)
@@ -274,6 +280,13 @@ def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
                     labels[i] if labels is not None else None,
                     int(cam.cx))
             cause_hist[cause] = cause_hist.get(cause, 0) + 1
+            if cause == "one_side_filtered_by_candidate_gate":
+                # A marking WAS produced and the candidate gate dropped it:
+                # record which gate and how far the reject was from passing.
+                for k, v in (dbg.get("collect_drops") or {}).items():
+                    gate_hist[k] = gate_hist.get(k, 0) + int(v)
+                for row in (dbg.get("collect_stats") or []):
+                    gate_stats.append(row)
             if cause.endswith("mask_has_paint_marking_dropped"):
                 # Ask the extractor itself why the paint it can see did not
                 # become a marking.
@@ -335,6 +348,21 @@ def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
         res["extractor_drops"] = drop_hist
     if kind_hist:
         res["extractor_kinds"] = kind_hist
+    if gate_hist:
+        res["gate_drops"] = gate_hist
+    if gate_stats:
+        by_gate: dict[str, list] = {}
+        for key, span, align, side in gate_stats:
+            by_gate.setdefault(key, []).append((span, align, side))
+
+        def _p50(rows, i):
+            vals = [r[i] for r in rows if r[i] == r[i]]
+            return round(float(np.median(vals)), 2) if vals else None
+
+        res["gate_by_reason"] = {
+            k: {"n": len(v), "span_p50": _p50(v, 0),
+                "align_p50": _p50(v, 1), "side_p50": _p50(v, 2)}
+            for k, v in by_gate.items()}
     if drop_stats:
         arr = np.asarray([(w, h, a) for _s, _r, w, h, a in drop_stats],
                          dtype=float)
@@ -356,6 +384,32 @@ def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
             for k, v in by_reason.items()}
     if lat_paired:
         res["lat_paired_mean_m"] = round(float(np.mean(lat_paired)), 3)
+    # Dropout run lengths: a bounded temporal hold can only bridge SHORT
+    # gaps, so how long the unpaired stretches last decides whether the
+    # fix is temporal continuity or better per-frame detection.
+    runs: list[tuple[int, float]] = []
+    i = 0
+    while i < len(flags):
+        if flags[i] == 0:
+            j = i
+            while j < len(flags) and flags[j] == 0:
+                j += 1
+            dur = ts[min(j, len(ts) - 1)] - ts[i]
+            runs.append((j - i, round(float(dur), 2)))
+            i = j
+        else:
+            i += 1
+    if runs:
+        res["dropout_runs"] = len(runs)
+        res["dropout_frames"] = sum(r[0] for r in runs)
+        res["dropout_s_total"] = round(sum(r[1] for r in runs), 1)
+        for bound in (0.5, 1.0, 2.0, 5.0):
+            covered = sum(r[1] for r in runs if r[1] <= bound)
+            res[f"dropout_s_within_{bound}s"] = round(covered, 1)
+        res["dropout_longest_s"] = max(r[1] for r in runs)
+        res["dropout_run_len_hist"] = {
+            str(k): sum(1 for r in runs if r[0] == k)
+            for k in sorted({r[0] for r in runs})[:12]}
     return res
 
 
@@ -431,6 +485,24 @@ def main() -> int:
                 print(f"      {v:4d}  {k}")
         if r.get("extractor_kinds"):
             print(f"  extractor kept kinds : {r['extractor_kinds']}")
+        if r.get("gate_drops"):
+            print("  candidate gate dropped these markings:")
+            for k, v in sorted(r["gate_drops"].items(),
+                               key=lambda kv: -kv[1])[:8]:
+                extra = (r.get("gate_by_reason") or {}).get(k, {})
+                print(f"      {v:4d}  {k}  span_p50={extra.get('span_p50')} "
+                      f"align_p50={extra.get('align_p50')} "
+                      f"side_p50={extra.get('side_p50')}")
+        if r.get("dropout_runs"):
+            print(f"  dropout runs         : {r['dropout_runs']} "
+                  f"({r['dropout_frames']} frames, "
+                  f"{r['dropout_s_total']}s total, longest "
+                  f"{r['dropout_longest_s']}s)")
+            print(f"  dropout seconds <=0.5/1/2/5s: "
+                  f"{r.get('dropout_s_within_0.5s')}/"
+                  f"{r.get('dropout_s_within_1.0s')}/"
+                  f"{r.get('dropout_s_within_2.0s')}/"
+                  f"{r.get('dropout_s_within_5.0s')}")
         if r.get("drop_stats_n"):
             print(f"  dropped comps n={r['drop_stats_n']} "
                   f"(w,h) p50={r['drop_wh_p50']} p90={r['drop_wh_p90']}")

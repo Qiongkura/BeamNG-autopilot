@@ -150,18 +150,41 @@ class _LineCandidate:
 
 
 def _collect_candidates(markings, pos: np.ndarray, fwd: np.ndarray,
-                        min_span: float) -> list[_LineCandidate]:
-    """Project every aligned marking into the car frame."""
+                        min_span: float,
+                        debug: dict | None = None) -> list[_LineCandidate]:
+    """Project every aligned marking into the car frame.
+
+    ``debug`` (optional) records why a detected marking was NOT accepted as
+    a lane-boundary candidate, keyed ``"<kind>:<reason>"`` and paired with
+    the near-miss geometry in ``collect_stats``.  This is the second of the
+    two places a real marking can be lost (the first is the mask->marking
+    extractor), and it is where the 2026-09-07 town runs lose about 29% of
+    their unpaired frames.
+    """
     left = np.array([-fwd[1], fwd[0]])
     cands: list[_LineCandidate] = []
+    drops = debug.setdefault("collect_drops", {}) if debug is not None else None
+    stats = debug.setdefault("collect_stats", []) if debug is not None else None
+
+    def _drop(mk, reason: str, span: float = 0.0, align: float = 0.0,
+              side: float = 0.0) -> None:
+        if drops is None:
+            return
+        key = f"{getattr(mk, 'kind', '?')}:{reason}"
+        drops[key] = int(drops.get(key, 0)) + 1
+        if stats is not None and len(stats) < 4000:
+            stats.append((key, float(span), float(align), float(side)))
+
     for mk in markings:
         # A dark pavement patch / tree shadow comes back as ``unknown``.
         # It may be long and confident, but it is not a painted lane line
         # and must never pair with a real line into a fake lane.
         if mk.kind not in ("solid", "dashed", "thin"):
+            _drop(mk, "kind")
             continue
         world = np.asarray(mk.world, dtype=float)
         if world.ndim != 2 or world.shape[1] < 2 or len(world) < 2:
+            _drop(mk, "world")
             continue
         # The LOCAL direction beside the car is the honest alignment on
         # a bend: the far arc of a tight curve swings around the car
@@ -172,13 +195,17 @@ def _collect_candidates(markings, pos: np.ndarray, fwd: np.ndarray,
         axis, _ = _marking_axis(near_w if len(near_w) >= 2 else world)
         if float(axis @ fwd) < 0:
             axis = -axis
-        if abs(float(axis @ fwd)) < MARKING_ALIGNMENT_MIN:
+        align = abs(float(axis @ fwd))
+        if align < MARKING_ALIGNMENT_MIN:
+            _drop(mk, "align", align=align)
             continue
         proj = _boundary_projection(world, pos, fwd, left)
         if len(proj) < 2:
+            _drop(mk, "proj")
             continue
         span = float(proj[-1, 0] - proj[0, 0])
         if span < _boundary_min_span(mk, min_span):
+            _drop(mk, "span", span=span, align=align)
             continue
         med_lat = float(np.median(proj[:, 1]))
         # On a bend the WHOLE-line median swings metres outward as the
@@ -190,6 +217,7 @@ def _collect_candidates(markings, pos: np.ndarray, fwd: np.ndarray,
         side_lat = (float(np.median(near_pts[:, 1]))
                     if len(near_pts) >= 2 else med_lat)
         if abs(side_lat) > LANE_EDGE_MAX_M:
+            _drop(mk, "side", span=span, align=align, side=side_lat)
             continue
         cands.append(_LineCandidate(
             proj=proj, span=span, conf=float(mk.confidence),
@@ -769,7 +797,7 @@ def pair_lane_markings(
         return None
     pos = np.asarray(pos, dtype=float)[:2]
     fwd = _unit_fwd(pos, heading, fwd)
-    cands = _collect_candidates(markings, pos, fwd, min_span)
+    cands = _collect_candidates(markings, pos, fwd, min_span, debug=debug)
     if not cands:
         if debug is not None:
             debug["mode"] = "none"
