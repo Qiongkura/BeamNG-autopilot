@@ -419,6 +419,21 @@ def _perception_off_road_m(out, pos, heading) -> float:
 PERCEPTION_DIR_SRCS = ("painted", "sensor_lane")
 
 
+def _in_end_pull_zone(rem_end, start_m: float = END_PULL_START_M) -> bool:
+    """True while the end-zone ease/hold ladder owns the longitudinal target.
+
+    Inside this zone the learned decision policy is skipped so its
+    "slow"/"ease" action cannot fight the deterministic end-stop and
+    alignment creep (see the DQN layer in the drive loop).
+    """
+    if rem_end is None:
+        return False
+    try:
+        return float(rem_end) < float(start_m)
+    except (TypeError, ValueError):
+        return False
+
+
 def _endzone_align_yaw_dev(heading, dir3, dir_src):
     """Yaw deviation to straighten the parking pose to, or None.
 
@@ -2167,9 +2182,17 @@ class FSDriveSession:
                 # It can only SLOW the plan - steering and every safety layer
                 # stay authoritative - so a bad policy costs comfort, never
                 # safety.
+                #
+                # The end-pull zone is exempt: inside END_PULL_START_M the
+                # end-zone ease/hold/alignment-creep ladder below owns the
+                # longitudinal target, and a learned "slow"/"ease" action
+                # there only fights the deterministic stop (the creep branch
+                # already runs slow by construction).  Skipping the policy
+                # keeps the final approach repeatable.
                 dqn_action = None
                 dqn_ms = None
-                if dqn_rt is not None:
+                _end_zone = _in_end_pull_zone(rem_end)
+                if dqn_rt is not None and not _end_zone:
                     try:
                         dqn_action, dqn_ms = dqn_rt.predict(
                             speed=v,

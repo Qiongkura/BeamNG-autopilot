@@ -350,3 +350,23 @@ def test_snap_heading_falls_back_without_bearing() -> None:
     # a degenerate route with no measurable forward extent keeps h_seg
     route = np.array([[0.0, 0.0], [0.5, 0.0]])
     assert fsd_drive._snap_heading(route, 0.0, 0.0, 1.23) == 1.23
+
+
+# --- _in_end_pull_zone --------------------------------------------------
+def test_in_end_pull_zone_only_inside_the_zone() -> None:
+    start = fsd_drive.END_PULL_START_M
+    assert fsd_drive._in_end_pull_zone(start - 0.1)
+    assert fsd_drive._in_end_pull_zone(0.0)
+    assert not fsd_drive._in_end_pull_zone(start)
+    assert not fsd_drive._in_end_pull_zone(start + 5.0)
+
+
+def test_in_end_pull_zone_handles_missing_and_bad_values() -> None:
+    assert fsd_drive._in_end_pull_zone(None) is False
+    assert fsd_drive._in_end_pull_zone(float("nan")) is False
+    assert fsd_drive._in_end_pull_zone("bad") is False
+
+
+def test_in_end_pull_zone_respects_custom_start() -> None:
+    assert fsd_drive._in_end_pull_zone(7.0, start_m=8.0)
+    assert not fsd_drive._in_end_pull_zone(9.0, start_m=8.0)
