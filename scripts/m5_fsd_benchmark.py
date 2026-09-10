@@ -162,6 +162,7 @@ def _print_row(name: str, r: dict) -> None:
     failed = [k for k, ok in r["checks"].items() if not ok]
     print(f"  {name:10s} {'PASS' if r['pass'] else 'FAIL':4s} "
           f"frames={a.get('frames', 0):4d} "
+          f"lane={a.get('lane_sensor_rate', 0.0):4.0%} "
           f"rev={a.get('reversing_frames', 0):3d} "
           f"crossC={a.get('cross_centre_frames', 0):3d} "
           f"crossR={a.get('cross_right_frames', 0):3d} "

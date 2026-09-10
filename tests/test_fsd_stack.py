@@ -14,6 +14,7 @@ from beamng_autopilot.fsd_stack import (
     compensate_range_motion,
     semantic_to_meta,
 )
+from beamng_autopilot.lane import bev_drivable_center
 
 
 class _StubRange:
@@ -138,7 +139,7 @@ def test_semantic_to_meta_flattens() -> None:
 
 
 def test_bev_drivable_center_returns_ahead_centerline() -> None:
-    st = _stack()
+    """The BEV free-space centreline now lives in ``lane.reference``."""
     from beamng_autopilot.occupancy import OccupancyGrid
     import numpy as np
 
@@ -152,7 +153,7 @@ def test_bev_drivable_center_returns_ahead_centerline() -> None:
         if r < 40:
             drv[r, 25:36] = 1
     grid.drivable = drv.astype(np.float32)
-    lane = st._bev_drivable_center(grid, np.array([0.0, 0.0]), 0.0)
+    lane = bev_drivable_center(grid, np.array([0.0, 0.0]), 0.0)
     assert lane is not None and len(lane) >= 3
     # the centreline includes points ahead of the ego within the corridor
     ahead = lane[lane[:, 0] > 2.0]
@@ -162,14 +163,13 @@ def test_bev_drivable_center_returns_ahead_centerline() -> None:
 
 
 def test_bev_drivable_center_empty_returns_none() -> None:
-    st = _stack()
     from beamng_autopilot.occupancy import OccupancyGrid
     import numpy as np
 
     grid = OccupancyGrid(30, 30, 0.5)
     grid.origin = (0.0, 0.0)
     grid.heading = 0.0
-    assert st._bev_drivable_center(grid, np.array([0.0, 0.0]), 0.0) is None
+    assert bev_drivable_center(grid, np.array([0.0, 0.0]), 0.0) is None
 
 def test_fsd_tick_lane_ref_anchored_near_ego() -> None:
     """The drivable-centreline lane reference must be anchored at the ego

@@ -13,6 +13,8 @@ from __future__ import annotations
 import math
 from typing import Iterable
 
+from beamng_autopilot.fsd_realism import SRC_SENSOR
+
 
 # --- thresholds -------------------------------------------------------
 # lat_left is the signed lateral distance to the LEFT (centre) boundary:
@@ -99,6 +101,33 @@ def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
         lvl[lv] = lvl.get(lv, 0) + 1
     out["source"] = src
     out["level"] = lvl
+
+    # perception-lane continuity: the leading indicator behind every
+    # discipline metric below.  A strict run gets a lane reference only
+    # while perception supplies one (``lane_sel``); once the pairing
+    # drops the stack fails closed and creeps, so the fraction of frames
+    # with a perception lane predicts stalls and progress long before
+    # they show up as speed (town 2026-09-07: lane_sel=sensor in 24 of
+    # 217 frames, median speed 0.57 m/s).  ``lane_paired`` is the
+    # stricter subset where BOTH lane sides were real detections.
+    lane_hist: dict = {}
+    lane_sensor = 0
+    lane_paired = 0
+    for i in settled:
+        sel = _f(hist, "lane_sel", i)
+        if sel in (None, ""):
+            sel = _f(hist, "lane_src", i)
+        sel = str(sel) if sel not in (None, "") else "?"
+        lane_hist[sel] = lane_hist.get(sel, 0) + 1
+        if sel == SRC_SENSOR:
+            lane_sensor += 1
+        if int(bool(_f(hist, "lane_paired", i, 0))):
+            lane_paired += 1
+    out["lane_src_hist"] = lane_hist
+    out["lane_sensor_frames"] = lane_sensor
+    out["lane_sensor_rate"] = round(lane_sensor / ns, 3) if ns else 0.0
+    out["lane_paired_frames"] = lane_paired
+    out["lane_paired_rate"] = round(lane_paired / ns, 3) if ns else 0.0
     out["reversing_frames"] = int(sum(
         int(bool(_f(hist, "reversing", i, 0))) for i in settled))
     out["stuck_frames"] = int(sum(
