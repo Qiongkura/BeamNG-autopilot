@@ -654,6 +654,20 @@ def _sensor_snapshot_age(out) -> float:
     """Max age of the data used by one FSD tick."""
     if out is None:
         return float("inf")
+    snapshot = getattr(out, "snapshot", None)
+    if snapshot is not None:
+        # The canonical perception snapshot is the freshness contract.
+        # Legacy tick fields remain only for stubs that predate it.
+        if not bool(getattr(snapshot, "valid", False)):
+            return float("inf")
+        try:
+            age = snapshot.freshness().get("max_s")
+        except (TypeError, ValueError):
+            return float("inf")
+        if age is None:
+            return float("inf")
+        age = float(age)
+        return age if math.isfinite(age) else float("inf")
     ages = list((getattr(out, "meta", {}) or {}).get(
         "head_age_s", {}).values())
     meta = getattr(out, "meta", {}) or {}

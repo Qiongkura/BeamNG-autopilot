@@ -58,7 +58,12 @@ class PerceptionSnapshot:
                 return float("inf")
             ages.append(float(self.bev_age_s))
         if self.lane_envelope is not None:
-            ages.append(float(self.lane_envelope.age_s))
+            lane_age = getattr(self.lane_envelope, "age_s", None)
+            if lane_age is None:
+                return float("inf")
+            if not np.isfinite(float(lane_age)):
+                return float("inf")
+            ages.append(float(lane_age))
         return max(ages, default=0.0)
 
     def freshness(self) -> dict[str, float | None]:

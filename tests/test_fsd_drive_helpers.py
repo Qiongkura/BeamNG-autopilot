@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from beamng_autopilot import fsd_drive
+from beamng_autopilot.perception_snapshot import PerceptionSnapshot
 
 
 def test_fs_drive_session_keeps_args_and_compat_wrapper():
@@ -247,6 +248,29 @@ def test_snapshot_age_uses_oldest_head_and_range():
 
 def test_snapshot_age_no_sensor_is_infinite():
     out = SimpleNamespace(frame=None, head_outputs={}, meta={})
+    assert math.isinf(fsd_drive._sensor_snapshot_age(out))
+
+
+def test_snapshot_age_prefers_canonical_snapshot():
+    snapshot = PerceptionSnapshot(
+        captured_at=0.0, tick_id=4,
+        pos=np.array([0.0, 0.0, 0.0]), heading=0.0,
+        bev=np.zeros((4, 4)), head_age_s={"semantic": 1.3},
+        range_age_s=0.2, bev_age_s=0.1)
+    out = SimpleNamespace(
+        frame=np.zeros((4, 4, 3), dtype=np.uint8),
+        head_outputs={"semantic": object()},
+        snapshot=snapshot,
+        meta={"head_age_s": {"semantic": 0.0},
+              "range_age_s": 0.0, "bev_age_s": 0.0})
+    assert fsd_drive._sensor_snapshot_age(out) == pytest.approx(1.3)
+
+
+def test_snapshot_age_invalid_canonical_snapshot_is_infinite():
+    snapshot = PerceptionSnapshot(
+        captured_at=0.0, tick_id=5,
+        pos=np.array([0.0, 0.0, 0.0]), heading=0.0)
+    out = SimpleNamespace(snapshot=snapshot, meta={})
     assert math.isinf(fsd_drive._sensor_snapshot_age(out))
 
 

@@ -32,3 +32,12 @@ def test_snapshot_without_sensor_is_invalid() -> None:
         captured_at=time.time(), tick_id=0,
         pos=np.array([0.0, 0.0]), heading=0.0)
     assert not s.valid
+
+
+def test_snapshot_missing_lane_age_is_stale() -> None:
+    envelope = type("Envelope", (), {"age_s": None})()
+    s = PerceptionSnapshot(
+        captured_at=time.time(), tick_id=1,
+        pos=np.array([0.0, 0.0]), heading=0.0,
+        bev=np.zeros((4, 4)), lane_envelope=envelope)
+    assert s.max_sensor_age_s == float("inf")
