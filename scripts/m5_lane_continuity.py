@@ -87,6 +87,38 @@ def _near_gt_line_px(label: np.ndarray) -> int:
     return int((near == LABEL_LINE).sum())
 
 
+# Distance bands for the GT audit, as fractions of image height measured
+# from the top: the lane paint lives in the lower half and the far/mid/near
+# split is what tells "cannot see far" apart from "cannot see at all".
+GT_BANDS = (("far", 0.45, 0.62), ("mid", 0.62, 0.78), ("near", 0.78, 1.0))
+
+
+def _audit_frame(mask, label, cx: int, acc: dict) -> None:
+    """Add one frame's per-side, per-band GT paint vs model-mask counts.
+
+    ``acc`` is keyed ``"<L|R>:<band>"`` -> ``[gt_px, pred_px, hit_px]``.
+    A low recall means the model cannot see paint that is provably there
+    (a capability gap); ``gt_px == 0`` means there was nothing to see
+    (a scene / data-coverage fact, not a model failure).
+    """
+    if mask is None or label is None:
+        return
+    m = np.asarray(mask, dtype=bool)
+    g = np.asarray(label) == LABEL_LINE
+    if m.shape != g.shape:
+        return
+    h, w = m.shape
+    for name, lo, hi in GT_BANDS:
+        r0, r1 = int(h * lo), int(h * hi)
+        for side, c0, c1 in (("L", 0, cx), ("R", cx, w)):
+            gm = g[r0:r1, c0:c1]
+            pm = m[r0:r1, c0:c1]
+            slot = acc.setdefault(f"{side}:{name}", [0, 0, 0])
+            slot[0] += int(gm.sum())
+            slot[1] += int(pm.sum())
+            slot[2] += int(np.logical_and(gm, pm).sum())
+
+
 def _marking_sides(markings, pos, heading: float) -> list[float]:
     """Near-field lateral offset of every detected marking (left = +).
 
@@ -187,7 +219,8 @@ def _single_cause(markings, pos, heading: float, dbg: dict) -> str:
 
 
 def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
-                    verbose: bool, diagnose: bool = False) -> dict:
+                    verbose: bool, diagnose: bool = False,
+                    gt_audit: bool = False) -> dict:
     d = np.load(ep, allow_pickle=True)
     meta = json.loads(bytes(d["meta"]).decode("utf-8")) if "meta" in d.files \
         else {}
@@ -226,6 +259,7 @@ def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
     drop_stats: list[tuple] = []
     gate_hist: dict[str, int] = {}
     gate_stats: list[tuple] = []
+    gt_acc: dict[str, list[int]] = {}
     n_marks: list[int] = []
     lat_paired: list[float] = []
     flags: list[int] = []
@@ -248,6 +282,10 @@ def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
         paired = bool(frame is not None and getattr(frame, "paired", False))
         flags.append(1 if paired else 0)
         ts.append(float(t[i]))
+        if gt_audit:
+            _audit_frame(out.masks.get("line"),
+                         labels[i] if labels is not None else None,
+                         int(cam.cx), gt_acc)
 
         gt_px = _near_gt_line_px(
             labels[i] if labels is not None else None)
@@ -384,6 +422,11 @@ def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
             for k, v in by_reason.items()}
     if lat_paired:
         res["lat_paired_mean_m"] = round(float(np.mean(lat_paired)), 3)
+    if gt_acc:
+        res["gt_audit"] = {
+            k: {"gt_px": v[0], "model_px": v[1], "hit_px": v[2],
+                "recall": round(v[2] / v[0], 3) if v[0] else None}
+            for k, v in gt_acc.items()}
     # Dropout run lengths: a bounded temporal hold can only bridge SHORT
     # gaps, so how long the unpaired stretches last decides whether the
     # fix is temporal continuity or better per-frame detection.
@@ -430,6 +473,8 @@ def main() -> int:
                     help="write the report JSON here")
     ap.add_argument("--diagnose", action="store_true",
                     help="classify WHY each unpaired frame missed its pair")
+    ap.add_argument("--gt-audit", action="store_true",
+                    help="per side/band GT paint vs model line mask")
     args = ap.parse_args()
 
     data_dir = Path(args.data) if args.data else config.LOGS_DIR / "m5_e2e"
@@ -454,7 +499,8 @@ def main() -> int:
     for ep in eps:
         r = measure_episode(ep, frames=frames, sem=sem,
                             verbose=os.environ.get("LANE_CONT_VERBOSE") == "1",
-                            diagnose=args.diagnose)
+                            diagnose=args.diagnose,
+                            gt_audit=args.gt_audit)
         reports.append(r)
         print(f"\n=== {r['episode']} (cam {r['cam'][0]}x{r['cam'][1]}) ===")
         print(f"  frames measured      : {r['frames']}")
@@ -503,6 +549,17 @@ def main() -> int:
                   f"{r.get('dropout_s_within_1.0s')}/"
                   f"{r.get('dropout_s_within_2.0s')}/"
                   f"{r.get('dropout_s_within_5.0s')}")
+        if r.get("gt_audit"):
+            print("  GT paint vs model line mask (recall = hit/GT px):")
+            print("      side/band     GT_px   model_px  hit_px   recall")
+            for k in ("L:far", "L:mid", "L:near", "R:far", "R:mid", "R:near"):
+                v = r["gt_audit"].get(k)
+                if not v:
+                    continue
+                rec = v["recall"]
+                print(f"      {k:10s} {v['gt_px']:8d} {v['model_px']:9d} "
+                      f"{v['hit_px']:7d}   "
+                      f"{'-' if rec is None else f'{rec:.1%}':>7}")
         if r.get("drop_stats_n"):
             print(f"  dropped comps n={r['drop_stats_n']} "
                   f"(w,h) p50={r['drop_wh_p50']} p90={r['drop_wh_p90']}")
