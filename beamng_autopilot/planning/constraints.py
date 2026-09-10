@@ -16,6 +16,14 @@ from dataclasses import dataclass
 import numpy as np
 
 from .geometry import polyline_point_distances
+from .lateral_ref import lateral_reference
+from ..vehicle_body import (
+    HALF_LENGTH_M,
+    HALF_WIDTH_M,
+    body_crosses_boundary_now,
+    boundary_lateral as _boundary_lateral,
+    first_boundary_crossing_m,
+)
 
 
 @dataclass
@@ -42,8 +50,6 @@ class Constraints:
     # obstacles (town runs 2026-08-21: the planner chose a path with 100%
     # of its samples in trees and the car crawled at 1 m/s through them).
     collision_fraction_stop: float = 0.9
-    # Paths that leave the nav route farther than this are rejected.
-    lane_dev_max_m: float = 4.0
     # Paths that leave the nav route farther than this are rejected.
     lane_dev_max_m: float = 4.0
     # --- drivable-surface gate -----------------------------------------
@@ -229,7 +235,7 @@ class Constraints:
             feasible = False
         cost += self.w_collision * col
         cost += self.w_curvature * cost_curvature(path)
-        if scene.route is not None and len(scene.route) >= 2:
+        if _has_lane_reference(scene):
             align = cost_lane_align(scene, path)
             if align > self.lane_dev_max_m:
                 feasible = False
@@ -409,67 +415,32 @@ def _path_known(scene: Scene, path, near_m: float = 10.0) -> list:
 
 
 
-def _boundary_lateral(wx, wy, ref, fwd):
-    """Signed lateral offset of a world point from a boundary polyline.
+def _scene_boundaries(scene: Scene):
+    """Detected lane boundaries of a scene (never a map fallback)."""
+    left = getattr(scene, "lane_left", None)
+    right = getattr(scene, "lane_right", None)
+    if left is None and right is None:
+        envelope = getattr(scene, "lane_envelope", None)
+        if envelope is not None:
+            left = getattr(envelope, "left", None)
+            right = getattr(envelope, "right", None)
+    return left, right
 
-    Returns ``(lat, covered)`` - ``covered`` is False when the nearest
-    polyline point is an endpoint (the boundary simply does not extend
-    to that location: a painted line ends at an intersection / a lane
-    change, so a path turning there must not be punished as a
-    crossing).  Positive lat = left of travel.
+
+def _has_lane_reference(scene: Scene) -> bool:
+    """Whether the scene carries any usable lateral lane reference.
+
+    Delegates to the single lateral-reference policy
+    (``planning.lateral_ref``): the nav route only counts in legacy
+    (non-strict) mode, so a strict scene with no perception lane has no
+    lateral reference at all.
     """
-    pts = np.asarray(ref[:, :2], dtype=float)
-    best = float("inf")
-    sign = 0.0
-    covered = False
-    best_k = None
-    best_t = 0.0
-    for k in range(len(pts) - 1):
-        ax, ay = pts[k]
-        bx, by = pts[k + 1]
-        abx, aby = bx - ax, by - ay
-        l2 = abx * abx + aby * aby
-        if l2 < 1e-12:
-            continue
-        t = float(((wx - ax) * abx + (wy - ay) * aby) / l2)
-        tc = min(1.0, max(0.0, t))
-        cx, cy = ax + tc * abx, ay + tc * aby
-        d = math.hypot(wx - cx, wy - cy)
-        # cross product of ref tangent and point offset
-        s = float((abx * (wy - ay) - aby * (wx - ax)) / math.sqrt(l2))
-        if d < best:
-            best = d
-            sign = s
-            covered = 0.02 < t < 0.98
-            best_k = k
-            best_t = t
-    if best_k is not None and not covered:
-        # The nearest point lies at an endpoint of the best segment.
-        # Only the FIRST/LAST vertex of the whole polyline is a true
-        # line end (paint stops at an intersection / lane change); an
-        # *interior* vertex is just a bend of the same boundary, and a
-        # crossing exactly at that bend must be caught too - otherwise
-        # a path that cuts the line at a corner is not punished
-        # (cross_right vertex repro 2026-08-22).
-        if best_t <= 0.02 and best_k > 0:
-            covered = True
-        elif best_t >= 0.98 and best_k < len(pts) - 2:
-            covered = True
-    # No fwd-based sign flip: the boundary polylines are stored in
-    # their own travel direction (map prior near->far, sensor lanes
-    # along the ego's forward at capture time).  A lane crossing is a
-    # WORLD constraint - never into the oncoming lane, never off the
-    # road edge - independent of which way the car happens to point at
-    # a bend (hairpin repro 2026-08-22: the flip inverted every
-    # in-lane candidate into a "crossing" at the apex, so the planner
-    # only had cross-lot arcs left and drove off the road).
-    return sign, covered
-
+    return lateral_reference(scene)[0] is not None
 
 
 def body_pose_crosses_lane(scene: Scene, pos, heading: float,
-                           half_len: float = 2.2,
-                           half_width: float = 0.9,
+                           half_len: float = HALF_LENGTH_M,
+                           half_width: float = HALF_WIDTH_M,
                            max_cross_m: float = 0.05) -> bool:
     """Whether the CURRENT full ego rectangle crosses a detected boundary.
 
@@ -479,43 +450,14 @@ def body_pose_crosses_lane(scene: Scene, pos, heading: float,
     immediate stop.  Only boundaries present in ``scene`` are consulted -
     no map fallback is invented here.
     """
-    left = getattr(scene, "lane_left", None)
-    right = getattr(scene, "lane_right", None)
-    if left is None and right is None:
-        envelope = getattr(scene, "lane_envelope", None)
-        if envelope is not None:
-            left = getattr(envelope, "left", None)
-            right = getattr(envelope, "right", None)
-    if left is None and right is None:
-        return False
-    p = np.asarray(pos, dtype=float).ravel()
-    if p.size < 2 or not np.isfinite(p[:2]).all():
-        return False
-    fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
-    lft = np.array([-fwd[1], fwd[0]])
-    centre = p[:2]
-    corners = (centre + half_len * fwd + half_width * lft,
-               centre + half_len * fwd - half_width * lft,
-               centre - half_len * fwd + half_width * lft,
-               centre - half_len * fwd - half_width * lft)
-    if left is not None:
-        for c in corners:
-            lat, covered = _boundary_lateral(
-                float(c[0]), float(c[1]), left, fwd)
-            if covered and lat > max_cross_m:
-                return True
-    if right is not None:
-        for c in corners:
-            lat, covered = _boundary_lateral(
-                float(c[0]), float(c[1]), right, fwd)
-            if covered and lat < -max_cross_m:
-                return True
-    return False
+    left, right = _scene_boundaries(scene)
+    return body_crosses_boundary_now(pos, float(heading), left, right,
+                                     half_len, half_width, max_cross_m)
 
 
 def body_lane_cross_dist_m(scene: Scene, path,
-                           half_len: float = 2.2,
-                           half_width: float = 0.9,
+                           half_len: float = HALF_LENGTH_M,
+                           half_width: float = HALF_WIDTH_M,
                            max_cross_m: float = 0.05) -> float:
     """First along-path distance where the FULL ego footprint crosses
     a detected lane boundary.
@@ -526,56 +468,12 @@ def body_lane_cross_dist_m(scene: Scene, path,
     local path tangent; every corner is tested against both world-space
     boundaries.  Returns 0 when no corner crosses or no boundaries exist.
     """
-    left = getattr(scene, "lane_left", None)
-    right = getattr(scene, "lane_right", None)
-    if left is None and right is None:
-        envelope = getattr(scene, "lane_envelope", None)
-        if envelope is not None:
-            left = getattr(envelope, "left", None)
-            right = getattr(envelope, "right", None)
-    if (left is None and right is None) or path is None:
+    left, right = _scene_boundaries(scene)
+    pos = getattr(scene, "pos", None)
+    if pos is None:
         return 0.0
-    pth = np.asarray(path, dtype=float)[:, :2]
-    if len(pth) < 2:
-        return 0.0
-    pos = np.asarray(scene.pos[:2], dtype=float)
-    cum = 0.0
-    for i, p in enumerate(pth):
-        d0 = float(np.linalg.norm(p - pos))
-        if d0 < 2.5 or d0 > 15.0:
-            if i < len(pth) - 1:
-                cum += float(np.linalg.norm(pth[i + 1] - p))
-            continue
-        if i == 0:
-            tv = pth[1] - pth[0]
-        elif i == len(pth) - 1:
-            tv = pth[-1] - pth[-2]
-        else:
-            tv = pth[i + 1] - pth[i - 1]
-        ln = float(np.linalg.norm(tv))
-        if ln < 1e-9:
-            continue
-        fwd = tv / ln
-        lft = np.array([-fwd[1], fwd[0]])
-        corners = (p + half_len * fwd + half_width * lft,
-                   p + half_len * fwd - half_width * lft,
-                   p - half_len * fwd + half_width * lft,
-                   p - half_len * fwd - half_width * lft)
-        if left is not None:
-            for corner in corners:
-                lat, covered = _boundary_lateral(
-                    float(corner[0]), float(corner[1]), left, fwd)
-                if covered and lat > max_cross_m:
-                    return max(cum, 0.1)
-        if right is not None:
-            for corner in corners:
-                lat, covered = _boundary_lateral(
-                    float(corner[0]), float(corner[1]), right, fwd)
-                if covered and lat < -max_cross_m:
-                    return max(cum, 0.1)
-        if i < len(pth) - 1:
-            cum += float(np.linalg.norm(pth[i + 1] - p))
-    return 0.0
+    return first_boundary_crossing_m(
+        pos, path, left, right, half_len, half_width, max_cross_m)
 
 
 def lane_cross_dist_m(scene: Scene, path, max_cross_m: float = 0.35) -> float:
@@ -788,19 +686,20 @@ def cost_curvature(path, jerk_w: float = 0.0) -> float:
 def cost_lane_align(scene: Scene, path) -> float:
     """Median lateral distance of the path's near segment from the lane reference.
 
-    Uses ``scene.lane_ref`` when available (the sensor lane centre), else
-    ``scene.route`` (the nav route / map road centre).  The sensor lane
-    centre is the correct centre of the ego lane (vision/LiDAR pairing),
-    not the road centreline - a real FSD never aligns to the centre line
-    of a two-way road.
+    The reference comes from the single lateral-reference policy
+    (``planning.lateral_ref``): the sensor lane centre (vision/LiDAR
+    pairing) - the correct centre of the ego lane, not the road
+    centreline - with the nav route only as the legacy non-strict
+    fallback.  In strict FSD realism the route is never a lateral
+    reference, so with no perception lane the cost is 0.0
+    ("unscoreable") and this term cannot pull the planner onto the map
+    centre line.
     """
-    route = getattr(scene, "lane_ref", None)
-    if route is None or len(route) < 2:
-        route = getattr(scene, "route", None)
-    if route is None or len(route) < 2:
+    ref, _src = lateral_reference(scene)
+    if ref is None or path is None:
         return 0.0
     path = np.asarray(path, dtype=float)[:, :2]
-    if len(route) < 2 or len(path) < 2:
+    if len(path) < 2:
         return 0.0
     pos = np.asarray(scene.pos[:2], dtype=float)
     # only evaluate the near part of the path (0..25 m ahead)
@@ -809,5 +708,5 @@ def cost_lane_align(scene: Scene, path) -> float:
     if len(near) < 2:
         near = path[: min(4, len(path))]
     # median distance to the nearest route segment (vectorised)
-    offs = polyline_point_distances(near, route)
+    offs = polyline_point_distances(near, ref)
     return float(np.median(offs)) if len(offs) else 0.0

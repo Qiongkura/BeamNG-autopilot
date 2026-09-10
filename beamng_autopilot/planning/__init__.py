@@ -36,6 +36,15 @@ from .constraints import (
     cost_curvature,
     cost_lane_align,
 )
+from .lateral_ref import (
+    REF_ENVELOPE,
+    REF_NONE,
+    REF_PERCEPTION,
+    REF_ROUTE,
+    REF_SENSOR,
+    lateral_reference,
+    perception_reference,
+)
 from .selector import select_trajectory
 from .arbiter import (
     ArbiterOutcome,
@@ -44,6 +53,7 @@ from .arbiter import (
     choose_plan_route,
 )
 from .speed_profile import speed_profile_for_path
+from .path_validation import PathValidation, validate_learned_path
 from .local_route import local_route, AHEAD_M, BACK_M, DUP_MIN_M
 from .intent import (
     RoutingIntent,
@@ -63,6 +73,13 @@ __all__ = [
     "body_lane_cross_dist_m",
     "body_pose_crosses_lane",
     "cost_lane_align",
+    "lateral_reference",
+    "perception_reference",
+    "REF_SENSOR",
+    "REF_ENVELOPE",
+    "REF_PERCEPTION",
+    "REF_ROUTE",
+    "REF_NONE",
     "local_route",
     "AHEAD_M",
     "BACK_M",
@@ -73,4 +90,6 @@ __all__ = [
     "arbitrate",
     "choose_plan_route",
     "speed_profile_for_path",
+    "PathValidation",
+    "validate_learned_path",
 ]

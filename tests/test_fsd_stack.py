@@ -532,3 +532,118 @@ def test_fsd_feature_map_rebuilds_per_tick() -> None:
         "heading": 0.0, "speed": 5.0})()
     out2 = st.tick()
     assert out2.feature_map is not first
+
+
+def test_tick_publishes_the_planning_scene() -> None:
+    """One world model per tick: the planner's Scene is published so the
+    safety layer evaluates the same occupancy and lane reference, and it
+    carries the tick's perception snapshot for the freshness contract."""
+    st = _stack()
+    out = st.tick()
+    assert out.scene is not None
+    assert out.scene.grid is not None
+    assert out.scene.perception_snapshot is out.snapshot
+    assert out.scene.meta is out.meta
+
+
+def test_strict_tick_marks_the_scene_strict_perception() -> None:
+    """FSD realism: the published Scene carries the strict-perception
+    flag, so the safety monitor fails closed instead of falling back to
+    the nav route when no sensor lane exists."""
+    st = _stack()
+    st.lane_mode = "sensor"
+    st.strict_sensor = True
+    out = st.tick()
+    assert out.scene is not None
+    assert out.scene.strict_perception is True
+
+
+def test_map_mode_scene_is_not_strict_perception() -> None:
+    """The legacy map-lane compatibility mode must stay non-strict."""
+    st = _stack()
+    st.lane_mode = "map"
+    st.strict_sensor = False
+    out = st.tick()
+    assert out.scene is not None
+    assert out.scene.strict_perception is False
+
+
+def test_strict_tick_never_seeds_lane_candidates_from_route(
+        monkeypatch) -> None:
+    """The strict candidate family must not use map geometry laterally.
+
+    The nav route is valid navigation intent, but when strict perception
+    has no sensor lane the planner is only allowed the ego-anchored arc
+    fan.  The lateral policy must therefore return ``none`` rather than
+    feeding the route into ``sample_lane_shift``.
+    """
+    import beamng_autopilot.fsd_stack as fs
+
+    st = _stack()
+    st.lane_mode = "sensor"
+    st.strict_sensor = True
+    route = np.column_stack([np.linspace(0.0, 40.0, 41),
+                             np.zeros(41)])
+    seen = []
+    original = fs.sample_lane_shift
+
+    def _spy(reference, *args, **kwargs):
+        seen.append(np.asarray(reference, dtype=float).copy())
+        return original(reference, *args, **kwargs)
+
+    monkeypatch.setattr(fs, "sample_lane_shift", _spy)
+    out = st.tick(route_ref=route)
+    assert out.scene is not None and out.scene.strict_perception
+    assert out.meta.get("lateral_candidate_src") in (
+        "sensor", "envelope", "none")
+    assert not any(np.allclose(ref, route) for ref in seen)
+
+
+def test_strict_tick_never_constructs_map_lane(monkeypatch) -> None:
+    """Strict FSD must not build map-lane geometry at all.
+
+    The route is navigation intent; constructing the map-prior own lane
+    keeps route geometry in the lateral decision chain even when a later
+    strict check discards it.
+    """
+    import importlib
+
+    lr = importlib.import_module(
+        "beamng_autopilot.planning.local_route")
+
+    calls = []
+
+    def _spy(*args, **kwargs):
+        calls.append((args, kwargs))
+        return None
+
+    st = _stack()
+    st.lane_mode = "sensor"
+    st.strict_sensor = True
+    route = np.column_stack([np.linspace(0.0, 40.0, 41),
+                             np.zeros(41)])
+    monkeypatch.setattr(lr, "map_lane_local", _spy)
+    out = st.tick(route_ref=route)
+    assert calls == []
+    assert out.scene is not None and out.scene.strict_perception
+
+
+def test_strict_tick_without_perception_lane_has_no_route_plan(
+        monkeypatch) -> None:
+    """A strict scene with no perception lane must fail closed.
+
+    The nav route remains available for intent and longitudinal planning,
+    but the planner Scene must not carry it as a driving trajectory.
+    """
+    st = _stack()
+    st.lane_mode = "sensor"
+    st.strict_sensor = True
+    monkeypatch.setattr(st, "_sensor_lane", lambda *args, **kwargs: None)
+    route = np.column_stack([np.linspace(0.0, 40.0, 41),
+                             np.zeros(41)])
+    out = st.tick(route_ref=route)
+    assert out.scene is not None
+    assert out.scene.strict_perception
+    assert out.scene.lane_ref is None
+    assert out.scene.route is None
+    assert out.meta.get("lateral_candidate_src") == "none"

@@ -122,6 +122,14 @@ ITALY_SPAWN_CROSSROADS_HEADING = math.atan2(0.430445611, 0.902616739)
 # 投影出的标线/边界在 5m 处偏约 0.5m、20m 处偏约 2m。
 EGO_ORIGIN_GROUND_GAP_M = 0.17
 
+# 车体矩形（etk800 实车尺寸，全车 4.36 x 1.79 m 取整）：车身包络
+# 安全判定（标线越线、可行驶边界、扫掠车体）的唯一权威尺寸。
+# 只描述「车本身有多大」，不含任何定位/偏移语义——横向定位只能来自
+# 感知。旧 planner 的 CAR_HALF_WIDTH=1.0 是带余量的通过宽度，不是车体
+# 尺寸，二者不要互相替换。
+EGO_HALF_LENGTH_M = 2.2
+EGO_HALF_WIDTH_M = 0.9
+
 
 def runtime_home(mode: str | None = None) -> Path:
     """Return the game install directory for the requested runtime."""

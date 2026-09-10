@@ -54,6 +54,24 @@ def test_sensor_lane_on_oncoming_side_rejected() -> None:
     np.testing.assert_allclose(out, route)
 
 
+def test_strict_perception_does_not_use_route_side_gate() -> None:
+    """Strict FSD treats the nav route as intent only.
+
+    The route must not veto a clear sensor lane by deciding which side of
+    the map centreline is "own lane"; the perception lane owns that
+    lateral decision in strict mode.
+    """
+    route = np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]])
+    lane = np.array([[0.0, 0.0], [5.0, 3.0], [10.0, 6.0]])
+    wall = [(x, 0.0) for x in np.linspace(3.0, 8.0, 12)]
+    wall += [(x, 0.5) for x in np.linspace(3.0, 8.0, 6)]
+    wall += [(x, -0.5) for x in np.linspace(3.0, 8.0, 6)]
+    g = _grid(wall)
+    out = choose_plan_route(route, lane, np.array([0.0, 0.0]), 0.0, g,
+                            strict_perception=True)
+    np.testing.assert_allclose(out, lane)
+
+
 def test_route_kept_when_lane_also_blocked() -> None:
     route = np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]])
     lane = np.array([[0.0, 0.0], [5.0, -3.0], [10.0, -6.0]])
@@ -70,6 +88,39 @@ def test_no_lane_returns_route() -> None:
     g = _grid([])
     out = choose_plan_route(route, None, np.array([0.0, 0.0]), 0.0, g)
     np.testing.assert_allclose(out, route)
+
+
+def test_no_lane_returns_none_in_strict_mode() -> None:
+    """Strict FSD never returns map geometry as a driving path."""
+    route = np.array([[0.0, 0.0], [5.0, 0.0]])
+    g = _grid([])
+    out = choose_plan_route(
+        route, None, np.array([0.0, 0.0]), 0.0, g,
+        strict_perception=True)
+    assert out is None
+
+
+def test_strict_mode_returns_sensor_lane_even_when_route_free() -> None:
+    """The route is intent only; strict planning follows perception."""
+    route = np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]])
+    lane = np.array([[0.0, 0.0], [5.0, -2.0], [10.0, -4.0]])
+    g = _grid([])
+    out = choose_plan_route(
+        route, lane, np.array([0.0, 0.0]), 0.0, g,
+        strict_perception=True)
+    np.testing.assert_allclose(out, lane)
+
+
+def test_strict_mode_rejects_lane_heading_mismatch() -> None:
+    """Route intent may gate a lane that points down another branch,
+    but the fallback is a fail-closed stop, not map lateral driving."""
+    route = np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]])
+    lane = np.array([[0.0, 0.0], [-5.0, 0.0], [-10.0, 0.0]])
+    g = _grid([])
+    out = choose_plan_route(
+        route, lane, np.array([0.0, 0.0]), 0.0, g,
+        strict_perception=True)
+    assert out is None
 
 
 def test_no_route_returns_lane() -> None:

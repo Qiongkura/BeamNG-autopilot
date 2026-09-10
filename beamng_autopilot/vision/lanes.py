@@ -485,6 +485,83 @@ def painted_line_direction(sem, cam_model, pos, heading,
         return None
 
 
+def painted_lane_reference(sem, cam_model, pos, heading,
+                           ground_z: float | None = None,
+                           lane_half_m: float = 1.5,
+                           marks: list | None = None,
+                           lookahead_m: float = 5.0,
+                           length_m: float = 24.0,
+                           step_m: float = 1.5,
+                           min_fwd_dot: float = 0.2
+                           ) -> np.ndarray | None:
+    """Perception-only own-lane reference polyline (world xy) for planning.
+
+    The lateral anchor is ``painted_line_lane_center`` (the perceived
+    own-lane centre); the orientation is ``painted_line_direction`` (the
+    perceived travel direction of the painted line).  The ray is anchored
+    at the ego and aimed at that anchor projected ``lookahead_m`` along
+    the perceived direction - the same construction the ``fsd_drive``
+    end-zone stop ray uses - so a planner following it converges onto the
+    sensor's own-lane centre.  No map route / nav lane plus fixed offset
+    is involved (project lateral rule).
+
+    Returns None when the line is not confidently visible or its
+    direction is unmeasurable: the strict FSD "lane unavailable" state,
+    where the caller must degrade (stop / hold heading) instead of
+    fabricating a reference from the map.  When the line is visible but
+    the ego already sits on the own-lane centre (``painted_line_lane_center``
+    deadband), the ray simply keeps the current lane offset while
+    following the perceived direction.
+    """
+    try:
+        if marks is None:
+            marks = painted_line_markings(sem, cam_model, pos, heading,
+                                          ground_z=ground_z)
+        if not marks:
+            return None
+        pd = painted_line_direction(sem, cam_model, pos, heading,
+                                    ground_z=ground_z, marks=marks)
+        if pd is None:
+            return None
+        v = np.asarray(pd, dtype=float).ravel()
+        if v.size < 2:
+            return None
+        n = float(np.hypot(float(v[0]), float(v[1])))
+        if n < 1e-6:
+            return None
+        d = v[:2] / n
+        p0 = np.asarray(pos, dtype=float).ravel()[:2]
+        if not np.isfinite(p0).all():
+            return None
+        hf = np.array([math.cos(float(heading)), math.sin(float(heading))])
+        if float(d @ hf) < 0.0:
+            d = -d
+        anchor = painted_line_lane_center(
+            sem, cam_model, pos, heading, ground_z=ground_z,
+            lane_half_m=lane_half_m, marks=marks)
+        if anchor is not None:
+            aim = np.asarray(anchor, dtype=float).ravel()[:2] \
+                + d * float(lookahead_m)
+        else:
+            # Line seen confidently but the ego already sits on the
+            # own-lane centre (the helper's deadband): keep the offset and
+            # follow the perceived lane direction.
+            aim = p0 + d
+        vec = aim - p0
+        n = float(np.hypot(float(vec[0]), float(vec[1])))
+        if n < 1e-6:
+            return None
+        f = vec / n
+        if float(f @ hf) < float(min_fwd_dot):
+            return None
+        t = np.arange(0.0, float(length_m) + 1e-9, float(step_m))
+        if t.size < 2:
+            return None
+        return p0[None, :] + f[None, :] * t[:, None]
+    except Exception:
+        return None
+
+
 class PaintedLineLateralCorrector:
     """Steady-state painted-line lateral correction (perception only).
 

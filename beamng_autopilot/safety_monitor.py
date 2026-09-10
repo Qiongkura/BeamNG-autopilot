@@ -29,6 +29,10 @@ from beamng_autopilot.planning.geometry import polyline_point_distances
 from beamng_autopilot.planning.constraints import (
     body_lane_cross_dist_m, body_pose_crosses_lane,
 )
+from beamng_autopilot.planning.lateral_ref import (
+    REF_NONE, lateral_reference,
+)
+from beamng_autopilot.vehicle_body import CORRIDOR_HALF_WIDTH_M
 
 # How old a range/vision snapshot can be before the monitor distrusts it.
 STALE_SNAPSHOT_S = 0.8
@@ -41,15 +45,24 @@ STALE_SNAPSHOT_S = 0.8
 OCC_FRACTION_DEGRADE = 0.30
 OCC_FRACTION_STOP = 0.40
 # Lane-keep: the path must stay within this of the lane reference.
+# These are the SOFT, centre-reference budgets (how far the chosen path
+# may sit from the lane reference before it degrades) - the HARD gate
+# is the full-body rectangle check below, which stops the car whenever
+# the one authoritative footprint touches a boundary no matter how
+# small the centre deviation is.  Kept separate from the footprint on
+# purpose: they describe a path budget, not the size of the car.
 LANE_DEV_DEGRADE_M = 3.0
 LANE_DEV_STOP_M = 6.0
 # Obstacle-approach speed ease: only occupied cells that intrude into
-# the driven corridor AHEAD of the ego count (same 1.6 m corridor as
-# ``path_forward_clearance_m``).  Roadside trees/curbs beside or behind
-# the car are lane bounds, not obstacles - easing to the 2 m/s creep
-# for every LiDAR point within 8 m parked the car on open mountain
-# roads (run 2026-08-27: plan 6 m/s, monitor crept at 2 m/s all run).
-EASE_CORRIDOR_HALF_WIDTH_M = 1.6
+# the driven corridor AHEAD of the ego count.  Roadside trees/curbs
+# beside or behind the car are lane bounds, not obstacles - easing to
+# the 2 m/s creep for every LiDAR point within 8 m parked the car on
+# open mountain roads (run 2026-08-27: plan 6 m/s, monitor crept at
+# 2 m/s all run).
+#
+# The corridor is the shared body corridor (``vehicle_body``: body half
+# width + detection margin = 1.6 m), never a standalone car size.
+EASE_CORRIDOR_HALF_WIDTH_M = CORRIDOR_HALF_WIDTH_M
 EASE_AHEAD_MIN_M = 1.0
 
 
@@ -72,6 +85,10 @@ class SafetyVerdict:
     lane_age_s: float | None = None
     range_age_s: float | None = None
     corridor_open: bool = True
+    # Which lateral reference the lane-keep check used: "sensor" /
+    # "envelope" (perception), "route" (legacy map fallback only) or
+    # "none".  Telemetry evidence for the FSD realism contract.
+    lane_ref_src: str = "none"
 
     @property
     def safe(self) -> bool:
@@ -226,18 +243,28 @@ class SafetyMonitor:
                 bad += 1
         return (bad / total) if total else 0.0
 
-    def _lane_deviation(self, scene, path) -> float:
-        """Median lateral distance of the near path from the lane ref."""
-        ref = getattr(scene, "lane_ref", None)
-        if ref is None or len(ref) < 2:
-            envelope = getattr(scene, "lane_envelope", None)
-            ref = (getattr(envelope, "center", None)
-                   if envelope is not None else None)
-        if ref is None or len(ref) < 2:
-            ref = getattr(scene, "route", None)
-        if ref is None or len(ref) < 2 or path is None or len(path) < 2:
-            return 0.0
-        ref = np.asarray(ref[:, :2], dtype=float)
+    @staticmethod
+    def _lane_reference(scene):
+        """The lateral lane reference for this tick.
+
+        Delegates to the single lateral-reference policy
+        (``planning.lateral_ref``): perception first, the nav route only
+        as the documented legacy fallback, and nothing at all in a strict
+        scene with no sensor lane - so the caller fails closed instead of
+        measuring against the map centre line.
+        """
+        return lateral_reference(scene)
+
+    def _lane_deviation(self, scene, path) -> tuple[float, str]:
+        """(median lateral distance from the lane ref, ref source).
+
+        The source is ``REF_NONE`` when there is no reference to measure
+        against at all; a strict scene with no perception lane yields
+        that, and ``evaluate`` turns it into a minimal-risk stop.
+        """
+        ref, src = self._lane_reference(scene)
+        if ref is None or path is None or len(path) < 2:
+            return 0.0, src
         path = np.asarray(path, dtype=float)[:, :2]
         pos = np.asarray(scene.pos[:2], dtype=float)
         d0 = np.linalg.norm(path - pos, axis=1)
@@ -245,7 +272,9 @@ class SafetyMonitor:
         if len(near) < 2:
             near = path[: min(4, len(path))]
         offs = polyline_point_distances(near, ref)
-        return float(np.median(offs)) if len(offs) else 0.0
+        if not len(offs):
+            return 0.0, src
+        return float(np.median(offs)), src
 
     # ------------------------------------------------------------------
     def evaluate(self, scene, path, closed_loop_steer: float = 0.0,
@@ -260,7 +289,7 @@ class SafetyMonitor:
         """
         closed_loop_steer = float(closed_loop_steer)
         path_occ = self._path_occupied_fraction(scene, path)
-        lane_dev = self._lane_deviation(scene, path)
+        lane_dev, lane_ref_src = self._lane_deviation(scene, path)
         body_cross = body_lane_cross_dist_m(scene, path)
         body_now_cross = body_pose_crosses_lane(
             scene, scene.pos, float(scene.heading))
@@ -305,6 +334,7 @@ class SafetyMonitor:
             bev_age_s=freshness["bev_age_s"],
             lane_age_s=freshness["lane_age_s"],
             range_age_s=freshness["range_age_s"])
+        v.lane_ref_src = lane_ref_src
 
         # --- stale sensors / planner -> degrade to minimal risk --------
         if stale_sensor or stale_planner:
@@ -317,6 +347,17 @@ class SafetyMonitor:
         if path is None or len(path) < 2:
             v.level = "minimal_risk"
             v.reason = "no drivable path"
+            v.target_speed = 0.0
+            return v
+
+        # --- strict perception: no sensor lane -> fail closed -----------
+        # A real FSD does not keep driving off the HD map when it cannot
+        # see the lane; it degrades.  Never measure lateral position
+        # against the nav route in strict mode.
+        if lane_ref_src == REF_NONE \
+                and getattr(scene, "strict_perception", False):
+            v.level = "minimal_risk"
+            v.reason = "perception lane unavailable"
             v.target_speed = 0.0
             return v
 

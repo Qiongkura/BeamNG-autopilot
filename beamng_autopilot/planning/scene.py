@@ -43,6 +43,11 @@ class Scene:
     # but existing code reads boxes; carry both).
     obstacles: list = field(default_factory=list)
     meta: dict = field(default_factory=dict)
+    # Strict FSD realism: the lateral reference may only come from
+    # perception (``lane_ref`` / ``lane_envelope``).  When True, consumers
+    # must fail closed instead of falling back to ``route`` - the nav
+    # route says *where to go*, never *where the lane is*.
+    strict_perception: bool = False
 
     def forward(self, dist_m: float) -> np.ndarray:
         """A point `dist_m` straight ahead of the ego (world)."""

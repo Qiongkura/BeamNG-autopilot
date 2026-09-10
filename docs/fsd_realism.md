@@ -31,6 +31,21 @@
   `lane_mode="sensor" + strict_sensor=True` 才是 FSD 拟真模式:
   无配对感知车道 → `lane_ref=None`,src=`perception-unavailable`,禁止地图车道进入规划。
 - 状态: ✅ `FSDStack(strict_sensor=True)` 已实现并单测。
+- 严格模式向下游一路生效:`Scene.strict_perception=True` 时,
+  `planning/lateral_ref.py` 是所有“我的车道在哪”判断的唯一策略入口
+  (`sensor` → `envelope` → 仅旧规则允许的 `route` → `none`);
+  safety 与 planner 不再各自实现一套优先级。
+  `safety_monitor` 无感知车道即 `minimal_risk`
+  (`perception lane unavailable`)、`constraints.cost_lane_align` 不计分,
+  `fsd_drive` 的 safety Scene 也不再把 nav route 塞进 `lane_ref`。
+  `SafetyVerdict.lane_ref_src` 会记录本 tick 实际使用的参考来源,
+  方便从遥测验证严格模式没有偷用地图几何。
+  非严格(旧规则兼容)模式保留 route 兜底。
+
+- **单一世界模型**:`FSDTick.scene` 发布本 tick 规划器实际使用的
+  `Scene`(occupancy、感知车道、strict 标记、快照/freshness)。
+  `m5_fsd_drive` 的 safety 层必须直接消费这同一份 Scene,不得重新拼一份
+  带不同横向参考的世界模型;只有旧 stub 不发布 Scene 时才允许走兼容重建。
 
 ## 5. 传感器真值优先,模拟器特权禁止进入推理
 

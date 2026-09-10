@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import math
-import sys
 import time
 from pathlib import Path
 
@@ -39,11 +38,13 @@ from beamng_autopilot.neural.e2e_runtime import (
 from beamng_autopilot.occupancy import OccupancyGrid
 from beamng_autopilot.planning import (
     Scene, anchored_rule_ref, arbitrate, local_route,
+    validate_learned_path,
 )
 from beamng_autopilot.planning.arbiter import (
     bearing_diff_deg, polyline_bearing,
 )
 from beamng_autopilot.planning.constraints import _boundary_lateral
+from beamng_autopilot.vehicle_body import footprint_corners
 from beamng_autopilot.planning.local_route import (
     map_lane_edges, _project_arc, _route_turn_deg,
 )
@@ -178,24 +179,16 @@ HEADING_DEV_START_DEG = 12.0
 HEADING_DEV_FULL_DEG = 40.0
 HEADING_DEV_CAP_MPS = 5.0
 HEADING_DEV_FLOOR_MPS = 1.5
-# Map road-edge guard: the real DecalRoad left/right edges are the
-# hard map prior for "where the road is".  Once the ego crosses an
-# edge the car is on grass/verge (right) or in the oncoming lane
-# (left) - cut the target hard so it never cruises off-road (opt13:
-# with no nav route the straight-line reference drove straight onto
-# grass and crept there).  Thresholds are beyond the own-lane centre
-# so normal right-lane driving is never punished.
-ROAD_OFF_EDGE_M = 1.0     # past an edge: crawl (stop if it worsens)
-ROAD_OFF_CRAWL_MPS = 0.5
-ROAD_EDGE_SLOW_MPS = 2.0
-# Past STOP_M the car is definitively off the road - stop creeping and
-# steer back to the road centre (town opt24: after a 90-deg corner cut
-# the car drove 20 m on grass because route_local anchors at the car
-# and the old guard only capped at 0.5 m/s).
-ROAD_OFF_STOP_M = 2.0   # beyond this = definitely off-road (hard stop);
-                    # junction/start offsets stay ~2 m and only crawl
-ROAD_RETURN_LOOK_M = 40.0  # road-centre target for the return steering
-ROAD_RETURN_STEER_MAX = 0.55
+# Off-road recovery is PERCEPTION ONLY.  ``_perception_off_road_m``
+# measures how far the ego BODY sticks out past a boundary the vision /
+# LiDAR chain detected this tick.  The old map guard (nav centreline +
+# DecalRoad edge half-width) was dead code - ``road_off`` was assigned
+# 0.0 and never updated, so the crawl / recovery branches could not
+# fire - and map lateral authority is banned in the FSD entry anyway.
+# More than this far past a DETECTED edge means the car is definitively
+# out of its lane: hard stop + hold, never creep further out, never
+# reverse (``off_recover`` also suppresses the reverse escape).
+ROAD_OFF_STOP_M = 2.0
 # Map-prior lane centre EMA: map_lane_edges re-derives the own-lane
 # centre every frame from the road edges; at junctions / edge
 # sampling switches it can wiggle a few degrees between frames and
@@ -370,47 +363,136 @@ def _ref_bearing(ref, pos, min_m: float = 1.5, max_m: float = 20.0):
     return round(float(math.degrees(math.atan2(v[1], v[0]))), 1)
 
 
-def _route_lateral_off_m(pos, nav_route, road_left, road_right,
-                         window: int = 10, cap_m: float = 12.0,
-                         default_m: float = 7.0):
-    """Signed lateral + metres beyond the local road edge vs the NAV
-    centreline.
+def _perception_off_road_m(out, pos, heading) -> float:
+    """How far the ego BODY sticks out past a DETECTED boundary (m).
 
-    Returns ``(lat, beyond, half_width)``: ``lat`` is the ego's signed
-    offset from the route centreline (positive = right of travel),
-    ``half_width`` the local road half-width (max edge distance in a
-    rolling window, capped), and ``beyond = max(0, |lat| - half_width)``.
+    Perception-only replacement for the old map ``road_off`` metric: the
+    four corners of the one authoritative footprint (``vehicle_body``)
+    are tested against the lane boundaries this tick's vision / LiDAR
+    chain published, and the worst signed overshoot is returned (>= 0).
 
-    The guard measures against the centreline instead of the raw
-    DecalRoad edge polylines because those fold at junctions (two road
-    segments stitched by the graph) and go stale past the last graph
-    node - the nearest-edge point then jumps to a far-away corner and
-    reports a fake 3 m off-road on a straight section while the car is
-    on the centreline (town run10 t=11 at (737,751)).
+    No map / DecalRoad fallback: the FSD entry takes lateral authority
+    from sensors only (project rule), and a missing boundary is
+    "unknown" - 0.0 - never a map guess.  Callers use the value for the
+    off-road telemetry, the learned decision layer's ``road_off`` input
+    and the definitively-off-lane hard stop.
     """
-    p = np.asarray(pos[:2], dtype=float)
-    r = np.asarray(nav_route[:, :2], dtype=float)
-    n = len(r)
-    if n < 2:
-        return 0.0, 0.0, default_m
-    i = int(np.argmin(np.linalg.norm(r - p, axis=1)))
-    i0 = max(0, i - 2)
-    i1 = min(n - 1, i + 2)
-    tv = r[i1] - r[i0]
-    L = float(np.linalg.norm(tv))
-    if L < 1e-9:
-        return 0.0, 0.0, default_m
-    rn = np.array([tv[1] / L, -tv[0] / L])
-    lat = float(np.dot(p - r[i], rn))
-    hw = []
-    for k in range(max(0, i - window), min(n, i + window + 1)):
-        lk = road_left[k]
-        rk = road_right[k]
-        if np.all(np.isfinite(lk)) and np.all(np.isfinite(rk)):
-            hw.append(float(np.linalg.norm(r[k] - lk)))
-            hw.append(float(np.linalg.norm(r[k] - rk)))
-    hw_m = min(cap_m, max(hw)) if hw else default_m
-    return lat, max(0.0, abs(lat) - hw_m), hw_m
+    if out is None:
+        return 0.0
+    left = getattr(out, "lane_left", None)
+    right = getattr(out, "lane_right", None)
+    if left is None and right is None:
+        return 0.0
+    try:
+        p = np.asarray(pos, dtype=float).ravel()[:2]
+        if p.size < 2 or not np.isfinite(p).all():
+            return 0.0
+        corners = footprint_corners(p, float(heading))
+    except Exception:
+        return 0.0
+    worst = 0.0
+    for c in corners:
+        if left is not None:
+            try:
+                lat, cov = _boundary_lateral(
+                    float(c[0]), float(c[1]), left, None)
+                if cov and float(lat) > worst:
+                    worst = float(lat)
+            except Exception:
+                pass
+        if right is not None:
+            try:
+                lat, cov = _boundary_lateral(
+                    float(c[0]), float(c[1]), right, None)
+                if cov and -float(lat) > worst:
+                    worst = -float(lat)
+            except Exception:
+                pass
+    return float(worst)
+
+
+# Travel-direction sources that count as PERCEPTION in the end zone
+# ("painted" = semantic line direction, "sensor_lane" = paired LiDAR /
+# camera lane centreline).  "route" is only ever a plain orientation
+# fallback for the stop RAY, never a steering reference.
+PERCEPTION_DIR_SRCS = ("painted", "sensor_lane")
+
+
+def _endzone_align_yaw_dev(heading, dir3, dir_src):
+    """Yaw deviation to straighten the parking pose to, or None.
+
+    The end zone creeps forward while straightening when a mid-turn hold
+    would park the body diagonally across the lane (town 2026-09-06).
+    "Which way is my lane" must come from PERCEPTION - using the nav
+    route tangent as a steering reference is the map-prior shortcut the
+    project rule forbids in the FSD entry (``_ref_bearing`` on the route
+    used to feed the alignment creep).
+
+    Returns the signed deviation (rad) to the perceived lane direction
+    when ``dir_src`` is a perception source, else None so the caller
+    holds the brake instead of steering on a map prior - the legal
+    no-perception degradation (stop, never steer on map).
+    """
+    if dir_src not in PERCEPTION_DIR_SRCS or dir3 is None:
+        return None
+    try:
+        d = np.asarray(dir3, dtype=float).ravel()[:2]
+        if d.size < 2 or not np.isfinite(d).all():
+            return None
+        if float(np.hypot(float(d[0]), float(d[1]))) < 1e-6:
+            return None
+        bear_deg = math.degrees(math.atan2(float(d[1]), float(d[0])))
+        return math.radians(
+            (float(heading) * 57.29577951308232 - bear_deg + 180.0)
+            % 360.0 - 180.0)
+    except Exception:
+        return None
+
+
+def _unit_dir2(value):
+    """Unit 2-D direction from a candidate, or None when unusable."""
+    if value is None:
+        return None
+    try:
+        d = np.asarray(value, dtype=float).ravel()
+        if d.size < 2:
+            return None
+        d = d[:2]
+        if not np.isfinite(d).all():
+            return None
+        n = float(np.hypot(float(d[0]), float(d[1])))
+        if n < 1e-6:
+            return None
+        return d / n
+    except Exception:
+        return None
+
+
+def _endzone_travel_direction(heading, painted=None, sensor=None,
+                              route_tangent=None, strict=False):
+    """Resolve the end-zone travel orientation: perception first.
+
+    Priority: the semantic painted-line direction, then the paired
+    sensor-lane centreline heading.  A nav-route tangent stays a plain
+    orientation fallback ONLY in the legacy non-strict mode; strict FSD
+    holds the current heading instead, because route geometry must never
+    steer the car there (``docs/fsd_realism.md`` §1/§4 and the project
+    lateral rule).  Returns ``(dir3, src)`` with ``src`` in
+    "painted" / "sensor_lane" / "route" / "none" ("none" = heading hold,
+    the legal no-perception degradation).
+    """
+    for cand, src in ((painted, "painted"), (sensor, "sensor_lane")):
+        d = _unit_dir2(cand)
+        if d is not None:
+            return d, src
+    if not strict:
+        d = _unit_dir2(route_tangent)
+        if d is not None:
+            return d, "route"
+    hf = _unit_dir2((math.cos(float(heading)), math.sin(float(heading))))
+    if hf is None:
+        hf = np.array([1.0, 0.0])
+    return hf, "none"
 
 
 def _path_curvature_ff(path, pos, heading, near_m: float = 1.5,
@@ -592,40 +674,26 @@ def _sensor_snapshot_age(out) -> float:
     return max([0.0] + [float(x) for x in ages])
 
 
-def run(args) -> int:
-    # initialised FIRST: the end-of-run finally touches these even when
-    # the connection fails before the drive section (2026-09-06:
-    # BNGDisconnectedError at connect -> UnboundLocalError in finally
-    # masked the real error)
-    hist: list[dict] = []
-    rec = None
+class FSDriveSession:
+    """Stateful live FSD drive session.
 
-    conn = BeamNGConnector(
-        "italy", "etk800",
-        port=config.runtime_port(args.runtime),
-        home=config.runtime_home(args.runtime))
-    pp = PurePursuit(lookahead=5.0)
-    speed_ctrl = SpeedController(deadband=SPEED_DEADBAND_MPS,
-                                hyst_mps=SPEED_HYST_MPS)
-    monitor = SafetyMonitor(max_speed=args.speed)
-    try:
-        conn.open(launch=not args.attach)
-        try:
-            conn.attach_vehicle(already_open=True)
-        except Exception:
-            conn.load_scenario()
-        if args.teleport is not None:
-            x, y, yaw = args.teleport
-            # Ground-safe teleport: the connector measures the real surface
-            # with a cast ray and re-checks after settling, so no map can
-            # ever drop the car below terrain (hardcoded z heights did on
-            # maps whose surface sits much higher - 2026-08-28).
-            conn.safe_teleport(float(x), float(y), heading_deg=float(yaw))
-            st1 = conn.get_state()
-            print(f"[fsd-drive] teleport -> "
-                  f"({float(st1.pos[0]):.1f}, {float(st1.pos[1]):.1f}, "
-                  f"{float(st1.pos[2]):.1f})")
+    The first extraction intentionally preserves the legacy statement order
+    byte-for-byte inside ``run``.  Subsequent stages can move lifecycle
+    slices into methods without changing the actuator sequence.
+    """
 
+    def __init__(self, args) -> None:
+        self.args = args
+
+    def _build_route(self, conn):
+        """Build and ground-snap the navigation route for this session.
+
+        This method is an extraction only: it preserves the original
+        road-graph/in-game-route fallback and snap order.  It returns the
+        navigation centreline plus optional physical edge polylines; the
+        caller still owns perception placement and all actuator timing.
+        """
+        args = self.args
         # Navigation route: a real stack plans ALONG the destination
         # route (FSD vector-space planner), not a straight line ahead -
         # a straight reference drives the car into the building on the
@@ -776,6 +844,15 @@ def run(args) -> int:
             print("[fsd-drive] no nav route set; falling back to "
                   "straight-ahead reference")
 
+        return nav_route, nav_route_ref, road_left, road_right
+
+    def _setup_runtime(self, conn, args):
+        """Assemble the FSD stack and learned candidates.
+
+        This is a resource-only extraction.  It does not start the car or
+        touch the watchdog; the caller keeps the original gearbox,
+        pre-warm, and actuator order.
+        """
         # Proven rule planner as the arbitration fallback: it rounds
         # switchback corners into drivable arcs (the 94.6% rule-autopilot
         # path), so the FSD drive never stops dead at a hairpin apex or
@@ -871,6 +948,12 @@ def run(args) -> int:
                 if dqn_rt.loaded:
                     print(f"[fsd-drive] DQN decision policy: "
                           f"{dqn_rt.weights}")
+                    if dqn_rt.meta_warning:
+                        print(f"[fsd-drive] DQN contract warning: "
+                              f"{dqn_rt.meta_warning}")
+                    elif dqn_rt.meta:
+                        print(f"[fsd-drive] DQN contract: "
+                              f"git={dqn_rt.meta.get('git_commit') or '?'}")
                 else:
                     print(f"[fsd-drive] DQN policy disabled: "
                           f"{dqn_rt.error or 'weights not found'}")
@@ -878,63 +961,21 @@ def run(args) -> int:
             except Exception as _dqn_e:
                 print(f"[fsd-drive] DQN policy disabled: {_dqn_e}")
                 dqn_rt = None
-        # Realistic gearbox locked into a forward gear (D).  A real stack
-        # never leaves the car in reverse; keep the D input on every
-        # control frame so an impact can never leave the gearbox in R.
-        fwd_gear = gearbox.forward_gear_input(conn)
-        conn.control(throttle=0.0, brake=0.0, steering=0.0,
-                     parkingbrake=0.0, gear=fwd_gear)
-        conn.step(3)
-        # Game-side input watchdog: if this Python process dies or is
-        # killed, the game keeps applying the last controls - the Lua
-        # watchdog stops the car once the heartbeat goes stale.
-        try:
-            if wd_arm(conn):
-                print("[fsd-drive] input watchdog armed")
-            else:
-                print("[fsd-drive] WATCHDOG FAILED TO ARM; aborting")
-                conn.control(throttle=0.0, brake=1.0, steering=0.0,
-                             parkingbrake=1.0, gear=fwd_gear)
-                conn.step(5)
-                return 2
-        except Exception as _wd_e:
-            print(f"[fsd-drive] WATCHDOG ARM ERROR; aborting: {_wd_e}")
-            try:
-                conn.control(throttle=0.0, brake=1.0, steering=0.0,
-                             parkingbrake=1.0, gear=fwd_gear)
-                conn.step(5)
-            except Exception:
-                pass
-            return 2
-        # Real-time control: DO NOT pause the sim.  With ticks now
-        # ~0.4-0.6 s (after warm-up) the stale-control window is a few
-        # metres at cruise and a fraction of a metre at bend speeds, so
-        # the sim runs continuously - the car is always moving, which
-        # removes the paused-step stutter.  The warm-up crawl and
-        # stale-tick scrub below bound the open-loop windows.
-        # Shadow episode: the FSD drive records its own (rgb + label +
-        # BEV + trajectory + executed control) frames for later
-        # end-to-end training - the same ShadowFrame contract
-        # m5_shadow_drive uses, so a drive IS a labelled run.
-        rec = None if args.no_shadow else ShadowRecorder(
-            config.LOGS_DIR / "m5_e2e", f"fsd_{int(time.time())}")
-        # Pre-warm the pipeline BEFORE driving: the first FSD ticks load
-        # YOLO and settle camera/LiDAR (observed 4-6 s, opt11: a 5.3 s
-        # tick).  Running that with the car braked means the long tick
-        # cannot drive the car open-loop off the road; release once the
-        # object head is live (or WARMUP_S elapsed).
+        return rule_planner, stack, e2e_rt, bc_rt, dqn_rt
+
+    def _prewarm_and_place(self, conn, stack, nav_route, fwd_gear):
+        """Warm sensors and place the ego using perception-only geometry.
+
+        The vehicle remains braked while expensive heads warm and while
+        painted-line placement retries.  The method returns ``(tick,
+        placed, abort_code)``; it contains no planner/control-loop state.
+        """
         _pw_out = None
         _percep_ok = False
-        _pl_t0 = time.time()
         try:
             conn.control(throttle=0.0, brake=1.0, steering=0.0,
                          parkingbrake=1.0, gear=fwd_gear)
             _pw_t0 = time.time()
-            # Hold at standstill until BOTH the pipeline is warm AND the
-            # painted-line placement has put the car in its own lane.
-            # The old flow attempted the placement ONCE and drove from
-            # the road-graph-node snap (= the road centre line) on any
-            # miss, riding the left line from metre one.
             while True:
                 _elapsed = time.time() - _pw_t0
                 try:
@@ -954,17 +995,17 @@ def run(args) -> int:
                     and _pw_out.meta.get("object_head"))
                 if _pw_out is not None and _pw_out.frame is not None:
                     try:
-                        _st_sp = _pw_state
                         _sp_tgt = painted_line_lane_center(
                             _pw_out.head_outputs.get("semantic"),
-                            _pw_out.cam, _st_sp.pos, float(_st_sp.heading),
-                            ground_z=(float(_st_sp.pos[2])
+                            _pw_out.cam, _pw_state.pos,
+                            float(_pw_state.heading),
+                            ground_z=(float(_pw_state.pos[2])
                                       - config.EGO_ORIGIN_GROUND_GAP_M))
                         if _sp_tgt is not None:
                             conn.safe_teleport(
                                 _sp_tgt[0], _sp_tgt[1],
                                 heading_deg=math.degrees(
-                                    float(_st_sp.heading)))
+                                    float(_pw_state.heading)))
                             _st_sp2 = conn.get_state()
                             _percep_ok = True
                             print(f"[fsd-drive] perception lane placement "
@@ -992,7 +1033,7 @@ def run(args) -> int:
                 conn.control(throttle=0.0, brake=1.0, steering=0.0,
                              parkingbrake=1.0, gear=fwd_gear)
                 conn.step(3)
-                return 2
+                return _pw_out, False, 2
             conn.control(throttle=0.0, brake=0.0, steering=0.0,
                          parkingbrake=0.0, gear=fwd_gear)
             conn.step(3)
@@ -1002,1704 +1043,1888 @@ def run(args) -> int:
                 pass
         except Exception as _pw_e:
             print(f"[fsd-drive] pre-warm skipped: {_pw_e}")
-        if not _percep_ok:
-            print("[fsd-drive] painted line not perceived; keeping the "
-                  "ground-safe route snap")
-        conn.control(throttle=0.0, brake=0.0, steering=0.0,
-                     parkingbrake=0.0, gear=fwd_gear)
-        conn.step(3)
-        print(f"[fsd-drive] gearbox realistic, forward gear input = {fwd_gear}")
-        rguard = ReverseGuard(threshold_mps=REVERSE_THRESHOLD_MPS,
-                              clear_mps=REVERSE_CLEAR_MPS)
-        rman = ReverseManeuver(fwd_gear=fwd_gear)
-        print(f"[fsd-drive] runtime={stack.mode} FSD pipeline driving "
-              f"for {args.seconds}s at {args.speed} m/s "
-              f"(lane_mode={args.lane_mode})")
+        return _pw_out, _percep_ok, 0
 
-        prev_steer = 0.0  # rate-limited steering state (rule-autopilot convention)
-        watchdog_lost = False
-        map_mc_smooth = None   # EMA-smoothed map-prior lane centre
-        end_plc_cache = None   # (own-lane centre xy, t_seen) last-good
-                               # perception anchor for the end zone
-        plc_corr = PaintedLineLateralCorrector(
-            max_shift_m=PLC_MAX_SHIFT_M, horizon_m=PLC_HORIZON_M,
-            rate_m_s=PLC_RATE_MPS, hold_s=PLC_HOLD_S,
-            min_speed_mps=PLC_MIN_SPEED_MPS)
-        last_h = None      # previous heading for the yaw-rate steering damper
-        climb_t = 0.0      # seconds spent in slope-creep assist
-        stuck_t = 0.0    # seconds at near-standstill with a "safe" plan
-        sig_rule_state = None   # game signal state on the current link
-        sig_rule_t = 0.0        # last road-link signal poll time
-        rev_thr = REV_THR_BASE  # reverse-escape throttle ramp state
-        t_end = time.time() + args.seconds
-        frames = 0
-        stopps = 0
-        t0 = time.time()
-        warmup_until = time.time() + WARMUP_S
-        target_sm = float(args.speed)
-        plan_sm = float(args.speed)
-        prev_thr = 0.0
-        prev_brk = 0.0
-        gov_brake = False
-        # First-frame steering: with last_t set to NOW the first tick has
-        # dt ~= 0, smooth_steer cannot move the wheel, and the car runs
-        # the whole first ~7 m straight past the corner entry before any
-        # steering appears (fix50: steer stayed -0.02 while the car went
-        # from the spawn to (726.9,756.8)).  Pretend one control interval
-        # has already elapsed so the first frame can steer immediately.
-        last_t = time.time() - 1.5
-        # Static full-route geometry: the nav route never changes during
-        # a run, so dedup/extend/round/resample + arc lengths + per-vertex
-        # radii are computed ONCE before the loop instead of every frame
-        # (the old per-frame rebuild of the whole rounded route cost
-        # ~10-20 ms on a long route, plus a repeated curvature scan for
-        # the bend governor).
-        route_round = None
-        route_arc = None
-        route_rad = None
-        if nav_route is not None and len(nav_route) >= 4:
+    def run(self) -> int:
+        args = self.args
+
+        # initialised FIRST: the end-of-run finally touches these even when
+        # the connection fails before the drive section (2026-09-06:
+        # BNGDisconnectedError at connect -> UnboundLocalError in finally
+        # masked the real error)
+        hist: list[dict] = []
+        rec = None
+
+        conn = BeamNGConnector(
+            "italy", "etk800",
+            port=config.runtime_port(args.runtime),
+            home=config.runtime_home(args.runtime))
+        pp = PurePursuit(lookahead=5.0)
+        speed_ctrl = SpeedController(deadband=SPEED_DEADBAND_MPS,
+                                    hyst_mps=SPEED_HYST_MPS)
+        monitor = SafetyMonitor(max_speed=args.speed)
+        try:
+            conn.open(launch=not args.attach)
             try:
-                from beamng_autopilot.planning.local_route import (
-                    _dedup as _rdd, _extend_back as _reb,
-                    _round_corners as _rrc, _resample as _rrs,
-                    CORNER_RADIUS_M as _CR, CORNER_RESAMPLE_M as _CSM)
-                route_round = _rrs(_rrc(_reb(_rdd(nav_route[:, :2])), _CR),
-                                   _CSM)
-                route_arc = np.concatenate(
-                    [[0.0], np.cumsum(np.linalg.norm(
-                        np.diff(route_round, axis=0), axis=1))])
-                _rv1 = np.diff(route_round, axis=0)
-                _rn1 = np.linalg.norm(_rv1, axis=1)
-                _rn2 = _rn1[1:]
-                _rcr = (_rv1[:-1, 0] * _rv1[1:, 1]
-                        - _rv1[:-1, 1] * _rv1[1:, 0])
-                _rcurv = 2.0 * np.abs(_rcr) / (
-                    _rn1[:-1] * _rn2 * (_rn1[:-1] + _rn2))
-                route_rad = np.full(len(route_round), np.inf)
-                _rm = _rcurv > 1e-6
-                route_rad[1:-1][_rm] = 1.0 / _rcurv[_rm]
+                conn.attach_vehicle(already_open=True)
             except Exception:
-                route_round = route_arc = route_rad = None
-        # Shadow episode + telemetry history are initialised HERE (before
-        # the placement/pre-warm section): the end-of-run finally writes
-        # telemetry, so these must exist even when the placement aborts
-        # the run early (the 2026-09-06 UnboundLocalError masked the real
-        # placement failure).
-        _ema_tick = 0.35          # adaptive tick-budget EMA (seeded: a
-                                  # typical warm tick is ~0.3-0.4 s)
-        while time.time() < t_end:
-            try:
-                if not wd_heartbeat(conn):
-                    watchdog_lost = True
-                    print("[fsd-drive] WATCHDOG HEARTBEAT LOST; "
-                          "braking and aborting", flush=True)
-                    conn.control(throttle=0.0, brake=1.0, steering=0.0,
-                                 gear=fwd_gear, parkingbrake=1.0)
-                    conn.step(5)
-                    break
-            except Exception as exc:
-                watchdog_lost = True
-                print(f"[fsd-drive] WATCHDOG HEARTBEAT ERROR; "
-                      f"braking and aborting: {exc}", flush=True)
-                try:
-                    conn.control(throttle=0.0, brake=1.0, steering=0.0,
-                                 gear=fwd_gear, parkingbrake=1.0)
-                    conn.step(5)
-                except Exception:
-                    pass
-                break
-            _f0 = time.time()
-            st = conn.get_state()
-            pos = np.asarray(st.pos, dtype=float)
-            heading = float(st.heading)
-            v = float(st.speed)
-            signed = 0.0
-            if st.vel is not None and st.dir is not None:
-                signed = float(np.dot(
-                    np.asarray(st.vel[:2], dtype=float),
-                    np.asarray(st.dir[:2], dtype=float)))
-            # Control-loop dt in real time: the sim runs continuously, so
-            # wall time between ticks IS the driving time.  Clamp the
-            # warm-up frames (which can take seconds) so the stuck /
-            # reverse / climb state machines do not count a camera stall
-            # as seconds of standstill (fix53) - dt caps at 0.5 s.
-            now_t = time.time()
-            _wall_dt = max(0.0, now_t - last_t)
-            last_t = now_t
-            dt = min(0.5, max(0.05, _wall_dt))
-            # Long-tick brake guard: if the PREVIOUS tick took too long
-            # the car just drove open-loop for that long.  Brake now
-            # (before the next, possibly long, tick) so no more distance
-            # is added uncontrolled; the tick below re-plans and resumes.
-            if _wall_dt > STALE_CTRL_S and v > 1.0:
-                try:
-                    conn.control(throttle=0.0, brake=0.5,
-                                 steering=prev_steer, gear=fwd_gear)
-                except Exception:
-                    pass
-            rev_brk, reversing = rguard.decide(signed, dt=dt)
-            # Yaw rate for the steering damper: a low-speed car at full
-            # lock keeps rotating for seconds after the wheel is centred
-            # (the fix37/38 loop - the car swung -130 deg around the
-            # junction because the bang-bang pursuit had no damping).
-            yaw_rate = 0.0
-            if last_h is not None and dt > 0.05:
-                _d = float(heading) - float(last_h)
-                _d = (_d + math.pi) % (2.0 * math.pi) - math.pi
-                yaw_rate = _d / dt
-            last_h = float(heading)
+                conn.load_scenario()
+            if args.teleport is not None:
+                x, y, yaw = args.teleport
+                # Ground-safe teleport: the connector measures the real surface
+                # with a cast ray and re-checks after settling, so no map can
+                # ever drop the car below terrain (hardcoded z heights did on
+                # maps whose surface sits much higher - 2026-08-28).
+                conn.safe_teleport(float(x), float(y), heading_deg=float(yaw))
+                st1 = conn.get_state()
+                print(f"[fsd-drive] teleport -> "
+                      f"({float(st1.pos[0]):.1f}, {float(st1.pos[1]):.1f}, "
+                      f"{float(st1.pos[2]):.1f})")
 
-            # one full FSD tick -> best trajectory (planned along the
-            # LOCAL forward route anchored at the ego; the full nav
-            # route tail is a map prior that can cut through a corner
-            # wall when the car drifts (town runs 2026-08-21) - the
-            # local forward route is what the planner may follow.
-            route_local = local_route(pos, heading, nav_route)
-            map_lane = None
-            if road_left is not None and road_right is not None:
+            nav_route, nav_route_ref, road_left, road_right = \
+                self._build_route(conn)
+            (rule_planner, stack, e2e_rt, bc_rt,
+             dqn_rt) = self._setup_runtime(conn, args)
+            # Realistic gearbox locked into a forward gear (D).  A real stack
+            # never leaves the car in reverse; keep the D input on every
+            # control frame so an impact can never leave the gearbox in R.
+            fwd_gear = gearbox.forward_gear_input(conn)
+            conn.control(throttle=0.0, brake=0.0, steering=0.0,
+                         parkingbrake=0.0, gear=fwd_gear)
+            conn.step(3)
+            # Game-side input watchdog: if this Python process dies or is
+            # killed, the game keeps applying the last controls - the Lua
+            # watchdog stops the car once the heartbeat goes stale.
+            try:
+                if wd_arm(conn):
+                    print("[fsd-drive] input watchdog armed")
+                else:
+                    print("[fsd-drive] WATCHDOG FAILED TO ARM; aborting")
+                    conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                                 parkingbrake=1.0, gear=fwd_gear)
+                    conn.step(5)
+                    return 2
+            except Exception as _wd_e:
+                print(f"[fsd-drive] WATCHDOG ARM ERROR; aborting: {_wd_e}")
                 try:
-                    map_lane = map_lane_edges(
-                        nav_route, road_left, road_right, pos, heading)
+                    conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                                 parkingbrake=1.0, gear=fwd_gear)
+                    conn.step(5)
                 except Exception:
-                    map_lane = None
-            if map_lane is not None:
-                _mc = np.asarray(map_lane[0], dtype=float)[:, :2]
-                if map_mc_smooth is not None and len(_mc) >= 3 \
-                        and len(map_mc_smooth) >= 3:
+                    pass
+                return 2
+            # Real-time control: DO NOT pause the sim.  With ticks now
+            # ~0.4-0.6 s (after warm-up) the stale-control window is a few
+            # metres at cruise and a fraction of a metre at bend speeds, so
+            # the sim runs continuously - the car is always moving, which
+            # removes the paused-step stutter.  The warm-up crawl and
+            # stale-tick scrub below bound the open-loop windows.
+            # Shadow episode: the FSD drive records its own (rgb + label +
+            # BEV + trajectory + executed control) frames for later
+            # end-to-end training - the same ShadowFrame contract
+            # m5_shadow_drive uses, so a drive IS a labelled run.
+            rec = None if args.no_shadow else ShadowRecorder(
+                config.LOGS_DIR / "m5_e2e", f"fsd_{int(time.time())}",
+                provenance={
+                    "source": "fsd_drive",
+                    "runtime": str(args.runtime),
+                    "map": "italy",
+                    "vehicle": "etk800",
+                    "speed_arg": float(args.speed),
+                    "strict": bool(args.strict),
+                    "e2e_weights": (str(e2e_rt.weights)
+                                    if e2e_rt is not None else None),
+                    "bc_weights": (str(bc_rt.weights)
+                                   if bc_rt is not None else None),
+                    "dqn_weights": (str(dqn_rt.weights)
+                                    if dqn_rt is not None else None),
+                    "dqn_contract": (
+                        "ok" if dqn_rt.contract is not None
+                        and dqn_rt.contract.ok else "disabled"),
+                    "dqn_contract_warning": (
+                        dqn_rt.meta_warning
+                        if dqn_rt is not None else None),
+                })
+            (_pw_out, _percep_ok,
+             _placement_rc) = self._prewarm_and_place(
+                conn, stack, nav_route, fwd_gear)
+            if _placement_rc:
+                return _placement_rc
+            if not _percep_ok:
+                print("[fsd-drive] painted line not perceived; keeping the "
+                      "ground-safe route snap")
+            conn.control(throttle=0.0, brake=0.0, steering=0.0,
+                         parkingbrake=0.0, gear=fwd_gear)
+            conn.step(3)
+            print(f"[fsd-drive] gearbox realistic, forward gear input = {fwd_gear}")
+            rguard = ReverseGuard(threshold_mps=REVERSE_THRESHOLD_MPS,
+                                  clear_mps=REVERSE_CLEAR_MPS)
+            rman = ReverseManeuver(fwd_gear=fwd_gear)
+            print(f"[fsd-drive] runtime={stack.mode} FSD pipeline driving "
+                  f"for {args.seconds}s at {args.speed} m/s "
+                  f"(lane_mode={args.lane_mode})")
+
+            prev_steer = 0.0  # rate-limited steering state (rule-autopilot convention)
+            watchdog_lost = False
+            map_mc_smooth = None   # EMA-smoothed map-prior lane centre
+            end_plc_cache = None   # (own-lane centre xy, t_seen) last-good
+                                   # perception anchor for the end zone
+            plc_corr = PaintedLineLateralCorrector(
+                max_shift_m=PLC_MAX_SHIFT_M, horizon_m=PLC_HORIZON_M,
+                rate_m_s=PLC_RATE_MPS, hold_s=PLC_HOLD_S,
+                min_speed_mps=PLC_MIN_SPEED_MPS)
+            last_h = None      # previous heading for the yaw-rate steering damper
+            climb_t = 0.0      # seconds spent in slope-creep assist
+            stuck_t = 0.0    # seconds at near-standstill with a "safe" plan
+            sig_rule_state = None   # game signal state on the current link
+            sig_rule_t = 0.0        # last road-link signal poll time
+            rev_thr = REV_THR_BASE  # reverse-escape throttle ramp state
+            t_end = time.time() + args.seconds
+            frames = 0
+            stopps = 0
+            t0 = time.time()
+            warmup_until = time.time() + WARMUP_S
+            target_sm = float(args.speed)
+            plan_sm = float(args.speed)
+            prev_thr = 0.0
+            prev_brk = 0.0
+            gov_brake = False
+            # First-frame steering: with last_t set to NOW the first tick has
+            # dt ~= 0, smooth_steer cannot move the wheel, and the car runs
+            # the whole first ~7 m straight past the corner entry before any
+            # steering appears (fix50: steer stayed -0.02 while the car went
+            # from the spawn to (726.9,756.8)).  Pretend one control interval
+            # has already elapsed so the first frame can steer immediately.
+            last_t = time.time() - 1.5
+            # Static full-route geometry: the nav route never changes during
+            # a run, so dedup/extend/round/resample + arc lengths + per-vertex
+            # radii are computed ONCE before the loop instead of every frame
+            # (the old per-frame rebuild of the whole rounded route cost
+            # ~10-20 ms on a long route, plus a repeated curvature scan for
+            # the bend governor).
+            route_round = None
+            route_arc = None
+            route_rad = None
+            if nav_route is not None and len(nav_route) >= 4:
+                try:
+                    from beamng_autopilot.planning.local_route import (
+                        _dedup as _rdd, _extend_back as _reb,
+                        _round_corners as _rrc, _resample as _rrs,
+                        CORNER_RADIUS_M as _CR, CORNER_RESAMPLE_M as _CSM)
+                    route_round = _rrs(_rrc(_reb(_rdd(nav_route[:, :2])), _CR),
+                                       _CSM)
+                    route_arc = np.concatenate(
+                        [[0.0], np.cumsum(np.linalg.norm(
+                            np.diff(route_round, axis=0), axis=1))])
+                    _rv1 = np.diff(route_round, axis=0)
+                    _rn1 = np.linalg.norm(_rv1, axis=1)
+                    _rn2 = _rn1[1:]
+                    _rcr = (_rv1[:-1, 0] * _rv1[1:, 1]
+                            - _rv1[:-1, 1] * _rv1[1:, 0])
+                    _rcurv = 2.0 * np.abs(_rcr) / (
+                        _rn1[:-1] * _rn2 * (_rn1[:-1] + _rn2))
+                    route_rad = np.full(len(route_round), np.inf)
+                    _rm = _rcurv > 1e-6
+                    route_rad[1:-1][_rm] = 1.0 / _rcurv[_rm]
+                except Exception:
+                    route_round = route_arc = route_rad = None
+            # Shadow episode + telemetry history are initialised HERE (before
+            # the placement/pre-warm section): the end-of-run finally writes
+            # telemetry, so these must exist even when the placement aborts
+            # the run early (the 2026-09-06 UnboundLocalError masked the real
+            # placement failure).
+            _ema_tick = 0.35          # adaptive tick-budget EMA (seeded: a
+                                      # typical warm tick is ~0.3-0.4 s)
+            while time.time() < t_end:
+                try:
+                    if not wd_heartbeat(conn):
+                        watchdog_lost = True
+                        print("[fsd-drive] WATCHDOG HEARTBEAT LOST; "
+                              "braking and aborting", flush=True)
+                        conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                                     gear=fwd_gear, parkingbrake=1.0)
+                        conn.step(5)
+                        break
+                except Exception as exc:
+                    watchdog_lost = True
+                    print(f"[fsd-drive] WATCHDOG HEARTBEAT ERROR; "
+                          f"braking and aborting: {exc}", flush=True)
                     try:
-                        _a_new = np.concatenate([[0.0], np.cumsum(
-                            np.linalg.norm(np.diff(_mc, axis=0), axis=1))])
-                        _a_old = np.concatenate([[0.0], np.cumsum(
-                            np.linalg.norm(np.diff(map_mc_smooth, axis=0),
-                                           axis=1))])
-                        _al = np.empty_like(_mc)
-                        for _j in range(len(_mc)):
-                            _k = int(np.clip(np.searchsorted(
-                                _a_old, _a_new[_j]), 0,
-                                len(map_mc_smooth) - 1))
-                            _al[_j] = map_mc_smooth[_k]
-                        _mc = _al * (1.0 - MAP_LANE_EMA) + _mc * MAP_LANE_EMA
+                        conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                                     gear=fwd_gear, parkingbrake=1.0)
+                        conn.step(5)
                     except Exception:
                         pass
-                map_mc_smooth = _mc.copy()
-                map_lane = (_mc, map_lane[1], map_lane[2])
-            # End-of-route remaining distance, measured on the FULL nav
-            # route (arc from the ego's projection to the route END).
-            # The old end-stop checked route_local[-1] against
-            # nav_route[-1]; right at the end the local window collapses
-            # to a straight fallback (its last point jumps ~40 m away),
-            # so rem_end became None exactly at the goal, the end-stop
-            # released, and the car crept onto the centre line and
-            # parked ON it (opt17: lat_left 0.00 -> +0.97 inside oncoming
-            # -> parked lat_left 0.00).  Computed here so the steering
-            # zone override and the target cap both use it.
-            rem_end = None
-            if nav_route is not None and len(nav_route) >= 2:
-                try:
-                    _r2 = np.asarray(nav_route[:, :2], dtype=float)
-                    _arc2 = np.concatenate([[0.0], np.cumsum(np.linalg.norm(
-                        np.diff(_r2, axis=0), axis=1))])
-                    _proj2 = _project_arc(_r2, pos[:2])
-                    rem_end = float(max(0.0, _arc2[-1] - _proj2))
-                except Exception:
-                    rem_end = None
-            _ta = time.time()  # local route / map lane / FSD tick split
-            # Adaptive shared time budget for the whole FSD tick (see
-            # TICK_BUDGET_* above): the stack drops to cached outputs
-            # once the tick exceeds the budget so one heavy tick cannot
-            # freeze the control loop.
-            _budget = float(np.clip(
-                _ema_tick * TICK_BUDGET_FRAC,
-                TICK_BUDGET_MIN_S, TICK_BUDGET_MAX_S))
-            out = stack.tick(st=st, route_ref=route_local,
-                             map_lane_override=map_lane,
-                             time_budget_s=_budget)
-            _tb = time.time()
-            _ema_tick = (TICK_BUDGET_EMA * (_tb - _f0)
-                         + (1.0 - TICK_BUDGET_EMA) * _ema_tick)
-            best = out.best_path
-            # Painted centre-line lateral (objective lane-side check).
-            # The semantic LINE mask is back-projected to world markings
-            # ONCE per frame and shared with the steady lateral corrector
-            # below, so a frame of line detection is never done twice.
-            _plmarks = None
-            # funnel counters: WHERE do painted-line frames drop?
-            # (mask -> world markings -> near field) 2026-09-06 diagnosis
-            _pl_mask = _pl_marks = _pl_near = False
-            if out is not None and out.cam is not None and                     getattr(out, "head_outputs", None):
-                _semx = out.head_outputs.get("semantic")
-                _linem = (getattr(_semx, "masks", {}) or {}).get("line")                     if _semx is not None else None
-                _pl_mask = _linem is not None and bool(
-                    np.asarray(_linem).any())
-                if _pl_mask:
+                    break
+                _f0 = time.time()
+                st = conn.get_state()
+                pos = np.asarray(st.pos, dtype=float)
+                heading = float(st.heading)
+                v = float(st.speed)
+                signed = 0.0
+                if st.vel is not None and st.dir is not None:
+                    signed = float(np.dot(
+                        np.asarray(st.vel[:2], dtype=float),
+                        np.asarray(st.dir[:2], dtype=float)))
+                # Control-loop dt in real time: the sim runs continuously, so
+                # wall time between ticks IS the driving time.  Clamp the
+                # warm-up frames (which can take seconds) so the stuck /
+                # reverse / climb state machines do not count a camera stall
+                # as seconds of standstill (fix53) - dt caps at 0.5 s.
+                now_t = time.time()
+                _wall_dt = max(0.0, now_t - last_t)
+                last_t = now_t
+                dt = min(0.5, max(0.05, _wall_dt))
+                # Long-tick brake guard: if the PREVIOUS tick took too long
+                # the car just drove open-loop for that long.  Brake now
+                # (before the next, possibly long, tick) so no more distance
+                # is added uncontrolled; the tick below re-plans and resumes.
+                if _wall_dt > STALE_CTRL_S and v > 1.0:
                     try:
-                        _plmarks = painted_line_markings(
-                            _semx, out.cam, pos, float(heading),
-                            ground_z=(float(pos[2])
-                                      - config.EGO_ORIGIN_GROUND_GAP_M
-                                      if len(pos) > 2 else None))
-                        _pl_marks = bool(_plmarks)
-                    except Exception as _ple:
-                        _plmarks = None
-                        print(f"[fsd-drive] painted-line projection "
-                              f"error: {_ple}")
-                    if _pl_marks:
-                        _p2 = np.asarray(pos[:2], dtype=float)
-                        for _mk in _plmarks:
-                            _mw = np.asarray(_mk.world, dtype=float)
-                            if np.linalg.norm(_mw[0, :2] - _p2) < 25.0:
-                                _pl_near = True
-                                break
-            line_lat = _painted_line_lat(out, pos, heading, _plmarks)
-            # Painted centre-line body gate: when the visible marking is
-            # the line LEFT of the ego, project all four body corners
-            # against that actual painted polyline.  This catches the
-            # screenshot case where the left wheel/body is over the line
-            # even though lane_left is absent or not covered.
-            painted_body_cross = False
-            if _plmarks:
-                try:
-                    _fbody = np.array([math.cos(heading), math.sin(heading)])
-                    _lbody = np.array([-_fbody[1], _fbody[0]])
-                    _pbody = np.asarray(pos[:2], dtype=float)
-                    _corners_body = (
-                        _pbody + 2.2 * _fbody + 0.9 * _lbody,
-                        _pbody + 2.2 * _fbody - 0.9 * _lbody,
-                        _pbody - 2.2 * _fbody + 0.9 * _lbody,
-                        _pbody - 2.2 * _fbody - 0.9 * _lbody)
-                    for _mk in _plmarks:
-                        _mw = np.asarray(_mk.world, dtype=float)[:, :2]
-                        _nearw = _mw[np.linalg.norm(_mw - _pbody, axis=1) < 25.0]
-                        if len(_nearw) < 4:
-                            continue
-                        _mlat = float(np.mean((_nearw - _pbody) @ _lbody))
-                        # A marking visibly left of the ego is the centre/
-                        # left boundary under right-hand traffic.  Do not
-                        # treat a right-edge marking as a centreline.
-                        if _mlat <= 0.1:
-                            continue
-                        for _corner in _corners_body:
-                            _clat, _cov = _boundary_lateral(
-                                float(_corner[0]), float(_corner[1]), _mw,
-                                _fbody)
-                            if _cov and _clat > 0.05:
-                                painted_body_cross = True
-                                break
-                        if painted_body_cross:
-                            break
-                except Exception:
-                    painted_body_cross = False
+                        conn.control(throttle=0.0, brake=0.5,
+                                     steering=prev_steer, gear=fwd_gear)
+                    except Exception:
+                        pass
+                rev_brk, reversing = rguard.decide(signed, dt=dt)
+                # Yaw rate for the steering damper: a low-speed car at full
+                # lock keeps rotating for seconds after the wheel is centred
+                # (the fix37/38 loop - the car swung -130 deg around the
+                # junction because the bang-bang pursuit had no damping).
+                yaw_rate = 0.0
+                if last_h is not None and dt > 0.05:
+                    _d = float(heading) - float(last_h)
+                    _d = (_d + math.pi) % (2.0 * math.pi) - math.pi
+                    yaw_rate = _d / dt
+                last_h = float(heading)
 
-            # safety arbitration on the chosen path: evaluate against the
-            # tick's FUSED occupancy (the planner's own vector space), not
-            # a fresh empty grid - an empty grid read every path as
-            # "grazes obstacle" and kicked the FSD path out on the first
-            # bend (observed town run 2026-08-21).
-            grid = OccupancyGrid(stack.grid_n, stack.grid_n,
-                                 stack.grid_res,
-                                 origin=(float(pos[0]), float(pos[1])),
-                                 heading=heading)
-            # Lane reference for the safety monitor: prefer the stack's
-            # vision/LiDAR drivable centreline (the lane the planner
-            # actually follows); the map nav route only when the sensor
-            # lane is not available.
-            local = route_local
-            if out.lane_ref is not None and len(out.lane_ref) >= 4:
-                local = np.asarray(out.lane_ref, dtype=float)
-            if out.bev is not None and out.bev.shape == grid.occupancy.shape:
-                grid.occupancy[:] = np.asarray(out.bev, dtype=np.float32)
-                grid.obstacle[:] = (np.asarray(out.bev) >= 0.6
-                                    ).astype(np.uint8)
-                if out.drivable is not None and \
-                        out.drivable.shape == grid.drivable.shape:
-                    grid.drivable[:] = np.asarray(out.drivable)
-                if out.observed is not None and \
-                        out.observed.shape == grid.drivable.shape:
-                    grid.observed[:] = np.asarray(out.observed)
-                scene = Scene(pos=pos, heading=heading, grid=grid,
-                              route=local,
-                              lane_ref=local,
-                              lane_left=out.lane_left,
-                              lane_right=out.lane_right,
-                              lane_width=out.lane_width,
-                              lane_envelope=getattr(out, "lane_envelope", None),
-                              perception_snapshot=getattr(out, "snapshot", None),
-                              meta=dict(getattr(out, "meta", {}) or {}),
-                              target_speed=args.speed)
-                verd = monitor.evaluate(scene, best,
-                                        planner_age_s=0.0,
-                                        snapshot_age_s=_sensor_snapshot_age(out))
-            else:
-                verd = monitor.evaluate(Scene(pos=pos, heading=heading),
-                                        best)
-            _tc = time.time()
-
-            # Neural (E2E) planner candidate: the trained end-to-end
-            # network consumes the same perception the layered planner
-            # saw (front RGB + segmentation label + BEV) and regresses
-            # an ego-relative trajectory, inverse-transformed to world
-            # here.  It is arbitrated BELOW the layered planner but
-            # ABOVE the map/rule fallback - a real FSD stack ranks its
-            # neural planner over the kinematic backup.  Only the
-            # trajectory steers the car; the net's raw action is
-            # telemetry-only, and the safety monitor re-verifies the
-            # path before arbitration can select it.
-            e2e_path = None
-            e2e_safe = False
-            e2e_ms = None
-            e2e_act = None
-            e2e_ext = None
-            _ve = None
-            if e2e_rt is not None:
-                try:
-                    e2e_path, e2e_act, e2e_ms = e2e_rt.step(
-                        getattr(out, "snapshot", None) or out,
-                        pos, heading, float(v))
-                    if e2e_path is not None and len(e2e_path) >= 2:
-                        _ve = monitor.evaluate(scene, e2e_path,
-                                               planner_age_s=0.0,
-                                               snapshot_age_s=
-                                               _sensor_snapshot_age(out))
-                        e2e_safe = bool(_ve.safe)
-                        e2e_ext = float(np.hypot(
-                            e2e_path[-1, 0] - pos[0],
-                            e2e_path[-1, 1] - pos[1]))
-                except Exception:
-                    e2e_path = None
-                    e2e_safe = False
-
-            # DAVE-2 imitation-learned steering (M3 BC): the net predicts
-            # a normalized steering value from the front frame; rolled
-            # into a constant-curvature arc it becomes a regular candidate
-            # path the safety monitor verifies, ranked below the E2E
-            # planner and above the rule backup (same neural-above-rule
-            # ordering).
-            bc_path = None
-            bc_safe = False
-            bc_ms = None
-            bc_steer = None
-            if bc_rt is not None:
-                try:
-                    bc_steer, bc_ms = bc_rt.predict_steer(out.frame)
-                    if bc_steer is not None:
-                        bc_path = steer_to_path(
-                            bc_steer, pos, heading,
-                            wheelbase=float(pp.wheelbase))
-                        if bc_path is not None and len(bc_path) >= 2:
-                            _vb = monitor.evaluate(scene, bc_path,
-                                                   planner_age_s=0.0,
-                                                   snapshot_age_s=
-                                                   _sensor_snapshot_age(out))
-                            bc_safe = bool(_vb.safe)
-                        else:
-                            bc_path = None
-                except Exception:
-                    bc_path = None
-                    bc_safe = False
-
-            _cls = out.meta.get("cls_counts", {})
-            _cls_near = out.meta.get("cls_nearest", {})
-            # planner arbitration: FSD path first; when the layered
-            # planner declined (even to minimal risk) fall back to the
-            # rule straight-ahead reference IN WORLD COORDINATES - the
-            # car must not stop dead on a transient "no drivable path"
-            # unless the rule path is also unusable (then and only then
-            # a minimal-risk stop).  A body-frame reference handed to
-            # PurePursuit points at a wrong world target and spins the
-            # car (the "dumb reversing" seen in probes).
-            # The rule fallback must also be a path the car can actually
-            # drive from here: anchored at the ego and heading forward.  A
-            # mis-anchored map prior sitting metres away must not be an
-            # excuse to push the wall - when no drivable path exists, the
-            # correct FSD behaviour is a minimal-risk stop (town runs
-            # 2026-08-21 pushed a wall under a far-away route reference).
-            # Proven rule-autopilot fallback: the LocalPlanner rounds
-            # switchback corners and keeps the car in its own lane, so the
-            # FSD drive does not stop dead at a hairpin apex when the
-            # layered planner declines every kinked map-prior candidate.
-            # The path must still be ego-anchored and head forward; the
-            # FSD safety monitor re-verifies it below (and can stop).
-            rule_ref = None
-            _need_rule = (best is None or len(best) < 2 or not verd.safe)
-            # FSD realism (strict): with no PAIRED perception lane the
-            # car must stop, not drive the map/nav route through the rule
-            # fallback (docs/fsd_realism.md §4).  The rule planner below
-            # is exactly that map fallback, so it is disabled here.
-            _strict_no_lane = bool(args.strict and
-                                   str(out.meta.get("lane_src_sel", ""))
-                                   != "sensor")
-            if _strict_no_lane:
-                _need_rule = False
-            if _need_rule and nav_route is not None and len(nav_route) >= 2:
-                try:
-                    _fwd = (np.asarray(st.dir[:2], dtype=float)
-                            if st.dir is not None else np.array(
-                                [math.cos(heading), math.sin(heading)]))
-                    _nidx = nearest_route_point(nav_route[:, :2], pos, _fwd)
-                    _rd, _rblk = rule_planner.plan(
-                        np.asarray(nav_route[:, :2], dtype=float), [],
-                        pos, heading, _nidx,
-                        sensor_lane=None, road_rule=None, cross_solid=False)
-                    if _rd is not None and len(_rd) >= 2 and not _rblk:
-                        rule_ref = anchored_rule_ref(
-                            pos, heading, np.asarray(_rd, dtype=float)[:, :2])
-                except Exception:
-                    rule_ref = None
-            chosen = arbitrate(
-                best, rule_ref,
-                fsd_safe=verd.safe and best is not None and len(best) >= 2,
-                e2e_path=e2e_path,
-                e2e_safe=e2e_safe,
-                bc_path=bc_path,
-                bc_safe=bc_safe,
-                prefer_rule=False)
-            # Re-verify the verdict against the path the car actually
-            # runs: the FSD verdict above was computed on the FSD best
-            # (which may be None / minimal-risk).  Arbitration then
-            # handed a drivable rule path to control, but the old
-            # minimal-risk stop stayed latched and braked the fallback
-            # to a standstill every frame (run_fix6: src=rule with
-            # brk=1.0 and v=0 for 60 s after a transient no-path frame).
-            if chosen.path is not None and len(chosen.path) >= 2 and \
-                    (best is None or len(best) < 2 or not verd.safe):
-                try:
-                    if chosen.source == "e2e" and _ve is not None:
-                        # already verified this tick against the same
-                        # scene; reuse to avoid a second evaluation
-                        verd = _ve
-                    else:
-                        verd = monitor.evaluate(scene, chosen.path,
-                                                planner_age_s=0.0,
-                                                snapshot_age_s=
-                                                _sensor_snapshot_age(out))
-                except Exception:
-                    pass
-            # End-zone steering reference: inside the final stop zone the
-            # raw route tail sits ON the road centre line at the
-            # destination (the road ends / edges swap there) and the
-            # near-end map lane can collapse onto the centreline -
-            # following it parked the car ON the line (opt17: lat_left
-            # 0.00 -> +0.97 inside oncoming -> parked lat_left 0.00).
-            # The stop reference is therefore a STRAIGHT ray whose
-            # LATERAL anchor comes from the perceived painted line
-            # (own-lane centre - perception only, no nav-route offset),
-            # and which falls back to holding the current heading when
-            # no line is visible, so the car brakes to a stop centred
-            # in its lane instead of turning onto the line.
-            steer_path = chosen.path
-            _end_ref = 0  # 0=straight hold 1=last-good perception hold
-                          # 2=live perception (telemetry)
-            _dir_src = "none"
-            if rem_end is not None and rem_end < END_PULL_START_M:
-                _bear = None
-                _anchor = np.asarray(pos[:2], dtype=float)
-                # Perception-only end-zone lateral reference (FSD
-                # realism rule 2026-09-03: lateral placement from a
-                # nav route + offset is BANNED - a real self-driving
-                # stack puts the car where the SENSORS say its lane
-                # is).  When the semantic head sees the painted line,
-                # aim the straight stop reference at the perceived
-                # own-lane centre (line right side + lane half width,
-                # the same perception helper as the start placement),
-                # so the final stop converges into the lane instead of
-                # riding the route centreline.  If the line is
-                # invisible (faded / degenerate road end) the car keeps
-                # converging to the LAST perceived own-lane centre for
-                # a short window, and only falls back to holding the
-                # current heading straight when that expires - still no
-                # map lateral pull anywhere in the chain.
-                _plc = None
-                try:
-                    _sem = (out.head_outputs.get("semantic")
-                            if out is not None
-                            and getattr(out, "head_outputs", None)
-                            else None)
-                    if _sem is not None and out.cam is not None:
-                        # Own-lane centre = line right side + measured
-                        # lane half width.  The half width comes from the
-                        # PAIRED sensor lane when it is live (perception),
-                        # else the same 1.5 m default as start placement -
-                        # never a map-centre offset constant.
-                        _lh = 1.5
+                # one full FSD tick -> best trajectory (planned along the
+                # LOCAL forward route anchored at the ego; the full nav
+                # route tail is a map prior that can cut through a corner
+                # wall when the car drifts (town runs 2026-08-21) - the
+                # local forward route is what the planner may follow.
+                route_local = local_route(pos, heading, nav_route)
+                # Strict FSD never even builds the map-prior lane: the
+                # route is navigation intent, not a lateral reference.
+                _strict_lane = bool(
+                    getattr(args, "strict", False)
+                    and str(getattr(args, "lane_mode", "map")) == "sensor")
+                map_lane = None
+                if not _strict_lane and road_left is not None \
+                        and road_right is not None:
+                    try:
+                        map_lane = map_lane_edges(
+                            nav_route, road_left, road_right, pos, heading)
+                    except Exception:
+                        map_lane = None
+                if map_lane is not None:
+                    _mc = np.asarray(map_lane[0], dtype=float)[:, :2]
+                    if map_mc_smooth is not None and len(_mc) >= 3 \
+                            and len(map_mc_smooth) >= 3:
                         try:
-                            if out is not None:
-                                _lw = float(getattr(out, "lane_width",
-                                                    0.0) or 0.0)
-                                _sel = str(out.meta.get("lane_src_sel", ""))
-                                if _lw >= 2.4 and _sel == "sensor":
-                                    _lh = float(np.clip(_lw / 2.0,
-                                                        1.2, 2.6))
+                            _a_new = np.concatenate([[0.0], np.cumsum(
+                                np.linalg.norm(np.diff(_mc, axis=0), axis=1))])
+                            _a_old = np.concatenate([[0.0], np.cumsum(
+                                np.linalg.norm(np.diff(map_mc_smooth, axis=0),
+                                               axis=1))])
+                            _al = np.empty_like(_mc)
+                            for _j in range(len(_mc)):
+                                _k = int(np.clip(np.searchsorted(
+                                    _a_old, _a_new[_j]), 0,
+                                    len(map_mc_smooth) - 1))
+                                _al[_j] = map_mc_smooth[_k]
+                            _mc = _al * (1.0 - MAP_LANE_EMA) + _mc * MAP_LANE_EMA
                         except Exception:
-                            _lh = 1.5
-                        _plc = painted_line_lane_center(
-                            _sem, out.cam, pos, float(heading),
-                            ground_z=(float(pos[2])
-                                      - config.EGO_ORIGIN_GROUND_GAP_M
-                                      if len(pos) > 2 else None),
-                            lane_half_m=_lh, marks=_plmarks)
-                except Exception:
-                    _plc = None
-                # Travel orientation for the stop ray - PERCEPTION FIRST,
-                # never a lateral offset.  1) the painted line's own
-                # direction (the sensors' answer to "which way is my
-                # lane"); 2) the paired sensor lane centreline's local
-                # heading; 3) the nav route tangent as a plain
-                # orientation fallback (the route tail folds onto the
-                # centreline at road ends, which is exactly why the nose
-                # used to park angled); 4) the current heading.
-                _dir3 = None
-                if out is not None:
+                            pass
+                    map_mc_smooth = _mc.copy()
+                    map_lane = (_mc, map_lane[1], map_lane[2])
+                # End-of-route remaining distance, measured on the FULL nav
+                # route (arc from the ego's projection to the route END).
+                # The old end-stop checked route_local[-1] against
+                # nav_route[-1]; right at the end the local window collapses
+                # to a straight fallback (its last point jumps ~40 m away),
+                # so rem_end became None exactly at the goal, the end-stop
+                # released, and the car crept onto the centre line and
+                # parked ON it (opt17: lat_left 0.00 -> +0.97 inside oncoming
+                # -> parked lat_left 0.00).  Computed here so the steering
+                # zone override and the target cap both use it.
+                rem_end = None
+                if nav_route is not None and len(nav_route) >= 2:
                     try:
-                        if _sem is not None and out.cam is not None:
-                            _pd = painted_line_direction(
-                                _sem, out.cam, pos, float(heading),
+                        _r2 = np.asarray(nav_route[:, :2], dtype=float)
+                        _arc2 = np.concatenate([[0.0], np.cumsum(np.linalg.norm(
+                            np.diff(_r2, axis=0), axis=1))])
+                        _proj2 = _project_arc(_r2, pos[:2])
+                        rem_end = float(max(0.0, _arc2[-1] - _proj2))
+                    except Exception:
+                        rem_end = None
+                _ta = time.time()  # local route / map lane / FSD tick split
+                # Adaptive shared time budget for the whole FSD tick (see
+                # TICK_BUDGET_* above): the stack drops to cached outputs
+                # once the tick exceeds the budget so one heavy tick cannot
+                # freeze the control loop.
+                _budget = float(np.clip(
+                    _ema_tick * TICK_BUDGET_FRAC,
+                    TICK_BUDGET_MIN_S, TICK_BUDGET_MAX_S))
+                out = stack.tick(st=st, route_ref=route_local,
+                                 map_lane_override=map_lane,
+                                 time_budget_s=_budget)
+                _tb = time.time()
+                _ema_tick = (TICK_BUDGET_EMA * (_tb - _f0)
+                             + (1.0 - TICK_BUDGET_EMA) * _ema_tick)
+                best = out.best_path
+                # Painted centre-line lateral (objective lane-side check).
+                # The semantic LINE mask is back-projected to world markings
+                # ONCE per frame and shared with the steady lateral corrector
+                # below, so a frame of line detection is never done twice.
+                _plmarks = None
+                # funnel counters: WHERE do painted-line frames drop?
+                # (mask -> world markings -> near field) 2026-09-06 diagnosis
+                _pl_mask = _pl_marks = _pl_near = False
+                if out is not None and out.cam is not None and                     getattr(out, "head_outputs", None):
+                    _semx = out.head_outputs.get("semantic")
+                    _linem = (getattr(_semx, "masks", {}) or {}).get("line")                     if _semx is not None else None
+                    _pl_mask = _linem is not None and bool(
+                        np.asarray(_linem).any())
+                    if _pl_mask:
+                        try:
+                            _plmarks = painted_line_markings(
+                                _semx, out.cam, pos, float(heading),
                                 ground_z=(float(pos[2])
                                           - config.EGO_ORIGIN_GROUND_GAP_M
                                           if len(pos) > 2 else None))
-                            if _pd is not None:
-                                _dir3 = np.asarray(_pd[:2], dtype=float)
-                                _dir_src = "painted"
-                        if _dir3 is None and \
-                                str(out.meta.get("lane_src_sel", "")) \
-                                == "sensor":
-                            # Sensor lane centreline local heading; sanity-
-                            # gate it to the travel direction so a stray
-                            # geometry read cannot aim the stop sideways.
-                            _dl = polyline_dir_at(out.lane_ref, _anchor)
-                            _hf = np.array([math.cos(float(heading)),
-                                            math.sin(float(heading))])
-                            if _dl is not None and \
-                                    float(_dl @ _hf) >= 0.5:
-                                _dir3 = _dl
-                                _dir_src = "sensor_lane"
-                    except Exception:
-                        _dir3 = None
-                if _dir3 is None:
-                    _nav_ref = nav_route_ref if nav_route_ref is not None \
-                        else nav_route
-                    if _nav_ref is not None and len(_nav_ref) >= 4:
-                        _r3 = np.asarray(_nav_ref[:, :2], dtype=float)
-                        _d3 = np.linalg.norm(
-                            _r3 - _anchor[None, :], axis=1)
-                        _i3 = int(np.argmin(_d3))
-                        _i3a = max(0, _i3 - 2)
-                        _i3b = min(len(_r3) - 1, _i3 + 2)
-                        _tv3 = _r3[_i3b] - _r3[_i3a]
-                        _L3 = float(np.linalg.norm(_tv3))
-                        if _L3 > 1e-9:
-                            _dir3 = _tv3 / _L3
-                            _dir_src = "route"
-                if _dir3 is None:
-                    _dir3 = np.array([math.cos(float(heading)),
-                                      math.sin(float(heading))])
-                _ref_xy = None
-                if _plc is not None:
-                    _ref_xy = np.asarray(_plc, dtype=float)[:2]
-                    end_plc_cache = (_ref_xy, time.time())
-                    _end_ref = 2
-                elif end_plc_cache is not None:
-                    # Line dropout: reuse the last perceived own-lane
-                    # centre while it is still fresh AND the car is
-                    # still near the same lane line (pedal to the
-                    # cached straight reference, projected ahead of the
-                    # ego), so the stop keeps converging instead of
-                    # freezing at the entry offset.
-                    _cxy, _t_seen = end_plc_cache
-                    _age = time.time() - float(_t_seen)
-                    _s_proj = float((_anchor - _cxy) @ _dir3)
-                    _perp = float((_anchor - _cxy)
-                                  @ np.array([-_dir3[1], _dir3[0]]))
-                    if _age <= END_PLC_HOLD_S \
-                            and _s_proj >= -1.0 \
-                            and _s_proj <= END_PLC_MAX_FWD_M \
-                            and abs(_perp) <= END_PLC_MAX_LAT_M:
-                        _ref_xy = _cxy
-                        _end_ref = 1
-                if _ref_xy is not None:
-                    _tgt3 = _ref_xy + _dir3 * 5.0
-                    _v3 = _tgt3 - _anchor
-                    if float(np.linalg.norm(_v3)) > 1e-6:
-                        _bear = float(math.atan2(_v3[1], _v3[0]))
-                if _bear is None:
-                    # No live line, no fresh last-good anchor: hold the
-                    # current heading straight instead of following the
-                    # degenerate tail or any map prior.
-                    _bear = float(heading)
-                _f3 = np.array([math.cos(_bear), math.sin(_bear)])
-                steer_path = _anchor + _f3 * np.arange(
-                    0.0, 8.0, 0.8)[:, None]
-            # Steady painted-line lateral corrector (cruising only): the
-            # end zone above already owns its perception reference, so the
-            # nudge engages while the car is driving normally.  When the
-            # map lane keeps leading (lane_src_sel != sensor) but the
-            # semantic LINE mask gives a confident own-lane centre, shift
-            # the near path toward it at a bounded rate - perception pulls
-            # the car into its own lane instead of hugging the centre
-            # line.  The corrector holds the last perceived shift across a
-            # line dropout and decays it, so the car never jerks back to
-            # the map prior mid-line.  Rule-source frames (FSD declined,
-            # obstacle/unsafe fallback) must not get a superimposed
-            # centring pull - the fallback path already carries its own
-            # avoidance shape, so the shift just holds then decays.
-            _plc_shift = 0.0
-            _plc_desired = None
-            plc_rejected = False
-            _plc_active = painted_line_correction_active(
-                str(out.meta.get("lane_src_sel", "")),
-                str(chosen.source),
-                rem_end, END_PULL_START_M)
-            if _plc_active:
-                try:
-                    _sem0 = (out.head_outputs.get("semantic")
-                             if out is not None
-                             and getattr(out, "head_outputs", None)
-                             else None)
-                    if _sem0 is not None and out.cam is not None:
-                        _olc = painted_line_lane_center(
-                            _sem0, out.cam, pos, float(heading),
-                            ground_z=(float(pos[2])
-                                      - config.EGO_ORIGIN_GROUND_GAP_M
-                                      if len(pos) > 2 else None),
-                            marks=_plmarks)
-                        if _olc is not None:
-                            _plc_desired = plc_corr.desired_shift(
-                                _olc, pos, float(heading),
-                                max_shift_m=PLC_MAX_SHIFT_M)
-                except Exception:
-                    pass
-                _plc_shift = plc_corr.update(_plc_desired, dt, v)
-                if steer_path is not None \
-                        and abs(_plc_shift) >= PLC_MIN_ENGAGE_M:
-                    steer_path = plc_corr.apply(
-                        steer_path, pos, float(heading))
-                    # PLC is a post-processing transform.  Re-run the same
-                    # full-body/occupancy safety contract after shifting;
-                    # the monitor verdict made on the pre-shift path is no
-                    # longer sufficient.
+                            _pl_marks = bool(_plmarks)
+                        except Exception as _ple:
+                            _plmarks = None
+                            print(f"[fsd-drive] painted-line projection "
+                                  f"error: {_ple}")
+                        if _pl_marks:
+                            _p2 = np.asarray(pos[:2], dtype=float)
+                            for _mk in _plmarks:
+                                _mw = np.asarray(_mk.world, dtype=float)
+                                if np.linalg.norm(_mw[0, :2] - _p2) < 25.0:
+                                    _pl_near = True
+                                    break
+                line_lat = _painted_line_lat(out, pos, heading, _plmarks)
+                # Painted centre-line body gate: when the visible marking is
+                # the line LEFT of the ego, project all four body corners
+                # against that actual painted polyline.  This catches the
+                # screenshot case where the left wheel/body is over the line
+                # even though lane_left is absent or not covered.
+                painted_body_cross = False
+                if _plmarks:
                     try:
-                        _plc_v = monitor.evaluate(
+                        _fbody = np.array([math.cos(heading), math.sin(heading)])
+                        _lbody = np.array([-_fbody[1], _fbody[0]])
+                        _pbody = np.asarray(pos[:2], dtype=float)
+                        _corners_body = footprint_corners(
+                            _pbody, float(heading))
+                        for _mk in _plmarks:
+                            _mw = np.asarray(_mk.world, dtype=float)[:, :2]
+                            _nearw = _mw[np.linalg.norm(_mw - _pbody, axis=1) < 25.0]
+                            if len(_nearw) < 4:
+                                continue
+                            _mlat = float(np.mean((_nearw - _pbody) @ _lbody))
+                            # A marking visibly left of the ego is the centre/
+                            # left boundary under right-hand traffic.  Do not
+                            # treat a right-edge marking as a centreline.
+                            if _mlat <= 0.1:
+                                continue
+                            for _corner in _corners_body:
+                                _clat, _cov = _boundary_lateral(
+                                    float(_corner[0]), float(_corner[1]), _mw,
+                                    _fbody)
+                                if _cov and _clat > 0.05:
+                                    painted_body_cross = True
+                                    break
+                            if painted_body_cross:
+                                break
+                    except Exception:
+                        painted_body_cross = False
+
+                # safety arbitration on the chosen path: evaluate against the
+                # SAME world model the planner planned against - one Scene
+                # per tick.  Rebuilding it here let the two layers disagree
+                # about the lane reference (the rebuild fed the BEV
+                # whole-road centre, i.e. the two-way centre line, into the
+                # safety lateral check while the planner used the own lane).
+                # The rebuild below survives only as the fallback for stubs
+                # that publish no Scene (docs/fsd_realism.md §2/§4).
+                _strict_perc = _strict_lane
+                scene = getattr(out, "scene", None)
+                if scene is not None:
+                    grid = scene.grid
+                    verd = monitor.evaluate(
+                        scene, best, planner_age_s=0.0,
+                        snapshot_age_s=_sensor_snapshot_age(out))
+                else:
+                    grid = OccupancyGrid(stack.grid_n, stack.grid_n,
+                                         stack.grid_res,
+                                         origin=(float(pos[0]), float(pos[1])),
+                                         heading=heading)
+                    # Fallback lane reference: the stack's own-lane centre
+                    # when available; never the map route in strict mode.
+                    lane_local = (np.asarray(out.lane_ref, dtype=float)
+                                  if out.lane_ref is not None
+                                  and len(out.lane_ref) >= 4
+                                  else (None if _strict_perc
+                                        else route_local))
+                    if out.bev is not None and \
+                            out.bev.shape == grid.occupancy.shape:
+                        grid.occupancy[:] = np.asarray(out.bev, dtype=np.float32)
+                        grid.obstacle[:] = (np.asarray(out.bev) >= 0.6
+                                            ).astype(np.uint8)
+                        if out.drivable is not None and \
+                                out.drivable.shape == grid.drivable.shape:
+                            grid.drivable[:] = np.asarray(out.drivable)
+                        if out.observed is not None and \
+                                out.observed.shape == grid.drivable.shape:
+                            grid.observed[:] = np.asarray(out.observed)
+                        scene = Scene(pos=pos, heading=heading, grid=grid,
+                                      route=route_local,
+                                      lane_ref=lane_local,
+                                      lane_left=out.lane_left,
+                                      lane_right=out.lane_right,
+                                      lane_width=out.lane_width,
+                                      lane_envelope=getattr(
+                                          out, "lane_envelope", None),
+                                      perception_snapshot=getattr(
+                                          out, "snapshot", None),
+                                      meta=dict(getattr(out, "meta", {}) or {}),
+                                      target_speed=args.speed,
+                                      strict_perception=_strict_perc)
+                        verd = monitor.evaluate(
+                            scene, best, planner_age_s=0.0,
+                            snapshot_age_s=_sensor_snapshot_age(out))
+                    else:
+                        scene = Scene(pos=pos, heading=heading)
+                        verd = monitor.evaluate(scene, best)
+                _tc = time.time()
+
+                # Neural (E2E) planner candidate: the trained end-to-end
+                # network consumes the same perception the layered planner
+                # saw (front RGB + segmentation label + BEV) and regresses
+                # an ego-relative trajectory, inverse-transformed to world
+                # here.  It is arbitrated BELOW the layered planner but
+                # ABOVE the map/rule fallback - a real FSD stack ranks its
+                # neural planner over the kinematic backup.  Only the
+                # trajectory steers the car; the net's raw action is
+                # telemetry-only, and the safety monitor re-verifies the
+                # path before arbitration can select it.
+                e2e_path = None
+                e2e_safe = False
+                e2e_ms = None
+                e2e_act = None
+                e2e_ext = None
+                e2e_reject = ""
+                e2e_val = None
+                _ve = None
+                if e2e_rt is not None:
+                    try:
+                        e2e_path, e2e_act, e2e_ms = e2e_rt.step(
+                            getattr(out, "snapshot", None) or out,
+                            pos, heading, float(v))
+                        e2e_reject = e2e_rt.last_reject
+                        e2e_val = e2e_rt.last_validation
+                        if e2e_path is not None and len(e2e_path) >= 2:
+                            _ve = monitor.evaluate(scene, e2e_path,
+                                                   planner_age_s=0.0,
+                                                   snapshot_age_s=
+                                                   _sensor_snapshot_age(out))
+                            e2e_safe = bool(_ve.safe)
+                            e2e_ext = float(np.hypot(
+                                e2e_path[-1, 0] - pos[0],
+                                e2e_path[-1, 1] - pos[1]))
+                    except Exception:
+                        e2e_path = None
+                        e2e_safe = False
+
+                # DAVE-2 imitation-learned steering (M3 BC): the net predicts
+                # a normalized steering value from the front frame; rolled
+                # into a constant-curvature arc it becomes a regular candidate
+                # path the safety monitor verifies, ranked below the E2E
+                # planner and above the rule backup (same neural-above-rule
+                # ordering).
+                bc_path = None
+                bc_safe = False
+                bc_ms = None
+                bc_steer = None
+                bc_reject = ""
+                bc_val = None
+                if bc_rt is not None:
+                    try:
+                        bc_steer, bc_ms = bc_rt.predict_steer(out.frame)
+                        if bc_steer is not None:
+                            bc_path = steer_to_path(
+                                bc_steer, pos, heading,
+                                wheelbase=float(pp.wheelbase))
+                            bc_val = validate_learned_path(
+                                bc_path, origin=pos,
+                                forward=(math.cos(heading),
+                                         math.sin(heading)))
+                            if not bc_val.ok:
+                                bc_reject = bc_val.reason
+                                bc_path = None
+                            if bc_path is not None and len(bc_path) >= 2:
+                                _vb = monitor.evaluate(scene, bc_path,
+                                                       planner_age_s=0.0,
+                                                       snapshot_age_s=
+                                                       _sensor_snapshot_age(out))
+                                bc_safe = bool(_vb.safe)
+                            else:
+                                bc_path = None
+                    except Exception:
+                        bc_path = None
+                        bc_safe = False
+
+                _cls = out.meta.get("cls_counts", {})
+                _cls_near = out.meta.get("cls_nearest", {})
+                # planner arbitration: FSD path first; when the layered
+                # planner declined (even to minimal risk) fall back to the
+                # rule straight-ahead reference IN WORLD COORDINATES - the
+                # car must not stop dead on a transient "no drivable path"
+                # unless the rule path is also unusable (then and only then
+                # a minimal-risk stop).  A body-frame reference handed to
+                # PurePursuit points at a wrong world target and spins the
+                # car (the "dumb reversing" seen in probes).
+                # The rule fallback must also be a path the car can actually
+                # drive from here: anchored at the ego and heading forward.  A
+                # mis-anchored map prior sitting metres away must not be an
+                # excuse to push the wall - when no drivable path exists, the
+                # correct FSD behaviour is a minimal-risk stop (town runs
+                # 2026-08-21 pushed a wall under a far-away route reference).
+                # Proven rule-autopilot fallback: the LocalPlanner rounds
+                # switchback corners and keeps the car in its own lane, so the
+                # FSD drive does not stop dead at a hairpin apex when the
+                # layered planner declines every kinked map-prior candidate.
+                # The path must still be ego-anchored and head forward; the
+                # FSD safety monitor re-verifies it below (and can stop).
+                rule_ref = None
+                _need_rule = (best is None or len(best) < 2 or not verd.safe)
+                # FSD realism (strict): with no PAIRED perception lane the
+                # car must stop, not drive the map/nav route through the rule
+                # fallback (docs/fsd_realism.md §4).  The rule planner below
+                # is exactly that map fallback, so it is disabled here.
+                _strict_no_lane = bool(args.strict and
+                                       str(out.meta.get("lane_src_sel", ""))
+                                       != "sensor")
+                if _strict_no_lane:
+                    _need_rule = False
+                if _need_rule and nav_route is not None and len(nav_route) >= 2:
+                    try:
+                        _fwd = (np.asarray(st.dir[:2], dtype=float)
+                                if st.dir is not None else np.array(
+                                    [math.cos(heading), math.sin(heading)]))
+                        _nidx = nearest_route_point(nav_route[:, :2], pos, _fwd)
+                        _rd, _rblk = rule_planner.plan(
+                            np.asarray(nav_route[:, :2], dtype=float), [],
+                            pos, heading, _nidx,
+                            sensor_lane=None, road_rule=None, cross_solid=False)
+                        if _rd is not None and len(_rd) >= 2 and not _rblk:
+                            rule_ref = anchored_rule_ref(
+                                pos, heading, np.asarray(_rd, dtype=float)[:, :2])
+                    except Exception:
+                        rule_ref = None
+                chosen = arbitrate(
+                    best, rule_ref,
+                    fsd_safe=verd.safe and best is not None and len(best) >= 2,
+                    e2e_path=e2e_path,
+                    e2e_safe=e2e_safe,
+                    bc_path=bc_path,
+                    bc_safe=bc_safe,
+                    prefer_rule=False)
+                # Re-verify the verdict against the path the car actually
+                # runs: the FSD verdict above was computed on the FSD best
+                # (which may be None / minimal-risk).  Arbitration then
+                # handed a drivable rule path to control, but the old
+                # minimal-risk stop stayed latched and braked the fallback
+                # to a standstill every frame (run_fix6: src=rule with
+                # brk=1.0 and v=0 for 60 s after a transient no-path frame).
+                if chosen.path is not None and len(chosen.path) >= 2 and \
+                        (best is None or len(best) < 2 or not verd.safe):
+                    try:
+                        if chosen.source == "e2e" and _ve is not None:
+                            # already verified this tick against the same
+                            # scene; reuse to avoid a second evaluation
+                            verd = _ve
+                        else:
+                            verd = monitor.evaluate(scene, chosen.path,
+                                                    planner_age_s=0.0,
+                                                    snapshot_age_s=
+                                                    _sensor_snapshot_age(out))
+                    except Exception:
+                        pass
+                # End-zone steering reference: inside the final stop zone the
+                # raw route tail sits ON the road centre line at the
+                # destination (the road ends / edges swap there) and the
+                # near-end map lane can collapse onto the centreline -
+                # following it parked the car ON the line (opt17: lat_left
+                # 0.00 -> +0.97 inside oncoming -> parked lat_left 0.00).
+                # The stop reference is therefore a STRAIGHT ray whose
+                # LATERAL anchor comes from the perceived painted line
+                # (own-lane centre - perception only, no nav-route offset),
+                # and which falls back to holding the current heading when
+                # no line is visible, so the car brakes to a stop centred
+                # in its lane instead of turning onto the line.
+                steer_path = chosen.path
+                _end_replaced = False   # end zone rewrote the steering path
+                _end_ref = 0  # 0=straight hold 1=last-good perception hold
+                              # 2=live perception (telemetry)
+                _dir_src = "none"
+                # Perception-first travel direction resolved inside the end
+                # zone; hoisted so the final alignment creep can read it
+                # (stays None / "none" while the zone is off).
+                _end_dir3 = None
+                _end_dir_src = "none"
+                if rem_end is not None and rem_end < END_PULL_START_M:
+                    _bear = None
+                    _anchor = np.asarray(pos[:2], dtype=float)
+                    # Perception-only end-zone lateral reference (FSD
+                    # realism rule 2026-09-03: lateral placement from a
+                    # nav route + offset is BANNED - a real self-driving
+                    # stack puts the car where the SENSORS say its lane
+                    # is).  When the semantic head sees the painted line,
+                    # aim the straight stop reference at the perceived
+                    # own-lane centre (line right side + lane half width,
+                    # the same perception helper as the start placement),
+                    # so the final stop converges into the lane instead of
+                    # riding the route centreline.  If the line is
+                    # invisible (faded / degenerate road end) the car keeps
+                    # converging to the LAST perceived own-lane centre for
+                    # a short window, and only falls back to holding the
+                    # current heading straight when that expires - still no
+                    # map lateral pull anywhere in the chain.
+                    _plc = None
+                    try:
+                        _sem = (out.head_outputs.get("semantic")
+                                if out is not None
+                                and getattr(out, "head_outputs", None)
+                                else None)
+                        if _sem is not None and out.cam is not None:
+                            # Own-lane centre = line right side + measured
+                            # lane half width.  The half width comes from the
+                            # PAIRED sensor lane when it is live (perception),
+                            # else the same 1.5 m default as start placement -
+                            # never a map-centre offset constant.
+                            _lh = 1.5
+                            try:
+                                if out is not None:
+                                    _lw = float(getattr(out, "lane_width",
+                                                        0.0) or 0.0)
+                                    _sel = str(out.meta.get("lane_src_sel", ""))
+                                    if _lw >= 2.4 and _sel == "sensor":
+                                        _lh = float(np.clip(_lw / 2.0,
+                                                            1.2, 2.6))
+                            except Exception:
+                                _lh = 1.5
+                            _plc = painted_line_lane_center(
+                                _sem, out.cam, pos, float(heading),
+                                ground_z=(float(pos[2])
+                                          - config.EGO_ORIGIN_GROUND_GAP_M
+                                          if len(pos) > 2 else None),
+                                lane_half_m=_lh, marks=_plmarks)
+                    except Exception:
+                        _plc = None
+                    # Travel orientation for the stop ray - PERCEPTION FIRST,
+                    # never a lateral offset.  1) the painted line's own
+                    # direction (the sensors' answer to "which way is my
+                    # lane"); 2) the paired sensor lane centreline's local
+                    # heading; 3) in the legacy non-strict mode only, the
+                    # nav route tangent as a plain orientation fallback;
+                    # 4) hold the current heading.  Strict FSD never even
+                    # reads the route here - the route tail folds onto the
+                    # centreline at road ends, which is exactly why the nose
+                    # used to park angled (docs/fsd_realism.md §1/§4).
+                    _painted_dir = None
+                    _sensor_dir = None
+                    if out is not None:
+                        try:
+                            if _sem is not None and out.cam is not None:
+                                _pd = painted_line_direction(
+                                    _sem, out.cam, pos, float(heading),
+                                    ground_z=(float(pos[2])
+                                              - config.EGO_ORIGIN_GROUND_GAP_M
+                                              if len(pos) > 2 else None))
+                                if _pd is not None:
+                                    _painted_dir = np.asarray(_pd[:2],
+                                                              dtype=float)
+                            if _painted_dir is None and \
+                                    str(out.meta.get("lane_src_sel", "")) \
+                                    == "sensor":
+                                # Sensor lane centreline local heading; sanity-
+                                # gate it to the travel direction so a stray
+                                # geometry read cannot aim the stop sideways.
+                                _dl = polyline_dir_at(out.lane_ref, _anchor)
+                                _hf = np.array([math.cos(float(heading)),
+                                                math.sin(float(heading))])
+                                if _dl is not None and \
+                                        float(_dl @ _hf) >= 0.5:
+                                    _sensor_dir = _dl
+                        except Exception:
+                            _painted_dir = None
+                            _sensor_dir = None
+                    _route_tan = None
+                    if not _strict_lane:
+                        _nav_ref = nav_route_ref \
+                            if nav_route_ref is not None else nav_route
+                        if _nav_ref is not None and len(_nav_ref) >= 4:
+                            _r3 = np.asarray(_nav_ref[:, :2], dtype=float)
+                            _d3 = np.linalg.norm(
+                                _r3 - _anchor[None, :], axis=1)
+                            _i3 = int(np.argmin(_d3))
+                            _i3a = max(0, _i3 - 2)
+                            _i3b = min(len(_r3) - 1, _i3 + 2)
+                            _tv3 = _r3[_i3b] - _r3[_i3a]
+                            _L3 = float(np.linalg.norm(_tv3))
+                            if _L3 > 1e-9:
+                                _route_tan = _tv3 / _L3
+                    _dir3, _dir_src = _endzone_travel_direction(
+                        float(heading), painted=_painted_dir,
+                        sensor=_sensor_dir, route_tangent=_route_tan,
+                        strict=_strict_lane)
+                    # Publish the resolved direction (and whether it came
+                    # from perception) for the alignment creep below.
+                    _end_dir3 = _dir3
+                    _end_dir_src = _dir_src
+                    _ref_xy = None
+                    if _plc is not None:
+                        _ref_xy = np.asarray(_plc, dtype=float)[:2]
+                        end_plc_cache = (_ref_xy, time.time())
+                        _end_ref = 2
+                    elif end_plc_cache is not None:
+                        # Line dropout: reuse the last perceived own-lane
+                        # centre while it is still fresh AND the car is
+                        # still near the same lane line (pedal to the
+                        # cached straight reference, projected ahead of the
+                        # ego), so the stop keeps converging instead of
+                        # freezing at the entry offset.
+                        _cxy, _t_seen = end_plc_cache
+                        _age = time.time() - float(_t_seen)
+                        _s_proj = float((_anchor - _cxy) @ _dir3)
+                        _perp = float((_anchor - _cxy)
+                                      @ np.array([-_dir3[1], _dir3[0]]))
+                        if _age <= END_PLC_HOLD_S \
+                                and _s_proj >= -1.0 \
+                                and _s_proj <= END_PLC_MAX_FWD_M \
+                                and abs(_perp) <= END_PLC_MAX_LAT_M:
+                            _ref_xy = _cxy
+                            _end_ref = 1
+                    if _ref_xy is not None:
+                        _tgt3 = _ref_xy + _dir3 * 5.0
+                        _v3 = _tgt3 - _anchor
+                        if float(np.linalg.norm(_v3)) > 1e-6:
+                            _bear = float(math.atan2(_v3[1], _v3[0]))
+                    if _bear is None:
+                        # No live line, no fresh last-good anchor: hold the
+                        # current heading straight instead of following the
+                        # degenerate tail or any map prior.
+                        _bear = float(heading)
+                    _f3 = np.array([math.cos(_bear), math.sin(_bear)])
+                    steer_path = _anchor + _f3 * np.arange(
+                        0.0, 8.0, 0.8)[:, None]
+                    _end_replaced = True
+                # End-zone post-processing is a steering-path transform too:
+                # the straight stop reference REPLACED the planner's path, so
+                # the verdict made on ``chosen.path`` no longer covers what is
+                # being steered.  Re-run the same full-body/occupancy contract
+                # and fall back to the already-approved planner path when the
+                # replacement fails (fail closed on the transform, not on
+                # what was already verified).
+                end_rejected = False
+                if _end_replaced and steer_path is not None:
+                    try:
+                        _end_v = monitor.evaluate(
                             scene, steer_path, planner_age_s=0.0,
                             snapshot_age_s=_sensor_snapshot_age(out))
-                        plc_rejected = _plc_v.level == "minimal_risk"
                     except Exception:
-                        plc_rejected = True
-            steer = 0.0
-            pp_alpha = None
-            pp_tgt = None
-            ff_steer = 0.0
-            if steer_path is not None and len(steer_path) >= 2:
-                # Same conversion as the proven rule autopilot: PurePursuit
-                # returns the steering ANGLE (rad), BeamNG expects a
-                # normalized input with the OPPOSITE sign (left target ->
-                # positive angle -> negative input).  Feeding the raw angle
-                # (as before 2026-08-22) steered the car the WRONG WAY at
-                # the town junction - the route bent left, the raw positive
-                # steer was applied as right, yaw swung -32 -> -70 deg and
-                # every candidate crossed the lane boundaries -> wedged.
-                # Also rate-limit like m5_autopilot so the wheel does not
-                # slam from lock to lock on a flickering reference.
-                # Speed-adaptive lookahead like the proven rule autopilot:
-                # a fixed 5 m lookahead at the hairpin lands the target ON the
-                # bend instead of past it, so the wheel barely turns and the
-                # car understeers off the road before the corner (mountain run
-                # 2026-08-26 run_fix11: at (727.1,757.5) the controller only
-                # asked -0.12 and the car missed the first hairpin, then only
-                # looping arcs were left).  Computed from the BASE lookahead
-                # each frame (no compounding ratchet).
-                pp.lookahead = float(np.clip(
-                    5.0 + 0.55 * max(0.0, v), 4.0, 16.0))
-                steer_rad, pp_tgt, pp_near = pp.steering(
-                    pos, heading, np.asarray(steer_path))
-                steer_rad = float(steer_rad)
-                ff_steer = _path_curvature_ff(steer_path, pos, heading)
-                new_steer = float(np.clip(
-                    -steer_rad / 0.6 + ff_steer, -1.0, 1.0))
-                # Speed-adaptive steering cap (same as the proven rule
-                # autopilot): at speed a full-lock correction swings the
-                # car far past the lane direction (the FSD runs showed
-                # 40-60 deg over-rotation at the junction exits, mountain
-                # runs 2026-08-27 fix31/32).  The rule autopilot caps the
-                # wheel by v^2 so high-speed corrections stay gentle.
-                v_sq = max(v * v, 2.0)
-                steer_cap = max(0.10, min(1.0, 5.0 * 2.9 / v_sq / 0.6))
-                # Low-speed cap: full lock at 2 m/s is a ~2.9 m radius
-                # circle and builds a yaw rate the slow control loop
-                # cannot catch - the car swings around the junction
-                # instead of converging onto the lane.  0.45 (~10.7 m
-                # radius) cannot track the 8 m hairpin fillet, so the
-                # first -110 -> -24 deg bend was run wide every time
-                # (fix44: lat_l=-7.7 at the apex, then reverse-loops).
-                # 0.55 (~8.8 m radius) matches the hairpin geometry; the
-                # old 0.55 over-rotation (fix40, 9.7 m/s downhill) is
-                # now blocked by the hard speed governor below.
-                steer_cap = min(steer_cap, 0.55)
-                new_steer = float(np.clip(new_steer, -steer_cap, steer_cap))
-                # Yaw-rate damper: oppose a fast rotation that is not
-                # being commanded (left rotation -> steer right).  It must
-                # NOT fight a hard commanded turn - in the hairpin the car
-                # needs ~0.35 rad/s of yaw and the damper cut the full-lock
-                # input from -0.55 to -0.46, so the car ran wide off the
-                # road (fix49: lat_left -7.5 m at the apex).  Only damp
-                # while the wheel is not already at a strong commanded
-                # angle.
-                if abs(yaw_rate) > 0.3 and abs(new_steer) < 0.35:
+                        _end_v = None
+                    if _end_v is None or _end_v.level == "minimal_risk":
+                        end_rejected = True
+                        if chosen.path is not None:
+                            steer_path = chosen.path
+                    else:
+                        verd = _end_v
+                # Steady painted-line lateral corrector (cruising only): the
+                # end zone above already owns its perception reference, so the
+                # nudge engages while the car is driving normally.  When the
+                # map lane keeps leading (lane_src_sel != sensor) but the
+                # semantic LINE mask gives a confident own-lane centre, shift
+                # the near path toward it at a bounded rate - perception pulls
+                # the car into its own lane instead of hugging the centre
+                # line.  The corrector holds the last perceived shift across a
+                # line dropout and decays it, so the car never jerks back to
+                # the map prior mid-line.  Rule-source frames (FSD declined,
+                # obstacle/unsafe fallback) must not get a superimposed
+                # centring pull - the fallback path already carries its own
+                # avoidance shape, so the shift just holds then decays.
+                _plc_shift = 0.0
+                _plc_desired = None
+                plc_rejected = False
+                _plc_active = painted_line_correction_active(
+                    str(out.meta.get("lane_src_sel", "")),
+                    str(chosen.source),
+                    rem_end, END_PULL_START_M)
+                if _plc_active:
+                    try:
+                        _sem0 = (out.head_outputs.get("semantic")
+                                 if out is not None
+                                 and getattr(out, "head_outputs", None)
+                                 else None)
+                        if _sem0 is not None and out.cam is not None:
+                            _olc = painted_line_lane_center(
+                                _sem0, out.cam, pos, float(heading),
+                                ground_z=(float(pos[2])
+                                          - config.EGO_ORIGIN_GROUND_GAP_M
+                                          if len(pos) > 2 else None),
+                                marks=_plmarks)
+                            if _olc is not None:
+                                _plc_desired = plc_corr.desired_shift(
+                                    _olc, pos, float(heading),
+                                    max_shift_m=PLC_MAX_SHIFT_M)
+                    except Exception:
+                        pass
+                    _plc_shift = plc_corr.update(_plc_desired, dt, v)
+                    if steer_path is not None \
+                            and abs(_plc_shift) >= PLC_MIN_ENGAGE_M:
+                        steer_path = plc_corr.apply(
+                            steer_path, pos, float(heading))
+                        # PLC is a post-processing transform.  Re-run the same
+                        # full-body/occupancy safety contract after shifting;
+                        # the monitor verdict made on the pre-shift path is no
+                        # longer sufficient.
+                        try:
+                            _plc_v = monitor.evaluate(
+                                scene, steer_path, planner_age_s=0.0,
+                                snapshot_age_s=_sensor_snapshot_age(out))
+                            plc_rejected = _plc_v.level == "minimal_risk"
+                        except Exception:
+                            plc_rejected = True
+                steer = 0.0
+                pp_alpha = None
+                pp_tgt = None
+                ff_steer = 0.0
+                if steer_path is not None and len(steer_path) >= 2:
+                    # Same conversion as the proven rule autopilot: PurePursuit
+                    # returns the steering ANGLE (rad), BeamNG expects a
+                    # normalized input with the OPPOSITE sign (left target ->
+                    # positive angle -> negative input).  Feeding the raw angle
+                    # (as before 2026-08-22) steered the car the WRONG WAY at
+                    # the town junction - the route bent left, the raw positive
+                    # steer was applied as right, yaw swung -32 -> -70 deg and
+                    # every candidate crossed the lane boundaries -> wedged.
+                    # Also rate-limit like m5_autopilot so the wheel does not
+                    # slam from lock to lock on a flickering reference.
+                    # Speed-adaptive lookahead like the proven rule autopilot:
+                    # a fixed 5 m lookahead at the hairpin lands the target ON the
+                    # bend instead of past it, so the wheel barely turns and the
+                    # car understeers off the road before the corner (mountain run
+                    # 2026-08-26 run_fix11: at (727.1,757.5) the controller only
+                    # asked -0.12 and the car missed the first hairpin, then only
+                    # looping arcs were left).  Computed from the BASE lookahead
+                    # each frame (no compounding ratchet).
+                    pp.lookahead = float(np.clip(
+                        5.0 + 0.55 * max(0.0, v), 4.0, 16.0))
+                    steer_rad, pp_tgt, pp_near = pp.steering(
+                        pos, heading, np.asarray(steer_path))
+                    steer_rad = float(steer_rad)
+                    ff_steer = _path_curvature_ff(steer_path, pos, heading)
                     new_steer = float(np.clip(
-                        new_steer + 0.25 * yaw_rate,
-                        -steer_cap, steer_cap))
-                steer = smooth_steer(prev_steer, new_steer, dt,
-                                 rate=0.8)
-                prev_steer = steer
-                _tv = np.asarray(pp_tgt, dtype=float)[:2] - pos[:2]
-                pp_alpha = round(float(math.degrees(
-                    math.atan2(_tv[1], _tv[0]) - heading)), 1)
+                        -steer_rad / 0.6 + ff_steer, -1.0, 1.0))
+                    # Speed-adaptive steering cap (same as the proven rule
+                    # autopilot): at speed a full-lock correction swings the
+                    # car far past the lane direction (the FSD runs showed
+                    # 40-60 deg over-rotation at the junction exits, mountain
+                    # runs 2026-08-27 fix31/32).  The rule autopilot caps the
+                    # wheel by v^2 so high-speed corrections stay gentle.
+                    v_sq = max(v * v, 2.0)
+                    steer_cap = max(0.10, min(1.0, 5.0 * 2.9 / v_sq / 0.6))
+                    # Low-speed cap: full lock at 2 m/s is a ~2.9 m radius
+                    # circle and builds a yaw rate the slow control loop
+                    # cannot catch - the car swings around the junction
+                    # instead of converging onto the lane.  0.45 (~10.7 m
+                    # radius) cannot track the 8 m hairpin fillet, so the
+                    # first -110 -> -24 deg bend was run wide every time
+                    # (fix44: lat_l=-7.7 at the apex, then reverse-loops).
+                    # 0.55 (~8.8 m radius) matches the hairpin geometry; the
+                    # old 0.55 over-rotation (fix40, 9.7 m/s downhill) is
+                    # now blocked by the hard speed governor below.
+                    steer_cap = min(steer_cap, 0.55)
+                    new_steer = float(np.clip(new_steer, -steer_cap, steer_cap))
+                    # Yaw-rate damper: oppose a fast rotation that is not
+                    # being commanded (left rotation -> steer right).  It must
+                    # NOT fight a hard commanded turn - in the hairpin the car
+                    # needs ~0.35 rad/s of yaw and the damper cut the full-lock
+                    # input from -0.55 to -0.46, so the car ran wide off the
+                    # road (fix49: lat_left -7.5 m at the apex).  Only damp
+                    # while the wheel is not already at a strong commanded
+                    # angle.
+                    if abs(yaw_rate) > 0.3 and abs(new_steer) < 0.35:
+                        new_steer = float(np.clip(
+                            new_steer + 0.25 * yaw_rate,
+                            -steer_cap, steer_cap))
+                    steer = smooth_steer(prev_steer, new_steer, dt,
+                                     rate=0.8)
+                    prev_steer = steer
+                    _tv = np.asarray(pp_tgt, dtype=float)[:2] - pos[:2]
+                    pp_alpha = round(float(math.degrees(
+                        math.atan2(_tv[1], _tv[0]) - heading)), 1)
 
-            # Longitudinal plan from the FULL RAW nav route, never the
-            # local resampled window: the local window starts ON the
-            # corner and its Catmull-Rom resample rounds the hairpin into
-            # a 4-5 m sweep, so the curvature profile reads 4-5 m/s into
-            # the bend and the car understeers off the road (mountain run
-            # 2026-08-23, run_fix6: plan_v 4.9-6.0 at the first hairpin,
-            # car left the road 3-10 m west of the route and never came
-            # back).  The raw road-graph polyline keeps the 90-degree
-            # kink - its look-ahead profile caps the entry speed at
-            # ~1.7 m/s, which is the speed the bend can actually take.
-            if route_round is not None and route_arc is not None \
-                    and route_rad is not None:
-                _rfull = route_round
-                _ga = route_arc
-                # Arc-length projection (not nearest-vertex): the nearest
-                # vertex can flip between two close route samples frame to
-                # frame, which snapped the sampled profile speed by whole
-                # m/s on straight segments; the projection stays stable.
-                _proj_s = float(_project_arc(_rfull, pos[:2]))
-                try:
-                    # Profile the ROUNDED full route, not the raw road-graph
-                    # polyline: the graph collapses the first hairpin into a
-                    # sharp vertex whose curvature profile caps the bend at
-                    # ~1.7 m/s - at that speed the tyres scrub and the car
-                    # cannot even turn (steering probe 2026-08-27).  The
-                    # rounded route (same 8 m fillet the lane centre uses)
-                    # lets the bend be taken at a speed the steering can
-                    # actually execute.  The rounded polyline, its arc
-                    # lengths and per-vertex radii are precomputed once
-                    # before the loop (route_round/route_arc/route_rad).
-                    _sp_raw = _spf_raw(
-                        _rfull, scene,
-                        target_speed=float(args.speed),
-                        # Corridor-open clutter (dense junction/end-zone
-                        # LiDAR that still leaves a free band) must not
-                        # pin the full-route plan to the 1 m/s MIN_SPEED -
-                        # the safety monitor keeps the same cruise floor
-                        # when its corridor is open.
-                        obstacle_min_speed=(
-                            max(_PROF_MIN_SPEED,
-                                0.4 * float(args.speed))
-                            if verd.corridor_open else _PROF_MIN_SPEED))
-                    if len(_sp_raw):
-                        # The full-route profile is indexed along the WHOLE
-                        # route; [0] is the speed at the ROUTE START, not at
-                        # the car.  Sample the profile at the nearest route
-                        # point so a hairpin 100 m into the route still caps
-                        # the speed when the car reaches it (run_fix25:
-                        # plan_speed stayed at the start speed into the bend).
-                        _i = int(np.clip(
+                # Longitudinal plan from the FULL RAW nav route, never the
+                # local resampled window: the local window starts ON the
+                # corner and its Catmull-Rom resample rounds the hairpin into
+                # a 4-5 m sweep, so the curvature profile reads 4-5 m/s into
+                # the bend and the car understeers off the road (mountain run
+                # 2026-08-23, run_fix6: plan_v 4.9-6.0 at the first hairpin,
+                # car left the road 3-10 m west of the route and never came
+                # back).  The raw road-graph polyline keeps the 90-degree
+                # kink - its look-ahead profile caps the entry speed at
+                # ~1.7 m/s, which is the speed the bend can actually take.
+                if route_round is not None and route_arc is not None \
+                        and route_rad is not None:
+                    _rfull = route_round
+                    _ga = route_arc
+                    # Arc-length projection (not nearest-vertex): the nearest
+                    # vertex can flip between two close route samples frame to
+                    # frame, which snapped the sampled profile speed by whole
+                    # m/s on straight segments; the projection stays stable.
+                    _proj_s = float(_project_arc(_rfull, pos[:2]))
+                    try:
+                        # Profile the ROUNDED full route, not the raw road-graph
+                        # polyline: the graph collapses the first hairpin into a
+                        # sharp vertex whose curvature profile caps the bend at
+                        # ~1.7 m/s - at that speed the tyres scrub and the car
+                        # cannot even turn (steering probe 2026-08-27).  The
+                        # rounded route (same 8 m fillet the lane centre uses)
+                        # lets the bend be taken at a speed the steering can
+                        # actually execute.  The rounded polyline, its arc
+                        # lengths and per-vertex radii are precomputed once
+                        # before the loop (route_round/route_arc/route_rad).
+                        _sp_raw = _spf_raw(
+                            _rfull, scene,
+                            target_speed=float(args.speed),
+                            # Corridor-open clutter (dense junction/end-zone
+                            # LiDAR that still leaves a free band) must not
+                            # pin the full-route plan to the 1 m/s MIN_SPEED -
+                            # the safety monitor keeps the same cruise floor
+                            # when its corridor is open.
+                            obstacle_min_speed=(
+                                max(_PROF_MIN_SPEED,
+                                    0.4 * float(args.speed))
+                                if verd.corridor_open else _PROF_MIN_SPEED))
+                        if len(_sp_raw):
+                            # The full-route profile is indexed along the WHOLE
+                            # route; [0] is the speed at the ROUTE START, not at
+                            # the car.  Sample the profile at the nearest route
+                            # point so a hairpin 100 m into the route still caps
+                            # the speed when the car reaches it (run_fix25:
+                            # plan_speed stayed at the start speed into the bend).
+                            _i = int(np.clip(
+                                int(np.searchsorted(_ga, _proj_s)),
+                                0, len(_rfull) - 1))
+                            out.best_speed = float(_sp_raw[_i])
+                            out.meta["plan_src"] = "nav_round"
+                    except Exception:
+                        pass
+                    # Tight-bend entry governor: the ~1.4 s control tick lets the
+                    # car overshoot the profiled corner speed by ~+1 m/s mid-tick
+                    # (fix45: 4.4 target -> ~5.5 actual at the first hairpin, ran
+                    # wide off the left edge).  For a bend tighter than 15 m in
+                    # the next 12 m, cap the plan speed at sqrt(1.5*R) so the
+                    # actual peak stays near 4 m/s, where the 0.55 steering cap
+                    # (~8.8 m radius) can track the 8 m hairpin fillet.
+                    try:
+                        _gi = int(np.clip(
                             int(np.searchsorted(_ga, _proj_s)),
                             0, len(_rfull) - 1))
-                        out.best_speed = float(_sp_raw[_i])
-                        out.meta["plan_src"] = "nav_round"
-                except Exception:
-                    pass
-                # Tight-bend entry governor: the ~1.4 s control tick lets the
-                # car overshoot the profiled corner speed by ~+1 m/s mid-tick
-                # (fix45: 4.4 target -> ~5.5 actual at the first hairpin, ran
-                # wide off the left edge).  For a bend tighter than 15 m in
-                # the next 12 m, cap the plan speed at sqrt(1.5*R) so the
-                # actual peak stays near 4 m/s, where the 0.55 steering cap
-                # (~8.8 m radius) can track the 8 m hairpin fillet.
-                try:
-                    _gi = int(np.clip(
-                        int(np.searchsorted(_ga, _proj_s)),
-                        0, len(_rfull) - 1))
-                    _ghi = int(np.searchsorted(_ga, _proj_s + 12.0))
-                    _lo = max(1, _gi)
-                    _hi = min(_ghi, len(route_rad) - 2) + 1
-                    _rmin = 1e9
-                    if _lo < _hi:
-                        _rmin = float(np.min(route_rad[_lo:_hi]))
-                    if _rmin < 15.0:
-                        # Turn-angle gate: only a REAL bend deserves the
-                        # hairpin speed cap.  A rounded junction corner /
-                        # resample wiggle can measure R~3 m over 12 m while
-                        # turning <30 deg total; capping there parked the
-                        # plan at sqrt(1.3*3)=1.97 and the car crawled 5+ s
-                        # through a widening junction (fsd opt23 t=36-45,
-                        # lat_right 1.5->4.2).  A true hairpin turns
-                        # 60-180 deg over the same window.
-                        if _route_turn_deg(route_round, _lo, _hi) >= \
-                                BEND_GOV_MIN_TURN_DEG:
-                            # Floor the implied radius: the 0.8 m resample
-                            # can measure a hairpin fillet edge as R~0.8 m
-                            # (three nearly-collinear points), which caps
-                            # the plan at ~1 m/s and stands the car dead
-                            # on the approach (fix65: plan=1.00 at the
-                            # second bend, v=5.6 -> brake-to-0).  Real
-                            # roads never bend tighter than ~3 m; anything
-                            # smaller is a sampling artifact.
-                            _rmin = max(_rmin, 3.0)
-                            out.best_speed = float(min(
-                                out.best_speed, math.sqrt(1.3 * _rmin)))
-                            out.meta["plan_src"] = "nav_round+gov"
-                except Exception:
-                    pass
-                # FSD-realism speed cap: slow on what the sensors SEE.
-                # The nav-route profile above is navigation intent; when
-                # the BEV road mask curves ahead, the plan is capped from
-                # PERCEPTION only (docs/fsd_realism.md §2).
-                try:
-                    if out.drivable is not None:
-                        _pg = OccupancyGrid(
-                            60, 60, 0.5,
-                            origin=(float(pos[0]), float(pos[1])),
-                            heading=float(heading))
-                        _pg.drivable = np.asarray(out.drivable, dtype=float)
-                        _pcap = perception_curve_speed(_pg, out.best_speed)
-                        if _pcap < out.best_speed:
-                            out.best_speed = _pcap
-                            out.meta["plan_src"] = "perception-curve"
-                except Exception:
-                    pass
-            # control from the (possibly degraded) target speed, but never
-            # exceed the *planned* speed along the chosen trajectory - the
-            # FSD longitudinal plan (bend deceleration, obstacle brake
-            # band) must govern the actual pedals.
-            plan_speed = out.best_speed if out.best_speed > 0.0 \
-                else float(args.speed)
-            if _strict_no_lane:
-                # No current perception lane means NO MOTION in strict
-                # mode, regardless of which candidate won arbitration.
-                # E2E/BC are perception-driven models, but neither gives
-                # a reliable current lane boundary when the painted/LiDAR
-                # lane is unavailable; allowing them here let the car
-                # drift half outside the road (user screenshot,
-                # town 2026-09-07).
-                plan_speed = 0.0
-                plan_sm = 0.0
-            # Traffic-light action: vision head (colour blob) fused with
-            # the game's authoritative road-link signal state via
-            # merge_signal_vision.  The game state wins when it knows the
-            # light; a confident vision RED stops the car at the line.
-            # Green never forces motion - the planner / safety monitor
-            # still own the pedals, so the car simply resumes when the
-            # light turns green.
-            if not args.no_signal and now_t - sig_rule_t > SIGNAL_RULE_POLL_S:
-                sig_rule_t = now_t
-                try:
-                    _rr = conn.read_current_road_rule(
-                        pos, (math.cos(heading), math.sin(heading), 0.0))
-                    if (_rr is not None and _rr.n1 and _rr.n2
-                            and conn.vehicle is not None):
-                        _sigs = conn.read_signal_snapshot(
-                            conn.vehicle.vid, _rr.n1, _rr.n2)
-                        _sel = select_signal_rule(_sigs, pos[:2],
-                                                  heading=heading)
-                        sig_rule_state = (
-                            _sel.state if _sel is not None else None)
-                except Exception:
-                    sig_rule_state = None
-            _sig_final, _sig_src = merge_signal_vision(
-                sig_rule_state,
-                str(out.meta.get("signal_state") or "none"),
-                float(out.meta.get("signal_conf", 0.0) or 0.0),
-                trust_vision_conf=SIGNAL_CONF_MIN)
-            out.meta["signal_src"] = _sig_src
-            if not args.no_signal and _sig_final == "red":
-                plan_speed = 0.0
-                plan_sm = 0.0
-            # a rule fallback does not get the FSD plan speed; cap it to a
-            # cautious creep so the L2 fallback is gentle
-            if chosen.source == "rule":
-                plan_speed = min(plan_speed, 3.0)
-            plan_raw_speed = float(plan_speed)
-            # M4 DQN decision layer: cap the plan target with the learned
-            # cruise/ease/slow decision from the stack's own perception.
-            # It can only SLOW the plan - steering and every safety layer
-            # stay authoritative - so a bad policy costs comfort, never
-            # safety.
-            dqn_action = None
-            dqn_ms = None
-            if dqn_rt is not None:
-                try:
-                    dqn_action, dqn_ms = dqn_rt.predict(
-                        speed=v,
-                        target_speed=max(0.5, float(plan_speed)),
-                        fwd_clearance=out.forward_clearance,
-                        closest_obs=(None if verd.closest_obs_m > 900.0
-                                     else float(verd.closest_obs_m)),
-                        lane_dev=float(getattr(verd, "lane_dev_m", 0.0)),
-                        road_off=road_off,
-                        n_tracks=len(out.tracks))
-                    plan_speed = min(
-                        plan_speed,
-                        action_to_target(dqn_action, plan_speed))
-                except Exception:
-                    dqn_action = None
-                    dqn_ms = None
-            # Rate-limit the plan (PLAN_* constants): transient LiDAR
-            # clutter at junctions/end zones must not snap the plan
-            # 6.0 <-> 1.0 between ticks and make the controller brake
-            # then relaunch (opt22).  Real bends still decelerate - the
-            # profile drops smoothly over many frames, well inside the
-            # down rate - and the safety monitor / force-stop remain the
-            # authority for genuine emergencies.
-            _dplan = float(np.clip(
-                plan_raw_speed - plan_sm,
-                -PLAN_DOWN_RATE_MPS2 * dt,
-                PLAN_UP_RATE_MPS2 * dt))
-            plan_sm = float(plan_sm + _dplan)
-            plan_speed = plan_sm
-            target = min(verd.target_speed, plan_speed, float(args.speed))
-            # Heading-error speed scrub: the nav route is the intent;
-            # when the nose drifts off it (oscillation / over-rotation)
-            # slow down so the steering loop converges instead of
-            # feeding the swing.  Falls back to no-op when the local
-            # route bearing cannot be measured.
-            _rh_b = _ref_bearing(route_local, pos)
-            if _rh_b is not None:
-                _hdg_dev = abs((float(heading)
-                                - math.radians(_rh_b) + math.pi)
-                               % (2.0 * math.pi) - math.pi)
-                _hdg_deg = math.degrees(_hdg_dev)
-                if _hdg_deg > HEADING_DEV_START_DEG:
-                    _k = min(1.0, (_hdg_deg - HEADING_DEV_START_DEG)
-                             / (HEADING_DEV_FULL_DEG
-                                - HEADING_DEV_START_DEG))
-                    _hdg_cap = (HEADING_DEV_FLOOR_MPS
-                                + (HEADING_DEV_CAP_MPS
-                                   - HEADING_DEV_FLOOR_MPS)
-                                * (1.0 - _k))
-                    target = min(target, _hdg_cap)
-            # No-route guard: without a nav route there is no map prior to
-            # keep the car on the road - a straight-line reference drives
-            # straight onto grass (opt13 2026-08-28: no route after a game
-            # restart, car crept on the grass at 0-4 m/s).  Never cruise
-            # without a route; the caller must pass --goal.
-            if nav_route is None:
-                target = min(target, 1.0)
-            # Map road-edge guard: the nav centreline + real DecalRoad
-            # edge rows are the map prior for "where the road is".  Once
-            # the ego is beyond the local road edge (grass/verge on the
-            # right, oncoming lane on the left) the car must not keep
-            # driving - crawl at 0.5 m/s; the monitor still stops it if
-            # the path is blocked.  The centreline is used instead of the
-            # raw edge polylines because edge rows fold at junctions and
-            # go stale past the last graph node (town run10: a folded
-            # edge corner reported 3.2 m off-road on a straight section
-            # while the car sat on the centreline).
-            road_off = 0.0
-            off_recover = False
-            hw_deficit = 0.0   # BEV road width minus the map edge width
-            if (nav_route is not None and len(nav_route) >= 2
-                    and road_left is not None and road_right is not None):
-                _lat2, _beyond2, _hw2 = _route_lateral_off_m(
-                    pos, nav_route, road_left, road_right)
-                # NB: a previous "perception-first road width" correction
-                # (measure the width from the BEV drivable raster and
-                # widen the map edges) was REVERTED: the semantic road
-                # mask on the town link INCLUDES the gravel shoulder, so
-                # the measured width ran ~1-3 m wide and the off-road
-                # guard went blind while the car rode the shoulder
-                # (town 2026-09-06, user screenshot: car on the gravel,
-                # road_off 0.00).  The mask needs shoulder-exclusive
-                # training data before any width widening is sound.
-                if road_off > ROAD_OFF_STOP_M:
-                    # Hard stop + return steering (recovery block
-                    # below), not a 0.5 m/s grass cruise.
-                    target = min(target, ROAD_OFF_CRAWL_MPS)
-                    off_recover = True
-                elif road_off > ROAD_OFF_EDGE_M:
-                    target = min(target, ROAD_OFF_CRAWL_MPS)
-                elif road_off > 0.0:
-                    target = min(target, ROAD_EDGE_SLOW_MPS)
-            # End-of-route (rem_end computed above from the FULL nav route
-            # arc, so it never goes None when the local window collapses):
-            # ease to a stop while still in the lane instead of parking
-            # over the edge line at the road end (opt15).
-            if rem_end is not None:
-                if rem_end < END_STOP_M:
+                        _ghi = int(np.searchsorted(_ga, _proj_s + 12.0))
+                        _lo = max(1, _gi)
+                        _hi = min(_ghi, len(route_rad) - 2) + 1
+                        _rmin = 1e9
+                        if _lo < _hi:
+                            _rmin = float(np.min(route_rad[_lo:_hi]))
+                        if _rmin < 15.0:
+                            # Turn-angle gate: only a REAL bend deserves the
+                            # hairpin speed cap.  A rounded junction corner /
+                            # resample wiggle can measure R~3 m over 12 m while
+                            # turning <30 deg total; capping there parked the
+                            # plan at sqrt(1.3*3)=1.97 and the car crawled 5+ s
+                            # through a widening junction (fsd opt23 t=36-45,
+                            # lat_right 1.5->4.2).  A true hairpin turns
+                            # 60-180 deg over the same window.
+                            if _route_turn_deg(route_round, _lo, _hi) >= \
+                                    BEND_GOV_MIN_TURN_DEG:
+                                # Floor the implied radius: the 0.8 m resample
+                                # can measure a hairpin fillet edge as R~0.8 m
+                                # (three nearly-collinear points), which caps
+                                # the plan at ~1 m/s and stands the car dead
+                                # on the approach (fix65: plan=1.00 at the
+                                # second bend, v=5.6 -> brake-to-0).  Real
+                                # roads never bend tighter than ~3 m; anything
+                                # smaller is a sampling artifact.
+                                _rmin = max(_rmin, 3.0)
+                                out.best_speed = float(min(
+                                    out.best_speed, math.sqrt(1.3 * _rmin)))
+                                out.meta["plan_src"] = "nav_round+gov"
+                    except Exception:
+                        pass
+                    # FSD-realism speed cap: slow on what the sensors SEE.
+                    # The nav-route profile above is navigation intent; when
+                    # the BEV road mask curves ahead, the plan is capped from
+                    # PERCEPTION only (docs/fsd_realism.md §2).
+                    try:
+                        if out.drivable is not None:
+                            _pg = OccupancyGrid(
+                                60, 60, 0.5,
+                                origin=(float(pos[0]), float(pos[1])),
+                                heading=float(heading))
+                            _pg.drivable = np.asarray(out.drivable, dtype=float)
+                            _pcap = perception_curve_speed(_pg, out.best_speed)
+                            if _pcap < out.best_speed:
+                                out.best_speed = _pcap
+                                out.meta["plan_src"] = "perception-curve"
+                    except Exception:
+                        pass
+                # control from the (possibly degraded) target speed, but never
+                # exceed the *planned* speed along the chosen trajectory - the
+                # FSD longitudinal plan (bend deceleration, obstacle brake
+                # band) must govern the actual pedals.
+                plan_speed = out.best_speed if out.best_speed > 0.0 \
+                    else float(args.speed)
+                if _strict_no_lane:
+                    # No current perception lane means NO MOTION in strict
+                    # mode, regardless of which candidate won arbitration.
+                    # E2E/BC are perception-driven models, but neither gives
+                    # a reliable current lane boundary when the painted/LiDAR
+                    # lane is unavailable; allowing them here let the car
+                    # drift half outside the road (user screenshot,
+                    # town 2026-09-07).
+                    plan_speed = 0.0
+                    plan_sm = 0.0
+                # Traffic-light action: vision head (colour blob) fused with
+                # the game's authoritative road-link signal state via
+                # merge_signal_vision.  The game state wins when it knows the
+                # light; a confident vision RED stops the car at the line.
+                # Green never forces motion - the planner / safety monitor
+                # still own the pedals, so the car simply resumes when the
+                # light turns green.
+                if not args.no_signal and now_t - sig_rule_t > SIGNAL_RULE_POLL_S:
+                    sig_rule_t = now_t
+                    try:
+                        _rr = conn.read_current_road_rule(
+                            pos, (math.cos(heading), math.sin(heading), 0.0))
+                        if (_rr is not None and _rr.n1 and _rr.n2
+                                and conn.vehicle is not None):
+                            _sigs = conn.read_signal_snapshot(
+                                conn.vehicle.vid, _rr.n1, _rr.n2)
+                            _sel = select_signal_rule(_sigs, pos[:2],
+                                                      heading=heading)
+                            sig_rule_state = (
+                                _sel.state if _sel is not None else None)
+                    except Exception:
+                        sig_rule_state = None
+                _sig_final, _sig_src = merge_signal_vision(
+                    sig_rule_state,
+                    str(out.meta.get("signal_state") or "none"),
+                    float(out.meta.get("signal_conf", 0.0) or 0.0),
+                    trust_vision_conf=SIGNAL_CONF_MIN)
+                out.meta["signal_src"] = _sig_src
+                if not args.no_signal and _sig_final == "red":
+                    plan_speed = 0.0
+                    plan_sm = 0.0
+                # a rule fallback does not get the FSD plan speed; cap it to a
+                # cautious creep so the L2 fallback is gentle
+                if chosen.source == "rule":
+                    plan_speed = min(plan_speed, 3.0)
+                plan_raw_speed = float(plan_speed)
+                # Perception-only off-road measure for this tick: how far
+                # the body sticks out past a DETECTED lane boundary.  Used
+                # by the learned decision layer below, the off-road hard
+                # stop / recovery branches and the telemetry.  0.0 also
+                # means "no boundary seen", never a map fallback.
+                road_off = _perception_off_road_m(out, pos, heading)
+                # M4 DQN decision layer: cap the plan target with the learned
+                # cruise/ease/slow decision from the stack's own perception.
+                # It can only SLOW the plan - steering and every safety layer
+                # stay authoritative - so a bad policy costs comfort, never
+                # safety.
+                dqn_action = None
+                dqn_ms = None
+                if dqn_rt is not None:
+                    try:
+                        dqn_action, dqn_ms = dqn_rt.predict(
+                            speed=v,
+                            target_speed=max(0.5, float(plan_speed)),
+                            fwd_clearance=out.forward_clearance,
+                            closest_obs=(None if verd.closest_obs_m > 900.0
+                                         else float(verd.closest_obs_m)),
+                            lane_dev=float(getattr(verd, "lane_dev_m", 0.0)),
+                            road_off=road_off,
+                            n_tracks=len(out.tracks))
+                        plan_speed = min(
+                            plan_speed,
+                            action_to_target(dqn_action, plan_speed))
+                    except Exception:
+                        dqn_action = None
+                        dqn_ms = None
+                # Rate-limit the plan (PLAN_* constants): transient LiDAR
+                # clutter at junctions/end zones must not snap the plan
+                # 6.0 <-> 1.0 between ticks and make the controller brake
+                # then relaunch (opt22).  Real bends still decelerate - the
+                # profile drops smoothly over many frames, well inside the
+                # down rate - and the safety monitor / force-stop remain the
+                # authority for genuine emergencies.
+                _dplan = float(np.clip(
+                    plan_raw_speed - plan_sm,
+                    -PLAN_DOWN_RATE_MPS2 * dt,
+                    PLAN_UP_RATE_MPS2 * dt))
+                plan_sm = float(plan_sm + _dplan)
+                plan_speed = plan_sm
+                target = min(verd.target_speed, plan_speed, float(args.speed))
+                # Heading-error speed scrub: the nav route is the intent;
+                # when the nose drifts off it (oscillation / over-rotation)
+                # slow down so the steering loop converges instead of
+                # feeding the swing.  Falls back to no-op when the local
+                # route bearing cannot be measured.
+                _rh_b = _ref_bearing(route_local, pos)
+                if _rh_b is not None:
+                    _hdg_dev = abs((float(heading)
+                                    - math.radians(_rh_b) + math.pi)
+                                   % (2.0 * math.pi) - math.pi)
+                    _hdg_deg = math.degrees(_hdg_dev)
+                    if _hdg_deg > HEADING_DEV_START_DEG:
+                        _k = min(1.0, (_hdg_deg - HEADING_DEV_START_DEG)
+                                 / (HEADING_DEV_FULL_DEG
+                                    - HEADING_DEV_START_DEG))
+                        _hdg_cap = (HEADING_DEV_FLOOR_MPS
+                                    + (HEADING_DEV_CAP_MPS
+                                       - HEADING_DEV_FLOOR_MPS)
+                                    * (1.0 - _k))
+                        target = min(target, _hdg_cap)
+                # No-route guard: without a nav route there is no map prior to
+                # keep the car on the road - a straight-line reference drives
+                # straight onto grass (opt13 2026-08-28: no route after a game
+                # restart, car crept on the grass at 0-4 m/s).  Never cruise
+                # without a route; the caller must pass --goal.
+                if nav_route is None:
+                    target = min(target, 1.0)
+                # Map road-edge guard: the nav centreline + real DecalRoad
+                # edge rows are the map prior for "where the road is".  Once
+                # the ego is beyond the local road edge (grass/verge on the
+                # right, oncoming lane on the left) the car must not keep
+                # driving - crawl at 0.5 m/s; the monitor still stops it if
+                # the path is blocked.  The centreline is used instead of the
+                # raw edge polylines because edge rows fold at junctions and
+                # go stale past the last graph node (town run10: a folded
+                # edge corner reported 3.2 m off-road on a straight section
+                # while the car sat on the centreline).
+                # Definitively off-lane (PERCEPTION only, computed above):
+                # the body is more than ROAD_OFF_STOP_M past a detected
+                # boundary.  The hard stop + hold is applied further down
+                # together with the other override branches; ``off_recover``
+                # also suppresses the reverse escape (never back further
+                # out).  The old map crawl ladder that lived here was dead
+                # code and map-based - see the constant comment above.
+                off_recover = bool(road_off > ROAD_OFF_STOP_M)
+                # End-of-route (rem_end computed above from the FULL nav route
+                # arc, so it never goes None when the local window collapses):
+                # ease to a stop while still in the lane instead of parking
+                # over the edge line at the road end (opt15).
+                if rem_end is not None:
+                    if rem_end < END_STOP_M:
+                        target = 0.0
+                    elif rem_end < END_START_SLOW_M:
+                        target = min(target, END_SLOW_MPS)
+                # Warm-up crawl + stale-tick scrub (real-time mode): before
+                # the object head is live, or after an unusually long tick,
+                # the car has been driving open-loop - keep it slow.
+                if time.time() < warmup_until and not out.meta.get("object_head"):
+                    target = min(target, WARMUP_SPEED_MPS)
+                if _wall_dt > STALE_CTRL_S:
+                    target = min(target, STALE_CTRL_SPEED_MPS)
+                # Safety clearance along the CHOSEN path (FSD vector-space
+                # safety layer): the grid obstacle layer the planner itself
+                # scored against is the authority, so a wall beside the nose
+                # that the chosen arc turns away from does not park the car
+                # (town corner run 2026-08-21: planner picked a feasible arc,
+                # raw LiDAR foliage read 0.5 m and the emergency layer
+                # force-stopped every frame).  A path that really is blocked
+                # still forces the same stop.  ``inf`` from
+                # ``path_grid_clearance_m`` MEANS the path is clear - it must
+                # not be treated as "missing" (run 2026-08-22: the fallback
+                # replaced a clean-path inf with the raw heading corridor
+                # 0.19 m at a town corner and parked a car that was steering
+                # fine).  The raw-sensor heading corridor is only the last
+                # line when there is NO planned path at all.
+                force_stop = bool(painted_body_cross or plc_rejected)
+                if force_stop:
                     target = 0.0
-                elif rem_end < END_START_SLOW_M:
-                    target = min(target, END_SLOW_MPS)
-            # Warm-up crawl + stale-tick scrub (real-time mode): before
-            # the object head is live, or after an unusually long tick,
-            # the car has been driving open-loop - keep it slow.
-            if time.time() < warmup_until and not out.meta.get("object_head"):
-                target = min(target, WARMUP_SPEED_MPS)
-            if _wall_dt > STALE_CTRL_S:
-                target = min(target, STALE_CTRL_SPEED_MPS)
-            # Safety clearance along the CHOSEN path (FSD vector-space
-            # safety layer): the grid obstacle layer the planner itself
-            # scored against is the authority, so a wall beside the nose
-            # that the chosen arc turns away from does not park the car
-            # (town corner run 2026-08-21: planner picked a feasible arc,
-            # raw LiDAR foliage read 0.5 m and the emergency layer
-            # force-stopped every frame).  A path that really is blocked
-            # still forces the same stop.  ``inf`` from
-            # ``path_grid_clearance_m`` MEANS the path is clear - it must
-            # not be treated as "missing" (run 2026-08-22: the fallback
-            # replaced a clean-path inf with the raw heading corridor
-            # 0.19 m at a town corner and parked a car that was steering
-            # fine).  The raw-sensor heading corridor is only the last
-            # line when there is NO planned path at all.
-            force_stop = bool(painted_body_cross or plc_rejected)
-            if force_stop:
-                target = 0.0
-            fwd_clear = float("inf")
-            if chosen.path is not None and len(chosen.path) >= 2:
-                fwd_clear = path_grid_clearance_m(chosen.path, grid)
-            else:
-                fwd_clear = float(out.forward_clearance)
-            if np.isfinite(fwd_clear):
-                need = emergency_stop_clearance_m(v)
-                force_stop, cap = emergency_speed_limit_mps(fwd_clear, need)
-                target = min(target, cap if not force_stop else 0.0)
-            # Smooth the effective target: ramp toward the raw plan at a
-            # bounded rate (sim time), so the corner governor stepping the
-            # plan from 6 to 3.2 m/s in one tick cannot flip the pedals.
-            # A safety force-stop bypasses the ramp and brakes immediately.
-            if force_stop:
-                target_sm = 0.0
-            else:
-                _dmax = SPEED_TARGET_RAMP_MPS * dt
-                if target > target_sm:
-                    target_sm = min(target, target_sm + _dmax)
+                fwd_clear = float("inf")
+                if chosen.path is not None and len(chosen.path) >= 2:
+                    fwd_clear = path_grid_clearance_m(chosen.path, grid)
                 else:
-                    target_sm = max(target, target_sm - _dmax)
-                # Never cruise above the planned corner speed.  The ramp
-                # can still be converging down from a high initial target
-                # (first frames), which let the car overshoot the bend
-                # plan and trip the hard governor every tick (fix61:
-                # v=4.45 against plan 3.23 -> brake 1.0 -> stall ->
-                # full throttle again).  Capping the smoothed target by
-                # plan_speed keeps the pedals inside the plan from the
-                # very first tick.
-                target_sm = min(target_sm, plan_speed)
-            thr, brk = speed_ctrl.update(
-                target_sm, v, dt=min(0.25, max(0.01, dt)))
-            # Downhill-start throttle guard: on the descent the car
-            # accelerates by gravity alone, so feeding throttle near the
-            # plan overshoots the bend speed and the governor then brakes
-            # it to a standstill every tick (fix61-64: v 0 -> 4.4 -> 0).
-            # Below a low speed, hold the pedal near idle and let gravity
-            # bring the speed up to the plan; the controller resumes once
-            # the speed is there.
-            if v < 2.5 and signed > 0.3 and target_sm <= plan_speed:
-                thr = min(thr, 0.25)
-            # Downhill acceleration cap: once the car is rolling, full
-            # throttle demand plus gravity overshoots the plan in one
-            # 0.66 s burst (opt8: 0.80 throttle -> 2.7 -> 7.3 m/s).
-            # Cap the pedal while approaching the target so gravity does
-            # most of the work; the plan governor trims the rest.
-            if v > 2.5 and signed > 0.5 and v < target_sm - 0.5:
-                thr = min(thr, 0.35)
-            # (The old "corner brake zone" here is gone: with the sim
-            # paused and stepped in 0.33 s bursts the speed controller
-            # reacts within one burst, while the zone caused an
-            # accelerate -> brake-to-stop oscillation - fix54 reached
-            # v=3.6 then brk=0.8 stopped it dead at every tick.  The
-            # plan-speed governor below still hard-brakes overshoot.)
-            # Soft overspeed governor: never let the car exceed the
-            # commanded cruise speed by more than 1 m/s regardless of
-            # the smoothed pedal state.  The old brk=1.0 here stopped
-            # the car DEAD on the downhill, then the controller relaunched
-            # with full throttle -> 0 <-> 7.8 m/s bang-bang (opt8).
-            # Taper the throttle off between +0.5 and +1.3 m/s overshoot
-            # instead of the old hard cut at +1.0.  A hard cut to 0 then
-            # a full re-launch made a +/-0.9 m/s speed wave around cruise
-            # (opt21: 49 throttle on/off flips in 169 frames); a gradual
-            # taper removes the relaunch kick while the plan governor's
-            # gentle GOV_BRAKE still trims the overshoot.
-            _ov = v - (float(args.speed) + 0.5)
-            if _ov > 0.0:
-                thr *= float(np.clip((0.8 - _ov) / 0.8, 0.0, 1.0))
-            # Plan-speed governor: never let the car exceed the planned
-            # corner speed by more than 0.8 m/s even within one tick -
-            # the profile alone is sampled at tick boundaries and the
-            # car can overshoot a 4.4 m/s hairpin plan to ~5.5 mid-tick.
-            if v > plan_speed + GOV_ON_MPS:
-                gov_brake = True
-            elif not (v > plan_speed + GOV_OFF_MPS):
-                gov_brake = False
-            if gov_brake:
-                thr, brk = 0.0, max(brk, GOV_BRAKE)
-            # Stuck detection: the planner can keep reporting "safe" while
-            # the car physically cannot move (wedged against a guardrail /
-            # embankment after an over-correction).  Holding throttle
-            # against the obstruction forever is the "spinning in place"
-            # failure - after a couple of seconds at near-standstill with
-            # a commanded forward path, treat it as "no forward path" so
-            # the bounded reverse escape backs out and re-plans (mountain
-            # run 2026-08-27 run_fix31: wedged at (741.2,745.7) with
-            # thr=0.53 and v=0 for 50 s).
-            if (chosen.path is not None and not force_stop
-                    and v < 0.35 and thr > 0.0):
-                stuck_t += max(0.0, float(dt))
-            else:
-                stuck_t = 0.0
-            stuck = stuck_t >= 2.5
-            # hard stop when no path remains, the raw-sensor forward
-            # clearance is inside the braking reserve (never grind into a
-            # wall / wedge the car into a too-narrow gap), or the car is
-            # stuck spinning against an obstruction
-            pb = 0.0  # handbrake: hold the car on a slope while stopped
-            # Slope-creep assist: the planner keeps a CLEAR forward path
-            # while the car cannot move (e.g. stopped at the bottom of a
-            # dip facing uphill).  Full throttle for a bounded window lets
-            # it climb before the reverse escape is allowed to arm - the
-            # fix41 east-side dip at (756.7,740.6) had fwd=8.6 clear but
-            # the stuck detector sent the car backwards downhill instead
-            # of giving it torque.
-            climb = False
-            if (stuck and not force_stop and not off_recover
-                    and chosen.path is not None
-                    and len(chosen.path) >= 2
-                    and np.isfinite(fwd_clear) and fwd_clear > 3.0):
-                if climb_t < CLIMB_ASSIST_S:
-                    climb = True
-                    climb_t += max(0.0, float(dt))
+                    fwd_clear = float(out.forward_clearance)
+                if np.isfinite(fwd_clear):
+                    need = emergency_stop_clearance_m(v)
+                    force_stop, cap = emergency_speed_limit_mps(fwd_clear, need)
+                    target = min(target, cap if not force_stop else 0.0)
+                # Smooth the effective target: ramp toward the raw plan at a
+                # bounded rate (sim time), so the corner governor stepping the
+                # plan from 6 to 3.2 m/s in one tick cannot flip the pedals.
+                # A safety force-stop bypasses the ramp and brakes immediately.
+                if force_stop:
+                    target_sm = 0.0
                 else:
-                    climb_t = 0.0  # give up climbing -> allow reverse
-            if (chosen.path is None or force_stop or stuck) \
-                    and not climb and not off_recover:
-                thr, brk = 0.0, 1.0
-                steer = 0.0
-                stopps += 1
-                pb = 1.0
-            if climb:
-                thr, brk = 1.0, 0.0
-                steer = 0.0
-                pb = 0.0
-            # Controlled reverse escape: when NO drivable forward path
-            # remains (dead-end / wedged nose) and the space BEHIND the
-            # car is clear, back up a bounded distance in R, then let the
-            # planner re-attempt a forward path.  This is the "reverse to
-            # find a feasible path" behaviour; it never reverses while a
-            # forward path exists and never reverses blindly (no rear
-            # clearance data -> stay stopped).
-            has_forward_path = (chosen.path is not None
-                                and len(chosen.path) >= 2
-                                and not force_stop and not stuck) or climb \
-                or off_recover
-            # Arrived at the destination: once inside the stop zone and
-            # nearly stopped, treat the forward path as present so the
-            # reverse escape never backs the car over the line at the end
-            # (opt18: rev=1 at the goal moved the car onto the oncoming
-            # lane and it parked over the line).
-            if rem_end is not None and rem_end < END_STOP_M and v < 0.6:
-                has_forward_path = True
-            rear_clear_m = None
-            if not has_forward_path and grid is not None:
-                try:
-                    _bh = float(heading) + math.pi
-                    _ln = np.array([math.cos(_bh), math.sin(_bh)])
-                    _lt = np.array([-_ln[1], _ln[0]])
-                    _best = float("inf")
-                    for _lat in (0.0, -1.5, 1.5):
-                        _o = pos[:2] + _lat * _lt
-                        for _ds in np.arange(1.0, 10.0, 0.4):
-                            _wx = float(_o[0] + _ds * _ln[0])
-                            _wy = float(_o[1] + _ds * _ln[1])
-                            _cell = grid.world_to_cell(_wx, _wy)
-                            if _cell is not None:
-                                _r, _c = int(_cell[0]), int(_cell[1])
-                                if (0 <= _r < grid.obstacle.shape[0]
-                                        and 0 <= _c < grid.obstacle.shape[1]
-                                        and grid.obstacle[_r, _c] > 0):
-                                    _best = min(_best, _ds - 0.5)
-                                    break
-                    rear_clear_m = (float(_best) if _best < float("inf")
-                                     else 40.0)
-                except Exception:
-                    rear_clear_m = None
-            rm = rman.decide(has_forward_path=has_forward_path,
-                             rear_clear_m=rear_clear_m,
-                             signed_speed=signed,
-                             pos2d=pos[:2], dt=dt)
-            gear_use = fwd_gear
-            if not rm.active:
-                rev_thr = REV_THR_BASE   # reset the escape ramp
-            if rm.active:
-                # Bounded reverse: gear R, slow, straight back (steering
-                # centred) until the state machine releases the attempt.
-                gear_use = rm.gear
-                steer = 0.0
-                pb = 0.0  # the car must roll for the escape
-                if signed >= -0.05:
-                    # Gentle R throttle: 0.25 ramped the car to -3 m/s in
-                    # ~1.5 s (fix37); 0.10 still reached -3.0 on the
-                    # east-side slope (fix41).  0.06 keeps the escape
-                    # near the -0.4 m/s target even on a mild grade.
-                    # No throttle once the car is ALREADY rolling back
-                    # (signed < -0.05): on a downhill slope gravity does
-                    # the backing, adding throttle only rolls it further
-                    # before the brake catches (east-side roll-back).
-                    # ON GRASS 0.06 cannot overcome rolling resistance:
-                    # the escape then pulses forever without moving
-                    # (fsd_benchmark mountain 2026-09-05: 28 s stuck at
-                    # road_off ~0.9 with rev_state cycling).  Ramp the
-                    # throttle while the car is not yet rolling back;
-                    # the -0.4 m/s target brake + rear_clear stop keep
-                    # the ramp bounded.
-                    rev_thr = min(REV_THR_MAX, rev_thr + REV_THR_STEP)
-                    thr, brk = rev_thr, 0.0
-                elif signed > rm.target_speed_mps:
-                    # Approaching the reverse target: back off the
-                    # throttle and brake softly instead of waiting for a
-                    # full overshoot (control ticks are ~1.4 s apart).
-                    thr, brk = 0.0, 0.6
-                else:
-                    # Backward speed already beyond the target (downhill
-                    # roll): brake hard AND handbrake - 0.8 alone let the
-                    # car run away to -7 m/s on a slope (run_fix17).
-                    thr, brk, pb = 0.0, 1.0, 1.0
-                # Extra stop margin when the rear space is nearly gone.
-                if rear_clear_m is not None and rear_clear_m <= 2.0:
-                    thr, brk, pb = 0.0, 1.0, 1.0
-            elif reversing:
-                # Passive reverse guard (unintended backward motion, e.g.
-                # a wall bounce): brake, centre the wheel, no throttle.
-                # Handbrake too while still moving backwards so a slope
-                # cannot roll the car away.
-                thr, brk = 0.0, max(brk, float(rev_brk))
-                steer = 0.0
-                if signed < -0.1:
-                    pb = 1.0
-            # Off-road recovery: the hard DecalRoad edges are the ground
-            # truth for "on the road".  Once the car has LEFT the road
-            # (grass/verge on the right, oncoming side on the left) it
-            # must not keep driving - creeping on the verge understeered
-            # 2 m -> 10 m further away at the town corner (opt24).  Hard
-            # stop + hold like the end zone; the driver / next teleport
-            # repositions.  Reverse escape is suppressed while off-road
-            # (has_forward_path above) so it never backs further off.
-            if off_recover:
-                thr = 0.0
-                brk = max(brk, END_BRAKE)
-                steer = 0.0
-                if v < 0.4:
-                    pb = 1.0
-            # End-of-route hard stop + hold: target=0 alone only asks the
-            # speed controller for a gentle ramp (brk ~0.16 at 1.3 m/s),
-            # so the car rolled through the whole stop zone, the lane
-            # reference collapsed onto the centre line and it parked ON
-            # the line (opt18: ll -1.00 -> 0.00 at rem 4->0, final parked
-            # over the line after the reverse escape).  Inside the stop
-            # zone brake hard so the car stops BEFORE the degenerate road
-            # end, and hold with the handbrake once stopped.
-            if rem_end is not None and rem_end < END_STOP_M:
-                thr = 0.0
-                brk = max(brk, END_BRAKE)
-                # Final ALIGNMENT before the hold: brake to a crawl, then
-                # creep straight until the body yaw is within
-                # ALIGN_YAW_DEG of the route - a mid-turn full-hold parks
-                # the car diagonal across both lanes (town 2026-09-06,
-                # user screenshot).  Bounded by rem_end > 2 m so the
-                # creep never pushes past the road end.
-                _yaw_dev = None
-                try:
-                    _r_bear = _ref_bearing(route_local, pos)
-                    if _r_bear is not None:
-                        _yaw_dev = math.radians(
-                            (heading * 57.29577951308232 - _r_bear + 180.0)
-                            % 360.0 - 180.0)
-                except Exception:
-                    _yaw_dev = None
-                if v < 0.5:
-                    if (_yaw_dev is not None
-                            and abs(_yaw_dev) > math.radians(ALIGN_YAW_DEG)
-                            and rem_end > 2.0):
-                        # creep forward while straightening toward the
-                        # route direction (positive steer = right =
-                        # heading decreases)
-                        thr = ALIGN_CREEP_THR
-                        brk = 0.0
-                        pb = 0.0
-                        steer = float(np.clip(
-                            _yaw_dev * 1.2, -0.4, 0.4))
+                    _dmax = SPEED_TARGET_RAMP_MPS * dt
+                    if target > target_sm:
+                        target_sm = min(target, target_sm + _dmax)
                     else:
-                        steer = 0.0
+                        target_sm = max(target, target_sm - _dmax)
+                    # Never cruise above the planned corner speed.  The ramp
+                    # can still be converging down from a high initial target
+                    # (first frames), which let the car overshoot the bend
+                    # plan and trip the hard governor every tick (fix61:
+                    # v=4.45 against plan 3.23 -> brake 1.0 -> stall ->
+                    # full throttle again).  Capping the smoothed target by
+                    # plan_speed keeps the pedals inside the plan from the
+                    # very first tick.
+                    target_sm = min(target_sm, plan_speed)
+                thr, brk = speed_ctrl.update(
+                    target_sm, v, dt=min(0.25, max(0.01, dt)))
+                # Downhill-start throttle guard: on the descent the car
+                # accelerates by gravity alone, so feeding throttle near the
+                # plan overshoots the bend speed and the governor then brakes
+                # it to a standstill every tick (fix61-64: v 0 -> 4.4 -> 0).
+                # Below a low speed, hold the pedal near idle and let gravity
+                # bring the speed up to the plan; the controller resumes once
+                # the speed is there.
+                if v < 2.5 and signed > 0.3 and target_sm <= plan_speed:
+                    thr = min(thr, 0.25)
+                # Downhill acceleration cap: once the car is rolling, full
+                # throttle demand plus gravity overshoots the plan in one
+                # 0.66 s burst (opt8: 0.80 throttle -> 2.7 -> 7.3 m/s).
+                # Cap the pedal while approaching the target so gravity does
+                # most of the work; the plan governor trims the rest.
+                if v > 2.5 and signed > 0.5 and v < target_sm - 0.5:
+                    thr = min(thr, 0.35)
+                # (The old "corner brake zone" here is gone: with the sim
+                # paused and stepped in 0.33 s bursts the speed controller
+                # reacts within one burst, while the zone caused an
+                # accelerate -> brake-to-stop oscillation - fix54 reached
+                # v=3.6 then brk=0.8 stopped it dead at every tick.  The
+                # plan-speed governor below still hard-brakes overshoot.)
+                # Soft overspeed governor: never let the car exceed the
+                # commanded cruise speed by more than 1 m/s regardless of
+                # the smoothed pedal state.  The old brk=1.0 here stopped
+                # the car DEAD on the downhill, then the controller relaunched
+                # with full throttle -> 0 <-> 7.8 m/s bang-bang (opt8).
+                # Taper the throttle off between +0.5 and +1.3 m/s overshoot
+                # instead of the old hard cut at +1.0.  A hard cut to 0 then
+                # a full re-launch made a +/-0.9 m/s speed wave around cruise
+                # (opt21: 49 throttle on/off flips in 169 frames); a gradual
+                # taper removes the relaunch kick while the plan governor's
+                # gentle GOV_BRAKE still trims the overshoot.
+                _ov = v - (float(args.speed) + 0.5)
+                if _ov > 0.0:
+                    thr *= float(np.clip((0.8 - _ov) / 0.8, 0.0, 1.0))
+                # Plan-speed governor: never let the car exceed the planned
+                # corner speed by more than 0.8 m/s even within one tick -
+                # the profile alone is sampled at tick boundaries and the
+                # car can overshoot a 4.4 m/s hairpin plan to ~5.5 mid-tick.
+                if v > plan_speed + GOV_ON_MPS:
+                    gov_brake = True
+                elif not (v > plan_speed + GOV_OFF_MPS):
+                    gov_brake = False
+                if gov_brake:
+                    thr, brk = 0.0, max(brk, GOV_BRAKE)
+                # Stuck detection: the planner can keep reporting "safe" while
+                # the car physically cannot move (wedged against a guardrail /
+                # embankment after an over-correction).  Holding throttle
+                # against the obstruction forever is the "spinning in place"
+                # failure - after a couple of seconds at near-standstill with
+                # a commanded forward path, treat it as "no forward path" so
+                # the bounded reverse escape backs out and re-plans (mountain
+                # run 2026-08-27 run_fix31: wedged at (741.2,745.7) with
+                # thr=0.53 and v=0 for 50 s).
+                if (chosen.path is not None and not force_stop
+                        and v < 0.35 and thr > 0.0):
+                    stuck_t += max(0.0, float(dt))
+                else:
+                    stuck_t = 0.0
+                stuck = stuck_t >= 2.5
+                # hard stop when no path remains, the raw-sensor forward
+                # clearance is inside the braking reserve (never grind into a
+                # wall / wedge the car into a too-narrow gap), or the car is
+                # stuck spinning against an obstruction
+                pb = 0.0  # handbrake: hold the car on a slope while stopped
+                # Slope-creep assist: the planner keeps a CLEAR forward path
+                # while the car cannot move (e.g. stopped at the bottom of a
+                # dip facing uphill).  Full throttle for a bounded window lets
+                # it climb before the reverse escape is allowed to arm - the
+                # fix41 east-side dip at (756.7,740.6) had fwd=8.6 clear but
+                # the stuck detector sent the car backwards downhill instead
+                # of giving it torque.
+                climb = False
+                if (stuck and not force_stop and not off_recover
+                        and chosen.path is not None
+                        and len(chosen.path) >= 2
+                        and np.isfinite(fwd_clear) and fwd_clear > 3.0):
+                    if climb_t < CLIMB_ASSIST_S:
+                        climb = True
+                        climb_t += max(0.0, float(dt))
+                    else:
+                        climb_t = 0.0  # give up climbing -> allow reverse
+                if (chosen.path is None or force_stop or stuck) \
+                        and not climb and not off_recover:
+                    thr, brk = 0.0, 1.0
+                    steer = 0.0
+                    stopps += 1
+                    pb = 1.0
+                if climb:
+                    thr, brk = 1.0, 0.0
+                    steer = 0.0
+                    pb = 0.0
+                # Controlled reverse escape: when NO drivable forward path
+                # remains (dead-end / wedged nose) and the space BEHIND the
+                # car is clear, back up a bounded distance in R, then let the
+                # planner re-attempt a forward path.  This is the "reverse to
+                # find a feasible path" behaviour; it never reverses while a
+                # forward path exists and never reverses blindly (no rear
+                # clearance data -> stay stopped).
+                has_forward_path = (chosen.path is not None
+                                    and len(chosen.path) >= 2
+                                    and not force_stop and not stuck) or climb \
+                    or off_recover
+                # Arrived at the destination: once inside the stop zone and
+                # nearly stopped, treat the forward path as present so the
+                # reverse escape never backs the car over the line at the end
+                # (opt18: rev=1 at the goal moved the car onto the oncoming
+                # lane and it parked over the line).
+                if rem_end is not None and rem_end < END_STOP_M and v < 0.6:
+                    has_forward_path = True
+                rear_clear_m = None
+                if not has_forward_path and grid is not None:
+                    try:
+                        _bh = float(heading) + math.pi
+                        _ln = np.array([math.cos(_bh), math.sin(_bh)])
+                        _lt = np.array([-_ln[1], _ln[0]])
+                        _best = float("inf")
+                        for _lat in (0.0, -1.5, 1.5):
+                            _o = pos[:2] + _lat * _lt
+                            for _ds in np.arange(1.0, 10.0, 0.4):
+                                _wx = float(_o[0] + _ds * _ln[0])
+                                _wy = float(_o[1] + _ds * _ln[1])
+                                _cell = grid.world_to_cell(_wx, _wy)
+                                if _cell is not None:
+                                    _r, _c = int(_cell[0]), int(_cell[1])
+                                    if (0 <= _r < grid.obstacle.shape[0]
+                                            and 0 <= _c < grid.obstacle.shape[1]
+                                            and grid.obstacle[_r, _c] > 0):
+                                        _best = min(_best, _ds - 0.5)
+                                        break
+                        rear_clear_m = (float(_best) if _best < float("inf")
+                                         else 40.0)
+                    except Exception:
+                        rear_clear_m = None
+                rm = rman.decide(has_forward_path=has_forward_path,
+                                 rear_clear_m=rear_clear_m,
+                                 signed_speed=signed,
+                                 pos2d=pos[:2], dt=dt)
+                gear_use = fwd_gear
+                if not rm.active:
+                    rev_thr = REV_THR_BASE   # reset the escape ramp
+                if rm.active:
+                    # Bounded reverse: gear R, slow, straight back (steering
+                    # centred) until the state machine releases the attempt.
+                    gear_use = rm.gear
+                    steer = 0.0
+                    pb = 0.0  # the car must roll for the escape
+                    if signed >= -0.05:
+                        # Gentle R throttle: 0.25 ramped the car to -3 m/s in
+                        # ~1.5 s (fix37); 0.10 still reached -3.0 on the
+                        # east-side slope (fix41).  0.06 keeps the escape
+                        # near the -0.4 m/s target even on a mild grade.
+                        # No throttle once the car is ALREADY rolling back
+                        # (signed < -0.05): on a downhill slope gravity does
+                        # the backing, adding throttle only rolls it further
+                        # before the brake catches (east-side roll-back).
+                        # ON GRASS 0.06 cannot overcome rolling resistance:
+                        # the escape then pulses forever without moving
+                        # (fsd_benchmark mountain 2026-09-05: 28 s stuck at
+                        # road_off ~0.9 with rev_state cycling).  Ramp the
+                        # throttle while the car is not yet rolling back;
+                        # the -0.4 m/s target brake + rear_clear stop keep
+                        # the ramp bounded.
+                        rev_thr = min(REV_THR_MAX, rev_thr + REV_THR_STEP)
+                        thr, brk = rev_thr, 0.0
+                    elif signed > rm.target_speed_mps:
+                        # Approaching the reverse target: back off the
+                        # throttle and brake softly instead of waiting for a
+                        # full overshoot (control ticks are ~1.4 s apart).
+                        thr, brk = 0.0, 0.6
+                    else:
+                        # Backward speed already beyond the target (downhill
+                        # roll): brake hard AND handbrake - 0.8 alone let the
+                        # car run away to -7 m/s on a slope (run_fix17).
+                        thr, brk, pb = 0.0, 1.0, 1.0
+                    # Extra stop margin when the rear space is nearly gone.
+                    if rear_clear_m is not None and rear_clear_m <= 2.0:
+                        thr, brk, pb = 0.0, 1.0, 1.0
+                elif reversing:
+                    # Passive reverse guard (unintended backward motion, e.g.
+                    # a wall bounce): brake, centre the wheel, no throttle.
+                    # Handbrake too while still moving backwards so a slope
+                    # cannot roll the car away.
+                    thr, brk = 0.0, max(brk, float(rev_brk))
+                    steer = 0.0
+                    if signed < -0.1:
                         pb = 1.0
-            # Pedal rate limit: the branches above (downhill cap, taper,
-            # governor, climb/reverse/hard-stop) can step thr/brk by a
-            # whole pedal in one tick - a relaunch then reads as a speed
-            # kick (opt23: 13 speed jumps >1.5 m/s per tick).  Ramp the
-            # FINAL commanded pedals toward the previous tick's at bounded
-            # rates; safety branches bypass on purpose (hard stop, climb,
-            # reverse escape, end-zone hold).
-            _hard_pedal = bool(
-                force_stop or stuck or climb or rm.active or reversing
-                or (rem_end is not None and rem_end < END_STOP_M))
-            if not _hard_pedal:
-                thr, brk = rate_limit_pedal(
-                    thr, brk, prev_thr, prev_brk, dt)
-            prev_thr, prev_brk = thr, brk
-            conn.control(throttle=thr, brake=brk, steering=steer,
-                         gear=gear_use, parkingbrake=pb)
-            # Shadow-frame recording (same ShadowFrame contract as
-            # m5_shadow_drive): a drive tick IS one labelled episode
-            # sample - executed controls + the perception/planning
-            # evidence (BEV, drivable, trajectory, camera + semantic
-            # label) that produced them, for image / BEV end-to-end
-            # training later.  A bad tick (no plan) is labelled with
-            # quality=0 so it can be gated out of the dataset.
+                # Off-road recovery: the hard DecalRoad edges are the ground
+                # truth for "on the road".  Once the car has LEFT the road
+                # (grass/verge on the right, oncoming side on the left) it
+                # must not keep driving - creeping on the verge understeered
+                # 2 m -> 10 m further away at the town corner (opt24).  Hard
+                # stop + hold like the end zone; the driver / next teleport
+                # repositions.  Reverse escape is suppressed while off-road
+                # (has_forward_path above) so it never backs further off.
+                if off_recover:
+                    thr = 0.0
+                    brk = max(brk, END_BRAKE)
+                    steer = 0.0
+                    if v < 0.4:
+                        pb = 1.0
+                # End-of-route hard stop + hold: target=0 alone only asks the
+                # speed controller for a gentle ramp (brk ~0.16 at 1.3 m/s),
+                # so the car rolled through the whole stop zone, the lane
+                # reference collapsed onto the centre line and it parked ON
+                # the line (opt18: ll -1.00 -> 0.00 at rem 4->0, final parked
+                # over the line after the reverse escape).  Inside the stop
+                # zone brake hard so the car stops BEFORE the degenerate road
+                # end, and hold with the handbrake once stopped.
+                if rem_end is not None and rem_end < END_STOP_M:
+                    thr = 0.0
+                    brk = max(brk, END_BRAKE)
+                    # Final ALIGNMENT before the hold: brake to a crawl, then
+                    # creep straight until the body yaw is within
+                    # ALIGN_YAW_DEG of the PERCEIVED lane direction - a
+                    # mid-turn full-hold parks the car diagonal across both
+                    # lanes (town 2026-09-06, user screenshot).  The
+                    # reference is perception only: the nav-route bearing
+                    # used to drive this creep, which is a map-derived
+                    # steering reference (banned in the FSD entry) and
+                    # folded onto the centreline exactly at road ends.
+                    # Without a perceived lane direction the car holds the
+                    # brake instead of steering on map.  Bounded by
+                    # rem_end > 2 m so the creep never pushes past the road
+                    # end.
+                    _yaw_dev = None
+                    try:
+                        _yaw_dev = _endzone_align_yaw_dev(
+                            heading, _end_dir3, _end_dir_src)
+                    except Exception:
+                        _yaw_dev = None
+                    if v < 0.5:
+                        if (_yaw_dev is not None
+                                and abs(_yaw_dev) > math.radians(ALIGN_YAW_DEG)
+                                and rem_end > 2.0):
+                            # creep forward while straightening toward the
+                            # route direction (positive steer = right =
+                            # heading decreases)
+                            thr = ALIGN_CREEP_THR
+                            brk = 0.0
+                            pb = 0.0
+                            steer = float(np.clip(
+                                _yaw_dev * 1.2, -0.4, 0.4))
+                        else:
+                            steer = 0.0
+                            pb = 1.0
+                # Pedal rate limit: the branches above (downhill cap, taper,
+                # governor, climb/reverse/hard-stop) can step thr/brk by a
+                # whole pedal in one tick - a relaunch then reads as a speed
+                # kick (opt23: 13 speed jumps >1.5 m/s per tick).  Ramp the
+                # FINAL commanded pedals toward the previous tick's at bounded
+                # rates; safety branches bypass on purpose (hard stop, climb,
+                # reverse escape, end-zone hold).
+                _hard_pedal = bool(
+                    force_stop or stuck or climb or rm.active or reversing
+                    or (rem_end is not None and rem_end < END_STOP_M))
+                if not _hard_pedal:
+                    thr, brk = rate_limit_pedal(
+                        thr, brk, prev_thr, prev_brk, dt)
+                prev_thr, prev_brk = thr, brk
+                conn.control(throttle=thr, brake=brk, steering=steer,
+                             gear=gear_use, parkingbrake=pb)
+                # Shadow-frame recording (same ShadowFrame contract as
+                # m5_shadow_drive): a drive tick IS one labelled episode
+                # sample - executed controls + the perception/planning
+                # evidence (BEV, drivable, trajectory, camera + semantic
+                # label) that produced them, for image / BEV end-to-end
+                # training later.  A bad tick (no plan) is labelled with
+                # quality=0 so it can be gated out of the dataset.
+                if rec is not None:
+                    try:
+                        _sem_r = out.head_outputs.get("semantic")
+                        _label = None
+                        if _sem_r is not None and out.frame is not None \
+                                and "road" in getattr(_sem_r, "masks", {}):
+                            _label = np.zeros(out.frame.shape[:2], dtype=np.uint8)
+                            _label[_sem_r.masks["road"]] = 1
+                            if "line" in getattr(_sem_r, "masks", {}):
+                                _label[_sem_r.masks["line"]] = 2
+                        _traj = (chosen.path if chosen.path is not None
+                                 else out.best_path)
+                        _fmap = None
+                        _fm = getattr(out, "feature_map", None)
+                        if _fm is not None:
+                            _fmap = np.stack([
+                                np.asarray(_fm.get(c), dtype=np.float32)
+                                for c in FMAP_CHANNELS]).astype(np.float32)
+                        rec.add(ShadowFrame(
+                            x=float(pos[0]), y=float(pos[1]),
+                            heading=heading, speed=v,
+                            throttle=thr, brake=brk, steer=steer,
+                            bev_raster=(np.asarray(out.bev, dtype=np.float32)
+                                        if out.bev is not None else None),
+                            drivable=(np.asarray(out.drivable, dtype=np.uint8)
+                                      if out.drivable is not None else None),
+                            fmap=_fmap,
+                            trajectory=(np.asarray(_traj, dtype=float)[:, :2]
+                                        if _traj is not None
+                                        and len(_traj) >= 2 else None),
+                            target_speed=float(plan_speed),
+                            lane_src=str(out.meta.get("lane_src", "")),
+                            cost=float(out.meta.get("planner", {})
+                                       .get("cost", -1.0)),
+                            kind=str(out.meta.get("planner", {})
+                                     .get("kind", "")),
+                            rgb=(np.ascontiguousarray(out.frame, dtype=np.uint8)
+                                 if out.frame is not None else None),
+                            label=_label,
+                            quality=1.0 if chosen.path is not None else 0.0))
+                    except Exception as _rec_e:
+                        print(f"[fsd-drive] shadow frame dropped: {_rec_e}")
+                # Lane-position telemetry: signed lateral offset of the ego from
+                # each DETECTED lane boundary (left: + = inside oncoming traffic;
+                # right: - = off the road edge).  None when the boundary does
+                # not extend to the ego or no lane was detected this frame.
+                lat_left = lat_right = None
+                fwd_lane = np.array([float(np.cos(heading)),
+                                     float(np.sin(heading))])
+                if out.lane_left is not None:
+                    try:
+                        _ll, _cl = _boundary_lateral(
+                            float(pos[0]), float(pos[1]), out.lane_left, fwd_lane)
+                        lat_left = round(float(_ll), 3) if _cl else None
+                    except Exception:
+                        pass
+                if out.lane_right is not None:
+                    try:
+                        _lr, _cr = _boundary_lateral(
+                            float(pos[0]), float(pos[1]), out.lane_right, fwd_lane)
+                        _lr = float(_lr)
+                        lat_right = round(float(_lr), 3) if _cr else None
+                    except Exception:
+                        pass
+                # BODY-aware lateral position: a yawed car crosses the line
+                # with its body while the centre point still reads in-lane
+                # (town run 2026-09-06: crossC=0 while the user photographed
+                # the left wheels ON the line).  Boundary heading ~= route
+                # bearing; footprint halves are the etk800's.
+                # FULL-BODY projection: the four corners of the ego footprint
+                # (half 2.2 x 0.9 m) in world space, each tested against the
+                # detected lane boundaries - ANY corner beyond a boundary is
+                # a body crossing (the centre point + lateral-extent
+                # approximation missed yawed-body crossings).
+                body_cross_l = body_cross_r = 0
+                try:
+                    _cy, _sy = math.cos(heading), math.sin(heading)
+                    _fwd = np.array([_cy, _sy])
+                    _corners = footprint_corners(pos[:2], float(heading))
+                    if out.lane_left is not None:
+                        for _c in _corners:
+                            _lc, _cov = _boundary_lateral(
+                                float(_c[0]), float(_c[1]), out.lane_left,
+                                _fwd)
+                            if _cov and _lc > 0.05:
+                                body_cross_l += 1
+                    if out.lane_right is not None:
+                        for _c in _corners:
+                            _rc, _cov = _boundary_lateral(
+                                float(_c[0]), float(_c[1]), out.lane_right,
+                                _fwd)
+                            if _cov and _rc < -0.05:
+                                body_cross_r += 1
+                except Exception:
+                    pass
+                # Body overshoot past each DETECTED boundary: the worst of
+                # the four corners, measured straight against the boundary
+                # polyline - the same perception-only footprint the gates
+                # above use.  (The old version projected a route bearing
+                # from the map onto the centre offset; no map in the
+                # lateral metric any more.)
+                body_lat_left = body_lat_right = None
+                try:
+                    _corners3 = footprint_corners(pos[:2], float(heading))
+                    if out.lane_left is not None:
+                        _l_lat = []
+                        for _c in _corners3:
+                            _lc, _cov = _boundary_lateral(
+                                float(_c[0]), float(_c[1]), out.lane_left, None)
+                            if _cov:
+                                _l_lat.append(float(_lc))
+                        if _l_lat:
+                            body_lat_left = round(max(_l_lat), 3)
+                    if out.lane_right is not None:
+                        _r_lat = []
+                        for _c in _corners3:
+                            _rc, _cov = _boundary_lateral(
+                                float(_c[0]), float(_c[1]), out.lane_right, None)
+                            if _cov:
+                                _r_lat.append(float(_rc))
+                        if _r_lat:
+                            body_lat_right = round(min(_r_lat), 3)
+                except Exception:
+                    pass
+                # snapshot for offline stability evaluation (safe / degraded
+                # ratio over a long route); written once at the end.
+                hist.append({
+                    "t": round(time.time() - t0, 3),
+                    "pos": [round(float(p), 3) for p in pos[:3]],
+                    "heading": round(float(heading), 4),
+                    "speed": round(float(v), 3),
+                    "signed": round(float(signed), 3),
+                    "level": str(verd.level),
+                    "reason": verd.reason or "-",
+                    "source": str(chosen.source),
+                    "e2e": int(e2e_path is not None and len(e2e_path) >= 2),
+                    "e2e_safe": int(bool(e2e_safe)),
+                    "e2e_ms": (round(float(e2e_ms), 1)
+                               if e2e_ms is not None else None),
+                    "e2e_extent": (round(float(e2e_ext), 2)
+                                   if e2e_ext is not None else None),
+                    "e2e_reject": e2e_reject or None,
+                    "e2e_lat": (round(float(e2e_val.lateral_m), 2)
+                                if e2e_val is not None else None),
+                    "e2e_backstep": (round(float(e2e_val.backstep_m), 2)
+                                     if e2e_val is not None else None),
+                    "e2e_curv": (round(float(e2e_val.max_curvature), 4)
+                                 if e2e_val is not None else None),
+                    "bc": int(bc_path is not None and len(bc_path) >= 2),
+                    "bc_safe": int(bool(bc_safe)),
+                    "bc_steer": (round(float(bc_steer), 3)
+                                 if bc_steer is not None else None),
+                    "bc_ms": (round(float(bc_ms), 1)
+                              if bc_ms is not None else None),
+                    "bc_reject": bc_reject or None,
+                    "bc_lat": (round(float(bc_val.lateral_m), 2)
+                               if bc_val is not None else None),
+                    "bc_backstep": (round(float(bc_val.backstep_m), 2)
+                                    if bc_val is not None else None),
+                    "bc_curv": (round(float(bc_val.max_curvature), 4)
+                                if bc_val is not None else None),
+                    "dqn_act": dqn_action,
+                    "dqn_contract_ok": (
+                        int(bool(dqn_rt.contract.ok))
+                        if dqn_rt is not None
+                        and dqn_rt.contract is not None else None),
+                    "dqn_contract_reason": (
+                        dqn_rt.contract.reason or None
+                        if dqn_rt is not None
+                        and dqn_rt.contract is not None else None),
+                    "dqn_contract_warning": (
+                        dqn_rt.meta_warning or None
+                        if dqn_rt is not None else None),
+                    "dqn_contract_git": (
+                        dqn_rt.meta.get("git_commit")
+                        if dqn_rt is not None and dqn_rt.meta else None),
+                    "cls_tree": int(_cls.get("tree", 0)),
+                    "cls_guardrail": int(_cls.get("guardrail", 0)),
+                    "cls_wall": int(_cls.get("wall", 0)),
+                    "cls_tree_d": _cls_near.get("tree"),
+                    "body_lat_left": body_lat_left,
+                    "body_lat_right": body_lat_right,
+                    "body_cross_l": int(body_cross_l > 0),
+                    "body_cross_r": int(body_cross_r > 0),
+                    "painted_body_cross": int(painted_body_cross),
+                    "plc_rejected": int(plc_rejected),
+                    "end_rejected": int(end_rejected),
+                    "pl_mask": int(_pl_mask),
+                    "pl_marks": int(_pl_marks),
+                    "pl_near": int(_pl_near),
+                    "cls_guardrail_d": _cls_near.get("guardrail"),
+                    "cls_wall_d": _cls_near.get("wall"),
+                    "dqn_ms": (round(float(dqn_ms), 1)
+                               if dqn_ms is not None else None),
+                    "e2e_act": ([round(float(a), 3) for a in e2e_act]
+                                if e2e_act is not None else None),
+                    "plan_speed": round(float(plan_speed), 2),
+                    "plan_raw": round(float(plan_raw_speed), 2),
+                    "target_sm": round(float(target_sm), 2),
+                    "plan_src": str(out.meta.get("plan_src", "?")),
+                    "tick_ms": out.meta.get("tick_ms"),
+                    "tick_wall_ms": round((_tb - _f0) * 1000.0, 1),
+                    "budget_s": round(float(_budget), 3),
+                    "budget_skips": list(
+                        out.meta.get("tick_budget_skips") or []),
+                    'frame_ms': {
+                        'local': round((_ta - _f0) * 1000.0, 1),
+                        'tick': round((_tb - _ta) * 1000.0, 1),
+                        'grid_mon': round((_tc - _tb) * 1000.0, 1),
+                        'rest': round((time.time() - _tc) * 1000.0, 1),
+                    },
+                    "throttle": round(float(thr), 4),
+                    "brake": round(float(brk), 4),
+                    "steer": round(float(steer), 4),
+                    "reversing": int(bool(reversing)),
+                    "rev_state": str(rman.state),
+                    "rev_active": int(bool(rm.active)),
+                    "rear_clear": (round(float(rear_clear_m), 2)
+                                   if rear_clear_m is not None else None),
+                    "fwd_clear": float(out.forward_clearance)
+                        if np.isfinite(out.forward_clearance) else None,
+                    "emergency": int(bool(force_stop)),
+                    "stuck": int(bool(stuck)),
+                    "lane_src": str(out.meta.get("lane_src", "?")),
+                    "lane_mode": str(args.lane_mode),
+                    "lane_reject": str(out.meta.get("lane_reject_reason", "")),
+                    "lane_sel": str(out.meta.get("lane_src_sel", "")),
+                    "lane_paired": int(out.meta.get("lane_paired", 0)),
+                    "n_object_obstacles": int(
+                        out.meta.get("n_object_obstacles", 0)),
+                    "object_head": int(out.meta.get("object_head", 0)),
+                    "signal_state": str(out.meta.get("signal_state", "")),
+                    "signal_conf": (round(float(out.meta["signal_conf"]), 3)
+                                    if out.meta.get("signal_conf") else None),
+                    "intent": str(out.meta.get("intent", "")),
+                    "intent_turn_deg": out.meta.get("intent_turn_deg"),
+                    "change_left": int(out.meta.get("change_left", 0)),
+                    "change_right": int(out.meta.get("change_right", 0)),
+                    "n_tracks": int(out.meta.get("n_tracks", 0)),
+                    "fmap": int(out.feature_map is not None),
+                    "lane_dev_m": round(float(getattr(verd, "lane_dev_m", 0.0)), 3),
+                    "lat_left": lat_left,
+                    "lat_right": lat_right,
+                    "kind": str(out.meta.get("planner", {}).get("kind", "?")),
+                    "cost": round(float(out.meta.get("planner", {}).get("cost", 0.0)), 3),
+                    "n_eval": int(out.meta.get("planner", {}).get("n_eval", 0)),
+                    "pp_alpha": pp_alpha,
+                    "yaw_rate": round(float(yaw_rate), 3),
+                    "ff_steer": round(float(ff_steer), 3),
+                    "climb": int(bool(climb)),
+                    "road_off": round(float(road_off), 3),
+                    "off_recover": int(off_recover),
+                    "rem_end": (round(float(rem_end), 2)
+                                if rem_end is not None else None),
+                    "mon_target": round(float(verd.target_speed), 2),
+                    "closest_obs": (round(float(verd.closest_obs_m), 2)
+                                    if verd.closest_obs_m < 900.0 else None),
+                    "pp_tgt": ([round(float(v), 2) for v in pp_tgt[:2]]
+                               if pp_tgt is not None else None),
+                    "line_lat": line_lat,
+                    "plc_active": int(_plc_active),
+                    "plc_shift": round(float(_plc_shift), 3),
+                    "plc_desired": (round(float(_plc_desired), 3)
+                                    if _plc_desired is not None else None),
+                    "end_ref": _end_ref,
+                    "end_dir_src": _dir_src,
+                    "lane_bear": _ref_bearing(out.lane_ref, pos),
+                    "route_bear": _ref_bearing(route_local, pos),
+                    "best_bear": _ref_bearing(out.best_path, pos),
+                })
+                # Real-time cadence: the sim keeps running; pace the control
+                # loop to ~2 Hz so the car is never left without a fresh
+                # command for long.
+                _elapsed = time.time() - _f0
+                _slack = (1.0 / REALTIME_CTRL_HZ) - _elapsed
+                if _slack > 0.0:
+                    time.sleep(_slack)
+                frames += 1
+                if frames % 4 == 1:
+                    _e2e_s = (f"e2e={e2e_ms:.0f}ms "
+                              if e2e_ms is not None else "")
+                    print(f"[fsd-drive] t={time.time()-t0:5.1f} v={v:4.1f} "
+                          f"level={verd.level} src={chosen.source:4s} "
+                          f"reason={verd.reason or '-':22s} "
+                          f"steer={steer:+.2f} thr={thr:.2f} "
+                          f"plan_v={plan_speed:.1f} {_e2e_s}"
+                          f"rev={int(reversing)} signed={signed:+.2f} "
+                          f"lane={out.meta.get('lane_src', '?')}/"
+                          f"{'P' if out.meta.get('lane_paired') else '1'} "
+                          f"dev={getattr(verd, 'lane_dev_m', 0.0):.2f}")
+            _ll = [f["line_lat"] for f in hist if f.get("line_lat") is not None]
+            if _ll:
+                _arr = np.asarray(_ll, dtype=float)
+                print(f"[fsd-drive] painted line lateral (left=+): "
+                      f"mean={_arr.mean():+.2f}m p50="
+                      f"{np.percentile(_arr, 50):+.2f}m "
+                      f"min={_arr.min():+.2f} max={_arr.max():+.2f} "
+                      f"({int((_arr < -0.5).sum())} frames car left of line)")
+            _ps = [float(f.get("plc_shift", 0.0)) for f in hist]
+            _nplc = sum(1 for f in hist
+                        if abs(f.get("plc_shift", 0.0)) > PLC_MIN_ENGAGE_M)
+            if _nplc:
+                print(f"[fsd-drive] painted-line steady corrector: "
+                      f"active {_nplc}/{len(hist)} frames, "
+                      f"mean|shift|={np.mean(np.abs(_ps)):.2f}m")
+            _er = [(f.get("end_ref", 0), f.get("rem_end")) for f in hist
+                   if f.get("rem_end") is not None
+                   and f["rem_end"] < END_PULL_START_M]
+            if _er:
+                _n_live = sum(1 for _r, _ in _er if _r == 2)
+                _n_hold = sum(1 for _r, _ in _er if _r == 1)
+                _n_flat = sum(1 for _r, _ in _er if _r == 0)
+                print(f"[fsd-drive] end-zone ref: live-perception={_n_live} "
+                      f"last-good-hold={_n_hold} straight-hold={_n_flat}")
+            print(f"[fsd-drive] done: {frames} frames, {stopps} stops")
+            _n_skip_fr = sum(1 for f in hist if f.get("budget_skips"))
+            if _n_skip_fr:
+                _n_skip_hd = sum(len(f.get("budget_skips") or [])
+                                 for f in hist)
+                _max_budget = max(float(f.get("budget_s") or 0.0)
+                                  for f in hist)
+                print(f"[fsd-drive] tick budget: {_n_skip_fr} frames "
+                      f"deferred {_n_skip_hd} heavy head(s) "
+                      f"(budget capped at {_max_budget:.2f}s)")
             if rec is not None:
                 try:
-                    _sem_r = out.head_outputs.get("semantic")
-                    _label = None
-                    if _sem_r is not None and out.frame is not None \
-                            and "road" in getattr(_sem_r, "masks", {}):
-                        _label = np.zeros(out.frame.shape[:2], dtype=np.uint8)
-                        _label[_sem_r.masks["road"]] = 1
-                        if "line" in getattr(_sem_r, "masks", {}):
-                            _label[_sem_r.masks["line"]] = 2
-                    _traj = (chosen.path if chosen.path is not None
-                             else out.best_path)
-                    _fmap = None
-                    _fm = getattr(out, "feature_map", None)
-                    if _fm is not None:
-                        _fmap = np.stack([
-                            np.asarray(_fm.get(c), dtype=np.float32)
-                            for c in FMAP_CHANNELS]).astype(np.float32)
-                    rec.add(ShadowFrame(
-                        x=float(pos[0]), y=float(pos[1]),
-                        heading=heading, speed=v,
-                        throttle=thr, brake=brk, steer=steer,
-                        bev_raster=(np.asarray(out.bev, dtype=np.float32)
-                                    if out.bev is not None else None),
-                        drivable=(np.asarray(out.drivable, dtype=np.uint8)
-                                  if out.drivable is not None else None),
-                        fmap=_fmap,
-                        trajectory=(np.asarray(_traj, dtype=float)[:, :2]
-                                    if _traj is not None
-                                    and len(_traj) >= 2 else None),
-                        target_speed=float(plan_speed),
-                        lane_src=str(out.meta.get("lane_src", "")),
-                        cost=float(out.meta.get("planner", {})
-                                   .get("cost", -1.0)),
-                        kind=str(out.meta.get("planner", {})
-                                 .get("kind", "")),
-                        rgb=(np.ascontiguousarray(out.frame, dtype=np.uint8)
-                             if out.frame is not None else None),
-                        label=_label,
-                        quality=1.0 if chosen.path is not None else 0.0))
+                    _rec_out = rec.save()
+                    if _rec_out:
+                        print(f"[fsd-drive] shadow episode saved -> {_rec_out}")
+                    else:
+                        print("[fsd-drive] nothing recorded")
                 except Exception as _rec_e:
-                    print(f"[fsd-drive] shadow frame dropped: {_rec_e}")
-            # Lane-position telemetry: signed lateral offset of the ego from
-            # each DETECTED lane boundary (left: + = inside oncoming traffic;
-            # right: - = off the road edge).  None when the boundary does
-            # not extend to the ego or no lane was detected this frame.
-            lat_left = lat_right = None
-            fwd_lane = np.array([float(np.cos(heading)),
-                                 float(np.sin(heading))])
-            if out.lane_left is not None:
-                try:
-                    _ll, _cl = _boundary_lateral(
-                        float(pos[0]), float(pos[1]), out.lane_left, fwd_lane)
-                    lat_left = round(float(_ll), 3) if _cl else None
-                except Exception:
-                    pass
-            if out.lane_right is not None:
-                try:
-                    _lr, _cr = _boundary_lateral(
-                        float(pos[0]), float(pos[1]), out.lane_right, fwd_lane)
-                    _lr = float(_lr)
-                    lat_right = round(float(_lr), 3) if _cr else None
-                except Exception:
-                    pass
-            # BODY-aware lateral position: a yawed car crosses the line
-            # with its body while the centre point still reads in-lane
-            # (town run 2026-09-06: crossC=0 while the user photographed
-            # the left wheels ON the line).  Boundary heading ~= route
-            # bearing; footprint halves are the etk800's.
-            # FULL-BODY projection: the four corners of the ego footprint
-            # (half 2.2 x 0.9 m) in world space, each tested against the
-            # detected lane boundaries - ANY corner beyond a boundary is
-            # a body crossing (the centre point + lateral-extent
-            # approximation missed yawed-body crossings).
-            body_cross_l = body_cross_r = 0
+                    print(f"[fsd-drive] shadow episode save failed: {_rec_e}")
+        finally:
+            # input watchdog must always be lifted, even on a crash, so a
+            # later attach is not blocked by a stale Lua-frame timer
             try:
-                _cy, _sy = math.cos(heading), math.sin(heading)
-                _fwd = np.array([_cy, _sy])
-                _lft = np.array([-_sy, _cy])
-                _p2 = np.asarray(pos[:2], dtype=float)
-                _corners = [_p2 + _fwd * 2.2 + _lft * 0.9,
-                            _p2 + _fwd * 2.2 - _lft * 0.9,
-                            _p2 - _fwd * 2.2 + _lft * 0.9,
-                            _p2 - _fwd * 2.2 - _lft * 0.9]
-                if out.lane_left is not None:
-                    for _c in _corners:
-                        _lc, _cov = _boundary_lateral(
-                            float(_c[0]), float(_c[1]), out.lane_left,
-                            _fwd)
-                        if _cov and _lc > 0.05:
-                            body_cross_l += 1
-                if out.lane_right is not None:
-                    for _c in _corners:
-                        _rc, _cov = _boundary_lateral(
-                            float(_c[0]), float(_c[1]), out.lane_right,
-                            _fwd)
-                        if _cov and _rc < -0.05:
-                            body_cross_r += 1
+                wd_disarm(conn)
             except Exception:
                 pass
-            body_road_off = None
+            # ensure the car stops
             try:
-                _r_bear2 = _ref_bearing(route_local, pos)
-                if _r_bear2 is not None:
-                    _dy2 = math.radians(
-                        (heading * 57.29577951308232 - _r_bear2 + 180.0)
-                        % 360.0 - 180.0)
-                    _ext2 = (0.9 * abs(math.cos(_dy2))
-                             + 2.2 * abs(math.sin(_dy2)))
-                    _lat_r = _hw_r = None
-                    try:
-                        if (nav_route is not None
-                                and road_left is not None
-                                and road_right is not None):
-                            _la, _be, _hw_r = _route_lateral_off_m(
-                                pos, nav_route, road_left, road_right)
-                            _lat_r = _la
-                    except Exception:
-                        _lat_r = None
-                    if _lat_r is not None and _hw_r:
-                        body_road_off = round(
-                            max(0.0, abs(float(_lat_r)) + _ext2
-                                - float(_hw_r)), 3)
-            except Exception:
-                body_road_off = None
-            body_lat_left = body_lat_right = None
-            try:
-                _r_bear = _ref_bearing(route_local, pos)
-                if _r_bear is not None:
-                    _dy = math.radians(
-                        (float(heading) * 57.29577951308232 - _r_bear
-                         + 180.0) % 360.0 - 180.0)
-                    _ext = (0.9 * abs(math.cos(_dy))
-                            + 2.2 * abs(math.sin(_dy)))
-                    if lat_left is not None:
-                        body_lat_left = round(float(lat_left) + _ext, 3)
-                    if lat_right is not None:
-                        body_lat_right = round(float(lat_right) - _ext, 3)
+                conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                             gear=locals().get("fwd_gear"))
+                conn.step(3)
             except Exception:
                 pass
-            # snapshot for offline stability evaluation (safe / degraded
-            # ratio over a long route); written once at the end.
-            hist.append({
-                "t": round(time.time() - t0, 3),
-                "pos": [round(float(p), 3) for p in pos[:3]],
-                "heading": round(float(heading), 4),
-                "speed": round(float(v), 3),
-                "signed": round(float(signed), 3),
-                "level": str(verd.level),
-                "reason": verd.reason or "-",
-                "source": str(chosen.source),
-                "e2e": int(e2e_path is not None and len(e2e_path) >= 2),
-                "e2e_safe": int(bool(e2e_safe)),
-                "e2e_ms": (round(float(e2e_ms), 1)
-                           if e2e_ms is not None else None),
-                "e2e_extent": (round(float(e2e_ext), 2)
-                               if e2e_ext is not None else None),
-                "bc": int(bc_path is not None and len(bc_path) >= 2),
-                "bc_safe": int(bool(bc_safe)),
-                "bc_steer": (round(float(bc_steer), 3)
-                             if bc_steer is not None else None),
-                "bc_ms": (round(float(bc_ms), 1)
-                          if bc_ms is not None else None),
-                "dqn_act": dqn_action,
-                "cls_tree": int(_cls.get("tree", 0)),
-                "cls_guardrail": int(_cls.get("guardrail", 0)),
-                "cls_wall": int(_cls.get("wall", 0)),
-                "cls_tree_d": _cls_near.get("tree"),
-                "body_lat_left": body_lat_left,
-                "body_lat_right": body_lat_right,
-                "body_road_off": body_road_off,
-                "body_cross_l": int(body_cross_l > 0),
-                "body_cross_r": int(body_cross_r > 0),
-                "painted_body_cross": int(painted_body_cross),
-                "plc_rejected": int(plc_rejected),
-                "pl_mask": int(_pl_mask),
-                "pl_marks": int(_pl_marks),
-                "pl_near": int(_pl_near),
-                "cls_guardrail_d": _cls_near.get("guardrail"),
-                "cls_wall_d": _cls_near.get("wall"),
-                "dqn_ms": (round(float(dqn_ms), 1)
-                           if dqn_ms is not None else None),
-                "e2e_act": ([round(float(a), 3) for a in e2e_act]
-                            if e2e_act is not None else None),
-                "plan_speed": round(float(plan_speed), 2),
-                "plan_raw": round(float(plan_raw_speed), 2),
-                "target_sm": round(float(target_sm), 2),
-                "plan_src": str(out.meta.get("plan_src", "?")),
-                "tick_ms": out.meta.get("tick_ms"),
-                "tick_wall_ms": round((_tb - _f0) * 1000.0, 1),
-                "budget_s": round(float(_budget), 3),
-                "budget_skips": list(
-                    out.meta.get("tick_budget_skips") or []),
-                'frame_ms': {
-                    'local': round((_ta - _f0) * 1000.0, 1),
-                    'tick': round((_tb - _ta) * 1000.0, 1),
-                    'grid_mon': round((_tc - _tb) * 1000.0, 1),
-                    'rest': round((time.time() - _tc) * 1000.0, 1),
-                },
-                "throttle": round(float(thr), 4),
-                "brake": round(float(brk), 4),
-                "steer": round(float(steer), 4),
-                "reversing": int(bool(reversing)),
-                "rev_state": str(rman.state),
-                "rev_active": int(bool(rm.active)),
-                "rear_clear": (round(float(rear_clear_m), 2)
-                               if rear_clear_m is not None else None),
-                "fwd_clear": float(out.forward_clearance)
-                    if np.isfinite(out.forward_clearance) else None,
-                "emergency": int(bool(force_stop)),
-                "stuck": int(bool(stuck)),
-                "lane_src": str(out.meta.get("lane_src", "?")),
-                "lane_mode": str(args.lane_mode),
-                "lane_reject": str(out.meta.get("lane_reject_reason", "")),
-                "lane_sel": str(out.meta.get("lane_src_sel", "")),
-                "lane_paired": int(out.meta.get("lane_paired", 0)),
-                "n_object_obstacles": int(
-                    out.meta.get("n_object_obstacles", 0)),
-                "object_head": int(out.meta.get("object_head", 0)),
-                "signal_state": str(out.meta.get("signal_state", "")),
-                "signal_conf": (round(float(out.meta["signal_conf"]), 3)
-                                if out.meta.get("signal_conf") else None),
-                "intent": str(out.meta.get("intent", "")),
-                "intent_turn_deg": out.meta.get("intent_turn_deg"),
-                "change_left": int(out.meta.get("change_left", 0)),
-                "change_right": int(out.meta.get("change_right", 0)),
-                "n_tracks": int(out.meta.get("n_tracks", 0)),
-                "fmap": int(out.feature_map is not None),
-                "lane_dev_m": round(float(getattr(verd, "lane_dev_m", 0.0)), 3),
-                "lat_left": lat_left,
-                "lat_right": lat_right,
-                "kind": str(out.meta.get("planner", {}).get("kind", "?")),
-                "cost": round(float(out.meta.get("planner", {}).get("cost", 0.0)), 3),
-                "n_eval": int(out.meta.get("planner", {}).get("n_eval", 0)),
-                "pp_alpha": pp_alpha,
-                "yaw_rate": round(float(yaw_rate), 3),
-                "ff_steer": round(float(ff_steer), 3),
-                "climb": int(bool(climb)),
-                "road_off": round(float(road_off), 3),
-                "off_recover": int(off_recover),
-                "rem_end": (round(float(rem_end), 2)
-                            if rem_end is not None else None),
-                "mon_target": round(float(verd.target_speed), 2),
-                "closest_obs": (round(float(verd.closest_obs_m), 2)
-                                if verd.closest_obs_m < 900.0 else None),
-                "pp_tgt": ([round(float(v), 2) for v in pp_tgt[:2]]
-                           if pp_tgt is not None else None),
-                "line_lat": line_lat,
-                "plc_active": int(_plc_active),
-                "plc_shift": round(float(_plc_shift), 3),
-                "plc_desired": (round(float(_plc_desired), 3)
-                                if _plc_desired is not None else None),
-                "end_ref": _end_ref,
-                "end_dir_src": _dir_src,
-                "lane_bear": _ref_bearing(out.lane_ref, pos),
-                "route_bear": _ref_bearing(route_local, pos),
-                "best_bear": _ref_bearing(out.best_path, pos),
-            })
-            # Real-time cadence: the sim keeps running; pace the control
-            # loop to ~2 Hz so the car is never left without a fresh
-            # command for long.
-            _elapsed = time.time() - _f0
-            _slack = (1.0 / REALTIME_CTRL_HZ) - _elapsed
-            if _slack > 0.0:
-                time.sleep(_slack)
-            frames += 1
-            if frames % 4 == 1:
-                _e2e_s = (f"e2e={e2e_ms:.0f}ms "
-                          if e2e_ms is not None else "")
-                print(f"[fsd-drive] t={time.time()-t0:5.1f} v={v:4.1f} "
-                      f"level={verd.level} src={chosen.source:4s} "
-                      f"reason={verd.reason or '-':22s} "
-                      f"steer={steer:+.2f} thr={thr:.2f} "
-                      f"plan_v={plan_speed:.1f} {_e2e_s}"
-                      f"rev={int(reversing)} signed={signed:+.2f} "
-                      f"lane={out.meta.get('lane_src', '?')}/"
-                      f"{'P' if out.meta.get('lane_paired') else '1'} "
-                      f"dev={getattr(verd, 'lane_dev_m', 0.0):.2f}")
-        _ll = [f["line_lat"] for f in hist if f.get("line_lat") is not None]
-        if _ll:
-            _arr = np.asarray(_ll, dtype=float)
-            print(f"[fsd-drive] painted line lateral (left=+): "
-                  f"mean={_arr.mean():+.2f}m p50="
-                  f"{np.percentile(_arr, 50):+.2f}m "
-                  f"min={_arr.min():+.2f} max={_arr.max():+.2f} "
-                  f"({int((_arr < -0.5).sum())} frames car left of line)")
-        _ps = [float(f.get("plc_shift", 0.0)) for f in hist]
-        _nplc = sum(1 for f in hist
-                    if abs(f.get("plc_shift", 0.0)) > PLC_MIN_ENGAGE_M)
-        if _nplc:
-            print(f"[fsd-drive] painted-line steady corrector: "
-                  f"active {_nplc}/{len(hist)} frames, "
-                  f"mean|shift|={np.mean(np.abs(_ps)):.2f}m")
-        _er = [(f.get("end_ref", 0), f.get("rem_end")) for f in hist
-               if f.get("rem_end") is not None
-               and f["rem_end"] < END_PULL_START_M]
-        if _er:
-            _n_live = sum(1 for _r, _ in _er if _r == 2)
-            _n_hold = sum(1 for _r, _ in _er if _r == 1)
-            _n_flat = sum(1 for _r, _ in _er if _r == 0)
-            print(f"[fsd-drive] end-zone ref: live-perception={_n_live} "
-                  f"last-good-hold={_n_hold} straight-hold={_n_flat}")
-        print(f"[fsd-drive] done: {frames} frames, {stopps} stops")
-        _n_skip_fr = sum(1 for f in hist if f.get("budget_skips"))
-        if _n_skip_fr:
-            _n_skip_hd = sum(len(f.get("budget_skips") or [])
-                             for f in hist)
-            _max_budget = max(float(f.get("budget_s") or 0.0)
-                              for f in hist)
-            print(f"[fsd-drive] tick budget: {_n_skip_fr} frames "
-                  f"deferred {_n_skip_hd} heavy head(s) "
-                  f"(budget capped at {_max_budget:.2f}s)")
-        if rec is not None:
+            # Remove the Tech camera/LiDAR sensors so a next attach process
+            # does not pile up sensors in the running game (leftover sensors
+            # made later camera polls fail intermittently).
             try:
-                _rec_out = rec.save()
-                if _rec_out:
-                    print(f"[fsd-drive] shadow episode saved -> {_rec_out}")
-                else:
-                    print("[fsd-drive] nothing recorded")
-            except Exception as _rec_e:
-                print(f"[fsd-drive] shadow episode save failed: {_rec_e}")
-    finally:
-        # input watchdog must always be lifted, even on a crash, so a
-        # later attach is not blocked by a stale Lua-frame timer
-        try:
-            wd_disarm(conn)
-        except Exception:
-            pass
-        # ensure the car stops
-        try:
-            conn.control(throttle=0.0, brake=1.0, steering=0.0,
-                         gear=locals().get("fwd_gear"))
-            conn.step(3)
-        except Exception:
-            pass
-        # Remove the Tech camera/LiDAR sensors so a next attach process
-        # does not pile up sensors in the running game (leftover sensors
-        # made later camera polls fail intermittently).
-        try:
-            stack.close()
-        except Exception:
-            pass
-        conn.close()
-        if hist and args.out:
-            try:
-                Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-                Path(args.out).write_text(
-                    json.dumps(hist, ensure_ascii=False), encoding="utf-8")
-                print(f"[fsd-drive] telemetry -> {args.out} ({len(hist)} frames)")
-            except Exception as _e:
-                print(f"[fsd-drive] telemetry write failed: {_e}")
-    return 2 if watchdog_lost else 0
+                stack.close()
+            except Exception:
+                pass
+            conn.close()
+            if hist and args.out:
+                try:
+                    Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+                    Path(args.out).write_text(
+                        json.dumps(hist, ensure_ascii=False), encoding="utf-8")
+                    print(f"[fsd-drive] telemetry -> {args.out} ({len(hist)} frames)")
+                except Exception as _e:
+                    print(f"[fsd-drive] telemetry write failed: {_e}")
+        return 2 if watchdog_lost else 0
+
+
+def run(args) -> int:
+    """Compatibility wrapper used by the thin script and benchmark."""
+    return FSDriveSession(args).run()

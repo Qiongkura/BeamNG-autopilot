@@ -16,6 +16,7 @@ import numpy as np
 from beamng_autopilot.vision import lanes
 from beamng_autopilot.vision.lanes import (
     LaneMarking,
+    painted_lane_reference,
     painted_line_direction,
     painted_line_lane_center,
     polyline_dir_at,
@@ -178,3 +179,65 @@ def test_two_same_side_lines_at_spawn_use_nearest_centre_line() -> None:
     # heading 0 uses +left as -y in world; target is ~1.85m to the
     # right of the centre line (-0.35 -> -2.20 in this coordinate setup)
     assert tgt[1] < 19.0
+
+
+# --- painted_lane_reference (strict perception-only lane reference) -----
+def test_painted_lane_reference_converges_to_perceived_lane_centre():
+    """Line 1.0 m left -> the reference tilts right toward the own lane."""
+    lanes._mask_to_markings = _fake_masks_to_markings([_line(1.0)])
+    ref = painted_lane_reference(
+        _Sem({"line": np.zeros((8, 8), np.uint8)}),
+        cam_model=None, pos=(10.0, 20.0, 1.5), heading=0.0)
+    assert ref is not None
+    assert ref.shape[1] == 2 and len(ref) >= 4
+    # anchored at the ego
+    assert np.allclose(ref[0], (10.0, 20.0), atol=1e-6)
+    # forward along the perceived travel direction ...
+    head = ref[1] - ref[0]
+    assert head[0] > 0.0
+    # ... tilted toward the perceived own-lane centre (right = -y here)
+    assert head[1] < 0.0
+    assert (np.diff(ref[:, 0]) > 0.0).all()
+
+
+def test_painted_lane_reference_centred_ego_keeps_lane_direction():
+    """Line 1.5 m left = already centred (lane-centre deadband) but the
+    direction is still measurable: keep the offset and follow the line."""
+    lanes._mask_to_markings = _fake_masks_to_markings([_line(1.5)])
+    ref = painted_lane_reference(
+        _Sem({"line": np.zeros((8, 8), np.uint8)}),
+        cam_model=None, pos=(10.0, 20.0, 1.5), heading=0.0)
+    assert ref is not None
+    head = ref[1] - ref[0]
+    assert abs(head[1]) < 1e-6            # no lateral pull when centred
+    assert head[0] > 0.0
+
+
+def test_painted_lane_reference_follows_bend():
+    """A line bending 30 deg right carries that yaw into the reference."""
+    lanes._mask_to_markings = _fake_masks_to_markings(
+        [_heading_line(30.0, 1.0)])
+    ref = painted_lane_reference(
+        _Sem({"line": np.zeros((8, 8), np.uint8)}),
+        cam_model=None, pos=(10.0, 20.0, 1.5), heading=0.0)
+    assert ref is not None
+    head = ref[3] - ref[0]
+    assert head[0] > 0.0
+    assert head[1] / head[0] > 0.3        # ~tan(30) plus the lane pull
+
+
+def test_painted_lane_reference_none_without_line():
+    lanes._mask_to_markings = _fake_masks_to_markings([])
+    assert painted_lane_reference(
+        _Sem({"road": np.zeros((8, 8), np.uint8)}),
+        cam_model=None, pos=(10.0, 20.0, 1.5), heading=0.0) is None
+
+
+def test_painted_lane_reference_none_when_direction_unmeasurable():
+    """A line across the road (stop line) cannot define the travel
+    direction; strict perception must degrade instead of guessing."""
+    lanes._mask_to_markings = _fake_masks_to_markings([_heading_line(
+        90.0, 0.0, lon0=-4.0, lon1=4.0)])
+    assert painted_lane_reference(
+        _Sem({"line": np.zeros((8, 8), np.uint8)}),
+        cam_model=None, pos=(10.0, 20.0, 1.5), heading=0.0) is None

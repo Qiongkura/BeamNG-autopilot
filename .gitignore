@@ -15,6 +15,9 @@ env/
 .vscode/
 *.swp
 
+# Local agent plans
+.zcode/
+
 # BeamNG autopilot runtime artifacts
 logs/
 .yolo/

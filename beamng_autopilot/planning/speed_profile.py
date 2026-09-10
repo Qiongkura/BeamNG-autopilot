@@ -21,6 +21,10 @@ import math
 
 import numpy as np
 
+from beamng_autopilot.vehicle_body import (
+    CORRIDOR_HALF_WIDTH_M as BODY_CORRIDOR_HALF_WIDTH_M,
+)
+
 # Comfort lateral acceleration limit for curvature speed (m/s^2).
 COMFORT_LAT = 2.0
 # How far ahead we start braking for an obstacle (m).
@@ -31,7 +35,13 @@ OBSTACLE_BRAKE_M = 25.0
 # town (2026-08-22 runs: every path in a wall-lined street got a 1.0 m/s
 # profile because the closest occupied cell was a roadside wall).  Only
 # occupancy that intrudes into this corridor is a real obstacle ahead.
-CORRIDOR_HALF_WIDTH_M = 2.0
+#
+# Derived from the one body authority (``vehicle_body``): the shared body
+# corridor plus the longitudinal brake band, so the profile starts
+# braking a little before a cell touches the corridor the safety monitor
+# guards.  Never a standalone "car size".
+BRAKE_BAND_MARGIN_M = 0.4
+CORRIDOR_HALF_WIDTH_M = BODY_CORRIDOR_HALF_WIDTH_M + BRAKE_BAND_MARGIN_M
 MIN_SPEED = 1.0
 MAX_SPEED = 40.0
 

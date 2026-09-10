@@ -63,6 +63,26 @@ as the execution layer during the transition.
 - **Safety + control guard** - `safety_monitor.py` (Safe/Degraded/
   MinimalRisk with target speed), `control/reverse_guard.py` (the FSD
   drive never drives backwards).
+- **One ego footprint** - `vehicle_body.py` projects
+  `config.EGO_HALF_*_M` (2.2 x 0.9 m) so candidate feasibility,
+  `SafetyMonitor` and the live loop all test the same body rectangle,
+  swept between waypoints (<= 0.73 m) instead of stamped on the
+  waypoints only.  The module also owns the detection corridor
+  (`HALF_WIDTH_M + CORRIDOR_MARGIN_M` = 1.6 m) that the safety
+  monitor's obstacle-ease corridor, the stack's forward / path
+  clearance and the speed profile derive from (the profile keeps its
+  wider 2.0 m as shared corridor + 0.4 m brake band), so no layer can
+  invent a second car size.
+- **Perception-only lateral metrics** - `fsd_drive._perception_off_road_m`
+  measures the worst body-corner overshoot past the lane boundaries the
+  sensors published this tick; a missing boundary is "unknown" (0.0),
+  never a map fallback (the old nav-centreline + DecalRoad `road_off`
+  guard is gone).  The end-zone straightening creep follows the
+  perceived lane direction (`painted` / `sensor_lane`) only - the
+  nav-tangent `route` fallback no longer steers, the car holds the
+  brake without perception (`end_dir_src` in telemetry) - and the
+  end-zone stop reference re-runs the same body / occupancy safety
+  contract before it is steered (`end_rejected` in telemetry).
 - **Live FSD driving** - `fsd_stack.py` + `scripts/m5_fsd_drive.py`
   (plan -> safety arbitration -> PurePursuit/SpeedController, with rule
   fallback and reverse guard).

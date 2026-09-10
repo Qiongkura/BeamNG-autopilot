@@ -341,3 +341,32 @@ def test_body_pose_crosses_lane_accepts_current_centred_body() -> None:
     from beamng_autopilot.planning import body_pose_crosses_lane
     sc = _lane_scene()
     assert body_pose_crosses_lane(sc, np.array([10.0, 0.0]), 0.0) is False
+
+
+def test_cost_lane_align_strict_ignores_map_route() -> None:
+    """Strict FSD realism: the nav route is intent, not lateral geometry.
+
+    With no perception lane the alignment term must be unscoreable (0.0)
+    rather than pulling the planner onto the map centre line; with a
+    sensor lane present it measures against that lane.
+    """
+    sc = _scene()  # route runs along y = 0
+    sc.strict_perception = True
+    off_lane = np.column_stack([np.linspace(0, 20, 20), np.full(20, 3.0)])
+    assert cost_lane_align(sc, off_lane) == 0.0
+    sc.lane_ref = np.column_stack([np.linspace(0, 30, 31),
+                                   np.full(31, 3.0)])
+    assert cost_lane_align(sc, off_lane) < 0.5
+
+
+def test_constraints_strict_without_lane_ref_skips_align_gate() -> None:
+    """A strict scene with route-only reference must not gate candidates
+    on route alignment (that gate would reject a correct own-lane path
+    that sits 1.8 m off the road centre)."""
+    from beamng_autopilot.planning.trajectory import Candidate
+    sc = _scene()
+    sc.strict_perception = True
+    cons = Constraints()
+    own_lane = np.column_stack([np.linspace(0, 20, 20), np.full(20, -1.8)])
+    _, feasible = cons.score(sc, Candidate(path=own_lane))
+    assert feasible

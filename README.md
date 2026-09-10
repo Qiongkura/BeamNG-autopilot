@@ -450,6 +450,30 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
 | **端到端已训练（影子数据）** | temporal 多模态 CNN（RGB+分割+BEV+速度 → 轨迹+动作） | 中 | ✅ val 0.0599（`best_temporal.pt`），批量回放报告 + 最差帧截图可查；实车闭环后续 |
 
 
+### 车身包络权威（2026-09-10）
+
+- 车体矩形只有一处权威：`config.EGO_HALF_LENGTH_M` / `EGO_HALF_WIDTH_M`
+  （2.2 x 0.9 m，etk800），由 `beamng_autopilot/vehicle_body.py` 统一投影。
+  候选可行性（`planning/constraints.py`）、`safety_monitor.py` 与
+  `scripts/m5_fsd_drive.py` 的车身越线/越界判定共用同一个矩形，不再各自写死。
+- 检测走廊同样只由这一处派生：`vehicle_body.CORRIDOR_HALF_WIDTH_M`
+  （`HALF_WIDTH_M + CORRIDOR_MARGIN_M(0.7) = 1.6 m`）被 `safety_monitor`
+  的避障缓行走廊和 `fsd_stack` 的前向/路径净空直接引用；`speed_profile`
+  的 2.0 m 仍是"共享走廊 + 纵向刹车带 0.4 m"。任何模块都不得再自造第二套车宽。
+- 计划路径的车身检查按 ≤0.73 m 插值姿态**扫掠**（原来只在路点处盖一次矩形），
+  两个路点之间被边界戳到的偏航车身不再漏检。
+- 横向权威不变：车在车道内的位置只来自感知标线/边界；感知不可用只有
+  刹停 / 保持航向 / 落到路面安全点，不用地图线加偏移。
+- 越界指标与终点姿态对齐同样只认感知（2026-09-10）：
+  `fsd_drive._perception_off_road_m` 把车体四角对所有**本帧感知到的**车道
+  边界取最差越出量（没有边界=未知=0，绝不回退地图；旧的 nav 中线 +
+  DecalRoad 道路边缘 `road_off` 已删除）。终点停靠段的回正爬行只跟感知到的
+  本车道方向（`painted` / `sensor_lane`），来自导航切线的 `route` 兜底
+  不再驱动转向，缺感知就保持刹车 —— telemetry 的 `end_dir_src` 可查。
+  终点直行停止参考替换掉规划路径后会**重跑一遍车身/占用安全契约**，
+  不通过就退回已批准的规划路径（telemetry `end_rejected`）。
+
+
 ### 离线评测与数据工具（2026-08-30）
 
 - **FSD 基准判分（2026-09-05）**：`scripts/m5_fsd_benchmark.py`——场景注册表
@@ -500,6 +524,14 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
   首段图对角线当朝向（78° 斜向出生）、倒车脱困油门在草地上推不动车
   （0.06 → 有界爬升 0.45）、压线容差随规划速度收紧（0.35m @低速 →
   0.2m @6m/s）。
+  **运行时契约收紧（2026-09-10）**：E2E/BC 学习路径进入仲裁前统一过
+  `planning.validate_learned_path`（有限值/前向/横向/倒步/曲率），不通过
+  只记 `e2e_reject`/`bc_reject` 遥测并禁用该候选，安全监控仍是最终权威；
+  DQN checkpoint 校验观测形状、动作映射、归一化与决策 dt，训练侧同时落
+  `.meta.json`，不匹配 fail-closed 禁用，运行日志与遥测同步带出
+  `dqn_contract_*` 状态；影子 episode 写 schema + 模态标签 + git/模型权重
+  provenance，数据集拒绝未知 schema，并暴露 episode 版本/provenance 供
+  训练前审计。
 
 - `m5_e2e_probe.py --data <dir> --weights <ckpt>`：批量回放评测，输出动作误差 /
   接管率 / 轨迹误差到 `logs/m5_e2e/report.json`，并把最差 Top-N 帧截图存到

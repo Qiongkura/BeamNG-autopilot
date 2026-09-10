@@ -183,3 +183,55 @@ def test_safety_monitor_stops_when_current_body_corner_is_over_boundary() -> Non
         scene, np.array([[10., 3.], [15., 3.]]))
     assert verdict.level == "minimal_risk"
     assert "vehicle body" in verdict.reason
+
+
+def test_strict_perception_stops_without_sensor_lane() -> None:
+    """Strict FSD: a nav route is intent, never lateral geometry.
+
+    With a perfectly good map route but no perception lane, the monitor
+    must fail closed instead of measuring the path against the route
+    (docs/fsd_realism.md §2 / §4).
+    """
+    xs = np.linspace(0, 30, 31)
+    route = np.column_stack([xs, np.zeros_like(xs)])
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.origin = (0.0, 0.0)
+    grid.heading = 0.0
+    scene = Scene(pos=np.array([0.0, 0.0]), heading=0.0, grid=grid,
+                  route=route, lane_ref=None, strict_perception=True)
+    v = SafetyMonitor(max_speed=12.0).evaluate(scene, _straight())
+    assert v.level == "minimal_risk"
+    assert v.reason == "perception lane unavailable"
+    assert v.target_speed == 0.0
+    assert v.lane_ref_src == "none"
+
+
+def test_strict_perception_measures_against_sensor_lane() -> None:
+    """Strict mode aligns to the perception lane, not the road centre."""
+    xs = np.linspace(0, 30, 31)
+    route = np.column_stack([xs, np.zeros_like(xs)])       # road centre
+    lane = np.column_stack([xs, np.full_like(xs, -1.8)])   # own lane
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.origin = (0.0, 0.0)
+    grid.heading = 0.0
+    scene = Scene(pos=np.array([0.0, 0.0]), heading=0.0, grid=grid,
+                  route=route, lane_ref=lane, strict_perception=True)
+    path = np.column_stack([np.linspace(0, 15, 20), np.full(20, -1.8)])
+    v = SafetyMonitor(max_speed=12.0).evaluate(scene, path)
+    assert v.safe
+    assert v.lane_dev_m < 0.2
+    assert v.lane_ref_src == "sensor"
+
+
+def test_legacy_mode_keeps_route_fallback() -> None:
+    """Non-strict scenes keep the old map-route fallback (M5 compat)."""
+    xs = np.linspace(0, 30, 31)
+    route = np.column_stack([xs, np.zeros_like(xs)])
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.origin = (0.0, 0.0)
+    grid.heading = 0.0
+    scene = Scene(pos=np.array([0.0, 0.0]), heading=0.0, grid=grid,
+                  route=route, lane_ref=None)
+    v = SafetyMonitor(max_speed=12.0).evaluate(scene, _straight())
+    assert v.safe
+    assert v.lane_ref_src == "route"

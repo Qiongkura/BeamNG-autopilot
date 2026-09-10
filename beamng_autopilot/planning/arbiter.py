@@ -293,7 +293,8 @@ def lane_side_ok(lane, route, pos, left_max_m: float = 0.0) -> bool:
 
 def choose_plan_route(route, lane_ref, pos, heading, grid,
                       route_blocked_frac: float = 0.20,
-                      lane_clear_frac: float = 0.15):
+                      lane_clear_frac: float = 0.15,
+                      strict_perception: bool = False):
     """Pick the navigational reference the planner should follow.
 
     Real FSD plans in vector space: the map/nav route carries the long
@@ -311,17 +312,33 @@ def choose_plan_route(route, lane_ref, pos, heading, grid,
     reads clear, and following it drives the car off the navigational
     route (town run 2026-08-22 - the lane pointed into the side road
     and the car wedged).  ``lane_heading_ok`` gates that decision.
+
+    ``strict_perception`` removes the route-relative lateral gate: the
+    nav route is navigation intent, not the authority that decides which
+    side of the road is the ego lane.  In strict FSD mode the sensor lane
+    is the only usable driving path whenever its heading agrees with the
+    route intent; the route is never returned as a driving trajectory or
+    used to veto the perception lane by geometry.
     """
     if route is None or len(route) < 2:
         return lane_ref if (lane_ref is not None and len(lane_ref) >= 2) else route
     if lane_ref is None or len(lane_ref) < 2:
-        return route
+        return None if strict_perception else route
+    if strict_perception:
+        # The route may gate whether the perception lane points toward
+        # the navigational goal, but it may never become the path the
+        # vehicle follows.  If the lane disagrees, fail closed and let
+        # the safety layer degrade instead of silently driving map
+        # geometry.
+        if not lane_heading_ok(route, lane_ref, pos, heading):
+            return None
+        return lane_ref
     r_b = _ref_blocked_fraction(route, pos, heading, grid)
     l_b = _ref_blocked_fraction(lane_ref, pos, heading, grid)
     if float(r_b) >= float(route_blocked_frac) and \
             float(l_b) <= float(lane_clear_frac) and \
             lane_heading_ok(route, lane_ref, pos, heading) and \
-            lane_side_ok(lane_ref, route, pos):
+            (strict_perception or lane_side_ok(lane_ref, route, pos)):
         return lane_ref
     return route
 

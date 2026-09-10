@@ -42,7 +42,10 @@ from beamng_autopilot.bev_fusion import (
 )
 from beamng_autopilot.planning import (
     Constraints,
+    REF_PERCEPTION,
+    REF_ROUTE,
     Scene,
+    lateral_reference,
     sample_arc,
     sample_lane_shift,
     select_trajectory,
@@ -50,12 +53,12 @@ from beamng_autopilot.planning import (
 from beamng_autopilot.planning.intent import infer_route_intent
 from beamng_autopilot.temporal import WorldObjectTracker
 from beamng_autopilot.perception_snapshot import PerceptionSnapshot
-from beamng_autopilot.planner import CAR_HALF_WIDTH, forward_clearance_m, path_forward_clearance_m
+from beamng_autopilot.planner import forward_clearance_m, path_forward_clearance_m
+from beamng_autopilot.vehicle_body import CORRIDOR_HALF_WIDTH_M
 from beamng_autopilot.lane import (
     LANE_WIDTH_DEFAULT_M,
     SensorLaneEnvelope,
     build_lidar_corridor,
-    pair_lane_markings,
     choose_sensor_lane,
 )
 from beamng_autopilot.runtime import (
@@ -200,6 +203,11 @@ class FSDTick:
                                                # feature map (vector space)
         self.intent = None                     # RoutingIntent of the nav route
         self.tracks: list = []                 # active world-object tracks
+        # The planning Scene (world model) of this tick.  Downstream
+        # consumers - the safety monitor in particular - must evaluate the
+        # SAME world model the planner used, not a rebuilt copy with a
+        # different lateral reference.  Assigned by ``FSDStack.tick``.
+        self.scene = None                      # planning.Scene | None
 
 
 class FSDStack:
@@ -268,9 +276,10 @@ class FSDStack:
         self.target_speed = 8.0  # plan cruise speed (m/s); drive can raise
         # Map-prior own-lane width (fallback when sensors see no lane)
         self.map_lane_width_m = LANE_WIDTH_DEFAULT_M
-        # Raw-sensor forward corridor half width (car half width + margin)
-        # used by the independent FSD safety layer (m5_fsd_drive).
-        self.ego_half_width = CAR_HALF_WIDTH + 0.5
+        # Raw-sensor forward corridor half width used by the independent
+        # FSD safety layer (m5_fsd_drive).  Shared body corridor, not a
+        # second vehicle size: see ``vehicle_body.CORRIDOR_HALF_WIDTH_M``.
+        self.ego_half_width = float(CORRIDOR_HALF_WIDTH_M)
 
         # FSD-style temporal occupancy fusion: single-frame LiDAR glitches
         # must not create a phantom wall or erase a real one.
@@ -485,7 +494,7 @@ class FSDStack:
                     out.ray_hits, pos,
                     np.array([math.cos(heading), math.sin(heading)]),
                     half_width=float(getattr(self, "ego_half_width",
-                                             CAR_HALF_WIDTH + 0.5)))
+                                             CORRIDOR_HALF_WIDTH_M)))
                 out.meta["fwd_clearance"] = round(
                     float(out.forward_clearance), 3)
                 # Fuse only the CLUSTERED obstacle boxes (walls, vehicles,
@@ -730,13 +739,18 @@ class FSDStack:
         # to enforce).  The road-graph route starts at the nearest road
         # node, so it also anchors the car's own lane even when the ego
         # has drifted off the A* polyline.
-        map_lane = map_lane_override
+        lane_mode = getattr(self, "lane_mode", "map")
+        strict_lane = bool(lane_mode == "sensor" and self.strict_sensor)
+        # Strict FSD must not even construct map geometry as a candidate
+        # lateral authority.  The route remains available for navigation
+        # intent and heading gates below, but it never becomes the lane.
+        map_lane = None if strict_lane else map_lane_override
         # Built whenever a nav route exists: it is both the fallback for a
         # missing sensor lane AND the override when a sensor lane heads into
         # a different road at a junction (heading gate below).  A caller
         # may supply ``map_lane_override`` (real road-edge own-lane window
         # from map_lane_edges); when absent the synthetic map lane is built.
-        if has_nav_route and map_lane is None:
+        if has_nav_route and map_lane is None and not strict_lane:
             try:
                 from beamng_autopilot.planning.local_route import (
                     map_lane_local)
@@ -754,7 +768,7 @@ class FSDStack:
         # and wedged).  Reject the whole sensor lane (centre + hard
         # boundaries) and fall back to the map-prior own lane.
         lane_rejected = False
-        lane_mode = getattr(self, "lane_mode", "map")
+        lane_src_sel = SRC_UNAVAILABLE
         # Gate ANY sensor lane (paired or not) against the map-prior own
         # lane: an unpaired vision/LiDAR corridor is often the whole-road
         # centre, which on a two-way road sits on the oncoming side of the
@@ -768,7 +782,7 @@ class FSDStack:
         # (perception-led) keeps only heading+side so the sensor lane can
         # lead through corners - the map prior still supplies the hard
         # lane boundaries below (never the sensor's own flickering edges).
-        if lane_frame is not None and map_lane is not None:
+        if lane_frame is not None and (map_lane is not None or strict_lane):
             try:
                 from beamng_autopilot.planning.arbiter import (
                     lane_heading_ok, lane_route_turn_ok,
@@ -812,7 +826,7 @@ class FSDStack:
                 # perception-led modes allow a small oncoming-side read
                 # (corner apex) because the map centreline is still the
                 # hard no-cross boundary.
-                elif not lane_side_ok(
+                elif not strict_lane and not lane_side_ok(
                         lane_ref, route_ref, pos,
                         left_max_m=(-0.4 if lane_mode == "map" else 0.5)):
                     lane_rejected = True
@@ -829,8 +843,7 @@ class FSDStack:
             except Exception as exc:
                 _warn_once("lane_gates",
                            f"lane gate checks failed: {exc}")
-        if map_lane is not None and not (
-                lane_mode == "sensor" and self.strict_sensor):
+        if map_lane is not None and not strict_lane:
             mc, ml, mr = map_lane
             lane_src_sel = "map"
             if sensor_paired and lane_ref is not None \
@@ -928,7 +941,7 @@ class FSDStack:
         # PAINTED boundary is also a perception lane: the missing side is
         # inferred from the painted-line lane-width contract, never from
         # the map.  Ambiguous/no-vision reads still stop.
-        if lane_mode == "sensor" and self.strict_sensor:
+        if strict_lane:
             _single_vision = bool(
                 lane_frame is not None
                 and not sensor_paired
@@ -1002,20 +1015,25 @@ class FSDStack:
         _base_route = np.asarray(route_ref, dtype=float)[:, :2]
         if route_anchored:
             plan_route = choose_plan_route(
-                _base_route, lane_ref, pos, heading, grid)
+                _base_route, lane_ref, pos, heading, grid,
+                strict_perception=strict_lane)
+        elif strict_lane:
+            plan_route = (lane_ref if lane_ref is not None
+                          and len(lane_ref) >= 4 else None)
         else:
             plan_route = (lane_ref if lane_ref is not None
                           and len(lane_ref) >= 4 else _base_route)
         if plan_route is None or len(plan_route) < 2:
-            plan_route = _base_route
-        if lane_ref is None and not (
-                lane_mode == "sensor" and self.strict_sensor):
+            if not strict_lane:
+                plan_route = _base_route
+        if lane_ref is None and not strict_lane:
             lane_ref = plan_route
         # out.lane_ref drives the *lateral* lane-keep reference (sensor
         # lane centre when available); plan_route stays the navigational
         # intent in the planner's Scene.
         out.meta["lane_src"] = (
-            "map_lane" if lane_rejected
+            lane_src_sel if strict_lane
+            else "map_lane" if lane_rejected
             else "sensor" if lane_frame is not None
             else "map_lane" if map_lane is not None else "bev/route")
         out.meta["lane_paired"] = int(
@@ -1065,7 +1083,18 @@ class FSDStack:
                       lane_left=lane_left, lane_right=lane_right,
                       lane_width=lane_width,
                       lane_envelope=self.lane_envelope,
-                      target_speed=_target, intent=intent)
+                      target_speed=_target, intent=intent,
+                      strict_perception=strict_lane)
+        # Publish the world model: the safety layer evaluates the same
+        # Scene the planner planned against (one world model per tick).
+        out.scene = scene
+        # Candidate families use the same lateral policy as the planner
+        # and safety layer.  Strict FSD mode therefore never seeds a
+        # map-centre path from the nav route when perception is missing.
+        candidate_ref, candidate_src = lateral_reference(scene)
+        out.meta["lateral_candidate_src"] = candidate_src
+        out.meta["lateral_candidate_pts"] = (
+            int(len(candidate_ref)) if candidate_ref is not None else 0)
         # Town corners need a tighter arc fan than a highway fan: a
         # 5-8 m radius bend is 0.12-0.2 rad/m, and the old 0.10 rad/m
         # cap (10 m radius) could not turn away from a corner wall
@@ -1074,11 +1103,26 @@ class FSDStack:
         # lateral shifts so the planner can actually dodge a near wall.
         fans = sample_arc(pos, heading, speed=max(2.0, float(st.speed)),
                           max_steer=0.5, n_curv=13, max_curv=0.25)
-        shifts = sample_lane_shift(plan_route,
-                                   offsets=(-3.0, -1.5, 1.5, 3.0))
-        for c in shifts.candidates:
-            fans.add(c.path, c.meta.get("kind", "shift"),
-                     offset=c.meta.get("offset", 0.0))
+        if candidate_ref is not None and len(candidate_ref) >= 4:
+            shifts = sample_lane_shift(candidate_ref,
+                                       offsets=(-3.0, -1.5, 1.5, 3.0))
+            for c in shifts.candidates:
+                kind = c.meta.get("kind", "shift")
+                # sample_lane_shift includes its reference as a candidate.
+                # When that reference is the perception lane, the explicit
+                # lane_center candidate below represents it; keeping the
+                # duplicate would win ties under the generic "reference"
+                # label and hide the perception-led choice from telemetry.
+                if kind == "reference" and candidate_src in REF_PERCEPTION:
+                    continue
+                fans.add(c.path, kind,
+                         offset=c.meta.get("offset", 0.0))
+        elif candidate_src == REF_ROUTE:
+            # The policy always returns the route with REF_ROUTE; this
+            # guard keeps a future policy change from silently dropping
+            # the legacy candidate family.
+            _warn_once("candidate_route",
+                       "route lateral candidate unavailable in legacy mode")
         # The LANE CENTRE itself is a candidate.  The synthetic shifts
         # blend the route over 8 m, so at low speed a 7 m PurePursuit
         # lookahead sits inside that blend and steers RIGHT while the
@@ -1089,8 +1133,12 @@ class FSDStack:
         # the lane centre (sensor or map-prior own lane) keeps the car
         # in its lane with no blend wiggle; its alignment cost is ~0 so
         # it wins whenever it is drivable.
-        if scene_lane_ref is not None and len(scene_lane_ref) >= 4:
-            fans.add(np.asarray(scene_lane_ref, dtype=float)[:, :2],
+        lane_center_ref = (scene_lane_ref
+                           if scene_lane_ref is not None
+                           else candidate_ref
+                           if candidate_src in REF_PERCEPTION else None)
+        if lane_center_ref is not None and len(lane_center_ref) >= 4:
+            fans.add(np.asarray(lane_center_ref, dtype=float)[:, :2],
                      "lane_center", offset=0.0)
         out.n_candidates = len(fans.candidates)
         best, meta = select_trajectory(scene, fans, self.constraints)
@@ -1102,7 +1150,7 @@ class FSDStack:
             out.path_forward_clearance = path_forward_clearance_m(
                 best, out.ray_hits,
                 half_width=float(getattr(self, "ego_half_width",
-                                         CAR_HALF_WIDTH + 0.5)))
+                                         CORRIDOR_HALF_WIDTH_M)))
             out.meta["path_fwd_clearance"] = round(
                 float(out.path_forward_clearance), 3)
         out.meta["planner"] = meta
@@ -1190,6 +1238,10 @@ class FSDStack:
             range_age_s=out.meta.get("range_age_s"),
             bev_age_s=out.meta.get("bev_age_s"))
         out.meta["snapshot"] = out.snapshot.meta()
+        # Backfill the published Scene with the tick's provenance so the
+        # safety monitor reads the same freshness/metadata contract.
+        scene.perception_snapshot = out.snapshot
+        scene.meta = out.meta
         return out
 
 
@@ -1392,4 +1444,3 @@ def semantic_to_meta(head_outputs: dict) -> dict:
         meta["change_left"] = topo.meta.get("change_left")
         meta["change_right"] = topo.meta.get("change_right")
     return meta
-
