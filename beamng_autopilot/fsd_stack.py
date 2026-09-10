@@ -174,40 +174,88 @@ def _warn_once(key: str, msg: str) -> None:
     print(f"[fsd-stack] {msg}", flush=True)
 
 
+def _world_view(source_attr: str, name: str):
+    """A read-through view of a world-model field.
+
+    Before the canonical owner (snapshot / planner scene) is bound the
+    value staged on the tick is returned; afterwards the owner's value
+    is, so a consumer can never observe a second, divergent copy.
+    """
+    def _get(self):
+        src = self.__dict__.get(source_attr)
+        if src is not None:
+            return getattr(src, name)
+        return self.__dict__.get("_" + name)
+
+    def _set(self, value):
+        self.__dict__["_" + name] = value
+
+    return property(_get, _set)
+
+
 class FSDTick:
-    """One planning-tick result from ``FSDStack``."""
+    """One planning-tick result from ``FSDStack``.
+
+    The world model is published ONCE: the canonical
+    ``PerceptionSnapshot`` (sensing) and the planner ``Scene`` (vector
+    space).  The flat perception attributes kept for existing consumers
+    are read-through views onto those two objects, so a consumer can
+    never observe a second copy of the world model that has drifted from
+    the one the planner and safety monitor used (docs/fsd_realism.md §2/§4).
+    """
+
+    # Sensing outputs: owned by ``self.snapshot`` once it is frozen.
+    bev = _world_view("snapshot", "bev")
+    drivable = _world_view("snapshot", "drivable")
+    observed = _world_view("snapshot", "observed")
+    feature_map = _world_view("snapshot", "feature_map")
+    lane_envelope = _world_view("snapshot", "lane_envelope")
+    frame = _world_view("snapshot", "frame")
+    cam = _world_view("snapshot", "cam")
+    head_outputs = _world_view("snapshot", "head_outputs")
+    tracks = _world_view("snapshot", "tracks")
+    errors = _world_view("snapshot", "errors")
+    ray_hits = _world_view("snapshot", "ray_hits")
+    # World-model fields: owned by the planner ``Scene`` of this tick.
+    lane_left = _world_view("scene", "lane_left")
+    lane_right = _world_view("scene", "lane_right")
+    lane_width = _world_view("scene", "lane_width")
+    intent = _world_view("scene", "intent")
 
     def __init__(self):
-        self.bev: np.ndarray | None = None      # (N, N) occupancy raster
-        self.drivable: np.ndarray | None = None
-        self.observed: np.ndarray | None = None  # (N, N) sensor-seen mask
+        self._bev: np.ndarray | None = None     # (N, N) occupancy raster
+        self._drivable: np.ndarray | None = None
+        self._observed: np.ndarray | None = None  # (N, N) sensor-seen mask
+        self._feature_map = None                # fused multi-camera BEV
+                                               # feature map (vector space)
+        self._lane_envelope: SensorLaneEnvelope | None = None
+        self._frame: np.ndarray | None = None   # front frame used this tick
+        self._cam = None                       # its CameraModel
+        self._head_outputs: dict = {}
+        self._tracks: list = []                # active world-object tracks
+        self._errors: dict = {}
+        self._ray_hits: list = []
+        self._lane_left: np.ndarray | None = None
+        self._lane_right: np.ndarray | None = None
+        self._lane_width: float = 0.0
+        self._intent = None                    # RoutingIntent of nav route
         self.best_path: np.ndarray | None = None
-        self.lane_ref: np.ndarray | None = None  # sensor lane centreline
-        self.lane_left: np.ndarray | None = None  # paired lane boundary (world)
-        self.lane_right: np.ndarray | None = None  # paired lane boundary (world)
-        self.lane_envelope: SensorLaneEnvelope | None = None
-        self.lane_width: float = 0.0
+        # Tick-level lane reference for the drive loop / safety monitor.
+        # NOT the planner's lateral authority: the planner reads
+        # ``scene.lane_ref``, which excludes the BEV whole-road centre.
+        self.lane_ref: np.ndarray | None = None
         self.best_speed: float = 0.0            # planned speed at the start
         self.min_speed: float = 0.0             # lowest speed on the path
         self.n_candidates: int = 0
         self.meta: dict = {}
-        self.head_outputs: dict = {}
+        # The canonical perception result and the planning Scene (world
+        # model) of this tick.  Downstream consumers - the safety monitor
+        # in particular - must evaluate the SAME objects, never a rebuilt
+        # copy with a different lateral reference.
         self.snapshot: PerceptionSnapshot | None = None
-        self.frame: np.ndarray | None = None   # front frame used this tick
-        self.cam = None                        # its CameraModel
-        self.errors: dict = {}
-        self.ray_hits: list = []
+        self.scene = None                      # planning.Scene | None
         self.forward_clearance: float = float("inf")
         self.path_forward_clearance: float = float("inf")
-        self.feature_map = None                # fused multi-camera BEV
-                                               # feature map (vector space)
-        self.intent = None                     # RoutingIntent of the nav route
-        self.tracks: list = []                 # active world-object tracks
-        # The planning Scene (world model) of this tick.  Downstream
-        # consumers - the safety monitor in particular - must evaluate the
-        # SAME world model the planner used, not a rebuilt copy with a
-        # different lateral reference.  Assigned by ``FSDStack.tick``.
-        self.scene = None                      # planning.Scene | None
 
 
 class FSDStack:

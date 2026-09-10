@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 import pytest
 
@@ -544,6 +546,39 @@ def test_tick_publishes_the_planning_scene() -> None:
     assert out.scene.grid is not None
     assert out.scene.perception_snapshot is out.snapshot
     assert out.scene.meta is out.meta
+
+
+def test_tick_flat_fields_are_views_of_the_canonical_world_model() -> None:
+    """The legacy flat tick attributes must be read-through views onto the
+    canonical snapshot / planner Scene, never a second copy.
+
+    A consumer that reads ``tick.bev`` / ``tick.lane_left`` must get the
+    exact object the planner and the safety monitor used; a divergent
+    copy is how a "single world model" silently becomes two.
+    """
+    st = _stack()
+    out = st.tick()
+    assert out.snapshot is not None and out.scene is not None
+    for name in ("bev", "drivable", "observed", "feature_map",
+                 "lane_envelope", "frame", "cam", "head_outputs",
+                 "tracks", "errors", "ray_hits"):
+        assert getattr(out, name) is getattr(out.snapshot, name), name
+    for name in ("lane_left", "lane_right", "intent"):
+        assert getattr(out, name) is getattr(out.scene, name), name
+    assert out.lane_width == out.scene.lane_width
+
+
+def test_tick_views_track_a_rebound_snapshot_and_scene() -> None:
+    """Re-binding the canonical objects must move the flat views with
+    them - otherwise a staged pre-bind value could leak out later."""
+    st = _stack()
+    out = st.tick()
+    bev = np.arange(9, dtype=np.float32).reshape(3, 3)
+    out.snapshot = replace(out.snapshot, bev=bev)
+    assert out.bev is bev
+    scene = replace(out.scene, lane_width=3.25)
+    out.scene = scene
+    assert out.lane_width == 3.25
 
 
 def test_strict_tick_marks_the_scene_strict_perception() -> None:
