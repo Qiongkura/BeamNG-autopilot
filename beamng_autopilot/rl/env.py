@@ -38,11 +38,11 @@ import numpy as np
 from beamng_autopilot.rl.obs import (
     decision_observation, DECISION_OBS_SIZE,
 )
+from beamng_autopilot.rl.dqn_runtime import ACTION_MULT, DECISION_DT_S
 
 ACTION_CRUISE, ACTION_EASE, ACTION_SLOW = 0, 2, 4
-ACTION_MULT = {0: 1.0, 1: 0.8, 2: 0.6, 3: 0.35, 4: 0.1}
 
-DT = 0.25                 # decision step (s), matches the control cadence
+DT = DECISION_DT_S        # decision step (s), matches the control cadence
 EPISODE_S = 40.0
 MAX_ACCEL = 1.5           # m/s^2 the ego can chase its target with
 MAX_BRAKE = 3.0

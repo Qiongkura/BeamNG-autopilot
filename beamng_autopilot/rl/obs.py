@@ -21,11 +21,19 @@ from __future__ import annotations
 import numpy as np
 
 DECISION_OBS_SIZE = 6
+DECISION_OBS_SCHEMA = "decision_observation"
+DECISION_OBS_VERSION = 1
 
 CLEARANCE_NORM_M = 30.0
 LANE_DEV_NORM_M = 2.0
 ROAD_OFF_NORM_M = 2.0
 TRACKS_NORM = 100.0     # live town scene carries ~60-120 tracks
+
+__all__ = [
+    "DECISION_OBS_SIZE", "DECISION_OBS_SCHEMA", "DECISION_OBS_VERSION",
+    "CLEARANCE_NORM_M", "LANE_DEV_NORM_M", "ROAD_OFF_NORM_M",
+    "TRACKS_NORM", "decision_observation",
+]
 
 
 def decision_observation(speed: float, target_speed: float,

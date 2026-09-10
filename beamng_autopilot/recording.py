@@ -24,17 +24,65 @@ This module gives that shape without writing to the game:
 from __future__ import annotations
 
 import json
+import platform
+import subprocess
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 EPISODE_VERSION = 3
+EPISODE_SCHEMA = "fsd_shadow_episode"
 
 # Channel order of the fused vector-space feature map (mirrors
 # ``BEVFeatureMap.CHANNELS``): obstacle / drivable / lane / sign.
 FMAP_CHANNELS = ("obstacle", "drivable", "lane", "sign")
+
+
+def shadow_expert_sample_ok(*, strict_perception: bool, lane_ref,
+                            trajectory) -> tuple[bool, str]:
+    """Validate one shadow sample before it becomes an expert demonstration.
+
+    Strict FSD recordings must never learn lateral behaviour from a
+    trajectory that was produced without a perception lane reference.
+    The kinematic arc fan can still be feasible from occupancy alone, so
+    checking only ``trajectory is not None`` is not enough: the sample
+    contract must require the same lateral perception contract as the
+    runtime planner.
+    """
+    if trajectory is None:
+        return False, "no shadow trajectory"
+    try:
+        traj = np.asarray(trajectory, dtype=float)
+    except (TypeError, ValueError):
+        return False, "invalid shadow trajectory"
+    if traj.ndim != 2 or traj.shape[0] < 2 or traj.shape[1] < 2 \
+            or not np.isfinite(traj[:, :2]).all():
+        return False, "invalid shadow trajectory"
+    if not strict_perception:
+        return True, ""
+    if lane_ref is None:
+        return False, "perception lane unavailable"
+    try:
+        lane = np.asarray(lane_ref, dtype=float)
+    except (TypeError, ValueError):
+        return False, "invalid perception lane"
+    if lane.ndim != 2 or lane.shape[0] < 4 or lane.shape[1] < 2 \
+            or not np.isfinite(lane[:, :2]).all():
+        return False, "perception lane unavailable"
+    return True, ""
+
+
+def git_revision() -> str:
+    """Best-effort code revision for episode provenance."""
+    try:
+        return subprocess.check_output(
+            ["git", "rev-parse", "HEAD"],
+            cwd=Path(__file__).resolve().parents[1],
+            text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        return ""
 
 
 @dataclass
@@ -68,9 +116,10 @@ class ShadowFrame:
 class ShadowRecorder:
     """Accumulate ``ShadowFrame``s and write one episode .npz."""
 
-    def __init__(self, log_dir, sequence: str):
+    def __init__(self, log_dir, sequence: str, provenance=None):
         self.log_dir = Path(log_dir)
         self.sequence = sequence
+        self.provenance = dict(provenance or {})
         self.frames: list[ShadowFrame] = []
         self._t0 = time.time()
 
@@ -145,6 +194,20 @@ class ShadowRecorder:
                 label[i, :cam_h, :cam_w] = np.asarray(
                     f.label[:cam_h, :cam_w], dtype=np.uint8)
 
+        tags = {
+            "has_rgb": any(f.rgb is not None for f in self.frames),
+            "has_label": any(f.label is not None for f in self.frames),
+            "has_bev": any(f.bev_raster is not None for f in self.frames),
+            "has_fmap": any(f.fmap is not None for f in self.frames),
+            "has_trajectory": any(f.trajectory is not None
+                                  for f in self.frames),
+        }
+        provenance = {
+            "git_commit": git_revision(),
+            "python": platform.python_version(),
+            "numpy": np.__version__,
+        }
+        provenance.update(self.provenance)
         np.savez_compressed(
             out,
             version=np.int64(EPISODE_VERSION),
@@ -171,12 +234,15 @@ class ShadowRecorder:
             quality=np.array([f.quality for f in self.frames],
                              dtype=np.float32),
             meta=json.dumps({
+                "schema": EPISODE_SCHEMA,
                 "sequence": self.sequence,
                 "frames": n,
                 "cam_h": int(cam_h),
                 "cam_w": int(cam_w),
                 "fmap_channels": int(fmap_c),
                 "episode_version": int(EPISODE_VERSION),
+                "tags": tags,
+                "provenance": provenance,
             }).encode("utf-8"),
         )
         return out
@@ -195,12 +261,14 @@ class EpisodeDataset:
     """
 
     def __init__(self, ep_files, modalities=("bev",), min_quality: float = 0.0):
-        import torch  # noqa: F401  (lazy import: only needed to train)
-
         if isinstance(ep_files, (str, Path)):
             ep_files = [Path(ep_files)]
         self.files = [Path(p) for p in ep_files if Path(p).exists()]
         self.modalities = tuple(modalities)
+        self.meta: list[dict] = []
+        self.schemas: list[str] = []
+        self.episode_versions: list[int | None] = []
+        self.provenance: list[dict] = []
         for m in self.modalities:
             if m not in ("bev", "rgb", "label", "drivable"):
                 raise KeyError(f"unknown modality: {m}")
@@ -209,6 +277,28 @@ class EpisodeDataset:
         self._idx: list[tuple[int, int]] = []
         for fi, p in enumerate(self.files):
             with np.load(p, allow_pickle=True) as z:
+                meta = {}
+                if "meta" in z:
+                    try:
+                        meta = json.loads(
+                            np.asarray(z["meta"]).item().decode("utf-8"))
+                    except Exception:
+                        meta = {}
+                schema = str(meta.get("schema", "") or "")
+                if schema and schema != EPISODE_SCHEMA:
+                    raise ValueError(
+                        f"unknown episode schema {schema!r} in {p}")
+                self.meta.append(meta)
+                self.schemas.append(schema or "legacy")
+                try:
+                    version = (
+                        int(meta["episode_version"])
+                        if "episode_version" in meta else None)
+                except (TypeError, ValueError):
+                    version = None
+                self.episode_versions.append(version)
+                self.provenance.append(
+                    dict(meta.get("provenance") or {}))
                 n = int(z["t"].shape[0])
                 q = np.asarray(z["quality"], dtype=np.float32) \
                     if "quality" in z else np.ones(n, dtype=np.float32)

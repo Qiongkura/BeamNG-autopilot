@@ -32,6 +32,43 @@ from beamng_autopilot import config
 from beamng_autopilot.rl.env import DecisionSpeedEnv
 
 
+def _write_contract_meta(out: Path, *, seed: int, mode: str) -> Path:
+    """Write the runtime checkpoint contract next to the SB3 zip."""
+    import subprocess
+
+    from beamng_autopilot.rl.dqn_runtime import ACTION_MULT, DECISION_DT_S
+    from beamng_autopilot.rl.obs import (
+        CLEARANCE_NORM_M, DECISION_OBS_SCHEMA, DECISION_OBS_SIZE,
+        DECISION_OBS_VERSION, LANE_DEV_NORM_M, ROAD_OFF_NORM_M, TRACKS_NORM,
+    )
+
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=ROOT,
+            text=True, stderr=subprocess.DEVNULL).strip()
+    except Exception:
+        commit = ""
+    meta = {
+        "schema": DECISION_OBS_SCHEMA,
+        "schema_version": DECISION_OBS_VERSION,
+        "obs_size": DECISION_OBS_SIZE,
+        "clearance_norm_m": CLEARANCE_NORM_M,
+        "lane_dev_norm_m": LANE_DEV_NORM_M,
+        "road_off_norm_m": ROAD_OFF_NORM_M,
+        "tracks_norm": TRACKS_NORM,
+        "action_mult": {str(k): v for k, v in ACTION_MULT.items()},
+        "dt_s": DECISION_DT_S,
+        "mode": mode,
+        "seed": int(seed),
+        "code_commit": commit,
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    path = out.with_suffix(".meta.json")
+    path.write_text(json.dumps(meta, ensure_ascii=False, indent=1),
+                    encoding="utf-8")
+    return path
+
+
 def evaluate(model, env, episodes: int = 12) -> dict:
     """Roll the policy (or the always-cruise baseline) over episodes."""
     totals, collisions, speeds = [], 0, []
@@ -148,6 +185,7 @@ def _train_sim(args, out) -> int:
         model.learn(total_timesteps=int(args.steps),
                     reset_num_timesteps=False)
         model.save(str(out))
+        _write_contract_meta(out, seed=args.seed, mode="sim")
         print(f"[m4-sim] saved -> {out}")
     finally:
         try:
@@ -208,6 +246,7 @@ def main() -> int:
         model.learn(total_timesteps=int(args.steps), progress_bar=False)
         train_s = time.time() - t0
         model.save(str(out))
+        _write_contract_meta(out, seed=args.seed, mode="offline")
         print(f"[m4] trained {args.steps} steps in {train_s:.0f}s "
               f"-> {out}")
     else:

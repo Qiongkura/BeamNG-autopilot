@@ -30,6 +30,7 @@ import torch.nn.functional as F
 
 from .e2e_torch import E2ENetTorch
 from ..bev_fusion import BEVFeatureMap
+from ..planning.path_validation import PathValidation, validate_learned_path
 
 DEFAULT_E2E_WEIGHTS = "logs/m5_e2e/best_temporal.pt"
 
@@ -69,6 +70,8 @@ class E2ERuntime:
         self.grid_n = 60
         self.bev_channels = 1
         self._buf: deque | None = None
+        self.last_validation: PathValidation | None = None
+        self.last_reject: str = ""
         if self.weights is not None and self.weights.exists():
             self._load()
 
@@ -89,6 +92,8 @@ class E2ERuntime:
         """Drop the temporal buffer (teleport / run restart)."""
         if self._buf is not None:
             self._buf.clear()
+        self.last_validation = None
+        self.last_reject = ""
 
     # ------------------------------------------------------------------
     def _load(self) -> None:
@@ -229,6 +234,8 @@ class E2ERuntime:
         FSD stack tick provides all three).  An unusable frame returns
         (None, None, 0.0) so the drive loop degrades silently.
         """
+        self.last_validation = None
+        self.last_reject = ""
         if self.net is None:
             return None, None, 0.0
         frame = getattr(out, "frame", None)
@@ -257,7 +264,22 @@ class E2ERuntime:
                 torch.tensor([[float(speed)]], dtype=torch.float32,
                              device=self.device))
         ms = (time.time() - t0) * 1000.0
-        world = ego_path_to_world(traj[0].cpu().numpy(), pos, heading)
+        traj_np = traj[0].detach().cpu().numpy()
+        act_np = action[0].detach().cpu().numpy()
+        # Runtime boundary contract: a learned trajectory is only usable
+        # when it is finite, advances forward, and stays within physically
+        # plausible extent/lateral/curvature bounds.  The safety monitor
+        # still re-checks it; this gate stops obvious model garbage before
+        # it reaches arbitration and records the exact rejection reason.
+        validation = validate_learned_path(
+            traj_np, origin=(0.0, 0.0), forward=(1.0, 0.0))
+        self.last_validation = validation
+        self.last_reject = "" if validation.ok else validation.reason
+        if not validation.ok:
+            return None, None, ms
+        if not np.isfinite(act_np).all():
+            act_np = None
+        world = ego_path_to_world(traj_np, pos, heading)
         if world is None:
             return None, None, ms
-        return world, action[0].cpu().numpy(), ms
+        return world, act_np, ms

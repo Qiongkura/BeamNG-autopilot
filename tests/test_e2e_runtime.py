@@ -50,6 +50,7 @@ def _tiny_ckpt(tmp_path, history: int = 1):
     # back to bev_channels=1 and still load the state dict.
     net = E2ENetTorch(grid_n=16, n_waypoints=8, history=history,
                       bev_channels=1).eval()
+    _straight_head(net)
     p = tmp_path / "tiny.pt"
     torch.save({
         "model": net.state_dict(),
@@ -61,6 +62,16 @@ def _tiny_ckpt(tmp_path, history: int = 1):
         "epoch": 1,
     }, p)
     return p
+
+
+def _straight_head(net: E2ENetTorch, step_m: float = 2.0) -> None:
+    """Make the random test net emit a valid straight trajectory."""
+    with torch.no_grad():
+        head = net.head[-1]
+        head.weight.zero_()
+        head.bias.zero_()
+        for i in range(net.n_waypoints):
+            head.bias[2 * i] = step_m * (i + 1)
 
 
 def test_e2e_runtime_step_pipeline(tmp_path) -> None:
@@ -91,6 +102,8 @@ def test_e2e_runtime_step_pipeline(tmp_path) -> None:
     assert np.isfinite(path).all()
     assert action is not None and action.shape == (2,)
     assert ms >= 0.0
+    assert rt.last_validation is not None and rt.last_validation.ok
+    assert rt.last_reject == ""
 
     # temporal buffer holds history+1 frames and pads at the start; a
     # second frame changes only the newest buffer slot.
@@ -113,6 +126,7 @@ def test_e2e_runtime_disabled_without_checkpoint() -> None:
 def _tiny_ckpt_multichannel(tmp_path, history: int = 1):
     net = E2ENetTorch(grid_n=16, n_waypoints=8, history=history,
                       bev_channels=4).eval()
+    _straight_head(net)
     p = tmp_path / "tiny_mc.pt"
     torch.save({
         "model": net.state_dict(),

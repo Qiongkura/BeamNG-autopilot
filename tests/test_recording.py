@@ -11,11 +11,13 @@ from beamng_autopilot.recording import (
     EpisodeDataset,
     ShadowFrame,
     ShadowRecorder,
+    shadow_expert_sample_ok,
 )
 
 
 def test_recorder_roundtrip(tmp_path) -> None:
-    rec = ShadowRecorder(tmp_path, "test_roundtrip")
+    rec = ShadowRecorder(tmp_path, "test_roundtrip",
+                         provenance={"source": "unit-test"})
     rgb = np.zeros((8, 16, 3), dtype=np.uint8)
     lab = np.zeros((8, 16), dtype=np.uint8)
     lab[2:6, 4:12] = 1
@@ -51,8 +53,14 @@ def test_recorder_roundtrip(tmp_path) -> None:
         assert abs(float(z["quality"][0]) - 0.9) < 1e-5
         assert abs(float(z["quality"][1]) - 0.2) < 1e-5
         _meta = json.loads(np.asarray(z["meta"]).item().decode("utf-8"))
+        assert _meta["schema"] == "fsd_shadow_episode"
         assert _meta["fmap_channels"] == 4
         assert _meta["episode_version"] == 3
+        assert _meta["tags"]["has_rgb"] is True
+        assert _meta["tags"]["has_label"] is True
+        assert _meta["tags"]["has_fmap"] is True
+        assert _meta["provenance"]["source"] == "unit-test"
+        assert "git_commit" in _meta["provenance"]
 
 
 def test_recorder_empty_save_returns_none(tmp_path) -> None:
@@ -68,6 +76,9 @@ def test_episode_dataset_iterates(tmp_path) -> None:
     out = rec.save()
     ds = EpisodeDataset([out])
     assert len(ds) == 3
+    assert ds.schemas == ["fsd_shadow_episode"]
+    assert ds.episode_versions == [3]
+    assert "git_commit" in ds.provenance[0]
     bev, action = ds[1]
     assert tuple(bev.shape) == (60, 60)
     assert abs(float(action[0]) - 0.1) < 1e-6
@@ -76,6 +87,16 @@ def test_episode_dataset_iterates(tmp_path) -> None:
 def test_episode_dataset_missing_file_ok(tmp_path) -> None:
     ds = EpisodeDataset([tmp_path / "nope.npz"])
     assert len(ds) == 0
+
+
+def test_episode_dataset_rejects_unknown_schema(tmp_path) -> None:
+    p = tmp_path / "bad.npz"
+    np.savez_compressed(
+        p, t=np.zeros(1, dtype=np.float64),
+        quality=np.ones(1, dtype=np.float32),
+        meta=json.dumps({"schema": "not-a-shadow-episode"}).encode("utf-8"))
+    with pytest.raises(ValueError, match="unknown episode schema"):
+        EpisodeDataset([p])
 
 
 def test_episode_dataset_multimodal(tmp_path) -> None:
@@ -110,3 +131,29 @@ def test_episode_dataset_quality_gate(tmp_path) -> None:
     assert len(ds) == 2
     bev, action = ds[1]
     assert abs(float(action[0]) - 0.2) < 1e-6
+
+
+def test_strict_shadow_sample_requires_perception_lane() -> None:
+    trajectory = np.array([[0.0, 0.0], [2.0, 0.0], [4.0, 0.0]])
+    ok, reason = shadow_expert_sample_ok(
+        strict_perception=True, lane_ref=None, trajectory=trajectory)
+    assert not ok
+    assert reason == "perception lane unavailable"
+
+
+def test_strict_shadow_sample_accepts_valid_perception_lane() -> None:
+    trajectory = np.array([[0.0, 0.0], [2.0, 0.0], [4.0, 0.0]])
+    lane = np.array([[0.0, 0.0], [1.0, 0.0],
+                     [2.0, 0.0], [3.0, 0.0]])
+    ok, reason = shadow_expert_sample_ok(
+        strict_perception=True, lane_ref=lane, trajectory=trajectory)
+    assert ok
+    assert reason == ""
+
+
+def test_legacy_shadow_sample_allows_missing_lane() -> None:
+    trajectory = np.array([[0.0, 0.0], [2.0, 0.0]])
+    ok, reason = shadow_expert_sample_ok(
+        strict_perception=False, lane_ref=None, trajectory=trajectory)
+    assert ok
+    assert reason == ""

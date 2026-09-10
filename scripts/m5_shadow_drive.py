@@ -53,6 +53,7 @@ from beamng_autopilot.recording import (
     FMAP_CHANNELS,
     ShadowFrame,
     ShadowRecorder,
+    shadow_expert_sample_ok,
 )
 from beamng_autopilot.roadnet import RoadNetwork
 from beamng_autopilot.runtime import (
@@ -61,7 +62,10 @@ from beamng_autopilot.runtime import (
 )
 from beamng_autopilot.vision.hydra import FrameContext, HydraNet
 from beamng_autopilot.vision.heads.semantic import SemanticHead
-from beamng_autopilot.vision.lanes import painted_line_lane_center
+from beamng_autopilot.vision.lanes import (
+    painted_lane_reference,
+    painted_line_lane_center,
+)
 
 
 def _path_curvature_ff(path, pos, heading, near_m: float = 1.5,
@@ -185,13 +189,34 @@ def main() -> int:
     ap.add_argument("--lidar-every", type=int, default=1,
                     help="reuse the last LiDAR scan for N-1 of every N "
                          "frames (range scan is the per-frame bottleneck)")
+    ap.add_argument("--lane-mode", choices=("map", "sensor"), default="map",
+                    help="lane reference for the shadow planner: map "
+                         "(legacy road-graph lane) or sensor (painted-line "
+                         "perception only; the FSD path)")
+    ap.add_argument("--strict", action="store_true",
+                    help="FSD realism mode (docs/fsd_realism.md): with "
+                         "--lane-mode sensor the map lane / nav route may "
+                         "NEVER steer or label a frame; frames without a "
+                         "perceived lane are stopped on and not recorded")
     args = ap.parse_args()
 
     conn = BeamNGConnector(
         "italy", "etk800",
         port=config.runtime_port(args.runtime),
         home=config.runtime_home(args.runtime))
-    rec = ShadowRecorder(args.out, f"shadow_{int(time.time())}")
+    rec = ShadowRecorder(
+        args.out, f"shadow_{int(time.time())}",
+        provenance={
+            "source": "m5_shadow_drive",
+            "runtime": str(args.runtime),
+            "map": "italy",
+            "vehicle": "etk800",
+            "speed_arg": float(args.speed),
+            "drive": bool(args.drive),
+            "goal": list(args.goal) if args.goal is not None else None,
+            "lane_mode": str(args.lane_mode),
+            "strict": bool(args.strict),
+        })
     pp = PurePursuit(lookahead=2.5)
     try:
         conn.open(launch=not args.attach)
@@ -336,6 +361,7 @@ def main() -> int:
 
         t_end = time.time() + args.seconds
         frames = 0
+        skipped_no_lane = 0
         rng_last = None
         stuck_t0 = None
         while time.time() < t_end:
@@ -344,6 +370,12 @@ def main() -> int:
             heading = float(st.heading)
             v = float(st.speed)
             drive_route = nav_route if nav_route is not None else route
+            _lane_mode = str(args.lane_mode)
+            # sensor mode: the shadow planner may only see painted-line
+            # perception.  strict additionally refuses to steer or label
+            # from the nav route when that perception is missing
+            # (docs/fsd_realism.md §1/§4).
+            _strict_lane = bool(args.strict and _lane_mode == "sensor")
             # End-stop: once the remaining route is short, brake to a
             # standstill in the lane instead of driving off the route end
             # onto the roadside grass (the route ends at a junction and
@@ -421,15 +453,22 @@ def main() -> int:
                 n=grid.n, res=grid.res)
 
             scene_route = nav_route if nav_route is not None else route
-            # Own-lane map reference (same as the FSD drive): the recorder
-            # must label a car in ITS OWN lane, not one riding the route
-            # centre line (which wedges on hairpins and labels centre-line
-            # driving).  The map lane centre is the lane_center candidate
-            # and the fallback when the arc fan declines.
+            # Own-lane reference for the shadow planner.
+            #   sensor = painted-line perception only; the map lane is
+            #            never even built, so no road-graph geometry can
+            #            leak into the expert trajectory / action label
+            #            (docs/fsd_realism.md §1/§4).
+            #   map    = legacy road-graph lane (compatibility mode): the
+            #            recorder must still label a car in ITS OWN lane,
+            #            not one riding the route centre line (which
+            #            wedges on hairpins and labels centre-line driving).
             scene_lane_ref = None
             lane_left = lane_right = None
             lane_width = 0.0
-            if nav_route is not None and road_left is not None \
+            if _lane_mode == "sensor":
+                scene_lane_ref = painted_lane_reference(
+                    out, cam, pos, heading, ground_z=float(pos[2]))
+            elif nav_route is not None and road_left is not None \
                     and road_right is not None:
                 try:
                     map_lane = map_lane_edges(
@@ -452,7 +491,8 @@ def main() -> int:
                           lane_left=lane_left, lane_right=lane_right,
                           lane_width=lane_width,
                           obstacles=rng.obstacles,
-                          target_speed=args.speed)
+                          target_speed=args.speed,
+                          strict_perception=_strict_lane)
             fans = sample_arc(pos, heading, speed=max(2.0, v),
                               max_steer=0.4, n_curv=9)
             if scene_lane_ref is not None and len(scene_lane_ref) >= 4:
@@ -465,15 +505,34 @@ def main() -> int:
                              offset=_c.meta.get("offset", 0.0))
             best, meta = select_trajectory(scene, fans, cons)
 
+            expert_ok, expert_reason = shadow_expert_sample_ok(
+                strict_perception=_strict_lane,
+                lane_ref=scene_lane_ref,
+                trajectory=best)
             # executed control: follow the shadow planner's ``best`` arc
             # when it exists (it is smooth through bends) and fall back
-            # to the own-lane centre (or the road graph when no map lane
-            # is available) otherwise; the lateral guard below keeps the
-            # car inside the road instead of cutting onto grass.
-            fallback_ref = drive_route
+            # to the own-lane reference otherwise.  In sensor mode the nav
+            # route is NOT a steering reference - it is navigation intent
+            # only (docs/fsd_realism.md §2); strict mode degrades to a stop
+            # instead of driving it.  The lateral guard below keeps the car
+            # inside the road instead of cutting onto grass.
+            fallback_ref = None if _lane_mode == "sensor" else drive_route
             if best is None and scene_lane_ref is not None \
                     and len(scene_lane_ref) >= 4:
                 fallback_ref = np.asarray(scene_lane_ref)[:, :2]
+            # strict FSD: no perception-derived trajectory this frame is the
+            # "lane unavailable" degradation - stop, never steer on the map /
+            # nav route, and do not record it as an expert demonstration
+            # (doing so would teach the end-to-end net to follow the route).
+            if _strict_lane and not expert_ok:
+                if args.drive:
+                    conn.control(throttle=0.0,
+                                 brake=1.0 if v > 0.2 else 0.3,
+                                 steering=0.0, parkingbrake=0.0,
+                                 gear=fwd_gear)
+                conn.step(3)
+                skipped_no_lane += 1
+                continue
             route_ref = best if best is not None else fallback_ref
             steer = 0.0
             if route_ref is not None and len(route_ref) >= 2:
@@ -530,7 +589,9 @@ def main() -> int:
                       if fmap is not None else None),
                 trajectory=None if best is None else best,
                 target_speed=float(args.speed),
-                lane_src="semantic" if net.names() else "",
+                lane_src=("painted" if scene_lane_ref is not None
+                          and _lane_mode == "sensor"
+                          else ("semantic" if net.names() else "")),
                 cost=cost,
                 kind=meta.get("kind", ""),
                 rgb=frame_rgb,
@@ -538,7 +599,8 @@ def main() -> int:
                 quality=quality))
             frames += 1
         out = rec.save()
-        print(f"[shadow] runtime={mode} frames={frames}")
+        print(f"[shadow] runtime={mode} frames={frames} "
+              f"skipped_no_lane={skipped_no_lane}")
         if out:
             print(f"[shadow] episode saved -> {out}")
         else:

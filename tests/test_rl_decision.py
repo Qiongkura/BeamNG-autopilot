@@ -124,6 +124,70 @@ def test_dqn_runtime_missing_weights_disabled(tmp_path) -> None:
     assert rt.predict(3.0, 6.0, 10.0, 10.0, 0.0, 0.0, 1) == (0, 0.0)
 
 
+def test_dqn_runtime_contract_structural_checks(tmp_path) -> None:
+    import gymnasium as gym
+    from types import SimpleNamespace
+
+    rt = DQNRuntime(tmp_path / "nope.zip")
+    good = SimpleNamespace(
+        observation_space=gym.spaces.Box(
+            0.0, 1.0, shape=(DECISION_OBS_SIZE,), dtype=np.float32),
+        action_space=gym.spaces.Discrete(5))
+    assert rt._validate_contract(good).ok
+    assert rt.meta_warning
+
+    wrong_obs = SimpleNamespace(
+        observation_space=gym.spaces.Box(
+            0.0, 1.0, shape=(4,), dtype=np.float32),
+        action_space=gym.spaces.Discrete(5))
+    bad = rt._validate_contract(wrong_obs)
+    assert not bad.ok and "observation shape" in bad.reason
+
+    wrong_actions = SimpleNamespace(
+        observation_space=gym.spaces.Box(
+            0.0, 1.0, shape=(DECISION_OBS_SIZE,), dtype=np.float32),
+        action_space=gym.spaces.Discrete(3))
+    bad = rt._validate_contract(wrong_actions)
+    assert not bad.ok and "action count" in bad.reason
+
+
+def test_dqn_runtime_contract_rejects_sidecar_drift(tmp_path) -> None:
+    import gymnasium as gym
+    from types import SimpleNamespace
+
+    from beamng_autopilot.rl.dqn_runtime import ACTION_MULT
+    from beamng_autopilot.rl.obs import (
+        CLEARANCE_NORM_M, DECISION_OBS_SCHEMA, DECISION_OBS_VERSION,
+        LANE_DEV_NORM_M, ROAD_OFF_NORM_M, TRACKS_NORM,
+    )
+
+    weights = tmp_path / "tiny_dqn.zip"
+    rt = DQNRuntime(weights)
+    model = SimpleNamespace(
+        observation_space=gym.spaces.Box(
+            0.0, 1.0, shape=(DECISION_OBS_SIZE,), dtype=np.float32),
+        action_space=gym.spaces.Discrete(len(ACTION_MULT)))
+    meta = {
+        "schema": DECISION_OBS_SCHEMA,
+        "schema_version": DECISION_OBS_VERSION,
+        "obs_size": DECISION_OBS_SIZE,
+        "clearance_norm_m": CLEARANCE_NORM_M,
+        "lane_dev_norm_m": LANE_DEV_NORM_M,
+        "road_off_norm_m": ROAD_OFF_NORM_M,
+        "tracks_norm": TRACKS_NORM,
+        "action_mult": {str(k): v for k, v in ACTION_MULT.items()},
+        "dt_s": 0.5,
+    }
+    weights.with_suffix(".meta.json").write_text(
+        json.dumps(meta), encoding="utf-8")
+    bad = rt._validate_contract(model)
+    assert not bad.ok and "dt_s" in bad.reason
+    meta["dt_s"] = 0.25
+    weights.with_suffix(".meta.json").write_text(
+        json.dumps(meta), encoding="utf-8")
+    assert rt._validate_contract(model).ok
+
+
 def test_trained_decision_policy_exists_and_evaluates() -> None:
     """The real offline training loop must have produced weights + report
     with a policy that beats the always-cruise baseline on collisions."""
