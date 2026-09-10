@@ -359,14 +359,40 @@ def test_cost_lane_align_strict_ignores_map_route() -> None:
     assert cost_lane_align(sc, off_lane) < 0.5
 
 
-def test_constraints_strict_without_lane_ref_skips_align_gate() -> None:
-    """A strict scene with route-only reference must not gate candidates
-    on route alignment (that gate would reject a correct own-lane path
-    that sits 1.8 m off the road centre)."""
-    from beamng_autopilot.planning.trajectory import Candidate
+def test_constraints_strict_without_lane_ref_declines_every_candidate() -> None:
+    """Strict FSD realism: no perception lane means no lateral authority.
+
+    The constraint layer - not each downstream consumer - owns the
+    fail-closed decision, so even a raw kinematic arc (which carries no
+    lane geometry at all) must be infeasible: publishing it would hand
+    the runtime a steering trajectory while the stack has no idea where
+    its own lane is.
+    """
+    from beamng_autopilot.planning.trajectory import Candidate, sample_arc
     sc = _scene()
     sc.strict_perception = True
     cons = Constraints()
     own_lane = np.column_stack([np.linspace(0, 20, 20), np.full(20, -1.8)])
-    _, feasible = cons.score(sc, Candidate(path=own_lane))
+    assert cons.score(sc, Candidate(path=own_lane))[1] is False
+    for cand in sample_arc([0.0, 0.0], 0.0, speed=8.0, max_steer=0.5,
+                           n_curv=5).candidates:
+        assert cons.score(sc, cand)[1] is False
+
+
+def test_constraints_strict_with_lane_ref_scores_the_same_path() -> None:
+    """The same path is drivable once perception supplies the lane.
+
+    The decline above is the missing lane reference, not the geometry -
+    the align gate stays skipped (route-only) and the perception lane
+    carries the lateral authority instead.
+    """
+    from beamng_autopilot.planning.trajectory import Candidate
+    sc = _scene()
+    sc.strict_perception = True
+    sc.lane_ref = np.column_stack([np.linspace(0, 30, 31),
+                                   np.full(31, -1.8)])
+    cons = Constraints()
+    own_lane = np.column_stack([np.linspace(0, 20, 20), np.full(20, -1.8)])
+    cost, feasible = cons.score(sc, Candidate(path=own_lane))
     assert feasible
+    assert np.isfinite(cost)

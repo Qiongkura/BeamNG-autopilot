@@ -647,3 +647,30 @@ def test_strict_tick_without_perception_lane_has_no_route_plan(
     assert out.scene.lane_ref is None
     assert out.scene.route is None
     assert out.meta.get("lateral_candidate_src") == "none"
+    # No lateral authority means no published trajectory at all - not even
+    # a raw kinematic arc, which carries no lane geometry either.
+    assert out.best_path is None
+    assert out.meta.get("plan_blocked") == "no_perception_lane"
+
+
+def test_tick_freezes_the_snapshot_before_planning(monkeypatch) -> None:
+    """The planner must consume the SAME perception snapshot the tick
+    published - the snapshot is frozen before planning runs, so planning is
+    provably a consumer of perception rather than a sibling of it."""
+    import beamng_autopilot.fsd_stack as fs
+    st = _stack()
+    seen: dict = {}
+    real = fs.select_trajectory
+
+    def _spy(scene, fans, constraints):
+        seen["snapshot"] = getattr(scene, "perception_snapshot", None)
+        seen["bev"] = getattr(seen["snapshot"], "bev", None)
+        return real(scene, fans, constraints)
+
+    monkeypatch.setattr(fs, "select_trajectory", _spy)
+    out = st.tick()
+    assert seen["snapshot"] is out.snapshot
+    assert seen["snapshot"] is not None
+    # Perception was complete at planning time, not back-filled afterwards.
+    assert seen["bev"] is not None
+    assert seen["snapshot"].tick_id == out.snapshot.tick_id

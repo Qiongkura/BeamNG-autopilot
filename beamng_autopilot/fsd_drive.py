@@ -1604,9 +1604,15 @@ class FSDriveSession:
                 # car must stop, not drive the map/nav route through the rule
                 # fallback (docs/fsd_realism.md §4).  The rule planner below
                 # is exactly that map fallback, so it is disabled here.
-                _strict_no_lane = bool(args.strict and
-                                       str(out.meta.get("lane_src_sel", ""))
-                                       != "sensor")
+                # The verdict itself is owned by the planner, which declines
+                # every candidate for a strict scene without a perception
+                # lane and publishes ``plan_blocked``; the runtime consumes
+                # that decision instead of re-implementing the lane policy.
+                # ``lane_src_sel`` is kept as the second, independent read of
+                # the same contract (a missing lock must not unblock motion).
+                _strict_no_lane = bool(args.strict and (
+                    out.meta.get("plan_blocked") == "no_perception_lane"
+                    or str(out.meta.get("lane_src_sel", "")) != "sensor"))
                 if _strict_no_lane:
                     _need_rule = False
                 if _need_rule and nav_route is not None and len(nav_route) >= 2:

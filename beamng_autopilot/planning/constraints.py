@@ -151,6 +151,17 @@ class Constraints:
         path = candidate.path
         if path is None or len(path) < 2:
             return 1e9, False
+        # FSD realism: a strict scene with no perception lane has no
+        # lateral authority at all.  Publishing ANY candidate - including
+        # a raw kinematic arc, which carries no lane geometry - would hand
+        # the runtime a steering trajectory while the stack does not know
+        # where its own lane is.  The planner must decline here so the
+        # single fail-closed decision lives in the constraint layer
+        # instead of being re-derived by every consumer
+        # (docs/fsd_realism.md §4).
+        if getattr(scene, "strict_perception", False) \
+                and not _has_lane_reference(scene):
+            return 1e9, False
         kind = str(candidate.meta.get("kind", ""))
         min_m = self.progress_min_m_ref if kind in self.ref_kinds \
             else self.progress_min_m

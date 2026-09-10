@@ -41,11 +41,22 @@
   `SafetyVerdict.lane_ref_src` 会记录本 tick 实际使用的参考来源,
   方便从遥测验证严格模式没有偷用地图几何。
   非严格(旧规则兼容)模式保留 route 兜底。
+  失败关闭本身只有一个 owner:`planning/constraints.py::Constraints.score`
+  在 strict scene 没有感知车道时**拒绝所有候选**——包括不含任何车道几何的
+  纯运动学弧线,所以规划器不会发布 `best_path`,下游没有可转向的轨迹,
+  只能在合法降级集合内动作(刹停 / 保持航向 / 落到路面安全点)。
+  这一决定以 `FSDTick.meta["plan_blocked"]="no_perception_lane"` 发布,
+  `m5_fsd_drive` 消费该裁决而不是自己再实现一遍车道策略。
 
 - **单一世界模型**:`FSDTick.scene` 发布本 tick 规划器实际使用的
   `Scene`(occupancy、感知车道、strict 标记、快照/freshness)。
   `m5_fsd_drive` 的 safety 层必须直接消费这同一份 Scene,不得重新拼一份
   带不同横向参考的世界模型;只有旧 stub 不发布 Scene 时才允许走兼容重建。
+
+- **单一感知快照**:`PerceptionSnapshot` 在感知阶段结束、规划开始**之前**
+  冻结(环视 → 多头 → BEV → 跟踪 → 车道包络 → 拓扑头),再作为构造参数传入
+  规划 `Scene`。规划因此是感知结果的消费者,而不是"先规划、再把快照回填进
+  Scene"的兄弟节点;安全层、遥测与影子录制读到的都是同一份快照。
 
 ## 5. 传感器真值优先,模拟器特权禁止进入推理
 

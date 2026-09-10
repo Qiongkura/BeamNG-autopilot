@@ -39,7 +39,12 @@ FSD_INVARIANTS = (
      "fsd_stack plan_route/lane_ref split"),
     ("perception-unavailable-degrades",
      "no paired sensor lane -> no-lane degradation, never a map-lane lead",
-     "fsd_stack strict_sensor=True"),
+     "fsd_stack strict_sensor=True + constraints fail-closed"),
+    ("fail-closed-single-owner",
+     "a strict scene without a perception lane must publish no trajectory at "
+     "all (not even a lane-less kinematic arc); one layer owns the decision "
+     "and every consumer reads it",
+     "planning/constraints.py score -> fsd_stack meta plan_blocked"),
     ("no-simulator-privilege-in-inference",
      "Lua ground truth / annotations must not enter the inference path",
      "vision/ + runtime providers"),

@@ -40,9 +40,10 @@ def test_assert_realistic_lane_raises_on_map_in_strict() -> None:
 
 def test_invariants_registry_complete() -> None:
     ids = [r[0] for r in FSD_INVARIANTS]
-    assert len(ids) == 5
+    assert len(ids) == 6
     assert "lane-perception-only" in ids
     assert "perception-unavailable-degrades" in ids
+    assert "fail-closed-single-owner" in ids
     for _id, rule, _by in FSD_INVARIANTS:
         assert len(rule) > 20
         assert len(_by) > 5

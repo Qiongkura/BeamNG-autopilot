@@ -688,7 +688,7 @@ class FSDStack:
         out.drivable = grid.drivable
         out.observed = getattr(grid, "observed", None)
 
-        # --- 3) layered planner -----------------------------------------
+        # --- 3) lane perception -----------------------------------------
         # ``has_nav_route``: only a caller-supplied map/nav route carries
         # real road geometry for the map-prior own-lane fallback; a
         # synthetic straight line does not.
@@ -992,6 +992,56 @@ class FSDStack:
             if lane_right is not None:
                 out.lane_right = np.asarray(lane_right, dtype=float)[:, :2]
             out.lane_width = lane_width
+        # Perception head that needs the fused lane: the topology head
+        # consumes a real LaneFrame (not just a frame context), so it runs
+        # once here - after fusion, before the snapshot is frozen.  It used
+        # to run after planning, which made planning a sibling of a head
+        # instead of a consumer of the complete perception result.
+        topology = self.hydra._heads.get("topology")
+        if topology is not None:
+            _topo_lane = self._sensor_lane_from_semantic(
+                out.head_outputs, pos, heading)
+            _topo_ctx = FrameContext(
+                frame_rgb=np.zeros((1, 1, 3), dtype=np.uint8),
+                cam=None, pos=pos, heading=heading,
+                ground_z=float(pos[2]) if len(pos) > 2 else 0.0,
+                role="front_main")
+            try:
+                _topo_out = topology.run(_topo_ctx, sensor_lane=_topo_lane)
+                getattr(self, "_head_timestamps", {})["topology"] = time.time()
+                out.meta.setdefault("head_age_s", {})["topology"] = 0.0
+                out.head_outputs["topology"] = _topo_out
+            except Exception as exc:
+                _warn_once("topology", f"topology head failed: {exc}")
+        out.meta.update(semantic_to_meta(out.head_outputs))
+        # --- 4) canonical perception snapshot ---------------------------
+        # Sensing is complete here: ring -> heads -> BEV -> tracking ->
+        # lane envelope.  Freeze it into the ONE snapshot every downstream
+        # stage reads this tick - the planner builds its Scene from it, the
+        # safety monitor verifies against it, telemetry and shadow
+        # recording publish it.  Building it HERE rather than after
+        # planning is what makes planning provably a consumer of
+        # perception instead of a sibling that re-reads raw tick fields
+        # (docs/fsd_realism.md §2).
+        out.meta.setdefault("bev_age_s",
+                            0.0 if out.bev is not None else None)
+        out.meta.setdefault("range_age_s", None)
+        out.snapshot = PerceptionSnapshot(
+            captured_at=float(_tick_cost0),
+            tick_id=int(getattr(self, "_tick_num", 0)),
+            pos=pos.copy(), heading=heading,
+            frame=out.frame, cam=out.cam,
+            head_outputs=dict(out.head_outputs),
+            head_age_s=dict(out.meta.get("head_age_s", {})),
+            errors=dict(out.errors), ray_hits=list(out.ray_hits),
+            tracks=list(out.tracks), bev=out.bev,
+            drivable=out.drivable, observed=out.observed,
+            feature_map=out.feature_map,
+            lane_envelope=getattr(out, "lane_envelope", None),
+            range_age_s=out.meta.get("range_age_s"),
+            bev_age_s=out.meta.get("bev_age_s"))
+        out.meta["snapshot"] = out.snapshot.meta()
+        # --- 5) layered planner -----------------------------------------
         # Route intent vs sensor lane: the map/nav route is the heading
         # the car must follow (FSD planning consumes the route as the
         # navigational goal), while the sensor lane is the lateral
@@ -1083,6 +1133,7 @@ class FSDStack:
                       lane_left=lane_left, lane_right=lane_right,
                       lane_width=lane_width,
                       lane_envelope=self.lane_envelope,
+                      perception_snapshot=out.snapshot,
                       target_speed=_target, intent=intent,
                       strict_perception=strict_lane)
         # Publish the world model: the safety layer evaluates the same
@@ -1143,6 +1194,14 @@ class FSDStack:
         out.n_candidates = len(fans.candidates)
         best, meta = select_trajectory(scene, fans, self.constraints)
         out.best_path = best
+        # One fail-closed decision, published in telemetry: strict mode
+        # with no perception lane declines every candidate in the
+        # constraint layer (raw arcs carry no lane geometry either), so
+        # the runtime has nothing to steer and the stack degrades to the
+        # legal set - stop, hold heading, or a safe road point
+        # (docs/fsd_realism.md §4).
+        if best is None and strict_lane and lane_src_sel != SRC_SENSOR:
+            out.meta["plan_blocked"] = "no_perception_lane"
         # Path-aware forward clearance: safety layer evaluates the chosen
         # trajectory corridor instead of the raw heading corridor, so a
         # turn away from a wall does not force a stop (town runs 2026-08-21).
@@ -1198,49 +1257,12 @@ class FSDStack:
             _warn_once("plan_speed", f"route speed profile failed: {exc}")
 
 
-        # Run the topology head over the sensor lane derived from the
-        # semantic markings (its graph needs a real LaneFrame, not just a
-        # frame context).
-        topology = self.hydra._heads.get("topology")
-        if topology is not None:
-            lane_frame = self._sensor_lane_from_semantic(
-                out.head_outputs, pos, heading)
-            ctx = FrameContext(
-                frame_rgb=np.zeros((1, 1, 3), dtype=np.uint8),
-                cam=None, pos=pos, heading=heading,
-                ground_z=float(pos[2]) if len(pos) > 2 else 0.0,
-                role="front_main")
-            try:
-                topo_out = topology.run(ctx, sensor_lane=lane_frame)
-                getattr(self, "_head_timestamps", {})["topology"] = time.time()
-                out.meta.setdefault("head_age_s", {})["topology"] = 0.0
-                out.head_outputs["topology"] = topo_out
-            except Exception as exc:
-                _warn_once("topology", f"topology head failed: {exc}")
-        out.meta.update(semantic_to_meta(out.head_outputs))
         _times['plan'] = round((time.time() - _tw) * 1000.0, 1)
         _times['total'] = round(sum(_times.values()), 1)
         out.meta['tick_ms'] = _times
-        out.meta.setdefault("bev_age_s", 0.0 if out.bev is not None else None)
-        out.meta.setdefault("range_age_s", None)
-        out.snapshot = PerceptionSnapshot(
-            captured_at=float(_tick_cost0),
-            tick_id=int(getattr(self, "_tick_num", 0)),
-            pos=pos.copy(), heading=heading,
-            frame=out.frame, cam=out.cam,
-            head_outputs=dict(out.head_outputs),
-            head_age_s=dict(out.meta.get("head_age_s", {})),
-            errors=dict(out.errors), ray_hits=list(out.ray_hits),
-            tracks=list(out.tracks), bev=out.bev,
-            drivable=out.drivable, observed=out.observed,
-            feature_map=out.feature_map,
-            lane_envelope=getattr(out, "lane_envelope", None),
-            range_age_s=out.meta.get("range_age_s"),
-            bev_age_s=out.meta.get("bev_age_s"))
-        out.meta["snapshot"] = out.snapshot.meta()
-        # Backfill the published Scene with the tick's provenance so the
-        # safety monitor reads the same freshness/metadata contract.
-        scene.perception_snapshot = out.snapshot
+        # Publish the tick's provenance on the Scene the planner already
+        # planned against, so the safety monitor reads the same freshness
+        # contract (the snapshot itself was frozen before planning).
         scene.meta = out.meta
         return out
 
