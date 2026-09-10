@@ -221,7 +221,7 @@ class Segmenter:
         Both masks share the same ground-plane back-projection pipeline.
         """
         from beamng_autopilot.vision.lanes import (
-            _mask_to_markings, WHITE_SAT_MAX)
+            _mask_to_markings, WHITE_SAT_MAX, recover_dashed_boundaries)
 
         _, line = self.predict(frame_rgb)
         # Classic-CV bright-stroke recovery, contrast-based: on a light
@@ -248,6 +248,21 @@ class Segmenter:
             out.extend(_mask_to_markings(
                 white_mask, "white", cam_model, pos, heading,
                 ground_z=ground_z))
+            # The shape gates above keep only long strokes, but the town
+            # ``line`` class is mostly short blocks (median 17 components
+            # per frame, median height 7 px), so a dashed lane line leaves
+            # no usable boundary behind.  Group the discarded collinear
+            # fragments back into one long boundary so the own lane can
+            # have two detected edges again.
+            #
+            # This runs on the LEARNED mask, not on ``white_mask``: the
+            # classic-CV bright-stroke union above exists to recover paint
+            # the model misses, but its texture edges are not paint and
+            # they pollute the grouping (measured: grouping the union
+            # yields a 23.9% paired rate, the learned mask alone 43.0%).
+            out.extend(recover_dashed_boundaries(
+                np.asarray(line, dtype=np.uint8) * 255,
+                cam_model, pos, heading, ground_z=ground_z))
         if cv_yellow.any():
             out.extend(_mask_to_markings(
                 cv_yellow.astype(np.uint8) * 255, "yellow",
