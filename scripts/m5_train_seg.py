@@ -340,6 +340,11 @@ def main() -> None:
     ap.add_argument("--task-episode-names", nargs="*", default=None,
                     help="固定任务评估的 episode 文件名：影子集随每次实车增长，"
                          "不固定就无法跨训练比较")
+    ap.add_argument("--task-min-in-lane", type=float, default=0.20,
+                    metavar="F",
+                    help="best_task.pt 的准入门槛：成对率再高，若该轮的 in-lane "
+                         "低于 F 也不选（可用率与横向正确性在 epoch 间互相交换，"
+                         "只按成对率会选中「配对多但中心错」的权重，默认 0.20）")
     ap.add_argument("--line-morph", action="store_true",
                     help="enable line morphology augmentation (default "
                          "off: v7 ablation showed it hurts line IoU)")
@@ -611,12 +616,28 @@ def main() -> None:
                 print(f"[train]     task paired={t_paired:.1%} "
                       f"in_lane={t_in_lane:.1%} "
                       f"lat_p50={tv.get('lat_p50_m')}m", flush=True)
+                # 每个已评估的 epoch 都留一份权重：可用率与横向正确性在 epoch
+                # 之间互相交换，改选门槛后必须能离线重选，不必重训。
+                torch.save({
+                    "state_dict": model.state_dict(),
+                    "n_classes": N_CLASSES,
+                    "class_names": CLASS_NAMES,
+                    "val_miou": round(m_iou, 4),
+                    "task_paired_rate": t_paired,
+                    "task_in_lane_rate": t_in_lane,
+                    "task_lat_p50_m": tv.get("lat_p50_m"),
+                    "task_episodes": [Path(e).name for e in task_eps],
+                    "weights": weights.tolist(),
+                    "train_args": ckpt["train_args"],
+                }, out_dir / f"task_ep{ep:02d}.pt")
             except Exception as exc:
                 print(f"[train] 任务评估失败: {exc}", flush=True)
         if task_eps:
             hist["task_paired"].append(t_paired)
             hist["task_in_lane"].append(t_in_lane)
-        if t_paired is not None and t_paired > best_task:
+        eligible = (t_paired is not None and t_in_lane is not None
+                    and t_in_lane >= args.task_min_in_lane)
+        if eligible and t_paired > best_task:
             best_task = float(t_paired)
             torch.save({
                 "state_dict": model.state_dict(),
