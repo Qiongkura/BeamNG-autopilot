@@ -34,8 +34,24 @@ from beamng_autopilot.planning.lateral_ref import (
 )
 from beamng_autopilot.vehicle_body import CORRIDOR_HALF_WIDTH_M
 
-# How old a range/vision snapshot can be before the monitor distrusts it.
+# How old a perception MODALITY (head / BEV / lane) can be before the
+# monitor distrusts it.
 STALE_SNAPSHOT_S = 0.8
+# The range (LiDAR) modality is reusable by design: FSDStack re-serves a
+# motion-compensated scan, bounded by ``RANGE_REUSE_MAX_DT_S``, whenever a
+# tick overruns its budget, so its age legitimately climbs past
+# STALE_SNAPSHOT_S.  A test pins this against ``fsd_stack``'s reuse cap so
+# the two cannot drift apart.
+STALE_RANGE_S = 2.0
+# The composite snapshot age is sensor-poll + per-tick pipeline latency,
+# i.e. roughly the control period, NOT a sensor-health signal: on the
+# 2026-09-11 town runs it ran p50 0.58 s / max 0.92 s while no perception
+# head exceeded 0.66 s.  Judged against STALE_SNAPSHOT_S it declared the
+# stack stale on 217/808 ticks (27%) purely for taking a slow tick, which
+# fail-closed the car into crawling (stall 150-190 frames).  It gets its
+# own bound instead - above every healthy observed tick, below the Lua
+# watchdog's 2.5 s heartbeat abort (``watchdog.timeout``).
+STALE_PIPELINE_S = 1.5
 # Fraction of path samples inside occupied cells that triggers "blocked".
 # Town roads are lined by trees/curbs whose clustered boxes overlap the
 # lane margin, so a 0.10 threshold made every FSD path "graze obstacle"
@@ -192,6 +208,26 @@ def _perception_freshness(scene, snapshot_age_s: float) -> dict:
             "max_s": max(vals, default=0.0)}
 
 
+def _modality_age(freshness: dict, snapshot_age_s: float | None) -> float:
+    """Age of the perception MODALITIES (heads / BEV / lane), range excluded.
+
+    An unknown head age stays fail-closed (``inf``) and an absent BEV/lane
+    modality contributes nothing.  When a scene reports no modality age at
+    all, the composite snapshot age is the only freshness signal there is,
+    so it is used rather than silently reporting "fresh".
+    """
+    vals: list[float] = []
+    for value in (freshness.get("head_age_s") or {}).values():
+        vals.append(float("inf") if value is None else float(value))
+    for key in ("bev_age_s", "lane_age_s"):
+        value = freshness.get(key)
+        if value is not None:
+            vals.append(float(value))
+    if not vals:
+        return float(snapshot_age_s or 0.0)
+    return max(vals)
+
+
 class SafetyMonitor:
     """Evaluate one planning tick; arbitrate speed / stop decision."""
 
@@ -294,8 +330,17 @@ class SafetyMonitor:
         body_now_cross = body_pose_crosses_lane(
             scene, scene.pos, float(scene.heading))
         freshness = _perception_freshness(scene, snapshot_age_s)
+        # ``sensor_age`` stays the honest max over every modality for
+        # telemetry; the stale decision separates three different things:
+        # the live modalities, the reusable range, and the composite
+        # pipeline latency (see the constants above).
         sensor_age = float(freshness["max_s"])
-        stale_sensor = sensor_age > self.stale_s
+        range_age = freshness.get("range_age_s")
+        stale_sensor = (
+            _modality_age(freshness, snapshot_age_s) > self.stale_s
+            or (range_age is not None
+                and float(range_age) > STALE_RANGE_S)
+            or float(snapshot_age_s or 0.0) > STALE_PIPELINE_S)
         stale_planner = planner_age_s > self.stale_s
 
         closest = 999.0
