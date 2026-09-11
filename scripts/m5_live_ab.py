@@ -78,23 +78,35 @@ def _stale_frames(card: Path) -> int | None:
         return None
 
 
-def _run_arm(scenario: str, env: dict[str, str]) -> dict | None:
-    subprocess.run([str(PYEXE), "scripts/m5_fsd_benchmark.py", "--attach",
-                    "--runtime", "tech", "--scenarios", scenario],
-                   cwd=str(ROOT), env=env, capture_output=True, text=True)
+def _run_arm(scenario: str, env: dict[str, str],
+             started_at: float) -> tuple[dict | None, str]:
+    """Run one arm; return (record, error_tail).
+
+    Only a scorecard written AFTER ``started_at`` counts.  Without that
+    check a failed arm silently re-reads the previous arm's scorecard and
+    reports identical numbers for both conditions - which is exactly how a
+    2026-09-11 read came out 'identical on every metric' while the game was
+    already closed and every arm died in 7 s.
+    """
+    proc = subprocess.run(
+        [str(PYEXE), "scripts/m5_fsd_benchmark.py", "--attach",
+         "--runtime", "tech", "--scenarios", scenario],
+        cwd=str(ROOT), env=env, capture_output=True, text=True)
     card = _newest_scorecard()
-    if card is None:
-        return None
+    if card is None or card.stat().st_mtime <= started_at:
+        tail = "\n".join((proc.stderr or proc.stdout or "")
+                         .strip().splitlines()[-3:])
+        return None, (tail or f"rc={proc.returncode}, no new scorecard")
     try:
         payload = json.loads(card.read_text("utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+    except (OSError, json.JSONDecodeError) as exc:
+        return None, f"scorecard unreadable: {exc}"
     for result in payload.get("results", []):
         assessed = result.get("assessed")
         if assessed:
             return {"card": card.name, "stale": _stale_frames(card),
-                    **{k: assessed.get(k) for k in METRICS}}
-    return None
+                    **{k: assessed.get(k) for k in METRICS}}, ""
+    return None, "scorecard carried no assessed result"
 
 
 def main() -> int:
@@ -124,14 +136,15 @@ def main() -> int:
                 name, _, val = item.partition("=")
                 env[name.strip()] = val.strip()
             t0 = time.time()
-            rec = _run_arm(args.scenario, env)
+            rec, err = _run_arm(args.scenario, env, t0)
             changed = _watch_hashes() != base
             base = _watch_hashes()
             if changed:
                 print("[ab] !! watched code changed during this arm - "
                       "run set invalidated")
             if rec is None:
-                print(f"[ab] arm {args.factor}={value}: no scorecard")
+                print(f"[ab] arm {args.factor}={value}: NO RESULT "
+                      f"({time.time() - t0:.0f}s) - {err}")
                 continue
             rec["value"] = value
             rows.append(rec)
@@ -145,8 +158,10 @@ def main() -> int:
                   f"stale={rec['stale']} ({time.time() - t0:.0f}s)")
 
     if not rows:
-        print("[ab] no usable arms")
-        return 1
+        print("[ab] no arm produced a result - is BeamNG.tech running and "
+              "attachable?  (start it with scripts/launch_game.py "
+              "--runtime tech)")
+        return 2
     print("\n[ab] === per condition ===")
     for value in ("0", "1"):
         sel = [r for r in rows if r["value"] == value]
