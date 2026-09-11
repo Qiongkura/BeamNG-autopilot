@@ -330,6 +330,16 @@ def main() -> None:
                          "梯度（v9 教训：稀疏 run 淹没密集 run）")
     ap.add_argument("--line-weight", type=float, default=2.0,
                     help="extra multiplier on the line class loss weight")
+    # 任务指标早停：本栈上 val_mIoU 与成对率反相关，按 mIoU 选检查点会挑错
+    # epoch（docs/lateral_reference_diag_20260911.md §15）。
+    ap.add_argument("--task-eval-every", type=int, default=0, metavar="N",
+                    help="每 N 轮用配对任务（scripts/m5_seg_task_eval.py）评估"
+                         "当前权重，保留 best_task.pt；0=关（默认）")
+    ap.add_argument("--task-episodes", type=int, default=4,
+                    help="任务评估取最新 N 个影子 episode（默认 4）")
+    ap.add_argument("--task-episode-names", nargs="*", default=None,
+                    help="固定任务评估的 episode 文件名：影子集随每次实车增长，"
+                         "不固定就无法跨训练比较")
     ap.add_argument("--line-morph", action="store_true",
                     help="enable line morphology augmentation (default "
                          "off: v7 ablation showed it hurts line IoU)")
@@ -493,6 +503,28 @@ def main() -> None:
         print(f"[train] 从 {args.resume} 续训, 从 epoch {start_ep} 继续 "
               f"(共 {args.epochs})", flush=True)
 
+    # 任务指标校验（opt-in）：本栈上 val_mIoU 与配对任务**反相关**
+    # （`scripts/m5_seg_task_eval.py`、docs/lateral_reference_diag_20260911.md
+    # §15），所以按 mIoU 选 best.pt 会挑到错误的 epoch。--task-eval-every N
+    # 每 N 轮用同一个评估口径量一次成对率并保留 best_task.pt；episode 列表
+    # 在训练前解析一次，训练中不漂移（影子集会随每次实车增长）。
+    task_eps = None
+    task_measure = None
+    best_task = float(ckpt.get("best_task", -1.0)) if start_ep else -1.0
+    if args.task_eval_every > 0:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from m5_seg_task_eval import _episodes as _task_eps
+        from m5_seg_task_eval import measure as _task_measure
+        task_measure = _task_measure
+        task_eps = _task_eps(config.LOGS_DIR / "m5_e2e", "shadow_fsd_*.npz",
+                             args.task_episode_names, args.task_episodes)
+        hist.setdefault("task_paired", [])
+        hist.setdefault("task_in_lane", [])
+        print(f"[train] 任务评估每 {args.task_eval_every} 轮："
+              f"{len(task_eps)} 个 episode"
+              f"{'（固定）' if args.task_episode_names else '（最新 N）'}",
+              flush=True)
+
     for ep in range(start_ep, args.epochs):
         t0 = time.time()
         tr_loss, tr_acc, _, _ = run_epoch(
@@ -547,6 +579,7 @@ def main() -> None:
             "scaler": scaler.state_dict() if use_amp else None,
             "next_epoch": ep + 1,
             "best_miou": best_miou,
+            "best_task": best_task,
             "hist": hist,
             "train_args": {
                 "line_weight": args.line_weight,
@@ -566,6 +599,38 @@ def main() -> None:
             },
         }
         torch.save(ckpt, out_dir / "checkpoint_last.pt")
+
+        # 任务指标：按成对率（而非 mIoU）保留这一轮权重。评估吃刚落盘的
+        # checkpoint_last.pt，因此与最终可复现的权重完全一致。
+        t_paired = t_in_lane = None
+        if task_eps and (ep + 1) % args.task_eval_every == 0:
+            try:
+                tv = task_measure(str(out_dir / "checkpoint_last.pt"), task_eps)
+                t_paired = tv.get("paired_rate")
+                t_in_lane = tv.get("in_lane_rate")
+                print(f"[train]     task paired={t_paired:.1%} "
+                      f"in_lane={t_in_lane:.1%} "
+                      f"lat_p50={tv.get('lat_p50_m')}m", flush=True)
+            except Exception as exc:
+                print(f"[train] 任务评估失败: {exc}", flush=True)
+        if task_eps:
+            hist["task_paired"].append(t_paired)
+            hist["task_in_lane"].append(t_in_lane)
+        if t_paired is not None and t_paired > best_task:
+            best_task = float(t_paired)
+            torch.save({
+                "state_dict": model.state_dict(),
+                "n_classes": N_CLASSES,
+                "class_names": CLASS_NAMES,
+                "val_miou": round(m_iou, 4),
+                "task_paired_rate": t_paired,
+                "task_in_lane_rate": t_in_lane,
+                "task_episodes": [Path(e).name for e in task_eps],
+                "weights": weights.tolist(),
+                "train_args": ckpt["train_args"],
+            }, out_dir / "best_task.pt")
+            print(f"[train] 保存最优任务成对率={t_paired:.1%} -> "
+                  f"{out_dir / 'best_task.pt'}", flush=True)
 
     (out_dir / "train_hist.json").write_text(
         json.dumps(hist, ensure_ascii=False, indent=1), encoding="utf-8")
