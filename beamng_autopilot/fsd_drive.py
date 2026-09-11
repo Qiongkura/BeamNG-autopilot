@@ -1654,7 +1654,15 @@ class FSDriveSession:
                     bool(args.strict),
                     out.meta.get("plan_blocked"),
                     out.meta.get("lane_src_sel", ""))
-                if _strict_no_lane:
+                # In strict mode the rule path must not drive at all: it is
+                # planned from ``nav_route`` with ``sensor_lane=None``, so
+                # its lateral reference is map/route geometry (AGENTS.md
+                # iron rule).  Gating on "no perception lane" alone left it
+                # driving whenever FSD declined WITH a lane present - that
+                # was every body-crossing and off-road frame on the
+                # 2026-09-11 town run.  Do not build it here; the arbiter
+                # enforces the same rule independently.
+                if _strict_no_lane or bool(args.strict):
                     _need_rule = False
                 if _need_rule and nav_route is not None and len(nav_route) >= 2:
                     try:

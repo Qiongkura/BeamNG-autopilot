@@ -112,13 +112,20 @@ def arbitrate_fsd_tick(fsd_path, rule_path, *, fsd_safe: bool = True,
     """Runtime arbitration with the strict perception-lane gate applied.
 
     Same ranking as :func:`arbitrate` (FSD -> E2E -> BC -> rule), but in
-    strict FSD mode a tick with no perception lane must not fall through
-    to the rule/map route: the nav route is navigation intent, never a
-    driving trajectory.  Neural candidates stay eligible - they are
-    perception-derived, not map geometry - while the legal degradations
-    remain stop / hold current heading / drop to a safe point.
+    strict FSD mode the rule path NEVER drives: it is planned along the nav
+    route with no sensor lane, so its lateral reference is map/route
+    geometry, which the iron rule forbids the FSD stack to steer by
+    (AGENTS.md).  Legal degradations remain stop / hold current heading /
+    drop to a safe point.  Neural candidates stay eligible - they are
+    perception-derived, not map geometry.
+
+    The gate used to fire only when perception reported NO lane, so a tick
+    that HAD a lane but no feasible FSD candidate still handed the car to
+    the map-route rule path.  On the 2026-09-11 town run every one of the
+    17 body-crossing and 12 off-road frames was ``source=rule`` with
+    ``lane_sel=sensor``.
     """
-    if strict_lane_unavailable(strict, plan_blocked, lane_src_sel):
+    if strict:
         rule_path = None
     return arbitrate(fsd_path, rule_path, fsd_safe=fsd_safe,
                      e2e_path=e2e_path, e2e_safe=e2e_safe,
