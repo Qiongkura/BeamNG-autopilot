@@ -30,22 +30,24 @@ LANE_SINGLE_MED_MIN_M = 0.08
 LANE_SINGLE_RIGHT_EDGE_MIN_M = 0.4
 LANE_RIDING_LINE_MAX_M = 0.6
 # How far ahead a right line may START and still be mirrored as the lane
-# edge.  Measured 2026-09-11 (v13b, the full pipeline, 410 unpaired frames
-# that carry a right edge): the old 3.0 m window failed on 410/410 with
-# len(near)==0 - not one right-line point beside the car - while the
-# riding-line branch never fired once.  The nearest right-line point sits
-# at p50 3.76 m / p90 7.08 m ahead and is never inside 3 m: the town line
-# class is short dashed blocks, so the stretch beside the car is usually
-# unpainted.  8.0 m matches the existing near/far-start convention
-# (LANE_ONE_NEAR_FAR_START_MAX_M) and 91.5% of those frames start their
-# right line within it (right polylines carry a median of 14 points, so the
-# gate's >=2-point requirement is met).  12 m would cover 96.3% but would
-# let paint a dozen metres ahead define the boundary beside the car, so the
-# step stops at 8 m.
-# BEAMNG_RIGHT_MIRROR_NEAR_WIDE=0 reverts to the legacy window for an A/B
-# or a rollback.
-LANE_RIGHT_MIRROR_NEAR_M = 8.0
-LANE_RIGHT_MIRROR_NEAR_LEGACY_M = 3.0
+# edge, when no two-sided pair exists.
+#
+# A 2026-09-11 attempt widened this from 3.0 to 8.0 m, because the town
+# right line starts a median 3.76 m ahead and the old window rejected all
+# 410 unpaired right-edge frames (len(near)==0: not one point beside the
+# car).  That measurement was correct about WHERE frames are lost, and it
+# was reverted the same hour because losing them is protective: under the
+# required in-lane constraint (centre within 1.2 m of the ego-lane centre)
+# accepting more single-edge frames raises availability from 81.1% to
+# 82.2% while the share of laterally-correct centres stays at ~11% - a
+# single-edge mirror infers the centre from an assumed width, so the fusion
+# guards are the lateral-correctness layer, not a redundant second owner
+# (docs/HANDOFF_20260911.md, commit 3272db9).
+#
+# The lever is the two-sided PAIRED rate (26.2% offline), where the centre
+# is the midpoint of two real boundaries and no width assumption is
+# involved - i.e. detection/segmentation, not this window.
+LANE_RIGHT_MIRROR_NEAR_M = 3.0
 LANE_ONE_NEAR_FAR_START_MAX_M = 8.0
 LANE_PAIR_NEAR_MAX_M = 5.5
 LANE_PAIR_CENTER_MAX_M = 1.75

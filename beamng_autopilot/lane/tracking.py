@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import os
 import time
 
 import numpy as np
@@ -15,7 +14,6 @@ from .constants import (
     LANE_PAIR_NEAR_CENTER_MAX_M,
     LANE_PAIR_WIDTH_MIN_M,
     LANE_PAIRED_VISION_MIN_SPAN_M,
-    LANE_RIGHT_MIRROR_NEAR_LEGACY_M,
     LANE_RIGHT_MIRROR_NEAR_M,
     LANE_RIDING_LINE_MAX_M,
     LANE_SINGLE_NEAR_REQUIRE_M,
@@ -31,15 +29,6 @@ from .constants import (
     TRACK_STATION_M,
 )
 from .pairing import LaneFrame
-
-
-# The right-mirror near window was widened on 2026-09-11 evidence (see
-# LANE_RIGHT_MIRROR_NEAR_M): the town right line starts a median 6.6 m
-# ahead, so the old 3 m window rejected every unpaired right-edge frame.
-# BEAMNG_RIGHT_MIRROR_NEAR_WIDE=0 restores the legacy window so the change
-# can be A/B'd or rolled back without editing code.
-_WIDE_RIGHT_MIRROR_NEAR = (
-    os.environ.get("BEAMNG_RIGHT_MIRROR_NEAR_WIDE", "1") != "0")
 
 
 # ---------------------------------------------------------------------------
@@ -437,14 +426,18 @@ def _mirror_right_ok(frame: LaneFrame, pos, heading: float,
     A painted right line is the strongest boundary once it is clearly to
     the right of the car.  A line that close to the car is usually the
     centre line being ridden, so mirroring it would drag the car across
-    the road - that lateral test is unchanged and never fired on the
-    2026-09-11 town frames.  What DID fire (410/410 unpaired right-edge
-    frames) was the ``len(near) < 2`` branch: with a 3 m window there was
-    not one right-line point beside the car, because the town dashed line
-    starts a median 6.6 m ahead.  The window now follows
-    ``LANE_RIGHT_MIRROR_NEAR_M`` (8 m, the repo's existing near/far-start
-    scale); a line that only appears beyond that is still kept for fusion
-    but cannot steer an unpaired mirror (run 188).
+    the road.  A line that only appears several metres ahead is not the
+    current lane edge on its own (run 188), so it is kept for fusion but
+    cannot steer an unpaired mirror.
+
+    This strictness is load-bearing, not an oversight.  On the 2026-09-11
+    town frames it rejects every unpaired right-edge frame (the town line
+    starts a median 3.76 m ahead, so nothing is beside the car), and
+    widening it to 8 m was measured and reverted: accepting those frames
+    raises lane availability 81.1% -> 82.2% while the laterally-correct
+    share stays at ~11%, because a single-edge mirror infers the centre
+    from an assumed width.  Do not widen this window without re-running
+    that in-lane constraint (see LANE_RIGHT_MIRROR_NEAR_M).
     """
     if frame.right is None:
         return True
@@ -454,9 +447,7 @@ def _mirror_right_ok(frame: LaneFrame, pos, heading: float,
     pos = np.asarray(pos, dtype=float)[:2]
     fwd = _unit_fwd(pos, heading, fwd)
     rel = _to_car_frame(pts, pos, fwd)
-    near_m = (LANE_RIGHT_MIRROR_NEAR_M if _WIDE_RIGHT_MIRROR_NEAR
-              else LANE_RIGHT_MIRROR_NEAR_LEGACY_M)
-    near = rel[rel[:, 0] <= near_m]
+    near = rel[rel[:, 0] <= LANE_RIGHT_MIRROR_NEAR_M]
     if len(near) < 2:
         return False
     lat = float(np.median(near[:, 1]))
