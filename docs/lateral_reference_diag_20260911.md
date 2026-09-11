@@ -619,3 +619,36 @@ v13b 19%/144/cc2/off7/47.3 m；hand 9%/112/off0/cc0/51.0 m。
 所以 17/7 vs 0/0 还不能单独作为结论；支撑它的是**机制一致**——离线 in-lane 57% vs 26%
 与实际压线差异同向。下一步是加臂复核（≥5 臂/组），通过后把 `task_ep06.pt` pin 进
 town 场景；`stall` 114 仍未回到 9/5–9/7 的 0–83。
+
+### 加臂复核（5 臂/组）与 pin（2026-09-11 22:xx）
+
+把实车 A/B 从 2 臂加到 **5 臂/组**（同期、交错、同 game 会话，`--seg-model` 切换）：
+
+| 模型 | lane p50 | stall p50 | off 各臂 | crossC | crossR | dist p50 |
+| --- | --- | --- | --- | --- | --- | --- |
+| v13b（旧 pin） | 19% | 137 | **[17, 7, 0, 0, 6]**（3/5 非零，合计 30） | [0, 2, 0, 0, 0] | 全 0 | 47.3 |
+| **hand_ep06** | **27%** | **115** | **[0, 0, 0, 0, 0]**（**5/5 为零**） | **全 0** | 全 0 | 50.8 |
+
+样本加大后分离**更清楚**（v13b 的 17/7 不是偶发：5 臂里有 3 臂非零）。因此把城镇 pin
+改为 `logs/m5_seg/seg_model_hand/best_task.pt`（与 `task_ep06.pt` 权重逐张量相同，
+paired 16.24%），并在 `m5_fsd_benchmark.py` 的场景条目里记下理由。
+
+**注册路径验证**（不带 `--seg-model`，确认 pin 真的生效）2 臂：
+
+```
+[fsd-drive] segmentation model: logs/m5_seg/seg_model_hand/best_task.pt
+  arm1 lane=33% stall=117 crossC=0 crossR=0 off=0 dist=27.2m
+  arm2 lane=19% stall=143 crossC=0 crossR=0 off=0 dist=10.6m
+```
+
+**累计 7 臂（5 交错 + 2 注册路径）：`off` 7/7 为 0，`crossC` 7/7 为 0，`crossR` 7/7 为 0。**
+
+离线：`pytest 661 passed`、`m5_offline_validate ALL PASS`。
+
+**验收状态**：`crossC/crossR/off` 这一半**已达成**（7/7 归零，旧 pin 为 off 3/5 非零、
+1 次 crossC）；`stall` 这一半**未达成**——p50 115（旧 pin 137），但 9/5–9/7 基线是 0–83。
+下一步应针对 stall：其主因已定位（§11：63/68 无路径帧是 `no_perception_lane`），
+即继续提高成对率，或缩短无车道时的停车代价。
+
+**保留意见**：这些实车数字来自本轮同一 game 会话；跨会话的绝对水平会漂（历史 `off`
+区间 0–22），所以「7/7 归零」应当用**下一轮新的同日 A/B**再确认一次，再谈并回 main。

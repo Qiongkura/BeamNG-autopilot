@@ -74,11 +74,16 @@ SCENARIOS: dict[str, dict] = {
         # never a map-lane drive.
         "lane_mode": "sensor",
         "strict": True,
-        # Domain-specific segmentation: v13b carries the user's manual
-        # town line annotations (85.1% tolerance recall vs 71.6% v12)
-        # but regresses mountain (0.02 IoU) - town only, mountain keeps
-        # the deployed v8/v12 checkpoint.
-        "seg_model": "logs/m5_seg/seg_model_v13b/best.pt",
+        # Domain-specific segmentation.  v13b (the user's manual town line
+        # annotations, 85.1% tolerance recall) paired most often but its
+        # centres landed left of the ego lane; the 2026-09-11 full recipe +
+        # hand labels + per-epoch task-metric selection produced
+        # seg_model_hand (paired 16.2%, in-lane 57.2% vs v13b's 24.3% /
+        # 25.8%), and on 5 live town arms each - same session, alternating -
+        # it passed off/crossC/crossR = 0 on 5/5 (v13b 2/5 for off-road,
+        # one crossC) with lower stall (p50 115 vs 137) and higher
+        # availability (p50 27% vs 19%).  Mountain keeps its own pin.
+        "seg_model": "logs/m5_seg/seg_model_hand/best_task.pt",
         "note": "town route (start node 22209, goal ~90 m along the "
                 "road graph); --traffic adds parked NPC vehicles for "
                 "YOLO / obstacle-fusion verification",
