@@ -399,16 +399,51 @@ def group_world_fragments(frags, *, gap_max_m: float = DASHED_FRAG_GAP_MAX_M,
     return [g for g in groups.values() if len(g) >= 2]
 
 
+def _back_project_many(us, vs, cam_model, pos, heading, ground_z):
+    """Ground-plane world points for many pixels in one pass.
+
+    ``back_project`` rebuilds the camera pose on every call, and that pose
+    build (three cross products + norms) dominated the dashed-recovery
+    stage: ~542 calls per frame cost ~54 ms, virtually all of it in
+    ``camera_pose``.  The optics are identical here - the same ray
+    intersection with the same guards - but the pose is built once for the
+    whole batch.
+
+    Returns ``(points, ok)`` where ``points`` is (N, 2) with NaNs where the
+    ray missed and ``ok`` the boolean mask of hits.
+    """
+    us = np.asarray(us, dtype=float)
+    vs = np.asarray(vs, dtype=float)
+    if us.size == 0:
+        return np.empty((0, 2)), np.zeros(0, dtype=bool)
+    C, r, f, u_axis = cam_model.camera_pose(pos, heading)
+    d = (r[None, :] * ((us - cam_model.cx) / cam_model.fx)[:, None]
+         + f[None, :]
+         + u_axis[None, :] * ((cam_model.cy - vs) / cam_model.fy)[:, None])
+    dz = d[:, 2]
+    ok = dz < -1e-9
+    t = np.zeros(len(us), dtype=float)
+    t[ok] = (float(ground_z) - C[2]) / dz[ok]
+    ok &= t > 0.05
+    pts = np.full((len(us), 2), np.nan)
+    pts[ok] = C[None, :2] + t[ok, None] * d[ok, :2]
+    return pts, ok
+
+
 def _mask_fragment_polylines(mask_u8, cam_model, pos, heading,
                              ground_z: float | None = None,
                              min_area: int = DASHED_FRAG_MIN_AREA_PX,
                              max_dist: float = 45.0,
                              max_samples: int = DASHED_FRAG_MAX_SAMPLES
                              ) -> list[dict]:
-    """Back-project every mask component into a world-space fragment."""
-    import cv2
+    """Back-project every mask component into a world-space fragment.
 
-    from beamng_autopilot.vision.detection import back_project
+    Cost-shaped for the live tick: the label image is scanned once and the
+    camera pose built once per frame, instead of one ``np.where`` over the
+    whole image plus one ``camera_pose`` per sampled pixel for every
+    component.
+    """
+    import cv2
 
     if mask_u8 is None or cam_model is None:
         return []
@@ -419,31 +454,69 @@ def _mask_fragment_polylines(mask_u8, cam_model, pos, heading,
     mask = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel)
     mask = cv2.dilate(mask, kernel, iterations=1)
     n, labels, stats, _c = cv2.connectedComponentsWithStats(mask, 8)
-    out: list[dict] = []
+    if n <= 1:
+        return []
+    # One pass over the label image (not one per component), grouped by
+    # label id so each component's pixels are a contiguous slice.
+    ys_all, xs_all = np.nonzero(labels)
+    lab_all = labels[ys_all, xs_all]
+    order = np.argsort(lab_all, kind="stable")
+    lab_all = lab_all[order]
+    ys_all = ys_all[order]
+    xs_all = xs_all[order]
+    bounds = np.searchsorted(lab_all, np.arange(1, n + 1))
+    bounds = np.append(bounds, len(lab_all))
+
+    comps: list[dict] = []
+    su: list[np.ndarray] = []
+    sv: list[np.ndarray] = []
+    taken = 0
     for i in range(1, n):
         area = int(stats[i][4])
         if area < min_area:
             continue
-        ys, xs = np.where(labels == i)
-        step = max(1, int(len(xs) // max(1, max_samples)))
-        world: list[tuple[float, float]] = []
-        pixels: list[tuple[float, float]] = []
-        for u, v in zip(xs[::step], ys[::step]):
-            wp = back_project(float(u), float(v), cam_model, pos, heading,
-                              ground_z=ground_z)
-            if wp is None:
-                continue
-            if not (2.0 <= math.hypot(wp[0] - p[0], wp[1] - p[1])
-                    <= max_dist):
-                continue
-            world.append(wp)
-            pixels.append((float(u), float(v)))
-        if len(world) < 3:
+        lo, hi = int(bounds[i - 1]), int(bounds[i])
+        if hi <= lo:
             continue
-        wpts = np.asarray(world, dtype=float)
-        c = wpts.mean(axis=0)
+        cys = ys_all[lo:hi]
+        cxs = xs_all[lo:hi]
+        o = np.argsort(cys, kind="stable")
+        cxs = cxs[o].astype(float)
+        cys = cys[o].astype(float)
+        step = max(1, int(len(cxs) // max(1, max_samples)))
+        u = cxs[::step]
+        v = cys[::step]
+        comps.append({"area": area, "start": taken, "n": len(u)})
+        su.append(u)
+        sv.append(v)
+        taken += len(u)
+    if not comps:
+        return []
+    U = np.concatenate(su)
+    V = np.concatenate(sv)
+    pts, ok = _back_project_many(U, V, cam_model, pos, heading, ground_z)
+    out: list[dict] = []
+    for comp in comps:
+        lo = comp["start"]
+        hi = lo + comp["n"]
+        c_area = int(comp["area"])
+        w = pts[lo:hi]
+        k = ok[lo:hi]
+        pix = np.column_stack([U[lo:hi], V[lo:hi]])
+        if k.any():
+            rel = w[k] - p[:2]
+            dist = np.hypot(rel[:, 0], rel[:, 1])
+            keep = (dist >= 2.0) & (dist <= max_dist)
+        else:
+            keep = np.zeros(0, dtype=bool)
+        w = w[k][keep]
+        pix = pix[k][keep]
+        if len(w) < 3:
+            continue
+        wpts = np.asarray(w, dtype=float)
+        cen = wpts.mean(axis=0)
         try:
-            _u, _s, vt = np.linalg.svd(wpts - c, full_matrices=False)
+            _u, _s, vt = np.linalg.svd(wpts - cen, full_matrices=False)
         except np.linalg.LinAlgError:
             continue
         d = np.asarray(vt[0], dtype=float)
@@ -451,11 +524,11 @@ def _mask_fragment_polylines(mask_u8, cam_model, pos, heading,
         if nrm <= 1e-9:
             continue
         d = d / nrm
-        proj = (wpts - c) @ d
+        proj = (wpts - cen) @ d
         if float(proj.max() - proj.min()) < 0.3:
             continue
-        out.append({"pts": wpts, "pixels": np.asarray(pixels, dtype=float),
-                    "c": c, "d": d, "area": area})
+        out.append({"pts": wpts, "pixels": np.asarray(pix, dtype=float),
+                    "c": cen, "d": d, "area": c_area})
     return out
 
 

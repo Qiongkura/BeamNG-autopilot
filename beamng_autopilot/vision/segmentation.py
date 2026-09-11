@@ -266,20 +266,21 @@ class Segmenter:
             # they pollute the grouping (measured: grouping the union
             # yields a 23.9% paired rate, the learned mask alone 43.0%).
             #
-            # BEAMNG_DASHED_RECOVERY=1 enables the stage (default OFF).
+            # BEAMNG_DASHED_RECOVERY=0 disables the stage (default ON).
             #
-            # It is off by default because a live A/B on the town scenario
-            # (2026-09-11, same game instance, exclusive runs) showed it
-            # COSTING lane continuity rather than helping: with the stage
-            # on, lane_sel=sensor ran at ~0-3% of frames; with it off,
-            # 17.7%.  It costs ~70 ms/frame (measured), about half of the
-            # whole segmentation stage, and the FSD tick races a time
-            # budget that defers heavy heads on overrun - the run logged
-            # "stale sensor" repeatedly and the watchdog aborted once.
-            # The offline gain (paired 20.8% -> 45.6%) is real but does not
-            # survive the live time budget yet, so the stage stays
-            # opt-in until its cost is fixed and a live A/B shows a win.
-            if os.environ.get("BEAMNG_DASHED_RECOVERY", "0") == "1":
+            # It was default-OFF because it cost ~70 ms/frame, about half
+            # of the whole segmentation stage, and a live A/B showed it
+            # losing lane continuity (lane_sel=sensor ~0-3% with it on,
+            # 17.7% off) - a stage that doubles the perception cost turns
+            # into MISSING perception because the FSD tick defers heads on
+            # overrun.  The cost is now fixed: the camera pose is built once
+            # per frame instead of once per sampled pixel, and the label
+            # image is scanned once instead of once per component, which
+            # takes `_mask_fragment_polylines` from 53.7 ms to 3.2 ms
+            # (whole stage ~70 ms -> ~3.6 ms).  On a same-episode A/B the
+            # benefit is intact: paired own-lane 13.0% -> 28.2% and
+            # lane_sel=sensor 27.7% -> 59.7%.
+            if os.environ.get("BEAMNG_DASHED_RECOVERY", "1") != "0":
                 out.extend(recover_dashed_boundaries(
                     np.asarray(line, dtype=np.uint8) * 255,
                     cam_model, pos, heading, ground_z=ground_z))
