@@ -111,3 +111,66 @@ A/B 交错（漂移由两组共担）、固定场景起点与 goal、逐臂记�
 
 `4fa7c2a`：stale-sensor 按模态判定（commit）。实车 `stale sensor` 75 → 0/1 帧；
 离线 `pytest 635 passed` + `m5_offline_validate ALL PASS`。
+
+---
+
+# 限幅关闭时 `off`/`crossC` 的定位（2026-09-11 11:45，revision `202281d`）
+
+车辆已让给并行会话（见 `docs/HANDOFF_20260911.md` 末尾的回复），本轮全部用**已录制的
+episode / telemetry**做离线诊断，不起实车。
+
+## 1. 压线帧的形态（最近 8 趟 town 共 1790 帧，`road_off`/`body_cross_*` 38 帧）
+
+38 帧**全部**满足：`lane_sel=sensor`、`lane_paired=1`、`source=none`、
+`level=minimal_risk`、`speed≈0`。`reason` 里 35 帧是 `no drivable path`，
+3 帧是 `current vehicle body crosses lane boundary`。
+
+即：**压线是「停住 + 存在成对车道」的伴生现象**，不是独立的横向控制失败。
+
+## 2. 主因：有车道却产不出路径（占全部帧 12.5%）
+
+`reason=no drivable path` 共 **223/1790 帧**，拆成两类：
+
+| 子类 | 帧数 | 含义 |
+| --- | --- | --- |
+| 无感知车道（`perception-unavailable`） | 158 | 严格模式**按设计**停车（铁律） |
+| **有配对车道却仍无路径** | **65** | 缺陷：38 个压线帧全在这一类 |
+
+65 帧里 `lane_reject` 为空（没有「车道被拒」的记录）、`plan_raw=0.0`（采样器没给出
+路径）、`fwd_clear≈11.8 m`、障碍数 0——**前方畅通、有车道，却产不出路径**。
+只有 14/65 帧在下一帧恢复出路径，说明这里是**锁住**而不是瞬时抖动。
+
+车体几何：26/65 帧车体确实越过某条感知边界（`latL=-0.65 latR=-0.09`），
+39/65 帧**右侧边界缺失**（`body_lat_right=None`），判定只能打在剩下的那一条上。
+而同一批帧相对**漆画线**的偏移 `line_lat` 中位只有 -0.38～-1.23 m——车大致在应在的
+位置。**偏的是感知边界，不是车。**
+
+## 3. 离线漏斗（同 revision，`m5_lane_continuity.py --diagnose`，v13b）
+
+| | ep 11:33 | ep 11:35 |
+| --- | --- | --- |
+| 配对本车道 | 23.2% | 29.5% |
+| **离线 `lane_sel=sensor`** | **83.5%** | **57.6%** |
+| 单边界帧 | 161 | 155 |
+| 中心横向偏差 | -0.19 m | +0.03 m |
+| 未配对首因 | `one_side_filtered_by_candidate_gate` 142 | 143 |
+| 门控最大丢弃 | `unknown:kind` 455 (GT 50%)、`dashed:align` 143 (GT 66%) | 同量级 |
+
+**最大的单点矛盾：离线 `lane_sel=sensor` 83.5% vs 实车 telemetry 里同批帧约 15%。**
+离线重放能通过可用性门、实车不能——「有车道却产不出路径」就活在这个差距里。
+（旧文档记过 45% vs 11% 的同类差距，现在差距更大。）
+
+## 4. 下一个候选改动（按证据排序）
+
+1. **解释并收敛离线/实车 `lane_sel=sensor` 差距（83.5% vs ~15%）**。这是单点最大
+   矛盾，且第一遍排查**不需要车辆**（离线重放 + 现有 telemetry 对照即可），
+   直接命中「有车道却无路径 → 停车 → 被判定压线」这条主链。
+2. 次级：`unknown:kind` 455 次丢弃、GT 50%——需先确认它们是车道边界还是斑马线/补丁漆
+   （此前 `*:side` 那批 0% GT 是正确拒绝；这批不同，不能直接照搬）。
+3. **不要**再动参考限幅（已 5 臂判定无收益，见上文）。
+
+## 5. 车辆协调
+
+已按 `docs/HANDOFF_20260911.md` 的约定让出车辆；本轮未起实车。取证时我试图用
+`CUDA_VISIBLE_DEVICES=""` 强制 CPU 以免抢 GPU，但 `Segmenter` 仍报了 `device=cuda`
+（环境变量未生效）——后续离线任务需要显式改 `Segmenter(device="cpu")` 才能真的不抢。
