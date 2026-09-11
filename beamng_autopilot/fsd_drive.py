@@ -1976,6 +1976,7 @@ class FSDriveSession:
                     _plc_shift = plc_corr.update(_plc_desired, dt, v)
                     if steer_path is not None \
                             and abs(_plc_shift) >= PLC_MIN_ENGAGE_M:
+                        _steer_pre_plc = steer_path
                         steer_path = plc_corr.apply(
                             steer_path, pos, float(heading))
                         # PLC is a post-processing transform.  Re-run the same
@@ -1989,6 +1990,19 @@ class FSDriveSession:
                             plc_rejected = _plc_v.level == "minimal_risk"
                         except Exception:
                             plc_rejected = True
+                        if plc_rejected:
+                            # The lateral correction is OPTIONAL
+                            # post-processing and the monitor had ALREADY
+                            # approved the un-shifted path, so rejecting the
+                            # shift must skip the correction - not stop the
+                            # car.  Escalating it to ``force_stop`` made the
+                            # state inescapable: on the 2026-09-11 town run the
+                            # car sat 1.838 m off the painted line with
+                            # plc_active on all 145 tail frames, the 1.0 m
+                            # shift was rejected every frame, and the vehicle
+                            # could never move to get back (emergency=1
+                            # throughout).
+                            steer_path = _steer_pre_plc
                 steer = 0.0
                 pp_alpha = None
                 pp_tgt = None
@@ -2353,7 +2367,14 @@ class FSDriveSession:
                 # 0.19 m at a town corner and parked a car that was steering
                 # fine).  The raw-sensor heading corridor is only the last
                 # line when there is NO planned path at all.
-                force_stop = bool(painted_body_cross or plc_rejected)
+                # ``plc_rejected`` no longer escalates to a vehicle stop: the
+                # rejected shift is skipped and the approved un-shifted path
+                # is driven instead (see the fallback above).  Keeping it here
+                # made the state inescapable - a car parked 1.838 m off the
+                # line had its correction rejected on every frame, so it was
+                # force-stopped on every frame and could never drive back.
+                # The telemetry field is kept for diagnosis.
+                force_stop = bool(painted_body_cross)
                 if force_stop:
                     target = 0.0
                 fwd_clear = float("inf")
