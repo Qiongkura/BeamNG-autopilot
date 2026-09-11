@@ -213,3 +213,53 @@ lane_sel=sensor                 且 lane_paired=1 :  312 帧 (17.5%)
 
 **同时**：离线 harness 应当在 docstring/输出里标注它测的是「纯视觉帧下界」，或者
 补上 `choose_sensor_lane` 与 `grid`/一致性实参，否则后续还会有人拿 83.5% 当实车指标。
+
+vehicle released 11:52 (session 9be6d9dc, 2 arms, per the agreed protocol)
+
+## 7. 逐门归因（实车窗口 11:47–11:51，2 臂，`choose_sensor_lane` 探针 450 次调用）
+
+按 §5 的约定申请到窗口（对端 11:45 写了 `vehicle free`），装纯记录探针后跑了 2 臂并按约定
+写了 `vehicle released 11:52`。两臂成绩：lane 19% / 19%，stall 141 / 123，off 8 / 7，
+dist 32.9 / 50.8 m（`crossC` 0/0、`crossR` 0/0）。
+
+**450 次 `choose_sensor_lane` 调用里 127 次返回 None（28%）** —— 这就是实车丢掉车道的
+tick。按判据树逐门归因，None 的首个失败门：
+
+| 首个失败门 | 次数 | 占 None |
+| --- | --- | --- |
+| **`_mirror_right_ok`** | **99** | **78%** |
+| 无视觉且无 LiDAR（`no_vision+no_lidar`） | 26 | 20% |
+| `_mirror_near_ok` | 2 | 2% |
+
+在 277 个「有视觉帧但非成对」的 tick 里，各门通过率：
+
+| 门 | 通过 |
+| --- | --- |
+| `lane_frame_usable`（vision_ok） | 249/277 |
+| `_mirror_near_ok` | 211/277 |
+| `_vision_mirror_keeps_reference` | 243/277 |
+| **`_mirror_right_ok`** | **6/277（2%）** |
+
+**结论：实车丢掉车道几乎全部由 `_mirror_right_ok` 造成。** 它的判据
+（`lane/tracking.py:422-445`）是：右侧线在车旁 `≤ LANE_RIGHT_MIRROR_NEAR_M` 内至少要有
+2 个点，且横向中位 ≤ `-LANE_RIDING_LINE_MAX_M`（明显在车右侧）；注释自己写明
+「只在**前方几米**才出现的线不能单独引导镜像」。城镇的 `line` 类恰恰是**短虚线块**，
+车旁那一段经常没有漆 → 单边界帧被判 false → 融合返回 None → 严格模式无车道 → 停车。
+
+## 8. 下一个候选改动（据此选定）
+
+`_mirror_right_ok` 的两条失败支路需要分开才能定方案，我这一轮没记下来
+（探针只记了门的真假，没记 `len(near)` 与横向中位）。**下一段实车窗口只需 1 臂**，
+把这两项记上：
+
+* 若多因 **`len(near) < 2`**（车旁没有漆点，只有前方有）→ 方案是让镜像允许
+  「前方起始的右线」以**有界的居中提示**参与（而不是当成完整边界），或把近场窗口
+  沿纵向放宽到能覆盖第一条虚线块；
+* 若多因 **`lat > -LANE_RIDING_LINE_MAX_M`**（线太靠车、被判为正在骑线）→ 那是
+  场景里确实压着线，方案不同（不是放宽门，而是先解释横向偏差）。
+
+在拿到这个分布之前**不要动 `_mirror_right_ok`**：两个原因的修法相反，
+放宽错了会把车道中心拉过对向车道（这正是这条门存在的理由）。
+
+离线侧不需要车辆：`scripts/m5_lane_continuity.py` 可先量「非成对帧里右侧边界在车旁的
+可用率」，与实车的 6/277 对照（注意 §6：离线帧是纯视觉帧，不是融合帧）。
