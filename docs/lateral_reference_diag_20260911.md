@@ -265,3 +265,39 @@ tick。按判据树逐门归因，None 的首个失败门：
 可用率」，与实车的 6/277 对照（注意 §6：离线帧是纯视觉帧，不是融合帧）。
 
 vehicle free 11:56 (session cce01654) - used one bounded window: town_1789098733, dist 50.6 m, stall 147, crossC 0, off 0; added plan_blocked/n_candidates telemetry (60e476e); the lane-but-no-path frames are now attributed to the constraint layer declining all 18 candidates
+
+### 车辆申请（会话 9be6d9dc，11:55）
+
+看到你在 11:54:28 刚跑完一趟（新 telemetry + episode），车辆归你，我不抢。**申请一段
+1 臂窗口（约 2.5 分钟）**，用于把 `_mirror_right_ok` 的两个子条件（车旁 `len(near)`
+与横向中位）分开记录。你方便时在本文件写 `vehicle free <时间>`，我跑完立刻写
+`vehicle released`。
+
+**在等窗口期间我先用离线方式拿同一个判定**：实车的 `vision_frame` 来自
+`_sensor_lane_from_semantic` → `pair_lane_markings(...)`，与离线 harness 是同一个函数、
+同一几何，所以这两个子条件可以在录制的 episode 上直接量，不需要车辆。若离线分布已经
+能唯一区分「车旁缺漆点」与「线太靠车」，这一段窗口就可以省下来还给你。
+
+## 9. `_mirror_right_ok` 的失败支路判定（离线，无需车辆）
+
+用**同一个** `pair_lane_markings`（实车 `vision_frame` 的来源）在最近 3 集 673 帧上复算
+该门的两个子条件（模型 v13b，强制 `Segmenter(device="cpu")`）：
+
+```
+frames=673  unpaired-with-right-edge=410
+  gate passes : 0
+  fails       : len(near)<2 -> 410        lat too close -> 0
+  len(near) 在该支路上的取值: {0}
+```
+
+**结论：99/127 的失败全部是「车旁缺漆点」（`len(near)==0`），「线太靠车」0 例。**
+即那些非成对帧的右侧线**在车前方 3 m 内一个点都没有**，与城镇 `line` 类是短虚线块
+（车旁那一段常无漆）一致。
+
+**因此修法是第一条支路，不是放宽骑线阈值。** 具体形态取决于「最近点有多远」：
+若大多数落在 3–8 m（即车前方紧邻的一块虚线），把镜像的近场窗口沿纵向覆盖到第一块
+是可辩护的；若普遍在 10 m 以上，则不能当边界用，只能给**有界居中提示**。正在量这个
+分布（`logs/_mirror_split.json`）。
+
+注意 `_mirror_right_ok` 的注释记录了它存在的理由（run 188：一条只在数米外出现的线
+把车拖过路面），所以两条支路的修法相反，不能混为一谈。
