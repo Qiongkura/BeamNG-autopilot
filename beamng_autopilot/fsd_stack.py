@@ -54,6 +54,7 @@ from beamng_autopilot.planning import (
 )
 from beamng_autopilot.planning.intent import infer_route_intent
 from beamng_autopilot.temporal import WorldObjectTracker
+from beamng_autopilot.prediction import predict_tracks, prediction_digest
 from beamng_autopilot.perception_snapshot import PerceptionSnapshot
 from beamng_autopilot.planner import forward_clearance_m, path_forward_clearance_m
 from beamng_autopilot.vehicle_body import CORRIDOR_HALF_WIDTH_M
@@ -713,6 +714,16 @@ class FSDStack:
                 _active = tracker.update(_dets, dt=_dt)
                 out.tracks = list(_active)
                 out.meta["n_tracks"] = len(_active)
+                # Prediction layer, published but NOT yet consumed: the
+                # tracker has always given every track a smoothed vx/vy and
+                # nothing used it, so planning scored candidates against
+                # occupancy as of THIS tick and a crossing vehicle was only
+                # avoided once it was already inside the corridor.  This is
+                # the telemetry-first step - the planner's collision cost
+                # consuming predicted poses is a separate, live-validated
+                # change (see beamng_autopilot/prediction.py).
+                out.meta["prediction"] = prediction_digest(
+                    predict_tracks(_active))
                 if _active:
                     from beamng_autopilot.occupancy import (
                         OccupancyGrid as _OG2)
