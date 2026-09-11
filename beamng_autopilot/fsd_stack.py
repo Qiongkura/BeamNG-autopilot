@@ -46,6 +46,7 @@ from beamng_autopilot.planning import (
     REF_ROUTE,
     Scene,
     lateral_reference,
+    limit_reference_slew,
     sample_arc,
     sample_lane_shift,
     select_trajectory,
@@ -269,6 +270,10 @@ class FSDStack:
         self._range_skip = 0
         self._last_range = None
         self._last_range_t = 0.0
+        # Last accepted own-lane reference + hold start, for the bounded
+        # tick-to-tick slew (see ``limit_reference_slew``).
+        self._lane_ref_prev = None
+        self._lane_ref_hold_t = 0.0
         # Per-head throttling: the expensive heads (semantic UNet
         # ~100-300 ms, YOLO object ~100-200 ms on the live 400x300
         # front frame) run every ``semantic_every_n`` / ``object_every_n``
@@ -767,6 +772,18 @@ class FSDStack:
             warn=_warn_once,
         )
         lane_ref = lane_ref_out.center
+        # Single owner, no sideways teleport: the accepted own-lane
+        # reference is the ONE reference the planner and the safety Scene
+        # both consume, so it is limited HERE, before either reads it.
+        # Measured 2026-09-11 (dashed recovery on): the accepted sensor
+        # reference jumped up to 2.20 m laterally between consecutive
+        # ticks (5.3% > 1.0 m) while the envelope moved at most 0.41 m.
+        lane_ref, self._lane_ref_hold_t = limit_reference_slew(
+            getattr(self, "_lane_ref_prev", None),
+            getattr(self, "_lane_ref_hold_t", 0.0),
+            lane_ref, time.time(), pos, heading)
+        self._lane_ref_prev = (None if lane_ref is None
+                               else np.asarray(lane_ref, dtype=float)[:, :2])
         lane_left = lane_ref_out.left
         lane_right = lane_ref_out.right
         lane_width = lane_ref_out.width
@@ -1155,6 +1172,11 @@ class FSDStack:
         self._last_range = None
         self._last_range_t = 0.0
         self._range_skip = 0
+        # The accepted lane reference is location-bound as well: after a
+        # teleport the previous polyline is somewhere else entirely and
+        # must not be held against the new tick's selection.
+        self._lane_ref_prev = None
+        self._lane_ref_hold_t = 0.0
 
     def close(self) -> None:
         if self.ring is not None:
