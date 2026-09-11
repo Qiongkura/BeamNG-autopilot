@@ -2845,6 +2845,16 @@ class FSDriveSession:
                     "lane_reject": str(out.meta.get("lane_reject_reason", "")),
                     "lane_sel": str(out.meta.get("lane_src_sel", "")),
                     "lane_paired": int(out.meta.get("lane_paired", 0)),
+                    # Freshness ages.  The safety monitor's "stale sensor"
+                    # verdict is `max(all head ages, range, bev, lane) >
+                    # STALE_SNAPSHOT_S`, and without these in the log a
+                    # stale run cannot be attributed at all: on 2026-09-11
+                    # 33% of town frames went stale (0% on 2026-09-07) and
+                    # the telemetry gave no way to see WHICH modality aged.
+                    "freshness": (out.meta.get("snapshot") or {}).get(
+                        "freshness"),
+                    "head_age_s": (out.meta.get("snapshot") or {}).get(
+                        "head_age_s"),
                     "n_object_obstacles": int(
                         out.meta.get("n_object_obstacles", 0)),
                     "object_head": int(out.meta.get("object_head", 0)),
