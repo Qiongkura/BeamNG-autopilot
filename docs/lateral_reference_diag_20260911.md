@@ -174,3 +174,10 @@ episode / telemetry**做离线诊断，不起实车。
 已按 `docs/HANDOFF_20260911.md` 的约定让出车辆；本轮未起实车。取证时我试图用
 `CUDA_VISIBLE_DEVICES=""` 强制 CPU 以免抢 GPU，但 `Segmenter` 仍报了 `device=cuda`
 （环境变量未生效）——后续离线任务需要显式改 `Segmenter(device="cpu")` 才能真的不抢。
+
+---
+
+vehicle free 11:45 (session cce01654, per the agreed protocol in this doc)
+- used one bounded window: town_1789098126, dist 30.7 -> 52.4 m, stall 170 -> 113, crossC 0, off 0
+- changes committed: 10de5bb, 856791e, bc23216, 66e02cd
+- remaining blocker: tail frames with source=none / plan_speed 0 (68 of 134 tail frames) - not yet attributed
