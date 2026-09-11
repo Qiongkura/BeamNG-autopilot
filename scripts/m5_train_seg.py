@@ -50,13 +50,22 @@ from beamng_autopilot.vision.segmentation import (
 def load_frames(
     run_dirs: list[Path], min_line_frac: float = 0.0,
     line_only_dirs: set[str] | None = None,
+    thin_line: int = 0,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], dict]:
     """读取所有 npz 帧，按文件名排序（时间序）。
 
     ``min_line_frac > 0`` 时丢弃标线像素占比低于阈值的帧。返回
     (frames, per_run)：per_run[run_name] 记录该 run 的帧总数/保留数/
     标线像素占比/在拼接列表中的 [start, end) 下标，供 per-run 验证划分。
+
+    ``thin_line > 0`` 把标线目标侵蚀 N 个像素，教模型学**细**车道线：标注的
+    line 类（与用户手绘 4-6 px 笔画）比"配对真正消费的那条细线"宽，而
+    2026-09-11 的实验证明两者不是同一个目标（标注 line IoU 与配对率单调反
+    相关）。``cv2.ximgproc`` 不可用，形态学侵蚀是最便宜的骨架化近似。全标注
+    集里被侵蚀的边缘记作路面(1)；line-only 人工集里周围本就未知，记作忽略(255)。
     """
+    import cv2
+
     frames: list[tuple[np.ndarray, np.ndarray]] = []
     per_run: dict[str, dict] = {}
     line_only_dirs = line_only_dirs or set()
@@ -79,6 +88,19 @@ def load_frames(
                 # hand annotations mark ONLY line pixels; every other
                 # pixel is unknown, not background/road
                 label = np.where(label == 2, 2, 255).astype(np.uint8)
+            if thin_line > 0:
+                line = (label == 2).astype(np.uint8)
+                if line.any():
+                    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                    thin = cv2.erode(line, k, iterations=int(thin_line))
+                    removed = (line > 0) & (thin == 0)
+                    # Full-label scenes: the eroded border is road.  A
+                    # line-only set has no information around the stroke, so
+                    # there it stays unknown (already 255) rather than being
+                    # taught as road.
+                    if not (rd.name in line_only_dirs):
+                        label = np.where(removed, 1, label).astype(np.uint8)
+                    label = np.where(thin > 0, 2, label).astype(np.uint8)
             n_pix = colour.shape[0] * colour.shape[1]
             line_px += int((label == 2).sum())
             n_run += 1
@@ -284,6 +306,11 @@ def main() -> None:
                     help="数据目录（可多个，如 logs/m5_seg/run_*）")
     ap.add_argument("--line-only-runs", nargs="*", default=[],
                     help="只标了标线的人工标注目录；非 line 像素忽略(255)，不当作背景")
+    ap.add_argument("--thin-line-labels", type=int, default=0, metavar="N",
+                    help="把标线目标侵蚀 N 像素以教模型学「细」车道线"
+                         "（0=关闭）。标注的 line 类比配对消费的细线宽，"
+                         "见 2026-09-11 的 IoU 与配对率反相关结论；"
+                         "cv2.ximgproc 不可用时这是最便宜的骨架化近似。")
     ap.add_argument("--train-only-runs", nargs="*", default=[],
                     help="只进训练、不切到验证集的人工标注目录")
     ap.add_argument("--epochs", type=int, default=40)
@@ -339,7 +366,8 @@ def main() -> None:
     train_only_runs = {Path(p).name for p in args.train_only_runs}
     frames, per_run = load_frames([Path(p) for p in args.runs],
                                   args.min_line_frac,
-                                  line_only_dirs=line_only_dirs)
+                                  line_only_dirs=line_only_dirs,
+                                  thin_line=int(args.thin_line_labels or 0))
     n = len(frames)
     train_frames, val_frames = split_frames(
         frames, per_run, args.split, args.val_frac,
@@ -578,6 +606,7 @@ def main() -> None:
                            "min_line_frac": args.min_line_frac,
                            "balance_runs": args.balance_runs,
                            "line_only_runs": list(args.line_only_runs),
+                           "thin_line_labels": int(args.thin_line_labels or 0),
                            "train_only_runs": list(args.train_only_runs),
                            "n_train": len(train_frames), "n_val": 0},
         }, out_dir / "best.pt")
