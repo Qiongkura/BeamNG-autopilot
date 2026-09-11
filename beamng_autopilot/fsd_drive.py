@@ -434,6 +434,39 @@ def _in_end_pull_zone(rem_end, start_m: float = END_PULL_START_M) -> bool:
         return False
 
 
+def _counts_as_stuck(*, has_path: bool, force_stop: bool, v: float,
+                     thr: float, plan_speed: float, near_obs_m: float,
+                     rem_end, v_eps: float = 0.35, plan_eps: float = 0.05,
+                     obs_close_m: float = 2.5) -> bool:
+    """True when this tick should advance the stuck timer.
+
+    Two ways the car parks itself while the stack still reports "safe" with
+    a live path:
+
+    * holding throttle against an obstruction (``thr > 0``) - the original
+      "spinning in place" case (mountain run 2026-08-27 run_fix31: wedged
+      at (741.2,745.7) with thr=0.53 and v=0 for 50 s); and
+    * a COMMANDED stop with an obstacle inside the brake reserve: the speed
+      profile clamps to 0, the controller brakes so ``thr == 0`` and the
+      first rule can never fire.  Measured 2026-09-11: closest_obs pinned
+      at 1.17 m with plan_speed 0.00 for 164 of 224 town frames, so the run
+      covered 18.4 m and then sat for 73% of the clock.
+
+    The commanded-stop branch needs the obstacle to actually be CLOSE so
+    waiting behind a lead vehicle (which sits further out) is not mistaken
+    for a wedge, and the end-pull zone is excluded because a commanded stop
+    there is the goal, not a failure.  Both branches arm the same bounded
+    reverse escape (1.5 m / 2.5 s / -0.4 m/s, rear-clearance checked).
+    """
+    if not has_path or force_stop or float(v) >= float(v_eps):
+        return False
+    if float(thr) > 0.0:
+        return True
+    return (float(plan_speed) <= float(plan_eps)
+            and float(near_obs_m) <= float(obs_close_m)
+            and not _in_end_pull_zone(rem_end))
+
+
 def _endzone_align_yaw_dev(heading, dir3, dir_src):
     """Yaw deviation to straighten the parking pose to, or None.
 
@@ -2401,30 +2434,16 @@ class FSDriveSession:
                     gov_brake = False
                 if gov_brake:
                     thr, brk = 0.0, max(brk, GOV_BRAKE)
-                # Stuck detection covers two ways the car parks itself while
-                # the stack still reports "safe" with a live path:
-                #   (a) holding throttle against an obstruction (thr > 0) -
-                #       the original "spinning in place" case (mountain run
-                #       2026-08-27 run_fix31: wedged at (741.2,745.7) with
-                #       thr=0.53 and v=0 for 50 s); and
-                #   (b) a COMMANDED stop with an obstacle inside the brake
-                #       reserve: the speed profile clamps to 0, the controller
-                #       brakes so thr == 0, and (a) can never accumulate - the
-                #       car parks forever.  Measured 2026-09-11: closest_obs
-                #       pinned at 1.17 m with plan_speed 0.00 for 164 of 224
-                #       town frames, which is why that run covered only 18.4 m.
-                # (b) requires the obstacle to actually be close, so waiting
-                # behind a lead vehicle is not mistaken for a wedge, and the
-                # end-pull zone is excluded because a commanded stop there is
-                # the goal.  The escape it arms is the same bounded one.
+                # Stuck detection: see ``_counts_as_stuck`` for the two
+                # states it covers and why the command-stop case needed its
+                # own rule.
                 _near_obs = float(getattr(verd, "closest_obs_m", 999.0)
                                   or 999.0)
-                _commanded_wedge = (
-                    plan_speed <= 0.05 and _near_obs <= 2.5
-                    and not _in_end_pull_zone(rem_end))
-                if (chosen.path is not None and not force_stop
-                        and v < 0.35
-                        and (thr > 0.0 or _commanded_wedge)):
+                if _counts_as_stuck(
+                        has_path=(chosen.path is not None),
+                        force_stop=bool(force_stop), v=v, thr=thr,
+                        plan_speed=plan_speed, near_obs_m=_near_obs,
+                        rem_end=rem_end):
                     stuck_t += max(0.0, float(dt))
                 else:
                     stuck_t = 0.0

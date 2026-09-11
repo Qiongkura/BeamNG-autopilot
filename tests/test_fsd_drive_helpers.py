@@ -370,3 +370,49 @@ def test_in_end_pull_zone_handles_missing_and_bad_values() -> None:
 def test_in_end_pull_zone_respects_custom_start() -> None:
     assert fsd_drive._in_end_pull_zone(7.0, start_m=8.0)
     assert not fsd_drive._in_end_pull_zone(9.0, start_m=8.0)
+
+
+def test_stuck_timer_sees_a_commanded_stop() -> None:
+    """A zero commanded speed with a close obstacle must count as stuck.
+
+    Measured 2026-09-11: plan_speed 0.00 with closest_obs pinned at 1.17 m
+    for 164 of 224 town frames, brake 1.00 (so thr == 0) and level=safe.
+    The old predicate required thr > 0, so the timer never advanced, the
+    bounded reverse escape never armed, and the car sat for 73% of the run.
+    """
+    from beamng_autopilot.fsd_drive import _counts_as_stuck
+
+    # (a) the original case: throttle held against an obstruction
+    assert _counts_as_stuck(has_path=True, force_stop=False, v=0.0,
+                            thr=0.5, plan_speed=2.0, near_obs_m=1.0,
+                            rem_end=70.0)
+    # (b) the new case: commanded stop, parking brake, obstacle in reserve
+    assert _counts_as_stuck(has_path=True, force_stop=False, v=0.0,
+                            thr=0.0, plan_speed=0.0, near_obs_m=1.17,
+                            rem_end=73.9)
+
+
+def test_stuck_timer_does_not_fire_on_legitimate_waits() -> None:
+    from beamng_autopilot.fsd_drive import (
+        END_PULL_START_M, _counts_as_stuck)
+
+    def stuck(**kw):
+        base = dict(has_path=True, force_stop=False, v=0.0, thr=0.0,
+                    plan_speed=0.0, near_obs_m=1.17, rem_end=70.0)
+        base.update(kw)
+        return _counts_as_stuck(**base)
+
+    # waiting behind a lead vehicle: the obstacle is not in the reserve
+    assert not stuck(near_obs_m=6.0)
+    # the end-pull stop IS the goal, not a wedge
+    assert not stuck(rem_end=END_PULL_START_M - 1.0)
+    # an unknown remaining distance is not a goal stop either
+    assert stuck(rem_end=None)
+    # an emergency stop owns the tick
+    assert not stuck(force_stop=True)
+    # no live path: the no-path degradation is not this detector's job
+    assert not stuck(has_path=False)
+    # still moving
+    assert not stuck(v=1.2)
+    # moving with throttle is the normal case
+    assert not stuck(v=1.2, thr=0.4, plan_speed=3.0)
