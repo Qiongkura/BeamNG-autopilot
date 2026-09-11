@@ -219,8 +219,8 @@ vehicle released 11:52 (session 9be6d9dc, 2 arms, per the agreed protocol)
 ## 7. 逐门归因（实车窗口 11:47–11:51，2 臂，`choose_sensor_lane` 探针 450 次调用）
 
 按 §5 的约定申请到窗口（对端 11:45 写了 `vehicle free`），装纯记录探针后跑了 2 臂并按约定
-写了 `vehicle released 11:52`。两臂成绩：lane 19% / 19%，stall 141 / 123，off 8 / 7，
-dist 32.9 / 50.8 m（`crossC` 0/0、`crossR` 0/0）。
+写了 `vehicle released 11:52`。两臂成绩：lane 28% / 19%，stall 129 / 123，off 9 / 7，
+dist 56.5 / 50.8 m（`crossC` 0/0、`crossR` 0/0）。
 
 **450 次 `choose_sensor_lane` 调用里 127 次返回 None（28%）** —— 这就是实车丢掉车道的
 tick。按判据树逐门归因，None 的首个失败门：
