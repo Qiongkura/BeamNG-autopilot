@@ -86,15 +86,17 @@ RANGE_REUSE_INFLATE_FRAC = 0.25
 RANGE_REUSE_INFLATE_MAX_M = 1.5
 
 # Bounded tick-to-tick slew of the accepted own-lane reference.
-# Default OFF (opt-in) because the live A/B does NOT support it yet:
-# on 2026-09-11, recovery pinned on, two arms each on one revision -
-#   slew on : lane 19%/3%, stall 135/184, off-road 17/0, dist 53.1/21.6
-#   slew off: lane  7%/13%, stall 134/113, off-road  0/0, dist 50.3/52.7
-# availability is unchanged and off-road/stall/dist all trend worse with
-# it enabled.  With off-road counts ranging 0-22 run-to-run in one
-# configuration, n=2-4 cannot decide it either way, so the stage stays
-# opt-in until a decisive A/B (>=5 arms per condition or a lower-variance
-# protocol) shows a win.  ``BEAMNG_LANE_REF_SLEW=1`` enables it.
+# Default OFF (opt-in) because a same-revision, same-game-session,
+# interleaved 5-arm-per-condition A/B (2026-09-11, dashed recovery pinned
+# on, scripts/m5_live_ab.py) shows no benefit and a real cost:
+#   slew off: lane p50 15%, stall p50 138 (135-169), dist p50 48.3,
+#             off-road [0,8,5,5,7], crossC [0,5,0,0,0], crossR [0,3,0,0,0]
+#   slew on : lane p50 13%, stall p50 180 (151-188), dist p50 32.4,
+#             off-road [0,7,11,0,2], crossC [0,0,6,0,0], crossR [0,0,0,0,0]
+# Availability is unchanged, stall and distance are worse, and off-road /
+# crossing frames occur in BOTH conditions - so this limiter is neither
+# the cure nor the cause of the excursions.  The stage stays opt-in:
+# ``BEAMNG_LANE_REF_SLEW=1`` enables it.
 _LANE_REF_SLEW_ENABLED = os.environ.get("BEAMNG_LANE_REF_SLEW", "0") == "1"
 
 
