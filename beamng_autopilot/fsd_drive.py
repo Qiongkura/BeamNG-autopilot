@@ -2878,6 +2878,16 @@ class FSDriveSession:
                     "plan_raw": round(float(plan_raw_speed), 2),
                     "target_sm": round(float(target_sm), 2),
                     "plan_src": str(out.meta.get("plan_src", "?")),
+                    # Why the planner did (or did not) publish a path.  The
+                    # 2026-09-11 town run had 34 frames with a PAIRED
+                    # perception lane and no path at all, and the record
+                    # could not say whether the constraint layer declined
+                    # every candidate, the strict gate fired, or the fan was
+                    # empty - `n_eval = 0` in the planner meta is just its
+                    # default when no plan exists.  Publish the decision.
+                    "plan_blocked": str(out.meta.get("plan_blocked", "")),
+                    "n_candidates": int(out.meta.get("total_candidates",
+                                                     out.n_candidates) or 0),
                     "tick_ms": out.meta.get("tick_ms"),
                     "tick_wall_ms": round((_tb - _f0) * 1000.0, 1),
                     "budget_s": round(float(_budget), 3),
