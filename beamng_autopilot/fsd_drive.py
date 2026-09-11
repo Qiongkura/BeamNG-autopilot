@@ -896,6 +896,20 @@ class FSDriveSession:
                 print(f"[fsd-drive] segmentation model: {args.seg_model}")
             except Exception as _seg_e:
                 print(f"[fsd-drive] segmentation model disabled: {_seg_e}")
+        else:
+            # No pin means the run uses whatever is deployed, and until it
+            # said so out loud a map could be evaluated on a checkpoint
+            # nobody chose - the deployed default and the v13b/v8
+            # specialists disagree strongly per map (see the line-IoU
+            # matrix in the README).  Build it here so the path logged is
+            # the path actually used, not a second lookup.
+            try:
+                from beamng_autopilot.vision.segmentation import Segmenter
+                _seg = Segmenter()
+                print("[fsd-drive] segmentation model (UNPINNED default): "
+                      f"{_seg.model_path}")
+            except Exception as _seg_e:
+                print(f"[fsd-drive] segmentation model disabled: {_seg_e}")
         stack = FSDStack(conn, args.runtime,
                          heads=[SemanticHead(segmenter=_seg), TrafficSignalHead(),
                                 ObjectHead(), LaneTopologyHead()],

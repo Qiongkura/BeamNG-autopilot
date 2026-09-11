@@ -110,6 +110,10 @@ class Segmenter:
                 "分割模型不存在；先运行 scripts/m5_train_seg.py 训练，"
                 f"或传入 model_path（默认 {config.LOGS_DIR}/m5_seg/"
                 "seg_model/best.pt）")
+        # Which checkpoint is loaded decides how every map behaves, so it
+        # is kept on the instance: an unpinned run must be attributable
+        # instead of silently using whatever happens to be deployed.
+        self.model_path = path
         self.device = device or (
             "cuda" if torch.cuda.is_available() else "cpu")
         ckpt = torch.load(path, map_location=self.device)

@@ -109,3 +109,37 @@ def test_train_run_bounds_tail_clips_last_run():
     bounds = _mod.train_run_bounds(frames, per_run, "tail", 0.2)
     assert bounds == [(0, 10), (10, 16)]  # 全局尾部 4 帧进验证，b 被截断
     assert len(tr) == 16 and len(va) == 4
+
+
+def test_default_model_path_follows_logs_dir(tmp_path, monkeypatch) -> None:
+    """Which checkpoint is deployed must be resolvable, not assumed.
+
+    An unpinned run (the mountain scenario) uses whatever this returns, so
+    the resolution has to be a pure function of ``config.LOGS_DIR`` - and
+    the choice is now logged, because the deployed default and the v13b/v8
+    specialists disagree strongly per map.
+    """
+    from beamng_autopilot import config
+    from beamng_autopilot.vision.segmentation import default_model_path
+
+    monkeypatch.setattr(config, "LOGS_DIR", tmp_path)
+    assert default_model_path() is None
+
+    p = tmp_path / "m5_seg" / "seg_model" / "best.pt"
+    p.parent.mkdir(parents=True)
+    p.write_bytes(b"stub")
+    assert default_model_path() == p
+
+
+def test_segmenter_exposes_the_loaded_checkpoint(tmp_path) -> None:
+    """The loaded path is recorded on the instance for attribution."""
+    import torch
+    from beamng_autopilot.vision.segmentation import Segmenter, SegUNet
+
+    ckpt = tmp_path / "best.pt"
+    model = SegUNet(n_classes=3)
+    torch.save({"state_dict": model.state_dict(), "n_classes": 3,
+                "class_names": ["background", "asphalt", "line"]},
+               ckpt)
+    seg = Segmenter(model_path=ckpt, device="cpu", use_half=False)
+    assert seg.model_path == ckpt
