@@ -2401,17 +2401,30 @@ class FSDriveSession:
                     gov_brake = False
                 if gov_brake:
                     thr, brk = 0.0, max(brk, GOV_BRAKE)
-                # Stuck detection: the planner can keep reporting "safe" while
-                # the car physically cannot move (wedged against a guardrail /
-                # embankment after an over-correction).  Holding throttle
-                # against the obstruction forever is the "spinning in place"
-                # failure - after a couple of seconds at near-standstill with
-                # a commanded forward path, treat it as "no forward path" so
-                # the bounded reverse escape backs out and re-plans (mountain
-                # run 2026-08-27 run_fix31: wedged at (741.2,745.7) with
-                # thr=0.53 and v=0 for 50 s).
+                # Stuck detection covers two ways the car parks itself while
+                # the stack still reports "safe" with a live path:
+                #   (a) holding throttle against an obstruction (thr > 0) -
+                #       the original "spinning in place" case (mountain run
+                #       2026-08-27 run_fix31: wedged at (741.2,745.7) with
+                #       thr=0.53 and v=0 for 50 s); and
+                #   (b) a COMMANDED stop with an obstacle inside the brake
+                #       reserve: the speed profile clamps to 0, the controller
+                #       brakes so thr == 0, and (a) can never accumulate - the
+                #       car parks forever.  Measured 2026-09-11: closest_obs
+                #       pinned at 1.17 m with plan_speed 0.00 for 164 of 224
+                #       town frames, which is why that run covered only 18.4 m.
+                # (b) requires the obstacle to actually be close, so waiting
+                # behind a lead vehicle is not mistaken for a wedge, and the
+                # end-pull zone is excluded because a commanded stop there is
+                # the goal.  The escape it arms is the same bounded one.
+                _near_obs = float(getattr(verd, "closest_obs_m", 999.0)
+                                  or 999.0)
+                _commanded_wedge = (
+                    plan_speed <= 0.05 and _near_obs <= 2.5
+                    and not _in_end_pull_zone(rem_end))
                 if (chosen.path is not None and not force_stop
-                        and v < 0.35 and thr > 0.0):
+                        and v < 0.35
+                        and (thr > 0.0 or _commanded_wedge)):
                     stuck_t += max(0.0, float(dt))
                 else:
                     stuck_t = 0.0
