@@ -49,6 +49,14 @@ SCENARIOS: dict[str, dict] = {
         "teleport": (729.6, 763.9, 45.0),
         "goal": (616.2, 894.5),
         "require_goal": False,
+        # Explicit pin.  Without one this scenario silently used the
+        # deployed default, which is byte-identical to seg_model_v12 - and
+        # v8 beats v12 on the objective metric (annotation-GT line IoU) on
+        # EVERY collected dataset, this one included: v8 0.2092 vs v12
+        # 0.1313 vs v13b 0.0208 (2026-09-11 matrix).  The user's manual
+        # stroke gate rates v13b 72.9% here, but v13b has a 0.02 line IoU on
+        # this domain, so that metric is a sanity check, not a selector.
+        "seg_model": "logs/m5_seg/seg_model_v8_backup/best.pt",
         "note": "mountain hairpin start (README real-vehicle record); "
                 "goal ~200 m along the road graph so a nav route exists "
                 "on a fresh game (no-route = known crawl behaviour)",
