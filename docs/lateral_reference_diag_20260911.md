@@ -263,3 +263,5 @@ tick。按判据树逐门归因，None 的首个失败门：
 
 离线侧不需要车辆：`scripts/m5_lane_continuity.py` 可先量「非成对帧里右侧边界在车旁的
 可用率」，与实车的 6/277 对照（注意 §6：离线帧是纯视觉帧，不是融合帧）。
+
+vehicle free 11:56 (session cce01654) - used one bounded window: town_1789098733, dist 50.6 m, stall 147, crossC 0, off 0; added plan_blocked/n_candidates telemetry (60e476e); the lane-but-no-path frames are now attributed to the constraint layer declining all 18 candidates
