@@ -458,3 +458,36 @@ run_town_truth_1329  120 帧  536x403  colour+label  标线 525 px/帧
   `.venv\Scripts\python.exe scripts\m5_annotate_manual.py --frames-dir logs/m5_seg/manual_town_capture_20260910_233426 --out logs/m5_seg/manual_town_labeled`
   （可选 `--prefill-model logs/m5_seg/seg_model_v13b/best.pt` 预填以减少涂画量；预填结果
   **必须人工修正**，不能直接当标签。）
+
+## 14. 全量配方 ± 新城镇真值：已启动，判定标准预先固定（2026-09-11 13:5x）
+
+按 §13 交下来的公平对照，两次训练已在后台**顺序**执行（唯一变量是 `run_town_truth_1329`）：
+
+```powershell
+# ARM A —— 不含新真值
+.venv\Scripts\python.exe scripts\m5_train_seg.py `
+  --runs <logs/m5_seg/run_* 去掉 run_town_truth_1329> `
+  --min-line-frac 0.003 --split per-run --epochs 60 --out logs\m5_seg\seg_model_full_A
+# ARM B —— 含新真值
+.venv\Scripts\python.exe scripts\m5_train_seg.py `
+  --runs logs\m5_seg\run_* `
+  --min-line-frac 0.003 --split per-run --epochs 60 --out logs\m5_seg\seg_model_full_B
+```
+
+实测代价：`--min-line-frac 0.003` 在 14 个 run（约 7600 帧）上保留约 2400 帧；
+**37–74 s/epoch**（游戏与训练共享 GPU），单臂 60 轮约 35–50 分钟，两臂约 1.5 小时。
+进度与日志：`logs/_fulltrain.log`。
+
+**预先固定判定标准（避免事后挪门）：**
+
+1. 用 `m5_lane_continuity.py --episodes 3 --all-frames --seg-model <arm>/best.pt` 读
+   **成对率（PAIRED own-lane frame）** 与 **own-lane centre lat**；
+2. 与 **v13b 的 20.2%（22.8 / 19.1 / 18.6%）** 比较，且要求**逐趟一致**（不接受靠单趟
+   拉高的均值，见 §12 的 v20）与**中心偏差近 0**（v13b 为 −0.08/−0.35/+0.01 m）；
+3. **val_mIoU 不作判据**——已有两次反例（§12 的 v8：IoU 领先而成对率 7.9%；
+   §13 的 v22：mIoU 0.632 > v13b 0.560 而成对率 12.0% vs 20.2%）。ARM A 前 18 轮的
+   val_mIoU 已到 0.72–0.78，同样不能据此判断；
+4. 取优者（且必须**超过** v13b，而不是「与 v13b 相当」）才 pin 进 town 场景，再跑
+   `scripts/m5_live_ab.py` 的实车 A/B 复核 `crossC/crossR/off` 与 `stall`。
+
+**当前状态**：ARM A 训练中（18/60），ARM B 排队；尚无结论，验收状态不变。
