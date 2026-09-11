@@ -573,3 +573,49 @@ A/B。** 这一步的产出不是更好的模型，而是三个可用的量化�
 进程**（7156 / 15032 / 10280），其中可能包含并行会话的任务——这是我的错误，正确做法是
 只按 PID 杀自己启动的进程（`nohup ... & echo $!` 已经打印了 PID）。已在此记录；后续
 停训练一律用 PID。
+
+## 18. 全量配方 **+ 人工标线** + 任务早停：首个通过安全项的候选（2026-09-11 21:xx）
+
+§16 的复盘发现一件事：我跑的两条全量配方臂**都没带人工标线集**（ARM A/B 只有 tech_truth），
+而本会话已量化「手工标线是决定性成分」。所以这次把两者合起来跑，并用新的逐轮任务门选点：
+
+```powershell
+.venv\Scripts\python.exe scripts\m5_train_seg.py `
+  --runs logs\m5_seg\run_* `
+  --line-only-runs logs\m5_seg\manual_review_batch_labeled manual_compare_batch_labeled `
+                   manual_mountain_labeled manual_20260906_134128 manual_current_full `
+  --min-line-frac 0.003 --split per-run --epochs 8 --balance-runs `
+  --task-eval-every 1 --task-episodes 4 --task-min-in-lane 0.20 `
+  --out logs\m5_seg\seg_model_hand
+```
+
+逐轮任务指标（4-episode 固定口径）：
+
+| ep | paired | in_lane |
+| --- | --- | --- |
+| 0 | 10.5% | 21.3% |
+| 2 | 10.3% | 44.0% |
+| **6** | **16.2%** | **57.2%** ← 取此轮 |
+| 7 | 2.1% | 26.3% |
+
+`ep06` 的**可用率低于 v13b（16.2% vs 24.3%），但 in-lane 高一倍（57.2% vs 25.8%）**——
+是一个不同的权衡点，而验收里正在失败的是**横向**项。
+
+### 实车 A/B（同 game 会话、交错、各 2 臂，`--seg-model` 切换）
+
+| 模型 | lane p50 | stall p50 | off | crossC | crossR | dist p50 |
+| --- | --- | --- | --- | --- | --- | --- |
+| v13b（当前 pin） | 20% | 143 | **[17, 7]** | [0, 2] | [0, 0] | 46.5 |
+| **hand_ep06** | 21% | **114** | **[0, 0]** | **[0, 0]** | [0, 0] | **50.9** |
+
+单臂：v13b 20%/142/off17/cc0/45.8 m；hand 33%/117/off0/cc0/50.8 m；
+v13b 19%/144/cc2/off7/47.3 m；hand 9%/112/off0/cc0/51.0 m。
+
+**`hand_ep06` 在两臂都通过安全项（off 0、crossC 0、crossR 0）**，同时 `stall` 更低
+（114 vs 143）、里程更高，`lane` 可用率相当。这是本会话第一个同时满足
+`crossC/crossR/off = 0` 的配置。
+
+**保留意见（必须说）**：每组只有 2 臂，而 `off` 的历史 run-to-run 区间是 0–22，
+所以 17/7 vs 0/0 还不能单独作为结论；支撑它的是**机制一致**——离线 in-lane 57% vs 26%
+与实际压线差异同向。下一步是加臂复核（≥5 臂/组），通过后把 `task_ep06.pt` pin 进
+town 场景；`stall` 114 仍未回到 9/5–9/7 的 0–83。
