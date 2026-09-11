@@ -18,6 +18,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -264,9 +265,24 @@ class Segmenter:
             # the model misses, but its texture edges are not paint and
             # they pollute the grouping (measured: grouping the union
             # yields a 23.9% paired rate, the learned mask alone 43.0%).
-            out.extend(recover_dashed_boundaries(
-                np.asarray(line, dtype=np.uint8) * 255,
-                cam_model, pos, heading, ground_z=ground_z))
+            #
+            # BEAMNG_DASHED_RECOVERY=1 enables the stage (default OFF).
+            #
+            # It is off by default because a live A/B on the town scenario
+            # (2026-09-11, same game instance, exclusive runs) showed it
+            # COSTING lane continuity rather than helping: with the stage
+            # on, lane_sel=sensor ran at ~0-3% of frames; with it off,
+            # 17.7%.  It costs ~70 ms/frame (measured), about half of the
+            # whole segmentation stage, and the FSD tick races a time
+            # budget that defers heavy heads on overrun - the run logged
+            # "stale sensor" repeatedly and the watchdog aborted once.
+            # The offline gain (paired 20.8% -> 45.6%) is real but does not
+            # survive the live time budget yet, so the stage stays
+            # opt-in until its cost is fixed and a live A/B shows a win.
+            if os.environ.get("BEAMNG_DASHED_RECOVERY", "0") == "1":
+                out.extend(recover_dashed_boundaries(
+                    np.asarray(line, dtype=np.uint8) * 255,
+                    cam_model, pos, heading, ground_z=ground_z))
         if cv_yellow.any():
             out.extend(_mask_to_markings(
                 cv_yellow.astype(np.uint8) * 255, "yellow",
