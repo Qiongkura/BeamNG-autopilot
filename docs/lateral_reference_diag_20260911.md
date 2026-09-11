@@ -181,3 +181,35 @@ vehicle free 11:45 (session cce01654, per the agreed protocol in this doc)
 - used one bounded window: town_1789098126, dist 30.7 -> 52.4 m, stall 170 -> 113, crossC 0, off 0
 - changes committed: 10de5bb, 856791e, bc23216, 66e02cd
 - remaining blocker: tail frames with source=none / plan_speed 0 (68 of 134 tail frames) - not yet attributed
+
+## 6. 离线漏斗那一栏为什么不能直接和实车比（重要，修正 §3 的读法）
+
+§3 表里「离线 `lane_sel=sensor` 83.5% / 57.6%」**不是实车那个量**。两处调用不等价：
+
+| | 离线（`m5_lane_continuity.py`） | 实车（`fsd_stack._sensor_lane`） |
+| --- | --- | --- |
+| 车道帧 | `pair_lane_markings(markings, ...)` 的**纯视觉帧** | `choose_sensor_lane(vision, lidar, state=...)` 的**融合帧**（含 LiDAR 走廊、镜像几何门、时序一致性） |
+| 额外实参 | 不传 `grid` / `map_lane_override` / `lane_consistency_*` | 传全套 |
+| `lane_sel` 含义 | 策略对**纯视觉帧**的判定 | 策略对**融合帧**的判定 |
+
+实车侧不是「另有门槛拒绝了车道」——`lane_reject` 在**全部 1787 帧都是空的**（没有任何门拒绝过）。
+`fsd_stack.py:915-918` 给出确切口径：`lane_paired = 1` 当且仅当**融合后的 `lane_frame`
+存在且 `paired`**。于是最近 8 趟的实测是：
+
+```
+lane_sel=perception-unavailable 且 lane_paired=0 : 1475 帧 (82.5%)
+lane_sel=sensor                 且 lane_paired=1 :  312 帧 (17.5%)
+```
+
+**两种组合之外没有第三类**——即实车里策略从未接受过非成对（镜像/单边界）帧，而离线
+重放对同一批帧有 83.5% 接受。所以 §3 的 83.5% 是一个**高估的代理量**，不能用来判断
+实车车道可用率；这也解释了为什么离线数字一直比实车乐观（本文件 §3、以及旧文档的
+45% vs 11%）。
+
+**下一个候选改动**（证据最集中的一点）：把实车 `choose_sensor_lane` 的逐 tick 判因
+打出来（是 `vision_ok`？`_mirror_near_ok`？`_mirror_right_ok`？还是一致性门？），
+看那 82.5% 的 tick 到底丢在哪一道门。它在**停车（stall）与压线（off/crossC）的共同上游**，
+而且第一遍只需一次**短实车窗口**（≤4 趟）就能定位——按 §5 的约定向并行会话申请。
+
+**同时**：离线 harness 应当在 docstring/输出里标注它测的是「纯视觉帧下界」，或者
+补上 `choose_sensor_lane` 与 `grid`/一致性实参，否则后续还会有人拿 83.5% 当实车指标。
