@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import math
+import os
 import time
 
 import numpy as np
@@ -83,6 +84,18 @@ RANGE_REUSE_MAX_DT_S = 2.0
 RANGE_REUSE_MAX_PREDICT_M = 10.0
 RANGE_REUSE_INFLATE_FRAC = 0.25
 RANGE_REUSE_INFLATE_MAX_M = 1.5
+
+# Bounded tick-to-tick slew of the accepted own-lane reference.
+# Default OFF (opt-in) because the live A/B does NOT support it yet:
+# on 2026-09-11, recovery pinned on, two arms each on one revision -
+#   slew on : lane 19%/3%, stall 135/184, off-road 17/0, dist 53.1/21.6
+#   slew off: lane  7%/13%, stall 134/113, off-road  0/0, dist 50.3/52.7
+# availability is unchanged and off-road/stall/dist all trend worse with
+# it enabled.  With off-road counts ranging 0-22 run-to-run in one
+# configuration, n=2-4 cannot decide it either way, so the stage stays
+# opt-in until a decisive A/B (>=5 arms per condition or a lower-variance
+# protocol) shows a win.  ``BEAMNG_LANE_REF_SLEW=1`` enables it.
+_LANE_REF_SLEW_ENABLED = os.environ.get("BEAMNG_LANE_REF_SLEW", "0") == "1"
 
 
 def compensate_range_motion(sample: RangeSample | None,
@@ -778,10 +791,14 @@ class FSDStack:
         # Measured 2026-09-11 (dashed recovery on): the accepted sensor
         # reference jumped up to 2.20 m laterally between consecutive
         # ticks (5.3% > 1.0 m) while the envelope moved at most 0.41 m.
-        lane_ref, self._lane_ref_hold_t = limit_reference_slew(
-            getattr(self, "_lane_ref_prev", None),
-            getattr(self, "_lane_ref_hold_t", 0.0),
-            lane_ref, time.time(), pos, heading)
+        # ``BEAMNG_LANE_REF_SLEW=0`` disables it: the live A/B is not yet
+        # decisive at this sample size, so the switch is the rollback and
+        # comparison lever.
+        if lane_ref is not None and _LANE_REF_SLEW_ENABLED:
+            lane_ref, self._lane_ref_hold_t = limit_reference_slew(
+                getattr(self, "_lane_ref_prev", None),
+                getattr(self, "_lane_ref_hold_t", 0.0),
+                lane_ref, time.time(), pos, heading)
         self._lane_ref_prev = (None if lane_ref is None
                                else np.asarray(lane_ref, dtype=float)[:, :2])
         lane_left = lane_ref_out.left
