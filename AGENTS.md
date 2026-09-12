@@ -59,6 +59,7 @@
 3. 后实现：保持最小 diff，不夹带无关重构。
 4. 验证：纯逻辑改动至少跑 `pytest tests/` 与 `scripts/m5_offline_validate.py`；涉及真实游戏的改动默认用 Tech（`--runtime tech`）验证对应探针或测试，Steam 路径只需确认不回归。
 5. 收尾：报告实际改动与验证结果，不假装没跑过的测试通过。
+6. 提交按模块拆分：一个模块（beamng_autopilot 子包 / scripts / tests / docs 等）一个提交，禁止攒一堆细碎提交或把所有模块混进一个提交；推送前按此自查。
 
 ## 常用验证
 
