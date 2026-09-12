@@ -215,8 +215,13 @@ class Segmenter:
             line = keep
         return road, line
 
+    def reset(self) -> None:
+        """Clear image-space hysteresis after a discontinuity."""
+        self._prev_line = None
+
     def detect_lines(self, frame_rgb, cam_model, pos, heading,
-                     ground_z: float | None = None) -> list:
+                     ground_z: float | None = None, *,
+                     line_mask: np.ndarray | None = None) -> list:
         """Line mask -> LaneMarking list (reuses the classic pipeline).
 
         The learned line mask is fused with a classic-CV bright-stroke
@@ -228,7 +233,14 @@ class Segmenter:
         from beamng_autopilot.vision.lanes import (
             _mask_to_markings, WHITE_SAT_MAX, recover_dashed_boundaries)
 
-        _, line = self.predict(frame_rgb)
+        # An explicit (possibly empty) mask is authoritative: do not run
+        # inference again or discard the head's temporal fusion.
+        if line_mask is None:
+            _, line = self.predict(frame_rgb)
+        else:
+            line = np.asarray(line_mask, dtype=bool)
+            if line.shape != frame_rgb.shape[:2]:
+                raise ValueError("line_mask shape must match image shape")
         # Classic-CV bright-stroke recovery, contrast-based: on a light
         # concrete road the absolute brightness of the paint and the
         # pavement are both high, so a global threshold fires on the whole

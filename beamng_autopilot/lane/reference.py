@@ -32,6 +32,7 @@ import numpy as np
 from .constants import LANE_WIDTH_DEFAULT_M
 from beamng_autopilot.fsd_realism import (
     SRC_BEV_ROUTE,
+    SRC_CORRIDOR,
     SRC_MAP,
     SRC_SENSOR,
     SRC_UNAVAILABLE,
@@ -51,6 +52,7 @@ from beamng_autopilot.fsd_realism import (
 _LABEL_BY_SRC = {
     SRC_SENSOR: "sensor",
     SRC_MAP: "map_lane",
+    SRC_CORRIDOR: "corridor",
     SRC_UNAVAILABLE: "perception-unavailable",
 }
 
@@ -161,6 +163,94 @@ def bev_drivable_center(grid, pos, heading):
     return ahead if len(ahead) >= 3 else None
 
 
+# Width gate for the corridor lane candidate, MEASURED not guessed: over
+# 24 town shadow episodes / 4951 frames (scripts/m5_lateral_ref_probe.py,
+# in-lane judged against a corrected 0 m ego-lane centre), the candidate
+# below scores 84.7% (width 7-8 m), 96.0% (8-9 m) and 100% (9-10 m), then
+# collapses to 61.9% (10-12 m) and 0.0% above 12 m - on a wide road the
+# corridor's right edge is NOT the ego lane's right boundary and the same
+# formula points ~6 m off the lane.  So the candidate must abstain above
+# this width and let strict mode fail closed instead.
+CORRIDOR_LANE_MAX_WIDTH_M = 10.0
+
+
+def bev_corridor_lane_center(grid, pos, heading,
+                             max_width_m: float = CORRIDOR_LANE_MAX_WIDTH_M,
+                             lane_half_m: float | None = None):
+    """World polyline of the ego-lane centre from the FREE corridor's right edge.
+
+    .. warning::
+        **REFUTED LIVE, do not enable** (2026-09-12, town corridor arm
+        ``town_1789142315``): the free corridor's right edge is the ROAD's
+        right edge, not the ego lane's right boundary.  Measured on that
+        run's own GT frames: painted right line at −1.43 m but drivable
+        right edge at −3.75 m — the road mask spills ~1.9 m past the lane
+        line (shoulder), so this candidate pointed 1.24 m (p50) right of
+        the true lane centre and >1.2 m off on 52.7% of frames.  A whole-
+        corridor width gate cannot catch this: "two lanes" and "two lanes
+        + right shoulder" have the same total width, and nothing at
+        runtime verifies the assumption.  The offline 95% in-lane (24
+        episodes) did not transfer.  Kept only as the recorded negative
+        result; ``corridor_fallback`` must stay False unless a redesign
+        anchors the boundary to painted lines and re-passes the live
+        safety gate (line_lat centred, 0 crossing / 0 off-road / 0
+        reversing).
+    """
+    drv = getattr(grid, "drivable", None)
+    if drv is None or not getattr(drv, "any", lambda: False)():
+        return None
+    occ = getattr(grid, "obstacle", None)
+    if occ is not None and occ.shape == drv.shape:
+        free = np.logical_and(drv != 0, occ == 0)
+    else:
+        free = drv != 0
+    if not free.any():
+        return None
+    n = int(getattr(grid, "n_rows", None) or
+            getattr(grid, "n_cols", None) or 60)
+    res = float(grid.res)
+    extent = float(grid.extent)
+    if lane_half_m is None:
+        lane_half_m = 0.5 * float(LANE_WIDTH_DEFAULT_M)
+    ch = math.cos(float(heading))
+    sh = math.sin(float(heading))
+    step = max(1, n // 24)
+    pts: list[tuple[float, float]] = []
+    widths: list[float] = []
+    for r in range(0, n, step):
+        cols = np.nonzero(free[r])[0]
+        if cols.size == 0:
+            continue
+        ex = extent - (r + 0.5) * res
+        ey_right = extent - (cols.max() + 0.5) * res
+        ey_left = extent - (cols.min() + 0.5) * res
+        # Gate on the NEAR field only: that is the band the validated
+        # width buckets come from, and far rows can spill onto junctions.
+        if 3.0 <= ex <= 15.0:
+            widths.append(ey_left - ey_right)
+        if ex < 0.5:
+            continue
+        ey = ey_right + lane_half_m
+        pts.append((float(pos[0]) + ex * ch - ey * sh,
+                    float(pos[1]) + ex * sh + ey * ch))
+    if len(widths) < 3 or float(np.median(widths)) > max_width_m:
+        return None
+    if len(pts) < 3:
+        return None
+    arr = np.asarray(pts, dtype=float)
+    d = arr - np.asarray(pos[:2], dtype=float)
+    fwd_m = d[:, 0] * ch + d[:, 1] * sh
+    ahead = arr[fwd_m > 0.5]
+    if len(ahead) < 3:
+        return None
+    ahead = ahead[np.argsort(np.linalg.norm(
+        ahead - np.asarray(pos[:2], dtype=float), axis=1))]
+    if float(np.linalg.norm(
+            ahead[0] - np.asarray(pos[:2], dtype=float))) > 2.0:
+        ahead = np.vstack([np.asarray(pos[:2], dtype=float), ahead])
+    return ahead if len(ahead) >= 3 else None
+
+
 @dataclass
 class LaneReference:
     """One tick's lane-keep decision, ready for planner/safety/telemetry."""
@@ -207,6 +297,8 @@ def select_lane_reference(
     lane_consistency_m: float = 1.5,
     lane_consistency_sensor_m: float = 2.5,
     map_lane_width_m: float = LANE_WIDTH_DEFAULT_M,
+    corridor_fallback: bool = False,
+    corridor_max_width_m: float = CORRIDOR_LANE_MAX_WIDTH_M,
     warn=None,
 ) -> LaneReference:
     """Decide which lane geometry may steer the car this tick.
@@ -471,6 +563,17 @@ def select_lane_reference(
             lane_width = 0.0
             lane_src_sel = SRC_UNAVAILABLE
             map_lane = None
+            # Pairing-free PERCEPTION fallback, flag-gated (default OFF):
+            # on a two-lane road the free corridor's right edge + half a
+            # lane IS the ego-lane centre - sensor-derived, never map.
+            # Roads wider than the validated gate abstain, so strict mode
+            # still fails closed exactly where the assumption breaks.
+            if corridor_fallback and grid is not None:
+                _corridor = bev_corridor_lane_center(
+                    grid, pos, heading, max_width_m=corridor_max_width_m)
+                if _corridor is not None and len(_corridor) >= 3:
+                    lane_ref = _corridor
+                    lane_src_sel = SRC_CORRIDOR
         if lane_src_sel == SRC_SENSOR:
             map_lane = None
         src_published = True

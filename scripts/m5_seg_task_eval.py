@@ -45,9 +45,18 @@ from beamng_autopilot.vision.hydra import FrameContext
 from beamng_autopilot.vision.ring import CAMERA_RING, FRONT_MAIN
 from beamng_autopilot.vision.segmentation import Segmenter
 
-# Ego-lane centre under right-hand traffic: half a lane width (3.5 m) right
-# of the centre line reads as -1.75 m in the car frame (left positive).
-EGO_LANE_CENTRE_M = -1.75
+# The paired centre is the MIDPOINT of the two detected lane boundaries, so
+# when the car sits in its own lane it reads ~0 m in the car frame (left
+# positive).  CORRECTION 2026-09-11: this used to be -1.75, which is the
+# "centred" value of a different quantity - the offset from a single line
+# (``line_lat``; fsd_drive.py's corrector comment says "+1.75 centred").
+# Using -1.75 for the paired centre mis-measured it by a full half lane:
+# on town episodes the GT paint midpoint and the recorded plan both give
+# ~0 (GT p50 +0.33/+0.73, trajectory p50 +0.18/+0.07), and the wrong target
+# flipped the model ranking (v13b in-lane 19% vs hand 18% under -1.75;
+# 92% vs 52% under 0).  Re-run model selection with this value before
+# trusting any checkpoint pin.
+EGO_LANE_CENTRE_M = 0.0
 IN_LANE_TOL_M = 1.2
 
 
@@ -68,17 +77,19 @@ def measure(model: str | None, eps: list[Path]) -> dict:
     for ep in eps:
         if not Path(ep).is_file():
             continue
+        sem.reset()
         d = np.load(ep, allow_pickle=True)
         meta = json.loads(bytes(d["meta"]).decode())
         cam = mount.camera_model(int(meta["cam_w"]), int(meta["cam_h"]))
         xs, ys, hds, rgbs = d["x"], d["y"], d["heading"], d["rgb"]
+        ts = d["t"]
         ep_frames = ep_paired = 0
         for i in range(len(xs)):
             pos = np.array([float(xs[i]), float(ys[i]), 0.0])
             heading = float(hds[i])
             ctx = FrameContext(frame_rgb=np.asarray(rgbs[i], np.uint8), cam=cam,
                                pos=pos, heading=heading, ground_z=0.0,
-                               role="front_main")
+                               role="front_main", timestamp=float(ts[i]))
             out = sem.run(ctx)
             marks = list(out.meta.get("markings") or [])
             frame = pair_lane_markings(marks, pos, heading) if marks else None

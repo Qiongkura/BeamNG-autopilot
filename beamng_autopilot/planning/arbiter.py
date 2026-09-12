@@ -31,6 +31,8 @@ from dataclasses import dataclass
 
 import numpy as np
 
+from beamng_autopilot.fsd_realism import SRC_CORRIDOR
+
 
 @dataclass
 class ArbiterOutcome:
@@ -95,12 +97,18 @@ def strict_lane_unavailable(strict: bool, plan_blocked,
     lateral policy.  The lane lock (``lane_src_sel``) is read as a
     second, independent signal: a missing lock must not unblock motion
     even when the block flag is absent (docs/fsd_realism.md §4).
+
+    ``corridor`` is the width-gated pairing-free PERCEPTION candidate
+    (free corridor right edge + half a lane).  It only ever reaches this
+    check when the lane owner produced it, so accepting the label here
+    cannot unlock map-driven motion: with the feature off the label never
+    occurs and behaviour is unchanged.
     """
     if not strict:
         return False
     if str(plan_blocked or "") == "no_perception_lane":
         return True
-    return str(lane_src_sel or "") != "sensor"
+    return str(lane_src_sel or "") not in ("sensor", SRC_CORRIDOR)
 
 
 def arbitrate_fsd_tick(fsd_path, rule_path, *, fsd_safe: bool = True,

@@ -79,7 +79,7 @@ def _stale_frames(card: Path) -> int | None:
 
 
 def _run_arm(scenario: str, env: dict[str, str],
-             started_at: float) -> tuple[dict | None, str]:
+             started_at: float, extra=None) -> tuple[dict | None, str]:
     """Run one arm; return (record, error_tail).
 
     Only a scorecard written AFTER ``started_at`` counts.  Without that
@@ -90,7 +90,7 @@ def _run_arm(scenario: str, env: dict[str, str],
     """
     proc = subprocess.run(
         [str(PYEXE), "scripts/m5_fsd_benchmark.py", "--attach",
-         "--runtime", "tech", "--scenarios", scenario],
+         "--runtime", "tech", "--scenarios", scenario] + list(extra or []),
         cwd=str(ROOT), env=env, capture_output=True, text=True)
     card = _newest_scorecard()
     if card is None or card.stat().st_mtime <= started_at:
@@ -111,8 +111,14 @@ def _run_arm(scenario: str, env: dict[str, str],
 
 def main() -> int:
     ap = argparse.ArgumentParser(description="same-session live A/B")
-    ap.add_argument("--factor", required=True,
-                    help="env switch compared at 0 (off) vs 1 (on)")
+    ap.add_argument("--factor", default=None,
+                    help="env switch compared at 0 (off) vs 1 (on); "
+                         "omit when --seg-models is used")
+    ap.add_argument("--seg-models", default=None,
+                    help="alternatively alternate the benchmark's "
+                         "--seg-model between two checkpoints "
+                         "(comma-separated) - e.g. to settle a scenario "
+                         "pin; --factor must be omitted")
     ap.add_argument("--arms", type=int, default=5,
                     help="runs PER condition (default 5)")
     ap.add_argument("--scenario", default="town")
@@ -123,32 +129,51 @@ def main() -> int:
     if args.arms < 1:
         print("[ab] --arms must be >= 1")
         return 2
+    if bool(args.factor) == bool(args.seg_models):
+        print("[ab] pass exactly one of --factor / --seg-models")
+        return 2
+    if args.seg_models:
+        parts = [p.strip() for p in args.seg_models.split(",") if p.strip()]
+        if len(parts) != 2:
+            print("[ab] --seg-models needs exactly two comma-separated "
+                  "checkpoints")
+            return 2
+        # CLI --seg-model overrides the scenario pin (scenario_args only
+        # applies its pin when the CLI did not set one), so the two
+        # conditions are exactly the two checkpoints on the same scenario.
+        conditions = [(Path(p).parent.name, ["--seg-model", p])
+                      for p in parts]
+    else:
+        conditions = [(f"{args.factor}=0", []),
+                      (f"{args.factor}=1", [])]
 
     base = _watch_hashes()
-    print(f"[ab] factor={args.factor} arms/condition={args.arms} "
-          f"pinned={args.pin}")
+    print(f"[ab] conditions={[c[0] for c in conditions]} "
+          f"arms/condition={args.arms} pinned={args.pin}")
     print(f"[ab] code: {base}")
     rows: list[dict] = []
     for i in range(args.arms):
-        for value in ("0", "1"):          # interleaved, drift is shared
-            env = dict(os.environ, **{args.factor: value})
+        for label, extra in conditions:   # interleaved, drift is shared
+            env = dict(os.environ)
+            if args.factor:
+                env[args.factor] = label.split("=", 1)[1]
             for item in args.pin:
                 name, _, val = item.partition("=")
                 env[name.strip()] = val.strip()
             t0 = time.time()
-            rec, err = _run_arm(args.scenario, env, t0)
+            rec, err = _run_arm(args.scenario, env, t0, extra)
             changed = _watch_hashes() != base
             base = _watch_hashes()
             if changed:
                 print("[ab] !! watched code changed during this arm - "
                       "run set invalidated")
             if rec is None:
-                print(f"[ab] arm {args.factor}={value}: NO RESULT "
+                print(f"[ab] arm {label}: NO RESULT "
                       f"({time.time() - t0:.0f}s) - {err}")
                 continue
-            rec["value"] = value
+            rec["value"] = label
             rows.append(rec)
-            print(f"[ab] arm {args.factor}={value} "
+            print(f"[ab] arm {label} "
                   f"lane={rec['lane_sensor_rate'] or 0:.0%} "
                   f"stall={rec['stall_frames']} "
                   f"crossC={rec['cross_centre_frames']} "
@@ -163,14 +188,14 @@ def main() -> int:
               "--runtime tech)")
         return 2
     print("\n[ab] === per condition ===")
-    for value in ("0", "1"):
-        sel = [r for r in rows if r["value"] == value]
+    for label, _extra in conditions:
+        sel = [r for r in rows if r["value"] == label]
         if not sel:
             continue
         stall = sorted(r["stall_frames"] for r in sel)
         lane = sorted(r["lane_sensor_rate"] or 0.0 for r in sel)
         dist = sorted(r["travelled_m"] for r in sel)
-        print(f"[ab] {args.factor}={value} n={len(sel)} | "
+        print(f"[ab] {label} n={len(sel)} | "
               f"lane p50={statistics.median(lane):.0%} | "
               f"stall p50={statistics.median(stall):.0f} "
               f"range={stall[0]}-{stall[-1]} | "

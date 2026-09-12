@@ -265,8 +265,14 @@ class FSDStack:
                  semantic_every_n: int = 1,
                  object_every_n: int = 1,
                  lane_mode: str = "map",
-                 strict_sensor: bool = False):
+                 strict_sensor: bool = False,
+                 corridor_fallback: bool = False):
         self.conn = conn
+        # Pairing-free strict-mode lane fallback (bev corridor right edge
+        # + half a lane, width-gated).  Default OFF: it changes which
+        # frames strict mode drives on, so it goes through live A/B
+        # before it becomes a default.
+        self.corridor_fallback = bool(corridor_fallback)
         self.grid_n = int(grid_n)
         self.grid_res = float(grid_res)
         self.heads = list(heads) if heads else []
@@ -795,6 +801,7 @@ class FSDStack:
                 self, "lane_consistency_sensor_m", 2.5),
             map_lane_width_m=getattr(
                 self, "map_lane_width_m", LANE_WIDTH_DEFAULT_M),
+            corridor_fallback=getattr(self, "corridor_fallback", False),
             warn=_warn_once,
         )
         lane_ref = lane_ref_out.center
@@ -1207,6 +1214,12 @@ class FSDStack:
         # must not be held against the new tick's selection.
         self._lane_ref_prev = None
         self._lane_ref_hold_t = 0.0
+        # Heads may hold location-bound temporal state of their own
+        # (semantic head: world-space line evidence) - clear it too.
+        for _h in getattr(self, "heads", None) or []:
+            _rst = getattr(_h, "reset", None)
+            if callable(_rst):
+                _rst()
 
     def close(self) -> None:
         if self.ring is not None:

@@ -330,6 +330,18 @@ def main() -> None:
                          "梯度（v9 教训：稀疏 run 淹没密集 run）")
     ap.add_argument("--line-weight", type=float, default=2.0,
                     help="extra multiplier on the line class loss weight")
+    ap.add_argument("--line-tversky-weight", type=float, default=1.0,
+                    help="line-channel Tversky term weight (FN>FP, thin-line "
+                         "recall); 0 disables and falls back to pure "
+                         "weighted CE")
+    ap.add_argument("--line-cldice-weight", type=float, default=1.0,
+                    help="line-channel soft-clDice term weight (keeps the "
+                         "predicted line connected); 0 disables")
+    ap.add_argument("--line-tversky-alpha", type=float, default=0.3,
+                    help="Tversky FP weight; alpha=beta=0.5 即无偏 Dice")
+    ap.add_argument("--line-tversky-beta", type=float, default=0.7,
+                    help="Tversky FN weight (beta>alpha 提细线召回,但实测"
+                         "会把配对中心拉偏,见 logs/_task_v13_cldice.json)")
     # 任务指标早停：本栈上 val_mIoU 与成对率反相关，按 mIoU 选检查点会挑错
     # epoch（docs/lateral_reference_diag_20260911.md §15）。
     ap.add_argument("--task-eval-every", type=int, default=0, metavar="N",
@@ -417,8 +429,17 @@ def main() -> None:
               flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
-    crit = nn.CrossEntropyLoss(weight=weights.to(device),
-                               ignore_index=255)
+    # 加权 CE 之外对 line 通道再加两个区域项：Tversky(FN>FP, 细线召回)
+    # + soft-clDice(连通性, 治断线帧)。权重 0 即回退历史纯 CE 行为。
+    from beamng_autopilot.vision.seg_losses import LineSegLoss
+    crit = LineSegLoss(weight=weights.to(device), ignore_index=255,
+                       w_tversky=args.line_tversky_weight,
+                       w_cldice=args.line_cldice_weight,
+                       tversky_alpha=args.line_tversky_alpha,
+                       tversky_beta=args.line_tversky_beta)
+    if args.line_tversky_weight > 0 or args.line_cldice_weight > 0:
+        print(f"[train] line region loss: tversky={args.line_tversky_weight} "
+              f"cldice={args.line_cldice_weight}", flush=True)
     use_amp = (device == "cuda") and not args.no_amp
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
@@ -540,12 +561,18 @@ def main() -> None:
             val_frames, train=False, ep=ep)
         m_iou = (float(va_ious[va_present].mean())
                  if va_present.any() else 0.0)
+        # 目标指标单独入史：line 类 IoU 是本训练真正要抬的量,mIoU 被路面
+        # 类主导,看不出 line 的起落。
+        line_iou_ep = float(va_ious[2]) if va_present[2] else None
         hist["epoch"].append(ep)
         hist["train_loss"].append(round(tr_loss, 4))
         hist["val_miou"].append(round(m_iou, 4))
         hist["val_acc"].append(round(va_acc, 4))
+        hist.setdefault("val_line_iou", []).append(
+            None if line_iou_ep is None else round(line_iou_ep, 4))
         print(f"[train] ep {ep:02d}  loss={tr_loss:.4f} "
               f"val_acc={va_acc:.3f} val_mIoU={m_iou:.4f} "
+              f"val_lineIoU={'n/a' if line_iou_ep is None else round(line_iou_ep, 4)} "
               f"({time.time() - t0:.0f}s)", flush=True)
         if m_iou > best_miou:
             best_miou = m_iou
@@ -560,6 +587,10 @@ def main() -> None:
                 # 超参随模型落盘：复现/对比不同 --line-weight 轮次有据可查
                 "train_args": {
                     "line_weight": args.line_weight,
+                    "line_tversky_weight": args.line_tversky_weight,
+                    "line_cldice_weight": args.line_cldice_weight,
+                    "line_tversky_alpha": args.line_tversky_alpha,
+                    "line_tversky_beta": args.line_tversky_beta,
                     "line_morph": args.line_morph,
                     "amp": use_amp,
                     "epochs": args.epochs,
@@ -588,6 +619,10 @@ def main() -> None:
             "hist": hist,
             "train_args": {
                 "line_weight": args.line_weight,
+                "line_tversky_weight": args.line_tversky_weight,
+                "line_cldice_weight": args.line_cldice_weight,
+                "line_tversky_alpha": args.line_tversky_alpha,
+                "line_tversky_beta": args.line_tversky_beta,
                 "line_morph": args.line_morph,
                 "amp": use_amp,
                 "epochs": args.epochs,
@@ -683,6 +718,10 @@ def main() -> None:
             "val_miou": None, "val_ious": [], "val_acc": None,
             "weights": weights.tolist(),
             "train_args": {"line_weight": args.line_weight,
+                           "line_tversky_weight": args.line_tversky_weight,
+                           "line_cldice_weight": args.line_cldice_weight,
+                           "line_tversky_alpha": args.line_tversky_alpha,
+                           "line_tversky_beta": args.line_tversky_beta,
                            "line_morph": args.line_morph,
                            "amp": use_amp, "epochs": args.epochs,
                            "batch": args.batch, "lr": args.lr,

@@ -225,6 +225,7 @@ def _single_cause(markings, pos, heading: float, dbg: dict) -> str:
 def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
                     verbose: bool, diagnose: bool = False,
                     gt_audit: bool = False) -> dict:
+    sem.reset()
     d = np.load(ep, allow_pickle=True)
     meta = json.loads(bytes(d["meta"]).decode("utf-8")) if "meta" in d.files \
         else {}
@@ -274,7 +275,8 @@ def measure_episode(ep: str, *, frames: int, sem: SemanticHead,
         heading = float(hds[i])
         rgb = np.asarray(rgbs[i], dtype=np.uint8)
         ctx = FrameContext(frame_rgb=rgb, cam=cam, pos=pos,
-                           heading=heading, ground_z=0.0, role="front_main")
+                           heading=heading, ground_z=0.0, role="front_main",
+                           timestamp=float(t[i]))
         out = sem.run(ctx)
         markings = list(out.meta.get("markings") or [])
         n_marks.append(len(markings))
@@ -493,6 +495,10 @@ def main() -> int:
     ap.add_argument("--pattern", type=str, default="shadow_fsd_*.npz")
     ap.add_argument("--episodes", type=int, default=1,
                     help="how many NEWEST episodes to measure")
+    ap.add_argument("--episode-names", type=str, default=None,
+                    help="comma-separated pinned episode file names "
+                         "(overrides --episodes; shadow sets grow on every "
+                         "live drive, so cross-time comparisons must pin)")
     ap.add_argument("--frames", type=int, default=40,
                     help="frames sampled per episode (0 = all)")
     ap.add_argument("--all-frames", action="store_true",
@@ -512,7 +518,11 @@ def main() -> int:
     if not eps:
         print(f"no episodes matching {args.pattern} in {data_dir}")
         return 1
-    eps = eps[-max(1, args.episodes):]
+    if args.episode_names:
+        eps = [str(data_dir / n.strip())
+               for n in args.episode_names.split(",") if n.strip()]
+    else:
+        eps = eps[-max(1, args.episodes):]
 
     from beamng_autopilot.vision.segmentation import Segmenter
     try:

@@ -32,6 +32,10 @@ def main() -> int:
     ap.add_argument("--runtime", choices=("auto", "steam", "tech"),
                     default="auto")
     ap.add_argument("--attach", action="store_true")
+    ap.add_argument("--map", type=str, default=None,
+                    help="BeamNG map/level to drive on (default italy; "
+                         "with --attach this forces a scenario load to "
+                         "switch the running instance to the map)")
     ap.add_argument("--seconds", type=float, default=20.0)
     ap.add_argument("--speed", type=float, default=6.0)
     ap.add_argument("--steps", type=int, default=3)
@@ -57,6 +61,17 @@ def main() -> int:
                     help="FSD realism mode (docs/fsd_realism.md): with "
                          "--lane-mode sensor the map lane may NEVER lead; "
                          "no paired perception lane -> no-lane degradation")
+    ap.add_argument("--allow-unplaced", action="store_true",
+                    help="collection mode: on cross-map lane-placement "
+                         "failure keep driving unplaced instead of aborting")
+    ap.add_argument("--corridor-lane", action="store_true",
+                    help="REFUTED LIVE, kept only as the recorded negative "
+                         "result: the corridor's right edge is the ROAD edge "
+                         "(spills ~1.9 m past the lane line on town), so "
+                         "the candidate pointed 1.24 m off the lane centre "
+                         "on 52.7%% of frames (town_1789142315).  Do not "
+                         "enable without a redesign anchored to painted "
+                         "lines.")
     ap.add_argument("--e2e-model", type=str, default=None,
                     help="trained E2ENetTorch checkpoint to rank as the "
                          "neural planning candidate (default: "

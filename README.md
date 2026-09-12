@@ -246,6 +246,20 @@ GPU 显存 6GB 以上（YOLO 检测 + HUD 可视化需要）
 
 ## 学习式路面/标线分割（M5-B）
 
+> **Annotation 使用边界**：专用 `m5_collect_seg.py` 已默认开启 RGB + annotation；
+> 仅用于训练标签和离线评测，不给驾驶模型、规划器或丢线兜底提供答案。
+> 新采集帧保留 `colour` / `label`、对齐的 `annotation`、原分辨率
+> `annotation_raw` 及 `label_source`；run 元数据记录调色板和逐帧标线像素数。
+> `annotation_review_required=true` 表示仍需抽查地图材质映射及 RGB/标签对齐，
+> 有标线像素不等于标注完整；没有标线像素也可能是正常无标线路段。
+> 采集器会在 Tech 会话开始时读取 `get_annotations()` 的活动调色板，避免把
+> 当前 italy 中的天空色误当成路面色；离线旧工具仍保留静态兼容调色板。
+> 旧 shadow 录像中的模型预测标签不能冒充独立真值。
+> 请在其他控车/采集任务退出后独占采集；不要用 `--no-step` 当作不控车模式。
+> 建议先用 `--runtime tech --frames 20 --segments 1` 小批检查，再采集与训练；
+> 使用新的 run 名，脚本拒绝覆盖已有目录。启用标签不会自动训练或替换驾驶模型。
+
+
 传统 CV 颜色阈值在 Tech 真渲染帧上失效（实测标线 recall 1.5%、边界误差
 0.8-1.0m）。替代方案：用 BeamNG.tech 的 annotation 像素真值训练轻量 UNet
 （背景 / 路面 / 标线 3 类），推理只吃 RGB 帧，Steam / Tech 通用。

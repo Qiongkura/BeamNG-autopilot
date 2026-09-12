@@ -124,6 +124,7 @@ _DRIVE_ARG_DEFAULTS = {
     "no_signal": False,
     "ring": "front",
     "no_shadow": False,
+    "corridor_lane": False,
 }
 
 
@@ -210,6 +211,10 @@ def main() -> int:
     ap.add_argument("--traffic", type=int, default=0, metavar="N",
                     help="park N NPC vehicles along the route")
     ap.add_argument("--no-signal", action="store_true")
+    ap.add_argument("--corridor-lane", action="store_true",
+                    help="REFUTED LIVE (town_1789142315: candidate 1.24 m "
+                         "off lane centre on 52.7%% of frames; kept only as "
+                         "the recorded negative result)")
     ap.add_argument("--goal", nargs=2, type=float, default=None,
                     metavar=("X", "Y"))
     args = ap.parse_args()
@@ -233,6 +238,7 @@ def main() -> int:
         "seg_model": args.seg_model,
         "traffic": int(args.traffic),
         "no_signal": args.no_signal,
+        "corridor_lane": bool(getattr(args, "corridor_lane", False)),
         "goal": (list(args.goal) if args.goal is not None else None),
     }
 
