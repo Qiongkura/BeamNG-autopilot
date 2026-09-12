@@ -49,6 +49,14 @@ SCENARIOS: dict[str, dict] = {
         "teleport": (729.6, 763.9, 45.0),
         "goal": (616.2, 894.5),
         "require_goal": False,
+        # Explicit pin.  Without one this scenario silently used the
+        # deployed default, which is byte-identical to seg_model_v12 - and
+        # v8 beats v12 on the objective metric (annotation-GT line IoU) on
+        # EVERY collected dataset, this one included: v8 0.2092 vs v12
+        # 0.1313 vs v13b 0.0208 (2026-09-11 matrix).  The user's manual
+        # stroke gate rates v13b 72.9% here, but v13b has a 0.02 line IoU on
+        # this domain, so that metric is a sanity check, not a selector.
+        "seg_model": "logs/m5_seg/seg_model_v8_backup/best.pt",
         "note": "mountain hairpin start (README real-vehicle record); "
                 "goal ~200 m along the road graph so a nav route exists "
                 "on a fresh game (no-route = known crawl behaviour)",
@@ -66,11 +74,16 @@ SCENARIOS: dict[str, dict] = {
         # never a map-lane drive.
         "lane_mode": "sensor",
         "strict": True,
-        # Domain-specific segmentation: v13b carries the user's manual
-        # town line annotations (85.1% tolerance recall vs 71.6% v12)
-        # but regresses mountain (0.02 IoU) - town only, mountain keeps
-        # the deployed v8/v12 checkpoint.
-        "seg_model": "logs/m5_seg/seg_model_v13b/best.pt",
+        # Domain-specific segmentation.  v13b (the user's manual town line
+        # annotations, 85.1% tolerance recall) paired most often but its
+        # centres landed left of the ego lane; the 2026-09-11 full recipe +
+        # hand labels + per-epoch task-metric selection produced
+        # seg_model_hand (paired 16.2%, in-lane 57.2% vs v13b's 24.3% /
+        # 25.8%), and on 5 live town arms each - same session, alternating -
+        # it passed off/crossC/crossR = 0 on 5/5 (v13b 2/5 for off-road,
+        # one crossC) with lower stall (p50 115 vs 137) and higher
+        # availability (p50 27% vs 19%).  Mountain keeps its own pin.
+        "seg_model": "logs/m5_seg/seg_model_hand/best_task.pt",
         "note": "town route (start node 22209, goal ~90 m along the "
                 "road graph); --traffic adds parked NPC vehicles for "
                 "YOLO / obstacle-fusion verification",
@@ -111,6 +124,7 @@ _DRIVE_ARG_DEFAULTS = {
     "no_signal": False,
     "ring": "front",
     "no_shadow": False,
+    "corridor_lane": False,
 }
 
 
@@ -197,6 +211,10 @@ def main() -> int:
     ap.add_argument("--traffic", type=int, default=0, metavar="N",
                     help="park N NPC vehicles along the route")
     ap.add_argument("--no-signal", action="store_true")
+    ap.add_argument("--corridor-lane", action="store_true",
+                    help="REFUTED LIVE (town_1789142315: candidate 1.24 m "
+                         "off lane centre on 52.7%% of frames; kept only as "
+                         "the recorded negative result)")
     ap.add_argument("--goal", nargs=2, type=float, default=None,
                     metavar=("X", "Y"))
     args = ap.parse_args()
@@ -220,6 +238,7 @@ def main() -> int:
         "seg_model": args.seg_model,
         "traffic": int(args.traffic),
         "no_signal": args.no_signal,
+        "corridor_lane": bool(getattr(args, "corridor_lane", False)),
         "goal": (list(args.goal) if args.goal is not None else None),
     }
 

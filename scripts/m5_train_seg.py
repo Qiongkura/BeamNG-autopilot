@@ -50,13 +50,22 @@ from beamng_autopilot.vision.segmentation import (
 def load_frames(
     run_dirs: list[Path], min_line_frac: float = 0.0,
     line_only_dirs: set[str] | None = None,
+    thin_line: int = 0,
 ) -> tuple[list[tuple[np.ndarray, np.ndarray]], dict]:
     """读取所有 npz 帧，按文件名排序（时间序）。
 
     ``min_line_frac > 0`` 时丢弃标线像素占比低于阈值的帧。返回
     (frames, per_run)：per_run[run_name] 记录该 run 的帧总数/保留数/
     标线像素占比/在拼接列表中的 [start, end) 下标，供 per-run 验证划分。
+
+    ``thin_line > 0`` 把标线目标侵蚀 N 个像素，教模型学**细**车道线：标注的
+    line 类（与用户手绘 4-6 px 笔画）比"配对真正消费的那条细线"宽，而
+    2026-09-11 的实验证明两者不是同一个目标（标注 line IoU 与配对率单调反
+    相关）。``cv2.ximgproc`` 不可用，形态学侵蚀是最便宜的骨架化近似。全标注
+    集里被侵蚀的边缘记作路面(1)；line-only 人工集里周围本就未知，记作忽略(255)。
     """
+    import cv2
+
     frames: list[tuple[np.ndarray, np.ndarray]] = []
     per_run: dict[str, dict] = {}
     line_only_dirs = line_only_dirs or set()
@@ -79,6 +88,19 @@ def load_frames(
                 # hand annotations mark ONLY line pixels; every other
                 # pixel is unknown, not background/road
                 label = np.where(label == 2, 2, 255).astype(np.uint8)
+            if thin_line > 0:
+                line = (label == 2).astype(np.uint8)
+                if line.any():
+                    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+                    thin = cv2.erode(line, k, iterations=int(thin_line))
+                    removed = (line > 0) & (thin == 0)
+                    # Full-label scenes: the eroded border is road.  A
+                    # line-only set has no information around the stroke, so
+                    # there it stays unknown (already 255) rather than being
+                    # taught as road.
+                    if not (rd.name in line_only_dirs):
+                        label = np.where(removed, 1, label).astype(np.uint8)
+                    label = np.where(thin > 0, 2, label).astype(np.uint8)
             n_pix = colour.shape[0] * colour.shape[1]
             line_px += int((label == 2).sum())
             n_run += 1
@@ -284,6 +306,11 @@ def main() -> None:
                     help="数据目录（可多个，如 logs/m5_seg/run_*）")
     ap.add_argument("--line-only-runs", nargs="*", default=[],
                     help="只标了标线的人工标注目录；非 line 像素忽略(255)，不当作背景")
+    ap.add_argument("--thin-line-labels", type=int, default=0, metavar="N",
+                    help="把标线目标侵蚀 N 像素以教模型学「细」车道线"
+                         "（0=关闭）。标注的 line 类比配对消费的细线宽，"
+                         "见 2026-09-11 的 IoU 与配对率反相关结论；"
+                         "cv2.ximgproc 不可用时这是最便宜的骨架化近似。")
     ap.add_argument("--train-only-runs", nargs="*", default=[],
                     help="只进训练、不切到验证集的人工标注目录")
     ap.add_argument("--epochs", type=int, default=40)
@@ -303,6 +330,33 @@ def main() -> None:
                          "梯度（v9 教训：稀疏 run 淹没密集 run）")
     ap.add_argument("--line-weight", type=float, default=2.0,
                     help="extra multiplier on the line class loss weight")
+    ap.add_argument("--line-tversky-weight", type=float, default=1.0,
+                    help="line-channel Tversky term weight (FN>FP, thin-line "
+                         "recall); 0 disables and falls back to pure "
+                         "weighted CE")
+    ap.add_argument("--line-cldice-weight", type=float, default=1.0,
+                    help="line-channel soft-clDice term weight (keeps the "
+                         "predicted line connected); 0 disables")
+    ap.add_argument("--line-tversky-alpha", type=float, default=0.3,
+                    help="Tversky FP weight; alpha=beta=0.5 即无偏 Dice")
+    ap.add_argument("--line-tversky-beta", type=float, default=0.7,
+                    help="Tversky FN weight (beta>alpha 提细线召回,但实测"
+                         "会把配对中心拉偏,见 logs/_task_v13_cldice.json)")
+    # 任务指标早停：本栈上 val_mIoU 与成对率反相关，按 mIoU 选检查点会挑错
+    # epoch（docs/lateral_reference_diag_20260911.md §15）。
+    ap.add_argument("--task-eval-every", type=int, default=0, metavar="N",
+                    help="每 N 轮用配对任务（scripts/m5_seg_task_eval.py）评估"
+                         "当前权重，保留 best_task.pt；0=关（默认）")
+    ap.add_argument("--task-episodes", type=int, default=4,
+                    help="任务评估取最新 N 个影子 episode（默认 4）")
+    ap.add_argument("--task-episode-names", nargs="*", default=None,
+                    help="固定任务评估的 episode 文件名：影子集随每次实车增长，"
+                         "不固定就无法跨训练比较")
+    ap.add_argument("--task-min-in-lane", type=float, default=0.20,
+                    metavar="F",
+                    help="best_task.pt 的准入门槛：成对率再高，若该轮的 in-lane "
+                         "低于 F 也不选（可用率与横向正确性在 epoch 间互相交换，"
+                         "只按成对率会选中「配对多但中心错」的权重，默认 0.20）")
     ap.add_argument("--line-morph", action="store_true",
                     help="enable line morphology augmentation (default "
                          "off: v7 ablation showed it hurts line IoU)")
@@ -339,7 +393,8 @@ def main() -> None:
     train_only_runs = {Path(p).name for p in args.train_only_runs}
     frames, per_run = load_frames([Path(p) for p in args.runs],
                                   args.min_line_frac,
-                                  line_only_dirs=line_only_dirs)
+                                  line_only_dirs=line_only_dirs,
+                                  thin_line=int(args.thin_line_labels or 0))
     n = len(frames)
     train_frames, val_frames = split_frames(
         frames, per_run, args.split, args.val_frac,
@@ -374,8 +429,17 @@ def main() -> None:
               flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
-    crit = nn.CrossEntropyLoss(weight=weights.to(device),
-                               ignore_index=255)
+    # 加权 CE 之外对 line 通道再加两个区域项：Tversky(FN>FP, 细线召回)
+    # + soft-clDice(连通性, 治断线帧)。权重 0 即回退历史纯 CE 行为。
+    from beamng_autopilot.vision.seg_losses import LineSegLoss
+    crit = LineSegLoss(weight=weights.to(device), ignore_index=255,
+                       w_tversky=args.line_tversky_weight,
+                       w_cldice=args.line_cldice_weight,
+                       tversky_alpha=args.line_tversky_alpha,
+                       tversky_beta=args.line_tversky_beta)
+    if args.line_tversky_weight > 0 or args.line_cldice_weight > 0:
+        print(f"[train] line region loss: tversky={args.line_tversky_weight} "
+              f"cldice={args.line_cldice_weight}", flush=True)
     use_amp = (device == "cuda") and not args.no_amp
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
@@ -465,6 +529,28 @@ def main() -> None:
         print(f"[train] 从 {args.resume} 续训, 从 epoch {start_ep} 继续 "
               f"(共 {args.epochs})", flush=True)
 
+    # 任务指标校验（opt-in）：本栈上 val_mIoU 与配对任务**反相关**
+    # （`scripts/m5_seg_task_eval.py`、docs/lateral_reference_diag_20260911.md
+    # §15），所以按 mIoU 选 best.pt 会挑到错误的 epoch。--task-eval-every N
+    # 每 N 轮用同一个评估口径量一次成对率并保留 best_task.pt；episode 列表
+    # 在训练前解析一次，训练中不漂移（影子集会随每次实车增长）。
+    task_eps = None
+    task_measure = None
+    best_task = float(ckpt.get("best_task", -1.0)) if start_ep else -1.0
+    if args.task_eval_every > 0:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from m5_seg_task_eval import _episodes as _task_eps
+        from m5_seg_task_eval import measure as _task_measure
+        task_measure = _task_measure
+        task_eps = _task_eps(config.LOGS_DIR / "m5_e2e", "shadow_fsd_*.npz",
+                             args.task_episode_names, args.task_episodes)
+        hist.setdefault("task_paired", [])
+        hist.setdefault("task_in_lane", [])
+        print(f"[train] 任务评估每 {args.task_eval_every} 轮："
+              f"{len(task_eps)} 个 episode"
+              f"{'（固定）' if args.task_episode_names else '（最新 N）'}",
+              flush=True)
+
     for ep in range(start_ep, args.epochs):
         t0 = time.time()
         tr_loss, tr_acc, _, _ = run_epoch(
@@ -475,12 +561,18 @@ def main() -> None:
             val_frames, train=False, ep=ep)
         m_iou = (float(va_ious[va_present].mean())
                  if va_present.any() else 0.0)
+        # 目标指标单独入史：line 类 IoU 是本训练真正要抬的量,mIoU 被路面
+        # 类主导,看不出 line 的起落。
+        line_iou_ep = float(va_ious[2]) if va_present[2] else None
         hist["epoch"].append(ep)
         hist["train_loss"].append(round(tr_loss, 4))
         hist["val_miou"].append(round(m_iou, 4))
         hist["val_acc"].append(round(va_acc, 4))
+        hist.setdefault("val_line_iou", []).append(
+            None if line_iou_ep is None else round(line_iou_ep, 4))
         print(f"[train] ep {ep:02d}  loss={tr_loss:.4f} "
               f"val_acc={va_acc:.3f} val_mIoU={m_iou:.4f} "
+              f"val_lineIoU={'n/a' if line_iou_ep is None else round(line_iou_ep, 4)} "
               f"({time.time() - t0:.0f}s)", flush=True)
         if m_iou > best_miou:
             best_miou = m_iou
@@ -495,6 +587,10 @@ def main() -> None:
                 # 超参随模型落盘：复现/对比不同 --line-weight 轮次有据可查
                 "train_args": {
                     "line_weight": args.line_weight,
+                    "line_tversky_weight": args.line_tversky_weight,
+                    "line_cldice_weight": args.line_cldice_weight,
+                    "line_tversky_alpha": args.line_tversky_alpha,
+                    "line_tversky_beta": args.line_tversky_beta,
                     "line_morph": args.line_morph,
                     "amp": use_amp,
                     "epochs": args.epochs,
@@ -519,9 +615,14 @@ def main() -> None:
             "scaler": scaler.state_dict() if use_amp else None,
             "next_epoch": ep + 1,
             "best_miou": best_miou,
+            "best_task": best_task,
             "hist": hist,
             "train_args": {
                 "line_weight": args.line_weight,
+                "line_tversky_weight": args.line_tversky_weight,
+                "line_cldice_weight": args.line_cldice_weight,
+                "line_tversky_alpha": args.line_tversky_alpha,
+                "line_tversky_beta": args.line_tversky_beta,
                 "line_morph": args.line_morph,
                 "amp": use_amp,
                 "epochs": args.epochs,
@@ -538,6 +639,54 @@ def main() -> None:
             },
         }
         torch.save(ckpt, out_dir / "checkpoint_last.pt")
+
+        # 任务指标：按成对率（而非 mIoU）保留这一轮权重。评估吃刚落盘的
+        # checkpoint_last.pt，因此与最终可复现的权重完全一致。
+        t_paired = t_in_lane = None
+        if task_eps and (ep + 1) % args.task_eval_every == 0:
+            try:
+                tv = task_measure(str(out_dir / "checkpoint_last.pt"), task_eps)
+                t_paired = tv.get("paired_rate")
+                t_in_lane = tv.get("in_lane_rate")
+                print(f"[train]     task paired={t_paired:.1%} "
+                      f"in_lane={t_in_lane:.1%} "
+                      f"lat_p50={tv.get('lat_p50_m')}m", flush=True)
+                # 每个已评估的 epoch 都留一份权重：可用率与横向正确性在 epoch
+                # 之间互相交换，改选门槛后必须能离线重选，不必重训。
+                torch.save({
+                    "state_dict": model.state_dict(),
+                    "n_classes": N_CLASSES,
+                    "class_names": CLASS_NAMES,
+                    "val_miou": round(m_iou, 4),
+                    "task_paired_rate": t_paired,
+                    "task_in_lane_rate": t_in_lane,
+                    "task_lat_p50_m": tv.get("lat_p50_m"),
+                    "task_episodes": [Path(e).name for e in task_eps],
+                    "weights": weights.tolist(),
+                    "train_args": ckpt["train_args"],
+                }, out_dir / f"task_ep{ep:02d}.pt")
+            except Exception as exc:
+                print(f"[train] 任务评估失败: {exc}", flush=True)
+        if task_eps:
+            hist["task_paired"].append(t_paired)
+            hist["task_in_lane"].append(t_in_lane)
+        eligible = (t_paired is not None and t_in_lane is not None
+                    and t_in_lane >= args.task_min_in_lane)
+        if eligible and t_paired > best_task:
+            best_task = float(t_paired)
+            torch.save({
+                "state_dict": model.state_dict(),
+                "n_classes": N_CLASSES,
+                "class_names": CLASS_NAMES,
+                "val_miou": round(m_iou, 4),
+                "task_paired_rate": t_paired,
+                "task_in_lane_rate": t_in_lane,
+                "task_episodes": [Path(e).name for e in task_eps],
+                "weights": weights.tolist(),
+                "train_args": ckpt["train_args"],
+            }, out_dir / "best_task.pt")
+            print(f"[train] 保存最优任务成对率={t_paired:.1%} -> "
+                  f"{out_dir / 'best_task.pt'}", flush=True)
 
     (out_dir / "train_hist.json").write_text(
         json.dumps(hist, ensure_ascii=False, indent=1), encoding="utf-8")
@@ -569,6 +718,10 @@ def main() -> None:
             "val_miou": None, "val_ious": [], "val_acc": None,
             "weights": weights.tolist(),
             "train_args": {"line_weight": args.line_weight,
+                           "line_tversky_weight": args.line_tversky_weight,
+                           "line_cldice_weight": args.line_cldice_weight,
+                           "line_tversky_alpha": args.line_tversky_alpha,
+                           "line_tversky_beta": args.line_tversky_beta,
                            "line_morph": args.line_morph,
                            "amp": use_amp, "epochs": args.epochs,
                            "batch": args.batch, "lr": args.lr,
@@ -578,6 +731,7 @@ def main() -> None:
                            "min_line_frac": args.min_line_frac,
                            "balance_runs": args.balance_runs,
                            "line_only_runs": list(args.line_only_runs),
+                           "thin_line_labels": int(args.thin_line_labels or 0),
                            "train_only_runs": list(args.train_only_runs),
                            "n_train": len(train_frames), "n_val": 0},
         }, out_dir / "best.pt")

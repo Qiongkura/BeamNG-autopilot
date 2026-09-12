@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import glob
+import json
 import os
 import sys
 from pathlib import Path
@@ -61,9 +62,27 @@ def main() -> int:
                                   d["rgb"], d["label"])
     print(f"episode: {os.path.basename(ep)} ({len(t)} frames)")
 
+    # The camera model must match the resolution the frames were recorded
+    # at, or every back-projection is scaled wrong (the episode meta
+    # carries it; hardcoding 400x300 silently mis-projected the 536x403
+    # town episodes this tool is used on).
+    meta: dict = {}
+    if "meta" in d.files:
+        try:
+            meta = json.loads(bytes(d["meta"]).decode("utf-8"))
+        except Exception:
+            meta = {}
+    frame_h, frame_w = np.asarray(rgbs[0]).shape[:2]
+    cam_w = int(meta.get("cam_w", frame_w) or frame_w)
+    cam_h = int(meta.get("cam_h", frame_h) or frame_h)
+    if (cam_w, cam_h) != (frame_w, frame_h):
+        print(f"warning: episode meta says {cam_w}x{cam_h} but frames are "
+              f"{frame_w}x{frame_h}; using the frame size")
+        cam_w, cam_h = frame_w, frame_h
     mount = next(m for m in CAMERA_RING if m.role == FRONT_MAIN)
-    cam = mount.camera_model(400, 300)
+    cam = mount.camera_model(cam_w, cam_h)
     sem = SemanticHead()
+    print(f"camera: {cam_w}x{cam_h} (cx={cam.cx:.1f}, fx={cam.fx:.1f})")
 
     out_dir = (Path(args.out) if args.out
                else config.LOGS_DIR / "m5_vis")

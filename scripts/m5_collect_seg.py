@@ -20,7 +20,6 @@ import sys
 import time
 from pathlib import Path
 
-import cv2
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -28,7 +27,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from beamng_autopilot import config
 from beamng_autopilot.connector import BeamNGConnector
 from beamng_autopilot.roadnet import RoadNetwork
-from beamng_autopilot_tech.annotations import to_label
+from beamng_autopilot.labeling.tech_annotation import (
+    annotation_metadata, prepare_annotation_sample,
+)
+from beamng_autopilot_tech.annotations import annotation_palette
 
 W, H = 536, 403  # 半分辨率（原始 1076x806）
 
@@ -105,6 +107,8 @@ def main() -> None:
                     help="共享模式：不 blocking step（另一客户端如 "
                          "lane_state_view 在推进 sim），只 poll 相机")
     args = ap.parse_args()
+    if args.rate <= 0 or (args.frames is not None and args.frames <= 0):
+        ap.error("--rate and --frames must be positive")
 
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -134,10 +138,26 @@ def main() -> None:
     per_seg = max(20, args.frames_per_seg)
     total = args.frames or segments * per_seg
 
+    run = args.run or time.strftime("%Y%m%d_%H%M%S")
+    if Path(run).name != run or run in (".", ".."):
+        ap.error("--run must be a directory name, not a path")
+    out_dir = config.LOGS_DIR / "m5_seg" / f"run_{run}"
+    # Never mix a fresh annotation run with an existing/pseudo-label dataset.
+    out_dir.mkdir(parents=True, exist_ok=False)
+
     conn = BeamNGConnector(
         port=(args.port or config.runtime_port(args.runtime)),
         home=config.runtime_home(args.runtime))
     conn.open(launch=False)
+    # Resolve the live Tech palette once.  In the current italy session,
+    # (128,196,255) is SKY; using the old static fallback would contaminate
+    # the road class with sky pixels.
+    get_annotations = getattr(conn.bng, "get_annotations", None)
+    tech_annotations = None
+    if callable(get_annotations):
+        with conn.io_lock:
+            tech_annotations = get_annotations()
+    palette = annotation_palette(tech_annotations)
     try:
         conn.attach_vehicle(already_open=True)
     except Exception:
@@ -151,10 +171,6 @@ def main() -> None:
                  is_using_shared_memory=True, is_render_colours=True,
                  is_render_annotations=True, is_render_instance=False,
                  is_render_depth=False, is_visualised=False)
-
-    run = args.run or time.strftime("%Y%m%d_%H%M%S")
-    out_dir = config.LOGS_DIR / "m5_seg" / f"run_{run}"
-    out_dir.mkdir(parents=True, exist_ok=True)
 
     # 多样采集：构建路网用于随机取点
     roadnet = None
@@ -184,7 +200,8 @@ def main() -> None:
     meta = {"port": args.port, "speed": args.speed, "w": W, "h": H,
             "classes": ["background", "asphalt", "line"],
             "segments": segments, "frames_per_seg": per_seg,
-            "frames": [], "segment_starts": []}
+            "frames": [], "segment_starts": [],
+            **annotation_metadata(tech_annotations)}
     line_px_total = 0
     frame_i = 0
     seg_start_xy = None
@@ -210,59 +227,58 @@ def main() -> None:
         except Exception as exc:
             print(f"[collect] WARNING: AI 启动失败 ({exc})，原地采集")
 
-    for seg in range(segments):
-        start_segment(seg)
-        seg_frames = min(per_seg, total - frame_i)
-        for k in range(seg_frames):
-            t0 = time.time()
-            if not args.no_step:
-                conn.step(10)
-            with conn.io_lock:
-                data = cam.poll()
-            colour = np.ascontiguousarray(
-                np.asarray(data["colour"], dtype=np.uint8))
-            ann = np.ascontiguousarray(
-                np.asarray(data["annotation"], dtype=np.uint8))
-            st = conn.get_state()
-
-            small_colour = cv2.resize(colour, (W, H),
-                                      interpolation=cv2.INTER_AREA)
-            small_ann = cv2.resize(ann, (W, H),
-                                   interpolation=cv2.INTER_NEAREST)
-            label = to_label(small_ann)
-
-            np.savez_compressed(
-                out_dir / f"frame_{frame_i:05d}.npz",
-                colour=small_colour, label=label)
-            meta["frames"].append({
-                "i": frame_i, "seg": seg,
-                "pos": [round(float(v), 2) for v in st.pos],
-                "heading": round(float(st.heading), 4),
-            })
-            line_px_total += int((label == 2).sum())
-            frame_i += 1
-
-            if (frame_i) % 25 == 0 or frame_i == total:
-                print(f"[collect] {frame_i}/{total}  段 {seg + 1}/{segments}  "
-                      f"标线px/帧={line_px_total / max(1, frame_i):.0f}")
-
-            rem = 1.0 / args.rate - (time.time() - t0)
-            if rem > 0:
-                time.sleep(rem)
-            if frame_i >= total:
-                break
-
     try:
-        with conn.io_lock:
-            conn.vehicle.ai.set_mode("disabled")
-    except Exception:
-        pass
-    with conn.io_lock:
-        cam.remove()
-    conn.close()
+        for seg in range(segments):
+            start_segment(seg)
+            seg_frames = min(per_seg, total - frame_i)
+            for k in range(seg_frames):
+                t0 = time.time()
+                if not args.no_step:
+                    conn.step(10)
+                with conn.io_lock:
+                    data = cam.poll()
+                sample, audit = prepare_annotation_sample(
+                    data.get("colour"), data.get("annotation"), width=W, height=H,
+                    palette=palette)
+                st = conn.get_state()
 
-    (out_dir / "meta.json").write_text(
-        json.dumps(meta, ensure_ascii=False, indent=1), encoding="utf-8")
+                np.savez_compressed(
+                    out_dir / f"frame_{frame_i:05d}.npz", **sample)
+                meta["frames"].append({
+                    "i": frame_i, "seg": seg,
+                    "pos": [round(float(v), 2) for v in st.pos],
+                    "heading": round(float(st.heading), 4),
+                    **audit,
+                })
+                line_px_total += audit["line_pixels"]
+                frame_i += 1
+
+                if (frame_i) % 25 == 0 or frame_i == total:
+                    print(f"[collect] {frame_i}/{total}  段 {seg + 1}/{segments}  "
+                          f"标线px/帧={line_px_total / max(1, frame_i):.0f}")
+
+                rem = 1.0 / args.rate - (time.time() - t0)
+                if rem > 0:
+                    time.sleep(rem)
+                if frame_i >= total:
+                    break
+
+    finally:
+        try:
+            with conn.io_lock:
+                conn.vehicle.ai.set_mode("disabled")
+        finally:
+            try:
+                with conn.io_lock:
+                    cam.remove()
+            finally:
+                try:
+                    conn.close()
+                finally:
+                    (out_dir / "meta.json").write_text(
+                        json.dumps(meta, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+
     print(f"[collect] 完成: {frame_i} 帧 / {segments} 段 -> {out_dir}")
     print(f"[collect] 标线像素总量 {line_px_total} "
           f"({line_px_total / max(1, frame_i):.0f}/帧)")

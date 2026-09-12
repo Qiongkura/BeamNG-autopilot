@@ -91,8 +91,13 @@ def main() -> None:
                   "runtime; falling back to plain frames")
         camera_provider, _ = build_camera_provider(
             conn, runtime_mode, annotations=use_annot)
+        annotation_session_palette = None
         if use_annot:
-            from beamng_autopilot_tech.annotations import road_share
+            from beamng_autopilot_tech.annotations import (
+                annotation_palette, road_share)
+            with conn.io_lock:
+                annotation_session_palette = annotation_palette(
+                    conn.bng.get_annotations())
         print(f"[bc-collect] scenario started; saving to {run_dir} "
               f"(annot={use_annot})")
 
@@ -154,7 +159,8 @@ def main() -> None:
                 # Annotation-based quality gate: an off-road / black frame
                 # (low road share) teaches the network the wrong label, so
                 # it is dropped at the source instead of poisoning the run.
-                road = float(road_share(ann))
+                road = float(road_share(
+                    ann, road_colors=annotation_session_palette["road"]))
                 if road < args.min_road_share:
                     dropped += 1
                     conn.control(throttle=throttle, steering=steer, brake=brake)
