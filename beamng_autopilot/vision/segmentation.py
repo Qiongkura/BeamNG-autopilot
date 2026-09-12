@@ -94,9 +94,28 @@ class SegUNet(nn.Module):
         return self.head(d0)
 
 
+_ACTIVE_MAP: str | None = None
+
+
+def set_active_map(name: str | None) -> None:
+    """登记当前关卡，default_model_path 据此优先选按地图专家模型。
+
+    布局：logs/m5_seg/seg_model/by_map/<地图名>/best.pt（不存在则回退
+    基础 best.pt）。必须在 Segmenter 初始化之前调用（connector 构造
+    时自动登记）。
+    """
+    global _ACTIVE_MAP
+    _ACTIVE_MAP = name
+
+
 def default_model_path() -> Path | None:
-    """logs/m5_seg/seg_model/best.pt when it exists, else None."""
-    p = config.LOGS_DIR / "m5_seg" / "seg_model" / "best.pt"
+    """按地图专家模型优先（by_map/<map>/best.pt），回退基础 best.pt。"""
+    base = config.LOGS_DIR / "m5_seg" / "seg_model"
+    if _ACTIVE_MAP:
+        by_map = base / "by_map" / _ACTIVE_MAP / "best.pt"
+        if by_map.is_file():
+            return by_map
+    p = base / "best.pt"
     return p if p.is_file() else None
 
 

@@ -79,6 +79,13 @@ class BeamNGConnector:
         # direct bng/vehicle call in the autopilot uses this lock.
         self.io_lock = threading.RLock()
         self._window_cache: tuple | None = None
+        # 登记当前关卡：分割默认模型按地图选专家 checkpoint
+        # （by_map/<地图>/best.pt，无专家则回退基础模型）
+        try:
+            from beamng_autopilot.vision.segmentation import set_active_map
+            set_active_map(map_name)
+        except Exception:
+            pass
 
     def __enter__(self):
         return self.open(launch=True)
