@@ -957,6 +957,11 @@ class FSDriveSession:
                                      else ("front_main",)),
                          lane_mode=args.lane_mode,
                          strict_sensor=args.strict,
+                         # Pairing-free strict-mode lane fallback, off by
+                         # default; --corridor-lane opts in (live A/B
+                         # before it may become a default).
+                         corridor_fallback=bool(getattr(
+                             args, "corridor_lane", False)),
                          cam_w=args.cam_w, cam_h=args.cam_h,
                          temporal=True, range_every_n=3,
                          # LiDAR every 3rd tick: a fresh scan costs
@@ -1104,6 +1109,12 @@ class FSDriveSession:
                   f"object_head={bool(_pw_out is not None and _pw_out.meta.get('object_head'))}, "
                   f"placed={_percep_ok}")
             if not _percep_ok:
+                if getattr(self.args, "allow_unplaced", False):
+                    # 采集模式：跨地图语义头可能放不进车道（没见过该地图
+                    # 标线），继续未放置驾驶让影子录制拿帧，不做拟真门槛
+                    print("[fsd-drive] lane placement failed - continuing "
+                          "UNPLACED (--allow-unplaced collection mode)")
+                    return _pw_out, False, 0
                 print("[fsd-drive] ABORT: lane placement failed after "
                       f"{PLACEMENT_HOLD_S:.0f}s - the car will NOT drive "
                       "unplaced from the road centre line")
@@ -1133,7 +1144,7 @@ class FSDriveSession:
         rec = None
 
         conn = BeamNGConnector(
-            "italy", "etk800",
+            getattr(args, "map", None) or "italy", "etk800",
             port=config.runtime_port(args.runtime),
             home=config.runtime_home(args.runtime))
         pp = PurePursuit(lookahead=5.0)
@@ -1144,6 +1155,10 @@ class FSDriveSession:
             conn.open(launch=not args.attach)
             try:
                 conn.attach_vehicle(already_open=True)
+                if getattr(args, "map", None):
+                    # attach 只挂到游戏当前关卡（昨天留在 italy 的实例被
+                    # 原样驱动了一整集）——显式 --map 时强制加载该地图场景
+                    conn.load_scenario()
             except Exception:
                 conn.load_scenario()
             if args.teleport is not None:
