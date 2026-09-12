@@ -28,3 +28,4 @@ probe_route.json
 # Large or generated data files (keep the small sample track)
 data/*
 !data/track_smallgrid.npz
+.playwright-cli/
