@@ -201,8 +201,21 @@ def test_arbitrate_fsd_tick_normal_ranking_with_lane_lock() -> None:
     out = arbitrate_fsd_tick(fsd, rule, fsd_safe=True, strict=True,
                              plan_blocked="", lane_src_sel="sensor")
     assert out.source == "fsd"
-    # A strict tick WITH a lane lock keeps the ordinary rule fallback when
-    # the layered planner declines.
+    # A strict tick does NOT keep the rule fallback even with a lane lock.
+    # The rule path is planned from the nav route with no sensor lane, so
+    # steering by it is map-geometry lateral control, which the iron rule
+    # forbids the FSD stack (AGENTS.md).  Gating this on "no perception
+    # lane" alone let the map-route path drive whenever the layered planner
+    # declined WITH a lane present: on the 2026-09-11 town run that was
+    # every body-crossing (17) and off-road (12) frame, all source=rule
+    # with lane_sel=sensor.  The legal degradations are stop / hold heading
+    # / a safe point; neural (perception-derived) candidates stay eligible.
     out = arbitrate_fsd_tick(None, rule, fsd_safe=False, strict=True,
+                             plan_blocked="", lane_src_sel="sensor")
+    assert out.source == "none"
+    assert out.path is None
+    # The same inputs in legacy non-strict mode keep the map fallback,
+    # which is what it exists for.
+    out = arbitrate_fsd_tick(None, rule, fsd_safe=False, strict=False,
                              plan_blocked="", lane_src_sel="sensor")
     assert out.source == "rule"

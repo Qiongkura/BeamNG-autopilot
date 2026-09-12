@@ -4,7 +4,8 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from beamng_autopilot_tech.annotations import ANN_ASPHALT, road_share, to_label
+from beamng_autopilot_tech.annotations import (
+    ANN_ASPHALT, annotation_palette, road_share, to_label)
 
 
 def _ann(shape=(40, 60, 3), color=(0, 0, 0)):
@@ -20,6 +21,22 @@ class TestToLabel:
         assert lab.shape == img.shape[:2]
         assert lab.dtype == np.uint8
         assert np.all(lab == 1)
+
+
+    def test_live_palette_does_not_confuse_sky_with_road(self):
+        palette = annotation_palette({
+            "ASPHALT": ANN_ASPHALT,
+            "SKY": (128, 196, 255),
+            "SOLID_LINE": (255, 196, 128),
+            "DASHED_LINE": (196, 196, 255),
+            "ZEBRA_CROSSING": (255, 128, 128),
+        })
+        img = _ann(color=(128, 196, 255))
+        img[10:20, 20:30] = np.asarray(ANN_ASPHALT, dtype=np.uint8)
+        lab = to_label(img, road_colors=palette["road"],
+                       line_colors=palette["line"])
+        assert np.all(lab[:10] == 0)
+        assert np.all(lab[10:20, 20:30] == 1)
 
     def test_unknown_color_is_background(self):
         img = _ann(color=(10, 20, 30))
