@@ -43,6 +43,7 @@ from .lateral_ref import (
     REF_ROUTE,
     REF_SENSOR,
     lateral_reference,
+    limit_reference_slew,
     perception_reference,
 )
 from .selector import select_trajectory

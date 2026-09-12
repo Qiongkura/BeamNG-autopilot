@@ -244,7 +244,8 @@ def _collect_candidates(markings, pos: np.ndarray, fwd: np.ndarray,
 
 
 def _axis_candidates(cands: list[_LineCandidate], station_step: float,
-                     max_stations: int) -> list[_LineCandidate]:
+                     max_stations: int,
+                     debug: dict | None = None) -> list[_LineCandidate]:
     """Merge the two edges of a line straddled by the car into one axis.
 
     When the camera sees the left and right edge of the same painted line
@@ -253,6 +254,7 @@ def _axis_candidates(cands: list[_LineCandidate], station_step: float,
     pair with the far edge of the lane on the other side.
     """
     axes: list[_LineCandidate] = []
+    rejects: dict[str, int] = {}
     for i, ci in enumerate(cands):
         if ci.med_lat <= 0.08:
             continue
@@ -264,6 +266,7 @@ def _axis_candidates(cands: list[_LineCandidate], station_step: float,
             s_lo = max(0.0, float(ci.proj[0, 0]), float(cj.proj[0, 0]))
             s_hi = min(float(ci.proj[-1, 0]), float(cj.proj[-1, 0]))
             if s_hi - s_lo < LANE_PAIR_OVERLAP_M:
+                rejects['overlap'] = rejects.get('overlap', 0) + 1
                 continue
             stations = _overlap_stations(s_lo, s_hi, station_step,
                                          max_stations)
@@ -271,6 +274,7 @@ def _axis_candidates(cands: list[_LineCandidate], station_step: float,
             lb = _interp_lat(cj.proj, stations)
             valid = ~(np.isnan(la) | np.isnan(lb))
             if int(np.sum(valid)) < 3:
+                rejects['interp'] = rejects.get('interp', 0) + 1
                 continue
             lat = 0.5 * (la + lb)
             axes.append(_LineCandidate(
@@ -281,6 +285,8 @@ def _axis_candidates(cands: list[_LineCandidate], station_step: float,
                 color="axis",
                 med_lat=float(np.median(lat[valid])),
                 score=0.5 * min(ci.score, cj.score)))
+    if debug is not None:
+        debug["axis_rejects"] = rejects
     return axes
 
 
@@ -459,7 +465,8 @@ def _cand_near_lat(c: _LineCandidate) -> float:
 def _best_vision_pair(cands: list[_LineCandidate],
                       axes: list[_LineCandidate],
                       pos: np.ndarray, fwd: np.ndarray,
-                      station_step: float, max_stations: int):
+                      station_step: float, max_stations: int,
+                      debug: dict | None = None):
     """Choose the most plausible single-lane boundary pair.
 
     Every left/right candidate combination is checked for a lane-like
@@ -497,6 +504,10 @@ def _best_vision_pair(cands: list[_LineCandidate],
     right_near = {id(c): _near_stats(c) for c in right_pool}
     best = None
     best_score = 0.0
+    # Per-combo rejection counters (debug only): which gate killed
+    # every combination on frames that end up single-edge despite
+    # both sides having candidates.
+    rejects: dict[str, int] = {}
     for l in left_pool:
         ln, _ = left_near[id(l)]
         for r in right_pool:
@@ -506,6 +517,7 @@ def _best_vision_pair(cands: list[_LineCandidate],
                 # fragments, not a real lane pair: pairing them gives a
                 # phantom centre that can drag the car across the road.
                 if l.kind == "thin" and r.kind == "thin":
+                    rejects['near_combo'] = rejects.get('near_combo', 0) + 1
                     continue
                 # A wide lane whose centre line and right edge only become
                 # visible ahead is still a real two-sided lane.  Without
@@ -515,6 +527,7 @@ def _best_vision_pair(cands: list[_LineCandidate],
                         and r.kind in ("solid", "dashed", "thin")
                         and l.proj[0, 0] <= LANE_FAR_START_MAX_M
                         and r.proj[0, 0] <= LANE_FAR_START_MAX_M):
+                    rejects['far_kind'] = rejects.get('far_kind', 0) + 1
                     continue
             # The far member of a one-near pair has to look like a real
             # road line, not a short unknown pavement patch.
@@ -532,6 +545,7 @@ def _best_vision_pair(cands: list[_LineCandidate],
             if (ln < 2) != (rn < 2):
                 far_c = l if ln < 2 else r
                 if far_c.proj[0, 0] > LANE_ONE_NEAR_FAR_START_MAX_M:
+                    rejects['one_near_far_start'] = rejects.get('one_near_far_start', 0) + 1
                     continue
             s_lo = max(0.0, float(l.proj[0, 0]), float(r.proj[0, 0]))
             s_hi = min(float(l.proj[-1, 0]), float(r.proj[-1, 0]))
@@ -555,13 +569,16 @@ def _best_vision_pair(cands: list[_LineCandidate],
                 center = float(np.median(center_vals))
             if abs(center) > LANE_PAIR_CENTER_PREFER_M \
                     and width > LANE_OFF_CENTER_WIDTH_MAX_M:
+                rejects['center_prefer_width'] = rejects.get('center_prefer_width', 0) + 1
                 continue
             min_w = (LANE_PAIR_WIDTH_MIN_M if abs(center) <= 0.5
                      else LANE_WIDTH_MIN_M)
             if not (min_w <= width <= LANE_VISION_PAIR_WIDTH_MAX_M):
+                rejects['width'] = rejects.get('width', 0) + 1
                 continue
             if ln < 2 and rn < 2 \
                     and width < LANE_FAR_CENTER_PAIR_MIN_WIDTH_M:
+                rejects['far_width'] = rejects.get('far_width', 0) + 1
                 continue
             # A paired lane whose centre is far from the car usually means
             # the camera paired a near line with a roadside line outside
@@ -569,6 +586,7 @@ def _best_vision_pair(cands: list[_LineCandidate],
             # across the road, so refuse it and let the single-side mirror
             # handle the near boundary instead.
             if abs(center) > LANE_PAIR_CENTER_MAX_M:
+                rejects['center_max'] = rejects.get('center_max', 0) + 1
                 continue
             span = s_hi - s_lo
             avg_conf = 0.5 * (l.conf + r.conf)
@@ -605,6 +623,8 @@ def _best_vision_pair(cands: list[_LineCandidate],
                             width = float(np.median(dw[vg]))
                 best = (l, r, stations, valid, width, center, span,
                         avg_conf, score, geom)
+    if debug is not None:
+        debug["pair_rejects"] = rejects
     return best
 
 
@@ -819,7 +839,8 @@ def pair_lane_markings(
         if debug is not None:
             debug["mode"] = "none"
         return None
-    axes = _axis_candidates(cands, station_step, max_stations)
+    axes = _axis_candidates(cands, station_step, max_stations,
+                            debug=debug)
     if debug is not None:
         def _cand_summary(c) -> dict:
             near = c.proj[c.proj[:, 0] <= 6.0]
@@ -839,7 +860,7 @@ def pair_lane_markings(
         debug["cands"] = [_cand_summary(c) for c in cands]
         debug["axes"] = [_cand_summary(a) for a in axes]
     pair = _best_vision_pair(cands, axes, pos, fwd,
-                             station_step, max_stations)
+                             station_step, max_stations, debug=debug)
     if pair is not None:
         l, r, stations, valid, width, center, span, avg_conf, _, geom = pair
         left_lat = _interp_lat(l.proj, stations)

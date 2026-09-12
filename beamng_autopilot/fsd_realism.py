@@ -23,6 +23,11 @@ SRC_SENSOR = "sensor"
 SRC_UNAVAILABLE = "perception-unavailable"
 SRC_MAP = "map"
 SRC_BEV_ROUTE = "bev/route"
+# Pairing-free PERCEPTION fallback: the free corridor's right edge + half
+# a lane width, valid only on two-lane roads (width-gated).  Sensor-
+# derived like SRC_SENSOR - never map lane geometry - but it carries no
+# hard boundary pair, so downstream treats it as a weaker reference.
+SRC_CORRIDOR = "corridor"
 
 FSD_LANE_SOURCES = (SRC_SENSOR, SRC_UNAVAILABLE)
 NON_FSD_LANE_SOURCES = (SRC_MAP, SRC_BEV_ROUTE)

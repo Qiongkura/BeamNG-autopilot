@@ -434,6 +434,39 @@ def _in_end_pull_zone(rem_end, start_m: float = END_PULL_START_M) -> bool:
         return False
 
 
+def _counts_as_stuck(*, has_path: bool, force_stop: bool, v: float,
+                     thr: float, plan_speed: float, near_obs_m: float,
+                     rem_end, v_eps: float = 0.35, plan_eps: float = 0.05,
+                     obs_close_m: float = 2.5) -> bool:
+    """True when this tick should advance the stuck timer.
+
+    Two ways the car parks itself while the stack still reports "safe" with
+    a live path:
+
+    * holding throttle against an obstruction (``thr > 0``) - the original
+      "spinning in place" case (mountain run 2026-08-27 run_fix31: wedged
+      at (741.2,745.7) with thr=0.53 and v=0 for 50 s); and
+    * a COMMANDED stop with an obstacle inside the brake reserve: the speed
+      profile clamps to 0, the controller brakes so ``thr == 0`` and the
+      first rule can never fire.  Measured 2026-09-11: closest_obs pinned
+      at 1.17 m with plan_speed 0.00 for 164 of 224 town frames, so the run
+      covered 18.4 m and then sat for 73% of the clock.
+
+    The commanded-stop branch needs the obstacle to actually be CLOSE so
+    waiting behind a lead vehicle (which sits further out) is not mistaken
+    for a wedge, and the end-pull zone is excluded because a commanded stop
+    there is the goal, not a failure.  Both branches arm the same bounded
+    reverse escape (1.5 m / 2.5 s / -0.4 m/s, rear-clearance checked).
+    """
+    if not has_path or force_stop or float(v) >= float(v_eps):
+        return False
+    if float(thr) > 0.0:
+        return True
+    return (float(plan_speed) <= float(plan_eps)
+            and float(near_obs_m) <= float(obs_close_m)
+            and not _in_end_pull_zone(rem_end))
+
+
 def _endzone_align_yaw_dev(heading, dir3, dir_src):
     """Yaw deviation to straighten the parking pose to, or None.
 
@@ -894,6 +927,20 @@ class FSDriveSession:
                 from beamng_autopilot.vision.segmentation import Segmenter
                 _seg = Segmenter(model_path=args.seg_model)
                 print(f"[fsd-drive] segmentation model: {args.seg_model}")
+            except Exception as _seg_e:
+                print(f"[fsd-drive] segmentation model disabled: {_seg_e}")
+        else:
+            # No pin means the run uses whatever is deployed, and until it
+            # said so out loud a map could be evaluated on a checkpoint
+            # nobody chose - the deployed default and the v13b/v8
+            # specialists disagree strongly per map (see the line-IoU
+            # matrix in the README).  Build it here so the path logged is
+            # the path actually used, not a second lookup.
+            try:
+                from beamng_autopilot.vision.segmentation import Segmenter
+                _seg = Segmenter()
+                print("[fsd-drive] segmentation model (UNPINNED default): "
+                      f"{_seg.model_path}")
             except Exception as _seg_e:
                 print(f"[fsd-drive] segmentation model disabled: {_seg_e}")
         stack = FSDStack(conn, args.runtime,
@@ -1640,7 +1687,15 @@ class FSDriveSession:
                     bool(args.strict),
                     out.meta.get("plan_blocked"),
                     out.meta.get("lane_src_sel", ""))
-                if _strict_no_lane:
+                # In strict mode the rule path must not drive at all: it is
+                # planned from ``nav_route`` with ``sensor_lane=None``, so
+                # its lateral reference is map/route geometry (AGENTS.md
+                # iron rule).  Gating on "no perception lane" alone left it
+                # driving whenever FSD declined WITH a lane present - that
+                # was every body-crossing and off-road frame on the
+                # 2026-09-11 town run.  Do not build it here; the arbiter
+                # enforces the same rule independently.
+                if _strict_no_lane or bool(args.strict):
                     _need_rule = False
                 if _need_rule and nav_route is not None and len(nav_route) >= 2:
                     try:
@@ -1921,6 +1976,7 @@ class FSDriveSession:
                     _plc_shift = plc_corr.update(_plc_desired, dt, v)
                     if steer_path is not None \
                             and abs(_plc_shift) >= PLC_MIN_ENGAGE_M:
+                        _steer_pre_plc = steer_path
                         steer_path = plc_corr.apply(
                             steer_path, pos, float(heading))
                         # PLC is a post-processing transform.  Re-run the same
@@ -1934,6 +1990,19 @@ class FSDriveSession:
                             plc_rejected = _plc_v.level == "minimal_risk"
                         except Exception:
                             plc_rejected = True
+                        if plc_rejected:
+                            # The lateral correction is OPTIONAL
+                            # post-processing and the monitor had ALREADY
+                            # approved the un-shifted path, so rejecting the
+                            # shift must skip the correction - not stop the
+                            # car.  Escalating it to ``force_stop`` made the
+                            # state inescapable: on the 2026-09-11 town run the
+                            # car sat 1.838 m off the painted line with
+                            # plc_active on all 145 tail frames, the 1.0 m
+                            # shift was rejected every frame, and the vehicle
+                            # could never move to get back (emergency=1
+                            # throughout).
+                            steer_path = _steer_pre_plc
                 steer = 0.0
                 pp_alpha = None
                 pp_tgt = None
@@ -2298,7 +2367,14 @@ class FSDriveSession:
                 # 0.19 m at a town corner and parked a car that was steering
                 # fine).  The raw-sensor heading corridor is only the last
                 # line when there is NO planned path at all.
-                force_stop = bool(painted_body_cross or plc_rejected)
+                # ``plc_rejected`` no longer escalates to a vehicle stop: the
+                # rejected shift is skipped and the approved un-shifted path
+                # is driven instead (see the fallback above).  Keeping it here
+                # made the state inescapable - a car parked 1.838 m off the
+                # line had its correction rejected on every frame, so it was
+                # force-stopped on every frame and could never drive back.
+                # The telemetry field is kept for diagnosis.
+                force_stop = bool(painted_body_cross)
                 if force_stop:
                     target = 0.0
                 fwd_clear = float("inf")
@@ -2379,17 +2455,16 @@ class FSDriveSession:
                     gov_brake = False
                 if gov_brake:
                     thr, brk = 0.0, max(brk, GOV_BRAKE)
-                # Stuck detection: the planner can keep reporting "safe" while
-                # the car physically cannot move (wedged against a guardrail /
-                # embankment after an over-correction).  Holding throttle
-                # against the obstruction forever is the "spinning in place"
-                # failure - after a couple of seconds at near-standstill with
-                # a commanded forward path, treat it as "no forward path" so
-                # the bounded reverse escape backs out and re-plans (mountain
-                # run 2026-08-27 run_fix31: wedged at (741.2,745.7) with
-                # thr=0.53 and v=0 for 50 s).
-                if (chosen.path is not None and not force_stop
-                        and v < 0.35 and thr > 0.0):
+                # Stuck detection: see ``_counts_as_stuck`` for the two
+                # states it covers and why the command-stop case needed its
+                # own rule.
+                _near_obs = float(getattr(verd, "closest_obs_m", 999.0)
+                                  or 999.0)
+                if _counts_as_stuck(
+                        has_path=(chosen.path is not None),
+                        force_stop=bool(force_stop), v=v, thr=thr,
+                        plan_speed=plan_speed, near_obs_m=_near_obs,
+                        rem_end=rem_end):
                     stuck_t += max(0.0, float(dt))
                 else:
                     stuck_t = 0.0
@@ -2803,6 +2878,16 @@ class FSDriveSession:
                     "plan_raw": round(float(plan_raw_speed), 2),
                     "target_sm": round(float(target_sm), 2),
                     "plan_src": str(out.meta.get("plan_src", "?")),
+                    # Why the planner did (or did not) publish a path.  The
+                    # 2026-09-11 town run had 34 frames with a PAIRED
+                    # perception lane and no path at all, and the record
+                    # could not say whether the constraint layer declined
+                    # every candidate, the strict gate fired, or the fan was
+                    # empty - `n_eval = 0` in the planner meta is just its
+                    # default when no plan exists.  Publish the decision.
+                    "plan_blocked": str(out.meta.get("plan_blocked", "")),
+                    "n_candidates": int(out.meta.get("total_candidates",
+                                                     out.n_candidates) or 0),
                     "tick_ms": out.meta.get("tick_ms"),
                     "tick_wall_ms": round((_tb - _f0) * 1000.0, 1),
                     "budget_s": round(float(_budget), 3),
@@ -2831,6 +2916,16 @@ class FSDriveSession:
                     "lane_reject": str(out.meta.get("lane_reject_reason", "")),
                     "lane_sel": str(out.meta.get("lane_src_sel", "")),
                     "lane_paired": int(out.meta.get("lane_paired", 0)),
+                    # Freshness ages.  The safety monitor's "stale sensor"
+                    # verdict is `max(all head ages, range, bev, lane) >
+                    # STALE_SNAPSHOT_S`, and without these in the log a
+                    # stale run cannot be attributed at all: on 2026-09-11
+                    # 33% of town frames went stale (0% on 2026-09-07) and
+                    # the telemetry gave no way to see WHICH modality aged.
+                    "freshness": (out.meta.get("snapshot") or {}).get(
+                        "freshness"),
+                    "head_age_s": (out.meta.get("snapshot") or {}).get(
+                        "head_age_s"),
                     "n_object_obstacles": int(
                         out.meta.get("n_object_obstacles", 0)),
                     "object_head": int(out.meta.get("object_head", 0)),

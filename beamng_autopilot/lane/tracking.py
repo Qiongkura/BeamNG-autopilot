@@ -429,6 +429,15 @@ def _mirror_right_ok(frame: LaneFrame, pos, heading: float,
     the road.  A line that only appears several metres ahead is not the
     current lane edge on its own (run 188), so it is kept for fusion but
     cannot steer an unpaired mirror.
+
+    This strictness is load-bearing, not an oversight.  On the 2026-09-11
+    town frames it rejects every unpaired right-edge frame (the town line
+    starts a median 3.76 m ahead, so nothing is beside the car), and
+    widening it to 8 m was measured and reverted: accepting those frames
+    raises lane availability 81.1% -> 82.2% while the laterally-correct
+    share stays at ~11%, because a single-edge mirror infers the centre
+    from an assumed width.  Do not widen this window without re-running
+    that in-lane constraint (see LANE_RIGHT_MIRROR_NEAR_M).
     """
     if frame.right is None:
         return True

@@ -24,6 +24,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 import math
+import os
 import time
 
 import numpy as np
@@ -46,12 +47,14 @@ from beamng_autopilot.planning import (
     REF_ROUTE,
     Scene,
     lateral_reference,
+    limit_reference_slew,
     sample_arc,
     sample_lane_shift,
     select_trajectory,
 )
 from beamng_autopilot.planning.intent import infer_route_intent
 from beamng_autopilot.temporal import WorldObjectTracker
+from beamng_autopilot.prediction import predict_tracks, prediction_digest
 from beamng_autopilot.perception_snapshot import PerceptionSnapshot
 from beamng_autopilot.planner import forward_clearance_m, path_forward_clearance_m
 from beamng_autopilot.vehicle_body import CORRIDOR_HALF_WIDTH_M
@@ -82,6 +85,20 @@ RANGE_REUSE_MAX_DT_S = 2.0
 RANGE_REUSE_MAX_PREDICT_M = 10.0
 RANGE_REUSE_INFLATE_FRAC = 0.25
 RANGE_REUSE_INFLATE_MAX_M = 1.5
+
+# Bounded tick-to-tick slew of the accepted own-lane reference.
+# Default OFF (opt-in) because a same-revision, same-game-session,
+# interleaved 5-arm-per-condition A/B (2026-09-11, dashed recovery pinned
+# on, scripts/m5_live_ab.py) shows no benefit and a real cost:
+#   slew off: lane p50 15%, stall p50 138 (135-169), dist p50 48.3,
+#             off-road [0,8,5,5,7], crossC [0,5,0,0,0], crossR [0,3,0,0,0]
+#   slew on : lane p50 13%, stall p50 180 (151-188), dist p50 32.4,
+#             off-road [0,7,11,0,2], crossC [0,0,6,0,0], crossR [0,0,0,0,0]
+# Availability is unchanged, stall and distance are worse, and off-road /
+# crossing frames occur in BOTH conditions - so this limiter is neither
+# the cure nor the cause of the excursions.  The stage stays opt-in:
+# ``BEAMNG_LANE_REF_SLEW=1`` enables it.
+_LANE_REF_SLEW_ENABLED = os.environ.get("BEAMNG_LANE_REF_SLEW", "0") == "1"
 
 
 def compensate_range_motion(sample: RangeSample | None,
@@ -248,8 +265,14 @@ class FSDStack:
                  semantic_every_n: int = 1,
                  object_every_n: int = 1,
                  lane_mode: str = "map",
-                 strict_sensor: bool = False):
+                 strict_sensor: bool = False,
+                 corridor_fallback: bool = False):
         self.conn = conn
+        # Pairing-free strict-mode lane fallback (bev corridor right edge
+        # + half a lane, width-gated).  Default OFF: it changes which
+        # frames strict mode drives on, so it goes through live A/B
+        # before it becomes a default.
+        self.corridor_fallback = bool(corridor_fallback)
         self.grid_n = int(grid_n)
         self.grid_res = float(grid_res)
         self.heads = list(heads) if heads else []
@@ -269,6 +292,10 @@ class FSDStack:
         self._range_skip = 0
         self._last_range = None
         self._last_range_t = 0.0
+        # Last accepted own-lane reference + hold start, for the bounded
+        # tick-to-tick slew (see ``limit_reference_slew``).
+        self._lane_ref_prev = None
+        self._lane_ref_hold_t = 0.0
         # Per-head throttling: the expensive heads (semantic UNet
         # ~100-300 ms, YOLO object ~100-200 ms on the live 400x300
         # front frame) run every ``semantic_every_n`` / ``object_every_n``
@@ -693,6 +720,16 @@ class FSDStack:
                 _active = tracker.update(_dets, dt=_dt)
                 out.tracks = list(_active)
                 out.meta["n_tracks"] = len(_active)
+                # Prediction layer, published but NOT yet consumed: the
+                # tracker has always given every track a smoothed vx/vy and
+                # nothing used it, so planning scored candidates against
+                # occupancy as of THIS tick and a crossing vehicle was only
+                # avoided once it was already inside the corridor.  This is
+                # the telemetry-first step - the planner's collision cost
+                # consuming predicted poses is a separate, live-validated
+                # change (see beamng_autopilot/prediction.py).
+                out.meta["prediction"] = prediction_digest(
+                    predict_tracks(_active))
                 if _active:
                     from beamng_autopilot.occupancy import (
                         OccupancyGrid as _OG2)
@@ -764,9 +801,26 @@ class FSDStack:
                 self, "lane_consistency_sensor_m", 2.5),
             map_lane_width_m=getattr(
                 self, "map_lane_width_m", LANE_WIDTH_DEFAULT_M),
+            corridor_fallback=getattr(self, "corridor_fallback", False),
             warn=_warn_once,
         )
         lane_ref = lane_ref_out.center
+        # Single owner, no sideways teleport: the accepted own-lane
+        # reference is the ONE reference the planner and the safety Scene
+        # both consume, so it is limited HERE, before either reads it.
+        # Measured 2026-09-11 (dashed recovery on): the accepted sensor
+        # reference jumped up to 2.20 m laterally between consecutive
+        # ticks (5.3% > 1.0 m) while the envelope moved at most 0.41 m.
+        # ``BEAMNG_LANE_REF_SLEW=0`` disables it: the live A/B is not yet
+        # decisive at this sample size, so the switch is the rollback and
+        # comparison lever.
+        if lane_ref is not None and _LANE_REF_SLEW_ENABLED:
+            lane_ref, self._lane_ref_hold_t = limit_reference_slew(
+                getattr(self, "_lane_ref_prev", None),
+                getattr(self, "_lane_ref_hold_t", 0.0),
+                lane_ref, time.time(), pos, heading)
+        self._lane_ref_prev = (None if lane_ref is None
+                               else np.asarray(lane_ref, dtype=float)[:, :2])
         lane_left = lane_ref_out.left
         lane_right = lane_ref_out.right
         lane_width = lane_ref_out.width
@@ -1155,6 +1209,17 @@ class FSDStack:
         self._last_range = None
         self._last_range_t = 0.0
         self._range_skip = 0
+        # The accepted lane reference is location-bound as well: after a
+        # teleport the previous polyline is somewhere else entirely and
+        # must not be held against the new tick's selection.
+        self._lane_ref_prev = None
+        self._lane_ref_hold_t = 0.0
+        # Heads may hold location-bound temporal state of their own
+        # (semantic head: world-space line evidence) - clear it too.
+        for _h in getattr(self, "heads", None) or []:
+            _rst = getattr(_h, "reset", None)
+            if callable(_rst):
+                _rst()
 
     def close(self) -> None:
         if self.ring is not None:

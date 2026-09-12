@@ -18,6 +18,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -110,6 +111,10 @@ class Segmenter:
                 "分割模型不存在；先运行 scripts/m5_train_seg.py 训练，"
                 f"或传入 model_path（默认 {config.LOGS_DIR}/m5_seg/"
                 "seg_model/best.pt）")
+        # Which checkpoint is loaded decides how every map behaves, so it
+        # is kept on the instance: an unpinned run must be attributable
+        # instead of silently using whatever happens to be deployed.
+        self.model_path = path
         self.device = device or (
             "cuda" if torch.cuda.is_available() else "cpu")
         ckpt = torch.load(path, map_location=self.device)
@@ -210,8 +215,13 @@ class Segmenter:
             line = keep
         return road, line
 
+    def reset(self) -> None:
+        """Clear image-space hysteresis after a discontinuity."""
+        self._prev_line = None
+
     def detect_lines(self, frame_rgb, cam_model, pos, heading,
-                     ground_z: float | None = None) -> list:
+                     ground_z: float | None = None, *,
+                     line_mask: np.ndarray | None = None) -> list:
         """Line mask -> LaneMarking list (reuses the classic pipeline).
 
         The learned line mask is fused with a classic-CV bright-stroke
@@ -221,9 +231,16 @@ class Segmenter:
         Both masks share the same ground-plane back-projection pipeline.
         """
         from beamng_autopilot.vision.lanes import (
-            _mask_to_markings, WHITE_SAT_MAX)
+            _mask_to_markings, WHITE_SAT_MAX, recover_dashed_boundaries)
 
-        _, line = self.predict(frame_rgb)
+        # An explicit (possibly empty) mask is authoritative: do not run
+        # inference again or discard the head's temporal fusion.
+        if line_mask is None:
+            _, line = self.predict(frame_rgb)
+        else:
+            line = np.asarray(line_mask, dtype=bool)
+            if line.shape != frame_rgb.shape[:2]:
+                raise ValueError("line_mask shape must match image shape")
         # Classic-CV bright-stroke recovery, contrast-based: on a light
         # concrete road the absolute brightness of the paint and the
         # pavement are both high, so a global threshold fires on the whole
@@ -248,6 +265,37 @@ class Segmenter:
             out.extend(_mask_to_markings(
                 white_mask, "white", cam_model, pos, heading,
                 ground_z=ground_z))
+            # The shape gates above keep only long strokes, but the town
+            # ``line`` class is mostly short blocks (median 17 components
+            # per frame, median height 7 px), so a dashed lane line leaves
+            # no usable boundary behind.  Group the discarded collinear
+            # fragments back into one long boundary so the own lane can
+            # have two detected edges again.
+            #
+            # This runs on the LEARNED mask, not on ``white_mask``: the
+            # classic-CV bright-stroke union above exists to recover paint
+            # the model misses, but its texture edges are not paint and
+            # they pollute the grouping (measured: grouping the union
+            # yields a 23.9% paired rate, the learned mask alone 43.0%).
+            #
+            # BEAMNG_DASHED_RECOVERY=0 disables the stage (default ON).
+            #
+            # It was default-OFF because it cost ~70 ms/frame, about half
+            # of the whole segmentation stage, and a live A/B showed it
+            # losing lane continuity (lane_sel=sensor ~0-3% with it on,
+            # 17.7% off) - a stage that doubles the perception cost turns
+            # into MISSING perception because the FSD tick defers heads on
+            # overrun.  The cost is now fixed: the camera pose is built once
+            # per frame instead of once per sampled pixel, and the label
+            # image is scanned once instead of once per component, which
+            # takes `_mask_fragment_polylines` from 53.7 ms to 3.2 ms
+            # (whole stage ~70 ms -> ~3.6 ms).  On a same-episode A/B the
+            # benefit is intact: paired own-lane 13.0% -> 28.2% and
+            # lane_sel=sensor 27.7% -> 59.7%.
+            if os.environ.get("BEAMNG_DASHED_RECOVERY", "1") != "0":
+                out.extend(recover_dashed_boundaries(
+                    np.asarray(line, dtype=np.uint8) * 255,
+                    cam_model, pos, heading, ground_z=ground_z))
         if cv_yellow.any():
             out.extend(_mask_to_markings(
                 cv_yellow.astype(np.uint8) * 255, "yellow",

@@ -78,6 +78,8 @@ class FrameContext:
     rotation: tuple | None = None
     ground_z: float = 0.0
     role: str = "front_main"
+    # Capture time in seconds; None uses monotonic time for live callers.
+    timestamp: float | None = None
 
 
 class HydraHead(Protocol):

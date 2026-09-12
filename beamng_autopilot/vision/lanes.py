@@ -316,6 +316,248 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
     return markings
 
 
+# --- dashed-boundary recovery ---------------------------------------------
+# The town ``line`` class is not a few long continuous lines: it has a
+# median of 17 connected components per frame with a median component
+# height of 7 px, so only about a quarter pass the extractor's shape gates
+# (h >= 18, width, fill).  Those short blocks are real paint - 65% of the
+# discarded pixels sit on the GT label - but a 17x5 px block back-projects
+# to a sub-metre stub that cannot define a lane edge, so the own lane ends
+# up with one detected boundary instead of two and nothing pairs.
+#
+# Grouping collinear, near-continuous fragments back into ONE boundary is
+# what recovers the dashed lane line: measured over 654 town shadow frames
+# it lifts the paired own-lane rate from 20.8% to 43.0% and the share of
+# paired centres inside the ego lane from 66% to 76%.  The merged boundary
+# is genuinely LONG, so it passes LANE_PAIRED_VISION_MIN_SPAN_M on its own
+# merits - the span floor is not lowered.
+DASHED_FRAG_MIN_AREA_PX = 12
+# Gap and lateral tolerance are deliberately loose: a detection gap is
+# wider than the physical dash gap (a missed dash is normal), and on a
+# bend the successive dashes of one lane line are NOT collinear with the
+# near dash under a straight-line fit, so 0.45 m rejected real merges.
+# Swept on the 2026-09-07 town episode (v13b): paired own-lane 37.8% at
+# gap 8 / lat 0.45, 41.5% at gap 12 / lat 0.60, with the paired centre
+# staying in the ego lane (-0.95 m -> -0.98 m).
+DASHED_FRAG_GAP_MAX_M = 12.0
+DASHED_FRAG_LAT_TOL_M = 0.60
+DASHED_FRAG_DIR_MIN = 0.94
+DASHED_FRAG_MAX_SPAN_M = 60.0
+DASHED_FRAG_MAX_SAMPLES = 24
+
+
+def group_world_fragments(frags, *, gap_max_m: float = DASHED_FRAG_GAP_MAX_M,
+                          lat_tol_m: float = DASHED_FRAG_LAT_TOL_M,
+                          dir_min: float = DASHED_FRAG_DIR_MIN,
+                          max_span_m: float = DASHED_FRAG_MAX_SPAN_M
+                          ) -> list[list[int]]:
+    """Group collinear, near-continuous world fragments into chains.
+
+    ``frags`` items need ``pts`` (N, 2 world points), ``c`` (centroid) and
+    ``d`` (unit direction).  Two fragments join when their directions
+    agree to ``dir_min``, their fitted lines are within ``lat_tol_m``,
+    they are within ``gap_max_m`` of each other along the direction, and
+    the chain would stay inside ``max_span_m``.  Returns the index groups
+    holding two or more fragments; singletons are left to the normal
+    single-component path.
+
+    Pure logic (no camera, no game) so the merge rule is unit-testable.
+    """
+    n = len(frags)
+    parent = list(range(n))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    for i in range(n):
+        for j in range(i + 1, n):
+            a, b = frags[i], frags[j]
+            if abs(float(a["d"] @ b["d"])) < dir_min:
+                continue
+            rel = np.asarray(b["c"], dtype=float) - np.asarray(a["c"],
+                                                             dtype=float)
+            perp = rel - (rel @ a["d"]) * a["d"]
+            if float(np.linalg.norm(perp)) > lat_tol_m:
+                continue
+            pa = (np.asarray(a["pts"], float) - a["c"]) @ a["d"]
+            pb = (np.asarray(b["pts"], float) - a["c"]) @ a["d"]
+            if float(max(pa.max(), pb.max()) - min(pa.min(), pb.min())) \
+                    > max_span_m:
+                continue
+            if float(max(pa.min(), pb.min()) - min(pa.max(), pb.max())) \
+                    > gap_max_m:
+                continue
+            ra, rb = find(i), find(j)
+            if ra != rb:
+                parent[rb] = ra
+    groups: dict[int, list[int]] = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+    return [g for g in groups.values() if len(g) >= 2]
+
+
+def _back_project_many(us, vs, cam_model, pos, heading, ground_z):
+    """Ground-plane world points for many pixels in one pass.
+
+    ``back_project`` rebuilds the camera pose on every call, and that pose
+    build (three cross products + norms) dominated the dashed-recovery
+    stage: ~542 calls per frame cost ~54 ms, virtually all of it in
+    ``camera_pose``.  The optics are identical here - the same ray
+    intersection with the same guards - but the pose is built once for the
+    whole batch.
+
+    Returns ``(points, ok)`` where ``points`` is (N, 2) with NaNs where the
+    ray missed and ``ok`` the boolean mask of hits.
+    """
+    us = np.asarray(us, dtype=float)
+    vs = np.asarray(vs, dtype=float)
+    if us.size == 0:
+        return np.empty((0, 2)), np.zeros(0, dtype=bool)
+    C, r, f, u_axis = cam_model.camera_pose(pos, heading)
+    d = (r[None, :] * ((us - cam_model.cx) / cam_model.fx)[:, None]
+         + f[None, :]
+         + u_axis[None, :] * ((cam_model.cy - vs) / cam_model.fy)[:, None])
+    dz = d[:, 2]
+    ok = dz < -1e-9
+    t = np.zeros(len(us), dtype=float)
+    t[ok] = (float(ground_z) - C[2]) / dz[ok]
+    ok &= t > 0.05
+    pts = np.full((len(us), 2), np.nan)
+    pts[ok] = C[None, :2] + t[ok, None] * d[ok, :2]
+    return pts, ok
+
+
+def _mask_fragment_polylines(mask_u8, cam_model, pos, heading,
+                             ground_z: float | None = None,
+                             min_area: int = DASHED_FRAG_MIN_AREA_PX,
+                             max_dist: float = 45.0,
+                             max_samples: int = DASHED_FRAG_MAX_SAMPLES
+                             ) -> list[dict]:
+    """Back-project every mask component into a world-space fragment.
+
+    Cost-shaped for the live tick: the label image is scanned once and the
+    camera pose built once per frame, instead of one ``np.where`` over the
+    whole image plus one ``camera_pose`` per sampled pixel for every
+    component.
+    """
+    import cv2
+
+    if mask_u8 is None or cam_model is None:
+        return []
+    p = np.asarray(pos, dtype=float)
+    if ground_z is None:
+        ground_z = float(p[2]) if p.size > 2 else 0.0
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+    mask = cv2.morphologyEx(mask_u8, cv2.MORPH_OPEN, kernel)
+    mask = cv2.dilate(mask, kernel, iterations=1)
+    n, labels, stats, _c = cv2.connectedComponentsWithStats(mask, 8)
+    if n <= 1:
+        return []
+    # One pass over the label image (not one per component), grouped by
+    # label id so each component's pixels are a contiguous slice.
+    ys_all, xs_all = np.nonzero(labels)
+    lab_all = labels[ys_all, xs_all]
+    order = np.argsort(lab_all, kind="stable")
+    lab_all = lab_all[order]
+    ys_all = ys_all[order]
+    xs_all = xs_all[order]
+    bounds = np.searchsorted(lab_all, np.arange(1, n + 1))
+    bounds = np.append(bounds, len(lab_all))
+
+    comps: list[dict] = []
+    su: list[np.ndarray] = []
+    sv: list[np.ndarray] = []
+    taken = 0
+    for i in range(1, n):
+        area = int(stats[i][4])
+        if area < min_area:
+            continue
+        lo, hi = int(bounds[i - 1]), int(bounds[i])
+        if hi <= lo:
+            continue
+        cys = ys_all[lo:hi]
+        cxs = xs_all[lo:hi]
+        o = np.argsort(cys, kind="stable")
+        cxs = cxs[o].astype(float)
+        cys = cys[o].astype(float)
+        step = max(1, int(len(cxs) // max(1, max_samples)))
+        u = cxs[::step]
+        v = cys[::step]
+        comps.append({"area": area, "start": taken, "n": len(u)})
+        su.append(u)
+        sv.append(v)
+        taken += len(u)
+    if not comps:
+        return []
+    U = np.concatenate(su)
+    V = np.concatenate(sv)
+    pts, ok = _back_project_many(U, V, cam_model, pos, heading, ground_z)
+    out: list[dict] = []
+    for comp in comps:
+        lo = comp["start"]
+        hi = lo + comp["n"]
+        c_area = int(comp["area"])
+        w = pts[lo:hi]
+        k = ok[lo:hi]
+        pix = np.column_stack([U[lo:hi], V[lo:hi]])
+        if k.any():
+            rel = w[k] - p[:2]
+            dist = np.hypot(rel[:, 0], rel[:, 1])
+            keep = (dist >= 2.0) & (dist <= max_dist)
+        else:
+            keep = np.zeros(0, dtype=bool)
+        w = w[k][keep]
+        pix = pix[k][keep]
+        if len(w) < 3:
+            continue
+        wpts = np.asarray(w, dtype=float)
+        cen = wpts.mean(axis=0)
+        try:
+            _u, _s, vt = np.linalg.svd(wpts - cen, full_matrices=False)
+        except np.linalg.LinAlgError:
+            continue
+        d = np.asarray(vt[0], dtype=float)
+        nrm = float(np.linalg.norm(d))
+        if nrm <= 1e-9:
+            continue
+        d = d / nrm
+        proj = (wpts - cen) @ d
+        if float(proj.max() - proj.min()) < 0.3:
+            continue
+        out.append({"pts": wpts, "pixels": np.asarray(pix, dtype=float),
+                    "c": cen, "d": d, "area": c_area})
+    return out
+
+
+def recover_dashed_boundaries(mask_u8, cam_model, pos, heading,
+                              ground_z: float | None = None, **kwargs
+                              ) -> list[LaneMarking]:
+    """Merge collinear short fragments into one boundary per chain.
+
+    Companion stage to ``_mask_to_markings``: it runs on the same mask but
+    keeps what the shape gates discard.  The merged marking is a genuine
+    long boundary, so downstream alignment / span / side gates judge it on
+    its real geometry instead of on the fragments it was built from.
+    """
+    frags = _mask_fragment_polylines(mask_u8, cam_model, pos, heading,
+                                     ground_z)
+    groups = group_world_fragments(frags, **kwargs)
+    out: list[LaneMarking] = []
+    for g in groups:
+        w = np.vstack([frags[i]["pts"] for i in g])
+        pix = np.vstack([frags[i]["pixels"] for i in g])
+        area = sum(int(frags[i]["area"]) for i in g)
+        span = float(np.linalg.norm(w.max(axis=0) - w.min(axis=0)))
+        conf = min(1.0, 0.35 + 0.25 * (area / 1500.0)
+                   + 0.4 * min(1.0, span / 40.0))
+        out.append(LaneMarking(world=w, pixels=pix, color="white",
+                               kind="dashed", confidence=float(conf)))
+    return out
+
+
 def painted_line_markings(sem, cam_model, pos, heading,
                           ground_z: float | None = None
                           ) -> list[LaneMarking] | None:

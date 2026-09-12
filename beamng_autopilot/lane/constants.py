@@ -29,6 +29,24 @@ LANE_SINGLE_NEAR_REQUIRE_M = 6.0
 LANE_SINGLE_MED_MIN_M = 0.08
 LANE_SINGLE_RIGHT_EDGE_MIN_M = 0.4
 LANE_RIDING_LINE_MAX_M = 0.6
+# How far ahead a right line may START and still be mirrored as the lane
+# edge, when no two-sided pair exists.
+#
+# A 2026-09-11 attempt widened this from 3.0 to 8.0 m, because the town
+# right line starts a median 3.76 m ahead and the old window rejected all
+# 410 unpaired right-edge frames (len(near)==0: not one point beside the
+# car).  That measurement was correct about WHERE frames are lost, and it
+# was reverted the same hour because losing them is protective: under the
+# required in-lane constraint (centre within 1.2 m of the ego-lane centre)
+# accepting more single-edge frames raises availability from 81.1% to
+# 82.2% while the share of laterally-correct centres stays at ~11% - a
+# single-edge mirror infers the centre from an assumed width, so the fusion
+# guards are the lateral-correctness layer, not a redundant second owner
+# (docs/HANDOFF_20260911.md, commit 3272db9).
+#
+# The lever is the two-sided PAIRED rate (26.2% offline), where the centre
+# is the midpoint of two real boundaries and no width assumption is
+# involved - i.e. detection/segmentation, not this window.
 LANE_RIGHT_MIRROR_NEAR_M = 3.0
 LANE_ONE_NEAR_FAR_START_MAX_M = 8.0
 LANE_PAIR_NEAR_MAX_M = 5.5
