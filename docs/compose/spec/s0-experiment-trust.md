@@ -1,14 +1,34 @@
 ---
 feature: s0-experiment-trust
-status: in-progress
+status: delivered
 updated: 2026-09-13
 branch: compose/s0-experiment-trust
-commits: 5f99b58..HEAD
+commits: 5f99b58..3df2255
 ---
 
 # S0 Experiment Trust (provenance + spawn gate)
 
 ## Report
+
+**What was built** — Shadow episodes no longer hardcode `map=italy`: `fsd_drive`
+resolves live level via `BeamNGConnector.current_env()` (`source=live`) and
+falls back to `unknown` when attach has neither a verified level nor `--map`.
+`data_contract` reads episode `meta.provenance` instead of inventing italy.
+Photo tour scores every camera stop with `vision/spawn_gate.assess_spawn_frame`
+(green / dark / road-like) and writes `ok`/`reasons`/metrics into `stops.json`;
+`--no-require-ok` keeps all frames but default requires at least one legal stop.
+
+**Verification** —
+`pytest tests/test_s0_experiment_trust.py tests/test_data_contract.py tests/test_fsd_drive_helpers.py -q`
+→ **55 passed**. Reviewer found critical attach-default-italy gap; fixed in
+`3df2255` with live-only trust + three resolve tests.
+
+**Journey log**
+- Worktree create blocked by env; used `compose/s0-experiment-trust` on main worktree.
+- Reviewer: `conn.map_name` is launch snapshot — attach without `--map` still italy.
+- Fix: `current_env()["source"]`; provenance `unknown` unless live or explicit `--map`.
+- `m5_shadow_drive` still hardcodes italy (follow-up, out of this feature).
+- Spawn gate is heuristic (HSV); human photo review still required before live runs.
 
 ## [S1] Problem
 
@@ -100,18 +120,18 @@ No change to FSD drive loop in this feature (live gate can consume
 
 ## Tasks
 
-- [ ] T1: Shadow provenance uses real map/vehicle — acceptance: unit test
+- [x] T1: Shadow provenance uses real map/vehicle — acceptance: unit test
       that `fsd_drive` helper (or extracted provenance builder) returns
       connector map, not `"italy"`; `make_npz_record` reads meta.provenance.map
       (covers: S2.1)
-- [ ] T2: `spawn_gate.assess_spawn_frame` + synthetic-frame tests —
+- [x] T2: `spawn_gate.assess_spawn_frame` + synthetic-frame tests —
       acceptance: green-dominated frame rejects `too_green`; dark frame
       rejects `too_dark`; bright low-veg road-like frame accepts
       (covers: S2.2)
-- [ ] T3: photo tour records assessments in `stops.json` — acceptance:
+- [x] T3: photo tour records assessments in `stops.json` — acceptance:
       tour code path writes `ok`/`reasons`/metrics; `--require-ok` flag
       exists; dry unit test of the log-builder function if extracted
       (covers: S2.2; depends: T2)
-- [ ] T4: targeted pytest for touched modules — acceptance: new tests +
+- [x] T4: targeted pytest for touched modules — acceptance: new tests +
       existing `test_data_contract` still pass
       (covers: S2.1, S2.2; depends: T1, T2, T3)
