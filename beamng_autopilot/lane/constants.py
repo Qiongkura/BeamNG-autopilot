@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 LANE_WIDTH_DEFAULT_M = 3.5
 LANE_WIDTH_MIN_M = 2.2
 LANE_PAIR_WIDTH_MIN_M = 1.5
@@ -70,7 +72,11 @@ LANE_FAR_CENTER_PAIR_MIN_WIDTH_M = 4.5
 LANE_FAR_START_MAX_M = 22.0
 LANE_FUSION_HOLD_FRAMES = 3
 LANE_FUSION_PAIRED_HOLD_FRAMES = 4
-LANE_FUSION_HOLD_NONE_FRAMES = 4
+# 检测间隙容忍：跨地图（US 标线）实测配对间隙达 5-17 帧（east_coast
+# junction 实车 2026-09-13），4 帧的默认值罩不住 → sensor/P 闪烁。
+# env 覆盖供实车 A/B，不设维持原口径。
+LANE_FUSION_HOLD_NONE_FRAMES = int(
+    os.environ.get("BEAMNG_LANE_HOLD_NONE_FRAMES", "4"))
 MARKING_ALIGNMENT_MIN = 0.65
 LIDAR_MAX_DIST_M = 24.0
 LIDAR_STATION_M = 1.5
