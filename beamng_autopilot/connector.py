@@ -238,7 +238,11 @@ class BeamNGConnector:
         Falls back to the launch args when the query fails.
         """
         with self.io_lock:
-            env = {"map": self.map_name, "vehicle": self.vehicle_model}
+            # source=launch_args means the level query failed and these are
+            # constructor defaults (often italy) — callers must not treat
+            # that as a verified live map (S0 provenance).
+            env = {"map": self.map_name, "vehicle": self.vehicle_model,
+                   "source": "launch_args"}
             try:
                 scenario = self.bng.scenario.get_current(connect=False)
                 lvl = getattr(scenario, "level", None)
@@ -248,6 +252,7 @@ class BeamNGConnector:
                     env["map"] = lvl
                 elif getattr(scenario, "name", None):
                     env["map"] = scenario.name
+                env["source"] = "live"
                 self._env_fail_printed = False
             except Exception as exc:
                 # NOTE: bare except kept — scenario query can fail with

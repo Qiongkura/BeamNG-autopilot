@@ -737,6 +737,33 @@ def _sensor_snapshot_age(out) -> float:
     return max([0.0] + [float(x) for x in ages])
 
 
+def resolve_provenance_env(conn, args) -> tuple[str, str]:
+    """(map, vehicle) for shadow provenance — never invent italy.
+
+    Trust live ``current_env()`` only when the level query succeeded
+    (``source == "live"``). Attach without ``--map`` and a failed query
+    must record ``unknown``, not the connector's italy constructor default.
+    """
+    env: dict = {}
+    try:
+        env = conn.current_env() or {}
+    except Exception:
+        env = {}
+    launch_map = getattr(args, "map", None)
+    src = str(env.get("source") or "")
+    if src == "live" and env.get("map"):
+        map_name = str(env["map"])
+    elif launch_map:
+        map_name = str(launch_map)
+    else:
+        map_name = "unknown"
+    vehicle = str(env.get("vehicle") or getattr(args, "vehicle", None)
+                  or "unknown")
+    if vehicle == "None":
+        vehicle = "unknown"
+    return map_name, vehicle
+
+
 def build_fsd_shadow_provenance(
     *,
     runtime: str,
@@ -1248,12 +1275,13 @@ class FSDriveSession:
             # BEV + trajectory + executed control) frames for later
             # end-to-end training - the same ShadowFrame contract
             # m5_shadow_drive uses, so a drive IS a labelled run.
+            prov_map, prov_vehicle = resolve_provenance_env(conn, args)
             rec = None if args.no_shadow else ShadowRecorder(
                 config.LOGS_DIR / "m5_e2e", f"fsd_{int(time.time())}",
                 provenance=build_fsd_shadow_provenance(
                     runtime=str(args.runtime),
-                    map_name=conn.map_name,
-                    vehicle=conn.vehicle_model,
+                    map_name=prov_map,
+                    vehicle=prov_vehicle,
                     speed_arg=float(args.speed),
                     strict=bool(args.strict),
                     e2e_weights=(str(e2e_rt.weights)

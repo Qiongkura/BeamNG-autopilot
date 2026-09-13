@@ -8,8 +8,25 @@ import numpy as np
 import pytest
 
 from beamng_autopilot.data_contract import make_npz_record
-from beamng_autopilot.fsd_drive import build_fsd_shadow_provenance
+from beamng_autopilot.fsd_drive import (
+    build_fsd_shadow_provenance,
+    resolve_provenance_env,
+)
 from beamng_autopilot.vision.spawn_gate import assess_spawn_frame
+
+
+class _Args:
+    def __init__(self, map=None, vehicle=None):
+        self.map = map
+        self.vehicle = vehicle
+
+
+class _FakeConn:
+    def __init__(self, env):
+        self._env = env
+
+    def current_env(self):
+        return dict(self._env)
 
 
 def _frame(h=120, w=160, rgb=(120, 120, 120)) -> np.ndarray:
@@ -65,6 +82,29 @@ def test_fsd_provenance_uses_connector_map() -> None:
     )
     assert p2["map"] == "unknown"
     assert p2["vehicle"] == "unknown"
+
+
+def test_resolve_provenance_env_uses_live_query() -> None:
+    conn = _FakeConn({"map": "east_coast_usa", "vehicle": "etk800",
+                      "source": "live"})
+    m, v = resolve_provenance_env(conn, _Args())
+    assert m == "east_coast_usa"
+    assert v == "etk800"
+
+
+def test_resolve_provenance_env_attach_fallback_not_italy() -> None:
+    # Level query failed: connector default is italy — must record unknown.
+    conn = _FakeConn({"map": "italy", "vehicle": "etk800",
+                      "source": "launch_args"})
+    m, _ = resolve_provenance_env(conn, _Args())
+    assert m == "unknown"
+
+
+def test_resolve_provenance_env_explicit_launch_map() -> None:
+    conn = _FakeConn({"map": "italy", "vehicle": "etk800",
+                      "source": "launch_args"})
+    m, _ = resolve_provenance_env(conn, _Args(map="east_coast_usa"))
+    assert m == "east_coast_usa"
 
 
 def test_make_npz_record_reads_episode_provenance(tmp_path) -> None:
