@@ -13,6 +13,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import random
 import sys
@@ -94,17 +95,20 @@ def main() -> int:
                                          roles=("front_main",))
     n = 0
     t0 = time.time()
+    stops_log: list[dict] = []
     for k, i in enumerate(stops):
         x, y = float(net.nodes[i][0]), float(net.nodes[i][1])
         try:
             h = float(net.road_heading_at((x, y)))
-            conn.safe_teleport(x, y, heading_deg=math.degrees(h))
+            conn.safe_teleport(x, y, heading_deg=h)
             conn.step(args.settle_steps)
             snap = ring.grab_ring()
             role = "front_main" if "front_main" in snap else next(iter(snap))
             rgb = snap[role][0]
-            cv2.imwrite(str(out_dir / f"frame_{n:05d}.png"),
-                        cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+            fp = out_dir / f"frame_{n:05d}.png"
+            cv2.imwrite(str(fp), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+            stops_log.append({"frame": fp.name, "node": int(i),
+                              "x": x, "y": y, "heading_deg": h})
             n += 1
         except Exception as exc:
             print(f"[tour] stop {i} failed: {exc}", flush=True)
@@ -113,6 +117,10 @@ def main() -> int:
             print(f"[tour] {k + 1}/{len(stops)} stops, {n} frames "
                   f"({rate:.1f} stops/s)", flush=True)
     print(f"[tour] done: {n} frames -> {out_dir}", flush=True)
+    stops_path = out_dir / "stops.json"
+    stops_path.write_text(json.dumps(stops_log, ensure_ascii=False, indent=1),
+                          encoding="utf-8")
+    print(f"[tour] stop coordinates -> {stops_path}", flush=True)
     conn.close()
     return 0
 
