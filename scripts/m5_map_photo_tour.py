@@ -43,11 +43,16 @@ def main() -> int:
     ap.add_argument("--launch", action="store_true",
                     help="新开游戏实例（默认 attach 现有实例）")
     ap.add_argument("--out", type=str, default=None)
+    ap.add_argument("--no-require-ok", dest="require_ok",
+                    action="store_false", default=True,
+                    help="不把灌木/过暗机位从 accepted 计数中剔除"
+                         "（仍写入 stops.json 评估结果）")
     args = ap.parse_args()
 
     from beamng_autopilot.connector import BeamNGConnector
     from beamng_autopilot.roadnet import RoadNetwork
     from beamng_autopilot.runtime import build_camera_ring_provider
+    from beamng_autopilot.vision.spawn_gate import assess_spawn_frame
     from beamng_autopilot.watchdog import disarm as wd_disarm
 
     out_dir = (Path(args.out) if args.out
@@ -94,6 +99,7 @@ def main() -> int:
     ring, _ = build_camera_ring_provider(conn, args.runtime, 536, 403,
                                          roles=("front_main",))
     n = 0
+    accepted = 0
     t0 = time.time()
     stops_log: list[dict] = []
     for k, i in enumerate(stops):
@@ -105,24 +111,32 @@ def main() -> int:
             snap = ring.grab_ring()
             role = "front_main" if "front_main" in snap else next(iter(snap))
             rgb = snap[role][0]
+            assess = assess_spawn_frame(rgb)
             fp = out_dir / f"frame_{n:05d}.png"
             cv2.imwrite(str(fp), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
-            stops_log.append({"frame": fp.name, "node": int(i),
-                              "x": x, "y": y, "heading_deg": h})
+            entry = {"frame": fp.name, "node": int(i),
+                     "x": x, "y": y, "heading_deg": h}
+            entry.update(assess.as_dict())
+            stops_log.append(entry)
             n += 1
+            if assess.ok:
+                accepted += 1
         except Exception as exc:
             print(f"[tour] stop {i} failed: {exc}", flush=True)
         if (k + 1) % 25 == 0:
             rate = (k + 1) / max(time.time() - t0, 1.0)
             print(f"[tour] {k + 1}/{len(stops)} stops, {n} frames "
-                  f"({rate:.1f} stops/s)", flush=True)
-    print(f"[tour] done: {n} frames -> {out_dir}", flush=True)
+                  f"ok={accepted} ({rate:.1f} stops/s)", flush=True)
+    ok_only = accepted if args.require_ok else n
+    print(f"[tour] done: {n} frames ({accepted} spawn-ok, "
+          f"require_ok={args.require_ok}) -> {out_dir}", flush=True)
     stops_path = out_dir / "stops.json"
     stops_path.write_text(json.dumps(stops_log, ensure_ascii=False, indent=1),
                           encoding="utf-8")
-    print(f"[tour] stop coordinates -> {stops_path}", flush=True)
+    print(f"[tour] stop coordinates+gate -> {stops_path} "
+          f"(accepted={ok_only})", flush=True)
     conn.close()
-    return 0
+    return 0 if (not args.require_ok or accepted > 0) else 2
 
 
 if __name__ == "__main__":

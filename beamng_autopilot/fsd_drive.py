@@ -737,6 +737,39 @@ def _sensor_snapshot_age(out) -> float:
     return max([0.0] + [float(x) for x in ages])
 
 
+def build_fsd_shadow_provenance(
+    *,
+    runtime: str,
+    map_name: str | None,
+    vehicle: str | None,
+    speed_arg: float,
+    strict: bool,
+    e2e_weights: str | None = None,
+    bc_weights: str | None = None,
+    dqn_weights: str | None = None,
+    dqn_contract: str = "disabled",
+    dqn_contract_warning: str | None = None,
+) -> dict:
+    """Episode provenance for ShadowRecorder.
+
+    Map/vehicle must come from the live connector — never hardcode italy
+    (multi-map experiments mislabeled every east_coast episode).
+    """
+    return {
+        "source": "fsd_drive",
+        "runtime": str(runtime),
+        "map": str(map_name or "unknown"),
+        "vehicle": str(vehicle or "unknown"),
+        "speed_arg": float(speed_arg),
+        "strict": bool(strict),
+        "e2e_weights": e2e_weights,
+        "bc_weights": bc_weights,
+        "dqn_weights": dqn_weights,
+        "dqn_contract": dqn_contract,
+        "dqn_contract_warning": dqn_contract_warning,
+    }
+
+
 class FSDriveSession:
     """Stateful live FSD drive session.
 
@@ -1217,26 +1250,26 @@ class FSDriveSession:
             # m5_shadow_drive uses, so a drive IS a labelled run.
             rec = None if args.no_shadow else ShadowRecorder(
                 config.LOGS_DIR / "m5_e2e", f"fsd_{int(time.time())}",
-                provenance={
-                    "source": "fsd_drive",
-                    "runtime": str(args.runtime),
-                    "map": "italy",
-                    "vehicle": "etk800",
-                    "speed_arg": float(args.speed),
-                    "strict": bool(args.strict),
-                    "e2e_weights": (str(e2e_rt.weights)
-                                    if e2e_rt is not None else None),
-                    "bc_weights": (str(bc_rt.weights)
-                                   if bc_rt is not None else None),
-                    "dqn_weights": (str(dqn_rt.weights)
-                                    if dqn_rt is not None else None),
-                    "dqn_contract": (
-                        "ok" if dqn_rt.contract is not None
+                provenance=build_fsd_shadow_provenance(
+                    runtime=str(args.runtime),
+                    map_name=conn.map_name,
+                    vehicle=conn.vehicle_model,
+                    speed_arg=float(args.speed),
+                    strict=bool(args.strict),
+                    e2e_weights=(str(e2e_rt.weights)
+                                 if e2e_rt is not None else None),
+                    bc_weights=(str(bc_rt.weights)
+                                if bc_rt is not None else None),
+                    dqn_weights=(str(dqn_rt.weights)
+                                 if dqn_rt is not None else None),
+                    dqn_contract=(
+                        "ok" if dqn_rt is not None
+                        and dqn_rt.contract is not None
                         and dqn_rt.contract.ok else "disabled"),
-                    "dqn_contract_warning": (
+                    dqn_contract_warning=(
                         dqn_rt.meta_warning
                         if dqn_rt is not None else None),
-                })
+                ))
             (_pw_out, _percep_ok,
              _placement_rc) = self._prewarm_and_place(
                 conn, stack, nav_route, fwd_gear)

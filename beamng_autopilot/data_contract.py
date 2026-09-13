@@ -118,7 +118,8 @@ def make_seg_record(path: Path, root: Path | None = None,
         "split": split,
         "environment": {
             "runtime": "tech" if domain == "tech_truth" else "unknown",
-            "map": meta.get("map", "italy"),
+            # Never invent italy: missing meta means unknown, not a guess.
+            "map": meta.get("map", "unknown"),
             "vehicle": meta.get("vehicle", "etk800"),
             "seed": meta.get("seed"),
         },
@@ -145,6 +146,9 @@ def make_npz_record(path: Path, root: Path | None = None,
     sensor: dict[str, Any] = {}
     version = None
     fmap_channels = None
+    env_map = "unknown"
+    env_vehicle = "unknown"
+    env_runtime = "unknown"
     try:
         import numpy as np
         with np.load(path, allow_pickle=True) as z:
@@ -158,10 +162,25 @@ def make_npz_record(path: Path, root: Path | None = None,
                           "channels": int(z["rgb"].shape[3])}
             if "fmap" in z and z["fmap"].ndim == 4:
                 fmap_channels = int(z["fmap"].shape[1])
+            if "meta" in z:
+                raw = z["meta"]
+                meta_s = raw.item() if getattr(raw, "ndim", 0) == 0 else raw
+                if isinstance(meta_s, bytes):
+                    meta_s = meta_s.decode("utf-8", errors="replace")
+                try:
+                    ep_meta = json.loads(str(meta_s))
+                except Exception:
+                    ep_meta = {}
+                prov = ep_meta.get("provenance") or {}
+                env_map = str(prov.get("map") or "unknown")
+                env_vehicle = str(prov.get("vehicle") or "unknown")
+                env_runtime = str(prov.get("runtime") or "unknown")
     except Exception as exc:
         info["read_error"] = str(exc)
     name = path.name.lower()
     scenario = "town" if "town" in name else "mountain" if "mountain" in name else "unknown"
+    if env_map != "unknown" and "town" not in name and "mountain" not in name:
+        scenario = "unknown"
     return {
         "manifest_version": MANIFEST_VERSION,
         "run_id": stable_id(path, root),
@@ -172,7 +191,11 @@ def make_npz_record(path: Path, root: Path | None = None,
         "scenario_id": scenario,
         "group_id": f"episode:{stable_id(path, root)}",
         "split": "unassigned",
-        "environment": {"runtime": "tech", "map": "italy", "vehicle": "etk800"},
+        "environment": {
+            "runtime": env_runtime,
+            "map": env_map,
+            "vehicle": env_vehicle,
+        },
         "sensor": {**sensor, "fmap_channels": fmap_channels,
                    "fmap_contract": "v3" if fmap_channels else "legacy"},
         "label": {"source": "semantic_prediction" if artifact_type == "shadow_episode" else None},
