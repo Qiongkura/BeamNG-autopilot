@@ -619,7 +619,7 @@ def painted_line_lane_center(sem, cam_model, pos, heading,
                              lane_half_m: float = 1.5,
                              max_lat_m: float = 4.0,
                              max_shift_m: float = 2.5,
-                             min_pts: int = 6,
+                             min_pts: int = 4,
                              near_lon_m: float = 14.0,
                              marks: list | None = None,
                              rgb: np.ndarray | None = None
@@ -734,7 +734,10 @@ def painted_line_lane_center(sem, cam_model, pos, heading,
         shift = float(np.clip(lane_half_m - line_lat,
                               -max_shift_m, max_shift_m))
         if abs(shift) < 0.2:
-            return None
+            # Already on the perceived own-lane centre: return the current
+            # pose so callers treat placement as SUCCESS (east_coast used
+            # to report placed=False whenever the ego was already centred).
+            return (float(p[0]), float(p[1]))
         tgt = p + np.array([fwd[1], -fwd[0]]) * shift
         return (float(tgt[0]), float(tgt[1]))
     except Exception:

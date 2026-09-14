@@ -112,11 +112,14 @@ def test_yellow_rgb_unions_into_line_mask():
 
 
 def test_already_in_lane_no_teleport():
-    """Line 1.6 m left -> shift 0.1 m < deadband; keep the pose."""
+    """Line 1.6 m left -> shift 0.1 m < deadband; return current pose."""
     lanes._mask_to_markings = _fake_masks_to_markings([_line(1.6)])
-    assert painted_line_lane_center(_Sem({"line": np.zeros((8, 8), np.uint8)}),
-                                    cam_model=None,
-                                    pos=(10.0, 20.0, 1.5), heading=0.0) is None
+    tgt = painted_line_lane_center(_Sem({"line": np.zeros((8, 8), np.uint8)}),
+                                   cam_model=None,
+                                   pos=(10.0, 20.0, 1.5), heading=0.0)
+    assert tgt is not None
+    assert abs(tgt[0] - 10.0) < 1e-6
+    assert abs(tgt[1] - 20.0) < 1e-6
 
 
 def test_clamps_lateral_shift():
