@@ -129,10 +129,10 @@ WARMUP_S = 8.0
 # deadline expires.  A start from the road-graph node sits ON the road
 # centre line - driving unplaced rides the left line from metre one
 # (town 2026-09-06, user-reported).  An unplaced run aborts instead.
-PLACEMENT_HOLD_S = 25.0
+PLACEMENT_HOLD_S = 30.0
 # Extra seconds after heads are live before giving up on painted-line
 # placement (US yellow paint / warm-up flicker).
-PLACEMENT_GRACE_S = 8.0
+PLACEMENT_GRACE_S = 15.0
 WARMUP_SPEED_MPS = 1.5
 # If a tick ever takes longer than this, the car has been driving
 # open-loop for that long - keep this frame slow instead of trusting
