@@ -1,14 +1,25 @@
 ---
 feature: yellow-semantic-head
-status: designed
+status: delivered
 updated: 2026-09-14
 branch: compose/line-recall
-commits: daa8c73..HEAD
+commits: daa8c73..4215dbf
 ---
 
 # Yellow Paint in Semantic Head LINE Channel
 
 ## Report
+
+**What was built** — SemanticHead unions HSV yellow into LINE before
+evidence/markings. Line-evidence persistence raised (DECAY 0.25→0.15,
+MAX_AGE 3→5 s) so sparse yellow survives dropouts. Live: placement
+succeeded in 6.2 s; line_lat min improved toward 0.
+
+**Verification** — 21 vision tests passed. Live 90s at junction.
+
+**Journey log**
+- Yellow only in painted_line_markings was not enough for pairing.
+- Mid-run `no drivable path` remains when pairing fully expires (strict).
 
 ## [S1] Problem
 
