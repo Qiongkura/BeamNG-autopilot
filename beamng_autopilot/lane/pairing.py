@@ -833,6 +833,10 @@ def _centre_line_own_lane(cand, pos, fwd, lane_width: float,
         pos, fwd, stations, center_lat, left_lat, None)
     conf = min(0.75, 0.35 + 0.03 * float(cand.span)
                + 0.2 * min(1.0, float(cand.conf)))
+    # Yellow centre paint is the authoritative own-lane cue on US maps;
+    # allow a slightly higher cap so lane_frame_usable accepts short spans.
+    if str(getattr(cand, "color", "")) == "yellow":
+        conf = min(0.85, conf + 0.08)
     return LaneFrame(center=center, left=left_pts, right=None,
                      width=float(lane_width), confidence=conf,
                      span_m=float(cand.span), sources=("vision",),
