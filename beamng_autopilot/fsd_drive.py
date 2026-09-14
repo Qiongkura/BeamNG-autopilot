@@ -135,7 +135,7 @@ PLACEMENT_HOLD_S = 30.0
 PLACEMENT_GRACE_S = 15.0
 # Skip the first N stack ticks after teleport so the camera settles
 # before placement (east_coast first frames often lack paint).
-PLACEMENT_SKIP_TICKS = 8
+PLACEMENT_SKIP_TICKS = 16
 WARMUP_SPEED_MPS = 1.5
 # If a tick ever takes longer than this, the car has been driving
 # open-loop for that long - keep this frame slow instead of trusting
