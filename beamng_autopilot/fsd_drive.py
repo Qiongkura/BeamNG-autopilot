@@ -133,6 +133,9 @@ PLACEMENT_HOLD_S = 30.0
 # Extra seconds after heads are live before giving up on painted-line
 # placement (US yellow paint / warm-up flicker).
 PLACEMENT_GRACE_S = 15.0
+# Skip the first N stack ticks after teleport so the camera settles
+# before placement (east_coast first frames often lack paint).
+PLACEMENT_SKIP_TICKS = 8
 WARMUP_SPEED_MPS = 1.5
 # If a tick ever takes longer than this, the car has been driving
 # open-loop for that long - keep this frame slow instead of trusting
@@ -1122,6 +1125,7 @@ class FSDriveSession:
             conn.control(throttle=0.0, brake=1.0, steering=0.0,
                          parkingbrake=1.0, gear=fwd_gear)
             _pw_t0 = time.time()
+            _pw_ticks = 0
             while True:
                 _elapsed = time.time() - _pw_t0
                 try:
@@ -1134,12 +1138,14 @@ class FSDriveSession:
                     float(_pw_state.heading), nav_route)
                 try:
                     _pw_out = stack.tick(st=_pw_state, route_ref=_pw_route)
+                    _pw_ticks += 1
                 except Exception:
                     _pw_out = None
                 _head_live = bool(
                     _pw_out is not None
                     and _pw_out.meta.get("object_head"))
-                if _pw_out is not None and _pw_out.frame is not None:
+                if (_pw_out is not None and _pw_out.frame is not None
+                        and _pw_ticks >= PLACEMENT_SKIP_TICKS):
                     try:
                         _sp_tgt = painted_line_lane_center(
                             _pw_out.head_outputs.get("semantic"),

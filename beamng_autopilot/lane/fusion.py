@@ -409,11 +409,40 @@ def choose_sensor_lane(vision_frame: LaneFrame | None,
             # east_coast gaps measured up to ~17 frames
             hold_limit = max(hold_limit, 22)
         if misses > hold_limit:
+            # Coast: after hold exhausts, project the last centre-paint
+            # frame forward for a short window instead of dropping to
+            # perception-unavailable (still no map lateral).
+            coast_n = int(state.get("coast", 0)) + 1
+            if (last is not None
+                    and bool(getattr(last, "paired", False))
+                    and getattr(last, "left", None) is not None
+                    and getattr(last, "right", None) is None
+                    and pos is not None and coast_n <= 6):
+                state["coast"] = coast_n
+                state["misses"] = misses
+                try:
+                    speed = float(state.get("speed") or 1.0)
+                except Exception:
+                    speed = 1.0
+                dt = 0.15
+                step = max(0.0, min(speed * dt, 1.2))
+                fwd = _unit_fwd(np.asarray(pos[:2], float), heading, fwd)
+                # Translate last centre polyline along heading
+                import copy
+                coast = copy.deepcopy(last)
+                coast.center = np.asarray(coast.center, dtype=float) + \
+                    np.outer(np.ones(len(coast.center)), fwd * step)
+                if coast.left is not None:
+                    coast.left = np.asarray(coast.left, dtype=float) + \
+                        np.outer(np.ones(len(coast.left)), fwd * step)
+                state["last"] = coast
+                return coast
             state.clear()
             return None
         state["misses"] = misses
         return state.get("last")
     state["misses"] = 0
+    state["coast"] = 0
     if state.get("src") == src:
         state["frames"] = int(state.get("frames", 0)) + 1
         state["last"] = chosen

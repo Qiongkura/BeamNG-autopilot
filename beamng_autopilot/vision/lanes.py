@@ -186,8 +186,8 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
         # Yellow centre paint on US maps is often thin/faded; keep more
         # small components than the white-line defaults.
         if str(color) == "yellow":
-            min_area = 15 if min_area is None else min_area
-            min_height = 10 if min_height is None else min_height
+            min_area = 12 if min_area is None else min_area
+            min_height = 8 if min_height is None else min_height
         else:
             min_area = 30 if min_area is None else min_area
             min_height = 18 if min_height is None else min_height
