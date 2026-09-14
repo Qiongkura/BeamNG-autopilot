@@ -17,8 +17,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+sys.path.insert(0, str(ROOT / "scripts"))
 
-from scripts.m5_run_metrics import metrics_from_text
+from m5_run_metrics import metrics_from_text
 
 
 def run_once(args, out_path: Path) -> dict:
@@ -35,12 +36,20 @@ def run_once(args, out_path: Path) -> dict:
         cmd.append("--allow-unplaced")
     print("[multi] run", out_path.name, flush=True)
     t0 = time.time()
-    p = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, timeout=int(args.seconds) + 180)
-    raw = p.stdout + b"\n" + p.stderr
+    timeout_s = int(args.seconds) + 400  # warm can exceed 30-40s
+    try:
+        p = subprocess.run(cmd, cwd=str(ROOT), capture_output=True,
+                           timeout=timeout_s)
+        raw = p.stdout + b"\n" + p.stderr
+        rc = p.returncode
+    except subprocess.TimeoutExpired as e:
+        raw = (e.stdout or b"") + b"\n" + (e.stderr or b"")
+        rc = -9
+        print("[multi] timeout", timeout_s, flush=True)
     out_path.write_bytes(raw)
     text = raw.decode("utf-8", errors="replace")
     m = metrics_from_text(text)
-    m["returncode"] = p.returncode
+    m["returncode"] = rc
     m["wall_s"] = round(time.time() - t0, 1)
     print("[multi]", m, flush=True)
     return m
