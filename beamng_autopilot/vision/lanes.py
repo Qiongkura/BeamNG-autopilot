@@ -159,7 +159,7 @@ def _color_masks(frame_rgb):
 
 def _mask_to_markings(mask0, color, cam_model, pos, heading,
                       ground_z: float | None = None,
-                      min_area: int = 30, min_height: int = 18,
+                      min_area: int | None = None, min_height: int | None = None,
                       max_dist: float = 45.0, solid_len: float = 6.0,
                       debug: dict | None = None
                       ) -> list[LaneMarking]:
@@ -182,6 +182,15 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
 
     from beamng_autopilot.vision.detection import back_project
 
+    if min_area is None or min_height is None:
+        # Yellow centre paint on US maps is often thin/faded; keep more
+        # small components than the white-line defaults.
+        if str(color) == "yellow":
+            min_area = 15 if min_area is None else min_area
+            min_height = 10 if min_height is None else min_height
+        else:
+            min_area = 30 if min_area is None else min_area
+            min_height = 18 if min_height is None else min_height
     if mask0 is None or cam_model is None:
         return []
     p = np.asarray(pos, dtype=float)
