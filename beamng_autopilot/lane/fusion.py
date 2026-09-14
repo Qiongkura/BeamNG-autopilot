@@ -397,7 +397,17 @@ def choose_sensor_lane(vision_frame: LaneFrame | None,
     src = tuple(chosen.sources) if chosen is not None else None
     if src is None:
         misses = int(state.get("misses", 0)) + 1
-        if misses > LANE_FUSION_HOLD_NONE_FRAMES:
+        hold_limit = int(LANE_FUSION_HOLD_NONE_FRAMES)
+        last = state.get("last")
+        # Centre-paint (US yellow) paired frames flicker 5-17 ticks on
+        # east_coast; the default 4-frame hold clears mid-gap and the
+        # strict runtime stops.  Hold a lone painted centre longer.
+        if (last is not None
+                and bool(getattr(last, "paired", False))
+                and getattr(last, "left", None) is not None
+                and getattr(last, "right", None) is None):
+            hold_limit = max(hold_limit, 12)
+        if misses > hold_limit:
             state.clear()
             return None
         state["misses"] = misses

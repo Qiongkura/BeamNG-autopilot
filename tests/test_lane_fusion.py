@@ -19,6 +19,35 @@ def _frame(paired=True, src=("vision",), yoff=0.0):
                      span_m=30.0, sources=src, paired=paired)
 
 
+def _centre_paint_frame():
+    from beamng_autopilot.lane.pairing import LaneFrame
+    xs = np.linspace(0.0, 24.0, 8)
+    left = np.column_stack([xs, np.zeros(8)])
+    center = np.column_stack([xs, np.full(8, -1.75)])
+    return LaneFrame(center=center, left=left, right=None, width=3.5,
+                     confidence=0.7, span_m=24.0, sources=("vision",),
+                     paired=True)
+
+
+def test_fusion_holds_centre_paint_past_default_gap() -> None:
+    """Centre-paint paired frames survive >4 miss ticks (US yellow flicker)."""
+    from beamng_autopilot.lane.constants import LANE_FUSION_HOLD_NONE_FRAMES
+    from beamng_autopilot.lane.fusion import choose_sensor_lane
+    pos = np.array([0.0, 0.0])
+    state = {}
+    paint = _centre_paint_frame()
+    out = choose_sensor_lane(paint, None, pos, 0.0, state=state)
+    assert out is not None and out.paired
+    # 5 misses > default 4 — must still hold centre-paint
+    for _ in range(5):
+        out = choose_sensor_lane(None, None, pos, 0.0, state=state)
+        assert out is not None, "centre-paint hold cleared too early"
+    # beyond 12 still clears
+    for _ in range(10):
+        out = choose_sensor_lane(None, None, pos, 0.0, state=state)
+    assert out is None or int(state.get("misses", 99)) <= 12
+
+
 def test_fusion_holds_lane_through_one_frame_glitch() -> None:
     """A one-frame glitch to a different source must NOT adopt instantly
     (the old counter tested the ACTIVE source's tenure, which in steady
