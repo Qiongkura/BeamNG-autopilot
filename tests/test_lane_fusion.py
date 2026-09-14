@@ -42,10 +42,10 @@ def test_fusion_holds_centre_paint_past_default_gap() -> None:
     for _ in range(5):
         out = choose_sensor_lane(None, None, pos, 0.0, state=state)
         assert out is not None, "centre-paint hold cleared too early"
-    # beyond 12 still clears
-    for _ in range(10):
+    # beyond the centre-paint hold (18) still clears
+    for _ in range(20):
         out = choose_sensor_lane(None, None, pos, 0.0, state=state)
-    assert out is None or int(state.get("misses", 99)) <= 12
+    assert out is None or int(state.get("misses", 99)) <= 18
 
 
 def test_fusion_holds_lane_through_one_frame_glitch() -> None:
