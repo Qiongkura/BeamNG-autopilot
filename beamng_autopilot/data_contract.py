@@ -19,6 +19,33 @@ from beamng_autopilot import config
 
 MANIFEST_VERSION = 1
 LABEL_CLASSES = ["background", "asphalt", "line"]
+EXCLUDED_EPISODES_FILE = config.PROJECT_ROOT / "data" / "excluded_shadow_episodes.json"
+
+
+def _load_exclusion_table() -> dict[str, dict[str, Any]]:
+    path = EXCLUDED_EPISODES_FILE
+    if not path.is_file():
+        return {}
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    eps = raw.get("episodes") if isinstance(raw, dict) else None
+    return eps if isinstance(eps, dict) else {}
+
+
+def is_excluded_episode(path: Path | str) -> bool:
+    """True when this shadow episode basename is on the deny list."""
+    name = Path(path).name
+    return name in _load_exclusion_table()
+
+
+def exclusion_reason(path: Path | str) -> str | None:
+    """Deny-list reason string, or None when the episode is not excluded."""
+    entry = _load_exclusion_table().get(Path(path).name)
+    if not isinstance(entry, dict):
+        return None
+    return str(entry.get("reason") or "excluded")
 
 
 def _rel(path: Path, root: Path) -> str:
@@ -181,6 +208,13 @@ def make_npz_record(path: Path, root: Path | None = None,
     scenario = "town" if "town" in name else "mountain" if "mountain" in name else "unknown"
     if env_map != "unknown" and "town" not in name and "mountain" not in name:
         scenario = "unknown"
+    excluded = exclusion_reason(path)
+    split = "excluded" if excluded else "unassigned"
+    label_source = (
+        "excluded" if excluded
+        else ("semantic_prediction" if artifact_type == "shadow_episode"
+              else None)
+    )
     return {
         "manifest_version": MANIFEST_VERSION,
         "run_id": stable_id(path, root),
@@ -190,7 +224,7 @@ def make_npz_record(path: Path, root: Path | None = None,
         "domain": "shadow" if artifact_type == "shadow_episode" else "closed_loop",
         "scenario_id": scenario,
         "group_id": f"episode:{stable_id(path, root)}",
-        "split": "unassigned",
+        "split": split,
         "environment": {
             "runtime": env_runtime,
             "map": env_map,
@@ -198,7 +232,8 @@ def make_npz_record(path: Path, root: Path | None = None,
         },
         "sensor": {**sensor, "fmap_channels": fmap_channels,
                    "fmap_contract": "v3" if fmap_channels else "legacy"},
-        "label": {"source": "semantic_prediction" if artifact_type == "shadow_episode" else None},
+        "label": {"source": label_source,
+                  "exclusion_reason": excluded},
         "stats": info,
         "provenance": {"git_commit": None,
                         "sha256": sha256_file(path) if path.is_file() else None},

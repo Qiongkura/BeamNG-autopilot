@@ -10,6 +10,8 @@ import pytest
 
 from beamng_autopilot.data_contract import (
     MANIFEST_VERSION,
+    exclusion_reason,
+    is_excluded_episode,
     make_seg_record,
     make_npz_record,
     stable_id,
@@ -68,6 +70,26 @@ def test_shadow_record_exposes_v2_v3_contract(tmp_path) -> None:
 def test_write_manifest_rejects_invalid_record(tmp_path) -> None:
     with pytest.raises(ValueError):
         write_manifest([{"manifest_version": 1}], tmp_path / "m.json")
+
+
+def test_bush_episode_is_excluded(tmp_path) -> None:
+    name = "shadow_fsd_1789298914_20260913_193100.npz"
+    assert is_excluded_episode(name)
+    assert exclusion_reason(name) == "camera_in_vegetation_20260913"
+    assert not is_excluded_episode("shadow_fsd_town.npz")
+    assert exclusion_reason("shadow_fsd_town.npz") is None
+
+
+def test_make_npz_record_marks_excluded_split(tmp_path) -> None:
+    p = tmp_path / "shadow_fsd_1789298914_20260913_193100.npz"
+    np.savez_compressed(
+        p, version=np.int64(3), t=np.zeros(1),
+        rgb=np.zeros((1, 4, 5, 3), dtype=np.uint8),
+    )
+    rec = make_npz_record(p, tmp_path, "shadow_episode")
+    assert rec["split"] == "excluded"
+    assert rec["label"]["source"] == "excluded"
+    assert "vegetation" in rec["label"]["exclusion_reason"]
 
 
 def test_write_manifest_roundtrip(tmp_path) -> None:

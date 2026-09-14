@@ -198,10 +198,15 @@ def main() -> int:
                          "--lane-mode sensor the map lane / nav route may "
                          "NEVER steer or label a frame; frames without a "
                          "perceived lane are stopped on and not recorded")
+    ap.add_argument("--map", type=str, default=None,
+                    help="BeamNG level to load / label (default: live "
+                         "session level when attach succeeds, else italy)")
     args = ap.parse_args()
 
+    from beamng_autopilot.fsd_drive import resolve_provenance_env
+
     conn = BeamNGConnector(
-        "italy", "etk800",
+        args.map or "italy", "etk800",
         port=config.runtime_port(args.runtime),
         home=config.runtime_home(args.runtime))
     rec = ShadowRecorder(
@@ -209,8 +214,10 @@ def main() -> int:
         provenance={
             "source": "m5_shadow_drive",
             "runtime": str(args.runtime),
-            "map": "italy",
-            "vehicle": "etk800",
+            # Placeholder until post-connect resolve; never trust italy
+            # after attach without --map (S0 hygiene).
+            "map": str(args.map or "unknown"),
+            "vehicle": str(conn.vehicle_model or "unknown"),
             "speed_arg": float(args.speed),
             "drive": bool(args.drive),
             "goal": list(args.goal) if args.goal is not None else None,
@@ -231,6 +238,11 @@ def main() -> int:
             print(f"[shadow] teleport -> "
                   f"({float(st1.pos[0]):.1f}, {float(st1.pos[1]):.1f}, "
                   f"{float(st1.pos[2]):.1f})")
+        # Live map/vehicle for provenance (attach + failed query -> unknown).
+        _map, _veh = resolve_provenance_env(conn, args)
+        rec.provenance["map"] = _map
+        rec.provenance["vehicle"] = _veh
+        print(f"[shadow] provenance map={_map} vehicle={_veh}")
         ring, mode = build_camera_ring_provider(
             conn, args.runtime, 320, 240, roles=("front_main",))
         range_prov, _ = build_range_provider(conn, args.runtime)
