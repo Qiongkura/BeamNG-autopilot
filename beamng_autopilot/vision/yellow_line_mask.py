@@ -13,11 +13,11 @@ import numpy as np
 # OpenCV HSV（H 0-180）：黄漆 H≈20-35、高饱和、中高亮度；路面/树影
 # 的黄色偏灰（低饱和）被 S 下限挡掉
 H_LO, H_HI = 18, 38
-S_LO = 90
-V_LO = 110
+S_LO = 70
+V_LO = 90
 # 只在画面下部 2/3 找（路面上方是树/天，误源密集）
 ROI_TOP_FRAC = 0.30
-_MIN_AREA = 40
+_MIN_AREA = 25
 
 
 def yellow_line_mask(rgb: np.ndarray) -> np.ndarray:
