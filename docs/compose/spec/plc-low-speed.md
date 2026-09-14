@@ -1,15 +1,31 @@
 ---
 feature: plc-low-speed
-status: designed
+status: delivered
 updated: 2026-09-14
 branch: compose/plc-low-speed
-commits: 72452dd..HEAD
+commits: 72452dd..0e5d916
 ---
 
 # PLC Low-Speed Engagement
 
 ## Report
 
+**What was built** — `PaintedLineLateralCorrector` now has three speed bands:
+park (<0.05 m/s) freezes; crawl (0.05–0.5) integrates at `rate * 0.25`;
+cruise (≥0.5) unchanged. A creeping ego can pull toward the painted-line
+own-lane centre instead of pressing the line under the old `min_speed=0.5`
+freeze. Policy gate (`painted_line_correction_active`) and hold/decay
+behaviour are unchanged.
+
+**Verification** —
+`pytest tests/test_painted_line_corrector.py tests/test_painted_line_lane_center.py -q`
+→ **32 passed**. Reviewer: no critical; defaults picked up at `fsd_drive`
+call site without edit.
+
+**Journey log**
+- Old park test used speed=0.1, which is crawl after the band split — freeze tests must use true standstill (0.0).
+- S0.4 p50 0.33 m/s explained PLC 59/216 engagement; this is the crawl-band fix.
+- Pairing flicker / planner `grazes` still separate; re-run live drive after merge.
 ## [S1] Problem
 
 On the S0.4 east_coast judgment run the car crawled with speed p50 ≈ 0.33 m/s
@@ -55,11 +71,11 @@ In `PaintedLineLateralCorrector`:
 
 ## Tasks
 
-- [ ] T1: Implement park/crawl bands in `PaintedLineLateralCorrector.update`
+- [x] T1: Implement park/crawl bands in `PaintedLineLateralCorrector.update`
       — acceptance: park freezes; crawl integrates at scaled rate
       (covers: S2.1)
-- [ ] T2: Update/extend `tests/test_painted_line_corrector.py` —
+- [x] T2: Update/extend `tests/test_painted_line_corrector.py` —
       acceptance: park test uses true park speed; new crawl test fails
       before T1 and passes after (covers: S2.1; depends: T1)
-- [ ] T3: Run painted-line + nearby lane tests — acceptance: green
+- [x] T3: Run painted-line + nearby lane tests — acceptance: green
       (covers: S2.2; depends: T1, T2)
