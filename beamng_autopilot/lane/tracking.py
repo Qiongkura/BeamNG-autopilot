@@ -332,6 +332,11 @@ def lane_frame_usable(frame: LaneFrame | None,
                 if frame.paired and (frame.sources == ("vision",)
                                      or len(frame.sources) > 1)
                 else LANE_FRAME_MIN_SPAN_M)
+    # Centre-paint only (US yellow): shorter fragments still count as a
+    # legal own-lane authority when the midline is the only boundary.
+    if (frame.paired and frame.left is not None
+            and getattr(frame, "right", None) is None):
+        min_span = min(min_span, LANE_MIN_SPAN_M)
     return (frame.confidence >= min_conf
             and frame.span_m >= min_span
             and min_w <= frame.width <= max_w)
