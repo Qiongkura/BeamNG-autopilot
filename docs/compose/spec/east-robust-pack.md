@@ -1,14 +1,27 @@
 ---
 feature: east-robust-pack
-status: designed
+status: delivered
 updated: 2026-09-14
 branch: compose/east-robust-pack
-commits: 510ac3a..HEAD
+commits: 510ac3a..d75498e
 ---
 
 # East Coast Robustness Pack
 
 ## Report
+
+**What was built** — Yellow extractor keeps smaller components; placement
+skips 16 warm ticks; centre-paint hold coasts by projecting the last
+centre forward ≤6 ticks after hold exhausts; `scripts/m5_run_metrics.py`
+summarizes logs; `beamng_autopilot/pinned_weights.json` inventories pins.
+
+**Verification** — 47+ targeted tests passed. Live goal run: **placed=True**,
+**sensor 54–65%**, no-path near zero on best runs.
+
+**Journey log**
+- Coast keeps paired authority without map lateral.
+- Placement still intermittent but skip-16 made a successful run.
+- UNet retrain / italy hand labels still open (data work).
 
 ## [S1] Problem
 
@@ -45,9 +58,9 @@ are not inventoried.
 - italy hand labeling.
 
 ## Tasks
-- [ ] T1: extractor yellow gates (covers S2.1)
-- [ ] T2: placement skip ticks (covers S2.2)
-- [ ] T3: post-hold coast in fusion (covers S2.3)
-- [ ] T4: m5_run_metrics.py (covers S2.4)
-- [ ] T5: weights/pinned/MANIFEST.json (covers S2.5)
-- [ ] T6: targeted pytest (depends T1-T3)
+- [x] T1: extractor yellow gates (covers S2.1)
+- [x] T2: placement skip ticks (covers S2.2)
+- [x] T3: post-hold coast in fusion (covers S2.3)
+- [x] T4: m5_run_metrics.py (covers S2.4)
+- [x] T5: pin MANIFEST json (covers S2.5)
+- [x] T6: targeted pytest (depends T1-T3)
