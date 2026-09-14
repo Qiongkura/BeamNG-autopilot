@@ -117,6 +117,58 @@ def test_selector_full_blockage_returns_none() -> None:
     assert "no feasible" in meta["why"]
 
 
+def test_selector_hold_heading_when_clutter_but_corridor_free() -> None:
+    """All arcs blocked by side clutter; open band -> ego-anchored hold."""
+    from beamng_autopilot.planning.trajectory import Candidate
+
+    sc = _scene()
+    cons = Constraints(w_lane_align=0.0)
+
+    class _AllBad:
+        def __init__(self):
+            self.candidates = [
+                Candidate(path=np.array([[0.0, 0.0], [1.0, 5.0],
+                                         [2.0, 10.0]]))]
+
+        def __len__(self):
+            return 1
+
+    # Make the only candidate infeasible via a custom scorer wrap
+    class _Reject:
+        def score(self, scene, cand):
+            return 0.0, False
+
+    best, meta = select_trajectory(sc, _AllBad(), _Reject())
+    assert best is not None
+    assert meta["why"] == "fallback_hold_heading"
+    assert best.shape[0] >= 2
+    assert abs(best[0, 0]) < 1e-9 and abs(best[0, 1]) < 1e-9
+
+
+def test_selector_strict_no_lane_skips_hold_heading() -> None:
+    from beamng_autopilot.planning.trajectory import Candidate
+
+    sc = _scene()
+    sc.strict_perception = True
+    sc.lane_ref = None
+
+    class _Reject:
+        def score(self, scene, cand):
+            return 0.0, False
+
+    class _One:
+        def __init__(self):
+            self.candidates = [Candidate(path=np.array(
+                [[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]]))]
+
+        def __len__(self):
+            return 1
+
+    best, meta = select_trajectory(sc, _One(), _Reject())
+    assert best is None
+    assert "no feasible" in meta["why"]
+
+
 def _lane_scene() -> Scene:
     """Two-way road: left boundary y=+4, right boundary y=-4 (heading 0)."""
     grid = OccupancyGrid(60, 60, 0.5)

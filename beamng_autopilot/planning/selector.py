@@ -8,7 +8,18 @@ falls back to the legacy planner / stops).
 
 from __future__ import annotations
 
+import math
+
 import numpy as np
+
+
+def _hold_heading_path(scene, length_m: float = 8.0, n: int = 9):
+    """Ego-anchored straight-ahead polyline (current heading)."""
+    p = np.asarray(scene.pos[:2], dtype=float)
+    h = float(scene.heading)
+    t = np.linspace(0.0, float(length_m), int(n))
+    return np.column_stack([p[0] + t * math.cos(h),
+                            p[1] + t * math.sin(h)])
 
 
 def select_trajectory(scene, candidate_set, constraints):
@@ -16,10 +27,15 @@ def select_trajectory(scene, candidate_set, constraints):
 
     ``best_path`` is the (N, 2) polyline of the lowest-cost feasible
     candidate, ``None`` when no candidate is feasible.  ``meta`` holds
-    the ranking so a planner / HUD can explain the choice ("cost", 
+    the ranking so a planner / HUD can explain the choice ("cost",
     "kind", "why"), plus the chosen candidate's speed profile (the
     matching longitudinal plan, ``meta["speed_profile"]``) when a scene
     target speed is available.
+
+    When every fan candidate is rejected but the forward corridor is
+    still laterally free, an ego-anchored hold-heading path is returned
+    so a cluttered junction BEV does not force ``no drivable path``
+    (east_coast 2026-09-14).  The safety monitor re-checks it.
     """
     if candidate_set is None or len(candidate_set) == 0:
         return None, {"why": "no candidates"}
@@ -29,6 +45,24 @@ def select_trajectory(scene, candidate_set, constraints):
         if ok and np.isfinite(cost):
             feasible.append((cost, cand))
     if not feasible:
+        # Strict FSD: no perception lane -> never invent a hold path
+        # (constraints already declined every candidate on purpose).
+        if (getattr(scene, "strict_perception", False)
+                and getattr(scene, "lane_ref", None) is None):
+            return None, {"why": "no feasible candidate"}
+        try:
+            from .constraints import corridor_free_band
+            open_corridor = bool(corridor_free_band(scene))
+        except Exception:
+            open_corridor = False
+        if open_corridor:
+            path = _hold_heading_path(scene)
+            return path, {
+                "why": "fallback_hold_heading",
+                "kind": "hold_heading",
+                "cost": float("inf"),
+                "n_eval": 0,
+            }
         return None, {"why": "no feasible candidate"}
     feasible.sort(key=lambda pair: pair[0])
     cost, best = feasible[0]
