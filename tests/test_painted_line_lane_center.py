@@ -83,6 +83,34 @@ def test_double_yellow_midpoint_places_ego_right():
     assert abs(tgt[1] - 18.5) < 1e-6
 
 
+def test_yellow_rgb_unions_into_line_mask():
+    """HSV yellow pixels join the LINE channel when rgb is provided."""
+    from beamng_autopilot.vision.yellow_line_mask import yellow_line_mask
+
+    h, w = 120, 160
+    rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    # asphalt-ish background
+    rgb[:] = (80, 80, 80)
+    # yellow band in lower half (OpenCV HSV H~25, high S)
+    rgb[h // 2:] = (200, 180, 20)
+    ym = yellow_line_mask(rgb)
+    assert ym.any()
+    called = {}
+
+    def _fake(markings):
+        def _inner(mask, *a, **k):
+            called["mask_sum"] = int(np.asarray(mask).sum())
+            return markings
+        return _inner
+
+    lanes._mask_to_markings = _fake([_line(3.0)])
+    tgt = painted_line_lane_center(
+        _Sem({"line": np.zeros((h, w), np.uint8)}),
+        cam_model=None, pos=(10.0, 20.0, 1.5), heading=0.0, rgb=rgb)
+    assert tgt is not None
+    assert called["mask_sum"] > 0
+
+
 def test_already_in_lane_no_teleport():
     """Line 1.6 m left -> shift 0.1 m < deadband; keep the pose."""
     lanes._mask_to_markings = _fake_masks_to_markings([_line(1.6)])

@@ -327,7 +327,8 @@ def _painted_line_lat(out, pos, heading, marks=None):
             ground_z = (float(pos[2]) - config.EGO_ORIGIN_GROUND_GAP_M
                         if len(pos) > 2 else None)
             marks = painted_line_markings(sem, out.cam, pos, heading,
-                                          ground_z=ground_z)
+                                          ground_z=ground_z,
+                                          rgb=out.frame)
         if not marks:
             return None
         fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
@@ -1142,7 +1143,8 @@ class FSDriveSession:
                             _pw_out.cam, _pw_state.pos,
                             float(_pw_state.heading),
                             ground_z=(float(_pw_state.pos[2])
-                                      - config.EGO_ORIGIN_GROUND_GAP_M))
+                                      - config.EGO_ORIGIN_GROUND_GAP_M),
+                            rgb=_pw_out.frame)
                         if _sp_tgt is not None:
                             conn.safe_teleport(
                                 _sp_tgt[0], _sp_tgt[1],

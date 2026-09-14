@@ -559,7 +559,8 @@ def recover_dashed_boundaries(mask_u8, cam_model, pos, heading,
 
 
 def painted_line_markings(sem, cam_model, pos, heading,
-                          ground_z: float | None = None
+                          ground_z: float | None = None,
+                          rgb: np.ndarray | None = None
                           ) -> list[LaneMarking] | None:
     """Back-project the semantic LINE mask to world LaneMarking polylines.
 
@@ -568,11 +569,36 @@ def painted_line_markings(sem, cam_model, pos, heading,
     serves every painted-line consumer.  Returns None when no LINE mask is
     present (no line to measure), [] when the mask exists but nothing
     confident survived back-projection.
+
+    ``rgb`` (optional front frame): union the HSV yellow-paint prior so
+    US yellow centre lines still feed geometry when the UNet missed them.
     """
     if sem is None or "line" not in getattr(sem, "masks", {}):
-        return None
+        # Yellow-only frames may have no semantic line channel yet.
+        if rgb is None:
+            return None
+        try:
+            from beamng_autopilot.vision.yellow_line_mask import (
+                yellow_line_mask)
+            y = yellow_line_mask(rgb)
+            if not y.any():
+                return None
+            mask = y.astype(np.uint8) * 255
+            return _mask_to_markings(mask, "yellow", cam_model, pos, heading,
+                                     ground_z=ground_z)
+        except Exception:
+            return None
     try:
         mask = np.asarray(sem.masks["line"], dtype=np.uint8) * 255
+        if rgb is not None:
+            try:
+                from beamng_autopilot.vision.yellow_line_mask import (
+                    yellow_line_mask)
+                y = yellow_line_mask(rgb)
+                if y.shape == mask.shape:
+                    mask = np.maximum(mask, y.astype(np.uint8) * 255)
+            except Exception:
+                pass
         return _mask_to_markings(mask, "white", cam_model, pos, heading,
                                  ground_z=ground_z)
     except Exception:
@@ -586,7 +612,8 @@ def painted_line_lane_center(sem, cam_model, pos, heading,
                              max_shift_m: float = 2.5,
                              min_pts: int = 6,
                              near_lon_m: float = 14.0,
-                             marks: list | None = None
+                             marks: list | None = None,
+                             rgb: np.ndarray | None = None
                              ) -> tuple[float, float] | None:
     """Own-lane centre (world xy) from the painted-line mask - perception only.
 
@@ -604,7 +631,7 @@ def painted_line_lane_center(sem, cam_model, pos, heading,
     """
     if marks is None:
         marks = painted_line_markings(sem, cam_model, pos, heading,
-                                      ground_z=ground_z)
+                                      ground_z=ground_z, rgb=rgb)
     if not marks:
         return None
     try:
