@@ -407,7 +407,7 @@ def choose_sensor_lane(vision_frame: LaneFrame | None,
                 and getattr(last, "left", None) is not None
                 and getattr(last, "right", None) is None):
             # east_coast gaps measured up to ~17 frames
-            hold_limit = max(hold_limit, 18)
+            hold_limit = max(hold_limit, 22)
         if misses > hold_limit:
             state.clear()
             return None
