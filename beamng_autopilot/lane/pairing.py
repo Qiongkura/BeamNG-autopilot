@@ -803,6 +803,42 @@ def _single_mirror_frame(best, side: int, pos: np.ndarray,
                      right_kind=(best.kind if side < 0 else None))
 
 
+def _centre_line_own_lane(cand, pos, fwd, lane_width: float,
+                          station_step: float = 1.5,
+                          max_stations: int = 18) -> LaneFrame | None:
+    """Single painted centre line (US yellow / double as one blob).
+
+    Own lane sits ``lane_width/2`` to the RIGHT of the paint (RHT).
+    Returns a paired frame so strict sensor mode can lead — a lone centre
+    line is enough lateral authority (east_coast flicker 2026-09-14).
+    """
+    if cand is None or float(cand.span) < LANE_MIN_SPAN_M:
+        return None
+    if abs(float(cand.med_lat)) > 1.2:
+        return None
+    proj = np.asarray(cand.proj, dtype=float)
+    if proj.ndim != 2 or proj.shape[0] < 3:
+        return None
+    s0, s1 = float(proj[0, 0]), float(proj[-1, 0])
+    n = int(max(3, min(max_stations, int((s1 - s0) / max(station_step, 0.1)) + 1)))
+    stations = np.linspace(max(0.0, s0), s1, n)
+    line_lat = _interp_lat(proj, stations)
+    if not np.isfinite(line_lat).any():
+        return None
+    # lat +left; own-lane centre is half-lane to the right of the paint
+    center_lat = line_lat - 0.5 * float(lane_width)
+    center_lat = np.where(np.isfinite(center_lat), center_lat, np.nan)
+    left_lat = line_lat
+    center, left_pts, _right = _frame_from_stations(
+        pos, fwd, stations, center_lat, left_lat, None)
+    conf = min(0.75, 0.35 + 0.03 * float(cand.span)
+               + 0.2 * min(1.0, float(cand.conf)))
+    return LaneFrame(center=center, left=left_pts, right=None,
+                     width=float(lane_width), confidence=conf,
+                     span_m=float(cand.span), sources=("vision",),
+                     paired=True, left_kind=cand.kind, right_kind=None)
+
+
 def pair_lane_markings(
     markings,
     pos,
@@ -924,6 +960,20 @@ def pair_lane_markings(
     # Under right-hand traffic the painted right line is the stronger
     # boundary, so try it first; a short left blob must not shadow a
     # longer, trusted right line.
+    # US centre paint (yellow / double) near the ego is enough to define
+    # the own lane as half-lane to the RIGHT — do this BEFORE the
+    # unpaired single-edge mirror so strict sensor mode can lead.
+    if not axes:
+        axes = _axis_candidates(cands, station_step, max_stations)
+    for c in axes:
+        if abs(float(getattr(c, "med_lat", 99.0))) <= 1.2:
+            cfr = _centre_line_own_lane(
+                c, pos, fwd, lane_width, station_step, max_stations)
+            if cfr is not None:
+                if debug is not None:
+                    debug["mode"] = "centre_line_own_lane"
+                    debug["paired"] = True
+                return cfr
     left_best = _best_single_boundary(cands, 1)
     right_best = _best_single_boundary(cands, -1)
     if left_best is None and right_best is None:
