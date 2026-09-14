@@ -260,10 +260,20 @@ class EpisodeDataset:
     at recording time, so bad shadow samples never poison training.
     """
 
-    def __init__(self, ep_files, modalities=("bev",), min_quality: float = 0.0):
+    def __init__(self, ep_files, modalities=("bev",), min_quality: float = 0.0,
+                 drop_excluded: bool = True):
         if isinstance(ep_files, (str, Path)):
             ep_files = [Path(ep_files)]
-        self.files = [Path(p) for p in ep_files if Path(p).exists()]
+        files = [Path(p) for p in ep_files if Path(p).exists()]
+        if drop_excluded:
+            from beamng_autopilot.data_contract import is_excluded_episode
+            kept = [p for p in files if not is_excluded_episode(p)]
+            dropped = len(files) - len(kept)
+            if dropped:
+                print(f"[EpisodeDataset] dropped {dropped} excluded "
+                      f"episode(s) (deny list)")
+            files = kept
+        self.files = files
         self.modalities = tuple(modalities)
         self.meta: list[dict] = []
         self.schemas: list[str] = []

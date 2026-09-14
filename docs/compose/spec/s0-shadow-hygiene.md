@@ -1,6 +1,6 @@
 ---
 feature: s0-shadow-hygiene
-status: in-progress
+status: delivered
 updated: 2026-09-13
 branch: compose/s0-shadow-hygiene
 commits: a29a1ae..HEAD
@@ -9,6 +9,21 @@ commits: a29a1ae..HEAD
 # S0 Shadow Provenance Hygiene
 
 ## Report
+
+**What was built** — `m5_shadow_drive` resolves live map/vehicle after
+connect via `resolve_provenance_env` (no more hardcoded italy in provenance;
+`--map` only as launch default). Bush episode is on an in-package deny list
+`beamng_autopilot/excluded_shadow_episodes.json`; manifests mark
+`split=excluded` and `EpisodeDataset` drops those files by default.
+
+**Verification** —
+`pytest tests/test_data_contract.py tests/test_s0_experiment_trust.py tests/test_recording.py -q`
+→ **28 passed** (plus earlier 57 on the pre-filter suite).
+
+**Journey log**
+- `data/` is gitignored — exclusion list must live under `beamng_autopilot/`.
+- Reviewer: deny list was contract-only; training still ingested bush episode → added `EpisodeDataset` filter.
+- Live 120s judgment (S0.4) still needs a BeamNG window; not in this feature.
 
 ## [S1] Problem
 
@@ -38,7 +53,8 @@ Review of `s0-experiment-trust` left two S0 holes:
 
 ### [S2.2] Episode exclusion list
 
-- New repo file `data/excluded_shadow_episodes.json`:
+- Repo-tracked file `beamng_autopilot/excluded_shadow_episodes.json`
+  (`data/` is gitignored, so the list lives in-package):
   `{"version": 1, "episodes": {"<filename>": {"reason": "...", "added": "YYYY-MM-DD"}}}`
 - Seed with the bush episode name + reason `camera_in_vegetation_20260913`.
 - `data_contract.is_excluded_episode(path) -> bool` and
@@ -56,10 +72,10 @@ Review of `s0-experiment-trust` left two S0 holes:
 
 ## Tasks
 
-- [ ] T1: `m5_shadow_drive` post-connect live map/vehicle in provenance —
+- [x] T1: `m5_shadow_drive` post-connect live map/vehicle in provenance —
       acceptance: unit test for resolve reuse path or small helper; script
       no longer string-literal `"map": "italy"` in provenance (covers: S2.1)
-- [ ] T2: exclusion list + data_contract hooks — acceptance: bush episode
+- [x] T2: exclusion list + data_contract hooks — acceptance: bush episode
       name in JSON; `make_npz_record` marks excluded; tests (covers: S2.2)
-- [ ] T3: targeted pytest — acceptance: s0 + data_contract + shadow path
+- [x] T3: targeted pytest — acceptance: s0 + data_contract + shadow path
       tests pass (covers: S2.1, S2.2; depends: T1, T2)

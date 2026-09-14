@@ -92,6 +92,27 @@ def test_make_npz_record_marks_excluded_split(tmp_path) -> None:
     assert "vegetation" in rec["label"]["exclusion_reason"]
 
 
+def test_episode_dataset_drops_excluded(tmp_path) -> None:
+    from beamng_autopilot.recording import EpisodeDataset
+
+    good = tmp_path / "shadow_fsd_good.npz"
+    bad = tmp_path / "shadow_fsd_1789298914_20260913_193100.npz"
+    for p in (good, bad):
+        np.savez_compressed(
+            p, version=np.int64(3), t=np.zeros(2),
+            quality=np.ones(2, dtype=np.float32),
+            bev=np.zeros((2, 4, 4), dtype=np.float32),
+            rgb=np.zeros((2, 4, 4, 3), dtype=np.uint8),
+            label=np.zeros((2, 4, 4), dtype=np.uint8),
+            drivable=np.zeros((2, 4, 4), dtype=np.uint8),
+        )
+    ds = EpisodeDataset([good, bad], modalities=("bev",))
+    assert [p.name for p in ds.files] == [good.name]
+    assert len(ds) == 2
+    ds2 = EpisodeDataset([good, bad], modalities=("bev",), drop_excluded=False)
+    assert len(ds2.files) == 2
+
+
 def test_write_manifest_roundtrip(tmp_path) -> None:
     p = _seg_dir(tmp_path, "run_a")
     rec = make_seg_record(p, tmp_path)
