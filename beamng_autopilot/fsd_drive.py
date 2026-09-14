@@ -130,6 +130,9 @@ WARMUP_S = 8.0
 # centre line - driving unplaced rides the left line from metre one
 # (town 2026-09-06, user-reported).  An unplaced run aborts instead.
 PLACEMENT_HOLD_S = 25.0
+# Extra seconds after heads are live before giving up on painted-line
+# placement (US yellow paint / warm-up flicker).
+PLACEMENT_GRACE_S = 8.0
 WARMUP_SPEED_MPS = 1.5
 # If a tick ever takes longer than this, the car has been driving
 # open-loop for that long - keep this frame slow instead of trusting
@@ -1163,7 +1166,11 @@ class FSDriveSession:
                         print(f"[fsd-drive] placement attempt failed: "
                               f"{_spe}")
                 if _elapsed > PLACEMENT_HOLD_S and _head_live:
-                    break
+                    # Yellow/US paint can appear a few ticks after the
+                    # object head is live; keep trying a short grace window
+                    # before declaring UNPLACED (east_coast 2026-09-14).
+                    if _elapsed > PLACEMENT_HOLD_S + PLACEMENT_GRACE_S:
+                        break
                 conn.control(throttle=0.0, brake=1.0, steering=0.0,
                              parkingbrake=1.0, gear=fwd_gear)
             print(f"[fsd-drive] pipeline warm: "
