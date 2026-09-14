@@ -660,27 +660,33 @@ def painted_line_lane_center(sem, cam_model, pos, heading,
         # left boundary is the cluster closest to lane_half_m.
         has_left = any(c[0] > 0.15 for c in clusters)
         has_right = any(c[0] < -0.15 for c in clusters)
+        line_lat: float | None = None
         if has_left and has_right:
-            # Spawn/restart special case: the ego is placed at a road-graph
-            # node (the road centre), and two same-road lines straddle it.
-            # The NEAREST line is therefore the painted centre line; when
-            # the pair is a plausible two-lane width, use that line and
-            # place the ego lane to its right.  Do NOT resolve arbitrary
-            # opposite-side reads this way: require the near line to be
-            # substantially nearer and the separation to be road-sized.
             ordered = sorted(clusters, key=lambda c: c[0])
             near_line = min(clusters, key=lambda c: abs(c[0]))
             far_line = max(clusters, key=lambda c: abs(c[0]))
             sep = abs(float(far_line[0]) - float(near_line[0]))
-            if (abs(float(near_line[0])) <= 0.9
-                    and 2.5 <= sep <= 5.0
-                    and abs(float(far_line[0])) >= 2.5):
+            near_abs = abs(float(near_line[0]))
+            far_abs = abs(float(far_line[0]))
+            # Double yellow / double solid: two paints hug the ego (sep
+            # ~0.3-0.6 m).  Midpoint is the painted centre; own lane is
+            # lane_half_m to the RIGHT (RHT).  The old road-size straddle
+            # gate (sep>=2.5) rejected this and left the car ON the paint
+            # (east_coast junction 2026-09-14).
+            if (near_abs <= 1.2 and far_abs <= 1.5
+                    and 0.15 <= sep <= 1.2):
+                line_lat = 0.5 * (float(near_line[0]) + float(far_line[0]))
+                best = (line_lat, near_line[1] + far_line[1],
+                        np.concatenate([near_line[2], far_line[2]]))
+            elif (near_abs <= 0.9 and 2.5 <= sep <= 5.0
+                    and far_abs >= 2.5):
                 best = near_line
+                line_lat = float(best[0])
             else:
                 return None
         else:
             best = min(clusters, key=lambda c: abs(c[0] - lane_half_m))
-        line_lat = best[0]
+            line_lat = float(best[0])
         c_spread = (float(np.percentile(best[2], 90)
                           - np.percentile(best[2], 10))
                     if len(best[2]) >= 2 else 0.0)

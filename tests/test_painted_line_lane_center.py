@@ -70,6 +70,19 @@ def test_ambiguous_edges_on_both_sides_returns_none():
                                     pos=(10.0, 20.0, 1.5), heading=0.0) is None
 
 
+def test_double_yellow_midpoint_places_ego_right():
+    """Ego ON double paint (±0.3 m): centre=midpoint, target 1.5 m right."""
+    lanes._mask_to_markings = _fake_masks_to_markings(
+        [_line(-0.3), _line(0.3)])
+    tgt = painted_line_lane_center(_Sem({"line": np.zeros((8, 8), np.uint8)}),
+                                   cam_model=None,
+                                   pos=(10.0, 20.0, 1.5), heading=0.0)
+    assert tgt is not None
+    # midpoint lat 0 -> shift +1.5 m right (heading 0, right = -y)
+    assert abs(tgt[0] - 10.0) < 1e-6
+    assert abs(tgt[1] - 18.5) < 1e-6
+
+
 def test_already_in_lane_no_teleport():
     """Line 1.6 m left -> shift 0.1 m < deadband; keep the pose."""
     lanes._mask_to_markings = _fake_masks_to_markings([_line(1.6)])
