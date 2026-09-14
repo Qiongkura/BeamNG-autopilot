@@ -24,8 +24,8 @@ CELL_M = 0.15        # world grid quantum; near-field px is 0.05-0.3 m
 HIT_ADD = 1.0        # per-sighting evidence
 HIT_CAP = 2.0
 HIT_MIN = 1.5        # need ~2 sightings to propagate into later frames
-DECAY_PER_S = 0.25   # linear decay; a 2-hit cell survives ~2 s unseen
-MAX_AGE_S = 3.0
+DECAY_PER_S = 0.15   # linear decay; a 2-hit cell survives ~4-6 s unseen
+MAX_AGE_S = 5.0
 MAX_RANGE_M = 70.0
 MAX_POINTS = 24000   # per-update back-projection budget
 
