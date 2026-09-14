@@ -71,6 +71,18 @@ class SemanticHead:
             line = np.zeros((h, w), dtype=bool)
         raw_line = line
         out.meta["line_pixels_raw"] = int(np.count_nonzero(raw_line))
+        # US yellow centre paint: UNet is white-line biased; union the HSV
+        # prior so pairing / evidence see yellow as LINE (east_coast).
+        if prediction_ok:
+            try:
+                from ..yellow_line_mask import yellow_line_mask
+                ym = yellow_line_mask(ctx.frame_rgb)
+                if ym.shape == line.shape:
+                    line = line | ym.astype(bool)
+            except Exception as exc:
+                out.meta.setdefault("line_errors", {})["yellow"] = str(exc)
+        out.meta["line_pixels_yellow"] = int(
+            np.count_nonzero(line) - np.count_nonzero(raw_line))
         if prediction_ok and self.enable_evidence and ctx.role == "front_main":
             try:
                 if self._evidence is None:
