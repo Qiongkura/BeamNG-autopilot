@@ -73,7 +73,9 @@ class SemanticHead:
         out.meta["line_pixels_raw"] = int(np.count_nonzero(raw_line))
         # US yellow centre paint: UNet is white-line biased; union the HSV
         # prior so pairing / evidence see yellow as LINE (east_coast).
-        if prediction_ok:
+        # BEAMNG_YELLOW_FUSION=0 disables for A/B.
+        import os
+        if prediction_ok and os.environ.get("BEAMNG_YELLOW_FUSION", "1") != "0":
             try:
                 from ..yellow_line_mask import yellow_line_mask
                 ym = yellow_line_mask(ctx.frame_rgb)

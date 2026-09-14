@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 
@@ -402,7 +403,9 @@ def choose_sensor_lane(vision_frame: LaneFrame | None,
         # Centre-paint (US yellow) paired frames flicker 5-17 ticks on
         # east_coast; the default 4-frame hold clears mid-gap and the
         # strict runtime stops.  Hold a lone painted centre longer.
-        if (last is not None
+        # BEAMNG_CENTRE_HOLD=0 disables extended hold + coast (A/B).
+        _centre_hold = os.environ.get("BEAMNG_CENTRE_HOLD", "1") != "0"
+        if (_centre_hold and last is not None
                 and bool(getattr(last, "paired", False))
                 and getattr(last, "left", None) is not None
                 and getattr(last, "right", None) is None):
@@ -413,7 +416,7 @@ def choose_sensor_lane(vision_frame: LaneFrame | None,
             # frame forward for a short window instead of dropping to
             # perception-unavailable (still no map lateral).
             coast_n = int(state.get("coast", 0)) + 1
-            if (last is not None
+            if (_centre_hold and last is not None
                     and bool(getattr(last, "paired", False))
                     and getattr(last, "left", None) is not None
                     and getattr(last, "right", None) is None
