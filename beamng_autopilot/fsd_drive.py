@@ -2634,6 +2634,12 @@ class FSDriveSession:
                                          else 40.0)
                     except Exception:
                         rear_clear_m = None
+                # Strict FSD: no perception lane -> never reverse.  A
+                # dead-end reverse without lateral authority walks the car
+                # backward off the road (east_coast 2026-09-14).
+                if args.strict and str(
+                        out.meta.get("lane_src_sel") or "") != "sensor":
+                    has_forward_path = True
                 rm = rman.decide(has_forward_path=has_forward_path,
                                  rear_clear_m=rear_clear_m,
                                  signed_speed=signed,
