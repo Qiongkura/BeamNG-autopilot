@@ -70,10 +70,25 @@ def test_update_clamps_state_to_max():
 
 
 def test_update_freezes_while_parked():
-    corr = PaintedLineLateralCorrector(min_speed_mps=0.5)
+    corr = PaintedLineLateralCorrector(min_speed_mps=0.5, park_speed_mps=0.05)
     corr.update(0.8, dt=0.5, speed=6.0)
-    parked = corr.update(0.8, dt=0.5, speed=0.1)
-    assert parked == corr.shift_m  # no integration at standstill
+    parked = corr.update(0.8, dt=0.5, speed=0.0)
+    assert parked == corr.shift_m  # no integration at true standstill
+
+
+def test_update_integrates_at_crawl_speed():
+    # S0.4: p50 0.33 m/s used to freeze under min_speed=0.5 — crawl must pull.
+    corr = PaintedLineLateralCorrector(
+        max_shift_m=1.0, rate_m_s=1.2, min_speed_mps=0.5,
+        park_speed_mps=0.05, crawl_rate_scale=0.25)
+    s0 = corr.update(0.0, dt=0.1, speed=6.0)
+    assert abs(s0) < 1e-9
+    # crawl step = 1.2 * 0.25 * 0.5 = 0.15
+    s1 = corr.update(0.8, dt=0.5, speed=0.33)
+    assert abs(s1 - 0.15) < 1e-9
+    # second crawl tick continues toward desired
+    s2 = corr.update(0.8, dt=0.5, speed=0.33)
+    assert abs(s2 - 0.30) < 1e-9
 
 
 def test_update_holds_then_decays_on_line_dropout():

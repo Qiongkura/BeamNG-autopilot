@@ -877,12 +877,16 @@ class PaintedLineLateralCorrector:
 
     def __init__(self, max_shift_m: float = 1.0, horizon_m: float = 12.0,
                  rate_m_s: float = 1.2, hold_s: float = 2.0,
-                 min_speed_mps: float = 0.5):
+                 min_speed_mps: float = 0.5,
+                 park_speed_mps: float = 0.05,
+                 crawl_rate_scale: float = 0.25):
         self.max_shift_m = float(max_shift_m)
         self.horizon_m = float(horizon_m)
         self.rate_m_s = float(rate_m_s)
         self.hold_s = float(hold_s)
         self.min_speed_mps = float(min_speed_mps)
+        self.park_speed_mps = float(park_speed_mps)
+        self.crawl_rate_scale = float(crawl_rate_scale)
         self.shift_m = 0.0
         self._desired = 0.0
         self._last_seen = -1e9
@@ -914,8 +918,10 @@ class PaintedLineLateralCorrector:
         ``desired`` None means the perception lane centre was unavailable
         this frame: the last desired shift is held for ``hold_s`` (a line
         dropout must not jerk the car back to the map prior) and then
-        decays to zero.  While the car is parked the shift freezes so a
-        standstill never accumulates a launch-worthy offset.
+        decays to zero.  True standstill (``speed < park_speed_mps``)
+        freezes the shift; crawl (park..min_speed) still pulls toward the
+        perceived centre at a reduced rate so a creeping ego does not
+        press the painted line (S0.4 east_coast p50 0.33 m/s).
         """
         dt = max(0.0, min(float(dt), 0.5))
         now = float(now) if now is not None else time.time()
@@ -924,9 +930,13 @@ class PaintedLineLateralCorrector:
             self._last_seen = now
         elif now - self._last_seen > self.hold_s:
             self._desired = 0.0
-        if float(speed) < self.min_speed_mps:
+        v = float(speed)
+        if v < self.park_speed_mps:
             return self.shift_m
-        step = self.rate_m_s * dt
+        if v < self.min_speed_mps:
+            step = self.rate_m_s * self.crawl_rate_scale * dt
+        else:
+            step = self.rate_m_s * dt
         self.shift_m = float(np.clip(
             self.shift_m + float(np.clip(self._desired - self.shift_m,
                                          -step, step)),
