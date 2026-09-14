@@ -19,7 +19,8 @@ from beamng_autopilot import config
 
 MANIFEST_VERSION = 1
 LABEL_CLASSES = ["background", "asphalt", "line"]
-EXCLUDED_EPISODES_FILE = config.PROJECT_ROOT / "data" / "excluded_shadow_episodes.json"
+EXCLUDED_EPISODES_FILE = (
+    Path(__file__).resolve().parent / "excluded_shadow_episodes.json")
 
 
 def _load_exclusion_table() -> dict[str, dict[str, Any]]:

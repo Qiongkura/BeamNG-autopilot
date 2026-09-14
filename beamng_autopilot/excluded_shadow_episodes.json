@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "episodes": {
+    "shadow_fsd_1789298914_20260913_193100.npz": {
+      "reason": "camera_in_vegetation_20260913",
+      "added": "2026-09-13",
+      "note": "east_coast judgment spawn sat in bushes; not a positive US sample"
+    }
+  }
+}
