@@ -145,6 +145,33 @@ def test_selector_hold_heading_when_clutter_but_corridor_free() -> None:
     assert abs(best[0, 0]) < 1e-9 and abs(best[0, 1]) < 1e-9
 
 
+def test_selector_hold_heading_when_path_low_occupancy() -> None:
+    """Corridor scan false-blocks, but hold path is clear -> still return."""
+    from beamng_autopilot.planning.trajectory import Candidate
+
+    sc = _scene()
+    # Side walls that may close corridor bands but leave the +x lane open
+    sc.grid.mark_obstacle_region(8.0, 4.0, 8.0, 1.0)
+    sc.grid.mark_obstacle_region(8.0, -4.0, 8.0, 1.0)
+
+    class _Reject:
+        def score(self, scene, cand):
+            return 0.0, False
+
+    class _One:
+        def __init__(self):
+            self.candidates = [Candidate(path=np.array(
+                [[0.0, 0.0], [5.0, 0.2], [10.0, 0.0]]))]
+
+        def __len__(self):
+            return 1
+
+    best, meta = select_trajectory(sc, _One(), _Reject())
+    assert best is not None
+    assert meta["why"].startswith("fallback_hold_heading")
+    assert meta.get("hold_occ_frac", 0.0) < 0.2
+
+
 def test_selector_strict_no_lane_skips_hold_heading() -> None:
     from beamng_autopilot.planning.trajectory import Candidate
 

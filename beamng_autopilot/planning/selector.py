@@ -22,6 +22,29 @@ def _hold_heading_path(scene, length_m: float = 8.0, n: int = 9):
                             p[1] + t * math.sin(h)])
 
 
+def _hold_path_occupied_frac(scene, path, skip_m: float = 2.5) -> float:
+    """Fraction of path samples (beyond the bumper) in occupied cells."""
+    grid = getattr(scene, "grid", None)
+    if grid is None or path is None or len(path) < 2:
+        return 0.0
+    occ = getattr(grid, "obstacle", None)
+    if occ is None or occ.size == 0:
+        return 0.0
+    p = np.asarray(scene.pos[:2], dtype=float)
+    pts = np.asarray(path, dtype=float)[:, :2]
+    d = np.hypot(pts[:, 0] - p[0], pts[:, 1] - p[1])
+    sel = pts[d >= skip_m]
+    if len(sel) == 0:
+        return 0.0
+    try:
+        r, c, ok = grid.world_to_cells(sel[:, 0], sel[:, 1])
+    except Exception:
+        return 1.0
+    if not np.any(ok):
+        return 0.0
+    return float(np.mean(occ[r[ok], c[ok]] > 0))
+
+
 def select_trajectory(scene, candidate_set, constraints):
     """Return ``(best_path, meta)``.
 
@@ -32,10 +55,11 @@ def select_trajectory(scene, candidate_set, constraints):
     matching longitudinal plan, ``meta["speed_profile"]``) when a scene
     target speed is available.
 
-    When every fan candidate is rejected but the forward corridor is
-    still laterally free, an ego-anchored hold-heading path is returned
-    so a cluttered junction BEV does not force ``no drivable path``
-    (east_coast 2026-09-14).  The safety monitor re-checks it.
+    When every fan candidate is rejected, an ego-anchored hold-heading
+    path is returned if either the forward corridor is laterally free
+    **or** that hold path itself is mostly not occupied (junction BEV
+    clutter must not force ``no drivable path``).  The safety monitor
+    re-checks it.
     """
     if candidate_set is None or len(candidate_set) == 0:
         return None, {"why": "no candidates"}
@@ -50,18 +74,22 @@ def select_trajectory(scene, candidate_set, constraints):
         if (getattr(scene, "strict_perception", False)
                 and getattr(scene, "lane_ref", None) is None):
             return None, {"why": "no feasible candidate"}
+        path = _hold_heading_path(scene)
         try:
             from .constraints import corridor_free_band
             open_corridor = bool(corridor_free_band(scene))
         except Exception:
             open_corridor = False
-        if open_corridor:
-            path = _hold_heading_path(scene)
+        occ_frac = _hold_path_occupied_frac(scene, path)
+        if open_corridor or occ_frac < 0.20:
             return path, {
-                "why": "fallback_hold_heading",
+                "why": ("fallback_hold_heading"
+                        if open_corridor
+                        else "fallback_hold_heading_low_occ"),
                 "kind": "hold_heading",
                 "cost": float("inf"),
                 "n_eval": 0,
+                "hold_occ_frac": round(occ_frac, 3),
             }
         return None, {"why": "no feasible candidate"}
     feasible.sort(key=lambda pair: pair[0])
