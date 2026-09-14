@@ -1184,11 +1184,18 @@ class FSDriveSession:
                   f"object_head={bool(_pw_out is not None and _pw_out.meta.get('object_head'))}, "
                   f"placed={_percep_ok}")
             if not _percep_ok:
-                if getattr(self.args, "allow_unplaced", False):
-                    # 采集模式：跨地图语义头可能放不进车道（没见过该地图
-                    # 标线），继续未放置驾驶让影子录制拿帧，不做拟真门槛
-                    print("[fsd-drive] lane placement failed - continuing "
-                          "UNPLACED (--allow-unplaced collection mode)")
+                _strict_sensor = bool(
+                    getattr(self.args, "strict", False)
+                    and str(getattr(self.args, "lane_mode", "")) == "sensor")
+                if getattr(self.args, "allow_unplaced", False) or _strict_sensor:
+                    # 采集 / 严格感知：先开再校——warm 里没看到漆线不
+                    # 中止；行驶中 PLC/配对出现后再横向校正，无车道
+                    # 仍 fail-closed 停车（east_coast 2026-09-14）。
+                    why = ("--allow-unplaced collection mode"
+                           if getattr(self.args, "allow_unplaced", False)
+                           else "strict sensor calibrate-after")
+                    print(f"[fsd-drive] lane placement failed - continuing "
+                          f"UNPLACED ({why})")
                     return _pw_out, False, 0
                 print("[fsd-drive] ABORT: lane placement failed after "
                       f"{PLACEMENT_HOLD_S:.0f}s - the car will NOT drive "
