@@ -1,14 +1,27 @@
 ---
 feature: pair-hold-centre
-status: designed
+status: delivered
 updated: 2026-09-14
 branch: compose/pair-hold
-commits: 7671b60..HEAD
+commits: 7671b60..7e1111e
 ---
 
 # Hold Centre-Paint Lanes Across Detection Gaps
 
 ## Report
+
+**What was built** — When fusion has no detection, a last **paired
+vision centre-paint** frame (left only) is held up to **12** miss ticks
+(default 4 for other sources), so strict sensor keeps `lane_src=sensor`
+across typical east_coast gaps.
+
+**Verification** — `pytest tests/test_lane_fusion.py -q` → **6 passed**.
+Live 90s at junction: longer early `sensor/P` run; later still planning
+stops (`no drivable path` / graze) — not a hold bug.
+
+**Journey log**
+- spawn_gate “ok” long roads still fail strict sensor if pairing dies.
+- Global `BEAMNG_LANE_HOLD_NONE_FRAMES` still available for A/B.
 
 ## [S1] Problem
 
@@ -37,7 +50,7 @@ In `choose_sensor_lane` when `chosen is None`:
 
 ## Tasks
 
-- [ ] T1: Extended hold for centre-paint frames — acceptance: unit test
+- [x] T1: Extended hold for centre-paint frames — acceptance: unit test
       that a paired left-only frame survives >4 miss ticks (covers: S2)
-- [ ] T2: Default hold unchanged for other frames — acceptance: existing
+- [x] T2: Default hold unchanged for other frames — acceptance: existing
       fusion tests pass (covers: S2; depends: T1)
