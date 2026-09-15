@@ -209,22 +209,25 @@ def _perception_freshness(scene, snapshot_age_s: float) -> dict:
 
 
 def _modality_age(freshness: dict, snapshot_age_s: float | None) -> float:
-    """Age of the perception MODALITIES (heads / BEV / lane), range excluded.
+    """Age of the required road-driving modalities.
 
-    An unknown head age stays fail-closed (``inf``) and an absent BEV/lane
-    modality contributes nothing.  When a scene reports no modality age at
-    all, the composite snapshot age is the only freshness signal there is,
-    so it is used rather than silently reporting "fresh".
+    ``head_age_s`` also contains optional heads (object / traffic / topology).
+    Those heads may be throttled or reused without invalidating a fresh road
+    lane: obstacle safety has its own range/BEV checks.  Only the semantic head
+    is required for the road-lateral decision; the full max remains available
+    in ``freshness['max_s']`` for honest telemetry.
     """
     vals: list[float] = []
-    for value in (freshness.get("head_age_s") or {}).values():
+    heads = freshness.get("head_age_s") or {}
+    if heads:
+        value = heads.get("semantic")
         vals.append(float("inf") if value is None else float(value))
     for key in ("bev_age_s", "lane_age_s"):
         value = freshness.get(key)
         if value is not None:
             vals.append(float(value))
     if not vals:
-        return float(snapshot_age_s or 0.0)
+        vals.append(float(snapshot_age_s or 0.0))
     return max(vals)
 
 
@@ -421,6 +424,17 @@ class SafetyMonitor:
             v.target_speed = 0.0
             return v
         if path_occ >= self.occ_degrade:
+            if corridor_open:
+                # Connectivity says a free lateral band exists: scattered
+                # roadside/guardrail occupancy is a soft speed cap, not a
+                # path-graze failure.  A closed corridor still takes the
+                # hard path-graze branch below.
+                v.level = "degraded"
+                v.reason = "scattered obstacle"
+                v.target_speed = min(
+                    v.target_speed,
+                    self.max_speed * self.corridor_open_floor)
+                return v
             v.level = "degraded"
             v.reason = "path grazes obstacle"
             v.target_speed = min(v.target_speed,

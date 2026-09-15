@@ -132,7 +132,10 @@ WARMUP_S = 8.0
 PLACEMENT_HOLD_S = 30.0
 # Extra seconds after heads are live before giving up on painted-line
 # placement (US yellow paint / warm-up flicker).
-PLACEMENT_GRACE_S = 15.0
+# After the heads come live, US yellow/short-pair evidence may need several
+# more camera ticks before it becomes a trusted sensor lane.  Keep the car
+# braked through a 30 s grace window (total placement deadline 60 s).
+PLACEMENT_GRACE_S = 30.0
 # Skip the first N stack ticks after teleport so the camera settles
 # before placement (east_coast first frames often lack paint).
 PLACEMENT_SKIP_TICKS = 16
@@ -707,7 +710,13 @@ def _spawn_traffic(conn, nav_route, n: int,
 
 
 def _sensor_snapshot_age(out) -> float:
-    """Max age of the data used by one FSD tick."""
+    """Max age of road-driving modalities used by one FSD tick.
+
+    The canonical snapshot also reports throttled optional heads (object /
+    traffic / topology) and reusable range age.  Those remain visible in
+    snapshot freshness telemetry, but they must not park a fresh semantic
+    lane/BEV stack; range has its own reuse horizon in SafetyMonitor.
+    """
     if out is None:
         return float("inf")
     snapshot = getattr(out, "snapshot", None)
@@ -716,32 +725,62 @@ def _sensor_snapshot_age(out) -> float:
         # Legacy tick fields remain only for stubs that predate it.
         if not bool(getattr(snapshot, "valid", False)):
             return float("inf")
-        try:
-            age = snapshot.freshness().get("max_s")
-        except (TypeError, ValueError):
-            return float("inf")
-        if age is None:
-            return float("inf")
-        age = float(age)
+        ages: list[float] = []
+        heads = getattr(snapshot, "head_age_s", {}) or {}
+        if heads:
+            semantic_age = heads.get("semantic")
+            if semantic_age is None:
+                return float("inf")
+            ages.append(float(semantic_age))
+        if getattr(snapshot, "bev_age_s", None) is not None:
+            ages.append(float(snapshot.bev_age_s))
+        envelope = getattr(snapshot, "lane_envelope", None)
+        if envelope is not None:
+            lane_age = getattr(envelope, "age_s", None)
+            if lane_age is None:
+                return float("inf")
+            ages.append(float(lane_age))
+        if not ages:
+            return 0.0
+        age = max(ages)
         return age if math.isfinite(age) else float("inf")
-    ages = list((getattr(out, "meta", {}) or {}).get(
-        "head_age_s", {}).values())
     meta = getattr(out, "meta", {}) or {}
-    for key in ("range_age_s", "bev_age_s"):
-        if key in meta:
-            ages.append(meta.get(key))
+    raw_heads = meta.get("head_age_s", {}) or {}
+    ages: list[float] = []
+    if raw_heads:
+        semantic_age = raw_heads.get("semantic")
+        if semantic_age is None:
+            return float("inf")
+        ages.append(float(semantic_age))
+    if meta.get("bev_age_s") is not None:
+        ages.append(float(meta["bev_age_s"]))
     envelope = getattr(out, "lane_envelope", None)
     if envelope is not None:
-        ages.append(envelope.age_s)
-    # None means a required modality has no valid sample; treat it as
-    # stale rather than silently converting it to zero age.
-    if any(x is None for x in ages):
-        return float("inf")
+        lane_age = getattr(envelope, "age_s", None)
+        if lane_age is None:
+            return float("inf")
+        ages.append(float(lane_age))
     # A tick with no frame and no head outputs has no fresh camera evidence.
     if getattr(out, "frame", None) is None \
             and not getattr(out, "head_outputs", None):
         return float("inf")
-    return max([0.0] + [float(x) for x in ages])
+    return max([0.0] + ages)
+
+
+def _sensor_lane_is_centered(out, pos, max_dist_m: float = 2.0) -> bool:
+    """True when strict perception already owns a near ego-lane reference."""
+    if out is None or str(out.meta.get("lane_src_sel", "")) != "sensor":
+        return False
+    lane = getattr(out, "lane_ref", None)
+    if lane is None:
+        return False
+    pts = np.asarray(lane, dtype=float)
+    if pts.ndim != 2 or pts.shape[1] < 2 or len(pts) < 3:
+        return False
+    pts = pts[:, :2]
+    p = np.asarray(pos[:2], dtype=float)
+    d = np.linalg.norm(pts - p[None, :], axis=1)
+    return bool(np.isfinite(d).any() and float(np.nanmin(d)) <= max_dist_m)
 
 
 def resolve_provenance_env(conn, args) -> tuple[str, str]:
@@ -1147,6 +1186,11 @@ class FSDriveSession:
                 if (_pw_out is not None and _pw_out.frame is not None
                         and _pw_ticks >= PLACEMENT_SKIP_TICKS):
                     try:
+                        if _sensor_lane_is_centered(_pw_out, _pw_state.pos):
+                            _percep_ok = True
+                            print("[fsd-drive] perception lane placement "
+                                  "already centered; no teleport needed")
+                            break
                         _sp_tgt = painted_line_lane_center(
                             _pw_out.head_outputs.get("semantic"),
                             _pw_out.cam, _pw_state.pos,
@@ -1543,6 +1587,11 @@ class FSDriveSession:
                 out = stack.tick(st=st, route_ref=route_local,
                                  map_lane_override=map_lane,
                                  time_budget_s=_budget)
+                if (not _percep_ok
+                        and _sensor_lane_is_centered(out, pos)):
+                    _percep_ok = True
+                    print("[fsd-drive] placed=True after calibrate-after "
+                          "sensor lane recovery", flush=True)
                 _tb = time.time()
                 _ema_tick = (TICK_BUDGET_EMA * (_tb - _f0)
                              + (1.0 - TICK_BUDGET_EMA) * _ema_tick)
@@ -2916,6 +2965,14 @@ class FSDriveSession:
                     "signed": round(float(signed), 3),
                     "level": str(verd.level),
                     "reason": verd.reason or "-",
+                    "path_occ_frac": round(
+                        float(getattr(verd, "path_occupied_frac", 0.0)), 4),
+                    "corridor_open": bool(
+                        getattr(verd, "corridor_open", False)),
+                    "closest_obs_m": round(
+                        float(getattr(verd, "closest_obs_m", 999.0)), 3),
+                    "planner_kind": str(out.meta.get("planner", {})
+                                         .get("kind", "")),
                     "source": str(chosen.source),
                     "e2e": int(e2e_path is not None and len(e2e_path) >= 2),
                     "e2e_safe": int(bool(e2e_safe)),
@@ -3020,6 +3077,8 @@ class FSDriveSession:
                     "lane_reject": str(out.meta.get("lane_reject_reason", "")),
                     "lane_sel": str(out.meta.get("lane_src_sel", "")),
                     "lane_paired": int(out.meta.get("lane_paired", 0)),
+                    "lane_pair_debug": out.meta.get("lane_pair_debug"),
+                    "lane_fusion_debug": out.meta.get("lane_fusion_debug"),
                     # Freshness ages.  The safety monitor's "stale sensor"
                     # verdict is `max(all head ages, range, bev, lane) >
                     # STALE_SNAPSHOT_S`, and without these in the log a

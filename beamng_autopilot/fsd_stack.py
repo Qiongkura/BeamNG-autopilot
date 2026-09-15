@@ -769,6 +769,12 @@ class FSDStack:
         # ride.  A real stack keeps to the centre of ITS OWN lane, which
         # is what pair_lane_markings / build_lidar_corridor deliver.
         lane_frame = self._sensor_lane(out, pos, heading)
+        if getattr(self, "_last_lane_fusion_debug", None):
+            out.meta["lane_fusion_debug"] = dict(
+                self._last_lane_fusion_debug)
+        if getattr(self, "_last_lane_pair_debug", None):
+            out.meta["lane_pair_debug"] = dict(
+                self._last_lane_pair_debug)
         self.lane_envelope = SensorLaneEnvelope.from_lane_frame(
             lane_frame, captured_at=time.time()) if lane_frame is not None else None
         out.lane_envelope = self.lane_envelope
@@ -1143,7 +1149,55 @@ class FSDStack:
             _warn_once("sensor_lane_fusion", f"lane fusion failed: {exc}")
             frame = vision or lidar
         if frame is None:
+            try:
+                from beamng_autopilot.lane import lane_frame_usable
+                self._last_lane_fusion_debug = {
+                    "vision": (None if vision is None else {
+                        "usable": bool(lane_frame_usable(vision)),
+                        "paired": bool(vision.paired),
+                        "confidence": round(float(vision.confidence), 3),
+                        "span_m": round(float(vision.span_m), 2),
+                        "width_m": round(float(vision.width), 2),
+                        "sources": tuple(vision.sources),
+                    }),
+                    "lidar": (None if lidar is None else {
+                        "usable": bool(lane_frame_usable(lidar, 0.35)),
+                        "paired": bool(lidar.paired),
+                        "confidence": round(float(lidar.confidence), 3),
+                        "span_m": round(float(lidar.span_m), 2),
+                        "sources": tuple(lidar.sources),
+                    }),
+                    "chosen": None,
+                }
+            except Exception:
+                pass
             return None
+        try:
+            from beamng_autopilot.lane import lane_frame_usable
+            self._last_lane_fusion_debug = {
+                "vision": (None if vision is None else {
+                    "usable": bool(lane_frame_usable(vision)),
+                    "paired": bool(vision.paired),
+                    "confidence": round(float(vision.confidence), 3),
+                    "span_m": round(float(vision.span_m), 2),
+                    "sources": tuple(vision.sources),
+                }),
+                "lidar": (None if lidar is None else {
+                    "usable": bool(lane_frame_usable(lidar, 0.35)),
+                    "paired": bool(lidar.paired),
+                    "confidence": round(float(lidar.confidence), 3),
+                    "span_m": round(float(lidar.span_m), 2),
+                    "sources": tuple(lidar.sources),
+                }),
+                "chosen": {
+                    "paired": bool(frame.paired),
+                    "confidence": round(float(frame.confidence), 3),
+                    "span_m": round(float(frame.span_m), 2),
+                    "sources": tuple(frame.sources),
+                },
+            }
+        except Exception:
+            pass
         # Re-anchor the centre at the CURRENT ego.  The fusion state may
         # return a held lane computed at an earlier pose; the planner
         # needs a drivable reference starting at/near the car (near ->
@@ -1169,16 +1223,30 @@ class FSDStack:
 
     def _sensor_lane_from_semantic(self, head_outputs, pos, heading):
         """Pair the semantic head's world markings into a LaneFrame."""
+        debug: dict = {}
+        self._last_lane_pair_debug = debug
         try:
             from beamng_autopilot.lane import pair_lane_markings
             sem = head_outputs.get("semantic")
             if sem is None:
+                debug["mode"] = "no_semantic"
                 return None
             markings = sem.meta.get("markings", [])
+            debug["marking_count"] = len(markings)
             if not markings:
+                debug["mode"] = "no_markings"
                 return None
-            return pair_lane_markings(markings, pos, heading)
+            frame = pair_lane_markings(markings, pos, heading,
+                                       debug=debug)
+            debug["result"] = (None if frame is None else {
+                "paired": bool(frame.paired),
+                "confidence": round(float(frame.confidence), 3),
+                "span_m": round(float(frame.span_m), 2),
+            })
+            return frame
         except Exception as exc:
+            debug["mode"] = "error"
+            debug["error"] = str(exc)
             _warn_once("pair_lane_markings",
                        f"vision lane pairing failed: {exc}")
             return None
