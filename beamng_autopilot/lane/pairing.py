@@ -782,6 +782,15 @@ def _single_mirror_frame(best, side: int, pos: np.ndarray,
         * (0.6 + 0.4 * min(1.0, conf))
     conf = min(0.82, conf)
     conf = _cap_mirror_conf(conf, stations, center_lat, side)
+    # A clear left painted edge that begins in the near field and mirrors to
+    # a centre within one metre of the ego is enough perception evidence for
+    # strict RHT control.  Keep the wider/far roadside cases below the strict
+    # confidence gate instead of trusting them as a lane.
+    if (side > 0 and float(proj[0, 0]) <= LANE_SINGLE_NEAR_REQUIRE_M
+            and span >= LANE_MIN_SPAN_M
+            and abs(float(np.nanmedian(center_lat)))
+            <= LANE_VISION_MIRROR_CENTER_MAX_M):
+        conf = max(conf, 0.50)
     # A line that only becomes visible several metres ahead is a weak
     # read: it can still beat a wall fallback, but the planner must only
     # give it a small nudge instead of a full-lane correction.
@@ -815,7 +824,13 @@ def _centre_line_own_lane(cand, pos, fwd, lane_width: float,
     if cand is None or float(cand.span) < LANE_MIN_SPAN_M:
         return None
     if abs(float(cand.med_lat)) > 1.2:
-        return None
+        # A far yellow centre line can sit outside the near 1.2 m band
+        # before the vehicle reaches the junction.  Its own-lane midpoint
+        # remains close after the RHT half-lane shift, so allow only explicit
+        # yellow paint in a wider 2.5 m band; white/unknown edges stay strict.
+        if (str(getattr(cand, "color", "")) != "yellow"
+                or abs(float(cand.med_lat)) > 2.5):
+            return None
     proj = np.asarray(cand.proj, dtype=float)
     if proj.ndim != 2 or proj.shape[0] < 3:
         return None
@@ -970,7 +985,10 @@ def pair_lane_markings(
     if not axes:
         axes = _axis_candidates(cands, station_step, max_stations)
     for c in axes:
-        if abs(float(getattr(c, "med_lat", 99.0))) <= 1.2:
+        _center_ok = abs(float(getattr(c, "med_lat", 99.0))) <= 1.2
+        if not _center_ok and str(getattr(c, "color", "")) == "yellow":
+            _center_ok = abs(float(getattr(c, "med_lat", 99.0))) <= 2.5
+        if _center_ok:
             cfr = _centre_line_own_lane(
                 c, pos, fwd, lane_width, station_step, max_stations)
             if cfr is not None:
@@ -978,6 +996,21 @@ def pair_lane_markings(
                     debug["mode"] = "centre_line_own_lane"
                     debug["paired"] = True
                 return cfr
+    # A single far yellow centre line can define the RHT own lane, but only
+    # on the positive/left side; a near right yellow line is not a centre
+    # line and must stay on the protected mirror path.
+    if not axes:
+        for c in cands:
+            if (str(getattr(c, "color", "")) == "yellow"
+                    and float(getattr(c, "med_lat", 99.0)) > 0.08
+                    and abs(float(getattr(c, "med_lat", 99.0))) <= 2.5):
+                cfr = _centre_line_own_lane(
+                    c, pos, fwd, lane_width, station_step, max_stations)
+                if cfr is not None:
+                    if debug is not None:
+                        debug["mode"] = "centre_line_own_lane"
+                        debug["paired"] = True
+                    return cfr
     left_best = _best_single_boundary(cands, 1)
     right_best = _best_single_boundary(cands, -1)
     if left_best is None and right_best is None:

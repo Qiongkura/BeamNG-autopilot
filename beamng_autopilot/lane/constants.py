@@ -14,6 +14,9 @@ LANE_MIN_SPAN_M = 4.0
 LANE_BOUNDARY_SPAN_M = 1.5
 LANE_PAIR_OVERLAP_M = 1.5
 LANE_FRAME_MIN_SPAN_M = 3.0
+# A short two-sided US paint pair is trusted only when both boundaries have
+# explicit solid/dashed kinds and the confidence gate passes.
+LANE_SHORT_PAIRED_SPAN_M = 1.5
 # How long a vision pair / vision+LiDAR overlap must be before it may
 # replace the nav route as the driving centre.  Deliberately strict even
 # for a two-sided painted pair: a 3.2 m pair can have its centre metres

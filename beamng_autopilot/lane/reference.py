@@ -543,11 +543,23 @@ def select_lane_reference(
     # from the painted-line lane-width contract, never from the map.
     # Ambiguous/no-vision reads still stop.
     if strict_lane:
+        _single_conf = float(getattr(lane_frame, "confidence", 0.0) or 0.0) \
+            if lane_frame is not None else 0.0
+        _single_kinds = {
+            getattr(lane_frame, "left_kind", None),
+            getattr(lane_frame, "right_kind", None),
+        } if lane_frame is not None else set()
+        # The pairing/fusion geometry already rejects far, wrong-side and
+        # unknown markings.  A near explicit painted edge at 0.35 is enough
+        # to keep strict control alive on the short US view; retain 0.50 for
+        # generic single-edge frames.
+        _single_min_conf = (0.35 if _single_kinds & {"solid", "dashed", "thin"}
+                            else 0.50)
         _single_vision = bool(
             lane_frame is not None
             and not sensor_paired
             and "vision" in tuple(getattr(lane_frame, "sources", ()) or ())
-            and float(getattr(lane_frame, "confidence", 0.0) or 0.0) >= 0.50
+            and _single_conf >= _single_min_conf
             and lane_ref is not None and len(lane_ref) >= 3)
         if sensor_paired and lane_ref is not None and len(lane_ref) >= 3:
             lane_src_sel = SRC_SENSOR

@@ -17,6 +17,7 @@ from .constants import (
     LANE_PAIRED_VISION_MIN_SPAN_M,
     LANE_RIGHT_MIRROR_NEAR_M,
     LANE_RIDING_LINE_MAX_M,
+    LANE_SHORT_PAIRED_SPAN_M,
     LANE_SINGLE_NEAR_REQUIRE_M,
     LANE_VISION_MIRROR_CENTER_MAX_M,
     LANE_VISION_RIGHT_MIRROR_CENTER_MAX_M,
@@ -333,6 +334,17 @@ def lane_frame_usable(frame: LaneFrame | None,
                 if frame.paired and (frame.sources == ("vision",)
                                      or len(frame.sources) > 1)
                 else LANE_FRAME_MIN_SPAN_M)
+    # A real US junction can expose both painted edges for only 2-3 m while
+    # the car is already inside the lane.  Keep the conservative 6 m floor
+    # for generic/unknown pairs, but allow a short pair only when both sides
+    # carry explicit painted-line kinds (at least one solid/dashed; a thin
+    # skeleton may be the opposite edge) and the confidence gate still passes.
+    if (frame.paired and frame.sources == ("vision",)
+            and frame.left_kind in ("solid", "dashed", "thin")
+            and frame.right_kind in ("solid", "dashed", "thin")
+            and (frame.left_kind != "thin" or frame.right_kind != "thin")
+            and frame.confidence >= 0.52):
+        min_span = min(min_span, LANE_SHORT_PAIRED_SPAN_M)
     # Centre-paint only (US yellow): shorter fragments still count as a
     # legal own-lane authority when the midline is the only boundary.
     if (frame.paired and frame.left is not None
