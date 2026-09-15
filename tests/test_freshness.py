@@ -38,6 +38,29 @@ def test_bev_and_lane_ages_participate_in_max_age():
         scene, np.array([[0.0, 0.0], [5.0, 0.0]])).stale_sensor
 
 
+def test_optional_object_head_does_not_stale_fresh_road_perception():
+    """A throttled object head must not park a fresh lane/BEV stack."""
+    scene = Scene(
+        pos=np.array([0.0, 0.0]), heading=0.0,
+        meta={"head_age_s": {"semantic": 0.1, "object": 1.8,
+                              "traffic": 2.2, "topology": 1.6},
+              "bev_age_s": 0.1, "range_age_s": 0.2})
+    verdict = SafetyMonitor(max_speed=6.0).evaluate(
+        scene, np.array([[0.0, 0.0], [5.0, 0.0]]))
+    assert verdict.stale_sensor is False
+    assert verdict.level != "degraded"
+
+
+def test_missing_required_semantic_head_stays_stale():
+    scene = Scene(
+        pos=np.array([0.0, 0.0]), heading=0.0,
+        meta={"head_age_s": {"object": 0.1},
+              "bev_age_s": 0.1, "range_age_s": 0.1})
+    verdict = SafetyMonitor(max_speed=6.0).evaluate(
+        scene, np.array([[0.0, 0.0], [5.0, 0.0]]))
+    assert verdict.stale_sensor is True
+
+
 def test_safety_prefers_canonical_snapshot_over_stale_scene_metadata():
     snapshot = PerceptionSnapshot(
         captured_at=time.time(), tick_id=3,

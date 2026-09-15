@@ -204,6 +204,19 @@ def test_strict_trusted_single_painted_boundary_publishes_the_lane() -> None:
     assert ref.boundaries is False
 
 
+def test_strict_explicit_single_paint_at_medium_confidence_publishes():
+    lane = _sensor_lane(paired=False, confidence=0.4)
+    lane.right_kind = "dashed"
+    ref = select_lane_reference(
+        lane_frame=lane,
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        lane_mode="sensor", strict_sensor=True,
+    )
+    assert ref.src == SRC_SENSOR
+    assert ref.center is not None
+
+
 def test_strict_rejected_lane_fails_closed_rather_than_single_edging() -> None:
     """The single-edge fallback must not resurrect a lane the gates dropped."""
     ref = select_lane_reference(

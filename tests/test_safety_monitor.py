@@ -68,6 +68,35 @@ def test_degraded_when_obstacle_grazed() -> None:
     assert v.level in ("minimal_risk", "degraded")
 
 
+def test_rotated_roadside_wall_does_not_false_graze_open_path() -> None:
+    """A thin diagonal roadside wall must not become an AABB block."""
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.origin = (0.0, 0.0)
+    grid.heading = 0.0
+    grid.mark_obstacle_region(
+        6.0, 1.0, 0.0, 0.0,
+        axis=np.array([1.0, 1.0]), half_len=4.0, half_thick=0.25)
+    path = _straight()
+    scene = Scene(pos=np.array([0.0, 0.0]), heading=0.0,
+                  grid=grid, route=path, lane_ref=path)
+    verdict = SafetyMonitor().evaluate(scene, path)
+    assert verdict.reason != "path grazes obstacle"
+    assert verdict.level == "safe"
+
+
+def test_open_corridor_treats_scattered_path_occupancy_as_soft():
+    mon = SafetyMonitor(max_speed=15.0, occ_fraction_degrade=0.01,
+                        occ_fraction_stop=0.9)
+    scene = _scene()
+    for x in (4.0, 6.0, 8.0):
+        scene.grid.mark_obstacle_region(x, 0.0, 0.35, 0.35)
+    verdict = mon.evaluate(scene, _straight())
+    assert verdict.corridor_open is True
+    assert verdict.reason == "scattered obstacle"
+    assert verdict.level == "degraded"
+    assert verdict.target_speed >= 15.0 * 0.55 - 1e-9
+
+
 def test_stale_sensor_degrades() -> None:
     mon = SafetyMonitor(max_speed=12.0)
     v = mon.evaluate(_scene(), _straight(),

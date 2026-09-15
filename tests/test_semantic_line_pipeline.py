@@ -69,6 +69,45 @@ def test_explicit_empty_mask_does_not_reinfer():
     assert seg.calls == 0
 
 
+def test_nonempty_line_mask_uses_classic_fallback_when_extractor_empty():
+    seg = _segmenter()
+    seg.predict = lambda frame: (
+        np.ones(frame.shape[:2], bool),
+        np.ones(frame.shape[:2], bool),
+    )
+    seg.detect_lines = lambda *args, **kwargs: []
+
+    class Classic:
+        def detect(self, *args, **kwargs):
+            return [("classic-short-paint", 1.0)]
+
+    out = SemanticHead(segmenter=seg, lane_detector=Classic(),
+                       enable_evidence=False).run(_ctx())
+    assert out.meta["markings"] == [("classic-short-paint", 1.0)]
+
+
+def test_classic_unknown_fragment_is_promoted_only_with_learned_line():
+    from beamng_autopilot.vision.lanes import LaneMarking
+    seg = _segmenter()
+    seg.predict = lambda frame: (
+        np.ones(frame.shape[:2], bool),
+        np.ones(frame.shape[:2], bool),
+    )
+    seg.detect_lines = lambda *args, **kwargs: []
+    world = np.column_stack([np.linspace(2.0, 7.0, 5),
+                             np.full(5, 2.0)])
+    marking = LaneMarking(world=world, pixels=world.copy(),
+                          kind="unknown", confidence=0.7)
+
+    class Classic:
+        def detect(self, *args, **kwargs):
+            return [marking]
+
+    out = SemanticHead(segmenter=seg, lane_detector=Classic(),
+                       enable_evidence=False).run(_ctx())
+    assert out.meta["markings"][0].kind == "thin"
+
+
 def test_legacy_detect_lines_still_infers_once():
     seg = _segmenter()
     ctx = _ctx()

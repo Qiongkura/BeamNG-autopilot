@@ -86,6 +86,20 @@ def test_obstacle_region_floods() -> None:
     assert g.obstacle[far] == 0
 
 
+def test_rotated_obstacle_region_does_not_fill_bounding_box() -> None:
+    g = _grid(res=0.5, n=60)
+    g.origin = (0.0, 0.0)
+    g.mark_obstacle_region(6.0, 6.0, 0.0, 0.0,
+                           axis=np.array([1.0, 1.0]),
+                           half_len=4.0, half_thick=0.25)
+
+    # The centreline is occupied, but a corner of its axis-aligned bounding
+    # box is outside the thin rotated rectangle and must stay clear.
+    assert g.obstacle[g.world_to_cell(6.0, 6.0)] == 1
+    assert g.obstacle[g.world_to_cell(2.0, 10.0)] == 0
+    assert int(g.obstacle.sum()) < 40
+
+
 def test_query_path_cost_penalises_occupied() -> None:
     g = _grid(res=0.5, n=40)
     g.origin = (0.0, 0.0)

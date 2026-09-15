@@ -73,6 +73,26 @@ def test_fusion_holds_lane_through_one_frame_glitch() -> None:
     assert out.sources == ("vision", "lidar")
 
 
+def test_strong_painted_single_beats_unpaired_lidar():
+    from beamng_autopilot.lane.fusion import choose_sensor_lane
+
+    vision = _frame(paired=False, src=("vision",))
+    vision.left = np.column_stack([
+        np.linspace(0.0, 5.0, 6), np.full(6, 2.3)])
+    vision.right = None
+    vision.left_kind = "dashed"
+    vision.right_kind = None
+    vision.confidence = 0.55
+    vision.span_m = 5.0
+    lidar = _frame(paired=False, src=("lidar", "right"))
+    lidar.confidence = 0.45
+    state = {}
+    chosen = choose_sensor_lane(
+        vision, lidar, np.array([0.0, 0.0]), 0.0, state=state)
+    assert chosen is vision
+    assert chosen.sources == ("vision",)
+
+
 def test_fusion_adopts_persistent_new_source() -> None:
     from beamng_autopilot.lane.fusion import choose_sensor_lane
     from beamng_autopilot.lane.constants import LANE_FUSION_HOLD_FRAMES
@@ -119,6 +139,18 @@ def test_short_pair_frame_is_not_usable() -> None:
     assert not lane_frame_usable(
         _usable(span=LANE_PAIRED_VISION_MIN_SPAN_M - 0.1))
     assert lane_frame_usable(_usable(span=LANE_PAIRED_VISION_MIN_SPAN_M))
+
+
+def test_short_explicit_painted_pair_is_usable():
+    from beamng_autopilot.lane.tracking import lane_frame_usable
+    frame = _usable(span=2.0, conf=0.55)
+    frame.left_kind = "dashed"
+    frame.right_kind = "thin"
+    assert lane_frame_usable(frame)
+
+    frame.left_kind = "thin"
+    frame.right_kind = "thin"
+    assert not lane_frame_usable(frame)
 
 
 def test_fused_overlap_uses_the_same_span_floor() -> None:

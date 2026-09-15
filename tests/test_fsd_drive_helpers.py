@@ -249,13 +249,21 @@ def test_ff_short_path_zero() -> None:
         path, np.array([0.0, 0.0, 0.0]), 0.0) == 0.0
 
 
-def test_snapshot_age_uses_oldest_head_and_range():
+def test_snapshot_age_uses_required_semantic_not_optional_object_or_range():
     out = SimpleNamespace(
         frame=np.zeros((4, 4, 3), dtype=np.uint8),
         head_outputs={"semantic": object()},
-        meta={"head_age_s": {"semantic": 0.2, "object": 0.7},
-              "range_age_s": 0.5})
-    assert fsd_drive._sensor_snapshot_age(out) == pytest.approx(0.7)
+        meta={"head_age_s": {"semantic": 0.2, "object": 1.8},
+              "range_age_s": 1.5})
+    assert fsd_drive._sensor_snapshot_age(out) == pytest.approx(0.2)
+
+
+def test_snapshot_age_missing_semantic_is_infinite_even_with_optional_heads():
+    out = SimpleNamespace(
+        frame=np.zeros((4, 4, 3), dtype=np.uint8),
+        head_outputs={"object": object()},
+        meta={"head_age_s": {"object": 0.1}, "range_age_s": 0.1})
+    assert math.isinf(fsd_drive._sensor_snapshot_age(out))
 
 
 def test_snapshot_age_no_sensor_is_infinite():
@@ -276,6 +284,39 @@ def test_snapshot_age_prefers_canonical_snapshot():
         meta={"head_age_s": {"semantic": 0.0},
               "range_age_s": 0.0, "bev_age_s": 0.0})
     assert fsd_drive._sensor_snapshot_age(out) == pytest.approx(1.3)
+
+
+def test_sensor_lane_is_centered_requires_strict_sensor_reference():
+    out = SimpleNamespace(
+        meta={"lane_src_sel": "sensor"},
+        lane_ref=np.array([[0.0, 0.0], [4.0, 0.0], [8.0, 0.0]]))
+    assert fsd_drive._sensor_lane_is_centered(
+        out, np.array([0.0, 0.0, 0.0]))
+
+    out.meta["lane_src_sel"] = "map"
+    assert not fsd_drive._sensor_lane_is_centered(
+        out, np.array([0.0, 0.0, 0.0]))
+
+
+def test_sensor_lane_is_centered_rejects_far_reference():
+    out = SimpleNamespace(
+        meta={"lane_src_sel": "sensor"},
+        lane_ref=np.array([[5.0, 0.0], [9.0, 0.0], [13.0, 0.0]]))
+    assert not fsd_drive._sensor_lane_is_centered(
+        out, np.array([0.0, 0.0, 0.0]))
+
+
+def test_snapshot_age_canonical_ignores_optional_heads_and_range():
+    snapshot = PerceptionSnapshot(
+        captured_at=0.0, tick_id=6,
+        pos=np.array([0.0, 0.0, 0.0]), heading=0.0,
+        bev=np.zeros((4, 4)),
+        head_age_s={"semantic": 0.2, "object": 1.8},
+        range_age_s=1.5, bev_age_s=0.1)
+    out = SimpleNamespace(
+        frame=np.zeros((4, 4, 3), dtype=np.uint8),
+        head_outputs={"semantic": object()}, snapshot=snapshot)
+    assert fsd_drive._sensor_snapshot_age(out) == pytest.approx(0.2)
 
 
 def test_snapshot_age_invalid_canonical_snapshot_is_infinite():

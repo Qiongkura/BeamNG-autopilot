@@ -172,6 +172,40 @@ def test_selector_hold_heading_when_path_low_occupancy() -> None:
     assert meta.get("hold_occ_frac", 0.0) < 0.2
 
 
+def test_selector_hold_heading_follows_sensor_lane_before_body_cross():
+    """A curved sensor lane must beat a straight hold path at its edge."""
+    from beamng_autopilot.planning.trajectory import Candidate
+    from beamng_autopilot.planning.constraints import body_lane_cross_dist_m
+
+    grid = OccupancyGrid(60, 60, 0.5)
+    lane = np.array([[0.0, 0.0], [3.0, 0.5], [6.0, 2.0],
+                     [8.0, 4.0]], dtype=float)
+    left = lane + np.array([0.0, 2.0])
+    right = lane - np.array([0.0, 2.0])
+    scene = Scene(pos=np.array([0.0, 0.0]), heading=0.0, grid=grid,
+                  route=lane, lane_ref=lane, lane_left=left,
+                  lane_right=right, lane_width=4.0,
+                  strict_perception=True)
+
+    class _Reject:
+        def score(self, scene, cand):
+            return 0.0, False
+
+    class _One:
+        def __init__(self):
+            self.candidates = [Candidate(path=np.array(
+                [[0.0, 0.0], [1.0, 5.0], [2.0, 10.0]]))]
+
+        def __len__(self):
+            return 1
+
+    best, meta = select_trajectory(scene, _One(), _Reject())
+    assert best is not None, meta
+    assert meta["kind"] == "hold_heading"
+    assert body_lane_cross_dist_m(scene, best) == 0.0
+    assert not np.allclose(best[-1], [8.0, 0.0])
+
+
 def test_selector_strict_no_lane_skips_hold_heading() -> None:
     from beamng_autopilot.planning.trajectory import Candidate
 
