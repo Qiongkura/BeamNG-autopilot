@@ -227,10 +227,6 @@ class OccupancyGrid:
             x1 = float(max(pt[0] for pt in corner_pts))
             y0 = float(min(pt[1] for pt in corner_pts))
             y1 = float(max(pt[1] for pt in corner_pts))
-            # Vectorised footprint sampling: same world-sample grid as the
-            # scalar loop, same rotated-rect membership test, cells via
-            # the shared batched world_to_cell (only the min/max of the
-            # hit cells feeds the stamp, so order is irrelevant).
             gx, gy = np.meshgrid(np.arange(x0, x1 + self.res, self.res),
                                  np.arange(y0, y1 + self.res, self.res))
             dx = gx - ctr[0]
@@ -242,11 +238,14 @@ class OccupancyGrid:
             rs, cs = self._cells_for_points(gx[sel], gy[sel])
             if not len(rs):
                 return
-            r0, r1 = int(rs.min()), int(rs.max())
-            c0, c1 = int(cs.min()), int(cs.max())
-            self.obstacle[r0:r1 + 1, c0:c1 + 1] = 1
-            self.occupancy[r0:r1 + 1, c0:c1 + 1] = np.maximum(
-                self.occupancy[r0:r1 + 1, c0:c1 + 1], 0.9)
+            # Stamp only the cells whose sample points are inside the rotated
+            # footprint.  Filling the row/column bounding box would turn a
+            # thin diagonal wall into a large axis-aligned obstacle and make
+            # an otherwise open path falsely graze it.
+            self.obstacle[rs, cs] = 1
+            self.occupancy[rs, cs] = np.maximum(
+                self.occupancy[rs, cs], 0.9)
+            self.height[rs, cs] = float(z)
             return
         x0, x1 = wx - hw, wx + hw
         y0, y1 = wy - hh, wy + hh
