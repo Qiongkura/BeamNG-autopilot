@@ -22,6 +22,72 @@ def _hold_heading_path(scene, length_m: float = 8.0, n: int = 9):
                             p[1] + t * math.sin(h)])
 
 
+def _perception_hold_path(scene, length_m: float = 8.0, n: int = 9):
+    """Use the current sensor lane for a short hold when it is available.
+
+    A straight heading hold is only a safe fallback on a straight lane.  On
+    a curved sensor lane it can put the ego footprint across a boundary even
+    though the lane centre itself is valid.
+    """
+    p = np.asarray(scene.pos[:2], dtype=float)
+    ref = None
+    envelope = getattr(scene, "lane_envelope", None)
+    if envelope is not None:
+        ref = getattr(envelope, "center", None)
+    if ref is None and getattr(scene, "strict_perception", False):
+        ref = getattr(scene, "lane_ref", None)
+    if ref is None:
+        return _hold_heading_path(scene, length_m, n)
+    ref = np.asarray(ref, dtype=float)
+    if ref.ndim != 2 or ref.shape[1] < 2:
+        return _hold_heading_path(scene, length_m, n)
+    ref = ref[:, :2]
+    ref = ref[np.isfinite(ref).all(axis=1)]
+    if len(ref) < 2:
+        return _hold_heading_path(scene, length_m, n)
+    h = float(scene.heading)
+    fwd = np.array([math.cos(h), math.sin(h)])
+    rel = ref - p
+    ahead = rel @ fwd
+    keep = (ahead >= -0.5) & (ahead <= float(length_m) + 0.5)
+    ref = ref[keep]
+    if len(ref) < 2:
+        return _hold_heading_path(scene, length_m, n)
+    order = np.argsort(np.linalg.norm(ref - p, axis=1))
+    path = np.vstack([p, ref[order]])
+    dedup = np.r_[True, np.linalg.norm(np.diff(path, axis=0), axis=1) > 1e-4]
+    path = path[dedup]
+    return path if len(path) >= 2 else _hold_heading_path(scene, length_m, n)
+
+
+def _trim_before_body_cross(scene, path, margin_m: float = 0.35):
+    """Shorten a fallback before its full ego footprint crosses a boundary."""
+    try:
+        from .constraints import body_lane_cross_dist_m
+        crossing = float(body_lane_cross_dist_m(scene, path))
+    except Exception:
+        return path
+    if crossing <= 0.0:
+        return path
+    limit = crossing - max(0.0, float(margin_m))
+    if limit < 0.8:
+        return None
+    pts = [np.asarray(path[0], dtype=float)[:2]]
+    travelled = 0.0
+    arr = np.asarray(path, dtype=float)[:, :2]
+    for a, b in zip(arr[:-1], arr[1:]):
+        seg = float(np.linalg.norm(b - a))
+        if seg < 1e-9:
+            continue
+        if travelled + seg >= limit:
+            pts.append(a + (limit - travelled) / seg * (b - a))
+            break
+        pts.append(b)
+        travelled += seg
+    out = np.asarray(pts, dtype=float)
+    return out if len(out) >= 2 else None
+
+
 def _hold_path_occupied_frac(scene, path, skip_m: float = 2.5) -> float:
     """Fraction of path samples (beyond the bumper) in occupied cells."""
     grid = getattr(scene, "grid", None)
@@ -74,7 +140,10 @@ def select_trajectory(scene, candidate_set, constraints):
         if (getattr(scene, "strict_perception", False)
                 and getattr(scene, "lane_ref", None) is None):
             return None, {"why": "no feasible candidate"}
-        path = _hold_heading_path(scene)
+        path = _perception_hold_path(scene)
+        path = _trim_before_body_cross(scene, path)
+        if path is None:
+            return None, {"why": "hold_heading_crosses_lane_boundary"}
         try:
             from .constraints import corridor_free_band
             open_corridor = bool(corridor_free_band(scene))
