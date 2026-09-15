@@ -1932,13 +1932,11 @@ def test_lane_boundary_guards() -> None:
         y = float(np.median(short.center[:, 1]))
         check("lane-guard: short pair centre on the middle",
               abs(y) < 0.05, f"y={y:.2f}")
-    # A 3.2 m pair is too short to steer by: its centre can sit metres
-    # off the nav route while every point is "near" the car, which
-    # dragged the car sideways in runs 42/47/52.  LANE_PAIRED_VISION_
-    # MIN_SPAN_M (6.0) now requires a real overlap before a vision pair
-    # may replace the nav route as the driving centre.
-    check("lane-guard: short pair frame not usable",
-          short is None or not lane_frame_usable(short),
+    # This is a real explicit painted pair (dashed + solid), so the short
+    # US-junction overlap is now allowed by the narrow short-pair gate.  A
+    # short pair with unknown kinds is still rejected by lane_frame_usable.
+    check("lane-guard: explicit short pair is usable",
+          short is not None and lane_frame_usable(short),
           f"conf={short.confidence:.2f} span={short.span_m:.1f} "
           f"w={short.width:.2f}")
 
