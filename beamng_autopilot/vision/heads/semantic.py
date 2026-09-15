@@ -109,17 +109,32 @@ class SemanticHead:
                     markings = seg.detect_lines(
                         ctx.frame_rgb, ctx.cam, ctx.pos, ctx.heading,
                         ground_z=ctx.ground_z, line_mask=line)
+                    if line.any():
+                        for marking in markings:
+                            if getattr(marking, "kind", None) == "unknown":
+                                marking.kind = "thin"
                 except Exception as exc:
                     out.meta.setdefault("line_errors", {})["markings"] = str(exc)
                     markings = []
-            if not markings and not line.any():
-                # Model unavailable or predicted no paint: fall back to the
-                # classic-CV colour-threshold detector so the planner still
-                # receives lane markings instead of an empty sensor lane.
+            if not markings:
+                # The learned mask can contain real paint while its
+                # mask-to-polyline extractor returns no usable component
+                # (short/faded US paint).  Classic CV is an independent
+                # geometric fallback and must still get a chance; it does
+                # not re-run segmentation or revive historical evidence.
                 try:
                     markings = self._get_lanes().detect(
                         ctx.frame_rgb, ctx.cam, ctx.pos, ctx.heading,
                         ground_z=ctx.ground_z)
+                    # The classic detector may call a small but bright paint
+                    # fragment "unknown" because its geometry is short.  If
+                    # the learned LINE mask also has evidence on this frame,
+                    # promote only those fallback fragments to a conservative
+                    # thin marking; pairing still applies all spatial gates.
+                    if line.any():
+                        for marking in markings:
+                            if getattr(marking, "kind", None) == "unknown":
+                                marking.kind = "thin"
                 except Exception:
                     markings = []
         out.meta["markings"] = markings
