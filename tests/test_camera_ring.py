@@ -115,3 +115,35 @@ def test_fwd_local_points_where_pan_says() -> None:
             assert f[0] < 0.0 and f[1] < 0.0  # left + back
         if mount.role == REAR_RIGHT:
             assert f[0] > 0.0 and f[1] < 0.0  # right + back
+
+
+def test_every_mount_round_trips_a_pixel() -> None:
+    """Pixel -> world -> pixel must return the original pixel.
+
+    ``project`` splits a ray as (d.r, d.f, d.u) while ``back_project``
+    rebuilds it as r*x + f + u*z: those are mutual inverses only when the
+    camera basis is orthonormal.  The ring stores a LEVEL up axis with a
+    pitched forward (-2 deg on the front main), which made the basis
+    oblique and put every back-projected marking 2.0 deg (~11 px) away
+    from the paint it came from.  Nothing caught it because both call
+    sites shared the same wrong basis.
+    """
+    from beamng_autopilot.vision.detection import back_project
+    from beamng_autopilot.vision.projection import default_camera
+
+    pos = np.array([234.5, 855.9, 41.0])
+    heading = -2.3023
+    ground = float(pos[2]) - 1.4
+    models = [default_camera(W, H)]
+    models += [m.camera_model(W, H) for m in CAMERA_RING]
+    for cam in models:
+        for u, v in ((188.0, 224.0), (351.0, 203.0), (455.0, 225.0),
+                     (6.0, 232.0), (cam.cx, cam.cy + 40.0)):
+            wp = back_project(u, v, cam, pos, heading, ground_z=ground)
+            if wp is None:
+                continue
+            uu, vv, ok = cam.project(
+                np.array([[wp[0], wp[1], ground]]), pos, heading)
+            assert bool(ok[0]), f"{cam}: ray must project back"
+            assert np.hypot(float(uu[0]) - u, float(vv[0]) - v) < 0.5, (
+                f"{cam}: round trip drifted for pixel ({u},{v})")
