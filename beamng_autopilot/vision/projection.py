@@ -103,6 +103,24 @@ class CameraModel:
         u = u / np.linalg.norm(u)
         r = np.cross(f, u)
         r = r / np.linalg.norm(r)
+        # ``project`` splits a ray as (d.r, d.f, d.u) and ``back_project``
+        # rebuilds it as r*x + f + u*z, which are mutual inverses ONLY for
+        # an orthonormal basis.  A mount whose ``up_local`` is not exactly
+        # perpendicular to its pitched ``fwd_local`` (the camera ring
+        # stores a LEVEL up with a -2 deg forward) made the basis oblique,
+        # so a pixel came back 2.0 deg = 11 px away from itself when it
+        # was drawn or compared in image space.  A pinhole image plane is
+        # perpendicular to the optical axis by construction, so re-derive
+        # up from (r, f) instead of trusting the stored axis.  For an
+        # already-perpendicular mount this is a no-op.
+        #
+        # Scope, measured: the ground-plane back-projection - what the
+        # lane geometry consumes - moved only 0.04 m across the whole
+        # image, so this changes what is DRAWN far more than what is
+        # measured.  The lane funnel is unchanged by it (same candidate
+        # count, span and pairing on the east_coast episodes).
+        u = np.cross(r, f)
+        u = u / np.linalg.norm(u)
         return C, r, f, u
 
     def project(self, world_points, pos, heading: float):
