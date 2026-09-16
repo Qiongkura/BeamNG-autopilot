@@ -50,6 +50,48 @@ def iou_from_accum(inter: np.ndarray, union: np.ndarray) -> np.ndarray:
     return ious
 
 
+def fill_interior_holes(mask: np.ndarray) -> np.ndarray:
+    """Fill every background region fully enclosed by ``mask``.
+
+    A background region touching the frame border is outside the mask; a
+    region that never reaches the border is a hole in it.
+    """
+    m = np.asarray(mask, dtype=np.uint8)
+    h, w = m.shape
+    padded = np.zeros((h + 2, w + 2), np.uint8)
+    padded[1:-1, 1:-1] = m
+    ff = padded.copy()
+    cv2.floodFill(ff, np.zeros((h + 4, w + 4), np.uint8), (0, 0), 2)
+    holes = ff[1:-1, 1:-1] == 0
+    return np.maximum(m, holes.astype(np.uint8)).astype(bool)
+
+
+def constrain_line_to_road(line: np.ndarray, road: np.ndarray,
+                           ksize: int = 7) -> np.ndarray:
+    """Keep the line pixels that lie on the road surface.
+
+    The model calls bright paint NOT asphalt, so the road mask carries
+    holes exactly along the markings (measured on the east_coast 300 s
+    run: 97.6% of the road-mask hole pixels sit on the line class).
+    Intersecting the line mask with the dilated road mask therefore ate
+    the marking's core and left a hollow outline - 56.8% of every marking
+    went missing (2965 px -> 1281 px per frame), which then fragmented
+    into the short thin strokes the pairing gates reject.
+
+    Paint enclosed by road IS on the road, so the road mask's interior
+    holes are filled before the containment test.  The false lines this
+    constraint exists for - grass edges, walls, stones - sit OUTSIDE the
+    road region and are still rejected.
+    """
+    m = np.asarray(line, dtype=bool)
+    if not m.any():
+        return m
+    rd = fill_interior_holes(np.asarray(road, dtype=bool)).astype(np.uint8)
+    rd = cv2.dilate(rd, cv2.getStructuringElement(
+        cv2.MORPH_RECT, (int(ksize), int(ksize))))
+    return m & rd.astype(bool)
+
+
 class SegUNet(nn.Module):
     """Lightweight UNet: 3 encoder blocks + skip connections (~1.3M params)."""
 
@@ -205,6 +247,9 @@ class Segmenter:
         # 物理约束：标线必须位于路面上。石头/护墙/草地边缘与标线视觉
         # 特征相似，模型常把它们误检为线；这些物体不在沥青路面上，用
         # 膨胀后的路面掩码约束即可滤掉（标线紧贴路面，边缘容忍 ~3px）。
+        # 路面掩码在标线处是破洞的（模型把白漆判为非路面），直接相与
+        # 会把标线芯挖空成轮廓，故先补内部空洞 —— 见
+        # ``constrain_line_to_road``。
         #
         # When the model over-predicts the road (bridge shadows, walls and
         # sky merged into "asphalt"), a dilated road mask covers the whole
@@ -213,10 +258,7 @@ class Segmenter:
         # stroke; texture / shadow specks are small blobs.  A component is
         # kept when it is elongated (major axis much longer than minor) or
         # big enough to be a real marking; scattered specks are dropped.
-        road_d = cv2.dilate(road.astype(np.uint8),
-                            cv2.getStructuringElement(cv2.MORPH_RECT,
-                                                      (7, 7))).astype(bool)
-        line &= road_d
+        line = constrain_line_to_road(line, road)
         if line.any():
             n, labels, stats, _ = cv2.connectedComponentsWithStats(
                 line.astype(np.uint8), 8)
