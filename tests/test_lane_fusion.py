@@ -93,6 +93,26 @@ def test_strong_painted_single_beats_unpaired_lidar():
     assert chosen.sources == ("vision",)
 
 
+def test_explicit_single_painted_edge_at_medium_confidence_is_chosen():
+    from beamng_autopilot.lane.fusion import choose_sensor_lane
+
+    vision = _frame(paired=False, src=("vision",))
+    vision.left = None
+    vision.right = np.column_stack([
+        np.linspace(0.0, 2.9, 6), np.full(6, -1.75)])
+    vision.left_kind = None
+    vision.right_kind = "solid"
+    vision.confidence = 0.44
+    vision.span_m = 2.9
+    vision.width = 3.5
+    state = {}
+    chosen = choose_sensor_lane(
+        vision, None, np.array([0.0, 0.0]), 0.0, state=state)
+    assert chosen is vision
+    assert chosen.sources == ("vision",)
+    assert not chosen.paired
+
+
 def test_fusion_adopts_persistent_new_source() -> None:
     from beamng_autopilot.lane.fusion import choose_sensor_lane
     from beamng_autopilot.lane.constants import LANE_FUSION_HOLD_FRAMES
@@ -171,3 +191,14 @@ def test_usable_gate_still_bounds_width_and_confidence() -> None:
     assert not lane_frame_usable(_usable(width=1.2))     # straddled line
     assert not lane_frame_usable(_usable(conf=LANE_MIN_CONF - 0.01))
     assert not lane_frame_usable(None)
+
+
+def test_explicit_single_painted_edge_is_usable_at_2m_span():
+    from beamng_autopilot.lane.tracking import lane_frame_usable
+    frame = _usable(paired=False, src=("vision",), span=2.5, conf=0.42)
+    frame.right_kind = "solid"
+    assert lane_frame_usable(frame)
+
+    frame.right_kind = "thin"
+    assert not lane_frame_usable(frame)
+
