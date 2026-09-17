@@ -791,6 +791,15 @@ def _single_mirror_frame(best, side: int, pos: np.ndarray,
             and abs(float(np.nanmedian(center_lat)))
             <= LANE_VISION_MIRROR_CENTER_MAX_M):
         conf = max(conf, 0.50)
+    # A clear right painted edge (solid or dashed) that begins in the near
+    # field and mirrors to a centre within the own-lane corridor is strong
+    # perception evidence for RHT (the outer road boundary).
+    if (side < 0 and float(proj[0, 0]) <= LANE_SINGLE_NEAR_REQUIRE_M
+            and span >= 2.0
+            and getattr(best, "kind", None) in ("solid", "dashed")
+            and abs(float(np.nanmedian(center_lat)))
+            <= LANE_VISION_RIGHT_MIRROR_CENTER_MAX_M):
+        conf = max(conf, 0.50)
     # A line that only becomes visible several metres ahead is a weak
     # read: it can still beat a wall fallback, but the planner must only
     # give it a small nudge instead of a full-lane correction.

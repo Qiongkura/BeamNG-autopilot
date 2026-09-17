@@ -350,6 +350,15 @@ def lane_frame_usable(frame: LaneFrame | None,
     if (frame.paired and frame.left is not None
             and getattr(frame, "right", None) is None):
         min_span = min(min_span, LANE_MIN_SPAN_M)
+    # A single painted edge (solid or dashed) in the near field is a valid
+    # own-lane lateral reference under RHT (the outer road boundary or centreline).
+    # Allow explicit solid/dashed paint to use a 2.0 m span floor rather than
+    # dropping a clear 2.8-2.9 m road line.
+    if (not frame.paired and "vision" in tuple(getattr(frame, "sources", ()) or ())
+            and (getattr(frame, "left_kind", None) in ("solid", "dashed")
+                 or getattr(frame, "right_kind", None) in ("solid", "dashed"))
+            and frame.confidence >= min_conf):
+        min_span = min(min_span, 2.0)
     return (frame.confidence >= min_conf
             and frame.span_m >= min_span
             and min_w <= frame.width <= max_w)

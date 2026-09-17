@@ -392,11 +392,9 @@ def choose_sensor_lane(vision_frame: LaneFrame | None,
     elif (vision_ok
             and not vision_frame.paired
             and "vision" in tuple(vision_frame.sources)
-            and float(vision_frame.confidence) >= 0.50
+            and float(vision_frame.confidence) >= 0.35
             and (vision_frame.left_kind in ("solid", "dashed")
                  or vision_frame.right_kind in ("solid", "dashed"))
-            and (state is None
-                 or not bool(getattr(state.get("last"), "paired", False)))
             and (lidar_frame is None
                  or not bool(getattr(lidar_frame, "paired", False)))):
         # A strong single painted edge is a valid strict perception fallback.
