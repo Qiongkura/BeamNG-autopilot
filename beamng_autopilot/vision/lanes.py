@@ -353,6 +353,12 @@ DASHED_FRAG_LAT_TOL_M = 0.60
 DASHED_FRAG_DIR_MIN = 0.94
 DASHED_FRAG_MAX_SPAN_M = 60.0
 DASHED_FRAG_MAX_SAMPLES = 24
+# A merged chain is published as one clean polyline: ordered along the
+# chain, resampled to a fixed station count and low-passed.  The
+# endpoints are preserved exactly, so the measured span (and therefore
+# every span gate) is unchanged by the fitting.
+DASHED_FRAG_CHAIN_STATIONS = 24
+DASHED_FRAG_SMOOTH_PASSES = 2
 
 
 def group_world_fragments(frags, *, gap_max_m: float = DASHED_FRAG_GAP_MAX_M,
@@ -541,6 +547,82 @@ def _mask_fragment_polylines(mask_u8, cam_model, pos, heading,
     return out
 
 
+def order_chain_points(pts, pixels, start_hint):
+    """Order a fragment chain into ONE polyline by a nearest-neighbour walk.
+
+    The fragments of a chain arrive in arbitrary order, so concatenating
+    them yields a polyline whose consecutive points can be metres apart -
+    harmless for the span/side gates (which read the point SET) but wrong
+    for anything that walks the curve.  The walk starts at the end nearest
+    ``start_hint`` (the ego) and repeatedly appends the closest remaining
+    point, which follows a bend as long as the chain is locally
+    continuous.
+
+    ``pixels`` is permuted with ``pts`` so the image trace and the world
+    polyline stay two views of the same curve.  Returns
+    ``(points, pixels)``.
+    """
+    p = np.asarray(pts, dtype=float)
+    px = np.asarray(pixels, dtype=float)
+    n = len(p)
+    if n < 2:
+        return p, px
+    remaining = list(range(n))
+    hint = np.asarray(start_hint, dtype=float)[:2]
+    first = int(np.argmin(np.linalg.norm(p - hint[None, :], axis=1)))
+    order = [remaining.pop(first)]
+    while remaining:
+        last = p[order[-1]]
+        nxt = int(np.argmin(
+            np.linalg.norm(p[remaining] - last[None, :], axis=1)))
+        order.append(remaining.pop(nxt))
+    idx = np.asarray(order, dtype=int)
+    return p[idx], (px[idx] if len(px) == n else px)
+
+
+def _resample_pair(world, pixels, n: int):
+    """Resample a world polyline and its pixel trace onto the same stations.
+
+    Both are parametrised by the WORLD arc length, so ``world[i]`` and
+    ``pixels[i]`` keep describing the same point of the marking.
+    """
+    w = np.asarray(world, dtype=float)
+    px = np.asarray(pixels, dtype=float)
+    if len(w) < 2 or n <= 1:
+        return w, px
+    d = np.linalg.norm(np.diff(w, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(d)])
+    total = float(cum[-1])
+    if total <= 1e-9:
+        return w[:1], px[:1]
+    st = np.linspace(0.0, total, int(n))
+    out_w = np.column_stack([np.interp(st, cum, w[:, 0]),
+                             np.interp(st, cum, w[:, 1])])
+    if px.ndim != 2 or len(px) != len(w):
+        return out_w, px
+    out_p = np.column_stack([np.interp(st, cum, px[:, 0]),
+                             np.interp(st, cum, px[:, 1])])
+    return out_w, out_p
+
+
+def _smooth_polyline(pts, passes: int = DASHED_FRAG_SMOOTH_PASSES):
+    """Low-pass a chain polyline with a 1-2-1 kernel, endpoints pinned.
+
+    Removes the per-sample jitter the ground back-projection leaves in a
+    chain built from many short fragments.  Pinning the first and last
+    point keeps the chain's measured span (and every span gate) intact.
+    """
+    p = np.asarray(pts, dtype=float)
+    if len(p) < 3 or int(passes) <= 0:
+        return p
+    out = p.copy()
+    first, last = p[0].copy(), p[-1].copy()
+    for _ in range(int(passes)):
+        out[1:-1] = 0.25 * out[:-2] + 0.5 * out[1:-1] + 0.25 * out[2:]
+        out[0], out[-1] = first, last
+    return out
+
+
 def recover_dashed_boundaries(mask_u8, cam_model, pos, heading,
                               ground_z: float | None = None, **kwargs
                               ) -> list[LaneMarking]:
@@ -550,6 +632,14 @@ def recover_dashed_boundaries(mask_u8, cam_model, pos, heading,
     keeps what the shape gates discard.  The merged marking is a genuine
     long boundary, so downstream alignment / span / side gates judge it on
     its real geometry instead of on the fragments it was built from.
+
+    The chain is ordered, resampled and smoothed before it is published.
+    Concatenating the fragments (the previous behaviour) produced a point
+    soup: the span/side gates only read the point SET and never noticed,
+    but every consumer that walks the polyline - arc length, local
+    tangent, resampling, temporal averaging, the drawn overlay - saw
+    points jumping metres back and forth, which is exactly what a fitted
+    lane boundary must not do.
     """
     frags = _mask_fragment_polylines(mask_u8, cam_model, pos, heading,
                                      ground_z)
@@ -559,6 +649,9 @@ def recover_dashed_boundaries(mask_u8, cam_model, pos, heading,
         w = np.vstack([frags[i]["pts"] for i in g])
         pix = np.vstack([frags[i]["pixels"] for i in g])
         area = sum(int(frags[i]["area"]) for i in g)
+        w, pix = order_chain_points(w, pix, np.asarray(pos, float)[:2])
+        w, pix = _resample_pair(w, pix, DASHED_FRAG_CHAIN_STATIONS)
+        w = _smooth_polyline(w, passes=DASHED_FRAG_SMOOTH_PASSES)
         span = float(np.linalg.norm(w.max(axis=0) - w.min(axis=0)))
         conf = min(1.0, 0.35 + 0.25 * (area / 1500.0)
                    + 0.4 * min(1.0, span / 40.0))
