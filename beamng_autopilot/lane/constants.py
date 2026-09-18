@@ -13,6 +13,12 @@ LANE_FUSION_WIDTH_MAX_M = 6.5
 LANE_MIN_SPAN_M = 4.0
 LANE_BOUNDARY_SPAN_M = 1.5
 LANE_PAIR_OVERLAP_M = 1.5
+# Two road edges should be locally parallel in the fixed camera view and
+# may only meet at a far vanishing point.  A pair whose fitted rays meet
+# in front of the car is a near crossing (wrong edge/roadside combination),
+# not a lane.  The constraint is perception-only: no map geometry.
+LANE_PAIR_MIN_CONVERGENCE_M = 12.0
+LANE_PAIR_MAX_LOCAL_ANGLE_DEG = 25.0
 LANE_FRAME_MIN_SPAN_M = 3.0
 # A short two-sided US paint pair is trusted only when both boundaries have
 # explicit solid/dashed kinds and the confidence gate passes.

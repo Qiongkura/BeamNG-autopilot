@@ -21,6 +21,8 @@ from .constants import (
     LANE_ONE_NEAR_FAR_START_MAX_M,
     LANE_PAIR_CENTER_MAX_M,
     LANE_PAIR_CENTER_PREFER_M,
+    LANE_PAIR_MAX_LOCAL_ANGLE_DEG,
+    LANE_PAIR_MIN_CONVERGENCE_M,
     LANE_PAIR_NEAR_CENTER_MAX_M,
     LANE_PAIR_NEAR_MAX_M,
     LANE_PAIR_OVERLAP_M,
@@ -462,6 +464,57 @@ def _cand_near_lat(c: _LineCandidate) -> float:
     return c.med_lat if near is None else near
 
 
+def _pair_perspective_valid(left_proj: np.ndarray,
+                             right_proj: np.ndarray,
+                             min_convergence_m: float =
+                             LANE_PAIR_MIN_CONVERGENCE_M,
+                             max_angle_deg: float =
+                             LANE_PAIR_MAX_LOCAL_ANGLE_DEG) -> tuple[bool, str]:
+    """Check fixed-camera perspective for a proposed boundary pair.
+
+    On one road, the two boundaries are locally related: their tangents
+    should have similar angles, and their extrapolated intersection is a
+    far vanishing point.  A near intersection means the pair crosses in
+    front of the ego (typically a near line matched to a roadside/far line)
+    and is not one lane.  This uses only the sensor-projected (s, lat)
+    geometry; it never consults a map or route.
+    """
+    lp = np.asarray(left_proj, dtype=float)
+    rp = np.asarray(right_proj, dtype=float)
+    if lp.ndim != 2 or rp.ndim != 2 or len(lp) < 3 or len(rp) < 3:
+        return True, "insufficient_points"
+    s0 = max(0.0, float(lp[0, 0]), float(rp[0, 0]))
+    s1 = min(float(lp[-1, 0]), float(rp[-1, 0]))
+    if s1 <= s0 + 0.5:
+        return True, "insufficient_overlap"
+    def _fit(p):
+        q = p[(p[:, 0] >= s0) & (p[:, 0] <= s1)]
+        if len(q) < 3:
+            q = p
+        if len(q) < 2 or float(np.ptp(q[:, 0])) < 0.5:
+            return None
+        return np.polyfit(q[:, 0], q[:, 1], 1)
+    fl = _fit(lp)
+    fr = _fit(rp)
+    if fl is None or fr is None:
+        return True, "insufficient_fit"
+    angle = abs(math.degrees(math.atan2(float(fl[0]), 1.0)
+                                  - math.atan2(float(fr[0]), 1.0)))
+    angle = min(angle, 180.0 - angle)
+    if angle > float(max_angle_deg):
+        return False, "perspective_angle"
+    wl = float(np.polyval(fl, s0))
+    wr = float(np.polyval(fr, s0))
+    width0 = wl - wr
+    slope_delta = float(fl[0] - fr[0])
+    if width0 <= 0.0 or abs(slope_delta) < 1e-6:
+        return True, "parallel_or_diverging"
+    cross_s = s0 - width0 / slope_delta
+    if 0.0 < cross_s < float(min_convergence_m):
+        return False, "near_perspective_crossing"
+    return True, "ok"
+
+
 def _best_vision_pair(cands: list[_LineCandidate],
                       axes: list[_LineCandidate],
                       pos: np.ndarray, fwd: np.ndarray,
@@ -550,6 +603,12 @@ def _best_vision_pair(cands: list[_LineCandidate],
             s_lo = max(0.0, float(l.proj[0, 0]), float(r.proj[0, 0]))
             s_hi = min(float(l.proj[-1, 0]), float(r.proj[-1, 0]))
             if s_hi - s_lo < LANE_PAIR_OVERLAP_M:
+                continue
+            perspective_ok, perspective_reason = _pair_perspective_valid(
+                l.proj, r.proj)
+            if not perspective_ok:
+                rejects[perspective_reason] = rejects.get(
+                    perspective_reason, 0) + 1
                 continue
             stations = _overlap_stations(s_lo, s_hi, station_step,
                                          max_stations)
