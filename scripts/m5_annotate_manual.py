@@ -82,6 +82,8 @@ def main() -> int:
     args = ap.parse_args()
 
     frames = []
+    resume_labels: dict[int, np.ndarray] = {}
+    resume_paths: dict[int, tuple[Path, Path]] = {}
     if args.grab:
         from beamng_autopilot.connector import BeamNGConnector
         rt = getattr(args, "runtime", "tech")
@@ -99,6 +101,15 @@ def main() -> int:
             except ValueError:
                 idx = len(frames)
             frames.append((np.asarray(d["colour"], dtype=np.uint8), idx))
+            if "label" in d.files:
+                resume_labels[idx] = np.asarray(d["label"],
+                                                dtype=np.uint8).copy()
+                if args.out and Path(args.out).resolve() == \
+                        Path(args.frames_dir).resolve():
+                    resume_paths[len(frames)] = (
+                        Path(f), Path(f).with_name(
+                            Path(f).name.replace("frame_", "preview_", 1)
+                                      .replace(".npz", ".png")))
     elif args.episode:
         ep = (sorted(glob.glob(str(config.LOGS_DIR / "m5_e2e"
                                / "shadow_fsd_*.npz")),
@@ -131,7 +142,11 @@ def main() -> int:
     save_i = [0]
     undo_stack: list = []
 
-    def _initial_label(frame):
+    def _initial_label(frame, source_idx=None):
+        if source_idx in resume_labels:
+            cached = resume_labels[source_idx]
+            if cached.shape == frame.shape[:2]:
+                return cached.copy()
         if prefill is None:
             return np.zeros(frame.shape[:2], dtype=np.uint8)
         try:
@@ -145,13 +160,13 @@ def main() -> int:
             return np.zeros(frame.shape[:2], dtype=np.uint8)
 
     rgb, fidx = frames[0]
-    label = _initial_label(rgb)
+    label = _initial_label(rgb, fidx)
     # Keep the current label in memory by SOURCE frame.  Going back must
     # restore the work (including unsaved fixes), and saving a revisited
     # frame must overwrite its existing output instead of creating a
     # duplicate training sample.
     label_cache: dict[int, np.ndarray] = {0: label.copy()}
-    saved_paths: dict[int, tuple[Path, Path]] = {}
+    saved_paths: dict[int, tuple[Path, Path]] = dict(resume_paths)
     painting = False
     last_pt = None
 
@@ -163,7 +178,9 @@ def main() -> int:
         _cache_current()
         fi = int(target)
         rgb, fidx = frames[fi]
-        label = label_cache.get(fi, _initial_label(rgb)).copy()
+        cached = label_cache.get(fi)
+        label = (cached.copy() if cached is not None
+                 else _initial_label(rgb, fidx))
         undo_stack.clear()
 
     def _save_current() -> None:
