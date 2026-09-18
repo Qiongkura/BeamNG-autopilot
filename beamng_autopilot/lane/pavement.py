@@ -94,7 +94,18 @@ PAVED_MIN_CLEAR_M = 1.15
 # "right edge" this candidate measures is the shoulder's edge.  That is a
 # model problem, not a gate problem.
 PAVED_MIN_SPAN_M = 2.4
-PAVED_MAX_SPAN_M = 10.0
+#
+# The ceiling is deliberately TIGHTER than the 10 m the refuted corridor
+# candidate used, because the live failure mode of THIS candidate is a
+# mask that swallowed the shoulder: on the east_coast stretch the user's
+# hand labels say ~6 m of pavement while the deployed model reads 8-11 m
+# there, and a run that accepted those reads drove on the shoulder and
+# wedged against the guardrail (2026-09-18).  Below 7.5 m the read can
+# not be "the whole road + both shoulders" of that stretch; a genuinely
+# wider road abstains and strict mode fails CLOSED (stop), which is the
+# legal degradation.  Raise only with hand-labelled evidence on the new
+# stretch.
+PAVED_MAX_SPAN_M = 7.5
 
 # Longitudinal read window.  The target has to be measurable where the
 # car can still act on it, so at least ``min_bands`` bands with both
