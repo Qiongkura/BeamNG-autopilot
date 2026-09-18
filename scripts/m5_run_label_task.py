@@ -31,9 +31,14 @@ from beamng_autopilot import config
 
 PY = ROOT / ".venv" / "Scripts" / "python.exe"
 RULES_HINT = (
-    "标注规则见包内 RULES.txt：铺装=road(2)、土肩/砂石/草地=erase(3)、"
-    "漆线=line(1)；整帧无铺装的土路本身=road(2)"
+    "按键 1/2/3 = line(标签值2) / road(标签值1) / erase(标签值0)；"
+    "土肩/砂石/草地涂 3=背景，整帧无铺装的土路涂 2=路面。"
+    "与老流程不同：老包走 --line-only-runs，那时 3=忽略(255)；本任务必须用"
+    "完整标签模式（--runs），土肩才会被当成背景来学。详见包内 RULES.txt"
 )
+# 本任务的训练必须走「完整标签」：--line-only-runs 会把非线像素改成
+# 忽略(255)，土肩就白标了（那是老的人工线包的模式）。
+FORBIDDEN_TRAIN_FLAGS = ("--line-only-runs",)
 
 
 def _run(cmd: list[str], **kw) -> int:
@@ -93,13 +98,16 @@ def main() -> int:
     # 3) 后续：训练 + 验证
     done = len(list(out.glob("frame_*.npz"))) if out.is_dir() else 0
     trained = config.LOGS_DIR / "m5_seg" / f"{args.name}_model"
+    train_cmd = [PY, ROOT / "scripts" / "m5_train_seg.py", "--runs", out,
+                 "--init", model, "--out", trained,
+                 "--epochs", args.epochs, "--balance-runs"]
+    assert not any(str(c) in FORBIDDEN_TRAIN_FLAGS for c in train_cmd), \
+        ("本任务的土肩是背景监督，不能用 --line-only-runs"
+         "（那会把非线像素改成忽略 255，标注白做）")
     print(f"\n[label-task] 已保存标注 {done} 帧 -> {out}")
     print("[label-task] 训练（微调现网模型，不要从零训练；"
           "输出到独立目录，不覆盖现网 best.pt）：")
-    print("  " + " ".join(str(c) for c in [
-        PY, ROOT / "scripts" / "m5_train_seg.py", "--runs", out,
-        "--init", model, "--out", trained,
-        "--epochs", args.epochs, "--balance-runs"]))
+    print("  " + " ".join(str(c) for c in train_cmd))
     print("[label-task] 训练后先离线看土肩是否被剔除（不用开游戏）：")
     print("  " + " ".join(str(c) for c in [
         PY, ROOT / "scripts" / "m5_eval_seg.py", "--model",
