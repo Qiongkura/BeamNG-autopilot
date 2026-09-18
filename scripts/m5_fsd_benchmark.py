@@ -125,7 +125,7 @@ _DRIVE_ARG_DEFAULTS = {
     "ring": "front",
     "no_shadow": False,
     "corridor_lane": False,
-    "no_paved_lane": False,
+    "paved_lane": False,
 }
 
 

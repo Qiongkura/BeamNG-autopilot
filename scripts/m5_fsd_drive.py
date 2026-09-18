@@ -72,12 +72,15 @@ def main() -> int:
                          "on 52.7%% of frames (town_1789142315).  Do not "
                          "enable without a redesign anchored to painted "
                          "lines.")
-    ap.add_argument("--no-paved-lane", action="store_true",
-                    help="disable the paved-boundary lane candidate: on a "
-                         "paved road with no usable marking the tick then "
-                         "fails closed (brakes) instead of keeping right "
-                         "against the observed paved edge.  Rollback lever "
-                         "for the live A/B.")
+    ap.add_argument("--paved-lane", action="store_true",
+                    help="OPT-IN, not proven: use the paved-boundary lane "
+                         "candidate on a paved road with no usable marking "
+                         "(keep right against the observed paved edge).  "
+                         "Default OFF: live 2026-09-18 with the deployed "
+                         "model the car rode the lane line and hit the "
+                         "guardrail, because the road mask classifies the "
+                         "gravel shoulder as pavement.  Needs a trustworthy "
+                         "pavement edge (fine-tuned model) + live A/B.")
     ap.add_argument("--e2e-model", type=str, default=None,
                     help="trained E2ENetTorch checkpoint to rank as the "
                          "neural planning candidate (default: "
