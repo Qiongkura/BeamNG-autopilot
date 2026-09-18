@@ -79,11 +79,15 @@ def main() -> int:
     ap.add_argument("--out", type=str, default=None)
     ap.add_argument("--prefill-model", type=str, default=None,
                     help="用分割模型预填 road/line，人工只需修正误检/漏检")
+    ap.add_argument("--review-incomplete", action="store_true",
+                    help="只打开已有标签中 road 占比低于 --min-road-frac 的帧")
+    ap.add_argument("--min-road-frac", type=float, default=0.10,
+                    help="--review-incomplete 的 road 标签比例阈值")
     args = ap.parse_args()
 
     frames = []
     resume_labels: dict[int, np.ndarray] = {}
-    resume_paths: dict[int, tuple[Path, Path]] = {}
+    resume_paths_by_source: dict[int, tuple[Path, Path]] = {}
     if args.grab:
         from beamng_autopilot.connector import BeamNGConnector
         rt = getattr(args, "runtime", "tech")
@@ -106,7 +110,7 @@ def main() -> int:
                                                 dtype=np.uint8).copy()
                 if args.out and Path(args.out).resolve() == \
                         Path(args.frames_dir).resolve():
-                    resume_paths[len(frames)] = (
+                    resume_paths_by_source[idx] = (
                         Path(f), Path(f).with_name(
                             Path(f).name.replace("frame_", "preview_", 1)
                                       .replace(".npz", ".png")))
@@ -119,6 +123,18 @@ def main() -> int:
     if not frames:
         print("no frames to annotate (use --episode / --frames-dir / --grab)")
         return 1
+    if args.review_incomplete:
+        before = len(frames)
+        frames = [
+            (rgb, idx) for rgb, idx in frames
+            if idx not in resume_labels
+            or float(np.mean(resume_labels[idx] == CLS_ROAD))
+            < float(args.min_road_frac)]
+        print(f"[annotate] review-incomplete: {len(frames)}/{before} frames "
+              f"(road < {args.min_road_frac:.2f})")
+        if not frames:
+            print("[annotate] no incomplete frames found")
+            return 0
 
     prefill = None
     if args.prefill_model:
@@ -166,7 +182,10 @@ def main() -> int:
     # frame must overwrite its existing output instead of creating a
     # duplicate training sample.
     label_cache: dict[int, np.ndarray] = {0: label.copy()}
-    saved_paths: dict[int, tuple[Path, Path]] = dict(resume_paths)
+    saved_paths: dict[int, tuple[Path, Path]] = {
+        fi0: resume_paths_by_source[src_idx]
+        for fi0, (_rgb0, src_idx) in enumerate(frames)
+        if src_idx in resume_paths_by_source}
     painting = False
     last_pt = None
 

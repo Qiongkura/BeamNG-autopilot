@@ -59,6 +59,8 @@ def main() -> int:
                     help="打印的训练命令用多少轮")
     ap.add_argument("--check-only", action="store_true",
                     help="只校验并打印命令，不打开标注窗口")
+    ap.add_argument("--review-incomplete", action="store_true",
+                    help="只打开已有 labeled 包中 road 占比低的帧")
     args = ap.parse_args()
 
     pkg = config.LOGS_DIR / "m5_seg" / f"{args.name}_pkg"
@@ -83,9 +85,22 @@ def main() -> int:
 
     # 2) 标注器（交互；--check-only 时只打印）
     print(f"[label-task] {RULES_HINT}")
-    annotate = [PY, ROOT / "scripts" / "m5_annotate_manual.py",
-                "--frames-dir", pkg, "--out", out,
-                "--prefill-model", model]
+    if args.review_incomplete and any(out.glob("frame_*.npz")):
+        # Resume the saved labels in place.  Do NOT prefill again: the
+        # existing label is the thing being repaired, and --out must equal
+        # --frames-dir so saving a revisited frame overwrites it.
+        annotate = [PY, ROOT / "scripts" / "m5_annotate_manual.py",
+                    "--frames-dir", out, "--out", out,
+                    "--review-incomplete"]
+    else:
+        annotate = [PY, ROOT / "scripts" / "m5_annotate_manual.py",
+                    "--frames-dir", pkg, "--out", out,
+                    "--prefill-model", model]
+        if args.review_incomplete:
+            print("[label-task] 没有已有 labeled 包，先创建完整标注包；"
+                  "下次用 --review-incomplete 修复半成品")
+    if args.review_incomplete:
+        annotate.extend(["--min-road-frac", "0.10"])
     if args.check_only:
         print("[label-task] check-only，将执行：")
         print("  " + " ".join(str(c) for c in annotate))
