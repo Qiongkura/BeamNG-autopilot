@@ -767,8 +767,21 @@ def _sensor_snapshot_age(out) -> float:
     return max([0.0] + ages)
 
 
-def _sensor_lane_is_centered(out, pos, max_dist_m: float = 2.0) -> bool:
-    """True when strict perception already owns a near ego-lane reference."""
+def _sensor_lane_is_centered(out, pos, heading: float | None = None,
+                             max_dist_m: float = 2.0,
+                             max_yaw_deg: float = 12.0) -> bool:
+    """True when strict perception already owns an ego lane the car is ON.
+
+    Distance alone is not enough.  A car standing inside the lane but
+    YAWED against the lane direction still has a footprint corner across
+    the boundary: on the 2026-09-18 live east_coast run the pit pose
+    passed "already centered" at v ~= 0.2 m/s (it could not have driven
+    there in the 4 s available), the alignment teleport below was
+    therefore skipped, and the body-cross gate fired at t=5 s and froze
+    the car across the line.  The pose must also point along the lane, so
+    a misaligned car takes the alignment teleport instead of driving off
+    its own footprint.
+    """
     if out is None or str(out.meta.get("lane_src_sel", "")) != "sensor":
         return False
     lane = getattr(out, "lane_ref", None)
@@ -780,7 +793,16 @@ def _sensor_lane_is_centered(out, pos, max_dist_m: float = 2.0) -> bool:
     pts = pts[:, :2]
     p = np.asarray(pos[:2], dtype=float)
     d = np.linalg.norm(pts - p[None, :], axis=1)
-    return bool(np.isfinite(d).any() and float(np.nanmin(d)) <= max_dist_m)
+    if not (np.isfinite(d).any() and float(np.nanmin(d)) <= max_dist_m):
+        return False
+    if heading is None:
+        return True
+    local = polyline_dir_at(pts, p)
+    if local is None:
+        return False
+    hf = np.array([math.cos(float(heading)), math.sin(float(heading))])
+    return bool(float(local @ hf)
+                >= math.cos(math.radians(float(max_yaw_deg))))
 
 
 def resolve_provenance_env(conn, args) -> tuple[str, str]:
@@ -1186,7 +1208,9 @@ class FSDriveSession:
                 if (_pw_out is not None and _pw_out.frame is not None
                         and _pw_ticks >= PLACEMENT_SKIP_TICKS):
                     try:
-                        if _sensor_lane_is_centered(_pw_out, _pw_state.pos):
+                        if _sensor_lane_is_centered(
+                                _pw_out, _pw_state.pos,
+                                float(_pw_state.heading)):
                             _percep_ok = True
                             print("[fsd-drive] perception lane placement "
                                   "already centered; no teleport needed")
@@ -1588,7 +1612,8 @@ class FSDriveSession:
                                  map_lane_override=map_lane,
                                  time_budget_s=_budget)
                 if (not _percep_ok
-                        and _sensor_lane_is_centered(out, pos)):
+                        and _sensor_lane_is_centered(out, pos,
+                                                     heading)):
                     _percep_ok = True
                     print("[fsd-drive] placed=True after calibrate-after "
                           "sensor lane recovery", flush=True)
