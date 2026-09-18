@@ -8,7 +8,7 @@ if not exist ".venv\Scripts\python.exe" (
   popd
   exit /b 2
 )
-".venv\Scripts\python.exe" "scripts\m5_run_label_task.py" %*
+".venv\Scripts\python.exe" "scripts\m5_run_label_task.py" --review-incomplete %*
 set "rc=%ERRORLEVEL%"
 echo.
 echo [label] exit code: %rc%
