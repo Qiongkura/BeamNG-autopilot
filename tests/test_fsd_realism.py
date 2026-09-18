@@ -10,6 +10,7 @@ from beamng_autopilot.fsd_realism import (
     FSD_INVARIANTS,
     NO_MAP_GUARDED_FILES,
     SRC_MAP,
+    SRC_PAVED,
     SRC_SENSOR,
     SRC_UNAVAILABLE,
     assert_realistic_lane,
@@ -29,6 +30,10 @@ def test_lane_source_ok_permissive() -> None:
 def test_lane_source_ok_strict() -> None:
     assert lane_source_ok(SRC_SENSOR, strict=True)
     assert lane_source_ok(SRC_UNAVAILABLE, strict=True)
+    # The paved-boundary lane is PERCEPTION (soil-stripped semantic road
+    # mask), not a map prior: strict mode may steer by it.
+    assert lane_source_ok(SRC_PAVED, strict=True)
+    assert not lane_source_ok(SRC_PAVED + "_x", strict=True)
     assert not lane_source_ok(SRC_MAP, strict=True)   # FSD: never map lane
     assert not lane_source_ok("bev/route", strict=True)
 

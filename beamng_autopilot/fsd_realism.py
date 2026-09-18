@@ -8,6 +8,10 @@ assert that the lane-keep / road-boundary logic stays PERCEPTION-only.
 Key contract
 ------------
 * lane source ``"sensor"``              - FSD: perception lane leads.
+* lane source ``"paved"``               - FSD: no marking on a paved
+  road, so the PAVED BOUNDARY (soil-stripped semantic road mask) is the
+  authority - keep right, hard boundaries = the pavement edges
+  (AGENTS.md「驾驶约束」: marking >> pavement edge).
 * lane source ``"perception-unavailable"`` - FSD degradation: no lane,
   safety decides (never map lane geometry).
 * lane source ``"map"``                 - NON-FSD fallback (old rule
@@ -28,8 +32,15 @@ SRC_BEV_ROUTE = "bev/route"
 # derived like SRC_SENSOR - never map lane geometry - but it carries no
 # hard boundary pair, so downstream treats it as a weaker reference.
 SRC_CORRIDOR = "corridor"
+# PERCEPTION lane with no painted marking at all, on a road that IS
+# paved: the observed PAVED edges (semantic road mask, soil-stripped)
+# are the authority, the reference is "half a lane left of the paved
+# right edge", and the pavement edges are the hard boundaries.  This is
+# the "marking >> pavement edge" level of the trust order; it is a real
+# sensor lane (not a map prior), so strict mode may steer by it.
+SRC_PAVED = "paved"
 
-FSD_LANE_SOURCES = (SRC_SENSOR, SRC_UNAVAILABLE)
+FSD_LANE_SOURCES = (SRC_SENSOR, SRC_UNAVAILABLE, SRC_PAVED)
 NON_FSD_LANE_SOURCES = (SRC_MAP, SRC_BEV_ROUTE)
 
 # Machine-checkable invariant registry: (id, rule, enforced_by).
@@ -73,6 +84,7 @@ NO_MAP_GUARDED_FILES = (
     "beamng_autopilot/lane/fusion.py",
     "beamng_autopilot/lane/lidar.py",
     "beamng_autopilot/lane/pairing.py",
+    "beamng_autopilot/lane/pavement.py",
     "beamng_autopilot/lane/tracking.py",
     # camera-ring vision perception
     "beamng_autopilot/vision/ring.py",
