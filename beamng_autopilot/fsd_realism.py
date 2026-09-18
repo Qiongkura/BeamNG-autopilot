@@ -115,6 +115,43 @@ FAIL_CLOSED_CONSUMER_FILES = (
 )
 
 
+def check_strict_never_reverses(root: Path | None = None) -> list[str]:
+    """List runtime files that could arm a reverse in a strict run.
+
+    Strict FSD fails CLOSED: no sensor lane -> stop and hold, never back
+    up (docs/fsd_realism.md §4, AGENTS.md「驾驶约束」).  The escape is a
+    rule-planner manoeuvre, so the drive loop must disable it explicitly
+    (``ReverseManeuver.enabled``) - gating it on "no sensor lane" was not
+    enough: the 2026-09-18 live demo reversed on 46 of 220 ticks with the
+    lane PAIRED every time, plan_blocked empty and stuck=0, peaking at
+    -2.99 m/s.
+    """
+    import ast
+
+    if root is None:
+        root = Path(__file__).resolve().parents[1]
+    bad: list[str] = []
+    for rel in FAIL_CLOSED_CONSUMER_FILES:
+        src = (Path(root) / rel).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        disables = False
+        for node in ast.walk(tree):
+            # ``rman.enabled = not bool(args.strict)`` (or any assignment
+            # that mentions strict) counts as the explicit disable.
+            if not isinstance(node, ast.Assign):
+                continue
+            for tgt in node.targets:
+                if not (isinstance(tgt, ast.Attribute)
+                        and tgt.attr == "enabled"):
+                    continue
+                if "strict" in ast.dump(node.value):
+                    disables = True
+        if not disables:
+            bad.append(f"{rel}: no strict-mode disable of the reverse "
+                       "maneuver (ReverseManeuver.enabled)")
+    return bad
+
+
 def lane_source_ok(src: str | None, strict: bool = False) -> bool:
     """True when a lane source satisfies the given realism level."""
     if src is None:
