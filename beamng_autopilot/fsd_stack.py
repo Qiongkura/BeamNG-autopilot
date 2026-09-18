@@ -269,7 +269,7 @@ class FSDStack:
                  lane_mode: str = "map",
                  strict_sensor: bool = False,
                  corridor_fallback: bool = False,
-                 paved_fallback: bool = True):
+                 paved_fallback: bool = False):
         self.conn = conn
         # Pairing-free strict-mode lane fallback (bev corridor right edge
         # + half a lane, width-gated).  Default OFF: it changes which
@@ -277,14 +277,22 @@ class FSDStack:
         # before it becomes a default.
         self.corridor_fallback = bool(corridor_fallback)
         # PAVED-boundary candidate for a paved road with NO marking: the
-        # soil-stripped road mask's edges are the authority, the reference
-        # is half a lane left of the paved right edge and the pavement
-        # edges are the hard boundaries (AGENTS.md「驾驶约束」).  Default
-        # ON: with no marking the alternative is a full stop, and every
-        # read is gated (paved right edge observed inside the image,
-        # road-sized span, pavement observed along the car's own track) so
-        # a bad read abstains instead of steering.  The live rollback
-        # lever is ``paved_fallback=False``.
+        # road mask's edges are the authority, the reference is half a
+        # lane in from the paved right edge and the pavement edges are the
+        # hard boundaries (AGENTS.md「驾驶约束」).
+        #
+        # Default OFF, and it stays that way until a pavement edge is
+        # trustworthy.  Measured live 2026-09-18 (east_coast unmarked
+        # stretch, deployed model): with the candidate enabled the car
+        # rode the lane line and wedged against the guardrail
+        # (``lane=paved``, "no drivable path"), because the model reads
+        # the gravel shoulder as pavement - its right edge sits 15 px
+        # (median) OUTSIDE the hand-labelled pavement (53.6% of rows), so
+        # "keep a lane width inside that edge" is a place on the
+        # shoulder, and publishing those edges as the hard boundaries
+        # WEAKENS the no-cross rule instead of enforcing it (the real
+        # lane line is no longer a boundary at all).  Enable only with
+        # --paved-lane after the edge is trustworthy.
         self.paved_fallback = bool(paved_fallback)
         self.grid_n = int(grid_n)
         self.grid_res = float(grid_res)
@@ -810,7 +818,7 @@ class FSDStack:
         # path.
         paved_ref = None
         paved_dbg: dict = {}
-        if (bool(getattr(self, "paved_fallback", True))
+        if (bool(getattr(self, "paved_fallback", False))
                 and not bool(getattr(lane_frame, "paired", False))):
             try:
                 _sem_p = out.head_outputs.get("semantic")
@@ -854,7 +862,7 @@ class FSDStack:
                 self, "map_lane_width_m", LANE_WIDTH_DEFAULT_M),
             corridor_fallback=getattr(self, "corridor_fallback", False),
             paved_ref=paved_ref,
-            paved_fallback=bool(getattr(self, "paved_fallback", True)),
+            paved_fallback=bool(getattr(self, "paved_fallback", False)),
             warn=_warn_once,
         )
         lane_ref = lane_ref_out.center
