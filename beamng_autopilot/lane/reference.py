@@ -34,6 +34,7 @@ from beamng_autopilot.fsd_realism import (
     SRC_BEV_ROUTE,
     SRC_CORRIDOR,
     SRC_MAP,
+    SRC_PAVED,
     SRC_SENSOR,
     SRC_UNAVAILABLE,
 )
@@ -53,6 +54,7 @@ _LABEL_BY_SRC = {
     SRC_SENSOR: "sensor",
     SRC_MAP: "map_lane",
     SRC_CORRIDOR: "corridor",
+    SRC_PAVED: "paved",
     SRC_UNAVAILABLE: "perception-unavailable",
 }
 
@@ -299,6 +301,8 @@ def select_lane_reference(
     map_lane_width_m: float = LANE_WIDTH_DEFAULT_M,
     corridor_fallback: bool = False,
     corridor_max_width_m: float = CORRIDOR_LANE_MAX_WIDTH_M,
+    paved_ref=None,
+    paved_fallback: bool = True,
     warn=None,
 ) -> LaneReference:
     """Decide which lane geometry may steer the car this tick.
@@ -310,14 +314,18 @@ def select_lane_reference(
     2. a trusted SINGLE painted boundary, whose missing side is inferred
        from the painted-line lane-width contract - strict mode's
        perception-only fallback;
-    3. the map-prior own lane built from the nav route - **legacy
+    3. the PAVED BOUNDARY (``paved_ref``, from the soil-stripped road
+       mask): a road with no usable marking at all.  AGENTS.md
+       「驾驶约束」 fixes the order marking >> pavement edge = guardrail =
+       fence, so this ranks below 1/2 and above every map-based level;
+    4. the map-prior own lane built from the nav route - **legacy
        non-strict mode only**;
-    4. the BEV drivable-space centre - a whole-road centre used only when
+    5. the BEV drivable-space centre - a whole-road centre used only when
        there is no nav route at all (probes / unit stubs), never in
        strict mode.
 
     Strict mode (``lane_mode == "sensor"`` and ``strict_sensor``) stops at
-    (1)/(2): no map geometry is even built, and a tick with neither
+    (1)-(3): no map geometry is even built, and a tick with none of them
     returns ``src = "perception-unavailable"`` with no centre at all, so
     the caller can only fail closed.
     """
@@ -568,6 +576,23 @@ def select_lane_reference(
             lane_left = getattr(lane_frame, "left", None)
             lane_right = getattr(lane_frame, "right", None)
             lane_width = float(getattr(lane_frame, "width", 0.0) or 0.0)
+        elif (paved_fallback and paved_ref is not None
+              and getattr(paved_ref, "center", None) is not None
+              and len(paved_ref.center) >= 3):
+            # NO usable marking on a road that IS paved: the pavement
+            # boundary is the authority (AGENTS.md「驾驶约束」: 标线 >>
+            # 路面边界 = 护墙 = 围栏).  The candidate already abstained
+            # unless the paved RIGHT edge is observed inside the image,
+            # the span is road-sized and the pavement is observed along
+            # the car's own track, so this branch can not invent a lane on
+            # grass; its edges are published as the tick's HARD
+            # boundaries, which is what keeps the car on the pavement
+            # ("禁止将车辆驾驶到土和草上").
+            lane_ref = np.asarray(paved_ref.center, dtype=float)[:, :2]
+            lane_left = np.asarray(paved_ref.left, dtype=float)[:, :2]
+            lane_right = np.asarray(paved_ref.right, dtype=float)[:, :2]
+            lane_width = float(getattr(paved_ref, "span_m", 0.0) or 0.0)
+            lane_src_sel = SRC_PAVED
         else:
             lane_ref = None
             lane_left = None
@@ -586,7 +611,7 @@ def select_lane_reference(
                 if _corridor is not None and len(_corridor) >= 3:
                     lane_ref = _corridor
                     lane_src_sel = SRC_CORRIDOR
-        if lane_src_sel == SRC_SENSOR:
+        if lane_src_sel in (SRC_SENSOR, SRC_PAVED):
             map_lane = None
         src_published = True
 
@@ -605,10 +630,13 @@ def select_lane_reference(
 
     center = (np.asarray(lane_ref, dtype=float)
               if lane_ref is not None else None)
-    # Only a REAL two-sided detection provides hard lane boundaries; the
-    # map prior provides its own when it is the reference.
+    # Only a REAL sensor detection provides hard lane boundaries: a
+    # two-sided lane pair, the observed pavement edges (SRC_PAVED), or the
+    # map prior when IT is the reference.  A single-edge mirror is not a
+    # physical edge the no-cross rule may enforce.
     boundaries = bool(
         (lane_frame is not None and getattr(lane_frame, "paired", False))
+        or lane_src_sel == SRC_PAVED
         or map_lane is not None)
     meta: dict = {}
     if lane_rejected and reject_reason is not None:
