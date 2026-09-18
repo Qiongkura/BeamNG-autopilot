@@ -197,7 +197,38 @@ def test_path_inside_grid_still_blocked() -> None:
     assert v.level in ("minimal_risk", "degraded")
 
 
-def test_safety_monitor_stops_when_current_body_corner_is_over_boundary() -> None:
+def test_safety_monitor_allows_a_converging_path_when_body_is_over() -> None:
+    """A car already across the line may creep back along a converging path.
+
+    The old gate refused EVERY path while a body corner was over the
+    boundary - including the one that brings the car back - so the car
+    froze across the line and the stuck detector armed a reverse escape
+    (live east_coast 2026-09-18).  A converging path is the legal
+    recovery, capped to a creep.
+    """
+    from beamng_autopilot.planning import Scene
+    from beamng_autopilot.occupancy import OccupancyGrid
+    from beamng_autopilot.safety_monitor import SafetyMonitor
+    grid = OccupancyGrid(60, 60, 0.5)
+    left = np.array([[0., 4.], [20., 4.]])
+    right = np.array([[0., -4.], [20., -4.]])
+    # the car is yawed with its front-left corner over lane_left, and the
+    # path runs straight down the lane: driving it rotates the body back
+    # inside, so the crossing strictly shrinks.
+    scene = Scene(pos=np.array([10., 3.0]), heading=math.radians(18.),
+                  grid=grid, route=np.array([[0., 0.], [20., 0.]]),
+                  lane_ref=np.array([[0., 0.], [20., 0.]]),
+                  lane_left=left, lane_right=right, lane_width=8.)
+    scene.lane_ref_src = "sensor"
+    verdict = SafetyMonitor(max_speed=6.).evaluate(
+        scene, np.array([[10., 3.], [15., 3.]]))
+    assert verdict.level == "degraded"
+    assert verdict.reason == "lane boundary recovery"
+    assert verdict.target_speed <= 1.0
+
+
+def test_safety_monitor_still_stops_a_diverging_crossing() -> None:
+    """A path that keeps (or deepens) the crossing must still hard-stop."""
     from beamng_autopilot.planning import Scene
     from beamng_autopilot.occupancy import OccupancyGrid
     from beamng_autopilot.safety_monitor import SafetyMonitor
@@ -208,10 +239,14 @@ def test_safety_monitor_stops_when_current_body_corner_is_over_boundary() -> Non
                   grid=grid, route=np.array([[0., 0.], [20., 0.]]),
                   lane_ref=np.array([[0., 0.], [20., 0.]]),
                   lane_left=left, lane_right=right, lane_width=8.)
+    scene.lane_ref_src = "sensor"
+    # the path keeps drifting further left, deeper across the boundary
     verdict = SafetyMonitor(max_speed=6.).evaluate(
-        scene, np.array([[10., 3.], [15., 3.]]))
+        scene, np.array([[10., 3.], [16., 4.5]]))
     assert verdict.level == "minimal_risk"
+    assert verdict.target_speed == 0.0
     assert "vehicle body" in verdict.reason
+
 
 
 def test_strict_perception_stops_without_sensor_lane() -> None:
