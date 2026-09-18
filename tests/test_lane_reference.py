@@ -251,13 +251,18 @@ def test_strict_rejected_lane_fails_closed_rather_than_single_edging() -> None:
 # --------------------------------------------------------------------------
 def test_strict_no_marking_uses_the_paved_boundary() -> None:
     """No marking + observed pavement -> the pavement boundary leads, and
-    its edges are the hard boundaries (AGENTS.md「驾驶约束」)."""
+    its edges are the hard boundaries (AGENTS.md「驾驶约束」).
+
+    OPT-IN: the default is still fail-closed (see the test below), since
+    a pavement edge the model reads 0.25 m past the true pavement sends
+    the car onto the shoulder.
+    """
     ref = select_lane_reference(
         lane_frame=None,
         pos=np.zeros(3), heading=0.0,
         route_ref=_route(), has_nav_route=True,
         lane_mode="sensor", strict_sensor=True,
-        paved_ref=_PavedRef(),
+        paved_ref=_PavedRef(), paved_fallback=True,
     )
     assert ref.src == SRC_PAVED
     assert ref.center is not None
@@ -275,19 +280,22 @@ def test_strict_painted_marking_still_beats_the_paved_boundary() -> None:
         pos=np.zeros(3), heading=0.0,
         route_ref=_route(), has_nav_route=True,
         lane_mode="sensor", strict_sensor=True,
-        paved_ref=_PavedRef(),
+        paved_ref=_PavedRef(), paved_fallback=True,
     )
     assert ref.src == SRC_SENSOR
 
 
-def test_strict_paved_boundary_can_be_switched_off() -> None:
-    """The rollback lever: without it the tick fails closed again."""
+def test_strict_paved_boundary_is_off_by_default() -> None:
+    """A paved candidate alone does NOT unlock strict motion: the live
+    2026-09-18 run that enabled it rode the lane line and hit the
+    guardrail, so the default stays fail-closed until the model's
+    pavement edge is trustworthy."""
     ref = select_lane_reference(
         lane_frame=None,
         pos=np.zeros(3), heading=0.0,
         route_ref=_route(), has_nav_route=True,
         lane_mode="sensor", strict_sensor=True,
-        paved_ref=_PavedRef(), paved_fallback=False,
+        paved_ref=_PavedRef(),
     )
     assert ref.src == SRC_UNAVAILABLE
     assert ref.center is None

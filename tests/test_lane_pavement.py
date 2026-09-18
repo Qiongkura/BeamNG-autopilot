@@ -149,7 +149,22 @@ def test_ego_on_soil_abstains():
     assert dbg["mode"] == "ego_not_on_pavement", dbg
 
 
-def test_wide_paved_area_is_not_a_lane():
+def test_a_plaza_sized_pavement_is_not_a_lane():
+    """Once the read is plaza / junction-mouth sized the "right edge"
+    stops being a road boundary and the candidate abstains (the target
+    definition itself does not care how wide the road is - measured on
+    the east_coast unmarked stretch, where 10.2 m reads were being
+    rejected by the borrowed 10 m corridor gate)."""
+    ref, dbg = _ref([(0.0, 26.0, -10.0, 10.0)])
+    assert ref is None
+    assert dbg["mode"] in ("too_few_bands", "too_far_or_short"), dbg
+
+
+def test_a_read_that_wide_is_a_spilled_mask_not_a_road():
+    """A 12 m read means the mask swallowed the shoulder: the real
+    pavement on that stretch is ~6 m (hand labels).  The candidate must
+    abstain - live 2026-09-18 a run that accepted these reads drove on
+    the shoulder and hit the guardrail."""
     ref, dbg = _ref([(0.0, 26.0, -6.0, 6.0)])
     assert ref is None
     assert dbg["mode"] in ("too_few_bands", "too_far_or_short"), dbg

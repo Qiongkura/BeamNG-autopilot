@@ -79,11 +79,20 @@ PAVED_MIN_CLEAR_M = 1.15
 # Observed pavement span gates.  The floor is two minimum clearances -
 # 2*PAVED_MIN_CLEAR_M, the width below which no legal lateral position
 # exists at all (the target clamps to the middle there, so a genuine
-# single-track lane is still drivable); the ceiling is the measured
-# collapse point of right-edge semantics (the same 10 m the refuted
-# corridor candidate was gated at: below it the right edge is the road's,
-# above it the read is a paved AREA - a junction mouth, a car park -
-# where "a lane in from the right edge" is not a lane).
+# single-track lane is still drivable).
+#
+# The CEILING is measured, and it is deliberately NOT the 10 m the
+# refuted corridor candidate used: that gate came from inferring a LANE
+# CENTRE as the corridor's centre, which collapses when the corridor's
+# right edge stops being the lane's.  This candidate never infers a
+# centre - it is "keep lane_half_m + margin inside the observed right
+# edge", which does not care how wide the pavement is.  Live evidence
+# raised to 14 m to admit those bands - and the live run that followed
+# drove on the shoulder and into the guardrail.  Reverted.  What the
+# stretch really shows is that the MASK reads 8-11 m where the hand
+# labels say ~6 m of pavement: the shoulder is classified as road, so the
+# "right edge" this candidate measures is the shoulder's edge.  That is a
+# model problem, not a gate problem.
 PAVED_MIN_SPAN_M = 2.4
 PAVED_MAX_SPAN_M = 10.0
 
@@ -166,6 +175,17 @@ PAVED_EDGE_MARGIN_M = 0.15
 
 # Corridor tracking: how far a band's run may sit from the previous
 # band's before the corridor is considered to have ended.
+#
+# 2026-09-18 live lesson: this was widened to 4.0 m (and the span ceiling
+# to 14 m) purely to raise offline AVAILABILITY on the east_coast
+# unmarked stretch - 98% of frames instead of 29%.  The next live run
+# used every one of those extra frames to ride the lane line and end up
+# wedged against the guardrail ("no drivable path", ``lane=paved``).
+# Availability is not correctness: a read that includes the shoulder
+# makes the car drive on the shoulder, and the longer/further the read
+# runs the more of the road it covers.  Both gates are back at their
+# measured-tight values, and the candidate stays OFF by default until a
+# pavement edge is trustworthy (see ``paved_fallback``).
 PAVED_CONTINUE_MAX_M = 2.0
 
 
@@ -401,9 +421,24 @@ def paved_edge_lane_center(road_mask, cam, pos, heading,
             if (lon - prev_lon) > (band_m + 0.6):
                 break                 # a whole band carried no pavement run
             prev_mid = 0.5 * (prev[0] + prev[1])
+            # Continuation is judged on the run's MIDDLE first: that is
+            # the run the car is driving on.  Judging it on the right edge
+            # alone latched onto a 1.2 m mask sliver beside the road on
+            # the east_coast unmarked stretch (frame 20 of the 22:08 run:
+            # runs (-3.74,-2.55) and (-1.53,8.5) at 10.5 m, the sliver
+            # winning on right-edge distance) and the walk then died at
+            # the next band.  The right edge is the FALLBACK, for a band
+            # that the car's own shadow / a paint hole split so that no
+            # run sits near the previous middle while one of them still
+            # carries the same right edge.
             best = min(runs, key=lambda r: abs(0.5 * (r[0] + r[1]) - prev_mid))
-            if abs(0.5 * (best[0] + best[1]) - prev_mid) > PAVED_CONTINUE_MAX_M:
-                break                 # corridor jumped to another patch
+            if abs(0.5 * (best[0] + best[1]) - prev_mid) \
+                    > PAVED_CONTINUE_MAX_M:
+                alt = min(runs, key=lambda r: abs(r[0] - prev[0]))
+                if abs(alt[0] - prev[0]) <= PAVED_CONTINUE_MAX_M:
+                    best = alt
+                else:
+                    break             # corridor jumped to another patch
             rlat, llat, r_ok, l_ok = best
             if r_ok:
                 lim: float | None = None

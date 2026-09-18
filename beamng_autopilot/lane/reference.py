@@ -302,7 +302,7 @@ def select_lane_reference(
     corridor_fallback: bool = False,
     corridor_max_width_m: float = CORRIDOR_LANE_MAX_WIDTH_M,
     paved_ref=None,
-    paved_fallback: bool = True,
+    paved_fallback: bool = False,
     warn=None,
 ) -> LaneReference:
     """Decide which lane geometry may steer the car this tick.
