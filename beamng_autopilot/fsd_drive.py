@@ -1131,14 +1131,14 @@ class FSDriveSession:
                              args, "corridor_lane", False)),
                          # Paved-boundary lane candidate for a paved road
                          # with no usable marking (AGENTS.md「驾驶约束」).
-                         # Default ON; --no-paved-lane (or the env switch
-                         # BEAMNG_PAVED_LANE=0, which the interleaved live
-                         # A/B harness can flip per arm) is the rollback
-                         # lever.
+                         # OPT-IN: --paved-lane (or BEAMNG_PAVED_LANE=1,
+                         # the lever the A/B harness flips) - NOT a
+                         # default, see FSDStack.paved_fallback for the
+                         # live failure that put it back behind the flag.
                          paved_fallback=(
-                             not bool(getattr(args, "no_paved_lane", False))
-                             and os.environ.get("BEAMNG_PAVED_LANE",
-                                                "1") != "0"),
+                             bool(getattr(args, "paved_lane", False))
+                             or os.environ.get("BEAMNG_PAVED_LANE",
+                                               "0") == "1"),
                          cam_w=args.cam_w, cam_h=args.cam_h,
                          temporal=True, range_every_n=3,
                          # LiDAR every 3rd tick: a fresh scan costs
