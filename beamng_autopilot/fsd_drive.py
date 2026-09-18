@@ -1255,16 +1255,20 @@ class FSDriveSession:
                 _strict_sensor = bool(
                     getattr(self.args, "strict", False)
                     and str(getattr(self.args, "lane_mode", "")) == "sensor")
-                if getattr(self.args, "allow_unplaced", False) or _strict_sensor:
-                    # 采集 / 严格感知：先开再校——warm 里没看到漆线不
-                    # 中止；行驶中 PLC/配对出现后再横向校正，无车道
-                    # 仍 fail-closed 停车（east_coast 2026-09-14）。
-                    why = ("--allow-unplaced collection mode"
-                           if getattr(self.args, "allow_unplaced", False)
-                           else "strict sensor calibrate-after")
-                    print(f"[fsd-drive] lane placement failed - continuing "
-                          f"UNPLACED ({why})")
+                if getattr(self.args, "allow_unplaced", False):
+                    # Explicit collection mode only: a dataset capture may
+                    # start before the lane is visible, but it must never be
+                    # mistaken for a valid strict driving run.
+                    print("[fsd-drive] lane placement failed - continuing "
+                          "UNPLACED (--allow-unplaced collection mode)")
                     return _pw_out, False, 0
+                if _strict_sensor:
+                    print("[fsd-drive] ABORT: strict sensor lane placement "
+                          "failed - the car will NOT drive unplaced")
+                    conn.control(throttle=0.0, brake=1.0, steering=0.0,
+                                 parkingbrake=1.0, gear=fwd_gear)
+                    conn.step(3)
+                    return _pw_out, False, 2
                 print("[fsd-drive] ABORT: lane placement failed after "
                       f"{PLACEMENT_HOLD_S:.0f}s - the car will NOT drive "
                       "unplaced from the road centre line")
