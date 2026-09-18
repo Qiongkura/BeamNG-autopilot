@@ -65,6 +65,8 @@ from beamng_autopilot.lane import (
     choose_sensor_lane,
     select_lane_reference,
 )
+from beamng_autopilot.lane.pavement import paved_edge_lane_center
+from beamng_autopilot.config import EGO_ORIGIN_GROUND_GAP_M
 from beamng_autopilot.runtime import (
     RangeSample,
     build_camera_ring_provider,
@@ -266,13 +268,24 @@ class FSDStack:
                  object_every_n: int = 1,
                  lane_mode: str = "map",
                  strict_sensor: bool = False,
-                 corridor_fallback: bool = False):
+                 corridor_fallback: bool = False,
+                 paved_fallback: bool = True):
         self.conn = conn
         # Pairing-free strict-mode lane fallback (bev corridor right edge
         # + half a lane, width-gated).  Default OFF: it changes which
         # frames strict mode drives on, so it goes through live A/B
         # before it becomes a default.
         self.corridor_fallback = bool(corridor_fallback)
+        # PAVED-boundary candidate for a paved road with NO marking: the
+        # soil-stripped road mask's edges are the authority, the reference
+        # is half a lane left of the paved right edge and the pavement
+        # edges are the hard boundaries (AGENTS.md「驾驶约束」).  Default
+        # ON: with no marking the alternative is a full stop, and every
+        # read is gated (paved right edge observed inside the image,
+        # road-sized span, pavement observed along the car's own track) so
+        # a bad read abstains instead of steering.  The live rollback
+        # lever is ``paved_fallback=False``.
+        self.paved_fallback = bool(paved_fallback)
         self.grid_n = int(grid_n)
         self.grid_res = float(grid_res)
         self.heads = list(heads) if heads else []
@@ -781,11 +794,43 @@ class FSDStack:
         if self.lane_envelope is not None:
             out.meta["lane_envelope"] = self.lane_envelope.as_meta()
         # One owner decides which lane geometry may steer the car this
-        # tick (sensor lane -> trusted single painted boundary -> map
-        # prior in legacy mode only -> BEV free-space centre when there
-        # is no nav route).  Strict FSD never builds map lane geometry
-        # and returns no centre when perception cannot supply one, so
-        # the planner can only fail closed.
+        # tick (sensor lane -> trusted single painted boundary -> paved
+        # boundary on a road with no marking -> map prior in legacy mode
+        # only -> BEV free-space centre when there is no nav route).
+        # Strict FSD never builds map lane geometry and returns no centre
+        # when perception cannot supply one, so the planner can only fail
+        # closed.
+        #
+        # The PAVED candidate is computed here because perception (the
+        # semantic road mask + the camera that produced it) lives here;
+        # the trust order and the strict gate stay in the lane owner.
+        # Skipped when a two-sided sensor lane already exists - that is
+        # the one case where the pavement edge can never win, and it is
+        # the common case, so the extra back-projection stays off the hot
+        # path.
+        paved_ref = None
+        paved_dbg: dict = {}
+        if (bool(getattr(self, "paved_fallback", True))
+                and not bool(getattr(lane_frame, "paired", False))):
+            try:
+                _sem_p = out.head_outputs.get("semantic")
+                _role_p = ("front_main" if "front_main" in snap
+                           else (next(iter(snap)) if snap else None))
+                if (_sem_p is not None and _role_p is not None
+                        and "road" in getattr(_sem_p, "masks", {})):
+                    # Ground plane, not the vehicle origin: the road mask
+                    # is a picture of the ROAD SURFACE (config comment:
+                    # the origin plane would bias the read 0.5 m at 5 m).
+                    _gz_p = float(pos[2]) - float(EGO_ORIGIN_GROUND_GAP_M)
+                    paved_ref = paved_edge_lane_center(
+                        _sem_p.masks["road"], snap[_role_p][1], pos,
+                        heading, ground_z=_gz_p, debug=paved_dbg)
+            except Exception as _exc:
+                paved_dbg["mode"] = "error"
+                paved_dbg["error"] = str(_exc)
+        out.meta["paved_edge_debug"] = dict(paved_dbg)
+        if paved_ref is not None:
+            out.meta["paved_edge"] = dict(paved_ref.meta)
         lane_mode = getattr(self, "lane_mode", "map")
         lane_ref_out = select_lane_reference(
             lane_frame=lane_frame,
@@ -808,6 +853,8 @@ class FSDStack:
             map_lane_width_m=getattr(
                 self, "map_lane_width_m", LANE_WIDTH_DEFAULT_M),
             corridor_fallback=getattr(self, "corridor_fallback", False),
+            paved_ref=paved_ref,
+            paved_fallback=bool(getattr(self, "paved_fallback", True)),
             warn=_warn_once,
         )
         lane_ref = lane_ref_out.center
