@@ -482,3 +482,49 @@ def test_stuck_timer_does_not_fire_on_legitimate_waits() -> None:
     assert not stuck(v=1.2)
     # moving with throttle is the normal case
     assert not stuck(v=1.2, thr=0.4, plan_speed=3.0)
+
+
+# --- _sensor_lane_is_centered: the paved-boundary placement path -------
+def _paved_out(src: str = "paved"):
+    """Perception stub shaped like the paved-boundary candidate's tick.
+
+    ``lane_ref`` is anchored AT the ego (that is what the candidate
+    publishes), so the placement test can not be a distance-to-polyline
+    check; ``lane_left``/``lane_right`` are the un-anchored pavement
+    edges the alignment is read from.
+    """
+    ref = _line(0.0, 0.0, 24.0, 0.0)          # keep-right target line
+    return SimpleNamespace(
+        meta={"lane_src_sel": src},
+        lane_ref=ref,
+        lane_left=_line(2.0, 3.5, 26.0, 3.5),
+        lane_right=_line(2.0, -3.5, 26.0, -3.5),
+    )
+
+
+def test_paved_placement_accepts_an_aligned_car_on_the_pavement():
+    out = _paved_out()
+    assert fsd_drive._sensor_lane_is_centered(
+        out, np.array([5.0, 0.0, 0.0]), 0.0)
+
+
+def test_paved_placement_rejects_a_yawed_car():
+    """A car across the road must not start driving from that pose - the
+    reason placement carries a heading gate at all (2026-09-18)."""
+    out = _paved_out()
+    assert not fsd_drive._sensor_lane_is_centered(
+        out, np.array([5.0, 0.0, 0.0]), math.radians(40.0))
+
+
+def test_paved_placement_needs_the_observed_pavement_edges():
+    out = _paved_out()
+    out.lane_right = None
+    out.lane_left = None
+    assert not fsd_drive._sensor_lane_is_centered(
+        out, np.array([5.0, 0.0, 0.0]), 0.0)
+
+
+def test_paved_placement_is_ignored_when_the_source_is_not_perception():
+    out = _paved_out(src="map_lane")
+    assert not fsd_drive._sensor_lane_is_centered(
+        out, np.array([5.0, 0.0, 0.0]), 0.0)

@@ -25,6 +25,7 @@ from beamng_autopilot.control.speed import (
     SpeedController, rate_limit_pedal,
 )
 from beamng_autopilot.fsd_stack import FSDStack
+from beamng_autopilot.fsd_realism import SRC_PAVED, SRC_SENSOR
 from beamng_autopilot.lane import perception_curve_speed
 from beamng_autopilot.neural.bc_runtime import (
     DEFAULT_BC_WEIGHTS, BCRuntime, steer_to_path,
@@ -130,6 +131,13 @@ WARMUP_S = 8.0
 # centre line - driving unplaced rides the left line from metre one
 # (town 2026-09-06, user-reported).  An unplaced run aborts instead.
 PLACEMENT_HOLD_S = 30.0
+# ``lane_src_sel`` values that mean "perception already owns the lane the
+# car is on, so it may drive": a sensor lane pair, or - on a paved road
+# with NO usable marking - the paved-boundary reference (AGENTS.md
+# 「驾驶约束」: 标线 >> 路面边界 = 护墙 = 围栏).  Both are sensor-derived;
+# a map lane is never in this set, so placement can not be unlocked by
+# map geometry.
+PLACEMENT_LANE_SRCS = (SRC_SENSOR, SRC_PAVED)
 # Extra seconds after heads are live before giving up on painted-line
 # placement (US yellow paint / warm-up flicker).
 # After the heads come live, US yellow/short-pair evidence may need several
@@ -770,19 +778,32 @@ def _sensor_snapshot_age(out) -> float:
 def _sensor_lane_is_centered(out, pos, heading: float | None = None,
                              max_dist_m: float = 2.0,
                              max_yaw_deg: float = 12.0) -> bool:
-    """True when strict perception already owns an ego lane the car is ON.
+    """True when strict perception already owns a lane the car may drive.
 
-    Distance alone is not enough.  A car standing inside the lane but
-    YAWED against the lane direction still has a footprint corner across
-    the boundary: on the 2026-09-18 live east_coast run the pit pose
-    passed "already centered" at v ~= 0.2 m/s (it could not have driven
-    there in the 4 s available), the alignment teleport below was
-    therefore skipped, and the body-cross gate fired at t=5 s and froze
-    the car across the line.  The pose must also point along the lane, so
-    a misaligned car takes the alignment teleport instead of driving off
-    its own footprint.
+    ``sensor`` source: the car must be ON the reference polyline (within
+    ``max_dist_m``) AND pointing along it.  Distance alone is not enough:
+    a car standing inside the lane but YAWED against the lane direction
+    still has a footprint corner across the boundary - on the 2026-09-18
+    live east_coast run the pit pose passed "already centered" at
+    v ~= 0.2 m/s, the alignment teleport was skipped, and the body-cross
+    gate then fired and froze the car across the line.
+
+    ``paved`` source (a paved road with no usable marking): the candidate
+    itself already proved that the paved right edge is observed inside the
+    image, the span is road-sized and the pavement is observed along the
+    car's own track, and its polyline is anchored AT the ego, so a
+    distance-to-polyline test would be trivially true.  What is graded
+    here instead is the ALIGNMENT with the observed pavement EDGES (the
+    un-anchored geometry of the candidate): a car yawed across the road
+    must not start driving from that pose.  How far it sits from the
+    keep-right target is the planner's job, not a placement precondition
+    - otherwise a car spawned on the centre line of an unmarked road
+    could never start at all.
     """
-    if out is None or str(out.meta.get("lane_src_sel", "")) != "sensor":
+    if out is None:
+        return False
+    src = str(out.meta.get("lane_src_sel", ""))
+    if src not in PLACEMENT_LANE_SRCS:
         return False
     lane = getattr(out, "lane_ref", None)
     if lane is None:
@@ -791,13 +812,30 @@ def _sensor_lane_is_centered(out, pos, heading: float | None = None,
     if pts.ndim != 2 or pts.shape[1] < 2 or len(pts) < 3:
         return False
     pts = pts[:, :2]
-    p = np.asarray(pos[:2], dtype=float)
-    d = np.linalg.norm(pts - p[None, :], axis=1)
-    if not (np.isfinite(d).any() and float(np.nanmin(d)) <= max_dist_m):
+    if not np.isfinite(pts).all():
         return False
+    p = np.asarray(pos[:2], dtype=float)
+    if src == SRC_PAVED:
+        dir_pts = None
+        for _e in (getattr(out, "lane_right", None),
+                   getattr(out, "lane_left", None)):
+            if _e is None:
+                continue
+            _ea = np.asarray(_e, dtype=float)
+            if _ea.ndim == 2 and _ea.shape[1] >= 2 and len(_ea) >= 3 \
+                    and np.isfinite(_ea[:, :2]).all():
+                dir_pts = _ea[:, :2]
+                break
+        if dir_pts is None:
+            return False
+    else:
+        d = np.linalg.norm(pts - p[None, :], axis=1)
+        if not (np.isfinite(d).any() and float(np.nanmin(d)) <= max_dist_m):
+            return False
+        dir_pts = pts
     if heading is None:
         return True
-    local = polyline_dir_at(pts, p)
+    local = polyline_dir_at(dir_pts, p)
     if local is None:
         return False
     hf = np.array([math.cos(float(heading)), math.sin(float(heading))])
@@ -1090,6 +1128,12 @@ class FSDriveSession:
                          # before it may become a default).
                          corridor_fallback=bool(getattr(
                              args, "corridor_lane", False)),
+                         # Paved-boundary lane candidate for a paved road
+                         # with no usable marking (AGENTS.md「驾驶约束」).
+                         # Default ON; --no-paved-lane is the live
+                         # rollback lever for the A/B.
+                         paved_fallback=not bool(getattr(
+                             args, "no_paved_lane", False)),
                          cam_w=args.cam_w, cam_h=args.cam_h,
                          temporal=True, range_every_n=3,
                          # LiDAR every 3rd tick: a fresh scan costs
