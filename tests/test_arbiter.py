@@ -133,6 +133,12 @@ def test_strict_lane_unavailable_reads_the_planner_decision() -> None:
     # Locked onto a perception lane and nothing declared blocked: usable.
     assert not strict_lane_unavailable(True, "", "sensor")
     assert not strict_lane_unavailable(True, None, "sensor")
+    # The paved-boundary candidate is perception too (soil-stripped road
+    # mask, keep-right target, hard pavement edges): a strict tick that
+    # published it must not be declared lane-less.
+    assert not strict_lane_unavailable(True, "", "paved")
+    # ... but only that exact label.  A map lane stays blocked.
+    assert strict_lane_unavailable(True, "", "map_lane")
 
 
 def test_strict_lane_unavailable_never_fires_outside_strict_mode() -> None:
