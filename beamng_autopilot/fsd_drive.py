@@ -2695,7 +2695,16 @@ class FSDriveSession:
                 # backward off the road (east_coast 2026-09-14).
                 if args.strict and str(
                         out.meta.get("lane_src_sel") or "") != "sensor":
+                    # Fail closed even when a reverse attempt was already
+                    # armed on the preceding tick.  Setting
+                    # ``has_forward_path`` alone is not enough: the state
+                    # machine stays in ``reversing`` and keeps commanding R
+                    # until its own timer expires, which caused the live
+                    # east_coast run to back away at -2.1 m/s while
+                    # perception-unavailable.  No lateral authority means
+                    # no reverse maneuver; keep D and brake.
                     has_forward_path = True
+                    rman.reset()
                 rm = rman.decide(has_forward_path=has_forward_path,
                                  rear_clear_m=rear_clear_m,
                                  signed_speed=signed,
