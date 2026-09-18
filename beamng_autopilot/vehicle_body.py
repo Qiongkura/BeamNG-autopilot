@@ -150,6 +150,44 @@ def corners_cross_boundaries(corners, left, right,
     return False
 
 
+def corner_cross_depth(corners, left, right) -> float:
+    """How far the deepest corner is beyond a detected boundary.
+
+    Counterpart of :func:`corners_cross_boundaries` that returns the
+    MAGNITUDE instead of a flag.  A car already outside its lane must be
+    allowed to converge back, and telling a recovery apart from a
+    worsening crossing needs the depth, not just "is over the line".
+    """
+    depth = 0.0
+    if left is not None:
+        for c in corners:
+            lat, covered = boundary_lateral(
+                float(c[0]), float(c[1]), left, None)
+            if covered and lat > depth:
+                depth = float(lat)
+    if right is not None:
+        for c in corners:
+            lat, covered = boundary_lateral(
+                float(c[0]), float(c[1]), right, None)
+            if covered and -lat > depth:
+                depth = float(-lat)
+    return depth
+
+
+def body_pose_cross_depth_m(pos, heading: float, left, right,
+                            half_len: float = HALF_LENGTH_M,
+                            half_width: float = HALF_WIDTH_M) -> float:
+    """Penetration of the CURRENT body rectangle beyond the boundaries."""
+    if left is None and right is None:
+        return 0.0
+    p = np.asarray(pos, dtype=float).ravel()
+    if p.size < 2 or not np.isfinite(p[:2]).all():
+        return 0.0
+    return corner_cross_depth(
+        footprint_corners(p[:2], float(heading), half_len, half_width),
+        left, right)
+
+
 def body_crosses_boundary_now(pos, heading: float, left, right,
                               half_len: float = HALF_LENGTH_M,
                               half_width: float = HALF_WIDTH_M,
@@ -226,3 +264,48 @@ def first_boundary_crossing_m(pos, path, left=None, right=None,
                 return max(cum + t * seg, 0.1)
         cum += seg
     return 0.0
+
+
+def max_body_cross_depth_m(pos, path, left=None, right=None,
+                           half_len: float = HALF_LENGTH_M,
+                           half_width: float = HALF_WIDTH_M,
+                           near_m: float = SWEEP_NEAR_M,
+                           far_m: float = SWEEP_FAR_M,
+                           step_m: float = SWEPT_STEP_M) -> float:
+    """Deepest body penetration beyond a boundary along the swept path.
+
+    Same swept-pose sampling as :func:`first_boundary_crossing_m`, but it
+    keeps the WORST penetration over the whole window instead of the first
+    violation.  Comparing it with the current pose's penetration is what
+    decides whether a path is converging back into the lane or still
+    driving deeper outside (a path that swings out and only then returns
+    therefore does not count as a recovery).
+    """
+    if (left is None and right is None) or path is None:
+        return 0.0
+    pth = np.asarray(path, dtype=float)[:, :2]
+    if len(pth) < 2:
+        return 0.0
+    origin = np.asarray(pos, dtype=float).ravel()[:2]
+    tangents = _vertex_tangents(pth)
+    step = float(step_m) if step_m and step_m > 0.0 else SWEPT_STEP_M
+    worst = 0.0
+    for i in range(len(pth) - 1):
+        a, b = pth[i], pth[i + 1]
+        seg = float(np.linalg.norm(b - a))
+        if not np.isfinite(seg) or seg <= 1e-12:
+            continue
+        n = max(1, int(math.ceil(seg / step)))
+        for k in range(1, n + 1):
+            t = k / float(n)
+            p = a + (b - a) * t
+            d0 = float(np.linalg.norm(p - origin))
+            if d0 < near_m or d0 > far_m:
+                continue
+            tv = (1.0 - t) * tangents[i] + t * tangents[i + 1]
+            if float(np.linalg.norm(tv)) < 1e-9:
+                tv = b - a
+            heading = math.atan2(float(tv[1]), float(tv[0]))
+            corners = footprint_corners(p, heading, half_len, half_width)
+            worst = max(worst, corner_cross_depth(corners, left, right))
+    return worst

@@ -21,8 +21,10 @@ from ..vehicle_body import (
     HALF_LENGTH_M,
     HALF_WIDTH_M,
     body_crosses_boundary_now,
+    body_pose_cross_depth_m,
     boundary_lateral as _boundary_lateral,
     first_boundary_crossing_m,
+    max_body_cross_depth_m,
 )
 
 
@@ -464,6 +466,39 @@ def body_pose_crosses_lane(scene: Scene, pos, heading: float,
     left, right = _scene_boundaries(scene)
     return body_crosses_boundary_now(pos, float(heading), left, right,
                                      half_len, half_width, max_cross_m)
+
+
+def body_lane_cross_recovery(scene: Scene, path,
+                             half_len: float = HALF_LENGTH_M,
+                             half_width: float = HALF_WIDTH_M,
+                             margin_m: float = 0.05) -> bool:
+    """Whether a path steers the CURRENT body crossing back into the lane.
+
+    :func:`body_pose_crosses_lane` is a flag, so once the car sits across a
+    boundary it refuses every path - including the one that brings it back
+    - and the car freezes there for good (live east_coast 2026-09-18: the
+    tick after the body-cross gate first fired the car was held at v=0
+    with the lane still paired, then the stuck detector armed the reverse
+    escape).  The centreline gate already carries an explicit convergence
+    rule (:func:`lane_cross_dist_m`); this is the footprint equivalent.
+
+    True only when the worst penetration along the swept path is strictly
+    smaller than the current pose's, so a path that keeps or deepens the
+    crossing is still refused.
+    """
+    left, right = _scene_boundaries(scene)
+    if left is None and right is None:
+        return False
+    pos = getattr(scene, "pos", None)
+    if pos is None:
+        return False
+    now = body_pose_cross_depth_m(pos, float(getattr(scene, "heading", 0.0)),
+                                  left, right, half_len, half_width)
+    if now <= 0.0:
+        return False
+    ahead = max_body_cross_depth_m(pos, path, left, right,
+                                   half_len, half_width)
+    return bool(ahead < now - max(0.0, float(margin_m)))
 
 
 def body_lane_cross_dist_m(scene: Scene, path,

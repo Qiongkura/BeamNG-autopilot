@@ -27,10 +27,11 @@ import numpy as np
 
 from beamng_autopilot.planning.geometry import polyline_point_distances
 from beamng_autopilot.planning.constraints import (
-    body_lane_cross_dist_m, body_pose_crosses_lane,
+    body_lane_cross_dist_m, body_lane_cross_recovery,
+    body_pose_crosses_lane,
 )
 from beamng_autopilot.planning.lateral_ref import (
-    REF_NONE, lateral_reference,
+    REF_NONE, REF_SENSOR, lateral_reference,
 )
 from beamng_autopilot.vehicle_body import CORRIDOR_HALF_WIDTH_M
 
@@ -446,6 +447,22 @@ class SafetyMonitor:
         # centre is inside but whose projected corner crosses a boundary
         # must stop before steering it (not merely degrade its speed).
         if body_now_cross or body_cross > 0.0:
+            if body_now_cross and lane_ref_src == REF_SENSOR \
+                    and body_lane_cross_recovery(scene, path):
+                # The car already sits across the line.  The current-pose
+                # flag alone refuses EVERY path - including the one that
+                # steers it back - so the car froze in the crossing and
+                # the stuck detector then armed a reverse escape (live
+                # east_coast 2026-09-18).  A path that CONVERGES is the
+                # legal recovery, exactly as the centreline gate already
+                # allows (``lane_cross_dist_m``); it is capped to a creep,
+                # and a path that keeps or deepens the crossing still
+                # takes the hard stop below.
+                v.level = "degraded"
+                v.reason = "lane boundary recovery"
+                v.target_speed = min(v.target_speed,
+                                     self.min_risk_speed * 0.5)
+                return v
             v.level = "minimal_risk"
             v.reason = ("current vehicle body crosses lane boundary"
                         if body_now_cross
