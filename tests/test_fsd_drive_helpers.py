@@ -291,11 +291,11 @@ def test_sensor_lane_is_centered_requires_strict_sensor_reference():
         meta={"lane_src_sel": "sensor"},
         lane_ref=np.array([[0.0, 0.0], [4.0, 0.0], [8.0, 0.0]]))
     assert fsd_drive._sensor_lane_is_centered(
-        out, np.array([0.0, 0.0, 0.0]))
+        out, np.array([0.0, 0.0, 0.0]), 0.0)
 
     out.meta["lane_src_sel"] = "map"
     assert not fsd_drive._sensor_lane_is_centered(
-        out, np.array([0.0, 0.0, 0.0]))
+        out, np.array([0.0, 0.0, 0.0]), 0.0)
 
 
 def test_sensor_lane_is_centered_rejects_far_reference():
@@ -303,7 +303,32 @@ def test_sensor_lane_is_centered_rejects_far_reference():
         meta={"lane_src_sel": "sensor"},
         lane_ref=np.array([[5.0, 0.0], [9.0, 0.0], [13.0, 0.0]]))
     assert not fsd_drive._sensor_lane_is_centered(
-        out, np.array([0.0, 0.0, 0.0]))
+        out, np.array([0.0, 0.0, 0.0]), 0.0)
+
+
+def test_sensor_lane_is_centered_rejects_a_yawed_pose():
+    """Standing in the lane but yawed is NOT "centered".
+
+    A 2.2 x 0.9 m footprint rotated against the lane puts a corner over
+    the boundary without the car ever driving there (live east_coast
+    2026-09-18: the pit pose passed the position-only check, the
+    alignment teleport was skipped, and the body-cross gate fired 5 s
+    later).  The pose must point along the lane.
+    """
+    out = SimpleNamespace(
+        meta={"lane_src_sel": "sensor"},
+        lane_ref=np.array([[0.0, 0.0], [4.0, 0.0], [8.0, 0.0]]))
+    pos = np.array([0.0, 0.0, 0.0])
+    assert fsd_drive._sensor_lane_is_centered(out, pos, 0.0)
+    assert fsd_drive._sensor_lane_is_centered(out, pos, math.radians(5.0))
+    # a car lying across the lane must not pass the placement check
+    assert not fsd_drive._sensor_lane_is_centered(out, pos,
+                                                  math.radians(90.0))
+    assert not fsd_drive._sensor_lane_is_centered(out, pos,
+                                                  math.radians(180.0))
+    # ...nor one yawed well past the tolerance
+    assert not fsd_drive._sensor_lane_is_centered(out, pos,
+                                                  math.radians(30.0))
 
 
 def test_snapshot_age_canonical_ignores_optional_heads_and_range():
