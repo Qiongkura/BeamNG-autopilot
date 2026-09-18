@@ -20,6 +20,7 @@ Controls:
     c           clear the whole label
     trackbar    brush size 1-40
     z           zoom 2x / 1x
+    a / Left    previous frame (back)
     s           save + next frame
     q           quit
 
@@ -145,8 +146,42 @@ def main() -> int:
 
     rgb, fidx = frames[0]
     label = _initial_label(rgb)
+    # Keep the current label in memory by SOURCE frame.  Going back must
+    # restore the work (including unsaved fixes), and saving a revisited
+    # frame must overwrite its existing output instead of creating a
+    # duplicate training sample.
+    label_cache: dict[int, np.ndarray] = {0: label.copy()}
+    saved_paths: dict[int, tuple[Path, Path]] = {}
     painting = False
     last_pt = None
+
+    def _cache_current() -> None:
+        label_cache[fi] = label.copy()
+
+    def _load_frame(target: int) -> None:
+        nonlocal fi, rgb, fidx, label
+        _cache_current()
+        fi = int(target)
+        rgb, fidx = frames[fi]
+        label = label_cache.get(fi, _initial_label(rgb)).copy()
+        undo_stack.clear()
+
+    def _save_current() -> None:
+        _cache_current()
+        if fi not in saved_paths:
+            save_i[0] += 1
+            saved_paths[fi] = (
+                out_dir / f"frame_{save_i[0]:05d}.npz",
+                out_dir / f"preview_{save_i[0]:05d}.png")
+        fp, prev = saved_paths[fi]
+        np.savez_compressed(str(fp), colour=rgb, label=label)
+        ov = rgb.copy()
+        ov[label == CLS_ROAD] = (ov[label == CLS_ROAD] * 0.6
+                                 + np.array([255, 120, 0]) * 0.4
+                                 ).astype(np.uint8)
+        ov[label == CLS_LINE] = (0, 255, 0)
+        cv2.imwrite(str(prev), cv2.cvtColor(ov, cv2.COLOR_RGB2BGR))
+        print(f"[saved] {fp.name} (src#{fidx})")
 
     def _push_undo():
         undo_stack.append(label.copy())
@@ -166,8 +201,8 @@ def main() -> int:
                    f"undo={len(undo_stack)}"
         for txt, row in (
                 (f"[{fi + 1}/{len(frames)}] src#{fidx} {tool_txt}", 20),
-                ("1/2/3 class  b=tool  u=undo  c=clear  s=save+next  "
-                 "q=quit", 40)):
+                ("1/2/3 class  b=tool  f=fill  p=pen  a/Left=back  "
+                 "u=undo  c=clear  z=zoom  s=save+next  q=quit", 40)):
             cv2.putText(big, txt, (8, row), cv2.FONT_HERSHEY_SIMPLEX,
                         0.5, (0, 0, 0), 3)
             cv2.putText(big, txt, (8, row), cv2.FONT_HERSHEY_SIMPLEX,
@@ -250,25 +285,15 @@ def main() -> int:
             label[:] = 0
         elif key == ord("z"):
             zoom = 1 if zoom == 2 else 2
+        elif key in (ord("a"), 81):       # 81 = left arrow
+            if fi > 0:
+                _load_frame(fi - 1)
         elif key == ord("s"):
-            save_i[0] += 1
-            fp = out_dir / f"frame_{save_i[0]:05d}.npz"
-            np.savez_compressed(str(fp), colour=rgb, label=label)
-            prev = out_dir / f"preview_{save_i[0]:05d}.png"
-            ov = rgb.copy()
-            ov[label == CLS_ROAD] = (ov[label == CLS_ROAD] * 0.6
-                                     + np.array([255, 120, 0]) * 0.4
-                                     ).astype(np.uint8)
-            ov[label == CLS_LINE] = (0, 255, 0)
-            cv2.imwrite(str(prev), cv2.cvtColor(ov, cv2.COLOR_RGB2BGR))
-            print(f"[saved] {fp.name} (src#{fidx})")
-            fi += 1
-            if fi >= len(frames):
+            _save_current()
+            if fi >= len(frames) - 1:
                 print("[annotate] all frames done")
                 break
-            rgb, fidx = frames[fi]
-            label = _initial_label(rgb)
-            undo_stack.clear()
+            _load_frame(fi + 1)
         _render()
     cv2.destroyAllWindows()
     print(f"[annotate] annotations in {out_dir} - training-ready by "
