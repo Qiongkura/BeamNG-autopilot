@@ -1182,6 +1182,9 @@ class FSDriveSession:
         """
         _pw_out = None
         _percep_ok = False
+        _strict_sensor = bool(
+            getattr(self.args, "strict", False)
+            and str(getattr(self.args, "lane_mode", "")) == "sensor")
         try:
             conn.control(throttle=0.0, brake=1.0, steering=0.0,
                          parkingbrake=1.0, gear=fwd_gear)
@@ -1241,9 +1244,21 @@ class FSDriveSession:
                               f"{_spe}")
                 if _elapsed > PLACEMENT_HOLD_S and _head_live:
                     # Yellow/US paint can appear a few ticks after the
-                    # object head is live; keep trying a short grace window
-                    # before declaring UNPLACED (east_coast 2026-09-14).
-                    if _elapsed > PLACEMENT_HOLD_S + PLACEMENT_GRACE_S:
+                    # object head is live.  In strict sensor mode a failed
+                    # placement is NOT a reason to exit or drive unplaced:
+                    # stay braked and keep refreshing perception until the
+                    # line/pose becomes usable, then the existing alignment
+                    # teleport or centred-lane check releases the car.
+                    # This is the "stop, recover, continue" contract; the
+                    # old timeout returned 2 and made the caller either end
+                    # the run or (in the old strict calibrate-after path)
+                    # enter the drive loop UNPLACED.
+                    if (_elapsed > PLACEMENT_HOLD_S + PLACEMENT_GRACE_S
+                            and _strict_sensor):
+                        if _pw_ticks % 20 == 0:
+                            print("[fsd-drive] placement not ready; "
+                                  "stopped, refreshing perception", flush=True)
+                    elif _elapsed > PLACEMENT_HOLD_S + PLACEMENT_GRACE_S:
                         break
                 conn.control(throttle=0.0, brake=1.0, steering=0.0,
                              parkingbrake=1.0, gear=fwd_gear)
