@@ -115,6 +115,20 @@ class SafetyVerdict:
     def degraded(self) -> bool:
         return self.level == "degraded"
 
+    @property
+    def drivable(self) -> bool:
+        """Whether this verdict's path may still be driven.
+
+        ``degraded`` is drivable BY DEFINITION - the monitor computed the
+        reduced speed cap (``target_speed``) for exactly that case - so
+        only ``minimal_risk`` refuses the path.  Callers that gate on
+        ``safe`` instead throw the cap away and stop the car: the
+        2026-09-18 live east_coast demo stopped on 122 of 222 ticks, 83 of
+        them ``level=degraded`` with ``mon_target`` 3.30 m/s and an open
+        corridor, because strict mode has no rule backup to fall through.
+        """
+        return self.level != "minimal_risk"
+
 
 def _corridor_ahead_distance(occ_pts, path, half_width_m: float,
                            ahead_min_m: float) -> float | None:

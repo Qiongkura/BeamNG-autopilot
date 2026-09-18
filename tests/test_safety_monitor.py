@@ -299,3 +299,40 @@ def test_legacy_mode_keeps_route_fallback() -> None:
     v = SafetyMonitor(max_speed=12.0).evaluate(scene, _straight())
     assert v.safe
     assert v.lane_ref_src == "route"
+
+
+def test_degraded_verdict_is_drivable_but_minimal_risk_is_not() -> None:
+    """A degraded verdict must still be driven at its reduced cap.
+
+    Gating the arbiter on ``safe`` instead threw the degraded speed cap
+    away and force-stopped the car: the 2026-09-18 live east_coast demo
+    stopped on 122 of 222 ticks, 83 of them ``level=degraded`` with
+    ``mon_target`` 3.30 m/s and an open corridor (strict mode has no rule
+    backup to fall through to).
+    """
+    from beamng_autopilot.safety_monitor import SafetyVerdict
+
+    assert SafetyVerdict(level="safe").drivable
+    assert SafetyVerdict(level="degraded").drivable
+    assert not SafetyVerdict(level="minimal_risk").drivable
+
+
+def test_monitor_keeps_a_degraded_path_drivable_with_its_speed_cap():
+    """End to end: the scattered-obstacle degrade keeps a non-zero cap."""
+    from beamng_autopilot.planning import Scene
+    from beamng_autopilot.occupancy import OccupancyGrid
+    from beamng_autopilot.safety_monitor import SafetyMonitor
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.origin = (0.0, 0.0)
+    grid.heading = 0.0
+    for x, y in ((6.0, -0.8), (7.0, 0.8), (8.0, -0.6)):
+        grid.mark_obstacle_region(x, y, 0.4, 0.4)
+    route = np.column_stack([np.linspace(0, 30, 31), np.zeros(31)])
+    scene = Scene(pos=np.array([0.0, 0.0]), heading=0.0, grid=grid,
+                  route=route, lane_ref=route)
+    verdict = SafetyMonitor(
+        max_speed=6.0, occ_fraction_degrade=0.05,
+        occ_fraction_stop=0.5).evaluate(scene, _straight())
+    assert verdict.level == "degraded"
+    assert verdict.drivable
+    assert verdict.target_speed > 0.0

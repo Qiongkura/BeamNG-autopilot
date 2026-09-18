@@ -1403,6 +1403,15 @@ class FSDriveSession:
             rguard = ReverseGuard(threshold_mps=REVERSE_THRESHOLD_MPS,
                                   clear_mps=REVERSE_CLEAR_MPS)
             rman = ReverseManeuver(fwd_gear=fwd_gear)
+            # Strict FSD never backs up: the bounded reverse escape is a
+            # rule-planner manoeuvre (back out of a dead end and re-plan),
+            # while a perception-led stack that cannot find a forward path
+            # fails CLOSED - stop and hold (docs/fsd_realism.md §4).
+            # Gating this on "no sensor lane" was not enough: the
+            # 2026-09-18 live demo reversed on 46 of 220 ticks with the
+            # lane PAIRED every time, plan_blocked empty and stuck=0,
+            # peaking at -2.99 m/s.
+            rman.enabled = not bool(args.strict)
             print(f"[fsd-drive] runtime={stack.mode} FSD pipeline driving "
                   f"for {args.seconds}s at {args.speed} m/s "
                   f"(lane_mode={args.lane_mode})")
@@ -1886,7 +1895,17 @@ class FSDriveSession:
                         rule_ref = None
                 chosen = arbitrate_fsd_tick(
                     best, rule_ref,
-                    fsd_safe=verd.safe and best is not None and len(best) >= 2,
+                    # ``drivable`` (not ``safe``): a degraded verdict is
+                    # drivable by definition - the monitor computed the
+                    # reduced speed cap for it and the loop applies it below
+                    # via ``target = min(verd.target_speed, ...)``.  Gating on
+                    # ``safe`` threw that cap away and force-stopped the car
+                    # (2026-09-18 live east_coast: 122 of 222 ticks stopped,
+                    # 83 of them level=degraded / source=none with
+                    # mon_target 3.30 m/s and an open corridor; strict mode
+                    # has no rule backup to fall through to).
+                    fsd_safe=(best is not None and len(best) >= 2
+                              and bool(getattr(verd, "drivable", False))),
                     e2e_path=e2e_path,
                     e2e_safe=e2e_safe,
                     bc_path=bc_path,
@@ -2715,21 +2734,11 @@ class FSDriveSession:
                                          else 40.0)
                     except Exception:
                         rear_clear_m = None
-                # Strict FSD: no perception lane -> never reverse.  A
-                # dead-end reverse without lateral authority walks the car
-                # backward off the road (east_coast 2026-09-14).
-                if args.strict and str(
-                        out.meta.get("lane_src_sel") or "") != "sensor":
-                    # Fail closed even when a reverse attempt was already
-                    # armed on the preceding tick.  Setting
-                    # ``has_forward_path`` alone is not enough: the state
-                    # machine stays in ``reversing`` and keeps commanding R
-                    # until its own timer expires, which caused the live
-                    # east_coast run to back away at -2.1 m/s while
-                    # perception-unavailable.  No lateral authority means
-                    # no reverse maneuver; keep D and brake.
-                    has_forward_path = True
-                    rman.reset()
+                # The reverse-escape policy lives in the state machine
+                # itself (``rman.enabled``, set from --strict above) so it
+                # is unit-testable instead of being an inline condition
+                # here.  See ReverseManeuver.enabled for the measured
+                # 2026-09-18 live numbers.
                 rm = rman.decide(has_forward_path=has_forward_path,
                                  rear_clear_m=rear_clear_m,
                                  signed_speed=signed,
