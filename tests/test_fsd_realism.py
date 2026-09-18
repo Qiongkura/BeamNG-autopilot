@@ -122,3 +122,29 @@ def test_fsd_stack_accepts_strict_param() -> None:
     sig = inspect.signature(FSDStack.__init__)
     assert "strict_sensor" in sig.parameters
     assert sig.parameters["strict_sensor"].default is False
+
+
+def test_strict_runs_disable_the_reverse_maneuver() -> None:
+    """The drive loop must disable the escape explicitly in strict mode.
+
+    Gating it on "no sensor lane" was not enough: the 2026-09-18 live demo
+    reversed on 46 of 220 ticks with the lane PAIRED every time,
+    plan_blocked empty and stuck=0, peaking at -2.99 m/s.
+    """
+    from beamng_autopilot.fsd_realism import check_strict_never_reverses
+
+    assert check_strict_never_reverses() == []
+
+
+def test_strict_no_reverse_guard_detects_a_bypass(tmp_path, monkeypatch) -> None:
+    import beamng_autopilot.fsd_realism as fr
+
+    bad = tmp_path / "fake_drive.py"
+    bad.write_text(
+        "def go(rman, args):\n"
+        "    rman.enabled = True\n"
+        "    return rman\n",
+        encoding="utf-8")
+    monkeypatch.setattr(fr, "FAIL_CLOSED_CONSUMER_FILES", ("fake_drive.py",))
+    hits = fr.check_strict_never_reverses(tmp_path)
+    assert hits and "fake_drive.py" in hits[0]
