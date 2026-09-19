@@ -44,6 +44,13 @@ class ReverseManeuver:
     """State machine for a bounded, forward-afterwards reverse escape."""
 
     # --- arming --------------------------------------------------------
+    # ``enabled=False`` forbids the manoeuvre outright (a latched attempt
+    # is cancelled).  Strict FSD sets this: a perception-led stack that
+    # cannot find a forward path fails CLOSED, it does not back up
+    # (docs/fsd_realism.md §4).  The 2026-09-18 live demo armed the escape
+    # on 46 of 220 ticks with the lane PAIRED on every one of them,
+    # plan_blocked empty and stuck=0, peaking at -2.99 m/s.
+    enabled: bool = True
     stall_s: float = 1.5          # no-forward-path time before arming
     stall_speed_mps: float = 0.5  # |signed speed| must be at/under this
     min_rear_clear_m: float = 4.0  # straight-line space behind the car
@@ -93,6 +100,13 @@ class ReverseManeuver:
         dt = max(0.0, float(dt))
         pos = (float(pos2d[0]), float(pos2d[1]))
         s = float(signed_speed)
+
+        if not self.enabled:
+            # Cancel anything already latched: ``_arm`` would otherwise
+            # keep commanding R gear until its own timer expired.
+            if self.state != "idle":
+                self.reset()
+            return ReverseCommand(reason="disabled")
 
         if self.state == "idle":
             if has_forward_path:

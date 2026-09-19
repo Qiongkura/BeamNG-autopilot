@@ -186,3 +186,28 @@ def test_runaway_give_up_never_retries_by_cooldown() -> None:
     for _ in range(5):
         c = rm.decide(False, 8.0, 0.0, (0.0, -1.0), dt=1.0)
         assert not c.active and rm.state == "give_up"
+
+
+def test_disabled_maneuver_never_arms_and_cancels_a_latched_attempt():
+    """Strict FSD must not back up, even with ideal arming conditions.
+
+    The 2026-09-18 live demo armed the escape on 46 of 220 ticks with the
+    lane PAIRED on every one of them, plan_blocked empty and stuck=0,
+    peaking at -2.99 m/s - so the gate has to live in the state machine,
+    not in a "no sensor lane" condition at the call site.
+    """
+    rm = ReverseManeuver(stall_s=0.1, enabled=False)
+    cmds = _run(rm, [(False, 8.0, 0.0)] * 8)
+    assert not any(c.active for c in cmds)
+    assert rm.state == "idle"
+
+
+def test_disabling_cancels_an_already_reversing_attempt():
+    rm = ReverseManeuver(stall_s=0.1)
+    cmd = rm.decide(False, 8.0, 0.0, (0.0, 0.0), dt=0.5)
+    assert cmd.active and rm.state == "reversing"
+    rm.enabled = False
+    cmd = rm.decide(False, 8.0, -1.0, (0.0, -0.5), dt=0.5)
+    assert not cmd.active
+    assert cmd.reason == "disabled"
+    assert rm.state == "idle"
