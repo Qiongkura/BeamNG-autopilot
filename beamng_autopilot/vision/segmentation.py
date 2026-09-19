@@ -32,6 +32,69 @@ _INFER_W, _INFER_H = 536, 403  # 训练分辨率
 # 在 536x403 上至少 ~150 px；远距离细线也能到几十 px，但形态细长，
 # 由 max(cw, ch) >= 24 分支保留）。
 _LINE_MIN_AREA_PX = 150
+# Soil / gravel colour window (OpenCV HSV): warm hue, saturated enough and
+# not in shadow.  Used only to keep the car on the PAVED surface - see
+# ``strip_soil_from_road``.
+_SOIL_HUE_MIN, _SOIL_HUE_MAX = 8, 35
+_SOIL_SAT_MIN = 45
+_SOIL_VAL_MIN = 60
+# Strip soil from the drivable mask only when what is left is still a real
+# paved surface.  Measured paved-share (fraction of the road mask that is
+# NOT soil-coloured), 20 frames each:
+#   paved road  : min 0.74, p10 0.87, p50 0.99
+#   all-dirt    : p10 0.36, p50 0.66   (p90 1.00 = the soil detector found
+#                 nothing to remove, so stripping is a no-op on those)
+# 0.70 separates the two populations with margin, and it keeps the worst
+# measured paved frame (0.752, a 14k px shoulder patch) strippable - a 0.80
+# floor silently kept exactly the frames this exists for.
+_SOIL_STRIP_MIN_PAVED_FRAC = 0.70
+
+
+def snow_or_soil_mask(frame_rgb: np.ndarray) -> np.ndarray:
+    """Warm, saturated ground (soil / gravel / sand) in the frame."""
+    hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+    H = hsv[:, :, 0]
+    S = hsv[:, :, 1]
+    V = hsv[:, :, 2]
+    return ((H >= _SOIL_HUE_MIN) & (H <= _SOIL_HUE_MAX)
+            & (S > _SOIL_SAT_MIN) & (V > _SOIL_VAL_MIN))
+
+
+def strip_soil_from_road(road: np.ndarray,
+                         frame_rgb: np.ndarray,
+                         route_is_dirt: bool = False) -> np.ndarray:
+    """Keep the paved surface only; dirt is road on dirt ROUTES only.
+
+    The model calls the dirt shoulder beside a paved road "asphalt"
+    (measured on the 2026-09-18 east_coast run: up to 24.8% of the road
+    mask was soil, a single 14k px patch joined to the road core).  The
+    car must stay on the PAVED surface, so soil-coloured pixels are
+    removed from the drivable mask.
+
+    Whether dirt counts as road is a property of the ROUTE
+    (AGENTS.md「驾驶约束」3), not of one frame's pixel share.  The old
+    per-frame escape hatch (skip stripping when the paved share fell
+    below 0.70) was measured live and removed: on the east_coast bend the
+    mask cut off mid-road, the paved share dropped to 0.40, the strip was
+    skipped, and the drivable layer - dirt included - walked the car off
+    the pavement while ``lane=sensor`` (2026-09-19 14:31, 40 frames off
+    the road).  ``route_is_dirt=True`` (the explicit --dirt-route opt-in
+    for a genuine dirt route) returns the mask untouched; the default
+    strips unconditionally.
+    """
+    m = np.asarray(road, dtype=bool)
+    if not m.any() or route_is_dirt:
+        return m
+    soil = snow_or_soil_mask(frame_rgb)
+    paved = m & ~soil
+    if not paved.any():
+        # Nothing paved survived: on a paved route this is a mask
+        # failure, and returning the soil-included mask would let the
+        # drivable layer claim the dirt is road.  Return an EMPTY mask
+        # so the strict fail-closed path (no road evidence -> no
+        # candidate) owns it instead.
+        return paved
+    return paved
 
 
 def iou_from_accum(inter: np.ndarray, union: np.ndarray) -> np.ndarray:
@@ -199,16 +262,21 @@ class Segmenter:
         # 离线验证，保留为 opt-in 选项。
         self.temporal_smooth = bool(temporal_smooth)
         self._prev_line: np.ndarray | None = None
+        # Route surface context (AGENTS.md「驾驶约束」3): dirt counts as
+        # road only on an explicitly dirt ROUTE (--dirt-route).  Default
+        # paved -> soil is stripped from the road mask unconditionally.
+        self.route_is_dirt = False
         self.class_names = list(ckpt.get(
             "class_names", CLASS_NAMES))
         self._line_idx = self.class_names.index("line") \
             if "line" in self.class_names else 2
         self._road_idx = self.class_names.index("asphalt") \
             if "asphalt" in self.class_names else 1
+        self._bg_idx = self.class_names.index("background") \
+            if "background" in self.class_names else 0
 
-    def predict(self, frame_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        """Return (road_mask, line_mask) at the input frame resolution."""
-        h, w = frame_rgb.shape[:2]
+    def _infer_logits(self, frame_rgb: np.ndarray):
+        """One forward pass: the logits tensor for ``frame_rgb``."""
         small = cv2.resize(frame_rgb, (_INFER_W, _INFER_H),
                            interpolation=cv2.INTER_AREA)
         x = torch.from_numpy(small).permute(2, 0, 1).float().div_(255.0)
@@ -216,11 +284,31 @@ class Segmenter:
         if self.half:
             x = x.half()
         with torch.no_grad():
-            logits = self.model(x)
+            return self.model(x)
+
+    def _argmax_masks(self, logits, frame_rgb: np.ndarray):
+        """The plain argmax road/line masks at the frame resolution."""
+        h, w = frame_rgb.shape[:2]
         pred = logits.argmax(dim=1)[0].cpu().numpy().astype(np.uint8)
         pred = cv2.resize(pred, (w, h), interpolation=cv2.INTER_NEAREST)
-        road = pred == self._road_idx
-        line = pred == self._line_idx
+        return pred == self._road_idx, pred == self._line_idx
+
+    def predict(self, frame_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Return (road_mask, line_mask) at the input frame resolution."""
+        road, line = self._argmax_masks(self._infer_logits(frame_rgb),
+                                        frame_rgb)
+        return self._postprocess(frame_rgb, road, line)
+
+    def _postprocess(self, frame_rgb: np.ndarray, road, line):
+        """The existing mask pipeline: soil, morphology, hysteresis, gates."""
+        # 铺装路面约束：模型会把铺装路两侧的土肩也判成路面（实测最坏一帧
+        # 掩码里 24.8% 是土、单块 1.4 万像素且与主路面连通）。车必须待在
+        # 铺装面上，所以在"确实是铺装路"时把土色像素从可行驶掩码里去掉；
+        # 全土路（剥完不足 80%）保持原样 —— 那里土就是路面。见
+        # ``strip_soil_from_road``。
+        road = strip_soil_from_road(
+            road, frame_rgb,
+            route_is_dirt=self.route_is_dirt)
         # 标线掩码形态学清理：去掉孤立噪点、弥合小断裂
         k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
         line = cv2.morphologyEx(line.astype(np.uint8), cv2.MORPH_CLOSE,
@@ -276,13 +364,66 @@ class Segmenter:
             line = keep
         return road, line
 
+    def predict_proba(self, frame_rgb: np.ndarray, *, _logits=None):
+        """Class probability maps at the input frame resolution (plan E1).
+
+        Returns ``(maps, raw_road, raw_line)``: per-class probabilities
+        (resized in probability space) plus the plain argmax decisions
+        taken BEFORE the post-processing pipeline, so a caller can gate
+        on the probabilities itself (``vision.seg_probs.gate_masks``)
+        instead of inheriting a decision that threw the confidence away.
+
+        ``_logits`` lets a caller that already ran the forward pass hand
+        the tensor in, so one inference can serve both this API and the
+        mask pipeline (see :meth:`predict_with_probs`).
+        """
+        from beamng_autopilot.vision.seg_probs import softmax_maps
+        h, w = frame_rgb.shape[:2]
+        logits = self._infer_logits(frame_rgb) if _logits is None else _logits
+        probs = torch.softmax(logits.float(), dim=1)[0].cpu().numpy()
+        maps_small = softmax_maps(probs, line_index=self._line_idx,
+                                  road_index=self._road_idx,
+                                  background_index=self._bg_idx)
+        out = {}
+        for name in ("line", "road", "background"):
+            m = getattr(maps_small, name)
+            if m is None:
+                out[name] = None
+                continue
+            out[name] = cv2.resize(np.asarray(m, dtype=np.float32), (w, h),
+                                   interpolation=cv2.INTER_LINEAR)
+        maps = type(maps_small)(
+            line=out["line"], road=out["road"], background=out["background"])
+        raw_road = maps.road >= maps.line
+        raw_line = maps.line >= maps.road
+        if maps.background is not None:
+            raw_road = raw_road & (maps.road >= maps.background)
+            raw_line = raw_line & (maps.line >= maps.background)
+        return maps, raw_road, raw_line
+
+    def predict_with_probs(self, frame_rgb: np.ndarray):
+        """One inference -> ``(road_mask, line_mask, probability maps)``.
+
+        Same pipeline output as :meth:`predict` (pinned by a test) plus
+        the class probabilities of the SAME forward pass, so a caller can
+        gate on them (plan phase E1) without paying for a second
+        inference.
+        """
+        logits = self._infer_logits(frame_rgb)
+        road, line = self._argmax_masks(logits, frame_rgb)
+        road, line = self._postprocess(frame_rgb, road, line)
+        maps, _raw_road, _raw_line = self.predict_proba(
+            frame_rgb, _logits=logits)
+        return road, line, maps
+
     def reset(self) -> None:
         """Clear image-space hysteresis after a discontinuity."""
         self._prev_line = None
 
     def detect_lines(self, frame_rgb, cam_model, pos, heading,
                      ground_z: float | None = None, *,
-                     line_mask: np.ndarray | None = None) -> list:
+                     line_mask: np.ndarray | None = None,
+                     road_mask: np.ndarray | None = None) -> list:
         """Line mask -> LaneMarking list (reuses the classic pipeline).
 
         The learned line mask is fused with a classic-CV bright-stroke
@@ -320,6 +461,15 @@ class Segmenter:
         # saturated (sun-bleached paint reads as low-sat yellow).
         cv_yellow = ((hue >= 12) & (hue <= 45) & (sat >= 30)
                      & (val >= 100) & bright)
+        # The HSV yellow prior (looser than cv_yellow - it catches the
+        # bleached centre paint the learned mask absorbed).  Its pixels
+        # must NOT stay in the white mask, or the centre paint is
+        # re-labelled white and the RHT centre-line policy never fires
+        # (live east_coast 2026-09-19: 'dashed/white' centre, mirror won).
+        from beamng_autopilot.vision.yellow_line_mask import yellow_line_mask
+        ym = yellow_line_mask(frame_rgb)
+        cv_yellow = cv_yellow | ym
+        cv_white = cv_white & ~ym
         out: list = []
         white_mask = (line | cv_white).astype(np.uint8) * 255
         if white_mask.any():
@@ -356,11 +506,35 @@ class Segmenter:
             if os.environ.get("BEAMNG_DASHED_RECOVERY", "1") != "0":
                 out.extend(recover_dashed_boundaries(
                     np.asarray(line, dtype=np.uint8) * 255,
-                    cam_model, pos, heading, ground_z=ground_z))
+                    cam_model, pos, heading, ground_z=ground_z,
+                    yellow_mask=ym))
         if cv_yellow.any():
-            out.extend(_mask_to_markings(
-                cv_yellow.astype(np.uint8) * 255, "yellow",
-                cam_model, pos, heading, ground_z=ground_z))
+            for _ymk in _mask_to_markings(
+                    cv_yellow.astype(np.uint8) * 255, "yellow",
+                    cam_model, pos, heading, ground_z=ground_z):
+                # Yellow-paint candidates must be PAINT: linearly
+                # elongated, and lying ON the published road mask.  Live
+                # east_coast 2026-09-19: the classic yellow detector lit
+                # up on yellow-green dirt/grass (round blobs, off the
+                # pavement), a false blob became the "centre line" and
+                # the centre-line policy walked the car off the road.
+                _pix = np.asarray(getattr(_ymk, "pixels", None),
+                                  dtype=float)
+                if _pix.ndim != 2 or len(_pix) < 6:
+                    continue
+                _bw = _pix.max(axis=0) - _pix.min(axis=0)
+                _long = max(float(_bw[0]), float(_bw[1]))
+                _short = max(1.0, min(float(_bw[0]), float(_bw[1])))
+                if _long / _short < 2.5:
+                    continue                     # a blob, not a line
+                if road_mask is not None:
+                    _rh, _rw = road_mask.shape[:2]
+                    _yy = np.clip(_pix[:, 1].astype(int), 0, _rh - 1)
+                    _xx = np.clip(_pix[:, 0].astype(int), 0, _rw - 1)
+                    if float(np.count_nonzero(
+                            road_mask[_yy, _xx])) / len(_pix) < 0.5:
+                        continue                 # off the pavement
+                out.append(_ymk)
         return out
 
     def offroad_mask(self, frame_rgb: np.ndarray) -> np.ndarray:

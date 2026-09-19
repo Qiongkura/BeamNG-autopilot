@@ -38,10 +38,15 @@ class LineEvidenceAccumulator:
         # (ix, iy) -> [hits, last_seen_seconds]
         self._cells: dict[tuple[int, int], list] = {}
         self._last_t: float | None = None
+        # Last frame that actually OBSERVED line pixels.  Distinct from
+        # ``_last_t`` (every update call): "连续丢线超过阈值" must be
+        # measured from the last real sighting, not from the last call.
+        self._last_observation_t: float | None = None
 
     def reset(self) -> None:
         self._cells.clear()
         self._last_t = None
+        self._last_observation_t = None
 
     def _key(self, x: float, y: float) -> tuple[int, int]:
         return (int(np.floor(x / self.cell_m)),
@@ -97,6 +102,8 @@ class LineEvidenceAccumulator:
         points = points[np.isfinite(points).all(axis=1)]
         # Pixel density must not turn a single sighting into confirmation.
         keys = {self._key(x, y) for x, y in points}
+        if keys:
+            self._last_observation_t = now
         for key in keys:
             rec = self._cells.get(key)
             if rec is None:
@@ -113,17 +120,83 @@ class LineEvidenceAccumulator:
                         for k, rec in self._cells.items()
                         if rec[0] >= HIT_MIN], dtype=float).reshape(-1, 2)
 
-    def fuse(self, line_mask: np.ndarray, cam_model, pos, heading: float,
-             ground_z: float = 0.0, now: float | None = None) -> np.ndarray:
-        """Update with the current mask, then union re-projected evidence.
+    def confidence(self) -> dict:
+        """Dual confidence of the accumulated evidence (plan phase E3).
 
-        Returns a bool mask of the same shape as ``line_mask``; when no
-        evidence has accumulated yet it is the input mask unchanged.
+        Kept SEPARATE on purpose - a fused line pixel is not the same
+        evidence when it was just observed and when it is being held:
+
+        * ``current_confidence``  - share of the supported cells whose
+          last sighting is the most recent observation (fresh evidence);
+        * ``history_confidence``  - mean per-cell strength scaled by
+          recency over the supported cells (how much the HELD evidence
+          still deserves to be trusted; it decays to 0);
+        * ``since_observation_s`` - how long no line pixel has been seen,
+          and ``expired`` once that passes ``MAX_AGE_S`` (continuous
+          loss invalidates history - the plan's explicit expiry rule).
+
+        Everything is derived from the accumulator's own bookkeeping; no
+        confidence is invented for evidence that does not exist.
         """
-        self.update(line_mask, cam_model, pos, heading, ground_z, now)
-        mask = np.asarray(line_mask, dtype=bool).copy()
+        now = self._last_t if self._last_t is not None else time.monotonic()
+        since = (None if self._last_observation_t is None
+                 else max(0.0, float(now) - float(self._last_observation_t)))
+        support = [(k, rec) for k, rec in self._cells.items()
+                   if rec[0] >= HIT_MIN]
+        if not support:
+            return {
+                "current_confidence": 0.0,
+                "history_confidence": 0.0,
+                "n_supported": 0, "n_current": 0, "n_history": 0,
+                "since_observation_s": (None if since is None
+                                        else round(since, 3)),
+                "expired": bool(since is not None and since > MAX_AGE_S),
+            }
+        last = self._last_t
+        n_current = 0
+        strengths = []
+        for _k, rec in support:
+            if last is not None and rec[1] >= float(last) - 1e-9:
+                n_current += 1
+            strength = min(1.0, float(rec[0]) / HIT_CAP)
+            age = max(0.0, float(now) - float(rec[1]))
+            strengths.append(strength * max(0.0, 1.0 - age / MAX_AGE_S))
+        n_supported = len(support)
+        return {
+            "current_confidence": round(n_current / float(n_supported), 4),
+            "history_confidence": round(float(np.mean(strengths)), 4),
+            "n_supported": n_supported,
+            "n_current": n_current,
+            "n_history": n_supported - n_current,
+            "since_observation_s": (None if since is None
+                                    else round(since, 3)),
+            "expired": bool(since is not None and since > MAX_AGE_S),
+        }
+
+    def fuse_with_confidence(self, line_mask: np.ndarray, cam_model, pos,
+                             heading: float, ground_z: float = 0.0,
+                             now: float | None = None
+                             ) -> tuple[np.ndarray, dict]:
+        """``fuse()`` plus the dual-confidence provenance (plan E3)."""
+        raw = np.asarray(line_mask, dtype=bool)
+        mask = self.fuse(line_mask, cam_model, pos, heading, ground_z, now)
+        info = self.confidence()
+        info["added_pixels"] = int(np.count_nonzero(mask & ~raw))
+        return mask, info
+
+    def support_mask(self, shape, cam_model, pos, heading: float,
+                     ground_z: float = 0.0) -> np.ndarray:
+        """The accumulated evidence re-projected into an IMAGE mask.
+
+        Reads only: it does not add a vote (that is :meth:`update`), so a
+        caller can ask "does history support this pixel?" BEFORE deciding
+        what to fuse - which is what the far-field zone rule needs (plan
+        E2: a loose far candidate must be temporally confirmed).
+        """
+        h, w = int(shape[0]), int(shape[1])
+        mask = np.zeros((h, w), dtype=bool)
         pts = self.fused_support()
-        if len(pts) == 0:
+        if len(pts) == 0 or cam_model is None:
             return mask
         pos3 = np.asarray(pos, dtype=float)
         if pos3.size < 3:
@@ -135,7 +208,19 @@ class LineEvidenceAccumulator:
         valid = np.asarray(valid, dtype=bool)
         u = np.asarray(u, dtype=float)[valid]
         v = np.asarray(v, dtype=float)[valid]
-        h, w = mask.shape
         inb = (u >= 0) & (u < w) & (v >= 0) & (v < h)
         mask[v[inb].astype(int), u[inb].astype(int)] = True
+        return mask
+
+    def fuse(self, line_mask: np.ndarray, cam_model, pos, heading: float,
+             ground_z: float = 0.0, now: float | None = None) -> np.ndarray:
+        """Update with the current mask, then union re-projected evidence.
+
+        Returns a bool mask of the same shape as ``line_mask``; when no
+        evidence has accumulated yet it is the input mask unchanged.
+        """
+        self.update(line_mask, cam_model, pos, heading, ground_z, now)
+        mask = np.asarray(line_mask, dtype=bool).copy()
+        mask |= self.support_mask(mask.shape, cam_model, pos, heading,
+                                  ground_z)
         return mask

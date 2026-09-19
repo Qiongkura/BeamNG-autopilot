@@ -353,6 +353,12 @@ DASHED_FRAG_LAT_TOL_M = 0.60
 DASHED_FRAG_DIR_MIN = 0.94
 DASHED_FRAG_MAX_SPAN_M = 60.0
 DASHED_FRAG_MAX_SAMPLES = 24
+# A merged chain is published as one clean polyline: ordered along the
+# chain, resampled to a fixed station count and low-passed.  The
+# endpoints are preserved exactly, so the measured span (and therefore
+# every span gate) is unchanged by the fitting.
+DASHED_FRAG_CHAIN_STATIONS = 24
+DASHED_FRAG_SMOOTH_PASSES = 2
 
 
 def group_world_fragments(frags, *, gap_max_m: float = DASHED_FRAG_GAP_MAX_M,
@@ -541,8 +547,105 @@ def _mask_fragment_polylines(mask_u8, cam_model, pos, heading,
     return out
 
 
+def order_chain_points(pts, pixels, start_hint):
+    """Order a fragment chain into ONE polyline by a nearest-neighbour walk.
+
+    The fragments of a chain arrive in arbitrary order, so concatenating
+    them yields a polyline whose consecutive points can be metres apart -
+    harmless for the span/side gates (which read the point SET) but wrong
+    for anything that walks the curve.  The walk starts at the end nearest
+    ``start_hint`` (the ego) and repeatedly appends the closest remaining
+    point, which follows a bend as long as the chain is locally
+    continuous.
+
+    ``pixels`` is permuted with ``pts`` so the image trace and the world
+    polyline stay two views of the same curve.  Returns
+    ``(points, pixels)``.
+    """
+    p = np.asarray(pts, dtype=float)
+    px = np.asarray(pixels, dtype=float)
+    n = len(p)
+    if n < 2:
+        return p, px
+    remaining = list(range(n))
+    hint = np.asarray(start_hint, dtype=float)[:2]
+    first = int(np.argmin(np.linalg.norm(p - hint[None, :], axis=1)))
+    order = [remaining.pop(first)]
+    while remaining:
+        last = p[order[-1]]
+        nxt = int(np.argmin(
+            np.linalg.norm(p[remaining] - last[None, :], axis=1)))
+        order.append(remaining.pop(nxt))
+    idx = np.asarray(order, dtype=int)
+    return p[idx], (px[idx] if len(px) == n else px)
+
+
+def _resample_pair(world, pixels, n: int):
+    """Resample a world polyline and its pixel trace onto the same stations.
+
+    Both are parametrised by the WORLD arc length, so ``world[i]`` and
+    ``pixels[i]`` keep describing the same point of the marking.
+    """
+    w = np.asarray(world, dtype=float)
+    px = np.asarray(pixels, dtype=float)
+    if len(w) < 2 or n <= 1:
+        return w, px
+    d = np.linalg.norm(np.diff(w, axis=0), axis=1)
+    cum = np.concatenate([[0.0], np.cumsum(d)])
+    total = float(cum[-1])
+    if total <= 1e-9:
+        return w[:1], px[:1]
+    st = np.linspace(0.0, total, int(n))
+    out_w = np.column_stack([np.interp(st, cum, w[:, 0]),
+                             np.interp(st, cum, w[:, 1])])
+    if px.ndim != 2 or len(px) != len(w):
+        return out_w, px
+    out_p = np.column_stack([np.interp(st, cum, px[:, 0]),
+                             np.interp(st, cum, px[:, 1])])
+    return out_w, out_p
+
+
+def _smooth_polyline(pts, passes: int = DASHED_FRAG_SMOOTH_PASSES):
+    """Low-pass a chain polyline with a 1-2-1 kernel, endpoints pinned.
+
+    Removes the per-sample jitter the ground back-projection leaves in a
+    chain built from many short fragments.  Pinning the first and last
+    point keeps the chain's measured span (and every span gate) intact.
+    """
+    p = np.asarray(pts, dtype=float)
+    if len(p) < 3 or int(passes) <= 0:
+        return p
+    out = p.copy()
+    first, last = p[0].copy(), p[-1].copy()
+    for _ in range(int(passes)):
+        out[1:-1] = 0.25 * out[:-2] + 0.5 * out[1:-1] + 0.25 * out[2:]
+        out[0], out[-1] = first, last
+    return out
+
+
+def _chain_color(pix: np.ndarray, yellow_mask: np.ndarray | None,
+                 frac: float = 0.35) -> str:
+    """"yellow" when enough of the chain's pixels sit on the yellow prior.
+
+    The segmentation line head fuses the HSV yellow prior into its mask,
+    and the dashed-recovery chains built from it were published as WHITE -
+    which stripped the centre paint of the one attribute the pairing
+    policy uses to treat it as an own-lane authority (live east_coast
+    2026-09-19: the centre dash read ``dashed/white`` and the mirror won).
+    """
+    if yellow_mask is None or not len(pix):
+        return "white"
+    h, w = yellow_mask.shape[:2]
+    yy = np.clip(np.asarray(pix[:, 1], dtype=int), 0, h - 1)
+    xx = np.clip(np.asarray(pix[:, 0], dtype=int), 0, w - 1)
+    hits = float(np.count_nonzero(yellow_mask[yy, xx]))
+    return "yellow" if len(pix) and hits / len(pix) >= frac else "white"
+
+
 def recover_dashed_boundaries(mask_u8, cam_model, pos, heading,
-                              ground_z: float | None = None, **kwargs
+                              ground_z: float | None = None,
+                              yellow_mask: np.ndarray | None = None,
+                              **kwargs
                               ) -> list[LaneMarking]:
     """Merge collinear short fragments into one boundary per chain.
 
@@ -550,6 +653,18 @@ def recover_dashed_boundaries(mask_u8, cam_model, pos, heading,
     keeps what the shape gates discard.  The merged marking is a genuine
     long boundary, so downstream alignment / span / side gates judge it on
     its real geometry instead of on the fragments it was built from.
+
+    The chain is ordered, resampled and smoothed before it is published.
+    Concatenating the fragments (the previous behaviour) produced a point
+    soup: the span/side gates only read the point SET and never noticed,
+    but every consumer that walks the polyline - arc length, local
+    tangent, resampling, temporal averaging, the drawn overlay - saw
+    points jumping metres back and forth, which is exactly what a fitted
+    lane boundary must not do.
+
+    ``yellow_mask`` (the HSV yellow prior) colours each chain: a chain
+    whose pixels mostly sit on the prior is published YELLOW so the RHT
+    centre-paint policy can claim it.
     """
     frags = _mask_fragment_polylines(mask_u8, cam_model, pos, heading,
                                      ground_z)
@@ -559,10 +674,14 @@ def recover_dashed_boundaries(mask_u8, cam_model, pos, heading,
         w = np.vstack([frags[i]["pts"] for i in g])
         pix = np.vstack([frags[i]["pixels"] for i in g])
         area = sum(int(frags[i]["area"]) for i in g)
+        w, pix = order_chain_points(w, pix, np.asarray(pos, float)[:2])
+        w, pix = _resample_pair(w, pix, DASHED_FRAG_CHAIN_STATIONS)
+        w = _smooth_polyline(w, passes=DASHED_FRAG_SMOOTH_PASSES)
         span = float(np.linalg.norm(w.max(axis=0) - w.min(axis=0)))
         conf = min(1.0, 0.35 + 0.25 * (area / 1500.0)
                    + 0.4 * min(1.0, span / 40.0))
-        out.append(LaneMarking(world=w, pixels=pix, color="white",
+        out.append(LaneMarking(world=w, pixels=pix,
+                               color=_chain_color(pix, yellow_mask),
                                kind="dashed", confidence=float(conf)))
     return out
 
@@ -622,7 +741,8 @@ def painted_line_lane_center(sem, cam_model, pos, heading,
                              min_pts: int = 4,
                              near_lon_m: float = 14.0,
                              marks: list | None = None,
-                             rgb: np.ndarray | None = None
+                             rgb: np.ndarray | None = None,
+                             debug: dict | None = None
                              ) -> tuple[float, float] | None:
     """Own-lane centre (world xy) from the painted-line mask - perception only.
 
@@ -638,10 +758,16 @@ def painted_line_lane_center(sem, cam_model, pos, heading,
     centre), and a clamped lateral shift.  Returns None when the line is
     not seen confidently, so callers keep their ground-safe fallback.
     """
+    dbg = debug if debug is not None else {}
+
+    def _dbg(reason: str) -> None:
+        dbg["reason"] = reason
+
     if marks is None:
         marks = painted_line_markings(sem, cam_model, pos, heading,
                                       ground_z=ground_z, rgb=rgb)
     if not marks:
+        _dbg("no_marks")
         return None
     try:
         p = np.asarray(pos[:2], dtype=float)
@@ -649,6 +775,7 @@ def painted_line_lane_center(sem, cam_model, pos, heading,
         left = np.array([-fwd[1], fwd[0]])
         lats: list[float] = []
         lons: list[float] = []
+        kinds: list[str] = []
         for m in marks:
             if m.kind not in _REAL_KINDS:
                 continue
@@ -661,7 +788,9 @@ def painted_line_lane_center(sem, cam_model, pos, heading,
                     if abs(lat) <= max_lat_m:
                         lats.append(lat)
                         lons.append(lon)
+                        kinds.append(str(getattr(m, "kind", "") or ""))
         if len(lats) < min_pts:
+            _dbg(f"min_pts({len(lats)}<{min_pts})")
             return None
         # CLUSTER the near points by lateral position and pick the
         # cluster closest to the expected lane_half_m: on a road with
@@ -671,11 +800,15 @@ def painted_line_lane_center(sem, cam_model, pos, heading,
         # 2.2) - the placement gave up exactly when perception got GOOD
         # enough to see both lines (town 2026-09-06, 536x403).
         lats_a = np.asarray(lats, dtype=float)
-        w_a = 1.0 / (1.0 + np.asarray(lons, dtype=float))
+        lons_a = np.asarray(lons, dtype=float)
+        w_a = 1.0 / (1.0 + lons_a)
+        kinds_a = np.asarray(kinds, dtype=object)
         order = np.argsort(lats_a)
         sl = lats_a[order]
         sw = w_a[order]
-        clusters: list[tuple[float, float, np.ndarray]] = []
+        sk = kinds_a[order]
+        so = lons_a[order]
+        clusters: list[tuple[float, float, np.ndarray, set, np.ndarray]] = []
         start = 0
         for i in range(1, len(sl) + 1):
             if i == len(sl) or sl[i] - sl[i - 1] > 1.2:
@@ -684,9 +817,12 @@ def painted_line_lane_center(sem, cam_model, pos, heading,
                 clusters.append((
                     float(np.average(c_lats, weights=c_w)),
                     float(i - start),
-                    c_lats))
+                    c_lats,
+                    set(str(k) for k in sk[start:i]),
+                    so[start:i]))
                 start = i
         if not clusters:
+            _dbg("no_clusters")
             return None
         # Straddle guard: clusters on OPPOSITE sides of the ego (one
         # left, one right) cannot be disambiguated single-frame - the
@@ -713,23 +849,63 @@ def painted_line_lane_center(sem, cam_model, pos, heading,
                     and 0.15 <= sep <= 1.2):
                 line_lat = 0.5 * (float(near_line[0]) + float(far_line[0]))
                 best = (line_lat, near_line[1] + far_line[1],
-                        np.concatenate([near_line[2], far_line[2]]))
+                        np.concatenate([near_line[2], far_line[2]]),
+                        near_line[3] | far_line[3],
+                        np.concatenate([near_line[4], far_line[4]]))
             elif (near_abs <= 0.9 and 2.5 <= sep <= 5.0
                     and far_abs >= 2.5):
                 best = near_line
                 line_lat = float(best[0])
+            elif (near_abs <= 2.0 and 2.5 <= sep <= 6.5
+                    and far_abs >= 2.5
+                    and "dashed" in near_line[3]):
+                # Car LEFT of a DASHED centre paint (spawn landed on the
+                # road node = the oncoming side; the paint reads 1.0-2.0 m
+                # to the RIGHT, a white edge further left).  Crossing a
+                # broken line to converge into the own lane is the legal
+                # recovery, and placement is exactly where it belongs:
+                # line_lat = the paint, so the shift below moves the car
+                # right across it.  A SOLID near line keeps the old
+                # refusal - crossing a solid centre line is never a legal
+                # convergence (base_speed3 t=2.3-7.2, 2026-09-19).
+                best = near_line
+                line_lat = float(best[0])
             else:
+                _dbg(f"straddle_unrefused(near={near_abs:.2f},sep={sep:.2f},"
+                     f"far={far_abs:.2f},kinds={sorted(near_line[3])})")
                 return None
         else:
             best = min(clusters, key=lambda c: abs(c[0] - lane_half_m))
+            # A wrong-side / on-the-paint spawn breaks the "closest to
+            # lane_half_m" assumption: the car sits ON the centre paint
+            # (cluster |lat| ~ 0) while the NEXT line to the left reads
+            # closer to lane_half_m - and merging that edge into one
+            # cluster with a nearby dashed fragment then trips the spread
+            # gate (live: spread 1.83 from dashed +1.18 and solid +1.62
+            # merging, 2026-09-19).  The centre paint is the DASHED line
+            # nearest the car (road edges are solid); prefer it when one
+            # sits beside the car.
+            _dash = [c for c in clusters
+                     if "dashed" in c[3] and abs(c[0]) <= 1.0]
+            if _dash:
+                best = min(_dash, key=lambda c: abs(c[0]))
             line_lat = float(best[0])
-        c_spread = (float(np.percentile(best[2], 90)
-                          - np.percentile(best[2], 10))
-                    if len(best[2]) >= 2 else 0.0)
+        # Spread is measured over the NEAR field (lon <= 8 m): a cluster
+        # straddling two parallel lines shows its full separation even
+        # close by, while a single curved chain (the recovered dashed
+        # polyline) only fans out with distance - live: full-window spread
+        # 1.8 on a bend rejected the true centre paint (2026-09-19).
+        _near_sel = best[4] <= 8.0
+        _sp_lats = best[2][_near_sel] if int(_near_sel.sum()) >= 2 else best[2]
+        c_spread = (float(np.percentile(_sp_lats, 90)
+                          - np.percentile(_sp_lats, 10))
+                    if len(_sp_lats) >= 2 else 0.0)
         if c_spread > 1.5:
             # the chosen cluster itself straddles two lines; ambiguous
+            _dbg(f"spread({c_spread:.2f})")
             return None
         if best[1] < min_pts:
+            _dbg(f"cluster_pts({best[1]:.0f}<{min_pts})")
             return None
         shift = float(np.clip(lane_half_m - line_lat,
                               -max_shift_m, max_shift_m))
@@ -738,9 +914,12 @@ def painted_line_lane_center(sem, cam_model, pos, heading,
             # pose so callers treat placement as SUCCESS (east_coast used
             # to report placed=False whenever the ego was already centred).
             return (float(p[0]), float(p[1]))
+        dbg["line_lat"] = round(line_lat, 2)
+        dbg["shift"] = round(shift, 2)
         tgt = p + np.array([fwd[1], -fwd[0]]) * shift
         return (float(tgt[0]), float(tgt[1]))
-    except Exception:
+    except Exception as exc:
+        dbg["reason"] = f"error:{exc}"
         return None
 
 

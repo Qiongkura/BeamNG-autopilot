@@ -147,3 +147,106 @@ def test_nonfinite_projected_points_do_not_poison_history(monkeypatch):
     acc.update(np.ones((1, 3), bool), None, (0., 0.), 0., now=100.)
     assert len(acc._cells) == 1
     assert acc.fused_support().shape == (0, 2)
+
+
+# ---------------------------------------------------------------------------
+# Dual confidence + continuous-loss expiry (plan phase E3)
+# ---------------------------------------------------------------------------
+
+def test_dual_confidence_separates_fresh_from_held_evidence():
+    acc = LineEvidenceAccumulator()
+    t = [200.0, 200.5, 201.0]
+    acc.update(_project_mask(WORLD_LINE, (0.0, 0.0, 0.0), 0.0),
+               CAM, (0.0, 0.0, 0.0), 0.0, 0.0, now=t[0])
+    acc.update(_project_mask(WORLD_LINE, (1.0, 0.0, 0.0), 0.0),
+               CAM, (1.0, 0.0, 0.0), 0.0, 0.0, now=t[1])
+    # frame 3 observes the line again: most supported cells are refreshed
+    # by THIS frame (the mask is thin and the car moved, so a few cells
+    # keep an older sighting - the share is honest, not forced to 1.0)
+    mask, info = acc.fuse_with_confidence(
+        _project_mask(WORLD_LINE, (2.0, 0.0, 0.0), 0.0),
+        CAM, (2.0, 0.0, 0.0), 0.0, 0.0, now=t[2])
+    assert 0.5 < info["current_confidence"] <= 1.0
+    assert info["n_current"] > 0
+    assert info["n_current"] + info["n_history"] == info["n_supported"]
+    assert info["history_confidence"] > 0.0
+    assert info["expired"] is False
+    # frame 4 is a total dropout: the SAME support is now held history
+    mask4, info4 = acc.fuse_with_confidence(
+        np.zeros((H, W), dtype=bool),
+        CAM, (3.0, 0.0, 0.0), 0.0, 0.0, now=t[2] + 0.5)
+    assert mask4.any()
+    assert info4["current_confidence"] == pytest.approx(0.0)
+    assert info4["n_current"] == 0
+    assert info4["n_history"] == info4["n_supported"]
+    assert info4["since_observation_s"] == pytest.approx(0.5)
+    # held evidence is trusted less than fresh evidence
+    assert info4["history_confidence"] < info["history_confidence"]
+
+
+def test_history_expires_after_continuous_loss():
+    """连续丢线超过阈值后必须失效 (plan E3)."""
+    from beamng_autopilot.vision.line_evidence import MAX_AGE_S
+    acc = LineEvidenceAccumulator()
+    acc.update(_project_mask(WORLD_LINE, (0.0, 0.0, 0.0), 0.0),
+               CAM, (0.0, 0.0, 0.0), 0.0, 0.0, now=100.0)
+    acc.update(_project_mask(WORLD_LINE, (1.0, 0.0, 0.0), 0.0),
+               CAM, (1.0, 0.0, 0.0), 0.0, 0.0, now=100.5)
+    _mask, info = acc.fuse_with_confidence(
+        np.zeros((H, W), dtype=bool), CAM, (2.0, 0.0, 0.0), 0.0, 0.0,
+        now=100.5 + MAX_AGE_S + 0.5)
+    assert info["expired"] is True
+    assert info["n_supported"] == 0
+    assert info["history_confidence"] == 0.0
+    assert info["since_observation_s"] > MAX_AGE_S
+
+
+def test_confidence_is_json_safe_and_zero_without_evidence():
+    import json
+    acc = LineEvidenceAccumulator()
+    info = acc.confidence()
+    assert info["current_confidence"] == 0.0
+    assert info["history_confidence"] == 0.0
+    assert info["n_supported"] == 0
+    json.dumps(info)
+
+
+def test_fuse_still_returns_the_mask_unchanged():
+    """The provenance-aware path must not alter fuse()'s contract."""
+    acc = LineEvidenceAccumulator()
+    t = [300.0, 300.5]
+    acc.update(_project_mask(WORLD_LINE, (0.0, 0.0, 0.0), 0.0),
+               CAM, (0.0, 0.0, 0.0), 0.0, 0.0, now=t[0])
+    acc.update(_project_mask(WORLD_LINE, (1.0, 0.0, 0.0), 0.0),
+               CAM, (1.0, 0.0, 0.0), 0.0, 0.0, now=t[1])
+    acc_a = LineEvidenceAccumulator()
+    acc_b = LineEvidenceAccumulator()
+    for a in (acc_a, acc_b):
+        a.update(_project_mask(WORLD_LINE, (0.0, 0.0, 0.0), 0.0),
+                 CAM, (0.0, 0.0, 0.0), 0.0, 0.0, now=t[0])
+        a.update(_project_mask(WORLD_LINE, (1.0, 0.0, 0.0), 0.0),
+                 CAM, (1.0, 0.0, 0.0), 0.0, 0.0, now=t[1])
+    empty = np.zeros((H, W), dtype=bool)
+    plain = acc_a.fuse(empty, CAM, (2.0, 0.0, 0.0), 0.0, 0.0, now=301.0)
+    aware, _info = acc_b.fuse_with_confidence(
+        empty, CAM, (2.0, 0.0, 0.0), 0.0, 0.0, now=301.0)
+    assert np.array_equal(plain, aware)
+
+
+def test_support_mask_projects_history_without_voting():
+    """The far-zone rule needs history read WITHOUT adding to it."""
+    acc = LineEvidenceAccumulator()
+    acc.update(_project_mask(WORLD_LINE, (0.0, 0.0, 0.0), 0.0),
+               CAM, (0.0, 0.0, 0.0), 0.0, 0.0, now=100.0)
+    acc.update(_project_mask(WORLD_LINE, (1.0, 0.0, 0.0), 0.0),
+               CAM, (1.0, 0.0, 0.0), 0.0, 0.0, now=100.5)
+    cells_before = dict(acc._cells)
+    support = acc.support_mask((H, W), CAM, (2.0, 0.0, 0.0), 0.0, 0.0)
+    assert support.any(), "accumulated evidence must project back"
+    assert acc._cells == cells_before, "support_mask must not vote"
+    assert acc._last_observation_t == 100.5, "nor count as an observation"
+    # an empty accumulator projects nothing at all
+    empty = LineEvidenceAccumulator()
+    assert not empty.support_mask((H, W), CAM, (0.0, 0.0, 0.0), 0.0).any()
+    # and a missing camera model degrades to an empty mask, not a crash
+    assert not acc.support_mask((H, W), None, (0.0, 0.0, 0.0), 0.0).any()

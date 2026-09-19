@@ -285,3 +285,31 @@ def test_painted_lane_reference_none_when_direction_unmeasurable():
     assert painted_lane_reference(
         _Sem({"line": np.zeros((8, 8), np.uint8)}),
         cam_model=None, pos=(10.0, 20.0, 1.5), heading=0.0) is None
+
+
+def test_straddle_dashed_paint_right_of_car_moves_right():
+    """Car spawned LEFT of a dashed centre paint (teleport lands on the
+    road node): the paint reads ~1.4 m to the RIGHT and a white edge
+    further left.  The own lane is across the broken line to the right,
+    so the placement target moves the car right past the paint."""
+    left_edge = _line(3.9, kind="solid")             # road's left edge (inside max_lat 4.0)
+    centre = _line(-1.44, kind="dashed")             # centre paint, right of ego
+    tgt = painted_line_lane_center(
+        _Sem({"line": np.zeros((8, 8), np.uint8)}), cam_model=None,
+        pos=(10.0, 20.0, 1.5), heading=0.0,
+        marks=[left_edge, centre])
+    assert tgt is not None
+    # shift is clipped at max_shift_m=2.5 to the right
+    assert tgt[1] - 20.0 < -2.0
+
+
+def test_straddle_solid_paint_right_of_car_still_refused():
+    """A SOLID near line on the right is not a legal convergence: keep the
+    refusal so placement never plans across a solid centre line."""
+    left_edge = _line(3.9, kind="solid")
+    centre = _line(-1.44, kind="solid")
+    tgt = painted_line_lane_center(
+        _Sem({"line": np.zeros((8, 8), np.uint8)}), cam_model=None,
+        pos=(10.0, 20.0, 1.5), heading=0.0,
+        marks=[left_edge, centre])
+    assert tgt is None
