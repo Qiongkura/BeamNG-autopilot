@@ -697,10 +697,10 @@ def test_tick_freezes_the_snapshot_before_planning(monkeypatch) -> None:
     seen: dict = {}
     real = fs.select_trajectory
 
-    def _spy(scene, fans, constraints):
+    def _spy(scene, fans, constraints, **kwargs):
         seen["snapshot"] = getattr(scene, "perception_snapshot", None)
         seen["bev"] = getattr(seen["snapshot"], "bev", None)
-        return real(scene, fans, constraints)
+        return real(scene, fans, constraints, **kwargs)
 
     monkeypatch.setattr(fs, "select_trajectory", _spy)
     out = st.tick()

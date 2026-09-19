@@ -54,6 +54,7 @@ from beamng_autopilot.planning import (
 )
 from beamng_autopilot.planning.intent import infer_route_intent
 from beamng_autopilot.temporal import WorldObjectTracker
+from beamng_autopilot.workers import LatestJobRunner
 from beamng_autopilot.prediction import predict_tracks, prediction_digest
 from beamng_autopilot.perception_snapshot import PerceptionSnapshot
 from beamng_autopilot.planner import forward_clearance_m, path_forward_clearance_m
@@ -65,6 +66,8 @@ from beamng_autopilot.lane import (
     choose_sensor_lane,
     select_lane_reference,
 )
+from beamng_autopilot.lane.pavement import paved_edge_lane_center
+from beamng_autopilot.config import EGO_ORIGIN_GROUND_GAP_M
 from beamng_autopilot.runtime import (
     RangeSample,
     build_camera_ring_provider,
@@ -99,6 +102,66 @@ RANGE_REUSE_INFLATE_MAX_M = 1.5
 # the cure nor the cause of the excursions.  The stage stays opt-in:
 # ``BEAMNG_LANE_REF_SLEW=1`` enables it.
 _LANE_REF_SLEW_ENABLED = os.environ.get("BEAMNG_LANE_REF_SLEW", "0") == "1"
+
+
+# Heavy-head worker timeout (plan A4): a head that runs longer than this
+# is counted in telemetry, never waited for - the served output simply
+# ages and the freshness contract (safety monitor) owns the decision.
+ASYNC_HEAD_TIMEOUT_S = 1.5
+
+# Default OFF, like every behaviour-changing perception switch in this
+# repo: moving the object head off the tick changes an observable
+# contract - its YOLO obstacles are fused into the BEV of the SAME tick
+# (test_fsd_stack.py pins it), and a one-tick delay before an NPC enters
+# vector space is a safety-relevant change that has to be decided on live
+# evidence, not offline.  With ``BEAMNG_ASYNC_HEADS=1`` the mechanism is
+# active and the tick-level contract (never wait for a head, serve the
+# newest available output with an honest age) is covered by
+# tests/test_fsd_stack_async.py.
+ASYNC_HEADS_ENABLED = os.environ.get("BEAMNG_ASYNC_HEADS", "0") == "1"
+
+
+def _async_allowed(name: str, *, strict: bool) -> bool:
+    """Which heavy heads may run in the background worker.
+
+    The semantic lane is strict mode's lateral safety input, and a
+    deferred/stale semantic reads as "stale sensor" and fail-closes the
+    car - the exact reason the tick-budget governor never defers it in
+    strict mode.  So the semantic head is asynchronous ONLY outside
+    strict mode; the object head is asynchronous always: the freshness
+    contract makes only the semantic head REQUIRED for the road-lateral
+    decision, and obstacle safety has its own range/BEV checks.
+    """
+    if not ASYNC_HEADS_ENABLED:
+        return False
+    if name == "object":
+        return True
+    if name == "semantic":
+        return not bool(strict)
+    return False
+
+
+def _budget_defers(name: str, *, strict: bool, every_n: int,
+                   budget: float | None, elapsed: float) -> bool:
+    """Whether the tick-budget governor defers this head.
+
+    Smoothness: a heavy head due on a tick that already consumed its
+    budget is deferred and the last cached output served, so a semantic +
+    YOLO + fresh-LiDAR collision can never freeze the control loop.
+
+    STRICT exception: the semantic lane is the lateral safety input, and
+    serving a stale one reads as "stale sensor" -> minimal-risk stop
+    (live base_emergency run: 9 stall frames, "tick budget: 19 frames
+    deferred 35 heavy heads").  In strict sensor mode the semantic head
+    is never deferred - the tick overruns its budget instead, and the
+    drive loop's stale-control guard owns the overly-long-tick case.
+    YOLO still defers.
+    """
+    if every_n <= 1 or budget is None:
+        return False
+    if elapsed <= float(budget):
+        return False
+    return not (name == "semantic" and bool(strict))
 
 
 def compensate_range_motion(sample: RangeSample | None,
@@ -266,13 +329,32 @@ class FSDStack:
                  object_every_n: int = 1,
                  lane_mode: str = "map",
                  strict_sensor: bool = False,
-                 corridor_fallback: bool = False):
+                 corridor_fallback: bool = False,
+                 paved_fallback: bool = False):
         self.conn = conn
         # Pairing-free strict-mode lane fallback (bev corridor right edge
         # + half a lane, width-gated).  Default OFF: it changes which
         # frames strict mode drives on, so it goes through live A/B
         # before it becomes a default.
         self.corridor_fallback = bool(corridor_fallback)
+        # PAVED-boundary candidate for a paved road with NO marking: the
+        # road mask's edges are the authority, the reference is half a
+        # lane in from the paved right edge and the pavement edges are the
+        # hard boundaries (AGENTS.md「驾驶约束」).
+        #
+        # Default OFF, and it stays that way until a pavement edge is
+        # trustworthy.  Measured live 2026-09-18 (east_coast unmarked
+        # stretch, deployed model): with the candidate enabled the car
+        # rode the lane line and wedged against the guardrail
+        # (``lane=paved``, "no drivable path"), because the model reads
+        # the gravel shoulder as pavement - its right edge sits 15 px
+        # (median) OUTSIDE the hand-labelled pavement (53.6% of rows), so
+        # "keep a lane width inside that edge" is a place on the
+        # shoulder, and publishing those edges as the hard boundaries
+        # WEAKENS the no-cross rule instead of enforcing it (the real
+        # lane line is no longer a boundary at all).  Enable only with
+        # --paved-lane after the edge is trustworthy.
+        self.paved_fallback = bool(paved_fallback)
         self.grid_n = int(grid_n)
         self.grid_res = float(grid_res)
         self.heads = list(heads) if heads else []
@@ -305,6 +387,11 @@ class FSDStack:
         self.semantic_every_n = max(1, int(semantic_every_n))
         self.object_every_n = max(1, int(object_every_n))
         self._head_skip: dict[str, int] = {}
+        # Background workers for the heavy heads that may run async (plan
+        # A4).  Created lazily on first use so __new__-built test stubs
+        # and non-driving callers never spawn a thread.
+        self._head_workers: dict[str, LatestJobRunner] = {}
+        self._head_async: set[str] = set()
         self._last_heads: dict = {}
         self._head_timestamps: dict[str, float] = {}
         self._tick_num = 0
@@ -378,6 +465,68 @@ class FSDStack:
         self._trk_t0: float | None = None
 
     # ------------------------------------------------------------------
+    def _range_async_step(self, pos, budget, tick_t0, budget_skips):
+        """Off-thread scan step (plan A4): fetch here, cluster in a worker.
+
+        The provider's ``fetch`` takes only the connection reads (under
+        the connector lock, on THIS thread); the 200+ ms of clustering
+        goes to a latest-wins worker.  Until the result lands the caller
+        serves the motion-compensated cached scan - the same reuse
+        semantics (and the same ``RANGE_REUSE_*`` bounds) the synchronous
+        path already uses when a scan is skipped.  Returns
+        ``(sample, error)``; ``sample`` may be None when nothing has been
+        produced yet.
+        """
+        runner = getattr(self, "_range_worker", None)
+        if runner is None:
+            runner = LatestJobRunner("range",
+                                     timeout_s=ASYNC_HEAD_TIMEOUT_S)
+            self._range_worker = runner
+            _async = getattr(self, "_head_async", None)
+            if _async is None:
+                _async = set()
+                self._head_async = _async
+            _async.add("range")
+        error = None
+        rng = None
+        result = runner.poll()
+        if result is not None:
+            if result.ok:
+                self._last_range = result.value
+                # the cloud was captured when the job was FETCHED, so that
+                # is the honest age of the evidence it produced
+                self._last_range_t = float(
+                    getattr(self, "_range_job_t", 0.0) or time.time())
+                rng = result.value
+            else:
+                error = str(result.error)
+        if rng is None:
+            _dt = time.time() - float(getattr(self, "_last_range_t", 0.0))
+            rng = compensate_range_motion(
+                getattr(self, "_last_range", None), _dt)
+        if not runner.busy:
+            if budget is not None and (time.time() - tick_t0) > budget:
+                # over budget this tick: keep the compensated cache, fetch
+                # on the next affordable tick (same rule as the sync path)
+                budget_skips.append("range")
+            else:
+                payload = None
+                try:
+                    payload = self.range_prov.fetch(pos)
+                except Exception as exc:
+                    error = str(exc)
+                if payload is not None:
+                    self._range_job_t = time.time()
+                    runner.submit(self.range_prov.process, payload, pos)
+                else:
+                    # the provider declared a split but produced no
+                    # payload: fall back to the synchronous scan
+                    rng = self.range_prov.scan(pos)
+                    self._last_range = rng
+                    self._last_range_t = time.time()
+        return rng, error
+
+    # ------------------------------------------------------------------
     def tick(self, st=None, route_ref: np.ndarray | None = None,
              include_bev: bool = True,
              map_lane_override=None,
@@ -417,7 +566,7 @@ class FSDStack:
             ctx = FrameContext(
                 frame_rgb=frame, cam=cam, pos=pos, heading=heading,
                 ground_z=float(pos[2]) if len(pos) > 2 else 0.0,
-                role=role)
+                role=role, timestamp=float(_tick_cost0))
             heads: dict = {}
             head_ages: dict[str, float] = {}
             _tick_num = int(getattr(self, '_tick_num', 0))
@@ -468,8 +617,68 @@ class FSDStack:
                 # later tick the budget allows, so a semantic + YOLO +
                 # fresh-LiDAR collision can never freeze the control loop
                 # ("stutter every few frames, car barely moves").
-                if (_n > 1 and _budget is not None
-                        and (time.time() - _tick_cost0) > _budget):
+                #
+                # STRICT exception: the semantic lane is the lateral
+                # safety input, and serving a stale one reads as "stale
+                # sensor" -> minimal-risk stop (live base_emergency run:
+                # 9 stall frames, "tick budget: 19 frames deferred 35
+                # heavy heads").  In strict sensor mode the semantic head
+                # is never deferred - the tick overruns its budget
+                # instead, and the drive loop's own stale-control guard
+                # owns the overly-long-tick case.  YOLO still defers.
+                if _async_allowed(
+                        _name,
+                        strict=bool(getattr(self, "strict_sensor", False))):
+                    # Heavy head in the background (plan A4): submit the
+                    # current frame and serve the newest AVAILABLE output
+                    # this tick - the tick never waits for the head, so a
+                    # slow UNet/YOLO costs freshness, not control cadence.
+                    # Only pure-CPU heads may go async: anything touching
+                    # the BeamNGpy connection stays on this thread.
+                    _workers = getattr(self, "_head_workers", None)
+                    if _workers is None:
+                        _workers = {}
+                        self._head_workers = _workers
+                    _async_set = getattr(self, "_head_async", None)
+                    if _async_set is None:
+                        _async_set = set()
+                        self._head_async = _async_set
+                    _runner = _workers.get(_name)
+                    if _runner is None:
+                        _runner = LatestJobRunner(
+                            _name, timeout_s=ASYNC_HEAD_TIMEOUT_S)
+                        _workers[_name] = _runner
+                        _async_set.add(_name)
+                    _frames = getattr(self, "_head_job_frame_t", None)
+                    if _frames is None:
+                        _frames = {}
+                        self._head_job_frame_t = _frames
+                    _res = _runner.poll() if _due or _runner.busy else None
+                    if _res is not None and _res.ok:
+                        heads[_name] = _res.value
+                        _last[_name] = _res.value
+                        _retry.discard(_name)
+                        # the output's age starts at the frame that
+                        # produced it, not at this tick
+                        _head_stamps[_name] = float(
+                            _frames.get(_name, _tick_cost0))
+                    if _name not in heads and _last.get(_name) is not None:
+                        heads[_name] = _last[_name]
+                    if _res is not None and not _res.ok:
+                        self.hydra.errors[_name] = str(_res.error)
+                    _stamp = _head_stamps.get(_name)
+                    head_ages[_name] = (
+                        float("inf") if _stamp is None
+                        else max(0.0, time.time() - float(_stamp)))
+                    if _due and not _runner.busy:
+                        _runner.submit(_head.run, ctx)
+                        _frames[_name] = float(_tick_cost0)
+                    continue
+                if _budget_defers(
+                        _name, strict=bool(getattr(self, "strict_sensor",
+                                                   False)),
+                        every_n=_n, budget=_budget,
+                        elapsed=time.time() - _tick_cost0):
                     if _last.get(_name) is not None:
                         heads[_name] = _last[_name]
                         _stamp = _head_stamps.get(
@@ -501,6 +710,13 @@ class FSDStack:
                 k: round(float(v), 3) if np.isfinite(v) else None
                 for k, v in head_ages.items()}
             out.meta["object_head"] = int("object" in self.hydra._heads)
+            _async = getattr(self, "_head_async", None)
+            if _async:
+                out.meta["head_async"] = sorted(_async)
+                out.meta["head_worker"] = {
+                    _n: _r.digest()
+                    for _n, _r in getattr(self, "_head_workers", {}).items()
+                    if _n in _async}
             _times['ring'] = round((time.time() - _tw) * 1000.0, 1)
             _tw = time.time()
 
@@ -518,7 +734,20 @@ class FSDStack:
             try:
                 # getattr defaults keep __new__-built test stubs
                 # (no __init__) working: they always scan.
-                if getattr(self, '_range_skip', 0) <= 0:
+                if ASYNC_HEADS_ENABLED and bool(
+                        getattr(self.range_prov, "range_split", False)):
+                    # LiDAR decoupling (plan A4): the provider declared the
+                    # fetch/process split, so the clustering runs off this
+                    # thread and the tick serves the compensated cache in
+                    # the meantime; a slow cloud costs freshness (bounded
+                    # by STALE_RANGE_S / RANGE_REUSE_MAX_DT_S), not the
+                    # control cadence.
+                    rng, _range_err = self._range_async_step(
+                        pos, _budget, _tick_cost0, _budget_skips)
+                    if _range_err:
+                        out.errors["range"] = _range_err
+                    out.meta["range_async"] = 1
+                elif getattr(self, '_range_skip', 0) <= 0:
                     if (_budget is not None
                             and (time.time() - _tick_cost0) > _budget
                             and getattr(self, '_last_range', None)
@@ -781,11 +1010,43 @@ class FSDStack:
         if self.lane_envelope is not None:
             out.meta["lane_envelope"] = self.lane_envelope.as_meta()
         # One owner decides which lane geometry may steer the car this
-        # tick (sensor lane -> trusted single painted boundary -> map
-        # prior in legacy mode only -> BEV free-space centre when there
-        # is no nav route).  Strict FSD never builds map lane geometry
-        # and returns no centre when perception cannot supply one, so
-        # the planner can only fail closed.
+        # tick (sensor lane -> trusted single painted boundary -> paved
+        # boundary on a road with no marking -> map prior in legacy mode
+        # only -> BEV free-space centre when there is no nav route).
+        # Strict FSD never builds map lane geometry and returns no centre
+        # when perception cannot supply one, so the planner can only fail
+        # closed.
+        #
+        # The PAVED candidate is computed here because perception (the
+        # semantic road mask + the camera that produced it) lives here;
+        # the trust order and the strict gate stay in the lane owner.
+        # Skipped when a two-sided sensor lane already exists - that is
+        # the one case where the pavement edge can never win, and it is
+        # the common case, so the extra back-projection stays off the hot
+        # path.
+        paved_ref = None
+        paved_dbg: dict = {}
+        if (bool(getattr(self, "paved_fallback", False))
+                and not bool(getattr(lane_frame, "paired", False))):
+            try:
+                _sem_p = out.head_outputs.get("semantic")
+                _role_p = ("front_main" if "front_main" in snap
+                           else (next(iter(snap)) if snap else None))
+                if (_sem_p is not None and _role_p is not None
+                        and "road" in getattr(_sem_p, "masks", {})):
+                    # Ground plane, not the vehicle origin: the road mask
+                    # is a picture of the ROAD SURFACE (config comment:
+                    # the origin plane would bias the read 0.5 m at 5 m).
+                    _gz_p = float(pos[2]) - float(EGO_ORIGIN_GROUND_GAP_M)
+                    paved_ref = paved_edge_lane_center(
+                        _sem_p.masks["road"], snap[_role_p][1], pos,
+                        heading, ground_z=_gz_p, debug=paved_dbg)
+            except Exception as _exc:
+                paved_dbg["mode"] = "error"
+                paved_dbg["error"] = str(_exc)
+        out.meta["paved_edge_debug"] = dict(paved_dbg)
+        if paved_ref is not None:
+            out.meta["paved_edge"] = dict(paved_ref.meta)
         lane_mode = getattr(self, "lane_mode", "map")
         lane_ref_out = select_lane_reference(
             lane_frame=lane_frame,
@@ -808,7 +1069,16 @@ class FSDStack:
             map_lane_width_m=getattr(
                 self, "map_lane_width_m", LANE_WIDTH_DEFAULT_M),
             corridor_fallback=getattr(self, "corridor_fallback", False),
+            paved_ref=paved_ref,
+            paved_fallback=bool(getattr(self, "paved_fallback", False)),
             warn=_warn_once,
+            # Plan E4 context: the previous tick's ACCEPTED reference (the
+            # slew limiter already keeps it, and it is updated only after
+            # this call, so it is genuinely the previous frame's) and the
+            # observed LiDAR corridor for this tick - both only consumed
+            # when BEAMNG_LANE_GEOM is on.
+            prev_ref=getattr(self, "_lane_ref_prev", None),
+            corridor=self._lane_geom_corridor(out, pos, heading),
         )
         lane_ref = lane_ref_out.center
         # Single owner, no sideways teleport: the accepted own-lane
@@ -820,7 +1090,16 @@ class FSDStack:
         # ``BEAMNG_LANE_REF_SLEW=0`` disables it: the live A/B is not yet
         # decisive at this sample size, so the switch is the rollback and
         # comparison lever.
-        if lane_ref is not None and _LANE_REF_SLEW_ENABLED:
+        # Strict perception-led mode enables the slew limiter regardless of
+        # the env switch: the accepted reference jumping 1.8 m laterally
+        # between ticks (line_lat +1.43 -> -0.33, live base_dirtfix
+        # 2026-09-19) bangs the steering full-lock left/right at 3 m/s and
+        # put the car into a tree.  The 2026-09-11 A/B that disabled it ran
+        # the legacy non-strict regime; in strict mode a reference jump is
+        # a perception flip, not a lane change.
+        if lane_ref is not None and (_LANE_REF_SLEW_ENABLED
+                                     or bool(getattr(self, "strict_sensor",
+                                                     False))):
             lane_ref, self._lane_ref_hold_t = limit_reference_slew(
                 getattr(self, "_lane_ref_prev", None),
                 getattr(self, "_lane_ref_hold_t", 0.0),
@@ -1006,7 +1285,8 @@ class FSDStack:
         # lateral shifts so the planner can actually dodge a near wall.
         fans = sample_arc(pos, heading, speed=max(2.0, float(st.speed)),
                           max_steer=0.5, n_curv=13, max_curv=0.25)
-        if candidate_ref is not None and len(candidate_ref) >= 4:
+        if (candidate_ref is not None and len(candidate_ref) >= 4
+                and not strict_lane):
             shifts = sample_lane_shift(candidate_ref,
                                        offsets=(-3.0, -1.5, 1.5, 3.0))
             for c in shifts.candidates:
@@ -1020,6 +1300,16 @@ class FSDStack:
                     continue
                 fans.add(c.path, kind,
                          offset=c.meta.get("offset", 0.0))
+        elif candidate_ref is not None and strict_lane:
+            # Strict perception owns the lane and its detected boundaries.
+            # Synthetic +/-1.5/3.0 m shifts are map-style lane changes, not
+            # evasive paths justified by this tick's sensor evidence; on a
+            # centre-paint-only frame they put the body across the physical
+            # centreline and trigger the planned-body-cross stop every
+            # tick.  Keep the sensor lane centre and the physical arc fan
+            # only.  A future obstacle manoeuvre must be generated from an
+            # observed free corridor, not from a fixed lateral shift.
+            out.meta["strict_lane_shift_disabled"] = 1
         elif candidate_src == REF_ROUTE:
             # The policy always returns the route with REF_ROUTE; this
             # guard keeps a future policy change from silently dropping
@@ -1044,7 +1334,23 @@ class FSDStack:
             fans.add(np.asarray(lane_center_ref, dtype=float)[:, :2],
                      "lane_center", offset=0.0)
         out.n_candidates = len(fans.candidates)
-        best, meta = select_trajectory(scene, fans, self.constraints)
+        # Candidate hysteresis (plan phase D1): the fan is re-scored every
+        # tick and two near-equal candidates would otherwise win on
+        # alternate frames, flipping the steering intent every 0.5 s.
+        # The choice sticks while the kept candidate is STILL feasible
+        # this tick and nothing beats it by more than the margin; the
+        # decision is published for telemetry (switch count / reason /
+        # age).  Lazy creation keeps ``__new__``-built test stubs valid.
+        _hyst = getattr(self, "candidate_hysteresis", None)
+        if _hyst is None:
+            from beamng_autopilot.planning import CandidateHysteresis
+            _hyst = CandidateHysteresis()
+            self.candidate_hysteresis = _hyst
+        best, meta = select_trajectory(scene, fans, self.constraints,
+                                       hysteresis=_hyst,
+                                       now_s=time.time())
+        if meta.get("hysteresis") is not None:
+            out.meta["hysteresis"] = dict(meta["hysteresis"])
         out.best_path = best
         # One fail-closed decision, published in telemetry: strict mode
         # with no perception lane declines every candidate in the
@@ -1118,6 +1424,35 @@ class FSDStack:
         scene.meta = out.meta
         return out
 
+
+    def _lane_geom_corridor(self, out, pos, heading):
+        """The LiDAR corridor polyline for the E4 check (None when off).
+
+        Built only when the geometry gate is enabled: it is a projection
+        over the tick's ray hits, and with the switch off it would be
+        pure waste.  A failure here degrades to "no corridor evidence",
+        which the check reports as a missing metric rather than a
+        rejection.
+        """
+        try:
+            from beamng_autopilot.lane.reference import LANE_GEOM_ENABLED
+        except Exception:
+            return None
+        if not LANE_GEOM_ENABLED:
+            return None
+        hits = list(getattr(out, "ray_hits", None) or [])
+        if not hits:
+            return None
+        try:
+            frame = build_lidar_corridor(hits, pos, heading)
+        except Exception as exc:
+            _warn_once("lane_geom_corridor", f"corridor build failed: {exc}")
+            return None
+        center = getattr(frame, "center", None)
+        if center is None:
+            return None
+        center = np.asarray(center, dtype=float)[:, :2]
+        return center if len(center) >= 2 else None
 
     def _sensor_lane(self, out, pos, heading):
         """Fused sensor lane: vision markings -> LiDAR corridor -> fusion.
@@ -1282,6 +1617,28 @@ class FSDStack:
         # must not be held against the new tick's selection.
         self._lane_ref_prev = None
         self._lane_ref_hold_t = 0.0
+        # Drop any in-flight/received async head output: a result computed
+        # from a pre-teleport frame must never be adopted at the new pose.
+        for _r in getattr(self, "_head_workers", {}).values():
+            try:
+                _r.poll()
+            except Exception:
+                pass
+        _rr = getattr(self, "_range_worker", None)
+        if _rr is not None:
+            try:
+                _rr.poll()
+            except Exception:
+                pass
+            self._last_range = None
+            self._last_range_t = 0.0
+        for _n in getattr(self, "_head_async", ()) or ():
+            for _d in (getattr(self, "_head_timestamps", None),
+                       getattr(self, "_head_job_frame_t", None)):
+                try:
+                    _d.pop(_n, None)
+                except Exception:
+                    pass
         # Heads may hold location-bound temporal state of their own
         # (semantic head: world-space line evidence) - clear it too.
         for _h in getattr(self, "heads", None) or []:
@@ -1309,6 +1666,15 @@ def semantic_to_meta(head_outputs: dict) -> dict:
     sem = head_outputs.get("semantic")
     if sem is not None:
         meta["lane_markings"] = len(sem.meta.get("markings", []))
+        # Line-evidence provenance (plan phase E3): how much of the fused
+        # line mask is a fresh observation vs. held history, and whether
+        # continuous loss has invalidated that history.
+        ev = sem.meta.get("line_evidence")
+        if isinstance(ev, dict):
+            meta["line_conf_current"] = ev.get("current_confidence")
+            meta["line_conf_history"] = ev.get("history_confidence")
+            meta["line_evidence_age_s"] = ev.get("since_observation_s")
+            meta["line_evidence_expired"] = int(bool(ev.get("expired")))
     tr = head_outputs.get("traffic")
     if tr is not None:
         meta["signal_state"] = tr.meta.get("signal_state")
