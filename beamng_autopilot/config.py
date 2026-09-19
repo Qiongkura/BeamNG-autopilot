@@ -130,6 +130,25 @@ EGO_ORIGIN_GROUND_GAP_M = 0.17
 EGO_HALF_LENGTH_M = 2.2
 EGO_HALF_WIDTH_M = 0.9
 
+# FSD 运行时降级界限（安全策略参数，不是任何横向参考）：
+# - PATH_HOLD 宽限/上限：某帧丢失路径时，监控器可在该窗口内有界复用
+#   上一条「已通过校验」的轨迹（宽限段保持原目标速度，之后蠕行减速，
+#   超时即清除并 fail-closed 停车）；复用前按当前场景重新校验。
+# - FSD_PLANNED_CROSS_HARD_M：规划扫掠车体越界的近场/远场分界，近场
+#   仍然立即停车，远场只降速换候选。
+# 数值沿用实施方案 B2 的初始带，最终以 Tech 实车测试调定。
+FSD_PATH_HOLD_GRACE_S = 0.30
+FSD_PATH_HOLD_MAX_S = 0.80
+FSD_PLANNED_CROSS_HARD_M = 4.0
+# 控制与感知解耦（实施方案阶段 A2/A4）：感知+规划 tick 保持其自然周期
+# （约 2 Hz），两次 tick 之间以该频率重发控制指令——用最新的车辆状态和
+# 已经过校验的缓存计划重跑转向/纵向控制器，因此慢的感知头只会推迟下一次
+# 「计划」，不会推迟方向盘与踏板。0 = 关闭（回退到 tick 同步控制）。
+# FSD_SUBSTEP_STALE_PLAN_S：缓存计划超过该时长仍未刷新即由子步刹停
+# （与 fsd_drive 的 STALE_CTRL_S 同义，子步侧的兜底）。
+FSD_CONTROL_SUBSTEP_HZ = 15.0
+FSD_SUBSTEP_STALE_PLAN_S = 1.2
+
 
 def runtime_home(mode: str | None = None) -> Path:
     """Return the game install directory for the requested runtime."""
