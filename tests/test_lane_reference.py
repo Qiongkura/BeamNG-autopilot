@@ -21,6 +21,7 @@ import pytest
 from beamng_autopilot.fsd_realism import (
     SRC_BEV_ROUTE,
     SRC_MAP,
+    SRC_PAVED,
     SRC_SENSOR,
     SRC_UNAVAILABLE,
 )
@@ -78,6 +79,22 @@ def _corridor_grid() -> OccupancyGrid:
     grid = OccupancyGrid(n_rows=60, n_cols=60, res=0.5)
     grid.drivable[:, 28:32] = 1.0
     return grid
+
+
+class _PavedRef:
+    """The ``lane.pavement.PavedLane`` geometry the stack hands over.
+
+    Only the fields ``select_lane_reference`` consumes: a keep-right
+    centre polyline on the right half of the road, the two observed
+    pavement edges and the measured span.
+    """
+
+    def __init__(self, half_m: float = 3.5) -> None:
+        xs = np.linspace(0.0, 24.0, 9)
+        self.center = np.column_stack([xs, np.full_like(xs, -1.9)])
+        self.left = np.column_stack([xs, np.full_like(xs, half_m)])
+        self.right = np.column_stack([xs, np.full_like(xs, -half_m)])
+        self.span_m = 2.0 * half_m
 
 
 # --------------------------------------------------------------------------
@@ -227,6 +244,74 @@ def test_strict_rejected_lane_fails_closed_rather_than_single_edging() -> None:
     )
     assert ref.src == SRC_UNAVAILABLE
     assert ref.center is None
+
+
+# --------------------------------------------------------------------------
+# paved boundary: the no-marking case on a paved road
+# --------------------------------------------------------------------------
+def test_strict_no_marking_uses_the_paved_boundary() -> None:
+    """No marking + observed pavement -> the pavement boundary leads, and
+    its edges are the hard boundaries (AGENTS.md「驾驶约束」).
+
+    OPT-IN: the default is still fail-closed (see the test below), since
+    a pavement edge the model reads 0.25 m past the true pavement sends
+    the car onto the shoulder.
+    """
+    ref = select_lane_reference(
+        lane_frame=None,
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        lane_mode="sensor", strict_sensor=True,
+        paved_ref=_PavedRef(), paved_fallback=True,
+    )
+    assert ref.src == SRC_PAVED
+    assert ref.center is not None
+    assert ref.map_lane is None
+    assert ref.boundaries is True
+    assert ref.left is not None and ref.right is not None
+    assert ref.width == pytest.approx(7.0)
+    assert ref.meta["lane_src"] == "paved"
+
+
+def test_strict_painted_marking_still_beats_the_paved_boundary() -> None:
+    """标线 >> 路面边界: a usable single painted edge wins."""
+    ref = select_lane_reference(
+        lane_frame=_sensor_lane(paired=False, confidence=0.8),
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        lane_mode="sensor", strict_sensor=True,
+        paved_ref=_PavedRef(), paved_fallback=True,
+    )
+    assert ref.src == SRC_SENSOR
+
+
+def test_strict_paved_boundary_is_off_by_default() -> None:
+    """A paved candidate alone does NOT unlock strict motion: the live
+    2026-09-18 run that enabled it rode the lane line and hit the
+    guardrail, so the default stays fail-closed until the model's
+    pavement edge is trustworthy."""
+    ref = select_lane_reference(
+        lane_frame=None,
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        lane_mode="sensor", strict_sensor=True,
+        paved_ref=_PavedRef(),
+    )
+    assert ref.src == SRC_UNAVAILABLE
+    assert ref.center is None
+
+
+def test_paved_boundary_never_replaces_the_map_prior_legacy_mode() -> None:
+    """Legacy (non-strict) mode keeps its map-prior own lane: the paved
+    candidate is a STRICT-mode perception fallback, not a new default."""
+    ref = select_lane_reference(
+        lane_frame=None,
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        lane_mode="map", strict_sensor=False,
+        paved_ref=_PavedRef(),
+    )
+    assert ref.src == SRC_MAP
 
 
 # --------------------------------------------------------------------------

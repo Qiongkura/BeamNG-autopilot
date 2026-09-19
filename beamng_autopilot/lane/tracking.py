@@ -8,6 +8,7 @@ import time
 import numpy as np
 
 from .constants import (
+    LANE_CENTER_PAINT_MIN_SPAN_M,
     LANE_FUSION_WIDTH_MAX_M,
     LANE_FRAME_MIN_SPAN_M,
     LANE_MIN_CONF,
@@ -349,7 +350,7 @@ def lane_frame_usable(frame: LaneFrame | None,
     # legal own-lane authority when the midline is the only boundary.
     if (frame.paired and frame.left is not None
             and getattr(frame, "right", None) is None):
-        min_span = min(min_span, LANE_MIN_SPAN_M)
+        min_span = min(min_span, LANE_CENTER_PAINT_MIN_SPAN_M)
     # A single painted edge (solid or dashed) in the near field is a valid
     # own-lane lateral reference under RHT (the outer road boundary or centreline).
     # Allow explicit solid/dashed paint to use a 2.0 m span floor rather than

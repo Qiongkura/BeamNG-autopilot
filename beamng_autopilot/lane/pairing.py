@@ -21,6 +21,8 @@ from .constants import (
     LANE_ONE_NEAR_FAR_START_MAX_M,
     LANE_PAIR_CENTER_MAX_M,
     LANE_PAIR_CENTER_PREFER_M,
+    LANE_PAIR_MAX_LOCAL_ANGLE_DEG,
+    LANE_PAIR_MIN_CONVERGENCE_M,
     LANE_PAIR_NEAR_CENTER_MAX_M,
     LANE_PAIR_NEAR_MAX_M,
     LANE_PAIR_OVERLAP_M,
@@ -236,9 +238,21 @@ def _collect_candidates(markings, pos: np.ndarray, fwd: np.ndarray,
         if abs(side_lat) > LANE_EDGE_MAX_M:
             _drop(mk, "side", span=span, align=align, side=side_lat)
             continue
+        cand_color = str(getattr(mk, "color", "") or "")
+        # A low-confidence short dashed white candidate exactly at the
+        # ego's near centre is often the yellow centre paint after the
+        # segmentation head lost chroma.  Promote only this narrow shape;
+        # long/solid white edges remain white and cannot become an inferred
+        # centreline accidentally.
+        if (cand_color == "white"
+                and mk.kind == "dashed"
+                and 1.5 <= span <= 3.5
+                and float(mk.confidence) <= 0.55
+                and abs(side_lat) <= 0.5):
+            cand_color = "yellow"
         cands.append(_LineCandidate(
             proj=proj, span=span, conf=float(mk.confidence),
-            kind=mk.kind, color=mk.color, med_lat=med_lat,
+            kind=mk.kind, color=cand_color, med_lat=med_lat,
             score=_marking_score(mk, span), world=world[:, :2]))
     return cands
 
@@ -462,6 +476,57 @@ def _cand_near_lat(c: _LineCandidate) -> float:
     return c.med_lat if near is None else near
 
 
+def _pair_perspective_valid(left_proj: np.ndarray,
+                             right_proj: np.ndarray,
+                             min_convergence_m: float =
+                             LANE_PAIR_MIN_CONVERGENCE_M,
+                             max_angle_deg: float =
+                             LANE_PAIR_MAX_LOCAL_ANGLE_DEG) -> tuple[bool, str]:
+    """Check fixed-camera perspective for a proposed boundary pair.
+
+    On one road, the two boundaries are locally related: their tangents
+    should have similar angles, and their extrapolated intersection is a
+    far vanishing point.  A near intersection means the pair crosses in
+    front of the ego (typically a near line matched to a roadside/far line)
+    and is not one lane.  This uses only the sensor-projected (s, lat)
+    geometry; it never consults a map or route.
+    """
+    lp = np.asarray(left_proj, dtype=float)
+    rp = np.asarray(right_proj, dtype=float)
+    if lp.ndim != 2 or rp.ndim != 2 or len(lp) < 3 or len(rp) < 3:
+        return True, "insufficient_points"
+    s0 = max(0.0, float(lp[0, 0]), float(rp[0, 0]))
+    s1 = min(float(lp[-1, 0]), float(rp[-1, 0]))
+    if s1 <= s0 + 0.5:
+        return True, "insufficient_overlap"
+    def _fit(p):
+        q = p[(p[:, 0] >= s0) & (p[:, 0] <= s1)]
+        if len(q) < 3:
+            q = p
+        if len(q) < 2 or float(np.ptp(q[:, 0])) < 0.5:
+            return None
+        return np.polyfit(q[:, 0], q[:, 1], 1)
+    fl = _fit(lp)
+    fr = _fit(rp)
+    if fl is None or fr is None:
+        return True, "insufficient_fit"
+    angle = abs(math.degrees(math.atan2(float(fl[0]), 1.0)
+                                  - math.atan2(float(fr[0]), 1.0)))
+    angle = min(angle, 180.0 - angle)
+    if angle > float(max_angle_deg):
+        return False, "perspective_angle"
+    wl = float(np.polyval(fl, s0))
+    wr = float(np.polyval(fr, s0))
+    width0 = wl - wr
+    slope_delta = float(fl[0] - fr[0])
+    if width0 <= 0.0 or abs(slope_delta) < 1e-6:
+        return True, "parallel_or_diverging"
+    cross_s = s0 - width0 / slope_delta
+    if 0.0 < cross_s < float(min_convergence_m):
+        return False, "near_perspective_crossing"
+    return True, "ok"
+
+
 def _best_vision_pair(cands: list[_LineCandidate],
                       axes: list[_LineCandidate],
                       pos: np.ndarray, fwd: np.ndarray,
@@ -550,6 +615,12 @@ def _best_vision_pair(cands: list[_LineCandidate],
             s_lo = max(0.0, float(l.proj[0, 0]), float(r.proj[0, 0]))
             s_hi = min(float(l.proj[-1, 0]), float(r.proj[-1, 0]))
             if s_hi - s_lo < LANE_PAIR_OVERLAP_M:
+                continue
+            perspective_ok, perspective_reason = _pair_perspective_valid(
+                l.proj, r.proj)
+            if not perspective_ok:
+                rejects[perspective_reason] = rejects.get(
+                    perspective_reason, 0) + 1
                 continue
             stations = _overlap_stations(s_lo, s_hi, station_step,
                                          max_stations)
@@ -827,10 +898,21 @@ def _centre_line_own_lane(cand, pos, fwd, lane_width: float,
     """Single painted centre line (US yellow / double as one blob).
 
     Own lane sits ``lane_width/2`` to the RIGHT of the paint (RHT).
-    Returns a paired frame so strict sensor mode can lead — a lone centre
-    line is enough lateral authority (east_coast flicker 2026-09-14).
+    A short but explicit centre-paint fragment is still useful: on the
+    live east_coast start the visible dashed centre fragment was 2.1 m
+    long, while the old 4.0 m floor rejected it and strict mode had no
+    lane.  Keep the short relaxation limited to yellow/centre-paint
+    candidates with a real solid/dashed kind and confidence >= 0.40;
+    generic white/unknown fragments remain at the conservative floor.
     """
-    if cand is None or float(cand.span) < LANE_MIN_SPAN_M:
+    if cand is None:
+        return None
+    _min_span = LANE_MIN_SPAN_M
+    if (str(getattr(cand, "color", "")) == "yellow"
+            and getattr(cand, "kind", None) in ("solid", "dashed")
+            and float(getattr(cand, "conf", 0.0) or 0.0) >= 0.40):
+        _min_span = 2.0
+    if float(cand.span) < _min_span:
         return None
     if abs(float(cand.med_lat)) > 1.2:
         # A far yellow centre line can sit outside the near 1.2 m band
@@ -1007,12 +1089,18 @@ def pair_lane_markings(
                 return cfr
     # A single far yellow centre line can define the RHT own lane, but only
     # on the positive/left side; a near right yellow line is not a centre
-    # line and must stay on the protected mirror path.
+    # line and must stay on the protected mirror path.  An explicit DASHED
+    # candidate in the centre band counts too - live evidence 2026-09-19:
+    # the centre dash sat at med_lat ~0.0 (the car ON the paint) and, read
+    # as white, fell through to a right-edge mirror that "centred" the car
+    # in an imagined lane while it drove the wrong side of the paint.
     if not axes:
         for c in cands:
-            if (str(getattr(c, "color", "")) == "yellow"
-                    and float(getattr(c, "med_lat", 99.0)) > 0.08
-                    and abs(float(getattr(c, "med_lat", 99.0))) <= 2.5):
+            _m = float(getattr(c, "med_lat", 99.0))
+            _is_yellow = str(getattr(c, "color", "")) == "yellow"
+            _is_dash = str(getattr(c, "kind", "")) == "dashed"
+            if ((_is_yellow and _m >= -0.25 and abs(_m) <= 2.5)
+                    or (_is_dash and -2.5 <= _m <= 1.2)):
                 cfr = _centre_line_own_lane(
                     c, pos, fwd, lane_width, station_step, max_stations)
                 if cfr is not None:
@@ -1024,8 +1112,43 @@ def pair_lane_markings(
     right_best = _best_single_boundary(cands, -1)
     if left_best is None and right_best is None:
         return None
+
+    def _mirror_contradicts_centre(side: int, edge_med: float) -> bool:
+        """True when the mirrored lane puts the centre on the wrong side.
+
+        A mirror claims the own-lane centre at ``edge +- width/2``.  When a
+        centre-paint candidate (yellow, or a dashed line in the centre
+        band) implies a DIFFERENT centre - under RHT the own-lane centre
+        is ``paint - width/2`` - and the mirror's centre sits on the
+        oncoming side of that, the mirror is "centring" the car across the
+        physical centre line and must be refused (live 2026-09-19,
+        mirror_right with the paint 1.88 m right of the car).
+        """
+        for c in cands:
+            _m = float(getattr(c, "med_lat", 99.0))
+            _is_centre = (str(getattr(c, "color", "")) == "yellow"
+                          or str(getattr(c, "kind", "")) == "dashed")
+            if not _is_centre or abs(_m) > 3.5:
+                continue
+            # skip the candidate that IS the mirrored edge
+            if abs(_m - edge_med) <= 0.8:
+                continue
+            c_mirror = (_m - lane_width / 2.0 if side > 0
+                        else _m + lane_width / 2.0)
+            c_paint = _m - lane_width / 2.0
+            if side < 0 and c_mirror > c_paint + 0.3:
+                return True
+            if side > 0 and c_mirror < c_paint - 0.3:
+                return True
+        return False
+
     for best, side in ((right_best, -1), (left_best, 1)):
         if best is None:
+            continue
+        if _mirror_contradicts_centre(side, _cand_side(best)):
+            if debug is not None:
+                debug["mirror_reject"] = (
+                    f"centre_contradiction(side={side})")
             continue
         frame = _single_mirror_frame(
             best, side, pos, fwd, lane_width, station_step,

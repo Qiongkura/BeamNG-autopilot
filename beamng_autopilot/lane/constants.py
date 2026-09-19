@@ -13,10 +13,23 @@ LANE_FUSION_WIDTH_MAX_M = 6.5
 LANE_MIN_SPAN_M = 4.0
 LANE_BOUNDARY_SPAN_M = 1.5
 LANE_PAIR_OVERLAP_M = 1.5
+# Two road edges should be locally parallel in the fixed camera view and
+# may only meet at a far vanishing point.  A pair whose fitted rays meet
+# in front of the car is a near crossing (wrong edge/roadside combination),
+# not a lane.  The constraint is perception-only: no map geometry.
+LANE_PAIR_MIN_CONVERGENCE_M = 12.0
+LANE_PAIR_MAX_LOCAL_ANGLE_DEG = 25.0
 LANE_FRAME_MIN_SPAN_M = 3.0
 # A short two-sided US paint pair is trusted only when both boundaries have
 # explicit solid/dashed kinds and the confidence gate passes.
 LANE_SHORT_PAIRED_SPAN_M = 1.5
+# A single visible US centre stripe is a real own-lane authority: the
+# missing right boundary is inferred by the RHT lane-width contract, but
+# the paint itself is physical.  Live east_coast frames expose only about
+# 2.1-2.6 m of dashed centre paint before the camera/curve changes; the
+# generic 4 m floor rejected it and strict mode stopped despite a marked
+# lane.
+LANE_CENTER_PAINT_MIN_SPAN_M = 2.0
 # How long a vision pair / vision+LiDAR overlap must be before it may
 # replace the nav route as the driving centre.  Deliberately strict even
 # for a two-sided painted pair: a 3.2 m pair can have its centre metres

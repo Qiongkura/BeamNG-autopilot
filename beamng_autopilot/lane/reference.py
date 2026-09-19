@@ -24,16 +24,26 @@ prior, used only in the legacy non-strict mode) or sensor-derived.
 
 from __future__ import annotations
 
+import os
+
 from dataclasses import dataclass, field
 import math
 
 import numpy as np
 
 from .constants import LANE_WIDTH_DEFAULT_M
+
+# Plan E4: geometric consistency of the ACCEPTED sensor lane (smoothness,
+# width rate, vanishing point, drivable overlap, corridor and previous-
+# reference agreement).  Default OFF: like every other gate in this repo it
+# is a live A/B lever, and it can only WITHDRAW a sensor lane - never
+# relax a gate, never touch a map-derived reference.
+LANE_GEOM_ENABLED = os.environ.get("BEAMNG_LANE_GEOM", "0") == "1"
 from beamng_autopilot.fsd_realism import (
     SRC_BEV_ROUTE,
     SRC_CORRIDOR,
     SRC_MAP,
+    SRC_PAVED,
     SRC_SENSOR,
     SRC_UNAVAILABLE,
 )
@@ -53,6 +63,7 @@ _LABEL_BY_SRC = {
     SRC_SENSOR: "sensor",
     SRC_MAP: "map_lane",
     SRC_CORRIDOR: "corridor",
+    SRC_PAVED: "paved",
     SRC_UNAVAILABLE: "perception-unavailable",
 }
 
@@ -299,7 +310,11 @@ def select_lane_reference(
     map_lane_width_m: float = LANE_WIDTH_DEFAULT_M,
     corridor_fallback: bool = False,
     corridor_max_width_m: float = CORRIDOR_LANE_MAX_WIDTH_M,
+    paved_ref=None,
+    paved_fallback: bool = False,
     warn=None,
+    prev_ref=None,
+    corridor=None,
 ) -> LaneReference:
     """Decide which lane geometry may steer the car this tick.
 
@@ -310,14 +325,18 @@ def select_lane_reference(
     2. a trusted SINGLE painted boundary, whose missing side is inferred
        from the painted-line lane-width contract - strict mode's
        perception-only fallback;
-    3. the map-prior own lane built from the nav route - **legacy
+    3. the PAVED BOUNDARY (``paved_ref``, from the soil-stripped road
+       mask): a road with no usable marking at all.  AGENTS.md
+       「驾驶约束」 fixes the order marking >> pavement edge = guardrail =
+       fence, so this ranks below 1/2 and above every map-based level;
+    4. the map-prior own lane built from the nav route - **legacy
        non-strict mode only**;
-    4. the BEV drivable-space centre - a whole-road centre used only when
+    5. the BEV drivable-space centre - a whole-road centre used only when
        there is no nav route at all (probes / unit stubs), never in
        strict mode.
 
     Strict mode (``lane_mode == "sensor"`` and ``strict_sensor``) stops at
-    (1)/(2): no map geometry is even built, and a tick with neither
+    (1)-(3): no map geometry is even built, and a tick with none of them
     returns ``src = "perception-unavailable"`` with no centre at all, so
     the caller can only fail closed.
     """
@@ -568,6 +587,23 @@ def select_lane_reference(
             lane_left = getattr(lane_frame, "left", None)
             lane_right = getattr(lane_frame, "right", None)
             lane_width = float(getattr(lane_frame, "width", 0.0) or 0.0)
+        elif (paved_fallback and paved_ref is not None
+              and getattr(paved_ref, "center", None) is not None
+              and len(paved_ref.center) >= 3):
+            # NO usable marking on a road that IS paved: the pavement
+            # boundary is the authority (AGENTS.md「驾驶约束」: 标线 >>
+            # 路面边界 = 护墙 = 围栏).  The candidate already abstained
+            # unless the paved RIGHT edge is observed inside the image,
+            # the span is road-sized and the pavement is observed along
+            # the car's own track, so this branch can not invent a lane on
+            # grass; its edges are published as the tick's HARD
+            # boundaries, which is what keeps the car on the pavement
+            # ("禁止将车辆驾驶到土和草上").
+            lane_ref = np.asarray(paved_ref.center, dtype=float)[:, :2]
+            lane_left = np.asarray(paved_ref.left, dtype=float)[:, :2]
+            lane_right = np.asarray(paved_ref.right, dtype=float)[:, :2]
+            lane_width = float(getattr(paved_ref, "span_m", 0.0) or 0.0)
+            lane_src_sel = SRC_PAVED
         else:
             lane_ref = None
             lane_left = None
@@ -586,7 +622,7 @@ def select_lane_reference(
                 if _corridor is not None and len(_corridor) >= 3:
                     lane_ref = _corridor
                     lane_src_sel = SRC_CORRIDOR
-        if lane_src_sel == SRC_SENSOR:
+        if lane_src_sel in (SRC_SENSOR, SRC_PAVED):
             map_lane = None
         src_published = True
 
@@ -605,10 +641,13 @@ def select_lane_reference(
 
     center = (np.asarray(lane_ref, dtype=float)
               if lane_ref is not None else None)
-    # Only a REAL two-sided detection provides hard lane boundaries; the
-    # map prior provides its own when it is the reference.
+    # Only a REAL sensor detection provides hard lane boundaries: a
+    # two-sided lane pair, the observed pavement edges (SRC_PAVED), or the
+    # map prior when IT is the reference.  A single-edge mirror is not a
+    # physical edge the no-cross rule may enforce.
     boundaries = bool(
         (lane_frame is not None and getattr(lane_frame, "paired", False))
+        or lane_src_sel == SRC_PAVED
         or map_lane is not None)
     meta: dict = {}
     if lane_rejected and reject_reason is not None:
@@ -623,6 +662,40 @@ def select_lane_reference(
     meta["lane_src"] = _LABEL_BY_SRC.get(lane_src_sel, SRC_BEV_ROUTE)
     if strict_lane:
         meta["lane_strict"] = 1
+    # Geometric consistency (plan E4, opt-in): the static gates above accept
+    # a lane sample by sample; this refuses one whose SHAPE is wrong - a
+    # pair whose width swings, a boundary that bends tighter than a road, a
+    # "lane" that pinches shut, a centre off the drivable evidence or off
+    # the observed LiDAR corridor, or one that jumped since the last frame.
+    # It applies to SENSOR-derived lanes only (a map lane's geometry is not
+    # a perception claim) and it can only withdraw, never relax.
+    if (LANE_GEOM_ENABLED and center is not None and len(center) >= 4
+            and lane_src_sel in (SRC_SENSOR, SRC_PAVED)):
+        try:
+            from .geometry_check import check_lane_geometry
+            _left = getattr(lane_frame, "left", None)
+            _right = getattr(lane_frame, "right", None)
+            _rep = check_lane_geometry(
+                center=center,
+                left=(None if _left is None
+                      else np.asarray(_left, dtype=float)[:, :2]),
+                right=(None if _right is None
+                       else np.asarray(_right, dtype=float)[:, :2]),
+                drivable=grid, corridor=corridor, prev_ref=prev_ref)
+            meta["lane_geom"] = _rep.digest()
+            if not _rep.ok:
+                center = None
+                boundaries = False
+                lane_width = 0.0
+                lane_src_sel = SRC_UNAVAILABLE
+                map_lane = None
+                meta["lane_reject_reason"] = "geom:" + ",".join(
+                    _rep.reasons)
+                meta["lane_src_sel"] = SRC_UNAVAILABLE
+                meta["lane_src"] = _LABEL_BY_SRC.get(SRC_UNAVAILABLE,
+                                                     SRC_BEV_ROUTE)
+        except Exception as exc:
+            meta["lane_geom_error"] = str(exc)
     return LaneReference(
         center=center,
         left=lane_left,
