@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -222,8 +223,28 @@ class TechCameraProvider(CameraProvider):
             self.camera.remove()
 
 
+@dataclass
+class _RawRange:
+    """Connection-read payload handed from ``fetch`` to ``process``."""
+
+    cloud: np.ndarray = field(
+        default_factory=lambda: np.empty((0, 3), dtype=float))
+    lua_obstacles: list = field(default_factory=list)
+    ray_hits: list = field(default_factory=list)
+    heading: float | None = None
+    radius: float = 55.0
+
+
 class TechRangeProvider(RangeProvider):
-    """LiDAR plus scenario/vehicle obstacle sources on BeamNG.tech."""
+    """LiDAR plus scenario/vehicle obstacle sources on BeamNG.tech.
+
+    Declares the two-phase range split: ``fetch`` holds ``io_lock`` only
+    for the sensor reads, ``process`` does the 200+ ms of clustering with
+    no lock held, so a caller may run that half on a worker thread (plan
+    phase A4) without ever putting socket access on two threads.
+    """
+
+    range_split = True
 
     def __init__(self, conn) -> None:
         check_graphics_quality(conn.user_dir)
@@ -275,18 +296,18 @@ class TechRangeProvider(RangeProvider):
         except Exception:
             return None
 
-    def scan(self, pos, ego_vid=None, radius: float = 55.0) -> RangeSample:
-        # Only the sensor reads (LiDAR poll, Lua fan) need the connector
-        # lock.  The CPU-side clustering / fusion below can take 200+ ms
-        # on a dense 360 cloud and must NOT hold io_lock: the control loop
-        # steps/commands through that same lock, so holding it across the
-        # clustering would cap the control cadence at ~1 Hz and the car
-        # would weave on bends (run 42-45).  Read under the lock, compute
-        # outside it.
-        obstacles: list[Obstacle] = []
-        pts: list[tuple[float, float]] = []
-        ox, oy = float(pos[0]), float(pos[1])
+    def fetch(self, pos, ego_vid=None, radius: float = 55.0):
+        """Connection-only phase: LiDAR poll + Lua fan, under ``io_lock``.
+
+        Returns a payload for :meth:`process`.  Every CPU-side step
+        (corridor/near masks, downsampling, ground removal) moved out of
+        the lock so the heavy half can run on a worker thread while the
+        control loop keeps stepping through that same lock.  ``scan()``
+        stays exactly ``process(fetch(...))``.
+        """
         cloud = np.empty((0, 3), dtype=float)
+        lua_obstacles: list[Obstacle] = []
+        ray_hits: list[tuple[float, float]] = []
         heading: float | None = None
         with self.conn.io_lock:
             try:
@@ -295,82 +316,97 @@ class TechRangeProvider(RangeProvider):
                 if cloud.ndim != 2 or cloud.shape[1] < 3:
                     cloud = np.empty((0, 3), dtype=float)
                 cloud = cloud[np.isfinite(cloud).all(axis=1)]
-                oz = float(pos[2])
                 heading = self._ego_heading()
-                # Lane-corridor hits (unchanged semantics): world z window
-                # around the ego, self footprint removed, voxel-capped.
-                dist = np.hypot(cloud[:, 0] - ox, cloud[:, 1] - oy)
-                keep = ((dist >= 2.5) & (dist <= radius)
-                        & (np.abs(cloud[:, 2] - oz) <= 4.0))
-                # Near-field 360-LiDAR points (1-2.5 m) are kept ONLY for
-                # the raw-sensor emergency-stop / approach-speed layer
-                # (forward_clearance_m).  The cluster/corridor pool still
-                # starts at 2.5 m so the own car's tail / wheel guards do
-                # not become road obstacles, but a wall 1-2 m off the
-                # bonnet must remain visible or the car floors the throttle
-                # into it while standing still (throttle=94.7% at v=0).
-                near_keep = ((dist >= 1.0) & (dist < 2.5)
-                             & (np.abs(cloud[:, 2] - oz) <= 4.0))
-                if heading is not None:
-                    uf = np.array([np.cos(heading), np.sin(heading)])
-                    ur = np.array([-uf[1], uf[0]])
-                    local = cloud[:, :2] - np.asarray(pos[:2], dtype=float)
-                    on_car = ((np.abs(local @ uf)
-                               <= self._ego_half_len + LIDAR_SELF_MARGIN)
-                              & (np.abs(local @ ur)
-                                 <= self._ego_half_w + LIDAR_SELF_MARGIN))
-                    keep = keep & ~on_car
-                    near_keep = near_keep & ~on_car
-                kept = downsample_cloud(cloud[keep])
-                pts = [(float(x), float(y)) for x, y, _ in kept]
-                # Drop the local ground plane from the near field the same
-                # way lidar_obstacles does: on flat ground the 1-2.5 m band
-                # is full of ground returns that project onto the emergency
-                # corridor and pin the car forever (EMERGENCY STOP raw
-                # clear=0.7m everywhere, v never leaves 0).  A wall / tree /
-                # vehicle right off the bonnet still has points above the
-                # ground clearance and stays visible to the safety layer.
-                near_cloud = downsample_cloud(cloud[near_keep])
-                if len(near_cloud) >= 4:
-                    gnd = _local_ground_z(near_cloud, ox, oy)
-                    above = ((near_cloud[:, 2] - gnd
-                              >= LIDAR_GROUND_CLEARANCE_M)
-                             & (near_cloud[:, 2] - gnd
-                                <= LIDAR_MAX_HEIGHT_M))
-                    if np.any(above):
-                        near_cloud = near_cloud[above]
-                    else:
-                        near_cloud = near_cloud[:0]
-                near_pts = [(float(x), float(y))
-                            for x, y, _ in near_cloud]
                 last_error["raycast"] = None
             except Exception as exc:
                 last_error["raycast"] = str(exc)
                 print(f"[tech] lidar scan failed: {exc}")
             try:
                 # Scenario / vehicle registry / raycast fan (shared with
-                # Steam).  The dense 360 LiDAR is now a first-class
-                # obstacle channel on top of this (lidar_obstacles below)
+                # Steam).  The dense 360 LiDAR is a first-class obstacle
+                # channel on top of this (lidar_obstacles in process())
                 # instead of a fallback, so vehicles / pedestrians /
                 # unexpected objects stay covered even without the camera.
-                obstacles, ray_hits = scan_obstacles_all(
+                lua_obstacles, ray_hits = scan_obstacles_all(
                     self.conn.bng, ego_vid, pos, radius=radius,
                     return_hits=True)
-                if ray_hits:
-                    pts = ray_hits
-                # Merge the 360-LiDAR near field on top of the Lua fan so
-                # a wall right in front of the bonnet is never invisible,
-                # whichever sensor channel happened to fire this frame.
-                pts = pts + near_pts
                 last_error["raycast"] = None
             except Exception as exc:
                 last_error["raycast"] = str(exc)
                 print(f"[tech] raycast scan failed: {exc}")
-        # Tech-native LiDAR obstacles: cluster the dense 360 cloud
-        # (with local ground removal) and fuse with the Lua sources.
-        # Lua boxes come first so a vehicle's registry velocity
-        # survives the merge; lidar-only clusters carry a tracker
-        # velocity estimate instead.
+        return _RawRange(cloud=cloud, lua_obstacles=list(lua_obstacles),
+                         ray_hits=list(ray_hits), heading=heading,
+                         radius=float(radius))
+
+    def process(self, payload, pos, ego_vid=None,
+                radius: float = 55.0) -> RangeSample:
+        """CPU-only phase: masks, downsampling, clustering, fusion.
+
+        Never touches the connection, so this is the half that may leave
+        the caller's thread: the same math the synchronous scan always
+        ran, in the same order.
+        """
+        if payload is None:
+            payload = _RawRange()
+        cloud = payload.cloud
+        heading = payload.heading
+        radius = float(payload.radius or radius)
+        obstacles: list[Obstacle] = list(payload.lua_obstacles)
+        pts: list[tuple[float, float]] = []
+        ox, oy = float(pos[0]), float(pos[1])
+        oz = float(pos[2])
+        # Lane-corridor hits (unchanged semantics): world z window around
+        # the ego, self footprint removed, voxel-capped.
+        dist = np.hypot(cloud[:, 0] - ox, cloud[:, 1] - oy)
+        keep = ((dist >= 2.5) & (dist <= radius)
+                & (np.abs(cloud[:, 2] - oz) <= 4.0))
+        # Near-field 360-LiDAR points (1-2.5 m) are kept ONLY for the
+        # raw-sensor emergency-stop / approach-speed layer
+        # (forward_clearance_m).  The cluster/corridor pool still starts
+        # at 2.5 m so the own car's tail / wheel guards do not become
+        # road obstacles, but a wall 1-2 m off the bonnet must remain
+        # visible or the car floors the throttle into it while standing
+        # still (throttle=94.7% at v=0).
+        near_keep = ((dist >= 1.0) & (dist < 2.5)
+                     & (np.abs(cloud[:, 2] - oz) <= 4.0))
+        if heading is not None:
+            uf = np.array([np.cos(heading), np.sin(heading)])
+            ur = np.array([-uf[1], uf[0]])
+            local = cloud[:, :2] - np.asarray(pos[:2], dtype=float)
+            on_car = ((np.abs(local @ uf)
+                       <= self._ego_half_len + LIDAR_SELF_MARGIN)
+                      & (np.abs(local @ ur)
+                         <= self._ego_half_w + LIDAR_SELF_MARGIN))
+            keep = keep & ~on_car
+            near_keep = near_keep & ~on_car
+        kept = downsample_cloud(cloud[keep])
+        pts = [(float(x), float(y)) for x, y, _ in kept]
+        # Drop the local ground plane from the near field the same way
+        # lidar_obstacles does: on flat ground the 1-2.5 m band is full of
+        # ground returns that project onto the emergency corridor and pin
+        # the car forever (EMERGENCY STOP raw clear=0.7m everywhere, v
+        # never leaves 0).  A wall / tree / vehicle right off the bonnet
+        # still has points above the ground clearance and stays visible.
+        near_cloud = downsample_cloud(cloud[near_keep])
+        if len(near_cloud) >= 4:
+            gnd = _local_ground_z(near_cloud, ox, oy)
+            above = ((near_cloud[:, 2] - gnd >= LIDAR_GROUND_CLEARANCE_M)
+                     & (near_cloud[:, 2] - gnd <= LIDAR_MAX_HEIGHT_M))
+            if np.any(above):
+                near_cloud = near_cloud[above]
+            else:
+                near_cloud = near_cloud[:0]
+        near_pts = [(float(x), float(y)) for x, y, _ in near_cloud]
+        if payload.ray_hits:
+            pts = list(payload.ray_hits)
+        # Merge the 360-LiDAR near field on top of the Lua fan so a wall
+        # right in front of the bonnet is never invisible, whichever
+        # sensor channel happened to fire this frame.
+        pts = pts + near_pts
+        # Tech-native LiDAR obstacles: cluster the dense 360 cloud (with
+        # local ground removal) and fuse with the Lua sources.  Lua boxes
+        # come first so a vehicle's registry velocity survives the merge;
+        # lidar-only clusters carry a tracker velocity estimate instead.
         if len(cloud) >= 4:
             try:
                 boxes = lidar_obstacles(
@@ -391,6 +427,18 @@ class TechRangeProvider(RangeProvider):
             for sector in _split_raycast_sectors(pts, (ox, oy)):
                 obstacles.extend(_cluster_points(sector, split_walls=True))
         return RangeSample(obstacles=obstacles, ray_hits=pts)
+
+    def scan(self, pos, ego_vid=None, radius: float = 55.0) -> RangeSample:
+        """Synchronous contract: exactly ``process(fetch(...))``.
+
+        Kept as the fallback and as the equivalence reference for the
+        split (tests pin that both paths return the same sample).  The
+        drive loop may instead run ``fetch`` on this thread and
+        ``process`` on a worker - the same work with the clustering off
+        the control path.
+        """
+        return self.process(self.fetch(pos, ego_vid, radius), pos,
+                            ego_vid, radius)
 
     def close(self) -> None:
         with self.conn.io_lock:
