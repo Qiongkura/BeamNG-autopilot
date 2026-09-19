@@ -46,6 +46,11 @@ def main() -> int:
     ap.add_argument("--cam-h", type=int, default=403)
     ap.add_argument("--seg-model", type=str, default=None,
                     help="segmentation checkpoint override (default deployed model)")
+    ap.add_argument("--line-seg-model", type=str, default=None,
+                    help="optional separate painted-line checkpoint; road mask "
+                         "still comes from --seg-model, while line extraction "
+                         "uses this checkpoint (recommended for the paved-" 
+                         "shoulder fine-tune until its line head is revalidated)")
     ap.add_argument("--teleport", nargs=3, type=float, default=None,
                     metavar=("X", "Y", "YAW_DEG"),
                     help="teleport to an open stretch before driving")
@@ -72,6 +77,15 @@ def main() -> int:
                          "on 52.7%% of frames (town_1789142315).  Do not "
                          "enable without a redesign anchored to painted "
                          "lines.")
+    ap.add_argument("--paved-lane", action="store_true",
+                    help="OPT-IN, not proven: use the paved-boundary lane "
+                         "candidate on a paved road with no usable marking "
+                         "(keep right against the observed paved edge).  "
+                         "Default OFF: live 2026-09-18 with the deployed "
+                         "model the car rode the lane line and hit the "
+                         "guardrail, because the road mask classifies the "
+                         "gravel shoulder as pavement.  Needs a trustworthy "
+                         "pavement edge (fine-tuned model) + live A/B.")
     ap.add_argument("--e2e-model", type=str, default=None,
                     help="trained E2ENetTorch checkpoint to rank as the "
                          "neural planning candidate (default: "
@@ -104,6 +118,12 @@ def main() -> int:
     ap.add_argument("--traffic", type=int, default=0, metavar="N",
                     help="park N NPC vehicles along the route (YOLO / "
                          "obstacle-fusion verification; best-effort)")
+    ap.add_argument("--vis", type=int, default=0, metavar="N",
+                    help="render a live lane-recognition overlay every N "
+                         "ticks into logs/m5_vis/live/ (0 = off): camera "
+                         "frame + road/line masks + world markings + the "
+                         "accepted lane reference and its hard boundaries "
+                         "+ BEV panel + HUD")
     ap.add_argument("--no-shadow", action="store_true",
                     help="disable shadow-episode recording during the drive")
     args = ap.parse_args()

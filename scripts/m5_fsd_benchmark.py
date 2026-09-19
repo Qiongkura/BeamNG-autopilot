@@ -109,6 +109,7 @@ _DRIVE_ARG_DEFAULTS = {
     "cam_w": 536,
     "cam_h": 403,
     "seg_model": None,
+    "line_seg_model": None,
     "teleport": None,
     "out": None,
     "lane_mode": "map",
@@ -124,7 +125,9 @@ _DRIVE_ARG_DEFAULTS = {
     "no_signal": False,
     "ring": "front",
     "no_shadow": False,
+    "vis": 0,
     "corridor_lane": False,
+    "paved_lane": False,
 }
 
 
@@ -208,6 +211,8 @@ def main() -> int:
     ap.add_argument("--no-dqn", action="store_true")
     ap.add_argument("--seg-model", type=str, default=None,
                     help="segmentation checkpoint override")
+    ap.add_argument("--line-seg-model", type=str, default=None,
+                    help="separate painted-line checkpoint")
     ap.add_argument("--traffic", type=int, default=0, metavar="N",
                     help="park N NPC vehicles along the route")
     ap.add_argument("--no-signal", action="store_true")
@@ -236,6 +241,7 @@ def main() -> int:
         "no_bc": args.no_bc,
         "no_dqn": args.no_dqn,
         "seg_model": args.seg_model,
+        "line_seg_model": args.line_seg_model,
         "traffic": int(args.traffic),
         "no_signal": args.no_signal,
         "corridor_lane": bool(getattr(args, "corridor_lane", False)),

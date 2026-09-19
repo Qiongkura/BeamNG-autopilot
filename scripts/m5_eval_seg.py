@@ -31,6 +31,9 @@ from beamng_autopilot import config
 from beamng_autopilot.vision.segmentation import (
     Segmenter, N_CLASSES, CLASS_NAMES, iou_from_accum,
 )
+from beamng_autopilot.vision.dataset_split import (
+    FrameRef, select_hard_negatives,
+)
 
 
 def main() -> None:
@@ -47,6 +50,11 @@ def main() -> None:
                          "negative on pixel line IoU)")
     ap.add_argument("--save", action="store_true",
                     help="保存可视化对比帧")
+    ap.add_argument("--hard-neg-out", type=str, default=None,
+                    help="写出 hard-negative 清单（预测为标线而标签不是的像素占比 "
+                         "最高的帧），供训练集增补")
+    ap.add_argument("--hard-neg-n", type=int, default=50,
+                    help="清单里保留的帧数（默认 50）")
     ap.add_argument("--save-n", type=int, default=12,
                     help="最多保存多少帧（默认 12，均匀采样）")
     ap.add_argument("--json", type=str, default=None,
@@ -86,6 +94,8 @@ def main() -> None:
     # 按 run 聚合：总体指标之外，每组单独报 mIoU / line IoU / 近场 /
     # 像素准确率 / 标线像素占比。
     run_stat: dict[str, dict] = {}
+    hard_neg_frames: list = []
+    hard_neg_files: list = []
     for idx, (run_name, f) in enumerate(files):
         d = np.load(f)
         colour, label = d["colour"], d["label"]
@@ -97,6 +107,17 @@ def main() -> None:
         correct = int(((pred == label) & known).sum())
         n_correct += correct
         n_pix += int(known.sum())
+        # Plan E7 hard negatives: line-like pixels the LABEL says are not
+        # paint - kerbs, wet reflections, wall edges, red-white posts.
+        # This is the only place predictions and labels meet, so it is
+        # where the per-frame hard-negative score can honestly come from.
+        hard_neg_frames.append(FrameRef(index=len(hard_neg_frames),
+                                        run=run_name, t=float(idx),
+                                        hard_neg=int(((pred == 2)
+                                                      & (label != 2)
+                                                      & known).sum())
+                                        / max(1, int(known.sum()))))
+        hard_neg_files.append(str(f))
         for c in range(N_CLASSES):
             p = (pred == c) & known
             t = (label == c) & known
@@ -196,6 +217,24 @@ def main() -> None:
             "per_run": report_runs,
         }, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"  JSON 报告 -> {args.json}")
+    if args.hard_neg_out and hard_neg_frames:
+        _top = select_hard_negatives(hard_neg_frames,
+                                     want=int(args.hard_neg_n))
+        manifest = {
+            "why": ("frames with the strongest false-positive line evidence "
+                    "(predicted line where the label says not paint) - the "
+                    "hard negatives plan E7 asks to add to the training set"),
+            "n_frames": len(hard_neg_frames),
+            "n_selected": len(_top),
+            "frames": [{"file": hard_neg_files[r.index], "run": r.run,
+                        "score": round(r.hard_neg, 6)} for r in _top],
+        }
+        _p = Path(args.hard_neg_out)
+        _p.parent.mkdir(parents=True, exist_ok=True)
+        _p.write_text(json.dumps(manifest, indent=1, ensure_ascii=False),
+                      encoding="utf-8")
+        print(f"  hard negatives -> {_p} ({len(_top)} of "
+              f"{len(hard_neg_frames)} frames)")
     if args.save:
         print(f"  可视化 -> {config.LOGS_DIR / 'm5_seg' / 'eval'}/eval_*.png")
     print("=" * 56)

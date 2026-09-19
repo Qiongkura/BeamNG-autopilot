@@ -20,6 +20,7 @@ Controls:
     c           clear the whole label
     trackbar    brush size 1-40
     z           zoom 2x / 1x
+    a / Left    previous frame (back)
     s           save + next frame
     q           quit
 
@@ -78,9 +79,15 @@ def main() -> int:
     ap.add_argument("--out", type=str, default=None)
     ap.add_argument("--prefill-model", type=str, default=None,
                     help="用分割模型预填 road/line，人工只需修正误检/漏检")
+    ap.add_argument("--review-incomplete", action="store_true",
+                    help="只打开已有标签中 road 占比低于 --min-road-frac 的帧")
+    ap.add_argument("--min-road-frac", type=float, default=0.10,
+                    help="--review-incomplete 的 road 标签比例阈值")
     args = ap.parse_args()
 
     frames = []
+    resume_labels: dict[int, np.ndarray] = {}
+    resume_paths_by_source: dict[int, tuple[Path, Path]] = {}
     if args.grab:
         from beamng_autopilot.connector import BeamNGConnector
         rt = getattr(args, "runtime", "tech")
@@ -98,6 +105,15 @@ def main() -> int:
             except ValueError:
                 idx = len(frames)
             frames.append((np.asarray(d["colour"], dtype=np.uint8), idx))
+            if "label" in d.files:
+                resume_labels[idx] = np.asarray(d["label"],
+                                                dtype=np.uint8).copy()
+                if args.out and Path(args.out).resolve() == \
+                        Path(args.frames_dir).resolve():
+                    resume_paths_by_source[idx] = (
+                        Path(f), Path(f).with_name(
+                            Path(f).name.replace("frame_", "preview_", 1)
+                                      .replace(".npz", ".png")))
     elif args.episode:
         ep = (sorted(glob.glob(str(config.LOGS_DIR / "m5_e2e"
                                / "shadow_fsd_*.npz")),
@@ -107,6 +123,18 @@ def main() -> int:
     if not frames:
         print("no frames to annotate (use --episode / --frames-dir / --grab)")
         return 1
+    if args.review_incomplete:
+        before = len(frames)
+        frames = [
+            (rgb, idx) for rgb, idx in frames
+            if idx not in resume_labels
+            or float(np.mean(resume_labels[idx] == CLS_ROAD))
+            < float(args.min_road_frac)]
+        print(f"[annotate] review-incomplete: {len(frames)}/{before} frames "
+              f"(road < {args.min_road_frac:.2f})")
+        if not frames:
+            print("[annotate] no incomplete frames found")
+            return 0
 
     prefill = None
     if args.prefill_model:
@@ -130,7 +158,11 @@ def main() -> int:
     save_i = [0]
     undo_stack: list = []
 
-    def _initial_label(frame):
+    def _initial_label(frame, source_idx=None):
+        if source_idx in resume_labels:
+            cached = resume_labels[source_idx]
+            if cached.shape == frame.shape[:2]:
+                return cached.copy()
         if prefill is None:
             return np.zeros(frame.shape[:2], dtype=np.uint8)
         try:
@@ -144,9 +176,48 @@ def main() -> int:
             return np.zeros(frame.shape[:2], dtype=np.uint8)
 
     rgb, fidx = frames[0]
-    label = _initial_label(rgb)
+    label = _initial_label(rgb, fidx)
+    # Keep the current label in memory by SOURCE frame.  Going back must
+    # restore the work (including unsaved fixes), and saving a revisited
+    # frame must overwrite its existing output instead of creating a
+    # duplicate training sample.
+    label_cache: dict[int, np.ndarray] = {0: label.copy()}
+    saved_paths: dict[int, tuple[Path, Path]] = {
+        fi0: resume_paths_by_source[src_idx]
+        for fi0, (_rgb0, src_idx) in enumerate(frames)
+        if src_idx in resume_paths_by_source}
     painting = False
     last_pt = None
+
+    def _cache_current() -> None:
+        label_cache[fi] = label.copy()
+
+    def _load_frame(target: int) -> None:
+        nonlocal fi, rgb, fidx, label
+        _cache_current()
+        fi = int(target)
+        rgb, fidx = frames[fi]
+        cached = label_cache.get(fi)
+        label = (cached.copy() if cached is not None
+                 else _initial_label(rgb, fidx))
+        undo_stack.clear()
+
+    def _save_current() -> None:
+        _cache_current()
+        if fi not in saved_paths:
+            save_i[0] += 1
+            saved_paths[fi] = (
+                out_dir / f"frame_{save_i[0]:05d}.npz",
+                out_dir / f"preview_{save_i[0]:05d}.png")
+        fp, prev = saved_paths[fi]
+        np.savez_compressed(str(fp), colour=rgb, label=label)
+        ov = rgb.copy()
+        ov[label == CLS_ROAD] = (ov[label == CLS_ROAD] * 0.6
+                                 + np.array([255, 120, 0]) * 0.4
+                                 ).astype(np.uint8)
+        ov[label == CLS_LINE] = (0, 255, 0)
+        cv2.imwrite(str(prev), cv2.cvtColor(ov, cv2.COLOR_RGB2BGR))
+        print(f"[saved] {fp.name} (src#{fidx})")
 
     def _push_undo():
         undo_stack.append(label.copy())
@@ -166,8 +237,8 @@ def main() -> int:
                    f"undo={len(undo_stack)}"
         for txt, row in (
                 (f"[{fi + 1}/{len(frames)}] src#{fidx} {tool_txt}", 20),
-                ("1/2/3 class  b=tool  u=undo  c=clear  s=save+next  "
-                 "q=quit", 40)):
+                ("1/2/3 class  b=tool  f=fill  p=pen  a/Left=back  "
+                 "u=undo  c=clear  z=zoom  s=save+next  q=quit", 40)):
             cv2.putText(big, txt, (8, row), cv2.FONT_HERSHEY_SIMPLEX,
                         0.5, (0, 0, 0), 3)
             cv2.putText(big, txt, (8, row), cv2.FONT_HERSHEY_SIMPLEX,
@@ -250,25 +321,15 @@ def main() -> int:
             label[:] = 0
         elif key == ord("z"):
             zoom = 1 if zoom == 2 else 2
+        elif key in (ord("a"), 81):       # 81 = left arrow
+            if fi > 0:
+                _load_frame(fi - 1)
         elif key == ord("s"):
-            save_i[0] += 1
-            fp = out_dir / f"frame_{save_i[0]:05d}.npz"
-            np.savez_compressed(str(fp), colour=rgb, label=label)
-            prev = out_dir / f"preview_{save_i[0]:05d}.png"
-            ov = rgb.copy()
-            ov[label == CLS_ROAD] = (ov[label == CLS_ROAD] * 0.6
-                                     + np.array([255, 120, 0]) * 0.4
-                                     ).astype(np.uint8)
-            ov[label == CLS_LINE] = (0, 255, 0)
-            cv2.imwrite(str(prev), cv2.cvtColor(ov, cv2.COLOR_RGB2BGR))
-            print(f"[saved] {fp.name} (src#{fidx})")
-            fi += 1
-            if fi >= len(frames):
+            _save_current()
+            if fi >= len(frames) - 1:
                 print("[annotate] all frames done")
                 break
-            rgb, fidx = frames[fi]
-            label = _initial_label(rgb)
-            undo_stack.clear()
+            _load_frame(fi + 1)
         _render()
     cv2.destroyAllWindows()
     print(f"[annotate] annotations in {out_dir} - training-ready by "

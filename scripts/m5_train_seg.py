@@ -45,6 +45,10 @@ from beamng_autopilot import config
 from beamng_autopilot.vision.segmentation import (
     SegUNet, N_CLASSES, CLASS_NAMES, iou_from_accum,
 )
+from beamng_autopilot.vision.dataset_split import (
+    FrameRef, coverage_digest, leak_check, select_weak_lines,
+    split_by_group,
+)
 
 
 def load_frames(
@@ -107,6 +111,9 @@ def load_frames(
             if min_line_frac > 0 and (label == 2).mean() < min_line_frac:
                 continue
             frames.append((colour, label))
+            # kept so the weak/faded-line band can be selected for real
+            # (plan E7) instead of inferred from the run average
+            rec.setdefault("fracs", []).append(float((label == 2).mean()))
             n_kept += 1
         rec["kept"] = n_kept
         rec["line_px_frac"] = line_px / max(1, n_run * n_pix)
@@ -179,7 +186,7 @@ def train_run_bounds(
     """
     bounds: list[tuple[int, int]] = []
     train_only_runs = train_only_runs or set()
-    if split == "per-run":
+    if split in ("per-run", "by-map-scene"):
         off = 0
         for name, rec in per_run.items():
             k = rec["kept"]
@@ -317,10 +324,17 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val-frac", type=float, default=0.2)
-    ap.add_argument("--split", choices=["tail", "per-run"], default="tail",
+    ap.add_argument("--split",
+                    choices=["tail", "per-run", "by-map-scene"],
+                    default="tail",
                     help="验证划分：tail=全部 run 拼接后取全局尾部 "
                          "(默认，历史行为)；per-run=每个 run 各取尾部 "
                          "val_frac 做验证，避免稀疏 run 主导验证集")
+    ap.add_argument("--weak-line-oversample", type=int, default=0,
+                    help="把淡线/远场带（low..high 的 line 占比）的训练帧额外重复 "
+                         "N 次（增补，不替换密集标线数据）；0=关闭")
+    ap.add_argument("--weak-line-low", type=float, default=0.0005)
+    ap.add_argument("--weak-line-high", type=float, default=0.01)
     ap.add_argument("--min-line-frac", type=float, default=0.0,
                     help="丢弃标线像素占比低于该值的帧（如 0.003），"
                          "防止无标线路段稀释 line 监督")
@@ -397,8 +411,52 @@ def main() -> None:
                                   thin_line=int(args.thin_line_labels or 0))
     n = len(frames)
     train_frames, val_frames = split_frames(
-        frames, per_run, args.split, args.val_frac,
-        train_only_runs=train_only_runs)
+        frames, per_run, args.split if args.split != "by-map-scene" else "tail",
+        args.val_frac, train_only_runs=train_only_runs)
+    if args.split == "by-map-scene":
+        # Plan E7: split by map/scene group (the run name carries the
+        # scene - and the map when the run recorded one), never by
+        # shuffling frames, and AUDIT the result: a group on both sides or
+        # a map with no validation frames is reported, not trusted.
+        refs = []
+        for _name, _rec in per_run.items():
+            _fracs = _rec.get("fracs") or []
+            for _i in range(_rec["kept"]):
+                refs.append(FrameRef(index=_rec["start"] + _i, run=_name,
+                                     t=float(_i),
+                                     line_frac=(_fracs[_i]
+                                                if _i < len(_fracs)
+                                                else 0.0)))
+        plan = split_by_group(refs, val_frac=args.val_frac)
+        train_frames = [frames[r.index] for r in plan.train]
+        val_frames = [frames[r.index] for r in plan.val]
+        _leak = leak_check(plan)
+        _cov = coverage_digest(plan)
+        print(f"[train] split by-map-scene: {len(plan.groups_train)} 训练组 / "
+              f"{len(plan.groups_val)} 验证组, 泄漏={_leak['leak']}",
+              flush=True)
+        if _cov["maps_without_val"]:
+            print(f"[train] 注意：以下组没有验证帧 -> "
+                  f"{_cov['maps_without_val']}", flush=True)
+        if _leak["leak"]:
+            print(f"[train] 严重：划分泄漏 {_leak['leaked_frames'][:8]}",
+                  flush=True)
+    if args.weak_line_oversample > 0 and train_frames:
+        _refs = [FrameRef(index=i, run="", t=float(i),
+                          line_frac=float((lb == 2).mean()))
+                 for i, (_img, lb) in enumerate(train_frames)]
+        _weak = select_weak_lines(_refs, low=args.weak_line_low,
+                                  high=args.weak_line_high)
+        if _weak:
+            _pick = [train_frames[r.index] for r in _weak]
+            for _ in range(int(args.weak_line_oversample)):
+                train_frames.extend(_pick)
+            print(f"[train] weak-line oversample: {len(_pick)} 帧 x"
+                  f"{int(args.weak_line_oversample)} 已加入训练集",
+                  flush=True)
+        else:
+            print(f"[train] weak-line band {args.weak_line_low}.."
+                  f"{args.weak_line_high}: 没有符合条件的帧", flush=True)
     train_bounds = train_run_bounds(
         frames, per_run, args.split, args.val_frac,
         train_only_runs=train_only_runs)
