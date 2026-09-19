@@ -29,6 +29,14 @@ CROSS_CENTRE_M = 0.1
 CROSS_RIGHT_M = -0.1
 NEAR_LINE_M = 0.25          # "on the line" band (report-only)
 OFF_ROAD_M = 0.05           # road_off > 0 means outside a DecalRoad edge
+# Off-pavement verdict from the ROUTE distance (the honest metric when
+# the run carries route_dist): half of a ~7 m two-lane road plus a small
+# tolerance - beyond this the car is on the shoulder, whatever the
+# perception boundaries claim.
+ROAD_HALF_WIDTH_M = 3.0
+# Metres beyond the road edge polyline before the run counts as
+# off-pavement (small tolerance for mask/GPS-level noise in the edges).
+EDGE_OVER_M = 0.3
 STALL_SPEED_MPS = 0.5
 STALL_REM_END_M = 8.0       # only count stalls away from the end zone
 
@@ -190,10 +198,32 @@ def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
     out["max_body_right_m"] = (round(max_body_right, 3)
                                if max_body_right is not None else None)
 
-    # off-road
+    # off-road.  Two sources, and they are NOT equivalent: ``road_off``
+    # is PERCEPTION-based (distance past a detected boundary; blind in
+    # strict mode when no boundary is published) while ``route_dist`` is
+    # the distance from the nav-route road CENTRELINE - the honest
+    # off-pavement metric.  When the run carries route_dist, off-road is
+    # judged on it (ROAD_HALF_WIDTH_M); the perception value stays in
+    # the report for diagnosis.
+    rd = [_f(hist, "route_dist", i) for i in settled]
+    rd_v = [v for v in rd if _num(v)]
     ro = [_f(hist, "road_off", i) for i in settled]
     ro_v = [v for v in ro if _num(v)]
-    out["off_road_frames"] = sum(1 for v in ro_v if v > OFF_ROAD_M)
+    # The precise verdict: metres beyond the road's own edge polylines
+    # (edge_over, > EDGE_OVER_M = off the pavement).  Fallbacks:
+    # route_dist (centre distance vs half width), then the perception
+    # road_off (blind in strict mode - kept for old telemetry).
+    eo = [_f(hist, "edge_over", i) for i in settled]
+    eo_v = [v for v in eo if _num(v)]
+    if eo_v:
+        out["off_road_frames"] = sum(1 for v in eo_v if v > EDGE_OVER_M)
+        out["max_edge_over_m"] = round(max(eo_v), 3)
+    elif rd_v:
+        out["off_road_frames"] = sum(1 for v in rd_v
+                                     if v > ROAD_HALF_WIDTH_M)
+        out["max_route_dist_m"] = round(max(rd_v), 3)
+    else:
+        out["off_road_frames"] = sum(1 for v in ro_v if v > OFF_ROAD_M)
     out["max_road_off_m"] = round(max(ro_v), 3) if ro_v else 0.0
 
     # speed profile / smoothness
