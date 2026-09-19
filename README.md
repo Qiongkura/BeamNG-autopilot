@@ -129,6 +129,132 @@ BEV/向量空间 → 占用 → 规划 → 安全 → 影子数据闭环**。现
   倒车（默认最多 1.5m / 2.5s / -0.4m/s），停下后重新规划前进；溜坡失控
   （低于 -3.0m/s）立即终止整个 maneuver；纯状态机可离线单测。
 
+### 5b) 安全降级链：路径保持 / 越界分级 / 障碍风险 / 候选滞回（2026-09-19）
+
+实施方案第一、二轮落地在四个纯逻辑模块上，全部先有单测再接进实车循环：
+
+- **有限时长 PATH_HOLD**（`safety_monitor.PathHold`）：某帧没有可驾驶路径时，
+  在窗口内复用**上一条已通过校验**的轨迹，而不是立即全停。宽限 0.3s 保持原
+  目标速度，0.3–0.8s 降到最小风险蠕行速度，超时即清除并 fail-closed 停车
+  （阈值在 `config.FSD_PATH_HOLD_*`）。复用前按**当前**场景重校验：车身当前
+  压线 / 保持轨迹压线 / 占用阻塞任一命中即拒绝。`fsd_drive` 只在「判定可驾驶 +
+  传感器新鲜 + 感知来源」时 offer（规则/地图兜底与陈旧帧永不入缓存），任务
+  结束时 path-hold 帧数与 safe-stop 帧数**分开统计**。过期后只有新的已验证
+  轨迹能让车重新走起来（重新起步确认）。
+- **current/planned 越界拆分**（`vehicle_body.first_boundary_crossing_detail`
+  → `constraints.body_lane_cross_detail_m`）：当前车身压线仍然立即停车（收敛
+  恢复例外不变）；只有**规划扫掠**的远端越界（首次越界 ≥ `FSD_PLANNED_CROSS_HARD_M`
+  4m）改为限速 4m/s 等下一帧重规划。verdict 带 `body_cross_current /
+  body_cross_planned / first_crossing_distance_m / crossing_path_index /
+  crossing_boundary_side`。`boundary_confidence` 有意留空——现有边界没有置信度。
+- **障碍物风险分级**（`obstacle_risk.py`）：把「有障碍」升级为「多紧急」——
+  `hard_collision`（接触带内，不等确认）/`braking_obstacle`/`roadside_clutter`
+  （走廊外，只在预测侵入走廊时才参与）/`unknown`（走廊内但未连续两帧确认，
+  不给限速）。限速取停距上界 `sqrt(2a(gap-margin-closing*reaction))`，静态障碍
+  的 TTC 来自**自车运动**而非臆造目标速度。作为独立后置层套在核心判定之后，
+  因此降级分支和被复用的 hold 帧同样受约束（测试固定：hold 被接触带障碍拦停）。
+- **转向整形**（阶段 D3，`control/steering.py`）：在既有的一阶速率限制之上加了
+  **二阶（jerk）限制**与**小幅反向抑制**——请求方向在窗口内翻转超过允许次数、且请求
+  与已施加角都在小的 trim 带内时，保持轮角并让速率归零，这正是「几厘米幅度、每秒数次
+  的反向抖动」；大幅命令永不被抑制，`force=True` 可整体绕过（限幅器不得延误安全动作）。
+  遥测每帧输出 `steer_rate` / `steer_jerk` / `steer_rev` / `steer_supp`。
+- **速度加权转向混合**（阶段 D2，`control/blend.py`）：Pure Pursuit + 曲率前馈仍是底，
+  **默认关闭**；开启（`BEAMNG_STEER_BLEND=1`）后按速度在两个端点间插值加入横向/航向
+  误差反馈——横向增益随速度**下降**（0.12→0.05 /m，低速小偏差好修、高速晚拉正是画龙
+  的原因），航向增益随速度**上升**（0.35→0.60 /rad，高速需要尽早摆正车头）。两个误差
+  都按「方向盘该怎么做」取值（正=右转），测量对象是规划器发布的那条轨迹，不是地图线
+  或偏移常量。遥测每帧输出各项与调度权重（`steer_blend`）。
+- **纵向计划合成与整形**（阶段 D4，`planning/longitudinal.py`）：把「道路曲率 / 横向
+  加速度 / 障碍 TTC / 感知置信度」合成到**一个**目标（取最紧的上限，再按最弱置信度
+  **只降不升**缩放；缺证据=不惩罚——没有车道包络就停车不是合法降级），并用**加速度 +
+  加速度变化率（jerk）**双重限幅把参考速度整形到目标，不冲过头、坏 dt 不产出 NaN。
+  不复算已有公式：曲率用 `speed_profile.COMFORT_LAT`、障碍用 `obstacle_risk.ttc_speed_cap`。
+  默认关闭（`BEAMNG_LONG_PLAN=1` 开启），紧急分支（force_stop / 硬停）在其上层，
+  舒适整形不可能延误安全动作；遥测输出各项与整形后的参考（`long_plan`）。
+- **显式驾驶模式**（阶段 D5，`control/drive_mode.py`）：把起步 / 低速对准 / 巡航 / 弯道
+  入口 / 障碍制动 / 受控停车 / 恢复七种情形显式化，各带自己的策略——起步降低转向权限
+  （0.6，避免起步瞬间猛打方向）、受控停车与障碍制动**禁止油门**（踏板不再互抢）、恢复段
+  以 ≤1.5 m/s 蠕行；升级立即生效、降级需等 dwell 窗口；「感知不可用时的停止」算停车不算
+  恢复（恢复需要感知，不只是命令解除）。默认关闭（`BEAMNG_DRIVE_MODES=1` 开启），
+  遥测每帧输出 `drive_mode` / `mode_why` / `mode_switches`。
+- **候选轨迹滞回**（`planning/hysteresis.py`）：路径代价在噪声级别的两个候选不再
+  隔帧轮流获胜。保留条件严格——被保留的候选必须**本帧仍被约束层接受**，切换
+  只在「无前值 / 前值不再可行 / 调用方判定紧急 / 未满足 dwell(0.7s) / 前值代价
+  暴涨 / 新候选便宜超过 margin」时发生；`meta["hysteresis"]` 输出 switch /
+  reason / age / 计数。
+- **分割像素概率与双门控**（阶段 E1，`vision/seg_probs.py` + `vision/segmentation.py` +
+  `vision/heads/semantic.py`）：不再只用 argmax——`Segmenter.predict_with_probs()` 用**同一次
+  前向**同时给出掩码与逐类概率，`gate_masks()` 施加方案要的双门控：线概率过阈值**且**
+  该像素处在**路面上下文**中（上下文是 max-filter 后的路面概率，因为白漆本来就不是沥青，
+  在像素处门控会抹掉每条真标线）。路面掩码改为软阈值，50/50 边界像素不再翻转可行驶掩码；
+  模型没有的通道报 None 而非伪造零值。接线在语义头、**默认关闭**（`BEAMNG_SEG_PROB_GATE=1`
+  开启），且只做“减像素”：作用于**当前帧**掩码、在时序证据融合**之前**，因此 E3 的丢线
+  续航不受影响；黄色先验作为额外线源同样必须过路面上下文门控。遥测输出门控统计
+  （`seg_gate`：两级门控前后像素数、线概率与路面上下文均值）。
+- **近/中/远分区阈值**（阶段 E2，`vision/seg_zones.py`）：同一阈值服务全图会两难——严到
+  挡住近场假线，就会丢掉规划需要的远处若隐若现的真标线；松到留住远线，路缘杂物就会钻到
+  车头下。分区按图像的**行**划分（相机正是在行上看到距离）：近区阈值最严、历史保持最短；
+  中区平衡；远区阈值最松，但**必须有时序历史支持**——这是方案「允许更宽松候选，但必须满足
+  几何连续性」在时序侧可执行的一半（几何一致性属 E4）。没有历史掩码时保留远区候选但计入
+  `far_unconfirmed`（未知 ≠ 被否证）。开关 `BEAMNG_SEG_ZONES=1`（默认关闭），遥测输出
+  `seg_gate_zones`（逐区阈值/保持时长/是否要求历史/前后像素数）与 `seg_gate_mode`。
+- **数据集划分与采样**（阶段 E7，`vision/dataset_split.py` + `m5_train_seg.py` / `m5_eval_seg.py`）：
+  按**地图/场景组**划分（run 名承载场景，元数据带地图时用地图限定），验证集取每组**时间尾部**，
+  相邻帧不会跨边泄漏；划分结果会被**审计**——`leak_check` 报告跨边帧与骑跨组、`coverage_digest`
+  报告每个地图的训练/验证帧数，没有验证帧的组合会被点名。`--weak-line-oversample N` 把淡线/
+  远场带（`--weak-line-low/high` 的标线占比区间）训练帧额外重复 N 次，是**增补**而非替换
+  （早期"只留密集帧"的实验让模型变差）。hard negative 由评估脚本产出：逐帧统计「预测为标线
+  而标签不是」的像素占比，`--hard-neg-out` 写出最差 N 帧的清单（含分数与来源 run）；训练侧
+  尚未自动消费该清单——增补会改变模型学到的东西，属需要显式实验的决定，不做静默默认。
+- **车道/标线评估指标**（阶段 E6，`lane/metrics.py` + `scripts/m5_lane_metrics.py`）：不再只看
+  `val_mIoU`——指标按「允许知道什么」分成两半：**观测类**（paired_rate / in_lane_rate /
+  line_lat_std / 车道宽均值与标准差 / future 1s、2s 压线率，从遥测自身算出）与**参考类**
+  （false_pair_rate / false_boundary_rate / line_lat 误差 / 近中远分区召回，需要标签）。
+  没有标签时参考类输出 `None`、报告写 `n/a (no labels)`；而观测类若该次运行根本没记录则写
+  `n/a (no data)`——两种缺失必须可区分。用预测给自己打分正是 E6 要防的失效模式（README 里
+  v13b 的教训：line IoU 0.02 的模型拿到 85% 的"召回"）。`false_boundary_rate` 只在**发布了
+  边界**的帧上统计，弃权不被记功也不被记过。用法：
+  `python scripts/m5_lane_metrics.py --hist logs/<run>.json [--labels gt.json]`。
+- **标线证据来源置信度**（`vision/line_evidence.py`，E3）：世界坐标累积 + ego 位姿
+  补偿本就在跑，本轮补上**双置信度**——`current_confidence`（支持格中被本帧刷新
+  的比例）与 `history_confidence`（保持证据的强度×衰减），以及从**最后一次真正
+  看到标线**起算的 `since_observation_s` / `expired`；连续丢线超过 `MAX_AGE_S`
+  明确失效，而不是只靠逐格衰减。
+- **控制与感知解耦**（阶段 A2/A4，`fsd_drive.py` + `control/substep.py`）：感知+规划
+  tick 保持约 2 Hz 的自然周期，两次 tick 之间以 `FSD_CONTROL_SUBSTEP_HZ`（15 Hz，
+  方案给的 10–20 Hz 带内）重发控制指令——用最新位姿/车速重跑 PurePursuit 与
+  速度控制器（转向限幅、曲率前馈、踏板限速沿用 tick 的参数，只是以子步 dt 执行）。
+  子步**从不规划、也看不到新传感器数据**，所以它授权不了任何 tick 没有授权的东西：
+  只在「缓存计划过期」或「接触带障碍风险」时刹停，车身已经压线时**交回**给下一个
+  tick（收敛恢复规则只属于安全监控器）。`BEAMNG_CONTROL_SUBSTEP=0` 可关闭（A/B 与
+  回退）；遥测记录子步累计数与实际控制指令频率。
+  重感知线程化（`LatestJobRunner`，latest-wins 单槽、不等待、超时只计数、异常只记在
+  结果上）：**纯 CPU 的感知头**（UNet 语义 / YOLO 目标）可放后台，tick 立即返回最新
+  可用输出，输出年龄从其**来源帧**起算。两个上限：strict 模式下语义头**必须同步**
+  （它是横向安全输入，陈旧即 fail-closed 停车），整条路径**默认关闭**，用
+  `BEAMNG_ASYNC_HEADS=1` 开启——把 YOLO 挪出 tick 会改变「NPC 同 tick 进入 BEV」这一
+  被测试固定的契约，属需要实车 A/B 的决定。LiDAR 保持同步：它的读取在 `io_lock` 下
+  访问共享连接，解耦需要先把 provider 拆成「加锁取点 + 无锁聚类」
+  已拆分：`RangeProvider.range_split` 声明两阶段协议，`fetch()` 只在 `io_lock` 内做
+  连接读取（LiDAR poll + Lua fan），`process()` 在**不持锁**的情况下做全部 CPU 工作
+  （掩码/降采样/地面剔除/聚类融合），`scan()` 恒等于 `process(fetch(...))`（等价性有
+  测试固定）。栈侧锁内取点留在 tick 线程、聚类交给 worker，结果落地前服务运动补偿
+  的缓存扫描，采纳时以**取点时刻**记龄（诚实包含处理延迟）。
+
+遥测新增（每帧）：`path_hold_active/phase/age_s`、`body_cross_current/planned`、
+`first_cross_m/cross_idx/cross_side`、`risk_kind/min_ttc/risk_closest_m`、
+`cand_switch/cand_reason/cand_age_s/cand_n_switch`、
+`line_conf_current/line_conf_history/line_ev_age_s/line_ev_expired`；
+结束汇总分别打印 path-hold 帧数、safe-stop 帧数与候选切换次数。
+
+> [!IMPORTANT]
+> 这些阈值（0.3/0.8s、4m、0.7s dwell、2.5m/s² 制动、15Hz 控制子步）沿用实施方案
+> 的初始带，**尚未经过 Tech 实车标定**；方案要求的验收指标（无意义停车 −50%、
+> steering jerk −30%、`candidate_switch_count` −50%、控制周期 P95 ≤150ms）需要
+> 同路线前后基线对照，由 `m5_fsd_benchmark.py` 场景 + 新增遥测字段
+> （`substeps` / `path_hold_*` / `cand_*` / `min_ttc`）产出，属下一轮实车工作。
+> 控制子步只用 `logs/` 之外无副作用的方式回退：`BEAMNG_CONTROL_SUBSTEP=0`。
+
 ### 6) 真实驾驶闭环（`fsd_stack.py`、`scripts/m5_fsd_drive.py`）
 
 - `FSDStack`：一条可调用完整管线——相机环 → HydraNet → 时序占用 → 分层
