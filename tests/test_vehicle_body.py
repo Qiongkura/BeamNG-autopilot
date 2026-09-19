@@ -88,6 +88,27 @@ def test_swept_check_stops_at_the_first_crossing():
     assert dist < 5.0
 
 
+def test_swept_detail_reports_first_segment_and_boundary_side():
+    left = np.array([[0.0, 0.5], [30.0, 0.5]])
+    path = np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]])
+    detail = vehicle_body.first_boundary_crossing_detail(
+        (0.0, 0.0), path, left, None)
+    dist, index, side = detail
+    assert 0.0 < dist < 5.0
+    assert index == 0
+    assert side == "left"
+
+
+def test_swept_detail_reports_right_boundary():
+    right = np.array([[0.0, -0.5], [30.0, -0.5]])
+    path = np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]])
+    dist, index, side = vehicle_body.first_boundary_crossing_detail(
+        (0.0, 0.0), path, None, right)
+    assert dist > 0.0
+    assert index == 0
+    assert side == "right"
+
+
 def test_swept_check_starts_at_the_front_bumper():
     """No near-field hole just past the bumper.
 
