@@ -111,7 +111,9 @@ def _hold_path_occupied_frac(scene, path, skip_m: float = 2.5) -> float:
     return float(np.mean(occ[r[ok], c[ok]] > 0))
 
 
-def select_trajectory(scene, candidate_set, constraints):
+def select_trajectory(scene, candidate_set, constraints, *,
+                      hysteresis=None, now_s: float | None = None,
+                      emergency: bool = False):
     """Return ``(best_path, meta)``.
 
     ``best_path`` is the (N, 2) polyline of the lowest-cost feasible
@@ -120,6 +122,15 @@ def select_trajectory(scene, candidate_set, constraints):
     "kind", "why"), plus the chosen candidate's speed profile (the
     matching longitudinal plan, ``meta["speed_profile"]``) when a scene
     target speed is available.
+
+    ``hysteresis`` (a ``planning.hysteresis.CandidateHysteresis``) makes
+    the choice STICKY: the previously chosen candidate is kept while it
+    is still feasible this tick and no other candidate beats it by more
+    than the configured margin, so two near-equal candidates cannot win
+    on alternate frames.  The decision (including why it held or
+    switched) is published as ``meta["hysteresis"]``.  Safety is
+    untouched: only candidates the constraint scorer accepted this tick
+    are eligible, and hysteresis can never revive a rejected one.
 
     When every fan candidate is rejected, an ego-anchored hold-heading
     path is returned if either the forward corridor is laterally free
@@ -162,13 +173,26 @@ def select_trajectory(scene, candidate_set, constraints):
             }
         return None, {"why": "no feasible candidate"}
     feasible.sort(key=lambda pair: pair[0])
-    cost, best = feasible[0]
+    hyst_info = None
+    if hysteresis is not None:
+        picked = hysteresis.choose(
+            feasible, time.time() if now_s is None else float(now_s),
+            emergency=bool(emergency))
+        if picked is None:
+            return None, {"why": "no feasible candidate"}
+        cost, best, hyst_info = picked
+    else:
+        cost, best = feasible[0]
     meta = {
         "cost": float(cost),
         "kind": best.meta.get("kind", "?"),
         "why": "best-of-N",
         "n_eval": len(feasible),
     }
+    if hyst_info is not None:
+        meta["hysteresis"] = hyst_info
+        if hyst_info.get("reason") in ("min_dwell", "cost_margin"):
+            meta["why"] = "hysteresis_hold"
     # attach the chosen candidate's longitudinal plan
     target = float(getattr(scene, "target_speed", 0.0))
     if best.speed_profile is not None and len(best.speed_profile):

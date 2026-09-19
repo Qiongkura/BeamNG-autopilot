@@ -31,7 +31,7 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from beamng_autopilot.fsd_realism import SRC_CORRIDOR
+from beamng_autopilot.fsd_realism import SRC_CORRIDOR, SRC_PAVED
 
 
 @dataclass
@@ -99,16 +99,19 @@ def strict_lane_unavailable(strict: bool, plan_blocked,
     even when the block flag is absent (docs/fsd_realism.md §4).
 
     ``corridor`` is the width-gated pairing-free PERCEPTION candidate
-    (free corridor right edge + half a lane).  It only ever reaches this
-    check when the lane owner produced it, so accepting the label here
-    cannot unlock map-driven motion: with the feature off the label never
-    occurs and behaviour is unchanged.
+    (free corridor right edge + half a lane); ``paved`` is the perception
+    candidate for a PAVED road with no marking at all (soil-stripped road
+    mask: paved right edge + half a lane, pavement edges as the hard
+    boundaries).  Both only ever reach this check when the lane owner
+    produced them, so accepting the labels here cannot unlock map-driven
+    motion: with a feature off the label never occurs and behaviour is
+    unchanged.
     """
     if not strict:
         return False
     if str(plan_blocked or "") == "no_perception_lane":
         return True
-    return str(lane_src_sel or "") not in ("sensor", SRC_CORRIDOR)
+    return str(lane_src_sel or "") not in ("sensor", SRC_CORRIDOR, SRC_PAVED)
 
 
 def arbitrate_fsd_tick(fsd_path, rule_path, *, fsd_safe: bool = True,

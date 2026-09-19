@@ -21,8 +21,12 @@ from ..vehicle_body import (
     HALF_LENGTH_M,
     HALF_WIDTH_M,
     body_crosses_boundary_now,
+    body_pose_cross_depth_m,
     boundary_lateral as _boundary_lateral,
     first_boundary_crossing_m,
+    first_boundary_crossing_detail,
+    footprint_corners,
+    max_body_cross_depth_m,
 )
 
 
@@ -31,6 +35,15 @@ class Constraints:
     """Weights and feasibility thresholds for trajectory scoring."""
 
     w_collision: float = 5.0
+    # Body-swept obstacle cost: the centreline collision fraction misses a
+    # guardrail box that sits 0.4 m from the path - the cells are clear
+    # but the 0.9 m half-width body contacts it (east_coast bend
+    # 2026-09-19: two contact-and-relaunch stalls, closest_obs 1.2 m).
+    # A candidate whose swept body overlaps obstacle cells pays the
+    # collision weight scaled by the overlap fraction (25% of poses with
+    # a corner inside a box -> full collision weight).
+    w_body_collision: float = 5.0
+    body_collision_full_frac: float = 0.25
     w_curvature: float = 1.0
     w_lane_align: float = 2.0
     w_progress: float = 0.01
@@ -162,6 +175,18 @@ class Constraints:
         if getattr(scene, "strict_perception", False) \
                 and not _has_lane_reference(scene):
             return 1e9, False
+        # Strict mode also owns the ROAD SURFACE evidence: a tick whose
+        # drivable layer is EMPTY has no road anywhere the sensors look
+        # (measured live 2026-09-19 14:31 - the road mask vanished on a
+        # dirt shoulder, the off-drivable gate silently skipped because
+        # "no evidence != grass", and the car drove 40 frames off the
+        # road on lane=sensor).  No road evidence -> no candidate, the
+        # same fail-closed contract as the missing lane.
+        if getattr(scene, "strict_perception", False):
+            _drv = getattr(scene.grid, "drivable", None) \
+                if scene.grid is not None else None
+            if _drv is None or not bool((np.asarray(_drv) > 0).any()):
+                return 1e9, False
         kind = str(candidate.meta.get("kind", ""))
         min_m = self.progress_min_m_ref if kind in self.ref_kinds \
             else self.progress_min_m
@@ -245,6 +270,22 @@ class Constraints:
                 bands=self.corridor_bands):
             feasible = False
         cost += self.w_collision * col
+        # Body-swept obstacle cost: a candidate whose full footprint
+        # overlaps roadside boxes (guardrail / tree clusters) pays the
+        # collision weight even when its centreline cells are clear - the
+        # centreline-only fraction let the car brush a guardrail at
+        # closest_obs 1.2 m twice in one live bend (2026-09-19).
+        _bbad, _btot, _bnear = _path_body_collision(scene, path)
+        if _btot:
+            if _bbad:
+                _bfrac = min(1.0, _bbad / max(1, _btot))
+                cost += self.w_body_collision * min(
+                    1.0, _bfrac / self.body_collision_full_frac)
+            elif _bnear:
+                # half weight: adjacent-cell proximity is the
+                # wedged-against-the-box precursor
+                cost += 0.5 * self.w_body_collision * min(
+                    1.0, _bnear / max(1, _btot))
         cost += self.w_curvature * cost_curvature(path)
         if _has_lane_reference(scene):
             align = cost_lane_align(scene, path)
@@ -309,6 +350,67 @@ def _path_infractions(scene: Scene, path, span: float = 2.0) -> list:
     r, c, ok = _grid_cells(scene.grid, path[cand, 0], path[cand, 1])
     bad = int(np.count_nonzero(ok & (scene.grid.obstacle[r, c] > 0)))
     return [bad, total]
+
+def _path_body_collision(scene: Scene, path,
+                         step_m: float = 0.6,
+                         far_m: float = 16.0) -> tuple[int, int]:
+    """Fraction of swept body poses with a corner inside an obstacle cell.
+
+    The centreline collision check misses a roadside box that sits beside
+    the path: its cells never touch the centreline, but the full 1.8 m
+    wide vehicle sweeps into it.  Every pose along the path (skipping the
+    car's own footprint, same convention as the other gates) places the
+    authoritative footprint rectangle; a corner inside an occupied cell
+    counts as a body collision pose.
+
+    Returns ``(bad_poses, total_poses)``; ``(0, 0)`` without a grid.
+    """
+    path = np.asarray(path, dtype=float)[:, :2]
+    if scene.grid is None or len(path) < 2:
+        return 0, 0
+    pos = np.asarray(scene.pos[:2], dtype=float)
+    extent = float(getattr(scene.grid, "extent", 0.0) or 0.0)
+
+    seg = np.diff(path, axis=0)
+    seg_len = np.linalg.norm(seg, axis=1)
+    arc = np.concatenate([[0.0], np.cumsum(seg_len)])
+    poses: list[tuple[float, float, float]] = []
+    s_cur = 0.0
+    while s_cur <= arc[-1]:
+        i = int(np.searchsorted(arc, s_cur, side="right")) - 1
+        i = min(i, len(seg) - 1)
+        t = (s_cur - arc[i]) / seg_len[i] if seg_len[i] > 1e-9 else 0.0
+        px, py = path[i] + t * seg[i]
+        d = math.hypot(px - pos[0], py - pos[1])
+        if d >= 2.5 and ((extent <= 0.0) or (d <= min(extent, far_m))):
+            _v = path[min(i + 1, len(path) - 1)] - path[i]
+            _L = float(np.linalg.norm(_v))
+            if _L > 1e-9:
+                poses.append((px, py, math.atan2(_v[1], _v[0])))
+        s_cur += step_m
+    if not poses:
+        return 0, 0
+    bad = 0
+    near = 0
+    obstacle = scene.grid.obstacle
+    for px, py, th in poses:
+        for cx, cy in footprint_corners(
+                np.array([px, py]), th, HALF_LENGTH_M, HALF_WIDTH_M):
+            cell = scene.grid.world_to_cell(float(cx), float(cy))
+            if cell is None:
+                continue
+            r, c = cell
+            if obstacle[r, c] > 0:
+                bad += 1                     # corner inside the box
+                break
+            # corner in a cell ADJACENT to the box: the next control
+            # burst or a 0.1 m perception error is contact (live: the
+            # car wedged at closest_obs 1.0 m, throttle 0.65, no motion)
+            if (obstacle[max(0, r - 1):r + 2, max(0, c - 1):c + 2] > 0).any():
+                near += 1
+                break
+    return bad, len(poses), near
+
 
 def _path_off_drivable(scene: Scene, path, near_m: float = 8.0,
                        min_evidence: float = 0.03) -> list:
@@ -466,6 +568,39 @@ def body_pose_crosses_lane(scene: Scene, pos, heading: float,
                                      half_len, half_width, max_cross_m)
 
 
+def body_lane_cross_recovery(scene: Scene, path,
+                             half_len: float = HALF_LENGTH_M,
+                             half_width: float = HALF_WIDTH_M,
+                             margin_m: float = 0.05) -> bool:
+    """Whether a path steers the CURRENT body crossing back into the lane.
+
+    :func:`body_pose_crosses_lane` is a flag, so once the car sits across a
+    boundary it refuses every path - including the one that brings it back
+    - and the car freezes there for good (live east_coast 2026-09-18: the
+    tick after the body-cross gate first fired the car was held at v=0
+    with the lane still paired, then the stuck detector armed the reverse
+    escape).  The centreline gate already carries an explicit convergence
+    rule (:func:`lane_cross_dist_m`); this is the footprint equivalent.
+
+    True only when the worst penetration along the swept path is strictly
+    smaller than the current pose's, so a path that keeps or deepens the
+    crossing is still refused.
+    """
+    left, right = _scene_boundaries(scene)
+    if left is None and right is None:
+        return False
+    pos = getattr(scene, "pos", None)
+    if pos is None:
+        return False
+    now = body_pose_cross_depth_m(pos, float(getattr(scene, "heading", 0.0)),
+                                  left, right, half_len, half_width)
+    if now <= 0.0:
+        return False
+    ahead = max_body_cross_depth_m(pos, path, left, right,
+                                   half_len, half_width)
+    return bool(ahead < now - max(0.0, float(margin_m)))
+
+
 def body_lane_cross_dist_m(scene: Scene, path,
                            half_len: float = HALF_LENGTH_M,
                            half_width: float = HALF_WIDTH_M,
@@ -484,6 +619,26 @@ def body_lane_cross_dist_m(scene: Scene, path,
     if pos is None:
         return 0.0
     return first_boundary_crossing_m(
+        pos, path, left, right, half_len, half_width, max_cross_m)
+
+
+def body_lane_cross_detail_m(scene: Scene, path,
+                             half_len: float = HALF_LENGTH_M,
+                             half_width: float = HALF_WIDTH_M,
+                             max_cross_m: float = 0.05,
+                             ) -> tuple[float, int, str]:
+    """Return the first planned body crossing and its provenance.
+
+    The tuple is ``(distance_m, path_index, side)``.  ``path_index`` is
+    the segment containing the first sampled crossing and ``side`` is the
+    detected ``"left"`` or ``"right"`` boundary.  A zero distance with
+    ``-1``/``""`` means that no future body crossing was observed.
+    """
+    left, right = _scene_boundaries(scene)
+    pos = getattr(scene, "pos", None)
+    if pos is None:
+        return 0.0, -1, ""
+    return first_boundary_crossing_detail(
         pos, path, left, right, half_len, half_width, max_cross_m)
 
 

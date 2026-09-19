@@ -29,6 +29,7 @@ from .trajectory import CandidateSet, sample_arc, sample_lane_shift
 from .constraints import (
     lane_cross_dist_m,
     body_lane_cross_dist_m,
+    body_lane_cross_detail_m,
     body_pose_crosses_lane,
     Constraints,
     corridor_free_band,
@@ -47,6 +48,7 @@ from .lateral_ref import (
     perception_reference,
 )
 from .selector import select_trajectory
+from .hysteresis import CandidateHysteresis, candidate_key
 from .arbiter import (
     ArbiterOutcome,
     anchored_rule_ref,
@@ -74,6 +76,7 @@ __all__ = [
     "cost_curvature",
     "lane_cross_dist_m",
     "body_lane_cross_dist_m",
+    "body_lane_cross_detail_m",
     "body_pose_crosses_lane",
     "cost_lane_align",
     "lateral_reference",
@@ -88,6 +91,8 @@ __all__ = [
     "BACK_M",
     "DUP_MIN_M",
     "select_trajectory",
+    "CandidateHysteresis",
+    "candidate_key",
     "ArbiterOutcome",
     "anchored_rule_ref",
     "arbitrate",

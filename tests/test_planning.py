@@ -504,8 +504,34 @@ def test_constraints_strict_with_lane_ref_scores_the_same_path() -> None:
     sc.strict_perception = True
     sc.lane_ref = np.column_stack([np.linspace(0, 30, 31),
                                    np.full(31, -1.8)])
+    # A real strict tick always has ROAD SURFACE evidence too (the same
+    # semantic head produces the lane and the road); an empty drivable
+    # layer is the 2026-09-19 14:31 pathology and is infeasible now.
+    sc.grid.drivable[24:36, 28:33] = 1.0
     cons = Constraints()
     own_lane = np.column_stack([np.linspace(0, 20, 20), np.full(20, -1.8)])
     cost, feasible = cons.score(sc, Candidate(path=own_lane))
     assert feasible
     assert np.isfinite(cost)
+
+
+def test_body_lane_cross_detail_reports_segment_and_side() -> None:
+    """The scene-level crossing wrapper returns distance + provenance.
+
+    The safety layer splits a near-field planned crossing (stop) from a
+    far-field one (slow down and re-plan), and telemetry must be able to
+    say WHERE on the path and against WHICH boundary it happens.
+    """
+    from beamng_autopilot.planning import body_lane_cross_detail_m
+    left = np.array([[0.0, 0.5], [30.0, 0.5]])
+    sc = _scene()
+    sc.lane_left = left
+    path = np.array([[0.0, 0.0], [5.0, 0.0], [10.0, 0.0]])
+    dist, index, side = body_lane_cross_detail_m(sc, path)
+    assert 0.0 < dist < 5.0
+    assert index == 0
+    assert side == "left"
+    # a clean path reports no crossing at all
+    sc2 = _scene()
+    sc2.lane_left = np.array([[0.0, 4.0], [30.0, 4.0]])
+    assert body_lane_cross_detail_m(sc2, path) == (0.0, -1, "")
