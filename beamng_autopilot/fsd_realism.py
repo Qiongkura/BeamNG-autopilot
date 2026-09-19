@@ -8,6 +8,10 @@ assert that the lane-keep / road-boundary logic stays PERCEPTION-only.
 Key contract
 ------------
 * lane source ``"sensor"``              - FSD: perception lane leads.
+* lane source ``"paved"``               - FSD: no marking on a paved
+  road, so the PAVED BOUNDARY (soil-stripped semantic road mask) is the
+  authority - keep right, hard boundaries = the pavement edges
+  (AGENTS.md「驾驶约束」: marking >> pavement edge).
 * lane source ``"perception-unavailable"`` - FSD degradation: no lane,
   safety decides (never map lane geometry).
 * lane source ``"map"``                 - NON-FSD fallback (old rule
@@ -28,8 +32,15 @@ SRC_BEV_ROUTE = "bev/route"
 # derived like SRC_SENSOR - never map lane geometry - but it carries no
 # hard boundary pair, so downstream treats it as a weaker reference.
 SRC_CORRIDOR = "corridor"
+# PERCEPTION lane with no painted marking at all, on a road that IS
+# paved: the observed PAVED edges (semantic road mask, soil-stripped)
+# are the authority, the reference is "half a lane left of the paved
+# right edge", and the pavement edges are the hard boundaries.  This is
+# the "marking >> pavement edge" level of the trust order; it is a real
+# sensor lane (not a map prior), so strict mode may steer by it.
+SRC_PAVED = "paved"
 
-FSD_LANE_SOURCES = (SRC_SENSOR, SRC_UNAVAILABLE)
+FSD_LANE_SOURCES = (SRC_SENSOR, SRC_UNAVAILABLE, SRC_PAVED)
 NON_FSD_LANE_SOURCES = (SRC_MAP, SRC_BEV_ROUTE)
 
 # Machine-checkable invariant registry: (id, rule, enforced_by).
@@ -73,6 +84,7 @@ NO_MAP_GUARDED_FILES = (
     "beamng_autopilot/lane/fusion.py",
     "beamng_autopilot/lane/lidar.py",
     "beamng_autopilot/lane/pairing.py",
+    "beamng_autopilot/lane/pavement.py",
     "beamng_autopilot/lane/tracking.py",
     # camera-ring vision perception
     "beamng_autopilot/vision/ring.py",
@@ -113,6 +125,43 @@ NO_MAP_GUARDED_FILES = (
 FAIL_CLOSED_CONSUMER_FILES = (
     "beamng_autopilot/fsd_drive.py",
 )
+
+
+def check_strict_never_reverses(root: Path | None = None) -> list[str]:
+    """List runtime files that could arm a reverse in a strict run.
+
+    Strict FSD fails CLOSED: no sensor lane -> stop and hold, never back
+    up (docs/fsd_realism.md §4, AGENTS.md「驾驶约束」).  The escape is a
+    rule-planner manoeuvre, so the drive loop must disable it explicitly
+    (``ReverseManeuver.enabled``) - gating it on "no sensor lane" was not
+    enough: the 2026-09-18 live demo reversed on 46 of 220 ticks with the
+    lane PAIRED every time, plan_blocked empty and stuck=0, peaking at
+    -2.99 m/s.
+    """
+    import ast
+
+    if root is None:
+        root = Path(__file__).resolve().parents[1]
+    bad: list[str] = []
+    for rel in FAIL_CLOSED_CONSUMER_FILES:
+        src = (Path(root) / rel).read_text(encoding="utf-8")
+        tree = ast.parse(src)
+        disables = False
+        for node in ast.walk(tree):
+            # ``rman.enabled = not bool(args.strict)`` (or any assignment
+            # that mentions strict) counts as the explicit disable.
+            if not isinstance(node, ast.Assign):
+                continue
+            for tgt in node.targets:
+                if not (isinstance(tgt, ast.Attribute)
+                        and tgt.attr == "enabled"):
+                    continue
+                if "strict" in ast.dump(node.value):
+                    disables = True
+        if not disables:
+            bad.append(f"{rel}: no strict-mode disable of the reverse "
+                       "maneuver (ReverseManeuver.enabled)")
+    return bad
 
 
 def lane_source_ok(src: str | None, strict: bool = False) -> bool:
