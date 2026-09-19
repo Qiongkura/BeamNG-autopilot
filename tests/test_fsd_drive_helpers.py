@@ -289,21 +289,55 @@ def test_snapshot_age_prefers_canonical_snapshot():
 def test_sensor_lane_is_centered_requires_strict_sensor_reference():
     out = SimpleNamespace(
         meta={"lane_src_sel": "sensor"},
-        lane_ref=np.array([[0.0, 0.0], [4.0, 0.0], [8.0, 0.0]]))
+        lane_paired=True,
+        lane_ref=np.array([[0.0, 0.0], [4.0, 0.0], [8.0, 0.0]]),
+        lane_left=_line(0.0, 2.5, 20.0, 2.5),
+        lane_right=_line(0.0, -2.5, 20.0, -2.5))
     assert fsd_drive._sensor_lane_is_centered(
-        out, np.array([0.0, 0.0, 0.0]))
+        out, np.array([0.0, 0.0, 0.0]), 0.0)
 
     out.meta["lane_src_sel"] = "map"
     assert not fsd_drive._sensor_lane_is_centered(
-        out, np.array([0.0, 0.0, 0.0]))
+        out, np.array([0.0, 0.0, 0.0]), 0.0)
 
 
 def test_sensor_lane_is_centered_rejects_far_reference():
     out = SimpleNamespace(
         meta={"lane_src_sel": "sensor"},
-        lane_ref=np.array([[5.0, 0.0], [9.0, 0.0], [13.0, 0.0]]))
+        lane_paired=True,
+        lane_ref=np.array([[5.0, 0.0], [9.0, 0.0], [13.0, 0.0]]),
+        lane_left=_line(0.0, 2.5, 20.0, 2.5),
+        lane_right=_line(0.0, -2.5, 20.0, -2.5))
     assert not fsd_drive._sensor_lane_is_centered(
-        out, np.array([0.0, 0.0, 0.0]))
+        out, np.array([0.0, 0.0, 0.0]), 0.0)
+
+
+def test_sensor_lane_is_centered_rejects_a_yawed_pose():
+    """Standing in the lane but yawed is NOT "centered".
+
+    A 2.2 x 0.9 m footprint rotated against the lane puts a corner over
+    the boundary without the car ever driving there (live east_coast
+    2026-09-18: the pit pose passed the position-only check, the
+    alignment teleport was skipped, and the body-cross gate fired 5 s
+    later).  The pose must point along the lane.
+    """
+    out = SimpleNamespace(
+        meta={"lane_src_sel": "sensor"},
+        lane_paired=True,
+        lane_ref=np.array([[0.0, 0.0], [4.0, 0.0], [8.0, 0.0]]),
+        lane_left=_line(0.0, 2.5, 20.0, 2.5),
+        lane_right=_line(0.0, -2.5, 20.0, -2.5))
+    pos = np.array([0.0, 0.0, 0.0])
+    assert fsd_drive._sensor_lane_is_centered(out, pos, 0.0)
+    assert fsd_drive._sensor_lane_is_centered(out, pos, math.radians(5.0))
+    # a car lying across the lane must not pass the placement check
+    assert not fsd_drive._sensor_lane_is_centered(out, pos,
+                                                  math.radians(90.0))
+    assert not fsd_drive._sensor_lane_is_centered(out, pos,
+                                                  math.radians(180.0))
+    # ...nor one yawed well past the tolerance
+    assert not fsd_drive._sensor_lane_is_centered(out, pos,
+                                                  math.radians(30.0))
 
 
 def test_snapshot_age_canonical_ignores_optional_heads_and_range():
@@ -393,6 +427,23 @@ def test_snap_heading_falls_back_without_bearing() -> None:
     assert fsd_drive._snap_heading(route, 0.0, 0.0, 1.23) == 1.23
 
 
+def test_snap_heading_keeps_the_road_when_the_goal_route_is_a_u_turn() -> None:
+    """If both the graph's first segment and near-ahead route bearing
+    disagree with the current road heading, never turn the car across its
+    lane just to satisfy a backwards goal (2026-09-18 east_coast)."""
+    route = np.vstack([
+        [[0.0, 0.0]],
+        [[-1.0, 0.0]],
+        [[-3.0, 3.0]],
+        [[-8.0, 3.0]],
+    ])
+    current = math.radians(-105.0)
+    h = fsd_drive._snap_heading(
+        route, 0.0, 0.0, math.radians(65.0),
+        reference_heading=current)
+    assert abs(math.degrees(h) + 105.0) < 1e-6
+
+
 # --- _in_end_pull_zone --------------------------------------------------
 def test_in_end_pull_zone_only_inside_the_zone() -> None:
     start = fsd_drive.END_PULL_START_M
@@ -457,3 +508,122 @@ def test_stuck_timer_does_not_fire_on_legitimate_waits() -> None:
     assert not stuck(v=1.2)
     # moving with throttle is the normal case
     assert not stuck(v=1.2, thr=0.4, plan_speed=3.0)
+
+
+# --- _sensor_lane_is_centered: the paved-boundary placement path -------
+def _paved_out(src: str = "paved"):
+    """Perception stub shaped like the paved-boundary candidate's tick.
+
+    ``lane_ref`` is anchored AT the ego (that is what the candidate
+    publishes), so the placement test can not be a distance-to-polyline
+    check; ``lane_left``/``lane_right`` are the un-anchored pavement
+    edges the alignment is read from.
+    """
+    ref = _line(0.0, 0.0, 24.0, 0.0)          # keep-right target line
+    return SimpleNamespace(
+        meta={"lane_src_sel": src},
+        lane_paired=(src == "sensor"),
+        lane_ref=ref,
+        lane_left=_line(2.0, 3.5, 26.0, 3.5),
+        lane_right=_line(2.0, -3.5, 26.0, -3.5),
+    )
+
+
+def test_paved_placement_accepts_an_aligned_car_on_the_pavement():
+    out = _paved_out()
+    assert fsd_drive._sensor_lane_is_centered(
+        out, np.array([5.0, 0.0, 0.0]), 0.0)
+
+
+def test_paved_placement_rejects_a_yawed_car():
+    """A car across the road must not start driving from that pose - the
+    reason placement carries a heading gate at all (2026-09-18)."""
+    out = _paved_out()
+    assert not fsd_drive._sensor_lane_is_centered(
+        out, np.array([5.0, 0.0, 0.0]), math.radians(40.0))
+
+
+def test_paved_placement_needs_the_observed_pavement_edges():
+    out = _paved_out()
+    out.lane_right = None
+    out.lane_left = None
+    assert not fsd_drive._sensor_lane_is_centered(
+        out, np.array([5.0, 0.0, 0.0]), 0.0)
+
+
+def test_paved_placement_is_ignored_when_the_source_is_not_perception():
+    out = _paved_out(src="map_lane")
+    assert not fsd_drive._sensor_lane_is_centered(
+        out, np.array([5.0, 0.0, 0.0]), 0.0)
+
+
+def _lane_out_with_ref(src: str = "sensor", half_m: float = 2.5):
+    """Sensor-lane tick stub: reference centred on the car, boundaries at
+    +-half_m, so the placement predicate can be probed directly."""
+    ref = _line(0.0, 0.0, 40.0, 0.0)
+    return SimpleNamespace(
+        meta={"lane_src_sel": src},
+        lane_paired=(src == "sensor"),
+        lane_ref=ref,
+        lane_left=_line(0.0, half_m, 40.0, half_m),
+        lane_right=_line(0.0, -half_m, 40.0, -half_m),
+    )
+
+
+def test_placement_accepts_a_centred_lane_with_clearance():
+    out = _lane_out_with_ref(half_m=2.5)
+    assert fsd_drive._sensor_lane_is_centered(
+        out, np.array([5.0, 0.0, 0.0]), 0.0)
+
+
+def test_placement_rejects_a_lane_with_the_body_at_the_boundary():
+    """A lane only 1.05 m away from the centre leaves the 0.9 m half-body
+    0.15 m of clearance - inside by less than PLACEMENT_BODY_CLEARANCE_M,
+    which is the pose that froze the 2026-09-18 fine-tuned arm."""
+    out = _lane_out_with_ref(half_m=1.05)
+    assert not fsd_drive._sensor_lane_is_centered(
+        out, np.array([5.0, 0.0, 0.0]), 0.0)
+
+
+def test_placement_rejects_a_boundary_on_the_wrong_side():
+    """A car spawned LEFT of the centre paint (teleport lands on the road
+    node) has the published left boundary 1.4 m to its RIGHT.  The
+    re-anchored lane centre makes the distance test vacuous and the paint
+    fragment starts 5 m ahead, so only the boundary SIDE catches it -
+    otherwise every forward path crosses the paint and the run stalls in
+    planned-body-cross stops (base_speed3 t=2.3-7.2, 2026-09-19)."""
+    out = _lane_out_with_ref(half_m=2.5)
+    # move the "left" boundary to the car's RIGHT side
+    out.lane_left = _line(2.0, -1.44, 26.0, -1.44)
+    assert not fsd_drive._sensor_lane_is_centered(
+        out, np.array([5.0, 0.0, 0.0]), 0.0)
+    # and a right boundary on the wrong (left) side is rejected too
+    out2 = _lane_out_with_ref(half_m=2.5)
+    out2.lane_right = _line(2.0, 1.44, 26.0, 1.44)
+    assert not fsd_drive._sensor_lane_is_centered(
+        out2, np.array([5.0, 0.0, 0.0]), 0.0)
+    # a correctly sided pair still passes
+    out3 = _lane_out_with_ref(half_m=2.5)
+    assert fsd_drive._sensor_lane_is_centered(
+        out3, np.array([5.0, 0.0, 0.0]), 0.0)
+
+
+# --- _needs_hard_pedal: the no-path emergency brake --------------------
+def test_hard_pedal_bypasses_the_ramp_when_no_path_remains():
+    """A no-path tick commands brake 1.0 but used to flow through the
+    pedal ramp; at 1.9 m/s the coast-down measured 2.8 m and buried the
+    car in the dirt past the pavement (east_coast 2026-09-19)."""
+    assert fsd_drive._needs_hard_pedal(
+        has_path=False, force_stop=False, stuck=False, climb=False,
+        reverse_active=False, reversing=False, rem_end=None)
+    # a normal driving tick with a path keeps the ramp
+    assert not fsd_drive._needs_hard_pedal(
+        has_path=True, force_stop=False, stuck=False, climb=False,
+        reverse_active=False, reversing=False, rem_end=None)
+    # the original emergency set still bypasses
+    assert fsd_drive._needs_hard_pedal(
+        has_path=True, force_stop=True, stuck=False, climb=False,
+        reverse_active=False, reversing=False, rem_end=None)
+    assert fsd_drive._needs_hard_pedal(
+        has_path=True, force_stop=False, stuck=False, climb=False,
+        reverse_active=False, reversing=False, rem_end=1.0)
