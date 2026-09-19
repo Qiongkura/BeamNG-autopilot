@@ -615,3 +615,81 @@ def test_fsd_closed_loop_wall_stop() -> None:
     assert speed_zeroed_after_stop, "car never reached v=0 after stop"
     assert speed == 0.0, f"car still moving at the end: {speed:.2f} m/s"
     assert total > 20.0, f"only drove {total:.1f} m in 200 ticks"
+
+
+def test_fsd_closed_loop_recovers_from_a_body_crossing() -> None:
+    """A car already across the centre line must steer back, not freeze.
+
+    The monitor's current-pose gate used to refuse EVERY path once a body
+    corner was over the boundary - including the one that brings the car
+    back - so the car stood across the line until the stuck detector armed
+    a reverse escape (live east_coast 2026-09-18: v~0 for 70 s, then
+    reverse).  A converging path is the legal recovery and must be driven
+    at a creep: the body penetration has to shrink monotonically and reach
+    zero, with forward progress and no reverse.
+    """
+    from beamng_autopilot.planning.constraints import (
+        body_pose_cross_depth_m,
+    )
+    from beamng_autopilot.safety_monitor import SafetyMonitor
+
+    st = _stack()
+    st.strict_sensor = True
+    st.lane_mode = "sensor"
+    st.target_speed = 6.0
+    route = np.column_stack([np.linspace(0.0, 140.0, 141),
+                             np.zeros(141)])
+    # lane centre is y=-1.75; start yawed LEFT toward the centre line so
+    # the front-left corner is already across it.  x starts mid-segment:
+    # ``boundary_lateral`` only reports a boundary as covering the point
+    # when it does not sit on the polyline's first/last vertex.
+    pos = np.array([20.0, -1.2, 0.0])
+    heading = math.radians(12.0)
+    speed = 0.0
+    dt = 0.25
+    wheelbase = 2.9
+    pp = PurePursuit(lookahead=6.0, wheelbase=wheelbase)
+    guard = ReverseGuard()
+    mon = SafetyMonitor(max_speed=6.0)
+
+    def _depth(p, h):
+        return body_pose_cross_depth_m(
+            p, h, np.array([[0.0, 0.0], [140.0, 0.0]]), None)
+
+    start_depth = _depth(pos, heading)
+    assert start_depth > 0.05, \
+        f"fixture must start with the body across the line: {start_depth:.3f}"
+
+    depths = []
+    total = 0.0
+    froze = 0
+    for _i in range(60):
+        out = st.tick(
+            st=SimpleNamespace(pos=pos, heading=heading, speed=speed),
+            route_ref=route)
+        assert out.best_path is not None, out.meta
+        path = np.asarray(out.best_path[:, :2], dtype=float)
+        verd = mon.evaluate(out.scene, path, planner_age_s=0.0,
+                            snapshot_age_s=0.0)
+        assert verd.reason != "current vehicle body crosses lane boundary", \
+            "the converging path must not be refused as a current crossing"
+        v = min(float(out.best_speed or 0.0),
+                float(verd.target_speed), 1.0)
+        steer, _, _ = pp.steering(pos, heading, path, speed=v)
+        brake, reverse = guard.decide(v, dt=dt)
+        assert not reverse, "car must never drive backwards"
+        if v <= 0.01:
+            froze += 1
+        depths.append(_depth(pos, heading))
+        fwd = np.array([np.cos(heading), np.sin(heading)])
+        total += v * dt
+        pos = pos + v * dt * np.array([fwd[0], fwd[1], 0.0])
+        heading = heading + steer * v * dt / wheelbase
+        speed = v
+
+    assert total >= 2.0, f"car barely moved while recovering: {total:.2f} m"
+    assert froze <= 6, f"recovery froze for {froze} ticks"
+    assert depths[-1] < start_depth, \
+        f"crossing did not shrink: {start_depth:.2f} -> {depths[-1]:.2f}"
+    assert depths[-1] <= 0.06, \
+        f"car never returned inside the lane: {depths[-1]:.3f} m over"

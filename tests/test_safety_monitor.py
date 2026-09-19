@@ -8,6 +8,8 @@ import pytest
 
 from beamng_autopilot.occupancy import OccupancyGrid
 from beamng_autopilot.planning import Scene
+from beamng_autopilot.obstacle_risk import (
+    RISK_BRAKING, RISK_HARD_COLLISION)
 from beamng_autopilot.safety_monitor import SafetyMonitor
 
 
@@ -197,7 +199,38 @@ def test_path_inside_grid_still_blocked() -> None:
     assert v.level in ("minimal_risk", "degraded")
 
 
-def test_safety_monitor_stops_when_current_body_corner_is_over_boundary() -> None:
+def test_safety_monitor_allows_a_converging_path_when_body_is_over() -> None:
+    """A car already across the line may creep back along a converging path.
+
+    The old gate refused EVERY path while a body corner was over the
+    boundary - including the one that brings the car back - so the car
+    froze across the line and the stuck detector armed a reverse escape
+    (live east_coast 2026-09-18).  A converging path is the legal
+    recovery, capped to a creep.
+    """
+    from beamng_autopilot.planning import Scene
+    from beamng_autopilot.occupancy import OccupancyGrid
+    from beamng_autopilot.safety_monitor import SafetyMonitor
+    grid = OccupancyGrid(60, 60, 0.5)
+    left = np.array([[0., 4.], [20., 4.]])
+    right = np.array([[0., -4.], [20., -4.]])
+    # the car is yawed with its front-left corner over lane_left, and the
+    # path runs straight down the lane: driving it rotates the body back
+    # inside, so the crossing strictly shrinks.
+    scene = Scene(pos=np.array([10., 3.0]), heading=math.radians(18.),
+                  grid=grid, route=np.array([[0., 0.], [20., 0.]]),
+                  lane_ref=np.array([[0., 0.], [20., 0.]]),
+                  lane_left=left, lane_right=right, lane_width=8.)
+    scene.lane_ref_src = "sensor"
+    verdict = SafetyMonitor(max_speed=6.).evaluate(
+        scene, np.array([[10., 3.], [15., 3.]]))
+    assert verdict.level == "degraded"
+    assert verdict.reason == "lane boundary recovery"
+    assert verdict.target_speed <= 1.0
+
+
+def test_safety_monitor_still_stops_a_diverging_crossing() -> None:
+    """A path that keeps (or deepens) the crossing must still hard-stop."""
     from beamng_autopilot.planning import Scene
     from beamng_autopilot.occupancy import OccupancyGrid
     from beamng_autopilot.safety_monitor import SafetyMonitor
@@ -208,10 +241,14 @@ def test_safety_monitor_stops_when_current_body_corner_is_over_boundary() -> Non
                   grid=grid, route=np.array([[0., 0.], [20., 0.]]),
                   lane_ref=np.array([[0., 0.], [20., 0.]]),
                   lane_left=left, lane_right=right, lane_width=8.)
+    scene.lane_ref_src = "sensor"
+    # the path keeps drifting further left, deeper across the boundary
     verdict = SafetyMonitor(max_speed=6.).evaluate(
-        scene, np.array([[10., 3.], [15., 3.]]))
+        scene, np.array([[10., 3.], [16., 4.5]]))
     assert verdict.level == "minimal_risk"
+    assert verdict.target_speed == 0.0
     assert "vehicle body" in verdict.reason
+
 
 
 def test_strict_perception_stops_without_sensor_lane() -> None:
@@ -264,3 +301,127 @@ def test_legacy_mode_keeps_route_fallback() -> None:
     v = SafetyMonitor(max_speed=12.0).evaluate(scene, _straight())
     assert v.safe
     assert v.lane_ref_src == "route"
+
+
+def test_degraded_verdict_is_drivable_but_minimal_risk_is_not() -> None:
+    """A degraded verdict must still be driven at its reduced cap.
+
+    Gating the arbiter on ``safe`` instead threw the degraded speed cap
+    away and force-stopped the car: the 2026-09-18 live east_coast demo
+    stopped on 122 of 222 ticks, 83 of them ``level=degraded`` with
+    ``mon_target`` 3.30 m/s and an open corridor (strict mode has no rule
+    backup to fall through to).
+    """
+    from beamng_autopilot.safety_monitor import SafetyVerdict
+
+    assert SafetyVerdict(level="safe").drivable
+    assert SafetyVerdict(level="degraded").drivable
+    assert not SafetyVerdict(level="minimal_risk").drivable
+
+
+def test_monitor_keeps_a_degraded_path_drivable_with_its_speed_cap():
+    """End to end: the scattered-obstacle degrade keeps a non-zero cap."""
+    from beamng_autopilot.planning import Scene
+    from beamng_autopilot.occupancy import OccupancyGrid
+    from beamng_autopilot.safety_monitor import SafetyMonitor
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.origin = (0.0, 0.0)
+    grid.heading = 0.0
+    for x, y in ((6.0, -0.8), (7.0, 0.8), (8.0, -0.6)):
+        grid.mark_obstacle_region(x, y, 0.4, 0.4)
+    route = np.column_stack([np.linspace(0, 30, 31), np.zeros(31)])
+    scene = Scene(pos=np.array([0.0, 0.0]), heading=0.0, grid=grid,
+                  route=route, lane_ref=route)
+    verdict = SafetyMonitor(
+        max_speed=6.0, occ_fraction_degrade=0.05,
+        occ_fraction_stop=0.5).evaluate(scene, _straight())
+    assert verdict.level == "degraded"
+    assert verdict.drivable
+    assert verdict.target_speed > 0.0
+
+
+def _track(x, y, vx=0.0, vy=0.0, matches: int = 4, lost: int = 0,
+           category: str = "object", track_id: int = 1):
+    """A ``temporal.TrackedObject``-shaped detection for risk tests."""
+    from types import SimpleNamespace
+    return SimpleNamespace(x=float(x), y=float(y), vx=float(vx),
+                           vy=float(vy), matches=int(matches),
+                           lost=int(lost), category=category,
+                           track_id=int(track_id))
+
+
+def _monitor_scene(tracks=None):
+    """Scene with an optional tracked-object snapshot (risk layer)."""
+    from beamng_autopilot.occupancy import OccupancyGrid
+    from beamng_autopilot.perception_snapshot import PerceptionSnapshot
+    from beamng_autopilot.planning import Scene
+    path = _straight()
+    scene = Scene(pos=np.array([0.0, 0.0]), heading=0.0,
+                  grid=OccupancyGrid(60, 60, 0.5), route=path,
+                  lane_ref=path)
+    if tracks is not None:
+        scene.perception_snapshot = PerceptionSnapshot(
+            captured_at=0.0, tick_id=1, pos=np.array([0.0, 0.0]),
+            heading=0.0, tracks=list(tracks))
+    return scene
+
+
+def test_monitor_caps_target_for_a_closing_track() -> None:
+    """The risk model must reach the verdict, not just the module."""
+    from beamng_autopilot.safety_monitor import SafetyMonitor
+
+    # no dynamic perception -> no risk fields, no risk cap
+    v0 = SafetyMonitor(max_speed=8.0).evaluate(
+        _monitor_scene(), _straight(), ego_speed_mps=8.0)
+    assert v0.risk_kind == ""
+    assert v0.min_ttc_s is None
+    assert v0.target_speed == pytest.approx(8.0)
+
+    # a vehicle closing head-on caps the target below cruise
+    v1 = SafetyMonitor(max_speed=8.0).evaluate(
+        _monitor_scene([_track(12.0, 0.0, vx=-6.0)]), _straight(),
+        ego_speed_mps=8.0)
+    assert v1.risk_kind == RISK_BRAKING
+    assert v1.min_ttc_s is not None and v1.min_ttc_s < 3.0
+    assert v1.risk_closest_m == pytest.approx(12.0, abs=0.5)
+    assert v1.target_speed < 8.0
+
+
+def test_monitor_stops_on_a_contact_band_obstacle() -> None:
+    from beamng_autopilot.safety_monitor import SafetyMonitor
+    v = SafetyMonitor(max_speed=8.0).evaluate(
+        _monitor_scene([_track(2.0, 0.0, matches=1)]), _straight(),
+        ego_speed_mps=8.0)
+    assert v.level == "minimal_risk"
+    assert v.reason == "obstacle contact risk"
+    assert v.target_speed == 0.0
+    assert v.risk_kind == RISK_HARD_COLLISION
+
+
+def test_monitor_ignores_roadside_and_unconfirmed_tracks() -> None:
+    from beamng_autopilot.safety_monitor import SafetyMonitor
+    scene = _monitor_scene([_track(6.0, 4.0),
+                            _track(20.0, 0.0, matches=1)])
+    v = SafetyMonitor(max_speed=8.0).evaluate(
+        scene, _straight(), ego_speed_mps=8.0)
+    assert v.level != "minimal_risk"
+    assert v.target_speed == pytest.approx(8.0)
+
+
+def test_risk_layer_constrains_a_served_path_hold() -> None:
+    """A hold may not drive toward a contact-band obstacle.
+
+    The risk layer runs AFTER the core arbitration, so a degraded verdict
+    - including a served PATH_HOLD - still gets the obstacle check.
+    """
+    from beamng_autopilot.safety_monitor import SafetyMonitor
+    path = _monitor_scene()
+    mon = SafetyMonitor(max_speed=8.0)
+    assert mon.offer_verified_path(_straight(), 0.0, 5.0,
+                                   now_s=100.0, strict=True)
+    scene = _monitor_scene([_track(2.0, 0.0, matches=1)])
+    v = mon.evaluate(scene, None, now_s=100.1, ego_speed_mps=5.0)
+    assert v.path_hold_active is True          # the hold WAS served...
+    assert v.level == "minimal_risk"           # ...and then stopped
+    assert v.reason == "obstacle contact risk"
+    assert v.target_speed == 0.0

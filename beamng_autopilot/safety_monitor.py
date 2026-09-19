@@ -21,18 +21,36 @@ speed/steer.
 from __future__ import annotations
 
 import math
+import time
 from dataclasses import dataclass
 
 import numpy as np
 
+from beamng_autopilot import config
 from beamng_autopilot.planning.geometry import polyline_point_distances
 from beamng_autopilot.planning.constraints import (
-    body_lane_cross_dist_m, body_pose_crosses_lane,
+    body_lane_cross_dist_m, body_lane_cross_detail_m,
+    body_lane_cross_recovery, body_pose_crosses_lane,
 )
 from beamng_autopilot.planning.lateral_ref import (
-    REF_NONE, lateral_reference,
+    REF_NONE, REF_SENSOR, lateral_reference,
 )
-from beamng_autopilot.vehicle_body import CORRIDOR_HALF_WIDTH_M
+from beamng_autopilot.obstacle_risk import assess_obstacles
+from beamng_autopilot.vehicle_body import (
+    CORRIDOR_HALF_WIDTH_M,
+    HALF_LENGTH_M,
+    HALF_WIDTH_M,
+)
+
+# Hard body-boundary margin.  The old gate stopped only when the swept
+# rectangle had already touched/crossed the detected line; at 3-4 m/s the
+# next control burst then carried the car across before the brake took
+# effect (split-model live run 2026-09-18: planned cross -> two right-edge
+# frames and road_off=2.37 m).  Inflate the same authoritative body by a
+# margin so the candidate is rejected before the physical footprint reaches
+# the boundary.  This is a safety margin around PERCEPTION geometry, not a
+# lateral reference or map offset.
+BODY_CROSS_MARGIN_M = 0.25
 
 # How old a perception MODALITY (head / BEV / lane) can be before the
 # monitor distrusts it.
@@ -81,6 +99,27 @@ LANE_DEV_STOP_M = 6.0
 EASE_CORRIDOR_HALF_WIDTH_M = CORRIDOR_HALF_WIDTH_M
 EASE_AHEAD_MIN_M = 1.0
 
+# --- Bounded PATH_HOLD (improvement plan phase B) ---------------------
+# When a tick produces NO drivable path (strict lane dropout, planner
+# decline) the monitor may re-serve the last VERIFIED trajectory for a
+# bounded window instead of demanding an instant full stop - that
+# instant stop is what produced the stop/restart churn (2026-09-19 live:
+# 17 stops in 40 s).  Grace keeps the offered target, after it the hold
+# creeps at the minimal-risk speed, past the horizon the hold is CLEARED
+# and the tick fails closed to a stop.  The held path is re-checked
+# against the CURRENT scene (body, boundaries, occupancy) every serve,
+# so only the planner output is reused - never stale perception.
+PATH_HOLD_MAX_LAT_M = 2.5     # ego may not drift this far off the held path
+PATH_HOLD_MIN_AHEAD_M = 4.0   # the held path must still reach this far ahead
+PATH_HOLD_MIN_LEN_M = 6.0     # minimum usable offered trajectory length
+# --- current/planned body-cross split (improvement plan phase C1) ----
+# A PLANNED sweep crossing detected at least config.FSD_PLANNED_CROSS_
+# HARD_M along the path is a far-field risk: degrade (cap speed, let the
+# next tick re-plan) instead of the instant full stop the old gate
+# applied at ANY crossing distance - a far-end sampling artefact of the
+# boundary fit must not stand the car dead.  Near-field planned
+# crossings and CURRENT body crossings keep the hard stop.
+
 
 @dataclass
 class SafetyVerdict:
@@ -105,6 +144,32 @@ class SafetyVerdict:
     # "envelope" (perception), "route" (legacy map fallback only) or
     # "none".  Telemetry evidence for the FSD realism contract.
     lane_ref_src: str = "none"
+    # Bounded PATH_HOLD diagnostics (plan phase B).  ``held_path`` is the
+    # re-served trajectory for the drive loop; it is deliberately NOT
+    # telemetry-serialised (only its scalars are).
+    path_hold_active: bool = False
+    path_hold_age_s: float | None = None
+    path_hold_phase: str = ""
+    held_path: np.ndarray | None = None
+    # Structured body-boundary diagnostics (plan phase C1): the
+    # current-pose crossing and the planned-sweep crossing are DIFFERENT
+    # events with different responses (stop now vs slow down and
+    # re-plan), and the planned one carries where on the path it
+    # happens.  ``boundary_confidence`` is intentionally absent - the
+    # detected boundaries carry no confidence value today and inventing
+    # one would fake certainty the sensors did not provide.
+    body_cross_current: bool = False
+    body_cross_planned: bool = False
+    first_crossing_distance_m: float | None = None
+    crossing_path_index: int | None = None
+    crossing_boundary_side: str = ""
+    # Obstacle risk grading (plan phase C3): the worst class seen this
+    # tick, the closest confirmed time-to-collision, and the distance of
+    # the nearest graded obstacle.  ``risk_kind`` is "" when no track was
+    # graded at all (no dynamic perception this tick).
+    risk_kind: str = ""
+    min_ttc_s: float | None = None
+    risk_closest_m: float | None = None
 
     @property
     def safe(self) -> bool:
@@ -113,6 +178,124 @@ class SafetyVerdict:
     @property
     def degraded(self) -> bool:
         return self.level == "degraded"
+
+    @property
+    def drivable(self) -> bool:
+        """Whether this verdict's path may still be driven.
+
+        ``degraded`` is drivable BY DEFINITION - the monitor computed the
+        reduced speed cap (``target_speed``) for exactly that case - so
+        only ``minimal_risk`` refuses the path.  Callers that gate on
+        ``safe`` instead throw the cap away and stop the car: the
+        2026-09-18 live east_coast demo stopped on 122 of 222 ticks, 83 of
+        them ``level=degraded`` with ``mon_target`` 3.30 m/s and an open
+        corridor, because strict mode has no rule backup to fall through.
+        """
+        return self.level != "minimal_risk"
+
+
+@dataclass
+class HeldPath:
+    """One verified trajectory offered to the bounded hold."""
+
+    path: np.ndarray          # (N, 2) world XY, ego-anchored near->far
+    heading: float
+    target_speed: float
+    offered_at: float
+    strict: bool
+
+
+class PathHold:
+    """Bounded reuse of the last verified-safe trajectory (PATH_HOLD).
+
+    Pure time/geometry logic: offer validation, the age phases and the
+    ego-consistency bounds.  The scene-dependent re-checks (current body
+    crossing, boundary crossing of the held path, occupancy) stay in
+    :class:`SafetyMonitor`, which owns the perception data they need.
+    An expired hold is refused AND cleared, so a stale trajectory can
+    never be revived after its horizon; only a fresh verified offer can
+    restart motion, which is the re-start confirmation the plan requires.
+    """
+
+    def __init__(self,
+                 grace_s: float | None = None,
+                 max_s: float | None = None,
+                 max_lat_m: float = PATH_HOLD_MAX_LAT_M,
+                 min_ahead_m: float = PATH_HOLD_MIN_AHEAD_M,
+                 min_len_m: float = PATH_HOLD_MIN_LEN_M):
+        self.grace_s = float(grace_s if grace_s is not None
+                             else config.FSD_PATH_HOLD_GRACE_S)
+        self.max_s = float(max_s if max_s is not None
+                           else config.FSD_PATH_HOLD_MAX_S)
+        self.max_lat_m = float(max_lat_m)
+        self.min_ahead_m = float(min_ahead_m)
+        self.min_len_m = float(min_len_m)
+        self._held: HeldPath | None = None
+
+    def offer(self, path, heading: float, target_speed: float, *,
+              now_s: float, strict: bool = False) -> bool:
+        """Store a verified trajectory (any previous one is replaced).
+
+        Only callers that JUST verified the path against the current
+        scene (drivable verdict, fresh sensors, perception-derived
+        geometry) may offer; this method only rejects structurally
+        unusable polylines.
+        """
+        if path is None:
+            return False
+        pts = np.asarray(path, dtype=float)
+        if pts.ndim != 2 or pts.shape[0] < 2:
+            return False
+        pts = pts[:, :2]
+        if not np.isfinite(pts).all():
+            return False
+        seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+        if float(seg.sum()) < self.min_len_m:
+            return False
+        self._held = HeldPath(
+            path=pts.copy(), heading=float(heading),
+            target_speed=max(0.0, float(target_speed)),
+            offered_at=float(now_s), strict=bool(strict))
+        return True
+
+    def request(self, pos, now_s: float):
+        """Serve the held path when still inside its bounded window.
+
+        Returns ``(held, age_s, phase)`` with ``held`` the :class:`HeldPath`
+        and phase ``"grace"`` (keep the offered target) or ``"creep"``
+        (decay to the minimal-risk speed), or None.  None also CLEARS an
+        expired hold.
+        """
+        held = self._held
+        if held is None:
+            return None
+        age = max(0.0, float(now_s) - held.offered_at)
+        if age > self.max_s:
+            self._held = None
+            return None
+        p = np.asarray(pos, dtype=float).ravel()[:2]
+        pts = held.path
+        d = np.linalg.norm(pts - p[None, :], axis=1)
+        j = int(np.argmin(d))
+        if float(d[j]) > self.max_lat_m:
+            return None
+        arc = np.concatenate([[0.0], np.cumsum(
+            np.linalg.norm(np.diff(pts, axis=0), axis=1))])
+        if float(arc[-1] - arc[j]) < self.min_ahead_m:
+            return None
+        phase = "grace" if age <= self.grace_s else "creep"
+        return held, age, phase
+
+    def clear(self) -> None:
+        self._held = None
+
+    @property
+    def active(self) -> bool:
+        return self._held is not None
+
+    @property
+    def target_speed(self) -> float:
+        return self._held.target_speed if self._held is not None else 0.0
 
 
 def _corridor_ahead_distance(occ_pts, path, half_width_m: float,
@@ -254,6 +437,58 @@ class SafetyMonitor:
         # only eases the target to this fraction of cruise (never the
         # minimal-risk creep); a closed corridor still creeps/stops.
         self.corridor_open_floor = float(corridor_open_floor_frac)
+        # Bounded PATH_HOLD state (plan phase B): the last verified
+        # trajectory, re-servable inside its hold window when a tick
+        # loses the path.  Replaced wholesale by every fresh verified
+        # offer; cleared when it expires or fails a current-scene check.
+        self.path_hold = PathHold()
+
+    # ------------------------------------------------------------------
+    def offer_verified_path(self, path, heading: float,
+                            target_speed: float, *,
+                            now_s: float | None = None,
+                            strict: bool = False) -> bool:
+        """Cache a drivable, freshly-verified trajectory for bounded reuse.
+
+        Callers must offer ONLY perception-derived paths that just passed
+        this monitor's checks on fresh sensors (never map/rule fallbacks
+        and never stale-sensor ticks) - the hold replays exactly that
+        evidence, never a lateral reference the iron rule forbids.
+        """
+        return self.path_hold.offer(
+            path, float(heading), float(target_speed),
+            now_s=(time.time() if now_s is None else float(now_s)),
+            strict=strict)
+
+    def _serve_hold(self, scene, now_s: float):
+        """Re-check the held path against the CURRENT scene, then serve.
+
+        The held trajectory was verified when it was offered; the world
+        has moved on, so every check that does not need the (missing)
+        planner output is re-run before it may be driven again: the
+        current body must not cross a boundary, the held path must not
+        now cross a detected boundary, and the occupancy grid must not
+        have gone blocked along it.  Returns
+        ``(held_path, age_s, phase, target_speed)`` or None.
+        """
+        req = self.path_hold.request(
+            np.asarray(scene.pos[:2], dtype=float), now_s)
+        if req is None:
+            return None
+        held, age, phase = req
+        half_len = HALF_LENGTH_M + BODY_CROSS_MARGIN_M
+        half_width = HALF_WIDTH_M + BODY_CROSS_MARGIN_M
+        if body_pose_crosses_lane(scene, scene.pos, float(scene.heading),
+                                  half_len=half_len, half_width=half_width):
+            return None
+        if body_lane_cross_dist_m(scene, held.path, half_len=half_len,
+                                  half_width=half_width) > 0.0:
+            return None
+        if self._path_occupied_fraction(scene, held.path) >= self.occ_stop:
+            return None
+        cap = (min(held.target_speed, self.max_speed) if phase == "grace"
+               else min(held.target_speed, self.min_risk_speed))
+        return held.path, age, phase, max(0.0, cap)
 
     # ------------------------------------------------------------------
     def _path_occupied_fraction(self, scene, path) -> float:
@@ -317,21 +552,84 @@ class SafetyMonitor:
 
     # ------------------------------------------------------------------
     def evaluate(self, scene, path, closed_loop_steer: float = 0.0,
-                 snapshot_age_s: float = 0.0, planner_age_s: float = 0.0
-                 ) -> SafetyVerdict:
+                 snapshot_age_s: float = 0.0, planner_age_s: float = 0.0,
+                 now_s: float | None = None,
+                 ego_speed_mps: float = 0.0) -> SafetyVerdict:
         """Arbitrate one tick.
 
         ``scene`` is a ``planning.Scene`` (occupancy grid + route/lane).
         ``path`` is the planner-chosen trajectory (or None when none).
         ``snapshot_age_s`` / ``planner_age_s`` are freshness of the
-        sensors and the planning output.
+        sensors and the planning output.  ``now_s`` pins the clock for
+        the bounded PATH_HOLD phases (tests pass an explicit value; live
+        callers use the wall clock).  ``ego_speed_mps`` feeds the
+        obstacle TTC model (closing speed is relative to the ego).
+
+        The obstacle risk layer is applied LAST, on whatever verdict the
+        core arbitration produced: a degraded branch (scattered clutter,
+        a served path hold) may still be driving toward a confirmed
+        closing obstacle, and an early return must not skip that check.
+        Only a verdict that is already ``minimal_risk`` has nothing left
+        to cap.
         """
+        v = self._evaluate_core(scene, path, closed_loop_steer,
+                                snapshot_age_s, planner_age_s, now_s)
+        return self._apply_obstacle_risk(v, scene, path,
+                                         float(ego_speed_mps))
+
+    def _apply_obstacle_risk(self, v: SafetyVerdict, scene, path,
+                             ego_speed_mps: float) -> SafetyVerdict:
+        """Grade tracked obstacles and fold the result into ``v``.
+
+        The occupancy grid says WHERE obstacles are; tracked objects
+        carry the velocity it cannot, so each is graded (hard collision /
+        braking / roadside / unknown) and a stopping-distance speed cap
+        is derived from the closing motion.  Roadside clutter and
+        unconfirmed specks cap nothing, and the contact band does not
+        wait for confirmation (plan phases C3/C4).
+        """
+        tracks = getattr(getattr(scene, "perception_snapshot", None),
+                         "tracks", None) or []
+        risk = assess_obstacles(
+            tracks, scene.pos, float(scene.heading), float(ego_speed_mps),
+            corridor_half_m=EASE_CORRIDOR_HALF_WIDTH_M,
+            path=(path if path is not None and len(path) >= 2 else None))
+        if risk.items:
+            v.risk_kind = str(risk.kind)
+            v.min_ttc_s = risk.min_ttc_s
+            v.risk_closest_m = (None if not math.isfinite(risk.closest_m)
+                                else float(risk.closest_m))
+        if v.level == "minimal_risk":
+            return v
+        if risk.stop:
+            v.level = "minimal_risk"
+            v.reason = "obstacle contact risk"
+            v.target_speed = 0.0
+            return v
+        if math.isfinite(risk.target_speed_cap):
+            v.target_speed = min(v.target_speed,
+                                 float(risk.target_speed_cap))
+            if v.target_speed <= 0.0 and v.level == "safe":
+                v.level = "degraded"
+                v.reason = "obstacle stopping distance"
+        return v
+
+    def _evaluate_core(self, scene, path, closed_loop_steer: float = 0.0,
+                       snapshot_age_s: float = 0.0,
+                       planner_age_s: float = 0.0,
+                       now_s: float | None = None) -> SafetyVerdict:
+        """The layered arbitration proper (see :meth:`evaluate`)."""
         closed_loop_steer = float(closed_loop_steer)
         path_occ = self._path_occupied_fraction(scene, path)
         lane_dev, lane_ref_src = self._lane_deviation(scene, path)
-        body_cross = body_lane_cross_dist_m(scene, path)
+        body_cross, cross_idx, cross_side = body_lane_cross_detail_m(
+            scene, path,
+            half_len=HALF_LENGTH_M + BODY_CROSS_MARGIN_M,
+            half_width=HALF_WIDTH_M + BODY_CROSS_MARGIN_M)
         body_now_cross = body_pose_crosses_lane(
-            scene, scene.pos, float(scene.heading))
+            scene, scene.pos, float(scene.heading),
+            half_len=HALF_LENGTH_M + BODY_CROSS_MARGIN_M,
+            half_width=HALF_WIDTH_M + BODY_CROSS_MARGIN_M)
         freshness = _perception_freshness(scene, snapshot_age_s)
         # ``sensor_age`` stays the honest max over every modality for
         # telemetry; the stale decision separates three different things:
@@ -383,6 +681,16 @@ class SafetyMonitor:
             lane_age_s=freshness["lane_age_s"],
             range_age_s=freshness["range_age_s"])
         v.lane_ref_src = lane_ref_src
+        # Structured boundary diagnostics ride EVERY verdict (plan C1):
+        # the current-pose and planned-sweep crossings are separate
+        # events, and the planned one reports where on the path it
+        # happens instead of only "crossed".
+        v.body_cross_current = bool(body_now_cross)
+        v.body_cross_planned = bool(body_cross > 0.0)
+        if body_cross > 0.0:
+            v.first_crossing_distance_m = float(body_cross)
+            v.crossing_path_index = int(cross_idx)
+            v.crossing_boundary_side = str(cross_side)
 
         # --- stale sensors / planner -> degrade to minimal risk --------
         if stale_sensor or stale_planner:
@@ -391,8 +699,26 @@ class SafetyMonitor:
             v.target_speed = min(v.target_speed, self.min_risk_speed * 2.0)
             return v
 
-        # --- path missing -> minimal risk ------------------------------
+        # --- path missing -> bounded hold, else minimal risk -----------
+        # A single frame without a path used to demand an instant full
+        # stop, which produced the stop/restart churn of short perception
+        # dropouts (17 stops in 40 s, 2026-09-19 live).  A path the
+        # monitor JUST verified may be re-served for the bounded hold
+        # window - re-checked against the CURRENT scene first - and the
+        # hold decays to a creep before failing closed to a stop.
         if path is None or len(path) < 2:
+            served = self._serve_hold(
+                scene, time.time() if now_s is None else float(now_s))
+            if served is not None:
+                held_path, hold_age, hold_phase, hold_cap = served
+                v.level = "degraded"
+                v.reason = f"path hold ({hold_phase})"
+                v.target_speed = hold_cap
+                v.path_hold_active = True
+                v.path_hold_age_s = float(hold_age)
+                v.path_hold_phase = str(hold_phase)
+                v.held_path = held_path
+                return v
             v.level = "minimal_risk"
             v.reason = "no drivable path"
             v.target_speed = 0.0
@@ -446,6 +772,39 @@ class SafetyMonitor:
         # centre is inside but whose projected corner crosses a boundary
         # must stop before steering it (not merely degrade its speed).
         if body_now_cross or body_cross > 0.0:
+            if body_now_cross and lane_ref_src == REF_SENSOR \
+                    and body_lane_cross_recovery(
+                        scene, path,
+                        half_len=HALF_LENGTH_M + BODY_CROSS_MARGIN_M,
+                        half_width=HALF_WIDTH_M + BODY_CROSS_MARGIN_M):
+                # The car already sits across the line.  The current-pose
+                # flag alone refuses EVERY path - including the one that
+                # steers it back - so the car froze in the crossing and
+                # the stuck detector then armed a reverse escape (live
+                # east_coast 2026-09-18).  A path that CONVERGES is the
+                # legal recovery, exactly as the centreline gate already
+                # allows (``lane_cross_dist_m``); it is capped to a creep,
+                # and a path that keeps or deepens the crossing still
+                # takes the hard stop below.
+                v.level = "degraded"
+                v.reason = "lane boundary recovery"
+                v.target_speed = min(v.target_speed,
+                                     self.min_risk_speed * 0.5)
+                return v
+            if not body_now_cross \
+                    and body_cross >= config.FSD_PLANNED_CROSS_HARD_M:
+                # Far-field PLANNED crossing (plan C1): the current body
+                # is clean and the first violation is still ahead - cap
+                # the speed and let the next tick re-plan instead of a
+                # full stop.  The crossing distance shrinks as the car
+                # advances, so a persistent crossing still converges to
+                # the hard stop below; only a far-end boundary-fit
+                # artefact gets smoothed out.
+                v.level = "degraded"
+                v.reason = "planned boundary crossing ahead"
+                v.target_speed = min(v.target_speed,
+                                     self.min_risk_speed * 2.0)
+                return v
             v.level = "minimal_risk"
             v.reason = ("current vehicle body crosses lane boundary"
                         if body_now_cross
@@ -480,6 +839,16 @@ class SafetyMonitor:
                 # the 2 m/s creep and stall the car (fsd opt21 t=54-60:
                 # v 5.3 -> 0.1 -> 3.0 with plan 6.0, junction clutter).
                 eased = max(eased, self.max_speed * self.corridor_open_floor)
+                # ... except in the last few metres before contact: the
+                # open-corridor floor (3.3 m/s at cruise 6) kept the car
+                # at full ease speed until it physically brushed a
+                # guardrail box at closest 1.2 m (two contact-and-relaunch
+                # stalls, east_coast 2026-09-19).  Inside the contact band
+                # the proximity ease wins, floored at the minimal-risk
+                # speed so the car keeps rolling instead of stalling.
+                if closest < 3.0:
+                    eased = max(min(eased, self.max_speed * k),
+                                self.min_risk_speed)
             else:
                 # Real forward blockage: keep the creep / stop reserve.
                 eased = max(eased, self.min_risk_speed)
