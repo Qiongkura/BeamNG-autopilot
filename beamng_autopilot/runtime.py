@@ -43,9 +43,37 @@ class CameraProvider:
 
 
 class RangeProvider:
-    """Returns merged obstacle boxes and raw ray hits for one scan."""
+    """Returns merged obstacle boxes and raw ray hits for one scan.
+
+    ``scan()`` is the synchronous contract every provider satisfies.  A
+    provider whose scan mixes CONNECTION I/O with CPU-side processing may
+    additionally declare ``range_split = True`` and implement the
+    two-phase form, so the heavy half can run on a worker thread (plan
+    phase A4) without ever putting socket access on two threads:
+
+    * ``fetch(pos, ego_vid, radius)`` - ONLY the connection reads, taken
+      under the connector's ``io_lock``; returns an opaque payload (or
+      None when the read failed / no split is available);
+    * ``process(payload, pos, ego_vid, radius)`` - ONLY CPU work
+      (filtering, clustering, fusion); never touches the connection, so
+      it is the half that may leave the caller's thread.
+
+    ``scan()`` must stay exactly ``process(fetch(...))`` for such a
+    provider - the split is a threading boundary, not a behaviour change.
+    """
+
+    range_split = False
 
     def scan(self, pos, ego_vid=None, radius: float = 55.0) -> RangeSample:
+        raise NotImplementedError
+
+    def fetch(self, pos, ego_vid=None, radius: float = 55.0):
+        """Connection-only phase; None when the provider has no split."""
+        return None
+
+    def process(self, payload, pos, ego_vid=None,
+                radius: float = 55.0) -> RangeSample:
+        """CPU-only phase for a payload produced by ``fetch``."""
         raise NotImplementedError
 
     def close(self) -> None:
