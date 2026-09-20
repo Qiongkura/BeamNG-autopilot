@@ -249,6 +249,40 @@ def emergency_stop_clearance_m(speed: float, decel: float = 6.0,
     return float(speed * speed / (2.0 * max(0.1, decel)) + margin)
 
 
+def contact_envelope_speed_mps(clearance: float, reaction_s: float,
+                               decel: float = 6.0,
+                               margin: float = 1.0) -> float:
+    """Largest speed that can still stop inside ``clearance`` (m).
+
+    The exact inverse of :func:`emergency_stop_clearance_m` PLUS one
+    control period of reaction travel.  The extra term is the whole
+    point: a speed cap is only honest if the car can still stop from it
+    *after* committing to that speed for one tick, because it cannot
+    react mid-tick.
+
+    The 2026-09-20 town collision is the case that needs it.  At
+    t=26.772 s the car sat 3.79 m from a corridor-intruding obstacle at
+    2.46 m/s and the open-corridor escape hatch raised the target to
+    3.30 m/s.  The reserve for 3.30 m/s is 1.91 m, which fits inside
+    3.79 m on its own - so a reserve-only test allowed the raise.  One
+    tick later the car had covered 2.6 m, sat at 3.545 m/s with 1.21 m
+    left, and hit the wall.  With a 0.8 s control period this helper
+    allows 2.72 m/s at 3.79 m, so the 3.30 m/s raise is refused on the
+    frame where it did the damage.
+
+    Solving ``s^2 / (2a) + s * reaction_s = clearance - margin`` for
+    ``s``.  ``reaction_s <= 0`` reduces it to the plain inverse of the
+    reserve.  Returns 0.0 when the clearance is already inside the
+    margin.
+    """
+    room = float(clearance) - float(margin)
+    if room <= 0.0:
+        return 0.0
+    a = 1.0 / (2.0 * max(0.1, decel))
+    b = max(0.0, float(reaction_s))
+    return max(0.0, (-b + math.sqrt(b * b + 4.0 * a * room)) / (2.0 * a))
+
+
 def approach_speed_limit_mps(clearance: float, need: float,
                               gain: float = 2.5) -> float:
     """Approach-speed cap (m/s) for the remaining raw forward clearance.

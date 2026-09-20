@@ -59,6 +59,7 @@ from .obstacles import (  # noqa: F401
     _path_hit_index,
     _seg_hits_obstacle,
     approach_speed_limit_mps,
+    contact_envelope_speed_mps,
     emergency_speed_limit_mps,
     emergency_stop_clearance_m,
     forward_clearance_m,
