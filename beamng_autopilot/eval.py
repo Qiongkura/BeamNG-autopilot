@@ -58,6 +58,16 @@ BENCH_MAX_CROSS_RIGHT = 0
 BENCH_MAX_OFF_ROAD_FRAMES = 0
 BENCH_MAX_STALL_FRAMES = 0
 BENCH_GOAL_TOL_M = 8.0
+BENCH_MAX_COLLISIONS = 0
+
+# Three-state run verdict (plan P0-3).  ``UNKNOWN`` is a first-class
+# outcome, not a soft FAIL: a run whose collision channel was never
+# sampled must not read as "no collisions" (the §12 gate is
+# ``collision_count = 0``, and a missing measurement cannot satisfy it),
+# while a run that DID measure and saw nothing is a genuine PASS.
+STATUS_PASS = "PASS"
+STATUS_FAIL = "FAIL"
+STATUS_UNKNOWN = "UNKNOWN"
 
 
 def _num(x):
@@ -71,6 +81,48 @@ def _f(hist, key, i, default=None):
     except Exception:
         return default
     return default if v is None else v
+
+
+def _episodes(flags: list[bool],
+              t: list[float]) -> tuple[float, float, int]:
+    """(total_s, longest_s, episode_count) for a boolean mask.
+
+    Each frame owns the interval to the NEXT frame; the LAST frame owns
+    nothing, because the sampled window is ``[t[0], t[-1]]`` and no
+    evidence exists past the final sample.  A mask covering the whole run
+    therefore sums to exactly the run's sampled duration (rather than one
+    frame short, or one frame long as a "reuse the previous gap" rule
+    would make it).
+
+    Frame COUNTS cannot be compared across runs of different cadence -
+    60 frames is 36 s at 1.65 Hz and 6 s at 10 Hz - which is why the plan
+    asks for duration, not counts.
+    """
+    n = len(flags)
+    if n == 0:
+        return 0.0, 0.0, 0
+    dts = [(float(t[i + 1]) - float(t[i])) if i + 1 < n else 0.0
+           for i in range(n)]
+    total = 0.0
+    longest = 0.0
+    cur = 0.0
+    episodes = 0
+    inside = False
+    for i in range(n):
+        if flags[i]:
+            if not inside:
+                episodes += 1
+                inside = True
+                cur = 0.0
+            step = max(0.0, dts[i])
+            cur += step
+            total += step
+            if cur > longest:
+                longest = cur
+        else:
+            inside = False
+            cur = 0.0
+    return total, longest, episodes
 
 
 def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
@@ -159,8 +211,10 @@ def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
     out["cross_right_frames"] = crossed_right
     out["near_centre_frames"] = near_centre
     out["near_right_frames"] = near_right
-    out["max_cross_centre_m"] = round(max(ll_v), 3) if ll_v else 0.0
-    out["max_cross_right_m"] = round(min(lr_v), 3) if lr_v else 0.0
+    # A run with no lateral samples at all is UNMEASURED, not "perfectly
+    # centred": the old 0.0 fallback read as a clean run (plan P0-5).
+    out["max_cross_centre_m"] = round(max(ll_v), 3) if ll_v else None
+    out["max_cross_right_m"] = round(min(lr_v), 3) if lr_v else None
     out["lat_frames"] = len(ll_v)
 
     # BODY-aware crossing: the car's yawed footprint extends its lateral
@@ -215,16 +269,49 @@ def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
     # road_off (blind in strict mode - kept for old telemetry).
     eo = [_f(hist, "edge_over", i) for i in settled]
     eo_v = [v for v in eo if _num(v)]
+    # Frames are reported as DURATION and MAGNITUDE too (plan P0-4):
+    # "60 frames off the pavement" is 36 s at 1.65 Hz and 6 s at 10 Hz,
+    # and 0.60 m past the edge is a different event from 6.96 m past it.
+    t_s = [float(t[i]) for i in settled]
     if eo_v:
-        out["off_road_frames"] = sum(1 for v in eo_v if v > EDGE_OVER_M)
+        src, limit = "edge_over", EDGE_OVER_M
+        mask = [_num(v) and float(v) > limit for v in eo]
+        mags = [float(v) for v in eo if _num(v)]
+        out["off_road_frames"] = sum(1 for m in mask if m)
         out["max_edge_over_m"] = round(max(eo_v), 3)
     elif rd_v:
-        out["off_road_frames"] = sum(1 for v in rd_v
-                                     if v > ROAD_HALF_WIDTH_M)
+        src, limit = "route_dist", ROAD_HALF_WIDTH_M
+        mask = [_num(v) and float(v) > limit for v in rd]
+        mags = [float(v) for v in rd if _num(v)]
+        out["off_road_frames"] = sum(1 for m in mask if m)
         out["max_route_dist_m"] = round(max(rd_v), 3)
+    elif ro_v:
+        src, limit = "road_off", OFF_ROAD_M
+        mask = [_num(v) and float(v) > limit for v in ro]
+        mags = [float(v) for v in ro if _num(v)]
+        out["off_road_frames"] = sum(1 for m in mask if m)
     else:
-        out["off_road_frames"] = sum(1 for v in ro_v if v > OFF_ROAD_M)
-    out["max_road_off_m"] = round(max(ro_v), 3) if ro_v else 0.0
+        # No off-road source at all: report MISSING, never 0 frames.
+        src, limit = None, None
+        mask = []
+        mags = []
+        out["off_road_frames"] = None
+    out["off_road_measured"] = src is not None
+    out["off_road_src"] = src
+    if src is not None:
+        total_s, longest_s, eps = _episodes(mask, t_s)
+        out["off_road_s"] = round(total_s, 2)
+        out["off_road_longest_s"] = round(longest_s, 2)
+        out["off_road_episodes"] = eps
+        off_mags = [m for m, ok in zip(mags, mask) if ok]
+        out["off_road_max_m"] = (round(max(off_mags), 3)
+                                 if off_mags else 0.0)
+    else:
+        out["off_road_s"] = None
+        out["off_road_longest_s"] = None
+        out["off_road_episodes"] = None
+        out["off_road_max_m"] = None
+    out["max_road_off_m"] = round(max(ro_v), 3) if ro_v else None
 
     # speed profile / smoothness
     v = [_f(hist, "speed", i, 0.0) for i in range(n)]
@@ -255,14 +342,36 @@ def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
     # PER settled frame - indexing v_v (a filtered list) by the raw
     # frame index desyncs the moment any speed is non-numeric.
     stalls = 0
+    stall_mask: list[bool] = []
     for i in settled:
         rem = _f(hist, "rem_end", i)
         rem = rem if _num(rem) else None
         spd = _f(hist, "speed", i, 0.0)
         spd = spd if _num(spd) else 0.0
-        if spd < STALL_SPEED_MPS and (rem is None or rem > STALL_REM_END_M):
+        hit = bool(spd < STALL_SPEED_MPS
+                   and (rem is None or rem > STALL_REM_END_M))
+        stall_mask.append(hit)
+        if hit:
             stalls += 1
     out["stall_frames"] = stalls
+    # Duration and episode count, not only frames (plan P0-4): one 40 s
+    # stall and forty 1 s stalls are the same frame count and completely
+    # different driving failures.
+    st_total, st_longest, st_eps = _episodes(stall_mask, t_s)
+    out["stall_s"] = round(st_total, 2)
+    out["stall_longest_s"] = round(st_longest, 2)
+    out["stall_events"] = st_eps
+    out["settled_duration_s"] = round(
+        max(0.0, (t_s[-1] - t_s[0]) if len(t_s) > 1 else 0.0), 2)
+    # Exposure-normalised rates, so runs of different length compare.
+    denom = out["settled_duration_s"] or 0.0
+    if denom > 0.0:
+        out["stall_frac"] = round(st_total / denom, 3)
+        out["off_road_frac"] = (round(out["off_road_s"] / denom, 3)
+                                if out["off_road_s"] is not None else None)
+    else:
+        out["stall_frac"] = None
+        out["off_road_frac"] = None
 
     # movement / final stop
     dist = 0.0
@@ -287,7 +396,76 @@ def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
         out["goal_dist_m"] = round(math.hypot(
             float(last["pos"][0]) - gx,
             float(last["pos"][1]) - gy), 2)
+    out.update(collision_events(hist))
     return out
+
+
+def collision_events(hist: list[dict], *,
+                     min_delta: float = 0.01,
+                     merge_s: float = 1.0) -> dict:
+    """Count collision events from the damage channel of a run.
+
+    The plan's §12 hard gate starts with ``collision_count = 0``, and the
+    evaluator had no way to say it: crossings and off-road frames are
+    proxies, not collisions.  A run that recorded the vehicle's damage
+    (``damage_total`` per frame, from the beamngpy Damage sensor) can be
+    counted honestly - a collision is a frame where the damage value
+    INCREASED by at least ``min_delta``.
+
+    Two counts, because they answer different questions (plan P0-4):
+
+    * ``collision_count`` - frames where the damage rose.  One impact
+      spread over several frames (the Damage sensor updates per tick
+      while a contact persists) counts more than once.
+    * ``collision_episodes`` - the same increases grouped by time: rises
+      less than ``merge_s`` apart belong to ONE event.  This is the
+      deduplicated event count, and the one to quote as "how many
+      collisions happened".
+
+    ``collided`` is the 0/1 reading - whether this run collided at all -
+    which is what a run-level pass/fail gate actually consumes.
+
+    Returns ``{"collision_count": int | None, "collision_episodes":
+    int | None, "collided": bool | None, "damage_frames": int,
+    "damage_total": float | None, "first_collision_t": float | None}``.
+    ``collision_count`` is None when the run carries no damage samples at
+    all: "not measured" must never read as "no collisions" - that is
+    exactly the mistake this metric exists to prevent.
+    """
+    rows = [h for h in (hist or ()) if isinstance(h, dict)]
+    vals: list[tuple[float, float]] = []
+    for h in rows:
+        v = h.get("damage_total")
+        if not _num(v):
+            continue
+        # read the row directly: ``_f`` indexes hist[index][key], it is not
+        # a per-row accessor (using it here silently produced t=0.0)
+        t_raw = h.get("t")
+        vals.append((float(t_raw) if _num(t_raw) else 0.0, float(v)))
+    if not vals:
+        return {"collision_count": None, "collision_episodes": None,
+                "collided": None, "damage_frames": 0,
+                "damage_total": None, "first_collision_t": None}
+    events = 0
+    first_t = None
+    last_rise_t: float | None = None
+    episodes = 0
+    prev = vals[0][1]
+    for t, v in vals[1:]:
+        if v - prev >= float(min_delta):
+            events += 1
+            if first_t is None:
+                first_t = t
+            if last_rise_t is None or (t - last_rise_t) > float(merge_s):
+                episodes += 1
+            last_rise_t = t
+        prev = v
+    return {"collision_count": int(events),
+            "collision_episodes": int(episodes),
+            "collided": bool(events > 0),
+            "damage_frames": len(vals),
+            "damage_total": round(float(vals[-1][1]), 4),
+            "first_collision_t": first_t}
 
 
 def assess_many(runs: Iterable[list[dict]], goal=None,
@@ -302,12 +480,25 @@ def score_run(assessed: dict, require_goal: bool = False) -> dict:
     """Verdict on one assessed run against the benchmark hard targets.
 
     ``assessed`` is an :func:`assess_run` result.  Returns
-    ``{"checks": {name: bool}, "pass": bool}`` — ``pass`` is True only
-    when every hard target holds (and, for goal scenarios, the goal was
-    reached within :data:`BENCH_GOAL_TOL_M`).  A run with no frames can
-    never pass.
+    ``{"checks": {name: bool}, "unknown": [name], "status": str,
+    "pass": bool}``.
+
+    ``status`` is PASS / FAIL / UNKNOWN (plan P0-3):
+
+    * FAIL - a measured target was violated.
+    * UNKNOWN - nothing was violated, but at least one target could not be
+      MEASURED, so it cannot be cleared either.  A run with no damage
+      channel cannot demonstrate ``collision_count = 0``; the old verdict
+      silently omitted the collision gate entirely, which is how a run
+      with no collision evidence passed.
+    * PASS - every target was measured and held.
+
+    ``pass`` is True only for PASS, so the release gate never clears an
+    UNKNOWN.  ``checks`` keeps its historical bool shape (an unmeasured
+    target is False there, because it did not hold); ``unknown`` says
+    whether that False means "violated" or "not measured".
     """
-    checks = {
+    checks: dict[str, bool] = {
         "has_frames": (
             int(assessed.get("frames", 0) or 0) > 0
             and int(assessed.get("settled_frames",
@@ -324,25 +515,74 @@ def score_run(assessed: dict, require_goal: bool = False) -> dict:
             <= BENCH_MAX_CROSS_RIGHT
             and int(assessed.get("body_cross_right_frames", 0) or 0)
             <= BENCH_MAX_CROSS_RIGHT),
-        "on_road": int(assessed.get("off_road_frames", 0) or 0)
-        <= BENCH_MAX_OFF_ROAD_FRAMES,
         "no_stall": int(assessed.get("stall_frames", 0) or 0)
         <= BENCH_MAX_STALL_FRAMES,
     }
+    unknown: list[str] = []
+    # ``off_road_frames is None`` means no off-road source existed in the
+    # run; that is unmeasured, not "on road".
+    orf = assessed.get("off_road_frames")
+    if orf is None:
+        checks["on_road"] = False
+        unknown.append("on_road")
+    else:
+        checks["on_road"] = int(orf) <= BENCH_MAX_OFF_ROAD_FRAMES
+    # The collision gate (§12 #1).  ``collision_count is None`` = the
+    # damage channel was never sampled.
+    cc = assessed.get("collision_count")
+    if cc is None:
+        checks["no_collision"] = False
+        unknown.append("no_collision")
+    else:
+        checks["no_collision"] = int(cc) <= BENCH_MAX_COLLISIONS
     if require_goal:
         gd = assessed.get("goal_dist_m")
-        checks["reached_goal"] = (
-            _num(gd) and float(gd) <= BENCH_GOAL_TOL_M)
-    return {"checks": checks, "pass": all(bool(v) for v in checks.values())}
+        if not _num(gd):
+            checks["reached_goal"] = False
+            unknown.append("reached_goal")
+        else:
+            checks["reached_goal"] = float(gd) <= BENCH_GOAL_TOL_M
+    failed = [k for k, ok in checks.items() if not ok and k not in unknown]
+    if failed:
+        status = STATUS_FAIL
+    elif unknown:
+        status = STATUS_UNKNOWN
+    else:
+        status = STATUS_PASS
+    return {"checks": checks, "unknown": unknown, "status": status,
+            "pass": status == STATUS_PASS}
 
 
 def score_many(assessed: list[dict], require_goal: bool = False) -> dict:
     """Aggregate benchmark verdicts over several assessed runs.
 
-    Returns ``{"runs": [verdict...], "pass": bool, "n_pass": int}`` —
-    the aggregate passes only when EVERY run passes.
+    Returns ``{"runs": [...], "status": str, "pass": bool, "n_pass": int,
+    "n_unknown": int, "n_failed": int, "n_collided": int | None,
+    "collision_run_ratio": float | None}`` - the aggregate passes only
+    when EVERY run passes, and is UNKNOWN (never PASS) when any run is
+    UNKNOWN.  ``collision_run_ratio`` is the share of runs that collided,
+    which is the honest reading of a 0/1 per-run collision flag; it is
+    None when no run measured damage.
     """
     verdicts = [score_run(a, require_goal=require_goal) for a in assessed]
-    n_pass = sum(1 for v in verdicts if v["pass"])
-    return {"runs": verdicts, "n_pass": n_pass,
-            "pass": bool(verdicts) and n_pass == len(verdicts)}
+    n_pass = sum(1 for v in verdicts if v["status"] == STATUS_PASS)
+    n_unknown = sum(1 for v in verdicts if v["status"] == STATUS_UNKNOWN)
+    n_failed = sum(1 for v in verdicts if v["status"] == STATUS_FAIL)
+    if n_failed:
+        status = STATUS_FAIL
+    elif n_unknown:
+        status = STATUS_UNKNOWN
+    elif verdicts:
+        status = STATUS_PASS
+    else:
+        status = STATUS_UNKNOWN
+    collided = [a.get("collided") for a in assessed]
+    measured = [c for c in collided if c is not None]
+    return {"runs": verdicts, "status": status,
+            "pass": status == STATUS_PASS,
+            "n_pass": n_pass, "n_unknown": n_unknown, "n_failed": n_failed,
+            "n_collided": (sum(1 for c in measured if c)
+                           if measured else None),
+            "collision_run_ratio": (round(sum(1 for c in measured if c)
+                                          / len(measured), 3)
+                                    if measured else None)}
