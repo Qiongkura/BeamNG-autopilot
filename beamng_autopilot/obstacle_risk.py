@@ -62,8 +62,11 @@ RISK_STOP_MARGIN_M = 2.0
 RISK_REACTION_S = 0.5
 # Relative speed below this counts as "not closing".
 RISK_MIN_CLOSING_MPS = 0.5
-# Prediction horizon for "will it intrude into my corridor".
+# Prediction horizon for "will it intrude into my corridor", and the step
+# used to sample it (a crossing vehicle must be caught when it crosses,
+# not only if the crossing lands exactly on the TTC instant).
 RISK_PREDICT_HORIZON_S = 3.0
+RISK_PREDICT_STEP_S = 0.5
 
 
 @dataclass
@@ -240,19 +243,30 @@ def assess_obstacles(tracks, pos, heading: float,
         frames_seen = int(getattr(tr, "matches", 1) or 1)
         lost = int(getattr(tr, "lost", 0) or 0)
         confirmed = frames_seen >= int(min_confirm_frames) and lost == 0
-        # Will it intrude into the corridor inside the horizon?
-        t_pred = min(float(horizon_s), ttc if ttc is not None
-                     else float(horizon_s))
-        pred = xy[i] + obs_vel * max(0.0, t_pred)
-        if pth is not None:
-            p_along, p_lat, _ = _project_to_path(
-                np.asarray([pred], dtype=float), pth)
-            predicted_intrusion = bool(abs(float(p_lat[0]))
-                                       <= float(corridor_half_m))
-        else:
-            rel_p = pred - p
-            predicted_intrusion = bool(abs(float(rel_p @ left))
-                                       <= float(corridor_half_m))
+        # Will it be INSIDE the corridor at any point within the horizon?
+        # Sampling only the TTC instant (the first version) missed a
+        # crossing vehicle that reaches the corridor slightly later: it
+        # stayed "roadside clutter" until it was already in the way.  The
+        # horizon is sampled in steps so the crossing is caught when it
+        # happens, not only if it happens to land on the TTC.
+        predicted_intrusion = False
+        _horizon = max(0.0, float(horizon_s))
+        _steps = np.arange(RISK_PREDICT_STEP_S, _horizon + 1e-9,
+                           RISK_PREDICT_STEP_S)
+        if len(_steps) == 0:
+            _steps = np.asarray([_horizon])
+        for _t in _steps:
+            pred = (xy[i] + obs_vel * float(_t))[None, :]
+            if pth is not None:
+                _p_along, p_lat, _ = _project_to_path(
+                    np.asarray(pred, dtype=float), pth)
+                _inside = abs(float(p_lat[0])) <= float(corridor_half_m)
+            else:
+                rel_p = np.asarray(pred, dtype=float)[0] - p
+                _inside = abs(float(rel_p @ left)) <= float(corridor_half_m)
+            if _inside:
+                predicted_intrusion = True
+                break
 
         cap = float("inf")
         why = ""
@@ -261,17 +275,24 @@ def assess_obstacles(tracks, pos, heading: float,
         # "已经无法在剩余距离内刹停" is an explicit no-wait case.
         stop_gap_m = stop_distance_m(ego_speed_mps, decel_mps2) + margin_m
         treat_in_corridor = bool(in_corridor or predicted_intrusion)
-        if gap <= float(contact_band_m):
-            # Contact band: no confirmation wait, no TTC needed.
+        if not in_corridor and not predicted_intrusion:
+            # Corridor gate FIRST, before even the contact band: a tree,
+            # kerb or parked car BESIDE the lane is a lane bound, and a
+            # town street has them within a couple of metres constantly.
+            # Ordering the contact band ahead of this gate turned every
+            # such object into an immediate collision: the 2026-09-20 town
+            # baseline stopped on 144/144 frames ("obstacle contact risk",
+            # hard_collision) with fwd_clear 16 m and the lane paired 136
+            # frames - the car never moved.  Distance alone is not danger;
+            # it is distance WITHIN the driven corridor that is.
+            kind = RISK_ROADSIDE
+            why = "outside the driven corridor"
+        elif gap <= float(contact_band_m):
+            # Inside the corridor and this close: no confirmation wait and
+            # no TTC needed.
             kind = RISK_HARD_COLLISION
             cap = 0.0
             why = "inside contact band"
-        elif not in_corridor and not predicted_intrusion:
-            # Corridor gate BEFORE any TTC branch: a static tree/curb
-            # beside the lane has a TTC against the ego's own motion too,
-            # but it is a lane bound and must never brake the car.
-            kind = RISK_ROADSIDE
-            why = "outside the driven corridor"
         elif not confirmed and gap > stop_gap_m:
             # Scattered / single-frame return that the car can still stop
             # for: no speed cap may be derived from it (plan C4).

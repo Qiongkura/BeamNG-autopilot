@@ -176,3 +176,34 @@ def test_digest_is_json_safe() -> None:
     import json
     text = json.dumps(risk.digest())
     assert "braking_obstacle" in text
+
+
+def test_roadside_object_in_the_contact_band_does_not_stop_the_car() -> None:
+    """The channel-wall failure: distance alone is not danger (live 2026-09-20).
+
+    A town street has trees, kerbs and parked cars within 3 m of the car
+    all the time.  Ordering the contact band BEFORE the corridor gate made
+    every one of them an immediate collision: the baseline stopped on
+    144/144 frames with the lane paired and 16 m of clear road ahead.
+    """
+    beside = _track(2.0, 4.0)          # 2 m ahead, 4 m to the side
+    risk = assess_obstacles([beside], (0.0, 0.0), 0.0, 3.0)
+    assert risk.kind == RISK_ROADSIDE
+    assert risk.stop is False
+    assert math.isinf(risk.target_speed_cap)
+
+
+def test_in_corridor_object_in_the_contact_band_still_stops() -> None:
+    """...while something genuinely in the driven corridor still does."""
+    ahead = _track(2.0, 0.4)           # 2 m ahead, inside the 1.6 m corridor
+    risk = assess_obstacles([ahead], (0.0, 0.0), 0.0, 3.0)
+    assert risk.kind == RISK_HARD_COLLISION
+    assert risk.stop is True
+    assert risk.target_speed_cap == 0.0
+
+
+def test_roadside_object_predicted_to_intrude_still_stops() -> None:
+    """A crossing vehicle is not "roadside", however far out it starts."""
+    crossing = _track(2.5, -3.0, vy=6.0)   # 3 m right, moving left fast
+    risk = assess_obstacles([crossing], (0.0, 0.0), 0.0, 3.0)
+    assert risk.stop is True
