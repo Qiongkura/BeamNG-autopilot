@@ -36,7 +36,12 @@ from beamng_autopilot.control.drive_mode import (
 from beamng_autopilot.control.steering import SteeringShaper
 from beamng_autopilot.control.substep import ControlSubstep
 from beamng_autopilot.obstacle_risk import assess_obstacles
-from beamng_autopilot.fsd_stack import FSDStack
+from beamng_autopilot.fsd_stack import (
+    FSDStack,
+    OBJECT_KEEPALIVE_S,
+    RANGE_KEEPALIVE_S,
+    SCHED_KEEPALIVE_ENABLED,
+)
 from beamng_autopilot.fsd_realism import SRC_PAVED, SRC_SENSOR
 from beamng_autopilot.lane import perception_curve_speed
 from beamng_autopilot.neural.bc_runtime import (
@@ -50,9 +55,9 @@ from beamng_autopilot.neural.e2e_runtime import (
 )
 from beamng_autopilot.occupancy import OccupancyGrid
 from beamng_autopilot.planning import (
-    ArbiterOutcome, Scene, anchored_rule_ref, arbitrate_fsd_tick,
-    body_pose_crosses_lane, local_route, strict_lane_unavailable,
-    validate_learned_path,
+    ArbiterOutcome, ClearanceGuard, Scene, anchored_rule_ref,
+    arbitrate_fsd_tick, body_pose_crosses_lane, local_route,
+    strict_lane_unavailable, validate_learned_path,
 )
 from beamng_autopilot.planning.arbiter import (
     bearing_diff_deg, polyline_bearing,
@@ -527,6 +532,27 @@ def _perception_off_road_m(out, pos, heading) -> float:
             except Exception:
                 pass
     return float(worst)
+
+
+def _perception_age_s(out, keys) -> float | None:
+    """Oldest age (s) among the named freshness keys, or None if unknown.
+
+    The forward-clearance layer is derived from FUSED perception, so its
+    reading is only as fresh as the oldest modality that feeds it: a grid
+    path clearance built from a 60 s old LiDAR sweep is not fresh
+    clearance just because the BEV was rebuilt this tick.  ``None`` means
+    the age is unknown - the clearance guard treats that as "no usable
+    evidence", never as fresh.
+    """
+    fresh = (getattr(out, "meta", None) or {}).get("snapshot") or {}
+    fresh = fresh.get("freshness") or {}
+    ages = []
+    for k in keys:
+        v = fresh.get(k)
+        if v is None:
+            return None
+        ages.append(float(v))
+    return max(ages) if ages else None
 
 
 # Travel-direction sources that count as PERCEPTION in the end zone
@@ -1242,6 +1268,130 @@ def resolve_provenance_env(conn, args) -> tuple[str, str]:
     return map_name, vehicle
 
 
+def consumed_from_head_sched(head_sched, cmd_t):
+    """Per head: which result this command acted on (plan P1, consumer side).
+
+    ``head_sched`` is what fsd_stack published this tick; ``cmd_t`` is when
+    the command left.  The age recorded is the age AT COMMAND TIME - the one
+    that actually mattered - not the age at publish time.
+
+    This is what makes the two failure shapes visible instead of identical:
+
+    * a head that published but never appears here -> published, not consumed;
+    * a head whose ``result_seq`` here trails the published one -> the tick
+      acted on an older version.
+
+    A missing publish time yields ``None``, never a plausible age.
+    """
+    out_: dict[str, dict] = {}
+    for name, rec in (head_sched or {}).items():
+        if not isinstance(rec, dict):
+            continue
+        pub = rec.get("publish_t")
+        out_[name] = {
+            "result_seq": rec.get("result_seq"),
+            "source_seq": rec.get("source_seq"),
+            "age_s": (round(float(cmd_t) - float(pub), 3)
+                      if (pub is not None and cmd_t is not None) else None),
+        }
+    return out_
+
+
+# Control watchdog (plan P3).  Default OFF: braking on a missed command
+# is a behaviour change.  The threshold sits well above the measured
+# worst-case command gap (0.801 s at p-max on town_1789890111) so it only
+# fires on a real stall, not on a slow tick.
+CTRL_WATCHDOG_ENABLED = (
+    os.environ.get("BEAMNG_CTRL_WATCHDOG", "0") != "0")
+CTRL_WATCHDOG_MAX_GAP_S = float(
+    os.environ.get("BEAMNG_CTRL_WATCHDOG_GAP_S", "1.5"))
+
+
+def final_target_speed(reference: float, plan_speed: float,
+                       hard_cap: float, *, force_stop: bool = False
+                       ) -> float:
+    """The last word of the speed chain: never above the hard cap.
+
+    Plan P2.3.  ``hard_cap`` is the value the safety monitor and the
+    emergency branches already agreed on (``target`` in the drive loop,
+    which is ``min(verd.target_speed, plan_speed, args.speed)`` and then
+    lowered further).  Everything downstream of it - the longitudinal
+    planner, the ramp, the corner governor - shapes how the car GETS to a
+    speed.  None of them may choose a higher one.
+
+    The long-planner branch used to clamp only against ``plan_speed``, so
+    a comfort-shaped reference above a monitor-imposed cap was published
+    as the target.  That is the "hard constraint raised by a later
+    branch" shape: the monitor said 3.3 m/s and the shaper was free to
+    answer 6.0 because the plan allowed it.
+
+    ``force_stop`` bypasses shaping entirely, as the loop already does.
+    """
+    if force_stop:
+        return 0.0
+    hi = float(hard_cap)
+    for value in (reference, plan_speed):
+        try:
+            hi = min(hi, float(value))
+        except (TypeError, ValueError):
+            # An unreadable reference must not relax the cap.
+            continue
+    return hi
+
+
+def substep_digest(requested_hz: float, interval_s, executed: int,
+                   skip_reason: str = "") -> dict:
+    """Nominal sub-step rate versus what actually ran (plan P3).
+
+    ``FSD_CONTROL_SUBSTEP_HZ`` is a REQUEST, not an achievement.  The
+    profile measures the achieved control interval at 0.666 s (1.5 Hz)
+    against a nominal 15 Hz, so the two have to be reported separately or
+    the log claims a control rate that never happened.
+    """
+    try:
+        expected = max(0, int(round(float(requested_hz)
+                                    * max(0.0, float(interval_s)))))
+    except (TypeError, ValueError):
+        return {"expected": None, "executed": int(executed),
+                "shortfall": None, "skip_reason": skip_reason or None,
+                "note": "interval not measured"}
+    done = int(executed)
+    return {"expected": expected, "executed": done,
+            "shortfall": max(0, expected - done),
+            "skip_reason": skip_reason or None}
+
+
+def watchdog_verdict(now_t, last_cmd_t, max_gap_s: float) -> dict:
+    """Has too long passed since the last command actually went out?
+
+    Plan P3: the heartbeat must not depend on the perception loop, which
+    is the thing that blocks - a watchdog driven by tick completion would
+    go quiet exactly when it is needed.  This measures the gap between
+    COMMANDS, on the wall clock.
+
+    It returns a verdict, it does not brake: the caller owns the actuator,
+    and P3 forbids a second control channel.  ``last_cmd_t`` None means
+    nothing has been sent yet, which is not the same as "on time".
+    """
+    try:
+        gap = None if (now_t is None or last_cmd_t is None) else (
+            float(now_t) - float(last_cmd_t))
+    except (TypeError, ValueError):
+        return {"action": "unknown", "gap_s": None, "due": False,
+                "reason": "unreadable timestamps"}
+    if gap is None:
+        return {"action": "unknown", "gap_s": None, "due": False,
+                "reason": "no command sent yet"}
+    if gap < 0.0:
+        return {"action": "unknown", "gap_s": gap, "due": False,
+                "reason": "time went backwards"}
+    due = gap > float(max_gap_s)
+    return {"action": "brake" if due else "ok", "gap_s": round(gap, 3),
+            "due": due,
+            "reason": (f"no command for {gap:.3f}s > {float(max_gap_s):.3f}s"
+                       if due else "")}
+
+
 def build_fsd_shadow_provenance(
     *,
     runtime: str,
@@ -1877,6 +2027,14 @@ class FSDriveSession:
         # masked the real error)
         hist: list[dict] = []
         rec = None
+        # Consumption side of the traceability contract (plan P1): the
+        # command sequence and the moment each command left, so "the stack
+        # published a result" and "the car acted on it" are two separate
+        # statements.  A result that was published but never consumed is
+        # otherwise invisible - it still looks like a fresh result.
+        _cmd_seq = 0
+        _cmd_t: float | None = None
+        _prev_cmd_t: float | None = None
 
         conn = BeamNGConnector(
             getattr(args, "map", None) or "italy", "etk800",
@@ -2011,6 +2169,10 @@ class FSDriveSession:
             long_digest = None
             drive_modes = DriveModeClassifier()
             mode_policy = None
+            # Temporal guard on the forward-clearance reserve (see
+            # ``planning.clearance_guard``): a single anomalous reading
+            # must not clear a collision risk that was real one tick ago.
+            clear_guard = ClearanceGuard()
             _sr_prev = 0.0    # previous applied steering rate (jerk telemetry)
             watchdog_lost = False
             map_mc_smooth = None   # EMA-smoothed map-prior lane centre
@@ -2457,6 +2619,14 @@ class FSDriveSession:
                         bc_path = None
                         bc_safe = False
 
+                # Damage sample (plan §12 gate #1): the only honest source
+                # for collision_count.  One read per tick; None when the
+                # runtime has no Damage sensor attached, which the evaluator
+                # reports as "not measured" rather than as zero collisions.
+                try:
+                    _damage_total = conn.read_damage_total()
+                except Exception:
+                    _damage_total = None
                 _cls = out.meta.get("cls_counts", {})
                 _cls_near = out.meta.get("cls_nearest", {})
                 # planner arbitration: FSD path first; when the layered
@@ -3269,13 +3439,42 @@ class FSDriveSession:
                 if force_stop:
                     target = 0.0
                 fwd_clear = float("inf")
+                clear_src = "none"
+                clear_valid = False
+                clear_age = None
                 if chosen.path is not None and len(chosen.path) >= 2:
                     fwd_clear = path_grid_clearance_m(chosen.path, grid)
+                    clear_src = "path_grid"
+                    # The grid is fused from the LiDAR sweep and the BEV
+                    # layer, so the reading is only as fresh as the older
+                    # of the two - and a missing grid is unknown, not
+                    # clear (``path_grid_clearance_m`` returns inf there).
+                    clear_valid = grid is not None
+                    clear_age = _perception_age_s(out, ("range_s", "bev_s"))
                 else:
                     fwd_clear = float(out.forward_clearance)
-                if np.isfinite(fwd_clear):
+                    clear_src = "raw_corridor"
+                    # An EMPTY hit list also returns inf: "no measurement"
+                    # must not read as "corridor clear".
+                    clear_valid = bool(getattr(out, "ray_hits", None))
+                    clear_age = _perception_age_s(out, ("range_s",))
+                # Temporal guard (``planning.clearance_guard``): the raw
+                # reading above is instantaneous, so one anomalous frame
+                # replaces last tick's verdict outright.  Town run
+                # 2026-09-20 accelerated through a 1.20 m reading (inside
+                # the 3.5 m/s braking reserve) and hit at -0.25 m, and 31
+                # recorded single-frame steps take the reading from below
+                # 2 m to above 8 m.  The guard lets a DECREASE through
+                # immediately but bounds an INCREASE by the last few
+                # frames' minimum, latching a jump until it is
+                # corroborated.  It never raises the value.
+                clear_read = clear_guard.update(
+                    fwd_clear, now_t, valid=clear_valid, age_s=clear_age)
+                fwd_clear_guarded = float(clear_read.value)
+                if np.isfinite(fwd_clear_guarded):
                     need = emergency_stop_clearance_m(v)
-                    force_stop, cap = emergency_speed_limit_mps(fwd_clear, need)
+                    force_stop, cap = emergency_speed_limit_mps(
+                        fwd_clear_guarded, need)
                     target = min(target, cap if not force_stop else 0.0)
                 # Smooth the effective target: ramp toward the raw plan at a
                 # bounded rate (sim time), so the corner governor stepping the
@@ -3297,7 +3496,11 @@ class FSDriveSession:
                         road_conf=(out.meta.get("lane_envelope")
                                    or {}).get("confidence"),
                         line_conf=out.meta.get("line_conf_current"))
-                    target_sm = min(float(_lt.reference), plan_speed)
+                    # Clamped against `target` too, not just the plan:
+                    # the planner shapes the approach to a speed, it does
+                    # not get to pick a higher one than the monitor.
+                    target_sm = final_target_speed(
+                        float(_lt.reference), plan_speed, target)
                     long_digest = _lt.digest()
                 else:
                     _dmax = SPEED_TARGET_RAMP_MPS * dt
@@ -3392,7 +3595,10 @@ class FSDriveSession:
                 if (stuck and not force_stop and not off_recover
                         and chosen.path is not None
                         and len(chosen.path) >= 2
-                        and np.isfinite(fwd_clear) and fwd_clear > 3.0):
+                        # the GUARDED clearance: a one-frame spike must not
+                        # be enough to authorise full throttle either
+                        and np.isfinite(fwd_clear_guarded)
+                        and fwd_clear_guarded > 3.0):
                     if climb_t < CLIMB_ASSIST_S:
                         climb = True
                         climb_t += max(0.0, float(dt))
@@ -3607,6 +3813,12 @@ class FSDriveSession:
                 prev_thr, prev_brk = thr, brk
                 conn.control(throttle=thr, brake=brk, steering=steer,
                              gear=gear_use, parkingbrake=pb)
+                # A receipt for the SEND, not for the execution: the game
+                # may or may not have applied it by the next tick, and the
+                # telemetry must not read "sent" as "done".
+                _cmd_seq += 1
+                _prev_cmd_t = _cmd_t
+                _cmd_t = time.time()
                 # Shadow-frame recording (same ShadowFrame contract as
                 # m5_shadow_drive): a drive tick IS one labelled episode
                 # sample - executed controls + the perception/planning
@@ -3781,6 +3993,15 @@ class FSDriveSession:
                             _vis_warned = True
                             print(f"[fsd-drive] live-vis render failed: "
                                   f"{_vis_e}", flush=True)
+                # Which version of each head this tick acted on.  fsd_stack
+                # publishes a result_seq per head; recording it here is what
+                # makes "published but not consumed" visible instead of
+                # indistinguishable from a fresh result.
+                _consumed = consumed_from_head_sched(
+                    (out.meta or {}).get("head_sched"), _cmd_t)
+                _sub_digest = substep_digest(SUBSTEP_HZ, dt, substeps)
+                _wd = watchdog_verdict(time.time(), _prev_cmd_t,
+                                       CTRL_WATCHDOG_MAX_GAP_S)
                 hist.append({
                     "t": round(time.time() - t0, 3),
                     "pos": [round(float(p), 3) for p in pos[:3]],
@@ -3793,6 +4014,29 @@ class FSDriveSession:
                         float(getattr(verd, "path_occupied_frac", 0.0)), 4),
                     "corridor_open": bool(
                         getattr(verd, "corridor_open", False)),
+                    # Perceived road SURFACE (2026-09-20): "on_road" /
+                    # "unknown" / "off_road" from the same 2-12 m drivable
+                    # band the lateral guard reads, plus how long it has
+                    # not read ON.  Published even when the fail-closed
+                    # response is switched off, so a run measures what the
+                    # gate WOULD have done - the off-road evidence this
+                    # replaces (``road_off``) read 0.0 m on the frames the
+                    # car was 6.96 m past the pavement edge.
+                    #
+                    # ``road_checked`` says whether the reader ran at all.
+                    # An early return ("no drivable path", "stale sensor",
+                    # "perception lane unavailable") publishes the two
+                    # defaults above, which are byte-identical to a
+                    # consulted-but-evidence-less read - three gate runs
+                    # logged four such frames and every one of them was a
+                    # pre-check return.  Never read ``road_lost_s``
+                    # without it.
+                    "road_surface": str(
+                        getattr(verd, "road_surface", "unknown")),
+                    "road_lost_s": round(
+                        float(getattr(verd, "road_lost_s", 0.0)), 3),
+                    "road_checked": int(
+                        bool(getattr(verd, "road_checked", False))),
                     "closest_obs_m": round(
                         float(getattr(verd, "closest_obs_m", 999.0)), 3),
                     "planner_kind": str(out.meta.get("planner", {})
@@ -3878,6 +4122,13 @@ class FSDriveSession:
                     # cumulative control sub-commands (plan A2/A4); the
                     # per-run control rate is reported in the summary
                     "substeps": int(substeps),
+                    # Nominal 15 Hz is a request; this is what ran.
+                    "substeps_expected": _sub_digest["expected"],
+                    "substeps_shortfall": _sub_digest["shortfall"],
+                    # Gap between COMMANDS, on the wall clock - it does not
+                    # go quiet when the perception loop blocks.
+                    "cmd_gap_s": _wd["gap_s"],
+                    "watchdog": _wd["action"],
                     "budget_s": round(float(_budget), 3),
                     "budget_skips": list(
                         out.meta.get("tick_budget_skips") or []),
@@ -3919,7 +4170,27 @@ class FSDriveSession:
                                    if rear_clear_m is not None else None),
                     "fwd_clear": float(out.forward_clearance)
                         if np.isfinite(out.forward_clearance) else None,
+                    # The value the safety layer actually acted on, plus
+                    # the guard's own record of what it did to get there.
+                    # ``fwd_clear`` above is the RAW heading-corridor
+                    # reading, which is not what brakes the car when a
+                    # planned path exists - without these two columns a
+                    # collision cannot be attributed to either source, and
+                    # a held/jumped reading is invisible (town run
+                    # 2026-09-20: raw read 1.20 m at 3.54 m/s with
+                    # ``emergency=0``, and the log could not say which
+                    # source the emergency layer had believed).
+                    "fwd_clear_guarded": (
+                        None if not np.isfinite(fwd_clear_guarded)
+                        else round(float(fwd_clear_guarded), 3)),
+                    "clear_src": str(clear_src),
+                    "clear_guard": clear_read.digest(),
                     "emergency": int(bool(force_stop)),
+                    # collision evidence: None means the Damage
+                    # sensor was not attached this run
+                    "damage_total": (round(float(_damage_total), 4)
+                                     if _damage_total is not None
+                                     else None),
                     "stuck": int(bool(stuck)),
                     "lane_src": str(out.meta.get("lane_src", "?")),
                     "lane_mode": str(args.lane_mode),
@@ -3938,6 +4209,31 @@ class FSDriveSession:
                         "freshness"),
                     "head_age_s": (out.meta.get("snapshot") or {}).get(
                         "head_age_s"),
+                    # WHICH modality threw this tick.  The ages above say a
+                    # modality went stale; without the error strings the log
+                    # cannot say WHY (2026-09-20 town: range_age p50 62 s and
+                    # the YOLO head age climbing to 113 s, with `out.errors`
+                    # never published).  ``head_errors`` carries the last
+                    # exception per head (async AND sync paths), and the two
+                    # worker digests separate a CRASHED job (errors > 0) from
+                    # a WEDGED one (busy=1, in_flight_s growing, submitted
+                    # stuck) - different causes, different fixes, and the age
+                    # alone cannot tell them apart.
+                    "errors": (dict((out.meta.get("snapshot") or {})
+                                    .get("errors") or {}) or None),
+                    "head_errors": out.meta.get("head_errors"),
+                    "head_worker": out.meta.get("head_worker"),
+                    "range_worker": out.meta.get("range_worker"),
+                    # Scheduler record: WHY each head did or did not run
+                    # this tick - cadence, budget deferral, keep-alive
+                    # forced refresh, async in flight / failed - with the
+                    # compute time it actually spent.  The ages say a
+                    # modality went stale and the errors say it did not
+                    # throw; this is the third answer, and the one that
+                    # separates "not scheduled" from "worker never
+                    # finished" from "finished but not published".
+                    "head_sched": out.meta.get("head_sched"),
+                    "range_sched": out.meta.get("range_sched"),
                     # Line-evidence provenance (plan phase E3): the fused
                     # line mask keeps historical support, and these say
                     # how much of it is fresh observation vs. held
@@ -3995,6 +4291,19 @@ class FSDriveSession:
                     "rem_end": (round(float(rem_end), 2)
                                 if rem_end is not None else None),
                     "mon_target": round(float(verd.target_speed), 2),
+                    # --- consumption side of the traceability contract
+                    # (plan P1) ---
+                    # cmd_seq / cmd_t say WHICH command left and WHEN.  This
+                    # is a receipt for the SEND only: the game may not have
+                    # applied it by the next tick, and "sent" must never be
+                    # read as "executed".
+                    "cmd_seq": int(_cmd_seq),
+                    "cmd_t": _cmd_t,
+                    # consumed: per head, which result_seq this tick acted
+                    # on, from which source frame, and how old it was at
+                    # command time.  A published result that never appears
+                    # here was published but not consumed.
+                    "consumed": _consumed,
                     # Bounded PATH_HOLD + boundary-cross diagnostics (plan
                     # phases B/C1): WHERE a hold served a verified path
                     # instead of a single-frame stop, and whether a
@@ -4141,6 +4450,12 @@ class FSDriveSession:
                             dt=min(0.25, max(0.01, _sdt)))
                         _sthr, _sbrk = rate_limit_pedal(
                             _sthr, _sbrk, prev_thr, prev_brk, _sdt)
+                        if CTRL_WATCHDOG_ENABLED and _wd["due"]:
+                            # Past the pedal rate limit on purpose: the
+                            # limit exists to smooth normal driving, and
+                            # a stalled command stream is not that.  Same
+                            # conn.control path - no second channel.
+                            _sthr, _sbrk = 0.0, 1.0
                         prev_thr, prev_brk = _sthr, _sbrk
                         conn.control(throttle=_sthr, brake=_sbrk,
                                      steering=_s_steer, gear=gear_use,
@@ -4231,6 +4546,15 @@ class FSDriveSession:
                 print(f"[fsd-drive] tick budget: {_n_skip_fr} frames "
                       f"deferred {_n_skip_hd} heavy head(s) "
                       f"(budget capped at {_max_budget:.2f}s)")
+            # Which scheduler policy this run actually used.  An A/B arm
+            # is only auditable if the log says which side of the switch
+            # it was on: the per-frame range_sched state shows it too, but
+            # only once the floor actually fires.
+            _ka = (f"ON (range {RANGE_KEEPALIVE_S:.1f}s, "
+                   f"object {OBJECT_KEEPALIVE_S:.1f}s)"
+                   if SCHED_KEEPALIVE_ENABLED
+                   else "OFF (BEAMNG_SCHED_KEEPALIVE=1 enables it)")
+            print(f"[fsd-drive] scheduler keep-alive: {_ka}")
             if rec is not None:
                 try:
                     _rec_out = rec.save()
