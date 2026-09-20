@@ -416,3 +416,107 @@ def test_bev_fallback_is_labelled_bev_route() -> None:
     )
     assert ref.src == ""
     assert ref.meta["lane_src"] == SRC_BEV_ROUTE
+
+
+# --------------------------------------------------------------------------
+# strict perception SIDE gate: the road centre line is never the
+# own lane.  Regression for live town run 2026-09-20 where --strict
+# bypassed this gate and the car sat on the road centre line at
+# mean=+1.18 m painted-line lateral (p50=+1.04 m).
+# --------------------------------------------------------------------------
+def _sensor_lane_at(y_center: float, *, paired: bool = True,
+                    confidence: float = 0.8) -> LaneFrame:
+    """LaneFrame with the centre pinned at an arbitrary lateral y.
+
+    The width is fixed at the lane-width contract so the helper matches
+    what select_lane_reference consumes from a real perception read.
+    """
+    xs = np.linspace(0.0, 30.0, 31)
+    return LaneFrame(
+        center=np.column_stack([xs, np.full_like(xs, y_center)]),
+        left=np.column_stack([xs, np.full_like(xs, y_center + LANE_HALF_M)]),
+        right=np.column_stack([xs, np.full_like(xs, y_center - LANE_HALF_M)]),
+        width=LANE_W_M,
+        confidence=confidence,
+        span_m=30.0,
+        sources=("vision",),
+        paired=paired,
+    )
+
+
+def test_strict_rejects_lane_sitting_on_the_route_centerline() -> None:
+    """Strict perception must NOT trust a centre pinned at y=0.
+
+    A perception lane whose centre coincides with the road centre line
+    is the WHOLE-ROAD free corridor, not the ego lane - trusting it
+    rides the divider end to end (live town run 2026-09-20, gate_on_3).
+    """
+    ref = select_lane_reference(
+        lane_frame=_sensor_lane_at(0.0),
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        lane_mode="sensor", strict_sensor=True,
+    )
+    assert ref.src == SRC_UNAVAILABLE
+    assert ref.center is None
+    assert ref.meta["lane_reject_reason"] == "side"
+
+
+def test_strict_rejects_lane_inside_the_centreline_band() -> None:
+    """Strict perception requires >= 0.2 m RIGHT of the route.
+
+    Anything inside the [-0.2, +inf] m band is still effectively the
+    road centre line: 0.1 m right of the route is straddling, not
+    driving.  Only outside the band may the centre steer.
+    """
+    ref = select_lane_reference(
+        lane_frame=_sensor_lane_at(-0.1),
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        lane_mode="sensor", strict_sensor=True,
+    )
+    assert ref.src == SRC_UNAVAILABLE
+    assert ref.center is None
+    assert ref.meta["lane_reject_reason"] == "side"
+
+
+def test_non_strict_sensor_lane_on_centreline_is_still_published() -> None:
+    """The relaxed tolerance for perception-led modes is preserved.
+
+    Non-strict ``sensor`` mode allows the corner-apex oncoming-side
+    read, so a centre pinned at y=0 stays publishable there.  This is
+    the only mode where the centreline-riding lane can survive, and
+    the downstream planner is responsible for the harder no-cross
+    rule.
+    """
+    ref = select_lane_reference(
+        lane_frame=_sensor_lane_at(0.0),
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        lane_mode="sensor", strict_sensor=False,
+    )
+    assert ref.src == SRC_SENSOR
+    assert ref.center is not None
+
+
+def test_map_mode_keeps_its_legacy_minus_0p4_tolerance() -> None:
+    """The legacy map-mode side gate (left_max_m = -0.4) is unchanged."""
+    # y = -0.3 is 0.3 m right of the route - inside the legacy band,
+    # published.
+    ref_ok = select_lane_reference(
+        lane_frame=_sensor_lane_at(-0.3),
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        lane_mode="map",
+    )
+    assert ref_ok.src in (SRC_SENSOR, SRC_MAP)
+    assert ref_ok.center is not None
+    # y = +0.3 is left of the route - rejected.
+    ref_no = select_lane_reference(
+        lane_frame=_sensor_lane_at(+0.3),
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        lane_mode="map",
+    )
+    assert ref_no.rejected is True
+    assert ref_no.meta["lane_reject_reason"] == "side"

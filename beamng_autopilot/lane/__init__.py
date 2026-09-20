@@ -43,8 +43,13 @@ from .envelope import SensorLaneEnvelope
 from .lidar import build_lidar_corridor  # noqa: F401
 from .fusion import choose_sensor_lane  # noqa: F401
 from .perception_guard import (  # noqa: F401
+    ROAD_SURFACE_OFF,
+    ROAD_SURFACE_ON,
+    ROAD_SURFACE_UNKNOWN,
+    perceived_road_state,
     perception_curve_speed,
     perception_lateral_guard,
+    perception_road_bands,
 )
 from .tracking import (  # noqa: F401
     LaneTracker,

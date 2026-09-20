@@ -434,25 +434,44 @@ def select_lane_reference(
                     max_turn_deg=LANE_ROUTE_TURN_MAX_DEG):
                 lane_rejected = True
                 corner_bad = True
-            # SIDE gate: the lane centre must sit clearly RIGHT of the
-            # road centreline (own lane).  A lane locked onto the
-            # ONCOMING lane passes the bearing gate (same direction) but
-            # still steers the car over the centre line (town runs
-            # 2026-08-22: the car rode the centre/oncoming lane end to
-            # end with lane_src=sensor).  A lane sitting ON the
-            # centreline is the WHOLE-ROAD free corridor, not the own
-            # lane - trusting it parks the car on the centre line and
-            # the switch to the map-prior own lane then forces a 2-3 m
-            # over-correction that swings it off the road edge (mountain
-            # run 2026-08-27 run_fix31: after the junction the car rode
-            # the centre line, then over-corrected right and wedged at
-            # (741.2,745.7)).  Require the lane centre at least 0.4 m
-            # right of the route in map mode; in perception-led modes
-            # allow a small oncoming-side read (corner apex) because the
-            # map centreline is still the hard no-cross boundary.
-            elif not strict_lane and not lane_side_ok(
+            # SIDE gate (safety net, NOT a navigator preference): the lane
+            # centre must sit clearly RIGHT of the road centreline
+            # (own lane).  A lane locked onto the ONCOMING lane passes
+            # the bearing gate (same direction) but still steers the car
+            # over the centre line (town runs 2026-08-22: the car rode
+            # the centre/oncoming lane end to end with lane_src=sensor).
+            # A lane sitting ON the centreline is the WHOLE-ROAD free
+            # corridor, not the own lane - trusting it parks the car on
+            # the centre line and the switch to the map-prior own lane
+            # then forces a 2-3 m over-correction that swings it off the
+            # road edge (mountain run 2026-08-27 run_fix31: after the
+            # junction the car rode the centre line, then over-corrected
+            # right and wedged at (741.2,745.7)).
+            #
+            # This gate is ALWAYS on - it is the last wall between an
+            # unpaired sensor centre (often the whole-road corridor on a
+            # two-way road) and the planner.  Strict perception
+            # (``lane_mode=sensor + strict_sensor``) tightens it to
+            # -0.2 m: the lane centre must sit at least 0.2 m RIGHT of
+            # the route (own side only).  ``off=0`` (lane sitting on the
+            # road centre line) is rejected - that is the whole-road
+            # corridor, not the ego lane, and it is exactly the failure
+            # mode the live town run 2026-09-20 exposed (see below).
+            # Without strict perception we allow a small oncoming-side
+            # read for corner apex (perception-led modes) or the legacy
+            # map-prior tolerance (map mode); both still keep the map
+            # centreline as the hard no-cross boundary downstream.
+            #
+            # Regression: live town run 2026-09-20 --strict kept this
+            # gate bypassed and the car sat on the road centre line at
+            # mean=+1.18 m painted-line lateral (p50=+1.04 m), straddle
+            # the divider for 75 of 166 frames and stall on the way to
+            # the goal.  See gate_on_3.log and the screenshot in
+            # docs/reviews/2026-09-20_strict_centerline.md.
+            elif not lane_side_ok(
                     lane_ref, route_ref, pos,
-                    left_max_m=(-0.4 if lane_mode == "map" else 0.5)):
+                    left_max_m=(-0.2 if strict_lane
+                                else (-0.4 if lane_mode == "map" else 0.5))):
                 lane_rejected = True
                 side_bad = True
             if lane_rejected:

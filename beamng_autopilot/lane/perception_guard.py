@@ -159,3 +159,71 @@ def perception_lateral_guard(
     if abs(edge_corr) > abs(corr):
         corr = edge_corr
     return float(np.clip(corr, -max_corr, max_corr))
+
+
+# ---------------------------------------------------------------------
+# Perceived road-surface STATE
+# ---------------------------------------------------------------------
+# ``perception_road_bands`` answers "where is the road ahead".  Whether it
+# answered AT ALL is a different question with a different consequence:
+# a ``None`` band means the road mask carried too little road surface to
+# locate the road, which is UNKNOWN - never "the car is on the road"
+# (AGENTS.md「驾驶约束」4: when the boundary source cannot be trusted the
+# legal behaviour is fail-closed, not a guessed boundary).
+#
+# The 2026-09-20 town runs are why this needs to be explicit.  Measured on
+# the shadow episodes that carry an ``edge_over`` ground truth (the map's
+# own pavement edge, used as a METRIC only):
+#
+# * the 8 runs that stayed on the pavement never lost the band for more
+#   than 5 consecutive frames (~3 s at the measured ~1.65 Hz tick), and 6
+#   of them never lost it at all;
+# * the one run that drove 6.96 m past the pavement edge lost it for 91
+#   consecutive frames (~55 s) - 50.6% of the whole run.
+#
+# So "band lost" separates cleanly where the lane boundaries cannot help:
+# ``lat_left`` / ``lat_right`` were BOTH ``None`` on 82-99% of frames in
+# every one of those runs (``boundary_lateral`` only answers at a true
+# ground-line endpoint), so the off-road metric read 0.0 m throughout and
+# the recovery never armed.
+ROAD_SURFACE_ON = "on_road"
+ROAD_SURFACE_UNKNOWN = "unknown"
+ROAD_SURFACE_OFF = "off_road"
+
+
+def perceived_road_state(grid: OccupancyGrid,
+                         half_width_m: float,
+                         *,
+                         margin_m: float = 0.5,
+                         ) -> tuple[str, dict | None]:
+    """Where the ego sits relative to the PERCEIVED road surface.
+
+    Returns ``(state, bands)``: ``state`` is one of
+    :data:`ROAD_SURFACE_ON` / :data:`ROAD_SURFACE_UNKNOWN` /
+    :data:`ROAD_SURFACE_OFF`, ``bands`` is the raw
+    :func:`perception_road_bands` reading (``None`` when there is none).
+
+    * ``UNKNOWN`` - no band this tick.  The common failure, and the one
+      that used to be silent: callers that only had "how far past a
+      DETECTED boundary" read it as 0.0 m ("perfectly on the road").
+    * ``OFF`` - a band exists and the ego's own lateral extent lies
+      entirely outside it.  Rare (0.5-4.6% of frames even in the run that
+      finished 6.96 m off) but unambiguous when it fires.
+    * ``ON`` - a band exists and overlaps the ego.
+
+    ``margin_m`` keeps the ON/OFF line off the exact band edge.  The band
+    is read 2-12 m AHEAD, so on a bend it legitimately shifts sideways
+    relative to the car; a car driving a bend is not off the road, and
+    the caller must not read the shift as one.  Only a band that has
+    cleared the ego's whole width by ``margin_m`` counts as OFF.
+    """
+    bands = perception_road_bands(grid)
+    if bands is None:
+        return ROAD_SURFACE_UNKNOWN, None
+    half = abs(float(half_width_m)) + max(0.0, float(margin_m))
+    # +y is left, so ``y_left`` is the largest lateral value of the band.
+    y_left = float(bands["y_left"])
+    y_right = float(bands["y_right"])
+    if y_right > half or y_left < -half:
+        return ROAD_SURFACE_OFF, bands
+    return ROAD_SURFACE_ON, bands
