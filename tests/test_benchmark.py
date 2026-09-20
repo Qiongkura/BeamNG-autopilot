@@ -11,7 +11,12 @@ import math
 import numpy as np
 import pytest
 
-from beamng_autopilot.eval import assess_run, score_many, score_run
+from beamng_autopilot.eval import (
+    assess_run,
+    collision_events,
+    score_many,
+    score_run,
+)
 
 _SCRIPT = Path(__file__).resolve().parents[1] / "scripts" / "m5_fsd_benchmark.py"
 _spec = importlib.util.spec_from_file_location("m5_fsd_benchmark", _SCRIPT)
@@ -28,17 +33,111 @@ def _hist(n=10, **over):
             "reversing": 0, "stuck": 0, "emergency": 0,
             "lat_left": -1.75, "lat_right": 1.75, "road_off": 0.0,
             "rem_end": 100.0, "throttle": 0.3, "brake": 0.0,
+            # A CLEAN run must still have measured damage: the collision
+            # gate is UNKNOWN without it (see the missing-channel tests),
+            # so "clean" and "unmeasured" are different fixtures on
+            # purpose.
+            "damage_total": 0.0,
         }
         row.update(over)
         rows.append(row)
     return rows
 
 
+def _hist_no_damage(n=10, **over):
+    """Same run with the damage channel absent (an old log)."""
+    rows = _hist(n, **over)
+    for r in rows:
+        r.pop("damage_total", None)
+    return rows
+
+
 def test_score_run_passes_clean_run() -> None:
     a = assess_run(_hist())
     v = score_run(a)
+    assert v["status"] == "PASS"
     assert v["pass"] is True
+    assert v["unknown"] == []
     assert all(v["checks"].values())
+
+
+def test_unmeasured_collision_is_unknown_not_pass() -> None:
+    """A run with no damage channel cannot clear the §12 collision gate.
+
+    This is the hole the old verdict had: ``no_collision`` was not a check
+    at all, so a run that never sampled damage passed on the other five.
+    """
+    a = assess_run(_hist_no_damage())
+    assert a["collision_count"] is None
+    v = score_run(a)
+    assert v["checks"]["no_collision"] is False
+    assert v["unknown"] == ["no_collision"]
+    assert v["status"] == "UNKNOWN"
+    assert v["pass"] is False
+
+
+def test_confirmed_collision_fails() -> None:
+    a = assess_run(_hist(damage_total=0.0))
+    a["collision_count"] = 1          # a measured impact
+    v = score_run(a)
+    assert v["checks"]["no_collision"] is False
+    assert "no_collision" not in v["unknown"]
+    assert v["status"] == "FAIL"
+
+
+def test_a_violation_outranks_an_unknown() -> None:
+    """A confirmed failure is FAIL even when something else is unmeasured."""
+    a = assess_run(_hist_no_damage(reversing=1))
+    v = score_run(a)
+    assert v["status"] == "FAIL"
+    assert "no_collision" in v["unknown"]
+
+
+def test_unmeasured_off_road_is_not_on_road() -> None:
+    rows = _hist()
+    for r in rows:
+        r.pop("road_off", None)       # no off-road source at all
+    a = assess_run(rows)
+    assert a["off_road_frames"] is None
+    assert a["off_road_measured"] is False
+    assert a["off_road_s"] is None
+    v = score_run(a)
+    assert v["checks"]["on_road"] is False
+    assert "on_road" in v["unknown"]
+
+
+def test_score_many_reports_unknown_and_collision_ratio() -> None:
+    good = assess_run(_hist())
+    unknown = assess_run(_hist_no_damage())
+    agg = score_many([good, unknown])
+    assert agg["status"] == "UNKNOWN"
+    assert agg["pass"] is False
+    assert agg["n_pass"] == 1 and agg["n_unknown"] == 1
+    assert agg["n_collided"] == 0
+    assert agg["collision_run_ratio"] == 0.0
+    # nothing measured at all -> the ratio is unknown, not zero
+    agg2 = score_many([unknown, unknown])
+    assert agg2["n_collided"] is None
+    assert agg2["collision_run_ratio"] is None
+
+
+def test_collision_episodes_dedupe_one_impact() -> None:
+    """Damage rising on consecutive frames is ONE impact, not three."""
+    rows = _hist(6)
+    for i, d in enumerate([0.0, 0.0, 0.05, 0.09, 0.14, 0.14]):
+        rows[i]["damage_total"] = d
+    rep = collision_events(rows)
+    assert rep["collision_count"] == 3        # three rising frames
+    assert rep["collision_episodes"] == 1     # one physical impact
+    assert rep["collided"] is True
+    # two impacts two seconds apart stay two
+    rows2 = _hist(10)
+    for i, d in enumerate([0.0, 0.0, 0.05, 0.05, 0.05, 0.05, 0.05,
+                           0.05, 0.30, 0.30]):
+        rows2[i]["damage_total"] = d
+    rep2 = collision_events(rows2)
+    assert rep2["collision_count"] == 2
+    assert rep2["collision_episodes"] == 2
 
 
 def test_score_run_fails_each_hard_target() -> None:

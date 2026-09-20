@@ -5,7 +5,15 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
-from beamng_autopilot.lane import perception_curve_speed, perception_lateral_guard
+from beamng_autopilot.lane import (
+    ROAD_SURFACE_OFF,
+    ROAD_SURFACE_ON,
+    ROAD_SURFACE_UNKNOWN,
+    perceived_road_state,
+    perception_curve_speed,
+    perception_lateral_guard,
+    perception_road_bands,
+)
 from beamng_autopilot.occupancy import OccupancyGrid
 
 
@@ -96,3 +104,82 @@ def test_curve_speed_no_road_keeps_cruise() -> None:
 def test_sparse_road_returns_zero() -> None:
     g = _grid_with_road(-0.5, 0.5, x_lo=4.0, x_hi=4.5)  # tiny patch
     assert perception_lateral_guard(g) == 0.0
+
+
+# ---------------------------------------------------------------------
+# perceived_road_state: "did I see the road at all" (2026-09-20)
+# ---------------------------------------------------------------------
+HALF_W = 0.95          # planning.constraints.HALF_WIDTH_M
+
+
+def test_state_on_road_when_band_overlaps_ego() -> None:
+    state, bands = perceived_road_state(_grid_with_road(-3.0, 3.0), HALF_W)
+    assert state == ROAD_SURFACE_ON
+    assert bands is not None and bands["y_left"] > 0.0 > bands["y_right"]
+
+
+def test_state_off_road_when_band_clears_the_ego_left() -> None:
+    # perceived road starts 2.5 m to the LEFT (+y) of the ego: the whole
+    # band is outside the car, so the car is off it on the right.
+    state, bands = perceived_road_state(_grid_with_road(2.5, 8.0), HALF_W)
+    assert state == ROAD_SURFACE_OFF
+    assert bands is not None
+
+
+def test_state_off_road_when_band_clears_the_ego_right() -> None:
+    state, _ = perceived_road_state(_grid_with_road(-8.0, -2.5), HALF_W)
+    assert state == ROAD_SURFACE_OFF
+
+
+def test_margin_absorbs_a_band_edge_just_beside_the_ego() -> None:
+    """A band edge 0.3 m outside the car is a bend, not an excursion.
+
+    The band is read 2-12 m AHEAD, so on a curve it legitimately slides
+    sideways relative to the car.  With the default margin the car is
+    still ON; with ``margin_m=0`` the same frame reads OFF, which pins
+    that the margin (not the band) is what decides.
+    """
+    g = _grid_with_road(1.2, 6.0)      # perceived y_right ~ +1.25 m
+    state, _ = perceived_road_state(g, HALF_W)
+    assert state == ROAD_SURFACE_ON
+    state0, _ = perceived_road_state(g, HALF_W, margin_m=0.0)
+    assert state0 == ROAD_SURFACE_OFF
+
+
+def test_state_unknown_when_no_road_evidence() -> None:
+    g = OccupancyGrid(60, 60, 0.5, origin=(0.0, 0.0), heading=0.0)
+    state, bands = perceived_road_state(g, HALF_W)
+    assert state == ROAD_SURFACE_UNKNOWN
+    assert bands is None
+
+
+def test_state_unknown_when_the_road_is_too_sparse() -> None:
+    """Silence is UNKNOWN - never "on the road" and never "off the road".
+
+    This is the regression the 2026-09-20 runs exposed: a road mask that
+    carries too little surface cannot answer the question, and the old
+    off-road metric read exactly that silence as 0.0 m ("perfectly on the
+    road") while the car finished 6.96 m past the pavement edge.
+    """
+    g = _grid_with_road(-0.5, 0.5, x_lo=4.0, x_hi=4.5)   # ~2 cells
+    state, bands = perceived_road_state(g, HALF_W)
+    assert state == ROAD_SURFACE_UNKNOWN
+    assert bands is None
+
+
+def test_state_unknown_when_the_road_is_beyond_the_band() -> None:
+    # 13-14.5 m ahead: outside the 2-12 m read, so the band does not
+    # exist even though the road does.
+    g = _grid_with_road(-3.0, 3.0, x_lo=13.0, x_hi=14.5)
+    state, bands = perceived_road_state(g, HALF_W)
+    assert state == ROAD_SURFACE_UNKNOWN
+    assert bands is None
+
+
+def test_state_matches_the_band_reader_used_by_the_lateral_guard() -> None:
+    """The state must come from the SAME read the guard and the corner
+    governor use, or the layers can disagree about where the road is."""
+    g = _grid_with_road(-3.0, 3.0)
+    state, bands = perceived_road_state(g, HALF_W)
+    assert state == ROAD_SURFACE_ON
+    assert bands == perception_road_bands(g)

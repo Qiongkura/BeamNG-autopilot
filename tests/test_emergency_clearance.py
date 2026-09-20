@@ -10,6 +10,7 @@ from __future__ import annotations
 import numpy as np
 
 from beamng_autopilot.planner import (
+    contact_envelope_speed_mps,
     emergency_speed_limit_mps,
     emergency_stop_clearance_m,
     forward_clearance_m,
@@ -85,3 +86,58 @@ class TestEmergencySpeedLimit:
         a = emergency_speed_limit_mps(7.0, need=6.0, gain=2.5)[1]
         b = emergency_speed_limit_mps(9.0, need=6.0, gain=2.5)[1]
         assert 0.0 <= a < b
+
+
+class TestContactEnvelopeSpeed:
+    """The largest speed whose stop still fits, reaction included."""
+
+    def test_no_reaction_is_the_exact_inverse_of_the_reserve(self):
+        for speed in (1.0, 2.46, 3.30, 8.0, 15.0):
+            room = emergency_stop_clearance_m(speed) - 1.0
+            back = contact_envelope_speed_mps(room + 1.0, reaction_s=0.0)
+            assert np.isclose(back, speed, atol=1e-9)
+
+    def test_reaction_always_lowers_the_allowed_speed(self):
+        assert (contact_envelope_speed_mps(6.0, reaction_s=0.8)
+                < contact_envelope_speed_mps(6.0, reaction_s=0.0))
+
+    def test_more_clearance_allows_more_speed(self):
+        a = contact_envelope_speed_mps(2.0, reaction_s=0.8)
+        b = contact_envelope_speed_mps(8.0, reaction_s=0.8)
+        assert 0.0 <= a < b
+
+    def test_clearance_inside_the_margin_allows_nothing(self):
+        assert contact_envelope_speed_mps(0.5, reaction_s=0.8) == 0.0
+        assert contact_envelope_speed_mps(1.0, reaction_s=0.8) == 0.0
+
+    def test_allowed_speed_really_stops_within_the_clearance(self):
+        """The contract: reserve(allowed) + travel(allowed) <= room."""
+        for clearance, tick in ((2.0, 0.8), (3.789, 0.8), (7.5, 0.6),
+                                (12.0, 1.0)):
+            s = contact_envelope_speed_mps(clearance, reaction_s=tick)
+            used = emergency_stop_clearance_m(s) - 1.0 + s * tick
+            assert used <= clearance - 1.0 + 1e-9
+
+    def test_the_2026_09_20_collision_frame_refuses_the_hatch(self):
+        """The frame the escape hatch raised the target on.
+
+        ``town_1789886413`` t=26.772 s: 3.789 m to the obstacle, car at
+        2.461 m/s, and the hatch raised the target to 3.30 m/s
+        (= max_speed 6.0 * corridor_open_floor 0.55).  The reserve for
+        3.30 m/s is 1.91 m, which fits inside 3.789 m, so a reserve-only
+        test lets it through; with the control period it does not.
+        """
+        allowed = contact_envelope_speed_mps(3.789, reaction_s=0.8)
+        assert np.isclose(allowed, 2.72, atol=0.01)
+        assert allowed < 3.30                     # the hatch is refused
+        # ... and the reserve-only form is exactly what let it through.
+        assert 3.789 > emergency_stop_clearance_m(3.30) - 1.0
+
+    def test_the_next_frame_is_past_helping(self):
+        """t=27.572 s: 1.206 m left.  Nothing legal can be allowed here.
+
+        The target was already 0.0 by then, which is why the reserve-only
+        gate was a no-op on this chain - it only fired once the obstacle
+        risk layer had already acted.
+        """
+        assert contact_envelope_speed_mps(1.206, reaction_s=0.8) < 0.3
