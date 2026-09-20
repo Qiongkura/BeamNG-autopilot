@@ -248,10 +248,11 @@ class TechRangeProvider(RangeProvider):
 
     def __init__(self, conn) -> None:
         check_graphics_quality(conn.user_dir)
-        from beamngpy.sensors import Lidar
+        from beamngpy.sensors import Damage, Lidar
 
         self.conn = conn
         self.name = f"autopilot_lidar_{_PID}"
+        self.damage_name = "damage"
         with conn.io_lock:
             self._ego_half_len, self._ego_half_w = self._ego_extents()
             self.lidar = Lidar(
@@ -270,6 +271,21 @@ class TechRangeProvider(RangeProvider):
                 is_visualised=False,
             )
         self._lidar_tracker = LidarClusterTracker()
+        # Damage sensor (plan §12 gate #1): beamngpy's ground-truth body
+        # deformation readout, polled with the rest of the sensors and
+        # logged per frame so collision_count is measurable.  It is
+        # attached here (Tech only) and read through Connector.read_damage_total.
+        try:
+            with conn.io_lock:
+                self.damage = Damage()
+                # the ONLY attach path in beamngpy 1.35:
+                # vehicle.sensors.attach(name, sensor) - it calls the
+                # sensor's own attach(vehicle, name) hook internally, so
+                # calling that hook by hand (wrong signature) would raise
+                # and silently leave the metric unmeasured
+                conn.vehicle.sensors.attach(self.damage_name, self.damage)
+        except Exception as exc:  # never block driving on a metric sensor
+            print(f"[tech] damage sensor unavailable: {exc}")
 
     def _ego_extents(self) -> tuple[float, float]:
         """Approximate ego footprint from the current BeamNG bbox."""
