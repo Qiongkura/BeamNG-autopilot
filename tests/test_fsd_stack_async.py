@@ -192,6 +192,30 @@ def test_worker_health_is_published_for_telemetry() -> None:
     assert ASYNC_HEAD_TIMEOUT_S > 0.0
 
 
+def test_async_head_failure_message_is_published() -> None:
+    """The age says a head went stale; only the message says WHY.
+
+    2026-09-20 town runs: the object head's age climbed to 113 s and the
+    telemetry could not tell a crashed head from a merely slow one.
+    """
+    boom = _SlowHead("object", 0.0, boom=True)
+    st = _stack(boom)
+    st.tick()
+    assert st._head_workers["object"].join(timeout=3.0)
+    out = st.tick()
+    assert "head exploded" in str(
+        out.meta.get("head_errors", {}).get("object", ""))
+
+
+def test_sync_head_failure_message_is_published(monkeypatch) -> None:
+    """The synchronous path records the same message, in the same tick."""
+    monkeypatch.setattr(fs, "ASYNC_HEADS_ENABLED", False)
+    st = _stack(_SlowHead("object", 0.0, boom=True))
+    out = st.tick()
+    assert "head exploded" in str(
+        out.meta.get("head_errors", {}).get("object", ""))
+
+
 def test_strict_mode_keeps_semantic_synchronous_and_creates_no_worker() -> None:
     sem = _SlowHead("semantic", 0.0)
     st = _stack(sem, _SlowHead("object", 0.0))
@@ -268,6 +292,24 @@ def test_async_range_does_not_block_the_tick() -> None:
     out2 = st.tick()
     assert out2.ray_hits == [(6.0, -1.0), (6.0, 1.0)]
     assert out2.meta["range_age_s"] is not None
+
+
+def test_range_worker_health_is_published_for_telemetry() -> None:
+    """A wedged clustering worker must be visible, not only its age.
+
+    ``range_age_s`` is what trips the stale verdict; without the runner's
+    busy / in_flight_s / submitted counters, a worker stuck in flight for
+    a whole run looks exactly like one that is merely slow.
+    """
+    prov = _SplitRange(cpu_seconds=0.05)
+    st = _stack(_SlowHead("object", 0.0))
+    st.range_prov = prov
+    out = st.tick()
+    digest = out.meta.get("range_worker")
+    assert digest is not None
+    assert digest["submitted"] >= 1
+    assert "in_flight_s" in digest
+    assert st._range_worker.join(timeout=5.0)
 
 
 def test_async_range_serves_the_cached_scan_while_clustering() -> None:

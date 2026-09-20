@@ -121,6 +121,74 @@ ASYNC_HEAD_TIMEOUT_S = 1.5
 ASYNC_HEADS_ENABLED = os.environ.get("BEAMNG_ASYNC_HEADS", "0") == "1"
 
 
+# --- scheduler keep-alive (2026-09-20) ---------------------------------
+# The tick-budget governor defers a due modality whenever the tick has
+# already spent its budget.  The instinct is right (perception must not
+# freeze the control loop) but the rule had no floor, and the ring alone
+# costs 376-672 ms against a 450 ms budget - so ``range`` was deferred on
+# 151/151 and 120/120 frames of the 2026-09-20 town runs and ``object`` on
+# 147/151, ``range_age`` reached p50 61.9 s, the freshness contract read
+# "stale sensor" on every frame, and the car crawled (speed p50 0.00 m/s).
+#
+# This is not a new failure mode.  ``range_every_n=3`` had already produced
+# the same shape (fsd_drive's strict-sensor comment: 4-6 s range age,
+# "every reuse cycle fail-closed into stale sensor stops"), and setting
+# ``range_every_n=1`` only handed the starvation to the budget gate.  Both
+# reuse paths were missing one rule:
+#
+#   a reused modality may not be pushed past its keep-alive bound.
+#
+# Past the bound the modality is STARVED, not deferred, and it refreshes
+# regardless of the budget or the every-n throttle.  This is deliberately
+# NOT "these modalities ignore the budget": the cost stays bounded at one
+# extra refresh per bound, so the governor still owns smoothness.
+#
+#   range : 1.0 s - the safety-critical channel and the one the stale
+#                   verdict actually reads.  STALE_RANGE_S = 2.0 and
+#                   RANGE_REUSE_MAX_DT_S = 2.0 say the compensation is
+#                   only meaningful that far, so the reuse must end well
+#                   inside it - one slow tick of margin.
+#   object: 2.0 s - YOLO is not a stale trigger (the freshness contract
+#                   requires the semantic head only), so this is the
+#                   lower tier: bounded, not tight.
+#
+# Default OFF, like every behaviour-changing perception switch in this
+# repo: the floor trades tick time for sensor freshness and that trade
+# needs same-condition live evidence.  ``BEAMNG_SCHED_KEEPALIVE=1``.
+RANGE_KEEPALIVE_S = 1.0
+OBJECT_KEEPALIVE_S = 2.0
+SCHED_KEEPALIVE_ENABLED = os.environ.get("BEAMNG_SCHED_KEEPALIVE", "0") == "1"
+
+
+def _keepalive_s(name: str) -> float | None:
+    """Scheduler keep-alive bound for a modality (None = no floor)."""
+    if not SCHED_KEEPALIVE_ENABLED:
+        return None
+    if name == "range":
+        return RANGE_KEEPALIVE_S
+    if name == "object":
+        return OBJECT_KEEPALIVE_S
+    return None
+
+
+def _keepalive_expired(name: str, age_s: float | None,
+                       *, keepalive_s: float | None = None) -> bool:
+    """Whether a held/reused output has reached its keep-alive bound.
+
+    ``None`` age (nothing to reuse yet) is never expired - there is no
+    bound to protect when the modality has no output at all.
+
+    ``keepalive_s`` overrides the module switch (``None`` = keep reading it),
+    so a test can exercise the floor on and off without re-importing the
+    module - the switch is otherwise frozen at import time.
+    """
+    keep = _keepalive_s(name) if keepalive_s is None else keepalive_s
+    if keep is None or age_s is None:
+        return False
+    return float(age_s) >= float(keep)
+
+
+
 def _async_allowed(name: str, *, strict: bool) -> bool:
     """Which heavy heads may run in the background worker.
 
@@ -142,7 +210,9 @@ def _async_allowed(name: str, *, strict: bool) -> bool:
 
 
 def _budget_defers(name: str, *, strict: bool, every_n: int,
-                   budget: float | None, elapsed: float) -> bool:
+                   budget: float | None, elapsed: float,
+                   age_s: float | None = None,
+                   keepalive_s: float | None = None) -> bool:
     """Whether the tick-budget governor defers this head.
 
     Smoothness: a heavy head due on a tick that already consumed its
@@ -156,12 +226,98 @@ def _budget_defers(name: str, *, strict: bool, every_n: int,
     is never deferred - the tick overruns its budget instead, and the
     drive loop's stale-control guard owns the overly-long-tick case.
     YOLO still defers.
+
+    KEEP-ALIVE floor (2026-09-20): ``elapsed`` is the WHOLE tick's spend,
+    not this head's, so a ring that costs more than the budget makes every
+    later deferral unconditional - 151/151 frames of the 2026-09-20 town
+    baseline deferred ``range`` and the car fail-closed into "stale
+    sensor" for the entire run.  A deferral is therefore only legal while
+    the head's own output is still inside its keep-alive bound; past it
+    the head is starved and runs whatever the budget says.  A head with no
+    output at all (``age_s=None``) is never deferred either: there is
+    nothing to serve from cache.  A disabled floor keeps the old behaviour
+    exactly.
     """
     if every_n <= 1 or budget is None:
         return False
     if elapsed <= float(budget):
         return False
-    return not (name == "semantic" and bool(strict))
+    if name == "semantic" and bool(strict):
+        return False
+    keep = _keepalive_s(name) if keepalive_s is None else keepalive_s
+    if keep is None:
+        return True                      # floor off: the old behaviour
+    if age_s is None:
+        # Nothing to reuse yet.  Deferring here does not "serve the last
+        # cached output", it leaves the modality absent for the whole run
+        # - the 2026-09-20 town baseline had n_object_obstacles = 0 on
+        # 151/151 frames for exactly this reason.
+        return False
+    return float(age_s) < float(keep)
+
+
+def range_schedule(*, budget: float | None, elapsed: float,
+                   age_s: float | None, has_prev: bool,
+                   keepalive_s: float | None) -> tuple[str, str]:
+    """What the range scan does this tick: ``(action, state)``.
+
+    Extracted from the tick body so the behaviour can be tested with a FAKE
+    clock instead of by driving town repeatedly.  The question the A/B could
+    not answer - "does the keep-alive floor do anything?" - is exactly the
+    ``("scan", "keepalive_forced")`` cell, and it needs (a) the budget already
+    blown at this decision point AND (b) the reused scan past its bound.  On
+    the 8 clean A/B runs (b) held 26 times but (a) never coincided, which is
+    why the floor never fired and the two arms ran identical logic.
+
+    ``keepalive_s`` is passed explicitly rather than read from the module
+    switch so a test can turn the floor on and off without re-importing.
+    ``None`` means "no floor" - the pre-floor behaviour, deferred
+    unconditionally.
+    """
+    over = budget is not None and float(elapsed) > float(budget)
+    starved = (keepalive_s is not None and age_s is not None
+               and float(age_s) >= float(keepalive_s))
+    if over and has_prev and not starved:
+        # Still inside its bound: serving the compensated cache is legal.
+        return "defer", "budget_deferred"
+    if over and starved:
+        # Past its bound: the budget does not get to reuse it.  This is the
+        # cell the A/B never reached.
+        return "scan", "keepalive_forced"
+    return "scan", "scanned"
+
+
+def sched_record(head: str, state: str, *, source_seq, result_seq,
+                 eligible_t, source_t=None, age_s=None, compute_ms=None,
+                 reason="", dispatch_t=None, finish_t=None,
+                 publish_t=None) -> dict:
+    """One head's record for this tick, in the traceability vocabulary.
+
+    The original keys (``state`` / ``age_s`` / ``compute_ms`` / ``reason``)
+    keep their exact meaning so existing consumers are unaffected; the added
+    ones are what let an anomaly land on a STAGE instead of on a bare age
+    (see ``telemetry_contract``).
+
+    Times are monotonic wall-clock seconds, all from the same clock, so
+    ``span_ms`` can difference any pair of them.  ``None`` means "did not
+    happen" and is never filled in with a plausible number.
+    """
+    return {
+        "state": state,
+        "age_s": age_s,
+        "compute_ms": compute_ms,
+        "reason": reason,
+        # --- traceability contract (plan P1) ---
+        "head": head,
+        "source_seq": source_seq,
+        "result_seq": result_seq,
+        "decision_state": state,
+        "source_t": source_t,
+        "eligible_t": eligible_t,
+        "dispatch_t": dispatch_t,
+        "finish_t": finish_t,
+        "publish_t": publish_t,
+    }
 
 
 def compensate_range_motion(sample: RangeSample | None,
@@ -474,8 +630,10 @@ class FSDStack:
         serves the motion-compensated cached scan - the same reuse
         semantics (and the same ``RANGE_REUSE_*`` bounds) the synchronous
         path already uses when a scan is skipped.  Returns
-        ``(sample, error)``; ``sample`` may be None when nothing has been
-        produced yet.
+        ``(sample, error, state)``; ``sample`` may be None when nothing has
+        been produced yet, and ``state`` is the scheduler record for this
+        tick (which of "adopted / submitted / in flight / deferred /
+        keep-alive forced / failed" actually happened).
         """
         runner = getattr(self, "_range_worker", None)
         if runner is None:
@@ -489,6 +647,8 @@ class FSDStack:
             _async.add("range")
         error = None
         rng = None
+        ran_ms = None
+        _adopted = _submitted = _scanned = _deferred = _forced = False
         result = runner.poll()
         if result is not None:
             if result.ok:
@@ -498,17 +658,27 @@ class FSDStack:
                 self._last_range_t = float(
                     getattr(self, "_range_job_t", 0.0) or time.time())
                 rng = result.value
+                ran_ms = round(float(result.duration_s) * 1000.0, 1)
+                _adopted = True
             else:
                 error = str(result.error)
         if rng is None:
             _dt = time.time() - float(getattr(self, "_last_range_t", 0.0))
             rng = compensate_range_motion(
                 getattr(self, "_last_range", None), _dt)
+        _age = (time.time() - float(getattr(self, "_last_range_t", 0.0))
+                if getattr(self, "_last_range", None) is not None else None)
         if not runner.busy:
-            if budget is not None and (time.time() - tick_t0) > budget:
+            # Keep-alive floor: the budget may not push the reused scan past
+            # its bound either (the same rule the synchronous path and the
+            # every-n throttle obey).
+            _forced = _keepalive_expired("range", _age)
+            if (budget is not None and (time.time() - tick_t0) > budget
+                    and not _forced):
                 # over budget this tick: keep the compensated cache, fetch
                 # on the next affordable tick (same rule as the sync path)
                 budget_skips.append("range")
+                _deferred = True
             else:
                 payload = None
                 try:
@@ -518,13 +688,35 @@ class FSDStack:
                 if payload is not None:
                     self._range_job_t = time.time()
                     runner.submit(self.range_prov.process, payload, pos)
+                    _submitted = True
                 else:
                     # the provider declared a split but produced no
                     # payload: fall back to the synchronous scan
+                    _t_scan = time.perf_counter()
                     rng = self.range_prov.scan(pos)
+                    ran_ms = round(
+                        (time.perf_counter() - _t_scan) * 1000.0, 1)
                     self._last_range = rng
                     self._last_range_t = time.time()
-        return rng, error
+                    _scanned = True
+        if error is not None:
+            state = "error"
+        elif _forced and (_submitted or _scanned):
+            state = "keepalive_forced"
+        elif _adopted:
+            state = "async_adopted"
+        elif _submitted:
+            state = "async_submitted"
+        elif _scanned:
+            state = "scanned_fallback"
+        elif _deferred:
+            state = "budget_deferred"
+        elif runner.busy:
+            state = "async_in_flight"
+        else:
+            state = "reused"
+        return rng, error, {"state": state, "age_s": _age,
+                            "compute_ms": ran_ms}
 
     # ------------------------------------------------------------------
     def tick(self, st=None, route_ref: np.ndarray | None = None,
@@ -549,6 +741,21 @@ class FSDStack:
                    if time_budget_s is not None and time_budget_s > 0.0
                    else None)
         _budget_skips: list[str] = []
+        # Per-head scheduler record (2026-09-20): the age says a modality
+        # is stale, the error says whether it threw, and this says WHY it
+        # did not run - "not due", "budget deferred", "starved past the
+        # keep-alive bound", "async in flight", "async failed", or the
+        # compute time it actually spent.  Without it "the head is 113 s
+        # old" cannot be told apart from "the head is broken".
+        _sched: dict[str, dict] = {}
+        # Result sequence per head: incremented whenever a NEW result is
+        # produced, so "the control tick consumed an older version" becomes
+        # detectable instead of invisible.  Without it, a reused output and
+        # a fresh one are indistinguishable in the telemetry.
+        _res_seq = getattr(self, "_head_result_seq", None)
+        if _res_seq is None:
+            _res_seq = {}
+            self._head_result_seq = _res_seq
 
         # --- 1) camera ring -> HydraNet heads ---------------------------
         snap: dict = {}
@@ -557,6 +764,10 @@ class FSDStack:
                 snap = self.ring.grab_ring()
             except Exception as exc:
                 out.errors["ring"] = str(exc)
+        # When the source frames were captured.  Everything downstream is
+        # measured from here, so "how stale is this result" is answerable
+        # without guessing at the tick start.
+        _source_t = time.time()
         if snap:
             role = "front_main" if "front_main" in snap \
                 else next(iter(snap))
@@ -603,12 +814,28 @@ class FSDStack:
                 _n = max(1, _n)
                 _due = ((_tick_num + int(_phase.get(_name, 0))) % _n == 0
                         or _name in _retry)
+                # The head's own output age BEFORE this tick's decision:
+                # the keep-alive floor and the deferral telemetry are both
+                # about what we would serve, not about what we just ran.
+                _stamp_now = _head_stamps.get(_name)
+                _age_now = (None if _stamp_now is None
+                            else max(0.0, time.time() - float(_stamp_now)))
+                # When this head became a candidate for this tick.  All the
+                # contract times come from this one clock read style
+                # (monotonic wall), so any pair can be differenced.
+                _eligible_t = time.time()
                 if not _due:
+                    _pub = _eligible_t
                     if _last.get(_name) is not None:
                         heads[_name] = _last[_name]
                         _stamp = _head_stamps.get(
                             _name, _tick_cost0)
                         head_ages[_name] = max(0.0, time.time() - _stamp)
+                    _sched[_name] = sched_record(
+                        _name, "not_due", source_seq=_tick_num,
+                        result_seq=_res_seq.get(_name),
+                        eligible_t=_pub, source_t=_source_t, age_s=_age_now,
+                        reason=f"every_n={_n}", publish_t=_pub)
                     continue
                 # Tick time-budget governor (smoothness): when a heavy
                 # head is due but this tick has already consumed its time
@@ -654,14 +881,19 @@ class FSDStack:
                         _frames = {}
                         self._head_job_frame_t = _frames
                     _res = _runner.poll() if _due or _runner.busy else None
+                    _finish_t = time.time() if _res is not None else None
+                    _ran_ms = None
                     if _res is not None and _res.ok:
                         heads[_name] = _res.value
                         _last[_name] = _res.value
                         _retry.discard(_name)
+                        # a NEW result entered the cache: bump its version
+                        _res_seq[_name] = _res_seq.get(_name, 0) + 1
                         # the output's age starts at the frame that
                         # produced it, not at this tick
                         _head_stamps[_name] = float(
                             _frames.get(_name, _tick_cost0))
+                        _ran_ms = round(float(_res.duration_s) * 1000.0, 1)
                     if _name not in heads and _last.get(_name) is not None:
                         heads[_name] = _last[_name]
                     if _res is not None and not _res.ok:
@@ -670,15 +902,65 @@ class FSDStack:
                     head_ages[_name] = (
                         float("inf") if _stamp is None
                         else max(0.0, time.time() - float(_stamp)))
+                    _dispatch_t = None
                     if _due and not _runner.busy:
                         _runner.submit(_head.run, ctx)
                         _frames[_name] = float(_tick_cost0)
+                        _dispatch_t = time.time()
+                    # An async head has four distinct "did not run this
+                    # tick" meanings and only the runner knows which one
+                    # applies: failed, still in flight, just submitted, or
+                    # idle with no output at all.
+                    _pub_t = time.time()
+                    if _res is not None and not _res.ok:
+                        _sched[_name] = sched_record(
+                            _name, "async_failed", source_seq=_tick_num,
+                            result_seq=_res_seq.get(_name),
+                            eligible_t=_eligible_t, source_t=_source_t, age_s=_age_now,
+                            compute_ms=_ran_ms, reason=str(_res.error),
+                            dispatch_t=_dispatch_t, finish_t=_finish_t)
+                    elif _res is not None and _res.ok:
+                        _sched[_name] = sched_record(
+                            _name, "async_adopted", source_seq=_tick_num,
+                            result_seq=_res_seq.get(_name),
+                            eligible_t=_eligible_t, source_t=_source_t, age_s=_age_now,
+                            compute_ms=_ran_ms, dispatch_t=_dispatch_t,
+                            finish_t=_finish_t, publish_t=_pub_t)
+                    elif _runner.busy:
+                        _sched[_name] = sched_record(
+                            _name, "async_in_flight", source_seq=_tick_num,
+                            result_seq=_res_seq.get(_name),
+                            eligible_t=_eligible_t, source_t=_source_t, age_s=_age_now,
+                            reason=(f"in_flight_s={_runner.in_flight_s():.2f}"),
+                            dispatch_t=_dispatch_t)
+                    elif _due:
+                        _sched[_name] = sched_record(
+                            _name, "async_submitted", source_seq=_tick_num,
+                            result_seq=_res_seq.get(_name),
+                            eligible_t=_eligible_t, source_t=_source_t, age_s=_age_now,
+                            dispatch_t=_dispatch_t)
+                    else:
+                        _sched[_name] = sched_record(
+                            _name, "async_idle_no_output",
+                            source_seq=_tick_num,
+                            result_seq=_res_seq.get(_name),
+                            eligible_t=_eligible_t, source_t=_source_t, age_s=_age_now,
+                            reason="no result and not due")
                     continue
+                _elapsed_now = time.time() - _tick_cost0
+                # "Starved, not deferred": the tick is over budget and the
+                # head is due, so only the keep-alive floor can let it run
+                # - record it as a forced refresh, not as a plain run.
+                _keepalive_forced = (
+                    _budget is not None
+                    and _elapsed_now > float(_budget)
+                    and _n > 1
+                    and _keepalive_expired(_name, _age_now))
                 if _budget_defers(
                         _name, strict=bool(getattr(self, "strict_sensor",
                                                    False)),
                         every_n=_n, budget=_budget,
-                        elapsed=time.time() - _tick_cost0):
+                        elapsed=_elapsed_now, age_s=_age_now):
                     if _last.get(_name) is not None:
                         heads[_name] = _last[_name]
                         _stamp = _head_stamps.get(
@@ -686,16 +968,48 @@ class FSDStack:
                         head_ages[_name] = max(0.0, time.time() - _stamp)
                     _retry.add(_name)
                     _budget_skips.append(_name)
+                    _sched[_name] = sched_record(
+                        _name, "budget_deferred", source_seq=_tick_num,
+                        result_seq=_res_seq.get(_name),
+                        eligible_t=_eligible_t, source_t=_source_t, age_s=_age_now,
+                        reason=(f"tick {_elapsed_now:.2f}s > budget "
+                                f"{float(_budget):.2f}s"),
+                        # the cached result is what gets published
+                        publish_t=time.time())
                     continue
+                _dispatch_t = None
                 try:
+                    _t_run = time.perf_counter()
+                    _dispatch_t = time.time()
                     out_head = _head.run(ctx)
+                    _finish_t = time.time()
+                    _head_ms = round(
+                        (time.perf_counter() - _t_run) * 1000.0, 1)
                     heads[_name] = out_head
                     _last[_name] = out_head
                     _head_stamps[_name] = time.time()
                     head_ages[_name] = 0.0
                     _retry.discard(_name)
+                    _res_seq[_name] = _res_seq.get(_name, 0) + 1
+                    _sched[_name] = sched_record(
+                        _name,
+                        "keepalive_forced" if _keepalive_forced else "ran",
+                        source_seq=_tick_num,
+                        result_seq=_res_seq.get(_name),
+                        eligible_t=_eligible_t, source_t=_source_t, age_s=_age_now,
+                        compute_ms=_head_ms, dispatch_t=_dispatch_t,
+                        finish_t=_finish_t, publish_t=time.time())
                 except Exception as _exc:
                     self.hydra.errors[_name] = str(_exc)
+                    # finish_t IS set: the work ended, it just failed, so
+                    # the stage is "finished but not published" - not
+                    # "in flight", which would look like it is still coming.
+                    _sched[_name] = sched_record(
+                        _name, "error", source_seq=_tick_num,
+                        result_seq=_res_seq.get(_name),
+                        eligible_t=_eligible_t, source_t=_source_t, age_s=_age_now,
+                        reason=str(_exc), dispatch_t=_dispatch_t,
+                        finish_t=time.time())
             self._tick_num = _tick_num + 1
             # Every registered head gets an explicit age.  A missing output
             # is not silently "fresh": without a previous result it is
@@ -709,6 +1023,15 @@ class FSDStack:
             out.meta["head_age_s"] = {
                 k: round(float(v), 3) if np.isfinite(v) else None
                 for k, v in head_ages.items()}
+            # Per-head scheduler record: WHY each head did not run, not
+            # only how old its output is.  Ages are rounded like the rest
+            # of the telemetry so the frames stay small.
+            if _sched:
+                out.meta["head_sched"] = {
+                    k: {**v,
+                        "age_s": (None if v.get("age_s") is None
+                                  else round(float(v["age_s"]), 3))}
+                    for k, v in _sched.items()}
             out.meta["object_head"] = int("object" in self.hydra._heads)
             _async = getattr(self, "_head_async", None)
             if _async:
@@ -717,6 +1040,16 @@ class FSDStack:
                     _n: _r.digest()
                     for _n, _r in getattr(self, "_head_workers", {}).items()
                     if _n in _async}
+            # WHICH head threw, in words.  ``head_age_s`` above says a head
+            # stopped refreshing; the exception that stopped it is kept on
+            # ``hydra.errors`` (dropped again the moment the head succeeds)
+            # and was never published - the 2026-09-20 town runs show the
+            # object head's age climbing to 113 s with no way to tell a
+            # crashed head from a merely slow one.  Sticky by design: it is
+            # the LAST error per head, not "an error happened this tick".
+            _head_errs = dict(getattr(self.hydra, "errors", None) or {})
+            if _head_errs:
+                out.meta["head_errors"] = _head_errs
             _times['ring'] = round((time.time() - _tw) * 1000.0, 1)
             _tw = time.time()
 
@@ -742,33 +1075,86 @@ class FSDStack:
                     # the meantime; a slow cloud costs freshness (bounded
                     # by STALE_RANGE_S / RANGE_REUSE_MAX_DT_S), not the
                     # control cadence.
-                    rng, _range_err = self._range_async_step(
+                    rng, _range_err, _range_state = self._range_async_step(
                         pos, _budget, _tick_cost0, _budget_skips)
                     if _range_err:
                         out.errors["range"] = _range_err
                     out.meta["range_async"] = 1
+                    out.meta["range_sched"] = _range_state
+                    _rworker = getattr(self, "_range_worker", None)
+                    if _rworker is not None:
+                        # The same health summary the async heads publish:
+                        # from ``range_age_s`` alone a WEDGED clustering
+                        # worker (busy=1, in_flight_s still growing, no new
+                        # submit) is indistinguishable from a healthy-but-
+                        # slow one - and range age is what trips the stale
+                        # verdict.
+                        out.meta["range_worker"] = _rworker.digest()
                 elif getattr(self, '_range_skip', 0) <= 0:
-                    if (_budget is not None
-                            and (time.time() - _tick_cost0) > _budget
-                            and getattr(self, '_last_range', None)
-                            is not None):
-                        _dt = (time.time()
+                    _has_prev = getattr(self, '_last_range', None) is not None
+                    _r_age = ((time.time()
                                - float(getattr(self, '_last_range_t', 0.0)))
+                              if _has_prev else None)
+                    # Keep-alive floor: the budget may only reuse the scan
+                    # while it is still inside its bound.  Past it the
+                    # modality is STARVED, not deferred, and the scan runs
+                    # whatever the budget says - this is the rule whose
+                    # absence deferred range on 151/151 and 120/120 frames
+                    # of the 2026-09-20 town runs.
+                    # Same decision as before, but named and testable: the
+                    # inline version could only be exercised by driving town.
+                    _r_elapsed = time.time() - _tick_cost0
+                    _action, _state = range_schedule(
+                        budget=_budget, elapsed=_r_elapsed,
+                        age_s=_r_age, has_prev=_has_prev,
+                        keepalive_s=_keepalive_s("range"))
+                    if _action == "defer":
                         rng = compensate_range_motion(
-                            self._last_range, _dt)
+                            self._last_range, _r_age)
                         _budget_skips.append("range")
+                        out.meta["range_sched"] = {
+                            "state": _state, "age_s": _r_age,
+                            "compute_ms": None}
                     else:
+                        _t_scan = time.perf_counter()
                         rng = self.range_prov.scan(pos)
+                        _scan_ms = round(
+                            (time.perf_counter() - _t_scan) * 1000.0, 1)
                         self._last_range = rng
                         self._last_range_t = time.time()
                         self._range_skip = max(
                             0, int(getattr(self, 'range_every_n', 1)) - 1)
+                        out.meta["range_sched"] = {
+                            "state": _state, "age_s": _r_age,
+                            "compute_ms": _scan_ms}
                 else:
-                    self._range_skip -= 1
                     _dt = (time.time()
                            - float(getattr(self, '_last_range_t', 0.0)))
-                    rng = compensate_range_motion(
-                        getattr(self, '_last_range', None), _dt)
+                    if _keepalive_expired("range", _dt):
+                        # The every-n throttle may not push the safety scan
+                        # past its bound either: that reuse is exactly the
+                        # shape that produced 4-6 s range age before
+                        # range_every_n was forced to 1 in strict mode, and
+                        # fixing the throttle alone only handed the
+                        # starvation to the budget gate.
+                        _t_scan = time.perf_counter()
+                        rng = self.range_prov.scan(pos)
+                        _scan_ms = round(
+                            (time.perf_counter() - _t_scan) * 1000.0, 1)
+                        self._last_range = rng
+                        self._last_range_t = time.time()
+                        self._range_skip = max(
+                            0, int(getattr(self, 'range_every_n', 1)) - 1)
+                        out.meta["range_sched"] = {
+                            "state": "keepalive_forced", "age_s": _dt,
+                            "compute_ms": _scan_ms}
+                    else:
+                        self._range_skip -= 1
+                        rng = compensate_range_motion(
+                            getattr(self, '_last_range', None), _dt)
+                        out.meta["range_sched"] = {
+                            "state": "every_n_reuse", "age_s": _dt,
+                            "compute_ms": None}
                 if rng is None:
                     raise RuntimeError("no range sample")
                 out.ray_hits = list(getattr(rng, "ray_hits", []) or [])
