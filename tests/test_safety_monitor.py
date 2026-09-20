@@ -425,3 +425,204 @@ def test_risk_layer_constrains_a_served_path_hold() -> None:
     assert v.level == "minimal_risk"           # ...and then stopped
     assert v.reason == "obstacle contact risk"
     assert v.target_speed == 0.0
+
+
+# ---------------------------------------------------------------------
+# Perceived road-surface gate (2026-09-20)
+#
+# ``lat_left`` / ``lat_right`` were BOTH None on 82-99% of frames in every
+# 2026-09-20 town run, so an off-road metric built on detected boundaries
+# read 0.0 m ("perfectly on the road") while the car finished 6.96 m past
+# the pavement edge.  The road-surface gate reads the SAME 2-12 m drivable
+# band the lateral guard and the corner governor use, and separates cleanly
+# on the recorded runs: the 8 runs that stayed on the pavement never lost
+# the band for more than 5 consecutive frames, the one that left it lost it
+# for 91.
+# ---------------------------------------------------------------------
+
+def _road_scene(y_lo: float = -3.0, y_hi: float = 3.0,
+                x_lo: float = 2.0, x_hi: float = 9.0):
+    """Monitor scene whose BEV carries a drivable road slab."""
+    scene = _scene()
+    ext = scene.grid.extent
+    res = scene.grid.res
+    r0 = int((ext - x_hi) / res)
+    r1 = int((ext - x_lo) / res)
+    c0 = int((ext - y_hi) / res)
+    c1 = int((ext - y_lo) / res)
+    scene.grid.drivable[r0:r1 + 1, c0:c1 + 1] = 1.0
+    return scene
+
+
+def test_road_surface_present_keeps_the_verdict_safe() -> None:
+    mon = SafetyMonitor(max_speed=12.0, road_surface_gate=True)
+    for t in (0.0, 3.0, 6.0, 12.0):
+        v = mon.evaluate(_road_scene(), _straight(), now_s=t)
+        assert v.road_surface == "on_road"
+        assert v.road_checked is True
+        assert v.safe
+        assert v.target_speed == pytest.approx(12.0)
+
+
+def test_a_return_before_the_road_check_is_not_reported_as_checked() -> None:
+    """``unknown`` + ``0.0`` must not be readable as "the road is fine".
+
+    ``_evaluate_core`` returns on "no drivable path" BEFORE it reads the
+    band, so the pair keeps its dataclass defaults.  Without the flag
+    that is byte-identical to a consulted-but-evidence-less read, which
+    is what the 2026-09-20 gate runs published (``town_1789890286``,
+    frames 99-100: ``road_surface=unknown``, ``road_lost_s=0.0``,
+    reason ``no drivable path``).
+    """
+    mon = SafetyMonitor(max_speed=12.0, road_surface_gate=True)
+    v = mon.evaluate(_road_scene(), None, now_s=0.0)
+    assert v.reason == "no drivable path"
+    assert v.road_surface == "unknown"
+    assert v.road_lost_s == 0.0
+    # ... and this is the whole point: the reader never ran.
+    assert v.road_checked is False
+
+
+def test_the_road_check_is_flagged_on_a_grid_with_no_evidence() -> None:
+    """Consulted + no evidence and not-consulted are different verdicts."""
+    mon = SafetyMonitor(max_speed=12.0, road_surface_gate=True)
+    v = mon.evaluate(_scene(), _straight(), now_s=0.0)
+    assert v.road_surface == "unknown"
+    assert v.road_checked is True
+
+
+def test_road_surface_unknown_is_not_reported_as_on_road() -> None:
+    """A grid with no road evidence must read UNKNOWN, not "on the road".
+
+    This is the contract the old off-road metric broke: ``_scene()`` has
+    an empty drivable layer, so the band reader returns None - and that
+    silence used to surface as 0.0 m, i.e. "perfectly on the road".
+    """
+    mon = SafetyMonitor(max_speed=12.0, road_surface_gate=True)
+    v = mon.evaluate(_scene(), _straight(), now_s=0.0)
+    assert v.road_surface == "unknown"
+    assert v.road_surface != "on_road"
+
+
+def test_one_blind_tick_is_not_a_fail_closed_event() -> None:
+    """A single lost band must not stop the car (that is the stall trap)."""
+    mon = SafetyMonitor(max_speed=12.0, road_surface_gate=True)
+    v = mon.evaluate(_scene(), _straight(), now_s=0.0)
+    assert v.road_surface == "unknown"
+    assert v.safe
+    assert v.target_speed == pytest.approx(12.0)
+
+
+def test_sustained_road_loss_degrades_then_stops() -> None:
+    mon = SafetyMonitor(max_speed=12.0, road_surface_gate=True)
+    blind = _scene()
+    mon.evaluate(blind, _straight(), now_s=0.0)          # clock starts here
+    v = mon.evaluate(blind, _straight(), now_s=5.0)      # 5 s blind
+    assert v.level == "degraded"
+    assert v.reason == "perceived road surface lost"
+    assert v.target_speed == pytest.approx(mon.min_risk_speed)
+    v = mon.evaluate(blind, _straight(), now_s=9.0)      # 9 s blind
+    assert v.level == "minimal_risk"
+    assert v.reason == "perceived road surface lost"
+    assert v.target_speed == 0.0
+
+
+def test_brief_road_loss_does_not_stop() -> None:
+    """~3 s of blindness is inside the recorded benign worst case."""
+    mon = SafetyMonitor(max_speed=12.0, road_surface_gate=True)
+    blind = _scene()
+    mon.evaluate(blind, _straight(), now_s=0.0)
+    v = mon.evaluate(blind, _straight(), now_s=3.0)
+    assert v.safe
+    v = mon.evaluate(_road_scene(), _straight(), now_s=3.1)
+    assert v.road_surface == "on_road"
+    assert v.safe
+
+
+def test_road_loss_timer_resets_when_the_band_returns() -> None:
+    mon = SafetyMonitor(max_speed=12.0, road_surface_gate=True)
+    blind = _scene()
+    mon.evaluate(blind, _straight(), now_s=0.0)
+    mon.evaluate(_road_scene(), _straight(), now_s=3.0)   # recovered
+    v = mon.evaluate(blind, _straight(), now_s=4.0)       # timer restarts
+    assert v.safe
+    assert v.road_surface == "unknown"
+
+
+def test_band_beside_the_ego_degrades_at_once() -> None:
+    """A perceived road entirely beside the car is OFF, not UNKNOWN.
+
+    OFF degrades on the FIRST tick - positive evidence that the car is
+    off the road must not read as a normal safe state - but it does not
+    hard-stop immediately, because the band is read 2-12 m AHEAD and a
+    bend can slide it sideways.  Sustained OFF still fails closed.
+    """
+    mon = SafetyMonitor(max_speed=12.0, road_surface_gate=True)
+    v = mon.evaluate(_road_scene(y_lo=2.5, y_hi=8.0), _straight(),
+                     now_s=0.0)
+    assert v.road_surface == "off_road"
+    assert v.level == "degraded"
+    assert v.reason == "off perceived road surface"
+    assert v.target_speed == pytest.approx(mon.min_risk_speed)
+
+
+def test_sustained_off_road_stops() -> None:
+    mon = SafetyMonitor(max_speed=12.0, road_surface_gate=True)
+    off = _road_scene(y_lo=2.5, y_hi=8.0)
+    mon.evaluate(off, _straight(), now_s=0.0)
+    v = mon.evaluate(off, _straight(), now_s=9.0)
+    assert v.road_surface == "off_road"
+    assert v.level == "minimal_risk"
+    assert v.target_speed == 0.0
+
+
+def test_brief_off_road_recovers_without_a_stop() -> None:
+    """A bend that slides the band off the car must not park the car."""
+    mon = SafetyMonitor(max_speed=12.0, road_surface_gate=True)
+    mon.evaluate(_road_scene(y_lo=2.5, y_hi=8.0), _straight(), now_s=0.0)
+    v = mon.evaluate(_road_scene(), _straight(), now_s=1.0)
+    assert v.road_surface == "on_road"
+    assert v.safe
+    assert v.target_speed == pytest.approx(12.0)
+
+
+def test_gate_off_reports_the_state_but_never_acts() -> None:
+    """With the switch off the state is still measured (A/B evidence)."""
+    mon = SafetyMonitor(max_speed=12.0, road_surface_gate=False)
+    blind = _scene()
+    for t in (0.0, 5.0, 20.0):
+        v = mon.evaluate(blind, _straight(), now_s=t)
+        assert v.road_surface == "unknown"
+        assert v.safe
+        assert v.target_speed == pytest.approx(12.0)
+
+
+def test_gate_off_still_reports_off_road_without_acting() -> None:
+    mon = SafetyMonitor(max_speed=12.0, road_surface_gate=False)
+    v = mon.evaluate(_road_scene(y_lo=2.5, y_hi=8.0), _straight(),
+                     now_s=0.0)
+    assert v.road_surface == "off_road"
+    assert v.safe
+
+
+def test_gate_defaults_to_the_module_switch() -> None:
+    import beamng_autopilot.safety_monitor as sm
+    mon = SafetyMonitor(max_speed=12.0)
+    assert mon.road_surface_gate == bool(sm.ROAD_SURFACE_GATE_ENABLED)
+
+
+def test_grid_less_scene_reports_unknown_without_starting_the_clock() -> None:
+    """No BEV at all is a different failure from a silent BEV.
+
+    A scene that never builds a grid must not accrue "road lost" time,
+    or a BEV-less configuration would stop the car after the threshold
+    with road evidence never having existed.
+    """
+    mon = SafetyMonitor(max_speed=12.0, road_surface_gate=True)
+    scene = _scene()
+    scene.grid = None
+    for t in (0.0, 5.0, 20.0):
+        v = mon.evaluate(scene, _straight(), now_s=t)
+        assert v.road_surface == "unknown"
+        assert v.road_lost_s == 0.0
+        assert v.safe
