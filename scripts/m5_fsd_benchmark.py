@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -36,7 +37,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from beamng_autopilot import config
-from beamng_autopilot.eval import assess_run, score_run
+from beamng_autopilot.eval import STATUS_FAIL, STATUS_UNKNOWN, assess_run, score_run
 
 # Scenario registry: fixed starting states mirroring the README real-
 # vehicle verification records so runs are comparable across commits.
@@ -174,10 +175,113 @@ def score_telemetry(path: Path, require_goal: bool, goal=None) -> dict:
     return {"file": str(path), "assessed": assessed, **verdict}
 
 
+def write_manifest(out_dir: Path, ts: int, names: list[str], base: dict,
+                   env: dict | None = None, procs=None) -> dict | None:
+    """Record what produced this batch of runs (plan P0-1/P0-2).
+
+    Written BEFORE the first run, so it describes the state the runs started
+    from.  Without it "same configuration" is an assumption: a run left a
+    telemetry JSON and nothing said which code, which switch values, which
+    model and which process produced it.
+
+    ``env``/``procs`` are injectable so this is testable without a game.
+    Returns the manifest, or None when the module is unavailable (a missing
+    record must never be the reason a run fails).
+    """
+    try:
+        from beamng_autopilot.run_manifest import build_manifest
+    except Exception as exc:                    # pragma: no cover - import guard
+        print(f"[benchmark] manifest unavailable: {exc}")
+        return None
+    try:
+        from beamng_autopilot.fsd_drive import WARMUP_S as _warmup
+        warmup = float(_warmup)
+    except Exception:                       # pragma: no cover - import guard
+        warmup = None
+    run = {
+        "scenarios": list(names),
+        "goal": base.get("goal"),
+        # Plan P0-1 asks for the warmup phase, the random seed and the vehicle
+        # id.  Two of the three are NOT knowable here and are recorded as
+        # unknown rather than filled in with something plausible:
+        # - vehicle id (vid) only exists once the connector is attached, which
+        #   happens inside fsd_drive, after this manifest is written.
+        # - the seed: BeamNG.tech owns weather/traffic randomness and the stack
+        #   exposes no seed for it, so "same configuration" cannot control it.
+        #   That is part of why town mileage varies 30.9-92.9 m within one arm.
+        "warmup_s": warmup,
+        "vehicle_id": None,
+        "seed": None,
+        "seed_controlled": False,
+        "teleport": {n: list(SCENARIOS[n].get("teleport") or ()) for n in names},
+        "seconds": {n: SCENARIOS[n].get("seconds") for n in names},
+        "speed_mps": {n: SCENARIOS[n].get("speed") for n in names},
+        "strict": base.get("strict"),
+        "lane_mode": base.get("lane_mode"),
+        "runtime": base.get("runtime"),
+        "attach": base.get("attach"),
+        "traffic": base.get("traffic"),
+        "no_signal": base.get("no_signal"),
+        "seg_model": base.get("seg_model"),
+        "line_seg_model": base.get("line_seg_model"),
+    }
+    # Tech version: the connector exposes no version API, so the install
+    # path is the only place it is written down.  A run from another Tech
+    # build is a different experiment and nothing said which build it was.
+    home = (env or {}).get("BEAMNG_TECH_HOME") \
+        or os.environ.get("BEAMNG_TECH_HOME") \
+        or getattr(config, "BEAMNG_TECH_HOME", None)
+    man = build_manifest(config.PROJECT_ROOT, run=run, env=env, procs=procs,
+                         tech_home=home)
+    path = out_dir / f"manifest_{ts}.json"
+    path.write_text(json.dumps(man, ensure_ascii=False, indent=1),
+                    encoding="utf-8")
+
+    git = man.get("git") or {}
+    switches = man.get("switches") or {}
+    unset = [k for k, v in switches.items() if v is None]
+    print(f"[benchmark] manifest -> {path}")
+    print(f"[benchmark]   commit {git.get('commit_short')} "
+          f"branch {git.get('branch')} "
+          f"dirty={git.get('dirty')} ({git.get('dirty_count')} path(s))")
+    print(f"[benchmark]   switches: {len(switches) - len(unset)} set, "
+          f"{len(unset)} unset (unset = module default, NOT '0')")
+    for art in (man.get("artifacts") or {}).values():
+        if not art.get("present"):
+            print(f"[benchmark]   !! artifact missing: {art.get('path')}")
+    return man
+
+
+def check_exclusivity(man: dict | None) -> bool:
+    """True when this is the only controller on the machine (plan P0-2).
+
+    Two controllers on one port drive the same vehicle through two teleports
+    and the run belongs to neither experiment - that already cost four runs
+    (town_1789889000/_9006/_9171/_9172).  The earlier detector compared log
+    mtimes, which only fires when the runs overlap to the second.
+    """
+    if not man:
+        return True                    # no record -> nothing to contradict
+    exc = man.get("exclusivity") or {}
+    if exc.get("ok", True):
+        return True
+    others = exc.get("others") or []
+    print(f"[benchmark] !! {len(others)} OTHER controller process(es) running "
+          f"- a run started now is contaminated:")
+    for o in others:
+        print(f"[benchmark]      pid={o.get('pid')} "
+              f"{' '.join(str(c) for c in (o.get('cmdline') or ()))}")
+    return False
+
+
 def _print_row(name: str, r: dict) -> None:
     a = r["assessed"]
-    failed = [k for k, ok in r["checks"].items() if not ok]
-    print(f"  {name:10s} {'PASS' if r['pass'] else 'FAIL':4s} "
+    # Three-state: a check that could not be measured is UNKNOWN, not FAIL -
+    # and it must not be printed as a pass either (plan P0-3).
+    status = r.get("status") or ("PASS" if r["pass"] else "FAIL")
+    unknown = list(r.get("unknown") or ())
+    failed = [k for k, ok in r["checks"].items() if not ok and k not in unknown]
+    print(f"  {name:10s} {status:7s} "
           f"frames={a.get('frames', 0):4d} "
           f"lane={a.get('lane_sensor_rate', 0.0):4.0%} "
           f"rev={a.get('reversing_frames', 0):3d} "
@@ -188,7 +292,8 @@ def _print_row(name: str, r: dict) -> None:
           f"dist={a.get('travelled_m', 0.0):6.1f}m"
           + (f"  goal={a.get('goal_dist_m')}m" if a.get("goal_dist_m")
              is not None else "")
-          + (f"  FAILED: {','.join(failed)}" if failed else ""))
+          + (f"  FAILED: {','.join(failed)}" if failed else "")
+          + (f"  UNKNOWN: {','.join(unknown)}" if unknown else ""))
 
 
 def main() -> int:
@@ -222,6 +327,9 @@ def main() -> int:
                          "the recorded negative result)")
     ap.add_argument("--goal", nargs=2, type=float, default=None,
                     metavar=("X", "Y"))
+    ap.add_argument("--allow-contaminated", action="store_true",
+                    help="drive even when another controller process is live "
+                         "(the manifest still records the conflict)")
     args = ap.parse_args()
 
     if args.list:
@@ -259,8 +367,12 @@ def main() -> int:
         all_pass = bool(results) and all(r["pass"] for r in results)
         for r in results:
             _print_row(Path(r["file"]).stem, r)
-        print(f"[benchmark] {len(results)} file(s), "
-              f"{'ALL PASS' if all_pass else 'FAILURES PRESENT'}")
+        n_fail = sum(1 for r in results if r.get("status") == STATUS_FAIL)
+        n_unk = sum(1 for r in results if r.get("status") == STATUS_UNKNOWN)
+        print(f"[benchmark] {len(results)} file(s): "
+              f"{len(results) - n_fail - n_unk} PASS / {n_fail} FAIL / "
+              f"{n_unk} UNKNOWN"
+              + ("" if all_pass else " - UNKNOWN does not release the gate"))
         return 0 if all_pass else 1
 
     from beamng_autopilot import fsd_drive
@@ -280,6 +392,16 @@ def main() -> int:
     out_dir = config.LOGS_DIR / "fsd_benchmark"
     out_dir.mkdir(parents=True, exist_ok=True)
     ts = int(time.time())
+
+    # Plan P0-1/P0-2: record the provenance BEFORE the first run, and refuse
+    # to drive while another controller is live - a contaminated run belongs
+    # to no experiment (four runs were lost that way on 2026-09-20).
+    man = write_manifest(out_dir, ts, names, base)
+    if not check_exclusivity(man) and not args.allow_contaminated:
+        print("[benchmark] refusing to drive; pass --allow-contaminated to "
+              "override (the manifest still records the conflict)")
+        return 3
+
     results = []
     for name in names:
         out_path = out_dir / f"{name}_{ts}.json"
