@@ -672,6 +672,31 @@ class BeamNGConnector:
                 rotation=np.asarray(st["rotation"], dtype=float),
             )
 
+    def read_damage_total(self):
+        """One damage number for the ego, or None when it cannot be read.
+
+        The ``Damage`` sensor is the ground truth behind the benchmark's
+        ``collision_count`` gate (plan §12).  It is attached by the Tech
+        provider; on a runtime without it (Steam, or a Tech session that
+        never attached one) this returns None - "not measured" - rather
+        than 0.0, so an unmeasured run can never read as a clean one.
+        """
+        with self.io_lock:
+            if self.vehicle is None:
+                return None
+            try:
+                from beamng_autopilot.damage import damage_total
+                sensors = getattr(self.vehicle, "sensors", None)
+                if sensors is None:
+                    return None
+                try:
+                    sensor = sensors["damage"]
+                except Exception:
+                    return None
+                return damage_total(getattr(sensor, "data", None))
+            except Exception:
+                return None
+
     def get_wheel_speed(self):
         """Best-effort average wheel speed (m/s) via the Lua bridge.
 
