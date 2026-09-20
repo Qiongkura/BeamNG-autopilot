@@ -36,6 +36,7 @@ from .constraints import (
     cost_collision,
     cost_curvature,
     cost_lane_align,
+    ego_drivable_coverage,
 )
 from .lateral_ref import (
     REF_ENVELOPE,
@@ -49,6 +50,7 @@ from .lateral_ref import (
 )
 from .selector import select_trajectory
 from .hysteresis import CandidateHysteresis, candidate_key
+from .clearance_guard import ClearanceGuard, ClearanceReading
 from .arbiter import (
     ArbiterOutcome,
     anchored_rule_ref,
@@ -72,6 +74,7 @@ __all__ = [
     "sample_lane_shift",
     "Constraints",
     "corridor_free_band",
+    "ego_drivable_coverage",
     "cost_collision",
     "cost_curvature",
     "lane_cross_dist_m",
@@ -93,6 +96,8 @@ __all__ = [
     "select_trajectory",
     "CandidateHysteresis",
     "candidate_key",
+    "ClearanceGuard",
+    "ClearanceReading",
     "ArbiterOutcome",
     "anchored_rule_ref",
     "arbitrate",

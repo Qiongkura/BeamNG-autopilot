@@ -490,6 +490,134 @@ def _path_off_drivable(scene: Scene, path, near_m: float = 8.0,
     return [bad, total, near_bad, near_total]
 
 
+# Activation floor for the ego road-surface check: the drivable layer must
+# have seen at least this fraction of the grid before a non-drivable cell
+# may be read as "off the road" (the same rule ``_path_off_drivable``
+# uses - a sparse camera footprint is unknown, not grass).
+EGO_ROAD_MIN_EVIDENCE = 0.03
+# LOCAL activation radius (m): the drivable layer must mark road surface
+# within this distance of the ego before "my footprint is off it" may be
+# read as off-road.  The global floor above is not enough, because a layer
+# can be large somewhere else and still say nothing about the car: the
+# 2026-09-20 town runs marked a median of 12 cells (~3 m^2) about 4 m
+# AHEAD of the car and overlapped the ego footprint on 0 of 197 frames, so
+# a footprint check against it would have reported "off road" on every
+# frame.  One car length is the smallest radius that still lets the layer
+# answer the question it is being asked.
+EGO_ROAD_LOCAL_RADIUS_M = HALF_LENGTH_M + HALF_WIDTH_M
+
+
+def ego_drivable_coverage(scene: Scene,
+                          min_evidence: float = EGO_ROAD_MIN_EVIDENCE,
+                          local_radius_m: float = EGO_ROAD_LOCAL_RADIUS_M
+                          ) -> float | None:
+    """Fraction of the ego FOOTPRINT standing on the drivable road layer.
+
+    Perception-only and boundary-INDEPENDENT: it answers "is the car on
+    the pavement?" without needing a detected lane line.  That is exactly
+    the state the 2026-09-20 town collision ended in - the car finished
+    2.3 m off the pavement while ``lat_left`` / ``lat_right`` were both
+    ``None``, so ``fsd_drive._perception_off_road_m`` reported 0.0 m
+    ("unknown" read as "perfectly on road").
+
+    ``None`` means there is no usable road-surface evidence:
+
+    * no grid, no drivable layer, or a non-2-D layer;
+    * the layer has seen less than ``min_evidence`` of the grid - the
+      rule ``_path_off_drivable`` already uses, because the mountain run
+      2026-08-27 never started when a 10% camera footprint made every
+      position read "off road";
+    * the layer marks NO road surface within ``local_radius_m`` of the
+      ego.  This is the rule the 2026-09-20 town runs made necessary: the
+      layer there holds a median of 12 cells about 4 m ahead of the car
+      and never touches its footprint, so without a local activation a
+      footprint check reads "off road" on every single frame.  A layer
+      that says nothing about the car's own neighbourhood is UNKNOWN, not
+      "grass".
+
+    Callers must treat ``None`` as unknown - never as "on the road" and
+    never as "off the road".
+
+    The footprint is sampled at its four corners, the centre and the four
+    mid-edge points, so a car half on the kerb reads ~0.5 instead of 0 or
+    1.  Cells the sensor never observed, and cells beyond the sensor
+    extent, are dropped from the denominator: they are unknown space, not
+    grass.
+    """
+    grid = getattr(scene, "grid", None)
+    if grid is None:
+        return None
+    drv = getattr(grid, "drivable", None)
+    if drv is None or np.size(drv) == 0:
+        return None
+    drv = np.asarray(drv)
+    if drv.ndim != 2:
+        return None
+    obs = getattr(grid, "observed", None)
+    if obs is not None and np.size(obs) == drv.size:
+        obs = np.asarray(obs)
+    else:
+        obs = None
+    evid = obs if obs is not None else drv
+    if float(evid.sum()) < float(min_evidence) * float(evid.size):
+        return None
+    pos = np.asarray(getattr(scene, "pos", None), dtype=float).ravel()[:2]
+    if pos.size < 2 or not np.isfinite(pos).all():
+        return None
+    extent = float(getattr(grid, "extent", 0.0) or 0.0)
+    # Local activation: is any marked road surface near the car?  Sampled
+    # through the grid's own ``world_to_cell`` so the check needs nothing
+    # but the public grid API.
+    if float(local_radius_m) > 0.0:
+        near_hit = False
+        for radius in (0.5 * float(local_radius_m), float(local_radius_m)):
+            for k in range(12):
+                ang = (2.0 * math.pi * k) / 12.0
+                qx = pos[0] + radius * math.cos(ang)
+                qy = pos[1] + radius * math.sin(ang)
+                cell = grid.world_to_cell(float(qx), float(qy))
+                if cell is None:
+                    continue
+                r, c = int(cell[0]), int(cell[1])
+                if not (0 <= r < drv.shape[0] and 0 <= c < drv.shape[1]):
+                    continue
+                if drv[r, c] > 0:
+                    near_hit = True
+                    break
+            if near_hit:
+                break
+        if not near_hit:
+            return None
+    try:
+        corners = footprint_corners(pos, float(scene.heading))
+    except Exception:
+        return None
+    pts = [np.asarray(c, dtype=float)[:2] for c in corners]
+    if len(pts) >= 4:
+        centre = sum(pts[:4]) / 4.0
+        edges = [(pts[i] + pts[(i + 1) % 4]) * 0.5 for i in range(4)]
+        pts = pts[:4] + edges + [centre]
+    total = 0
+    inside = 0
+    for p in pts:
+        if extent > 0.0 and float(np.hypot(p[0] - pos[0],
+                                           p[1] - pos[1])) > extent:
+            continue
+        cell = grid.world_to_cell(float(p[0]), float(p[1]))
+        if cell is None:
+            continue
+        r, c = int(cell[0]), int(cell[1])
+        if not (0 <= r < drv.shape[0] and 0 <= c < drv.shape[1]):
+            continue
+        if obs is not None and obs[r, c] <= 0:
+            continue          # never observed: unknown, not grass
+        total += 1
+        inside += int(bool(drv[r, c] > 0))
+    if total == 0:
+        return None
+    return float(inside) / float(total)
+
+
 def _path_known(scene: Scene, path, near_m: float = 10.0) -> list:
     """Count near-window path samples inside sensor-observed cells.
 

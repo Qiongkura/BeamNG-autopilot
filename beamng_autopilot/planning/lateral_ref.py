@@ -66,14 +66,26 @@ def lateral_reference(scene) -> tuple[np.ndarray | None, str]:
     ref = _as_ref(getattr(scene, "lane_ref", None))
     if ref is not None:
         return ref, REF_SENSOR
+    if getattr(scene, "strict_perception", False):
+        # FSD mode: no map geometry may become the lane.
+        #
+        # The envelope centre is checked HERE, not after it: it is the
+        # same polyline the lane gate just rejected.  When perception
+        # pairs the whole-road corridor its centre IS the road centre
+        # line, so falling through to it put the car straight back on
+        # the centre line with a different label - measured 2026-09-20,
+        # lane_src read perception-unavailable while this function
+        # still returned y=0.060 and best_path sat at y=0.060, i.e. the
+        # gate changed a tag and nothing else.
+        #
+        # The envelope still supplies hard BOUNDARIES elsewhere; only
+        # its centre is refused as a steering reference.
+        return None, REF_NONE
     envelope = getattr(scene, "lane_envelope", None)
     ref = _as_ref(getattr(envelope, "center", None)
                   if envelope is not None else None)
     if ref is not None:
         return ref, REF_ENVELOPE
-    if getattr(scene, "strict_perception", False):
-        # FSD mode: no map geometry may become the lane.
-        return None, REF_NONE
     ref = _as_ref(getattr(scene, "route", None))
     if ref is not None:
         return ref, REF_ROUTE
