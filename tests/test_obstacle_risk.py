@@ -14,6 +14,7 @@ from beamng_autopilot.obstacle_risk import (
     RISK_ROADSIDE,
     RISK_UNKNOWN,
     RISK_CONTACT_BAND_M,
+    RISK_STOP_MARGIN_M,
     assess_obstacles,
     stop_distance_m,
     ttc_speed_cap,
@@ -84,6 +85,134 @@ def test_unconfirmed_return_inside_contact_band_still_stops() -> None:
     assert risk.kind == RISK_HARD_COLLISION
     assert risk.stop is True
     assert risk.target_speed_cap == 0.0
+
+
+def test_contact_band_stop_needs_corroboration_when_occupancy_says_free() -> None:
+    """Two sources disagreeing at contact distance must not park the car.
+
+    Measured 2026-09-21 (town, strict): 72-82 LiDAR + 17-20 raycast terrain
+    returns, one unconfirmed speck inside the contact band, the fused
+    occupancy showing 13.5 m of clear path - 37 of 55 frames stopped on it
+    and the car could never move, so the speck never left the band.
+    """
+    from beamng_autopilot.occupancy import OccupancyGrid
+
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.observed[:] = 1
+    # The grid must carry real evidence elsewhere (roadside vegetation, the
+    # road edge) for its "free here" to mean anything - an all-zero grid is
+    # no evidence at all and must not contradict a contact return.
+    grid.mark_obstacle_region(6.0, 5.0, 2.0, 1.0)
+    risk = assess_obstacles(
+        [_track(RISK_CONTACT_BAND_M - 0.5, 0.0, matches=1)],
+        (0.0, 0.0), 0.0, 6.0, grid=grid)
+    assert risk.stop is False
+    assert risk.kind != RISK_HARD_COLLISION
+    # Creep toward it, bounded by the stop margin - never a full stop, and
+    # never a speed that could reach it.
+    assert 0.0 < risk.target_speed_cap <= 2.0
+
+
+def test_contact_band_stop_survives_when_the_grid_agrees() -> None:
+    from beamng_autopilot.occupancy import OccupancyGrid
+
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.observed[:] = 1
+    grid.obstacle[:, 30] = 1                   # occupied where the track is
+    grid.mark_obstacle_region(2.5, 0.0, 0.25, 0.25)
+    risk = assess_obstacles(
+        [_track(RISK_CONTACT_BAND_M - 0.5, 0.0, matches=1)],
+        (0.0, 0.0), 0.0, 6.0, grid=grid)
+    assert risk.kind == RISK_HARD_COLLISION
+    assert risk.stop is True
+
+
+def test_a_confirmed_static_object_is_still_stopped_when_the_grid_agrees() -> None:
+    from beamng_autopilot.occupancy import OccupancyGrid
+
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.observed[:] = 1
+    grid.mark_obstacle_region(6.0, 5.0, 2.0, 1.0)      # grid carries evidence
+    grid.mark_obstacle_region(2.5, 0.0, 0.4, 0.4)       # ...and agrees here
+    risk = assess_obstacles(
+        [_track(RISK_CONTACT_BAND_M - 0.5, 0.0, matches=4)],
+        (0.0, 0.0), 0.0, 6.0, grid=grid)
+    assert risk.kind == RISK_HARD_COLLISION
+    assert risk.stop is True
+
+
+def test_a_moving_object_in_the_contact_band_is_never_contradicted() -> None:
+    """The track layer's unique value over a raster is motion: the raster
+    lags a vehicle, so a moving object stops the car even where the fused
+    occupancy is still empty."""
+    from beamng_autopilot.occupancy import OccupancyGrid
+
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.observed[:] = 1
+    grid.mark_obstacle_region(6.0, 5.0, 2.0, 1.0)
+    risk = assess_obstacles(
+        [_track(RISK_CONTACT_BAND_M - 0.5, 0.0, vx=-4.0, matches=2)],
+        (0.0, 0.0), 0.0, 6.0, grid=grid)
+    assert risk.kind == RISK_HARD_COLLISION
+    assert risk.stop is True
+
+
+def test_a_static_object_the_ego_approaches_is_not_excused_by_closing() -> None:
+    """A static wall closes at the EGO speed; that must not count as the
+    object moving, or no static obstacle could ever be graded."""
+    from beamng_autopilot.occupancy import OccupancyGrid
+
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.observed[:] = 1
+    grid.mark_obstacle_region(6.0, 5.0, 2.0, 1.0)
+    grid.mark_obstacle_region(2.5, 0.0, 0.4, 0.4)     # raster agrees here
+    risk = assess_obstacles(
+        [_track(RISK_CONTACT_BAND_M - 0.5, 0.0, matches=4)],
+        (0.0, 0.0), 0.0, 6.0, grid=grid)
+    assert risk.kind == RISK_HARD_COLLISION
+    assert risk.stop is True
+
+
+def test_a_static_object_the_grid_contradicts_creeps_instead_of_stopping() -> None:
+    """A persistent return the fused raster calls free is terrain, not a
+    wall: the two sources disagree and the raster is the filtered one.  The
+    creep cap still keeps the stop margin, so a real object the raster
+    missed halts the car ~2 m short instead of hitting it."""
+    from beamng_autopilot.occupancy import OccupancyGrid
+
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.observed[:] = 1
+    grid.mark_obstacle_region(6.0, 5.0, 2.0, 1.0)
+    risk = assess_obstacles(
+        [_track(RISK_CONTACT_BAND_M - 0.5, 0.0, matches=4)],
+        (0.0, 0.0), 0.0, 6.0, grid=grid)
+    assert risk.stop is False
+    assert 0.0 < risk.target_speed_cap <= 2.0
+    # The cap falls with the gap and reaches zero at the margin: the car
+    # halts short of it even if it is real and the raster missed it.
+    close = assess_obstacles(
+        [_track(RISK_STOP_MARGIN_M + 0.2, 0.0, matches=4)],
+        (0.0, 0.0), 0.0, 6.0, grid=grid)
+    assert close.target_speed_cap == pytest.approx(
+        ttc_speed_cap(RISK_STOP_MARGIN_M + 0.2, 0.0), abs=0.05)
+    at_margin = assess_obstacles(
+        [_track(RISK_STOP_MARGIN_M - 0.1, 0.0, matches=4)],
+        (0.0, 0.0), 0.0, 6.0, grid=grid)
+    assert at_margin.target_speed_cap == pytest.approx(0.0)
+
+
+def test_a_detection_inside_the_ego_footprint_is_not_an_obstacle() -> None:
+    """Own body / ground under the car: 0.02 m "collisions" are not real."""
+    risk = assess_obstacles([_track(0.05, 0.1, matches=6)], (0.0, 0.0), 0.0, 0.0)
+    assert risk.stop is False
+    assert risk.kind == RISK_UNKNOWN
+    assert risk.items == []
+
+
+def test_a_real_object_just_ahead_is_still_graded() -> None:
+    risk = assess_obstacles([_track(2.0, 0.0, matches=6)], (0.0, 0.0), 0.0, 0.0)
+    assert risk.kind == RISK_HARD_COLLISION
+    assert risk.stop is True
 
 
 def test_closing_vehicle_brakes_on_ttc() -> None:

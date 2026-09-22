@@ -39,7 +39,18 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from beamng_autopilot.vehicle_body import CORRIDOR_HALF_WIDTH_M
+from beamng_autopilot.vehicle_body import (
+    CORRIDOR_HALF_WIDTH_M,
+    HALF_LENGTH_M,
+    HALF_WIDTH_M,
+)
+
+# Margin around the ego rectangle for the "this is me" rejection, and the
+# longitudinal half-window around the ego centre that counts as "under the
+# car" (the path is anchored at the centre, so the bumper is
+# HALF_LENGTH_M further on - see _inside_ego).
+EGO_SELF_MARGIN_M = 0.3
+EGO_SELF_ALONG_M = 1.0
 
 RISK_HARD_COLLISION = "hard_collision"
 RISK_BRAKING = "braking_obstacle"
@@ -67,6 +78,14 @@ RISK_MIN_CLOSING_MPS = 0.5
 # not only if the crossing lands exactly on the TTC instant).
 RISK_PREDICT_HORIZON_S = 3.0
 RISK_PREDICT_STEP_S = 0.5
+# Speed ceiling applied to a contact-band return the fused occupancy
+# contradicts: it may not stop the car, but it must not be ignored either.
+CREEP_SPEED_CAP_MPS = 2.0
+# An object moving faster than this is a real moving threat; the fused
+# raster lags a vehicle, so such a track is never excused by "the grid
+# says free".  Static terrain/vegetation returns carry tracker-noise
+# velocities of a few tenths of a m/s.
+RISK_STATIC_OBJ_MAX_MPS = 1.5
 
 
 @dataclass
@@ -157,6 +176,48 @@ def stop_distance_m(speed_mps: float,
     return v * v / (2.0 * a)
 
 
+def stopping_margin_m(speed_mps: float, *, latency_s: float,
+                      a_min_mps2: float | None,
+                      extra_m: float = 0.5) -> tuple[float | None, str]:
+    """Conservative distance to stop, or UNKNOWN.
+
+    ``v*latency + v^2/(2*a_min) + extra`` - the plan's starting point.
+    ``a_min_mps2`` must come from a measured/declared deceleration; when it
+    is missing (or non-positive) the answer is UNKNOWN, because the formula
+    without it is an assumption about the road and the brakes, not a
+    measurement.  Slope, tyre grip, brake build-up and the swept curve are
+    all outside this model and are named in the returned reason.
+
+    This lives here (with ``stop_distance_m``), not in ``lane``: T09's hold
+    audit needs it, and a planner module importing the lane package was a
+    layering inversion - measured as a real ImportError while checking the
+    round-7 commits one by one.
+    """
+    import math
+
+    try:
+        v = float(speed_mps)
+        lat = float(latency_s)
+    except (TypeError, ValueError):
+        return None, "speed/latency unreadable"
+    if not (math.isfinite(v) and math.isfinite(lat)) or v < 0.0 or lat < 0.0:
+        return None, "speed/latency invalid"
+    if a_min_mps2 is None:
+        return None, "no declared minimum deceleration"
+    try:
+        a = float(a_min_mps2)
+    except (TypeError, ValueError):
+        return None, "deceleration unreadable"
+    if not math.isfinite(a) or a <= 0.0:
+        return None, "deceleration must be positive"
+    declared = abs(a - RISK_BRAKE_DECEL_MPS2) < 1e-9
+    dist = v * lat + stop_distance_m(v, a) + max(0.0, float(extra_m))
+    return float(dist), (
+        "flat ground, dry asphalt, no brake build-up; deceleration is a "
+        "declared constant" if declared else
+        "flat ground, dry asphalt, no brake build-up")
+
+
 def ttc_speed_cap(gap_m: float, closing_mps: float = 0.0,
                   decel_mps2: float = RISK_BRAKE_DECEL_MPS2,
                   margin_m: float = RISK_STOP_MARGIN_M,
@@ -176,10 +237,82 @@ def ttc_speed_cap(gap_m: float, closing_mps: float = 0.0,
     return math.sqrt(2.0 * max(1e-3, float(decel_mps2)) * usable)
 
 
+def _inside_ego(track, pos, heading: float,
+                along_m: float = EGO_SELF_ALONG_M,
+                half_width: float = HALF_WIDTH_M,
+                margin_m: float = EGO_SELF_MARGIN_M) -> bool:
+    """True when a detection centre sits under the ego's own body.
+
+    A LiDAR cluster or raycast return whose centre is essentially AT the
+    car - inside its width, within ``EGO_SELF_ALONG_M`` of the ego centre
+    along the heading - is not an object in front of it; it is the car's
+    own body or the ground it stands on.  Grading it is how a car standing
+    on an open road got a "hard collision at 0.02 m" verdict: measured
+    2026-09-21 on the town route, 72-82 LiDAR + 17-20 raycast terrain
+    returns per tick with the fused occupancy showing 13.5 m of clear path
+    ahead - 37 of 55 frames stopped and the car could never move, so the
+    speck never left the contact band.
+
+    The window is deliberately much shorter than the car's own length: the
+    path is anchored at the ego CENTRE, so the front bumper sits
+    ``HALF_LENGTH_M`` ahead and anything beyond this window may be a real
+    object just in front of the nose, which the contact band must still
+    grade.  Objects from ``EGO_SELF_ALONG_M`` out are untouched.
+    """
+    x = float(getattr(track, "x", 0.0) or 0.0)
+    y = float(getattr(track, "y", 0.0) or 0.0)
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return False
+    p = np.asarray(pos, dtype=float).ravel()[:2]
+    fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
+    left = np.array([-fwd[1], fwd[0]])
+    rel = np.array([x, y]) - p
+    return (abs(float(rel @ fwd)) <= float(along_m)
+            and abs(float(rel @ left)) <= float(half_width) + float(margin_m))
+
+
+def grid_has_evidence(grid) -> bool:
+    """True when the fused occupancy actually detected SOMETHING.
+
+    An all-zero grid is not evidence of free space: it is a grid that
+    detected nothing (or a stub with no perception at all).  Only a grid
+    that carries occupancy may contradict another sensor's contact return.
+    """
+    if grid is None:
+        return False
+    occ = getattr(grid, "obstacle", None)
+    if occ is None or not getattr(occ, "size", 0):
+        return False
+    try:
+        return bool((np.asarray(occ) > 0).any())
+    except Exception:
+        return False
+
+
+def grid_occupied_at(grid, x: float, y: float) -> bool | None:
+    """Is the fused occupancy occupied at (x, y)?  ``None`` = no evidence."""
+    if grid is None:
+        return None
+    occ = getattr(grid, "obstacle", None)
+    if occ is None or not getattr(occ, "size", 0):
+        return None
+    try:
+        cell = grid.world_to_cell(float(x), float(y))
+    except Exception:
+        return None
+    if cell is None:
+        return None
+    r, c = int(cell[0]), int(cell[1])
+    if not (0 <= r < occ.shape[0] and 0 <= c < occ.shape[1]):
+        return None
+    return bool(occ[r, c] > 0)
+
+
 def assess_obstacles(tracks, pos, heading: float,
                      ego_speed_mps: float = 0.0, *,
                      corridor_half_m: float = CORRIDOR_HALF_WIDTH_M,
                      path=None,
+                     grid=None,
                      contact_band_m: float = RISK_CONTACT_BAND_M,
                      ttc_brake_s: float = RISK_TTC_BRAKE_S,
                      min_confirm_frames: int = RISK_MIN_CONFIRM_FRAMES,
@@ -226,10 +359,41 @@ def assess_obstacles(tracks, pos, heading: float,
         lat = rel @ left
         tan = np.tile(fwd, (len(xy), 1))
 
+    def _contradicted(track, idx: int) -> bool:
+        """Contact-band return the fused occupancy calls free.
+
+        The fused occupancy is the authority the PLANNER scored the path
+        against and it is temporally filtered; a terrain/vegetation return
+        standing inside the band while that raster shows the cell free is
+        the failure this excludes (measured 2026-09-21: 72-82 LiDAR + 17-20
+        raycast terrain returns per tick, 13.5 m of clear grid path, and 37
+        of 55 frames stopped on one speck - the car could not move, so the
+        speck never left the band).
+
+        A FAST object is never contradicted: the raster lags a vehicle,
+        and that is exactly what the track layer adds over it.  "Fast" is
+        the object's OWN speed, not the approach rate - a static wall the
+        car is driving at still closes at the ego speed and must not be
+        excused by that.  A grid with no occupancy evidence at all cannot
+        contradict anything.
+        """
+        if not grid_has_evidence(grid):
+            return False
+        obs_speed = float(math.hypot(
+            float(getattr(track, "vx", 0.0) or 0.0),
+            float(getattr(track, "vy", 0.0) or 0.0)))
+        if obs_speed > RISK_STATIC_OBJ_MAX_MPS:
+            return False           # moving threat: never contradicted
+        return grid_occupied_at(grid, xy[idx, 0], xy[idx, 1]) is False
+
     worst_rank = -1
     ranks = {RISK_UNKNOWN: 0, RISK_ROADSIDE: 1,
              RISK_BRAKING: 2, RISK_HARD_COLLISION: 3}
     for i, tr in enumerate(trs):
+        if _inside_ego(tr, p, h):
+            # A detection centred inside the car's own rectangle is not an
+            # object in front of it (own body / the ground under it).
+            continue
         gap = float(along[i])
         if not math.isfinite(gap) or gap <= 0.0:
             continue          # behind the ego (or unusable projection)
@@ -287,12 +451,34 @@ def assess_obstacles(tracks, pos, heading: float,
             # it is distance WITHIN the driven corridor that is.
             kind = RISK_ROADSIDE
             why = "outside the driven corridor"
-        elif gap <= float(contact_band_m):
+        elif gap <= float(contact_band_m) and not _contradicted(tr, i):
             # Inside the corridor and this close: no confirmation wait and
             # no TTC needed.
             kind = RISK_HARD_COLLISION
             cap = 0.0
             why = "inside contact band"
+        elif gap <= float(contact_band_m):
+            # In the contact band, but a SINGLE-FRAME return the fused
+            # occupancy shows as free.  Two evidence sources disagree at
+            # contact distance - the grid path is clear while a speck
+            # claims a collision - and the grid is the corroborated one
+            # (its own clearance over this path reads tens of metres).
+            # Stopping on the speck alone parks the car permanently: it
+            # never moves, so the speck never leaves the band (measured
+            # 2026-09-21: 37 of 55 frames stopped with path_occ_frac 0.0
+            # and fwd_clear 13.5 m).  The speck still caps the speed to
+            # the creep band, so an approach that becomes real on the
+            # next frame is re-graded with confirmation.
+            kind = RISK_UNKNOWN
+            # Creep toward it, but never closer than the stop margin: the
+            # same stopping-distance bound used everywhere else.  If the
+            # object IS real and the raster simply has not fused it, the
+            # car halts ~``margin_m`` short of it instead of hitting it;
+            # if it is a terrain/vegetation return, the car keeps moving
+            # instead of parking on a phantom.
+            cap = min(float(cap), ttc_speed_cap(gap, 0.0, decel_mps2,
+                                                margin_m, reaction_s))
+            why = "contact-band return the fused occupancy calls free"
         elif not confirmed and gap > stop_gap_m:
             # Scattered / single-frame return that the car can still stop
             # for: no speed cap may be derived from it (plan C4).
