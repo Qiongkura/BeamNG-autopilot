@@ -79,6 +79,17 @@ def test_span_rejects_an_unknown_field():
 
 def test_clock_constants_differ():
     assert CLOCK_WALL != CLOCK_SIM
+    assert CLOCK_WALL == "wall_time"
+
+
+def test_command_deadline_clock_cannot_be_subtracted_from_wall_trace():
+    with pytest.raises(ClockMismatch):
+        span_ms(_full(cmd_monotonic_t=12.0), "source_t", "cmd_monotonic_t")
+
+
+@pytest.mark.parametrize("finish", [99.0, float("nan"), float("inf"), "bad"])
+def test_invalid_or_reversed_span_is_unknown(finish):
+    assert span_ms(_full(finish_t=finish), "dispatch_t", "finish_t") is None
 
 
 # ------------------------------------------------------------ field checks
@@ -146,6 +157,11 @@ def test_consumed_but_already_stale():
 def test_consumed_in_time():
     rec = _full(consumed_age_s=0.2)
     assert stage_of(rec, stale_age_s=1.0) == STAGE_CONSUMED
+
+
+@pytest.mark.parametrize("age", [None, "bad", float("nan"), float("inf"), -0.1])
+def test_consumed_unknown_age_cannot_pass_a_freshness_bound(age):
+    assert stage_of(_full(consumed_age_s=age), stale_age_s=1.0) == STAGE_UNKNOWN
 
 
 def test_stale_without_a_bound_is_not_judged():
