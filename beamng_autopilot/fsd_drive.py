@@ -36,6 +36,7 @@ from beamng_autopilot.control.drive_mode import (
 from beamng_autopilot.control.steering import SteeringShaper
 from beamng_autopilot.control.substep import ControlSubstep
 from beamng_autopilot.obstacle_risk import assess_obstacles
+from beamng_autopilot import fsd_stack as fsd_stack_mod
 from beamng_autopilot.fsd_stack import (
     FSDStack,
     OBJECT_KEEPALIVE_S,
@@ -263,6 +264,24 @@ SPEED_HYST_MPS = 0.25           # SpeedController brake/throttle hysteresis
 # control.  Real bends (hairpins) are already slowed by the corner
 # governor, so this only trims the oscillation case.
 HEADING_DEV_START_DEG = 12.0
+# A steering command that would rotate the car FURTHER away from the road
+# direction is clamped once the deviation passes this band, and to this
+# magnitude.  The failure it answers (2026-09-21 town crash): creeping at
+# 0.2-2 m/s with the wheel held at +0.41..+0.55 rotated the nose 23 deg
+# off the road direction and the car then rolled off the pavement into a
+# roadside tree.  Turning back TOWARD the road is never clamped, so
+# recovering from a deviation is unaffected.
+STEER_AWAY_MAX_DEG = 12.0
+STEER_AWAY_CLAMP = 0.12
+# Reference-stability steering authority (review handoff P1-2, arm C/D).
+# The stack grades every accepted lateral reference (paired? stable for
+# N ticks?) and publishes ``ref_authority``; when this switch is on, a
+# reference that is NOT a stable paired perception read may only make the
+# small correction below instead of a full-lock command.  Default OFF so
+# the four-arm A/B (handoff phase 1) can measure it; the grading itself
+# always runs and is always published.
+REF_STABILITY_ENABLED = os.environ.get("BEAMNG_REF_STABILITY", "0") != "0"
+REF_STABILITY_LIMITED_STEER = 0.15
 HEADING_DEV_FULL_DEG = 40.0
 HEADING_DEV_CAP_MPS = 5.0
 HEADING_DEV_FLOOR_MPS = 1.5
@@ -1281,18 +1300,30 @@ def consumed_from_head_sched(head_sched, cmd_t):
     * a head whose ``result_seq`` here trails the published one -> the tick
       acted on an older version.
 
-    A missing publish time yields ``None``, never a plausible age.
+    Source age includes inference and publication latency.  Publication age
+    is a separate measurement; neither is known without a published result.
     """
+    def _age(start):
+        try:
+            elapsed = float(cmd_t) - float(start)
+        except (TypeError, ValueError):
+            return None
+        return (round(elapsed, 3)
+                if math.isfinite(elapsed) and elapsed >= 0.0 else None)
+
     out_: dict[str, dict] = {}
     for name, rec in (head_sched or {}).items():
         if not isinstance(rec, dict):
             continue
-        pub = rec.get("publish_t")
+        published = (rec.get("result_seq") is not None
+                     and rec.get("publish_t") is not None)
+        publish_age = _age(rec.get("publish_t")) if published else None
         out_[name] = {
             "result_seq": rec.get("result_seq"),
             "source_seq": rec.get("source_seq"),
-            "age_s": (round(float(cmd_t) - float(pub), 3)
-                      if (pub is not None and cmd_t is not None) else None),
+            "age_s": (_age(rec.get("source_t"))
+                      if publish_age is not None else None),
+            "publish_age_s": publish_age,
         }
     return out_
 
@@ -1305,6 +1336,38 @@ CTRL_WATCHDOG_ENABLED = (
     os.environ.get("BEAMNG_CTRL_WATCHDOG", "0") != "0")
 CTRL_WATCHDOG_MAX_GAP_S = float(
     os.environ.get("BEAMNG_CTRL_WATCHDOG_GAP_S", "1.5"))
+
+# Learned lateral residual (M5-L, ``rl/lateral_runtime.py``).  Default
+# OFF: it is a learned component, so it ships behind a switch and every
+# shift it proposes is re-verified by the safety monitor against the same
+# contract as the painted-line corrector - a refused shift is dropped, the
+# approved path is driven instead.
+LATERAL_RL_ENABLED = os.environ.get("BEAMNG_LATERAL_RL", "0") != "0"
+# Horizon over which the residual blends out along the path.
+LATERAL_RL_HORIZON_M = 12.0
+
+
+def shift_path_right(path, pos, heading: float, shift_m: float,
+                     horizon_m: float = LATERAL_RL_HORIZON_M):
+    """Move the NEAR part of ``path`` right by ``shift_m`` metres.
+
+    Same shape as the painted-line corrector: full shift at the ego,
+    blending to zero at ``horizon_m``, so a learned residual can adjust
+    where the car sits inside its lane without rewriting the corner /
+    obstacle geometry further along the path.
+    """
+    if path is None or len(path) < 2 or abs(float(shift_m)) < 1e-6:
+        return path
+    pts = np.asarray(path, dtype=float)
+    p = np.asarray(pos[:2], dtype=float)
+    fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
+    right = np.array([fwd[1], -fwd[0]])
+    lon = pts[:, :2] @ fwd - float(p @ fwd)
+    w = np.clip(1.0 - lon / max(float(horizon_m), 1e-3), 0.0, 1.0)
+    out = np.array(pts, dtype=float, copy=True)
+    out[:, 0] += right[0] * float(shift_m) * w
+    out[:, 1] += right[1] * float(shift_m) * w
+    return out
 
 
 def final_target_speed(reference: float, plan_speed: float,
@@ -1329,14 +1392,94 @@ def final_target_speed(reference: float, plan_speed: float,
     """
     if force_stop:
         return 0.0
-    hi = float(hard_cap)
+    try:
+        hi = float(hard_cap)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(hi):
+        return 0.0
     for value in (reference, plan_speed):
         try:
-            hi = min(hi, float(value))
+            candidate = float(value)
         except (TypeError, ValueError):
-            # An unreadable reference must not relax the cap.
             continue
+        if math.isfinite(candidate):
+            hi = min(hi, candidate)
     return hi
+
+
+def clamp_steer_away_from_road(steer: float, heading: float,
+                              road_bearing_deg: float | None, *,
+                              start_deg: float = STEER_AWAY_MAX_DEG,
+                              clamp: float = STEER_AWAY_CLAMP) -> float:
+    """Stop a steering command that turns the car further off the road.
+
+    BeamNG steering is positive = right; the heading error is
+    ``heading - road_bearing`` wrapped to (-180, 180], positive when the
+    nose sits LEFT of the road direction.  Reducing a positive error means
+    steering right (positive input), so the command that INCREASES the
+    deviation is a negative input while the nose is left, or a positive
+    input while the nose is right.
+
+    Past ``start_deg`` such a command is clamped to ``clamp``; commands
+    that turn the car back toward the road, and everything inside the
+    band, pass through unchanged.  ``road_bearing_deg`` None (no measurable
+    route bearing) disables the check rather than guessing.
+    """
+    if road_bearing_deg is None:
+        return float(steer)
+    try:
+        err = (float(heading) - math.radians(float(road_bearing_deg))
+               + math.pi) % (2.0 * math.pi) - math.pi
+    except (TypeError, ValueError):
+        return float(steer)
+    deg = math.degrees(err)
+    if abs(deg) <= float(start_deg):
+        return float(steer)
+    away = (steer > 0.0) if deg < 0.0 else (steer < 0.0)
+    if not away:
+        return float(steer)
+    return float(np.clip(steer, -abs(float(clamp)), abs(float(clamp))))
+
+
+def _ramped_target_speed(previous: float, target: float,
+                         plan_speed: float, dt: float) -> float:
+    """Ramp acceleration without delaying a lower safety ceiling."""
+    step = SPEED_TARGET_RAMP_MPS * max(0.0, float(dt))
+    reference = float(previous) + float(np.clip(
+        float(target) - float(previous), -step, step))
+    return final_target_speed(reference, plan_speed, target)
+
+
+def _final_stop_controls(throttle: float, brake: float, steering: float,
+                         parkingbrake: float, *, stop: bool, speed: float
+                         ) -> tuple[float, float, float, float]:
+    """Reassert hard stops after recovery overrides and pedal shaping."""
+    if stop:
+        return 0.0, 1.0, 0.0, (1.0 if speed < 0.6 else parkingbrake)
+    return throttle, brake, steering, parkingbrake
+
+
+def vis_should_write(*, on_flag: bool, every: int, control_every: int,
+                      frame: int, flagged: bool) -> str | None:
+    """Which overlay frame (if any) this tick should render.
+
+    ``"flag"`` for a tick that claims a crossing / off-pavement,
+    ``"ctrl"`` for a control sample of unflagged ticks (so false negatives
+    are checkable), ``"tick"`` for the fixed cadence, ``None`` for nothing.
+    Extracted from the drive loop because the naming and the cadence rules
+    are exactly what a truth-audit depends on - and they were wrong once:
+    a filename index is not a telemetry row index.
+    """
+    if on_flag:
+        if flagged:
+            return "flag"
+        if control_every > 0 and (frame % control_every) == 0:
+            return "ctrl"
+        return None
+    if every > 0 and (frame % every) == 0:
+        return "tick"
+    return None
 
 
 def substep_digest(requested_hz: float, interval_s, executed: int,
@@ -1349,9 +1492,12 @@ def substep_digest(requested_hz: float, interval_s, executed: int,
     the log claims a control rate that never happened.
     """
     try:
-        expected = max(0, int(round(float(requested_hz)
-                                    * max(0.0, float(interval_s)))))
-    except (TypeError, ValueError):
+        hz, interval = float(requested_hz), float(interval_s)
+        if not (math.isfinite(hz) and hz >= 0.0
+                and math.isfinite(interval) and interval >= 0.0):
+            raise ValueError("invalid control interval")
+        expected = int(round(hz * interval))
+    except (TypeError, ValueError, OverflowError):
         return {"expected": None, "executed": int(executed),
                 "shortfall": None, "skip_reason": skip_reason or None,
                 "note": "interval not measured"}
@@ -1364,14 +1510,12 @@ def substep_digest(requested_hz: float, interval_s, executed: int,
 def watchdog_verdict(now_t, last_cmd_t, max_gap_s: float) -> dict:
     """Has too long passed since the last command actually went out?
 
-    Plan P3: the heartbeat must not depend on the perception loop, which
-    is the thing that blocks - a watchdog driven by tick completion would
-    go quiet exactly when it is needed.  This measures the gap between
-    COMMANDS, on the wall clock.
+    The caller uses a monotonic clock and checks before EVERY send.  This
+    detects a missed deadline when Python resumes; the game-side watchdog
+    remains responsible for braking while Python is blocked.
 
-    It returns a verdict, it does not brake: the caller owns the actuator,
-    and P3 forbids a second control channel.  ``last_cmd_t`` None means
-    nothing has been sent yet, which is not the same as "on time".
+    It returns a verdict, it does not brake: the caller owns the actuator.
+    ``last_cmd_t`` None means nothing has been sent yet, not "on time".
     """
     try:
         gap = None if (now_t is None or last_cmd_t is None) else (
@@ -1385,11 +1529,76 @@ def watchdog_verdict(now_t, last_cmd_t, max_gap_s: float) -> dict:
     if gap < 0.0:
         return {"action": "unknown", "gap_s": gap, "due": False,
                 "reason": "time went backwards"}
-    due = gap > float(max_gap_s)
+    try:
+        bound = float(max_gap_s)
+    except (TypeError, ValueError):
+        bound = float("nan")
+    if not math.isfinite(gap) or not math.isfinite(bound) or bound <= 0.0:
+        return {"action": "unknown", "gap_s": None, "due": False,
+                "reason": "invalid clock or deadline"}
+    due = gap > bound
     return {"action": "brake" if due else "ok", "gap_s": round(gap, 3),
             "due": due,
-            "reason": (f"no command for {gap:.3f}s > {float(max_gap_s):.3f}s"
+            "reason": (f"no command for {gap:.3f}s > {bound:.3f}s"
                        if due else "")}
+
+
+class _CommandStream:
+    """One receipt stream for tick, substep and protective control sends."""
+
+    def __init__(self, conn, *, enabled: bool = False,
+                 max_gap_s: float = CTRL_WATCHDOG_MAX_GAP_S,
+                 clock=None, wall_clock=None):
+        self.conn = conn
+        self.enabled = bool(enabled)
+        self.max_gap_s = float(max_gap_s)
+        self.clock = clock if clock is not None else time.monotonic
+        self.wall_clock = wall_clock if wall_clock is not None else time.time
+        self.seq = 0
+        self.sent_t: float | None = None
+        self.monotonic_t: float | None = None
+        self.verdict = watchdog_verdict(None, None, self.max_gap_s)
+        self.braked = False
+        self.controls: dict = {}
+        self.gap_s: float | None = None
+        self.send_ms: float | None = None
+
+    def send(self, **controls) -> dict:
+        now = self.clock()
+        verdict = watchdog_verdict(now, self.monotonic_t, self.max_gap_s)
+        braked = bool(self.enabled and verdict["due"])
+        actual = dict(controls)
+        if braked:
+            actual.update(throttle=0.0, brake=1.0,
+                          steering=0.0, parkingbrake=1.0)
+        self.conn.control(**actual)
+        # Failed sends never advance the receipt or refresh the deadline.
+        self.seq += 1
+        self.sent_t = self.wall_clock()
+        finished = self.clock()
+        self.gap_s = (None if self.monotonic_t is None
+                      else round(max(0.0, finished - self.monotonic_t), 3))
+        self.send_ms = round(max(0.0, finished - now) * 1000.0, 3)
+        self.monotonic_t = finished
+        self.verdict = verdict
+        self.braked = braked
+        self.controls = actual
+        return actual
+
+    def receipt(self, head_sched, target_speed: float) -> dict:
+        return {
+            "cmd_seq": self.seq,
+            "cmd_t": self.sent_t,
+            "cmd_monotonic_t": self.monotonic_t,
+            "cmd_gap_s": self.gap_s,
+            "cmd_send_ms": self.send_ms,
+            "watchdog_gap_s": self.verdict["gap_s"],
+            "watchdog": self.verdict["action"],
+            "watchdog_braked": self.braked,
+            "target_speed": 0.0 if self.braked else float(target_speed),
+            "consumed": consumed_from_head_sched(head_sched, self.sent_t),
+            **self.controls,
+        }
 
 
 def build_fsd_shadow_provenance(
@@ -1652,8 +1861,15 @@ class FSDriveSession:
                          # cameras pays ~7x grab time per tick for frames
                          # that are discarded.  --ring all restores the
                          # full surround polling (side-camera work).
+                         # P1-1: the near-field experiment needs the
+                         # front fisheye frame in the same ring grab; the
+                         # switch decides, so the default path still pays
+                         # for ONE camera only.
                          ring_roles=(None if args.ring == "all"
-                                     else ("front_main",)),
+                                     else (("front_main", "front_fisheye")
+                                           if fsd_stack_mod.NEARFIELD_CAM in
+                                           ("fisheye", "fuse", "band")
+                                           else ("front_main",))),
                          lane_mode=args.lane_mode,
                          strict_sensor=args.strict,
                          # Pairing-free strict-mode lane fallback, off by
@@ -2027,19 +2243,13 @@ class FSDriveSession:
         # masked the real error)
         hist: list[dict] = []
         rec = None
-        # Consumption side of the traceability contract (plan P1): the
-        # command sequence and the moment each command left, so "the stack
-        # published a result" and "the car acted on it" are two separate
-        # statements.  A result that was published but never consumed is
-        # otherwise invisible - it still looks like a fresh result.
-        _cmd_seq = 0
-        _cmd_t: float | None = None
-        _prev_cmd_t: float | None = None
-
         conn = BeamNGConnector(
             getattr(args, "map", None) or "italy", "etk800",
             port=config.runtime_port(args.runtime),
             home=config.runtime_home(args.runtime))
+        _commands = _CommandStream(
+            conn, enabled=CTRL_WATCHDOG_ENABLED,
+            max_gap_s=CTRL_WATCHDOG_MAX_GAP_S)
         pp = PurePursuit(lookahead=5.0)
         speed_ctrl = SpeedController(deadband=SPEED_DEADBAND_MPS,
                                     hyst_mps=SPEED_HYST_MPS)
@@ -2139,8 +2349,8 @@ class FSDriveSession:
             if not _percep_ok:
                 print("[fsd-drive] painted line not perceived; keeping the "
                       "ground-safe route snap")
-            conn.control(throttle=0.0, brake=0.0, steering=0.0,
-                         parkingbrake=0.0, gear=fwd_gear)
+            _commands.send(throttle=0.0, brake=0.0, steering=0.0,
+                           parkingbrake=0.0, gear=fwd_gear)
             conn.step(3)
             print(f"[fsd-drive] gearbox realistic, forward gear input = {fwd_gear}")
             rguard = ReverseGuard(threshold_mps=REVERSE_THRESHOLD_MPS,
@@ -2173,6 +2383,21 @@ class FSDriveSession:
             # ``planning.clearance_guard``): a single anomalous reading
             # must not clear a collision risk that was real one tick ago.
             clear_guard = ClearanceGuard()
+            # Learned lateral-residual policy (M5-L).  Constructed only when
+            # the switch is on, so a default run never imports SB3 or
+            # touches the checkpoint; unavailable -> no-op (fail-closed).
+            _lat_rl = None
+            _lat_rl_warned = False
+            if LATERAL_RL_ENABLED:
+                try:
+                    from beamng_autopilot.rl.lateral_runtime import (
+                        LateralRLRuntime)
+                    _lat_rl = LateralRLRuntime()
+                    print(f"[fsd-drive] lateral RL: "
+                          f"{'loaded' if _lat_rl.available else _lat_rl.error}")
+                except Exception as _lr_e:
+                    _lat_rl = None
+                    print(f"[fsd-drive] lateral RL unavailable: {_lr_e}")
             _sr_prev = 0.0    # previous applied steering rate (jerk telemetry)
             watchdog_lost = False
             map_mc_smooth = None   # EMA-smoothed map-prior lane centre
@@ -2202,7 +2427,23 @@ class FSDriveSession:
             # Live lane-recognition overlay (--vis): every N ticks render
             # what the perception chain saw into PNGs a human can watch.
             _vis_every = int(getattr(args, "vis", 0) or 0)
-            _vis_dir = (config.LOGS_DIR / "m5_vis" / "live")
+            # Flag-only capture (2026-09-22): the frames a hand-check needs
+            # are exactly the ones where perception CLAIMS a crossing or
+            # off-pavement, which a fixed cadence almost never lands on (3
+            # of 107 flagged frames had an image).  ``--vis-on-flag`` writes
+            # those frames (and, with ``--vis-control-every N``, a control
+            # sample of UNFLAGGED frames so false negatives are checkable
+            # too).
+            _vis_on_flag = bool(getattr(args, "vis_on_flag", False))
+            _vis_control_every = int(
+                getattr(args, "vis_control_every", 0) or 0)
+            _vis_written = 0
+            _vis_index: list[dict] = []
+            # A shared "live" directory meant the next run overwrote the
+            # previous run's frames (same collision class as the stage-C
+            # telemetry tags): --vis-dir gives each run its own folder.
+            _vis_dir = Path(getattr(args, "vis_dir", "") or
+                            (config.LOGS_DIR / "m5_vis" / "live"))
             _vis_warned = False
             warmup_until = time.time() + WARMUP_S
             target_sm = float(args.speed)
@@ -2262,8 +2503,8 @@ class FSDriveSession:
                         watchdog_lost = True
                         print("[fsd-drive] WATCHDOG HEARTBEAT LOST; "
                               "braking and aborting", flush=True)
-                        conn.control(throttle=0.0, brake=1.0, steering=0.0,
-                                     gear=fwd_gear, parkingbrake=1.0)
+                        _commands.send(throttle=0.0, brake=1.0, steering=0.0,
+                                       gear=fwd_gear, parkingbrake=1.0)
                         conn.step(5)
                         break
                 except Exception as exc:
@@ -2271,13 +2512,16 @@ class FSDriveSession:
                     print(f"[fsd-drive] WATCHDOG HEARTBEAT ERROR; "
                           f"braking and aborting: {exc}", flush=True)
                     try:
-                        conn.control(throttle=0.0, brake=1.0, steering=0.0,
-                                     gear=fwd_gear, parkingbrake=1.0)
+                        _commands.send(throttle=0.0, brake=1.0, steering=0.0,
+                                       gear=fwd_gear, parkingbrake=1.0)
                         conn.step(5)
                     except Exception:
                         pass
                     break
                 _f0 = time.time()
+                _frame_monotonic_t = time.monotonic()
+                _substeps_before = substeps
+                _protective_receipts = []
                 st = conn.get_state()
                 pos = np.asarray(st.pos, dtype=float)
                 heading = float(st.heading)
@@ -2302,8 +2546,9 @@ class FSDriveSession:
                 # is added uncontrolled; the tick below re-plans and resumes.
                 if _wall_dt > STALE_CTRL_S and v > 1.0:
                     try:
-                        conn.control(throttle=0.0, brake=0.5,
-                                     steering=prev_steer, gear=fwd_gear)
+                        _commands.send(throttle=0.0, brake=0.5,
+                                       steering=prev_steer, gear=fwd_gear)
+                        _protective_receipts.append(_commands.receipt({}, 0.0))
                     except Exception:
                         pass
                 rev_brk, reversing = rguard.decide(signed, dt=dt)
@@ -2729,6 +2974,60 @@ class FSDriveSession:
                                                     ego_speed_mps=v)
                     except Exception:
                         pass
+                # --- T09 hold-joint audit (read-only unless gated) ------
+                # Four conditions the plan asks for and PathHold does NOT
+                # currently measure: time since the last REAL observation,
+                # how far the car has actually driven since then, the
+                # lateral/heading uncertainty, and whether the remaining
+                # path still covers the stopping distance.  The clock runs
+                # from the observation, so a repeated offer cannot refresh
+                # it; the gate (default OFF) can only REFUSE a hold, never
+                # extend one.
+                try:
+                    from beamng_autopilot.planning.hold_audit import (
+                        HOLD_JOINT_GATE, audit_hold)
+                    from beamng_autopilot.obstacle_risk import (
+                        RISK_BRAKE_DECEL_MPS2)
+                    _sh = out.meta.get("lane_shadow") or {}
+                    _obs_age = (_sh.get("age_since_update_s")
+                                if isinstance(_sh, dict) else None)
+                    if _obs_age is None:
+                        _obs_age = out.meta.get("line_evidence_age_s")
+                    # accumulated travel since the last fresh observation
+                    if getattr(verd, "fresh_reference", False) or                             (_obs_age is not None and _obs_age <= 0.2):
+                        self._hold_travel_m = 0.0
+                    else:
+                        self._hold_travel_m = (getattr(self, "_hold_travel_m",
+                                                       0.0)
+                                               + max(0.0, float(v)) * dt)
+                    # A filter that has not measured yet carries INIT
+                    # covariances, not measured ones: reporting those as a
+                    # failed condition would blame the car for a number
+                    # nobody measured.  They are UNKNOWN instead.
+                    _measured = (isinstance(_sh, dict)
+                                 and int(_sh.get("n_updates", 0) or 0) > 0)
+                    _hold_audit = audit_hold(
+                        path=(verd.held_path if getattr(verd,
+                                                        "path_hold_active",
+                                                        False) else best),
+                        pos=pos, observation_age_s=_obs_age,
+                        travelled_since_obs_m=float(getattr(
+                            self, "_hold_travel_m", 0.0)),
+                        sigma_lat_m=(_sh.get("sigma_e_m") if _measured
+                                     else None),
+                        sigma_theta_rad=(_sh.get("sigma_theta_rad")
+                                         if _measured else None),
+                        speed_mps=float(v), latency_s=0.35,
+                        a_min_mps2=RISK_BRAKE_DECEL_MPS2)
+                    out.meta["hold_audit"] = _hold_audit.as_dict()
+                    if HOLD_JOINT_GATE and getattr(verd, "path_hold_active",
+                                                   False)                             and not _hold_audit.satisfied:
+                        # contraction only: refuse the held path this tick
+                        verd.held_path = None
+                        verd.path_hold_active = False
+                except Exception as exc:
+                    out.meta["hold_audit_error"] = str(exc)
+
                 # Bounded PATH_HOLD consume (plan phase B): when
                 # arbitration produced nothing this tick but the monitor
                 # still holds a recently verified path (and re-checked it
@@ -2738,6 +3037,7 @@ class FSDriveSession:
                 # controlled stop; only a fresh verified path restarts.
                 if chosen.path is None and getattr(verd, "path_hold_active",
                                                    False) \
+                        and bool(getattr(verd, "drivable", False)) \
                         and getattr(verd, "held_path", None) is not None:
                     chosen = ArbiterOutcome(
                         np.asarray(verd.held_path, dtype=float)[:, :2],
@@ -3004,10 +3304,84 @@ class FSDriveSession:
                             # could never move to get back (emergency=1
                             # throughout).
                             steer_path = _steer_pre_plc
+                        else:
+                            verd = _plc_v
+                # --- learned lateral residual (M5-L, default OFF) --------
+                # A trained DQN chooses a BOUNDED offset (+-0.5 m, decaying
+                # to zero) that is added to the lateral reference the car is
+                # already tracking: the training environment measured mean
+                # |lat| 0.076 m against 0.128 m for the zero-residual base
+                # (40k steps, seed 7).  The switch is the rollback lever and
+                # a refusal by the monitor drops the shift, exactly like the
+                # painted-line corrector above - so a learned component can
+                # never widen the hard guarantees.
+                _lat_rl_act = None
+                _lat_rl_ok = False
+                if LATERAL_RL_ENABLED and _lat_rl is not None:
+                    try:
+                        _ref_ok = bool(
+                            str(out.meta.get("lane_src_sel", "")) == SRC_SENSOR
+                            and out.lane_ref is not None
+                            and len(out.lane_ref) >= 2)
+                        _lat_e = _head_e = None
+                        _ref = out.lane_ref if _ref_ok else steer_path
+                        if _ref is not None and len(_ref) >= 2:
+                            _lat_e, _head_e = _path_errors_steer_frame(
+                                np.asarray(_ref, dtype=float), pos, heading)
+                        _radius = (_path_radius_m(steer_path, pos, heading)
+                                   if steer_path is not None
+                                   and len(steer_path) >= 2 else None)
+                        _curv = (0.0 if _radius is None
+                                 or not np.isfinite(_radius)
+                                 or _radius <= 1e-6 else float(1.0 / _radius))
+                        _offset = _lat_rl.act(
+                            lat_err_m=(0.0 if _lat_e is None else float(_lat_e)),
+                            heading_err_rad=(0.0 if _head_e is None
+                                             else float(_head_e)),
+                            curvature=_curv, speed_mps=float(v),
+                            reference_ok=bool(_ref_ok and _lat_e is not None))
+                        _lat_rl_act = _lat_rl.last_action
+                        # Sign: the residual moves the car's equilibrium to
+                        # the RIGHT of the nominal reference by ``offset``
+                        # (env: lat settles at -applied, lat is left-positive),
+                        # so the path shifts right by the same amount.
+                        if steer_path is not None and len(steer_path) >= 2 \
+                                and abs(_offset) >= PLC_MIN_ENGAGE_M:
+                            _steer_pre_rl = steer_path
+                            steer_path = shift_path_right(
+                                steer_path, pos, float(heading), _offset)
+                            try:
+                                _rl_v = monitor.evaluate(
+                                    scene, steer_path, planner_age_s=0.0,
+                                    snapshot_age_s=_sensor_snapshot_age(out),
+                                    ego_speed_mps=v)
+                                _lat_rl_ok = _rl_v.level != "minimal_risk"
+                            except Exception:
+                                _lat_rl_ok = False
+                            if not _lat_rl_ok:
+                                steer_path = _steer_pre_rl
+                            else:
+                                verd = _rl_v
+                    except Exception as _rl_e:
+                        _lat_rl_act = None
+                        _lat_rl_ok = False
+                        if not _lat_rl_warned:
+                            _lat_rl_warned = True
+                            print(f"[fsd-drive] lateral RL skipped: {_rl_e}")
                 steer = 0.0
                 pp_alpha = None
                 pp_tgt = None
                 ff_steer = 0.0
+                _steer_away_clamped = False
+                _steer_authority_clamped = False
+                # T04 terminal contract: the steering authority in force for
+                # THIS step (magnitude bound + why).  Computed before the
+                # command is shaped and reused by the sub-step loop and the
+                # end-zone branch, so every command sent in this tick answers
+                # to one number instead of three independent clamps.
+                _authority_cap = 1.0
+                _authority_src = "full"
+                _steer_final_clamped = False
                 mode_policy = None
                 if DRIVE_MODES_ENABLED:
                     # D5: classify the situation ONCE per tick, before the
@@ -3116,11 +3490,64 @@ class FSDriveSession:
                         new_steer = float(np.clip(
                             new_steer + 0.25 * yaw_rate,
                             -steer_cap, steer_cap))
-                    # D3: the shaper must start from whatever was last
+                    # Never keep rotating the car AWAY from the road.
+                    # Measured 2026-09-21: +0.41..+0.55 held for ~3 s at
+                    # 0.2-2 m/s rotated the nose 23 deg off the road
+                    # direction while the car crept; it then coasted off
+                    # the pavement into a roadside tree (damage 86.2,
+                    # crashsite.png).  Steering TOWARD the road direction
+                    # is never clamped - only the command that increases
+                    # the deviation.
+                    _steer_pre_away = new_steer
+                    new_steer = clamp_steer_away_from_road(
+                        new_steer, heading,
+                        _ref_bearing(route_local, pos))
+                    _steer_away_clamped = bool(
+                        abs(new_steer - _steer_pre_away) > 1e-9)
+                    # Reference-stability authority (P1-2): an unpaired or
+                    # not-yet-stable reference may nudge, not steer to lock
+                    # - the crash run held +0.55 while the reference was
+                    # flipping between own lane, oncoming and whole-road.
+                    _ref_authority = str(out.meta.get("ref_authority") or "")
+                    if (REF_STABILITY_ENABLED
+                            and _ref_authority == "limited"):
+                        _steer_pre_auth = new_steer
+                        new_steer = float(np.clip(
+                            new_steer, -REF_STABILITY_LIMITED_STEER,
+                            REF_STABILITY_LIMITED_STEER))
+                        _steer_authority_clamped = bool(
+                            abs(new_steer - _steer_pre_auth) > 1e-9)
+                    else:
+                        _steer_authority_clamped = False
+                    # T04: the authority is a property of the STEP, not of
+                    # the request.  Handing it to the shaper is what stops a
+                    # comfort filter from emitting more than the car is
+                    # allowed to do - measured 2026-09-22 through this very
+                    # loop: with the wheel at 0.40 and the stabiliser
+                    # withdrawing authority to 0.15, the wire still carried
+                    # 0.40 for the whole ramp-down.
+                    _authority_cap = float(steer_cap)
+                    _authority_src = "mode"
+                    if (REF_STABILITY_ENABLED
+                            and _ref_authority == "limited"):
+                        _authority_cap = min(_authority_cap,
+                                             float(REF_STABILITY_LIMITED_STEER))
+                        _authority_src = "mode+ref_stability"                    # D3: the shaper must start from whatever was last
                     # commanded (stop / end-zone branches assign ``steer``
                     # directly), exactly like the old smooth_steer did.
                     steer_shaper.value = float(prev_steer)
-                    steer = steer_shaper.update(new_steer, dt)
+                    steer = steer_shaper.update(new_steer, dt,
+                                                cap=_authority_cap)
+                    # ...and re-check the OUTPUT against the constraints
+                    # that are directional rather than a magnitude bound.
+                    # The away-clamp is one: the shaper can carry an earlier
+                    # wrong-way angle through a tick boundary.
+                    _steer_post_away = clamp_steer_away_from_road(
+                        steer, heading, _ref_bearing(route_local, pos))
+                    if abs(_steer_post_away - steer) > 1e-9:
+                        steer = _steer_post_away
+                        steer_shaper.force_state(steer)
+                        _steer_away_clamped = True
                     prev_steer = steer
                     _tv = np.asarray(pp_tgt, dtype=float)[:2] - pos[:2]
                     pp_alpha = round(float(math.degrees(
@@ -3318,6 +3745,7 @@ class FSDriveSession:
                 # keeps the final approach repeatable.
                 dqn_action = None
                 dqn_ms = None
+                dqn_cap = float("inf")
                 _end_zone = _in_end_pull_zone(rem_end)
                 if dqn_rt is not None and not _end_zone:
                     try:
@@ -3327,10 +3755,14 @@ class FSDriveSession:
                             fwd_clearance=out.forward_clearance,
                             closest_obs=(None if verd.closest_obs_m > 900.0
                                          else float(verd.closest_obs_m)),
-                            lane_dev=float(getattr(verd, "lane_dev_m", 0.0)),
+                            # Unmeasured lateral error feeds the policy as 0.0:
+                            # the DQN was trained with that encoding, and
+                            # "no reference" already fails closed elsewhere.
+                            lane_dev=(0.0 if getattr(verd, "lane_dev_m", None) is None
+                                      else float(verd.lane_dev_m)),
                             road_off=road_off,
                             n_tracks=len(out.tracks))
-                        plan_speed = min(
+                        dqn_cap = min(
                             plan_speed,
                             action_to_target(dqn_action, plan_speed))
                     except Exception:
@@ -3349,7 +3781,8 @@ class FSDriveSession:
                     PLAN_UP_RATE_MPS2 * dt))
                 plan_sm = float(plan_sm + _dplan)
                 plan_speed = plan_sm
-                target = min(verd.target_speed, plan_speed, float(args.speed))
+                target = min(verd.target_speed, plan_speed,
+                             float(args.speed), dqn_cap)
                 if mode_policy is not None                         and np.isfinite(mode_policy.max_speed_mps):
                     # D5: CONTROLLED_STOP caps to zero, RECOVERY creeps
                     target = min(target, float(mode_policy.max_speed_mps))
@@ -3435,7 +3868,8 @@ class FSDriveSession:
                 # line had its correction rejected on every frame, so it was
                 # force-stopped on every frame and could never drive back.
                 # The telemetry field is kept for diagnosis.
-                force_stop = bool(painted_body_cross)
+                force_stop = bool(
+                    painted_body_cross or verd.level == "minimal_risk")
                 if force_stop:
                     target = 0.0
                 fwd_clear = float("inf")
@@ -3473,8 +3907,9 @@ class FSDriveSession:
                 fwd_clear_guarded = float(clear_read.value)
                 if np.isfinite(fwd_clear_guarded):
                     need = emergency_stop_clearance_m(v)
-                    force_stop, cap = emergency_speed_limit_mps(
+                    clearance_stop, cap = emergency_speed_limit_mps(
                         fwd_clear_guarded, need)
+                    force_stop = bool(force_stop or clearance_stop)
                     target = min(target, cap if not force_stop else 0.0)
                 # Smooth the effective target: ramp toward the raw plan at a
                 # bounded rate (sim time), so the corner governor stepping the
@@ -3503,20 +3938,10 @@ class FSDriveSession:
                         float(_lt.reference), plan_speed, target)
                     long_digest = _lt.digest()
                 else:
-                    _dmax = SPEED_TARGET_RAMP_MPS * dt
-                    if target > target_sm:
-                        target_sm = min(target, target_sm + _dmax)
-                    else:
-                        target_sm = max(target, target_sm - _dmax)
-                    # Never cruise above the planned corner speed.  The ramp
-                    # can still be converging down from a high initial target
-                    # (first frames), which let the car overshoot the bend
-                    # plan and trip the hard governor every tick (fix61:
-                    # v=4.45 against plan 3.23 -> brake 1.0 -> stall ->
-                    # full throttle again).  Capping the smoothed target by
-                    # plan_speed keeps the pedals inside the plan from the
-                    # very first tick.
-                    target_sm = min(target_sm, plan_speed)
+                    target_sm = _ramped_target_speed(
+                        target_sm, target, plan_speed, dt)
+                target_sm = final_target_speed(
+                    target_sm, plan_speed, target, force_stop=force_stop)
                 thr, brk = speed_ctrl.update(
                     target_sm, v, dt=min(0.25, max(0.01, dt)))
                 # Downhill-start throttle guard: on the descent the car
@@ -3782,11 +4207,20 @@ class FSDriveSession:
                             thr = ALIGN_CREEP_THR
                             brk = 0.0
                             pb = 0.0
-                            steer = float(np.clip(
-                                _yaw_dev * 1.2, -0.4, 0.4))
+                            # T04: the end-zone alignment writes the wheel
+                            # AFTER the shaper, so it must answer to the same
+                            # authority as every other command in the tick
+                            # (plan §2.3: it used to be a separate ±0.4).
+                            _align_cap = min(0.4, float(_authority_cap))
+                            steer = float(np.clip(_yaw_dev * 1.2,
+                                                  -_align_cap, _align_cap))
+                            if abs(_yaw_dev * 1.2) > _align_cap:
+                                _steer_final_clamped = True
+                            steer_shaper.force_state(steer)
                         else:
                             steer = 0.0
                             pb = 1.0
+                            steer_shaper.force_state(0.0)
                 # Pedal rate limit: the branches above (downhill cap, taper,
                 # governor, climb/reverse/hard-stop) can step thr/brk by a
                 # whole pedal in one tick - a relaunch then reads as a speed
@@ -3810,15 +4244,36 @@ class FSDriveSession:
                     # throttle is forced off so the pedals cannot fight.
                     # It only ever REMOVES throttle - never adds any.
                     thr = 0.0
+                final_stop = bool(
+                    force_stop or off_recover
+                    or (not args.no_signal and _sig_final == "red")
+                    or (not rm.active and (chosen.path is None
+                                           or len(chosen.path) < 2)))
+                thr, brk, steer, pb = _final_stop_controls(
+                    thr, brk, steer, pb, stop=final_stop, speed=v)
+                # T04 last check before the wire: whatever branch produced
+                # the command (alignment, end-zone hold, recovery), the
+                # magnitude in force for this tick still bounds it.  A hard
+                # stop commands 0 and is unaffected; anything else that
+                # arrives wider than the authority is clipped and recorded
+                # as evidence rather than sent.
+                if not final_stop and abs(steer) > float(_authority_cap) + 1e-9:
+                    steer = float(np.clip(steer, -float(_authority_cap),
+                                          float(_authority_cap)))
+                    _steer_final_clamped = True
+                    steer_shaper.force_state(steer)
+                _sent = _commands.send(
+                    throttle=thr, brake=brk, steering=steer,
+                    gear=gear_use, parkingbrake=pb)
+                thr, brk = _sent["throttle"], _sent["brake"]
+                steer, pb = _sent["steering"], _sent["parkingbrake"]
+                final_stop = bool(final_stop or _commands.braked)
+                if final_stop:
+                    target_sm = 0.0
                 prev_thr, prev_brk = thr, brk
-                conn.control(throttle=thr, brake=brk, steering=steer,
-                             gear=gear_use, parkingbrake=pb)
-                # A receipt for the SEND, not for the execution: the game
-                # may or may not have applied it by the next tick, and the
-                # telemetry must not read "sent" as "done".
-                _cmd_seq += 1
-                _prev_cmd_t = _cmd_t
-                _cmd_t = time.time()
+                _cmd_seq, _cmd_t = _commands.seq, _commands.sent_t
+                _cmd_monotonic_t = _commands.monotonic_t
+                _wd = dict(_commands.verdict)
                 # Shadow-frame recording (same ShadowFrame contract as
                 # m5_shadow_drive): a drive tick IS one labelled episode
                 # sample - executed controls + the perception/planning
@@ -3978,16 +4433,43 @@ class FSDriveSession:
                                     max(0.0, abs(_lat) - _half), 3)
                 # snapshot for offline stability evaluation (safe / degraded
                 # ratio over a long route); written once at the end.
-                if _vis_every and (frames % _vis_every) == 0:
+                _vis_flag = bool(
+                    body_cross_l or body_cross_r
+                    or (road_off or 0.0) > 1e-9
+                    or str(verd.body_cov_status or "") == "off_road")
+                _name = vis_should_write(
+                    on_flag=_vis_on_flag, every=_vis_every,
+                    control_every=_vis_control_every, frame=int(frames),
+                    flagged=_vis_flag)
+                if _name is not None:
                     try:
                         from beamng_autopilot.vision.live_vis import (
                             render_lane_vis)
                         _vis_img = render_lane_vis(
                             out, pos, heading, line_lat=line_lat)
                         _vis_dir.mkdir(parents=True, exist_ok=True)
-                        cv2.imwrite(str(_vis_dir / f"frame_{frames:05d}.png"),
-                                    _vis_img)
+                        # The name carries the reason, so a reviewer can
+                        # tell a flagged frame from a control without
+                        # cross-referencing the telemetry.
+                        # The filename carries the LOOP frame counter, which
+                        # is not necessarily the telemetry row index (a tick
+                        # that skips the append shifts them apart; measured
+                        # 2026-09-22: image@2 had line_lat 2.627 while hist
+                        # row 2 had 2.052).  The timestamp is the join key -
+                        # it is written into both the name and the JSON.
+                        _vis_t = round(float(time.time() - t0), 3)
+                        cv2.imwrite(
+                            str(_vis_dir / f"{_name}_{frames:05d}"
+                                           f"_t{_vis_t:.3f}.png"),
+                            _vis_img)
+                        if _vis_on_flag or _vis_every:
+                            _vis_index.append({"file": (
+                                f"{_name}_{frames:05d}_t{_vis_t:.3f}.png"),
+                                "t": _vis_t, "flag": int(_vis_flag),
+                                "line_lat": (None if line_lat is None
+                                             else round(float(line_lat), 3))})
                         cv2.imwrite(str(_vis_dir / "last.png"), _vis_img)
+                        _vis_written += 1
                     except Exception as _vis_e:
                         if not _vis_warned:
                             _vis_warned = True
@@ -3999,9 +4481,7 @@ class FSDriveSession:
                 # indistinguishable from a fresh result.
                 _consumed = consumed_from_head_sched(
                     (out.meta or {}).get("head_sched"), _cmd_t)
-                _sub_digest = substep_digest(SUBSTEP_HZ, dt, substeps)
-                _wd = watchdog_verdict(time.time(), _prev_cmd_t,
-                                       CTRL_WATCHDOG_MAX_GAP_S)
+                _sub_digest = substep_digest(SUBSTEP_HZ, None, 0)
                 hist.append({
                     "t": round(time.time() - t0, 3),
                     "pos": [round(float(p), 3) for p in pos[:3]],
@@ -4014,6 +4494,16 @@ class FSDriveSession:
                         float(getattr(verd, "path_occupied_frac", 0.0)), 4),
                     "corridor_open": bool(
                         getattr(verd, "corridor_open", False)),
+                    "corridor_state": getattr(verd, "corridor_state", "unknown"),
+                    "corridor_reason": getattr(verd, "corridor_reason", ""),
+                    "corridor_evidence": getattr(verd, "corridor_evidence", {}),
+                    "effective_rule": getattr(verd, "effective_rule", None),
+                    "rules_evaluated": list(
+                        getattr(verd, "rules_evaluated", [])),
+                    "rules_unevaluated": list(
+                        getattr(verd, "rules_unevaluated", [])),
+                    "masked_hard_rules": list(
+                        getattr(verd, "masked_hard_rules", [])),
                     # Perceived road SURFACE (2026-09-20): "on_road" /
                     # "unknown" / "off_road" from the same 2-12 m drivable
                     # band the lateral guard reads, plus how long it has
@@ -4037,6 +4527,29 @@ class FSDriveSession:
                         float(getattr(verd, "road_lost_s", 0.0)), 3),
                     "road_checked": int(
                         bool(getattr(verd, "road_checked", False))),
+                    # Where the CAR BODY is, from the same grid (P1-3):
+                    # "on_road" / "off_road" / "unknown", the observed
+                    # fraction of the footprint, and how long OFF has been
+                    # confirmed.  The road_surface gate above reads a 2-12 m
+                    # band AHEAD of the car; this one reads the rectangle
+                    # the car occupies, so the two can disagree (body on
+                    # pavement while the next band is off it, and vice
+                    # versa).  ``body_off_pavement`` is the rule that stops
+                    # the car on this evidence; ``body_cov_checked`` says
+                    # whether the measurement ran at all.
+                    "body_cov_status": str(
+                        getattr(verd, "body_cov_status", "")),
+                    "body_cov_frac": getattr(verd, "body_cov_frac", None),
+                    "body_cov_observed": int(
+                        getattr(verd, "body_cov_observed", 0)),
+                    "body_cov_footprint": int(
+                        getattr(verd, "body_cov_footprint", 0)),
+                    "body_cov_observed_frac": getattr(
+                        verd, "body_cov_observed_frac", None),
+                    "body_cov_low_s": round(
+                        float(getattr(verd, "body_cov_low_s", 0.0)), 3),
+                    "body_cov_checked": int(
+                        bool(getattr(verd, "body_cov_checked", False))),
                     "closest_obs_m": round(
                         float(getattr(verd, "closest_obs_m", 999.0)), 3),
                     "planner_kind": str(out.meta.get("planner", {})
@@ -4106,6 +4619,11 @@ class FSDriveSession:
                     "plan_speed": round(float(plan_speed), 2),
                     "plan_raw": round(float(plan_raw_speed), 2),
                     "target_sm": round(float(target_sm), 2),
+                    "hard_cap": round(float(target), 3),
+                    "final_target_speed": round(float(target_sm), 3),
+                    "final_stop": bool(final_stop),
+                    "dqn_cap": (round(float(dqn_cap), 3)
+                                if math.isfinite(dqn_cap) else None),
                     "plan_src": str(out.meta.get("plan_src", "?")),
                     # Why the planner did (or did not) publish a path.  The
                     # 2026-09-11 town run had 34 frames with a PAIRED
@@ -4115,9 +4633,18 @@ class FSDriveSession:
                     # empty - `n_eval = 0` in the planner meta is just its
                     # default when no plan exists.  Publish the decision.
                     "plan_blocked": str(out.meta.get("plan_blocked", "")),
+                    # Which constraint gate killed the candidates (P1-3):
+                    # reason -> count, {} when nothing was rejected.
+                    "plan_rejects": out.meta.get("plan_rejects"),
                     "n_candidates": int(out.meta.get("total_candidates",
                                                      out.n_candidates) or 0),
                     "tick_ms": out.meta.get("tick_ms"),
+                    "perception_ms": out.meta.get("perception_ms"),
+                    "semantic_ms": out.meta.get("semantic_ms"),
+                    "segmentation_ms": out.meta.get("segmentation_ms"),
+                    "head_trace_clock": out.meta.get("head_trace_clock"),
+                    "head_source_clock_basis": out.meta.get(
+                        "head_source_clock_basis"),
                     "tick_wall_ms": round((_tb - _f0) * 1000.0, 1),
                     # cumulative control sub-commands (plan A2/A4); the
                     # per-run control rate is reported in the summary
@@ -4125,10 +4652,11 @@ class FSDriveSession:
                     # Nominal 15 Hz is a request; this is what ran.
                     "substeps_expected": _sub_digest["expected"],
                     "substeps_shortfall": _sub_digest["shortfall"],
-                    # Gap between COMMANDS, on the wall clock - it does not
-                    # go quiet when the perception loop blocks.
-                    "cmd_gap_s": _wd["gap_s"],
+                    "cmd_gap_s": _commands.gap_s,
+                    "cmd_send_ms": _commands.send_ms,
+                    "watchdog_gap_s": _wd["gap_s"],
                     "watchdog": _wd["action"],
+                    "watchdog_braked": bool(_commands.braked),
                     "budget_s": round(float(_budget), 3),
                     "budget_skips": list(
                         out.meta.get("tick_budget_skips") or []),
@@ -4199,6 +4727,85 @@ class FSDriveSession:
                     "lane_paired": int(out.meta.get("lane_paired", 0)),
                     "lane_pair_debug": out.meta.get("lane_pair_debug"),
                     "lane_fusion_debug": out.meta.get("lane_fusion_debug"),
+                    # Why the lane gate refused a sensor lane, with the
+                    # measured offset that caused it: without the number a
+                    # refusal cannot be told apart from a pairing error.
+                    "lane_side_off_m": out.meta.get("lane_side_off_m"),
+                    "lane_side_limit_m": out.meta.get("lane_side_limit_m"),
+                    "pair_width_m": out.meta.get("pair_width_m"),
+                    "pair_span_m": out.meta.get("pair_span_m"),
+                    "pair_conf": out.meta.get("pair_conf"),
+                    "pair_paired": out.meta.get("pair_paired"),
+                    "pair_sources": out.meta.get("pair_sources"),
+                    "lane_marks_n": out.meta.get("lane_marks_n"),
+                    "lane_from": out.meta.get("lane_from"),
+                    "lane_drivable": out.meta.get("lane_drivable"),
+                    # Learned lateral residual participation (M5-L): which
+                    # action the policy chose, and whether the monitor
+                    # accepted the shift it proposed.
+                    "lat_rl_act": _lat_rl_act,
+                    "lat_rl_ok": int(bool(_lat_rl_ok)),
+                    "lat_rl_offset": (round(float(_lat_rl.applied), 3)
+                                      if _lat_rl is not None else None),
+                    "steer_away_clamped": int(bool(_steer_away_clamped)),
+                    # Cross-tick reference stability (P1-2): which authority
+                    # the accepted reference earned, the side/centre it was
+                    # judged on, and whether the authority clamp bit.
+                    # T05 geometry baseline: which ground model and which
+                    # attitude model produced this tick's numbers.
+                    "ground_model": out.meta.get("ground_model"),
+                    "ground_z": out.meta.get("ground_z"),
+                    "ego_ground_gap_m": out.meta.get("ego_ground_gap_m"),
+                    "pose_label": out.meta.get("pose_label"),
+                    "ref_authority": out.meta.get("ref_authority"),
+                    # T02 provenance: whether the accepted reference rests on
+                    # a real two-sided measurement OF THIS TICK, and the
+                    # geometry version the planner/controller consumed.  The
+                    # ids must match between the two keys on every frame.
+                    # T06 shadow lateral state posterior (read-only):
+                    # (e, e_dot, theta, theta_dot) + covariance.  Recorded
+                    # so it can be compared against the current behaviour;
+                    # never consumed by control.
+                    "lane_shadow": out.meta.get("lane_shadow"),
+                    # T09 bounded risk output (read-only): signed gaps,
+                    # first crossing, stopping margin, evidence freshness.
+                    "lateral_risk": out.meta.get("lateral_risk"),
+                    "hold_audit": out.meta.get("hold_audit"),
+                    "lane_ref_two_sided": out.meta.get("lane_ref_two_sided"),
+                    "lane_ref_fresh_obs": out.meta.get("lane_ref_fresh_obs"),
+                    "lane_ref_inferred": out.meta.get("lane_ref_inferred"),
+                    "lane_ref_geom_id": out.meta.get("lane_ref_geom_id"),
+                    "scene_ref_geom_id": out.meta.get("scene_ref_geom_id"),
+                    "scene_ref_geom_mismatch": out.meta.get(
+                        "scene_ref_geom_mismatch"),
+                    "ref_stability_reason": out.meta.get("ref_stability_reason"),
+                    "ref_side": out.meta.get("ref_side"),
+                    "ref_lat_m": out.meta.get("ref_lat_m"),
+                    "ref_stable_ticks": out.meta.get("ref_stable_ticks"),
+                    "ref_side_flips": out.meta.get("ref_side_flips"),
+                    "ref_flip": out.meta.get("ref_flip"),
+                    "steer_authority_clamped": int(
+                        bool(_steer_authority_clamped)),
+                    # T04 terminal contract: the magnitude bound in force for
+                    # this tick's commands, what set it, and how many steps
+                    # the shaper had to clip to obey it.  A reviewer checks
+                    # these against the sent command instead of trusting the
+                    # pre-shaper clamp.
+                    "steer_authority_cap": round(float(_authority_cap), 3),
+                    "steer_authority_src": _authority_src,
+                    "steer_final_clamped": int(bool(_steer_final_clamped)),
+                    "steer_shaper": steer_shaper.digest(),
+                    # Near-field drivable evidence (P1-1): which input mode
+                    # ran, what it cost, and the 0-4 m coverage the planner
+                    # actually saw (None = nothing observed = UNKNOWN).
+                    "nearfield_mode": out.meta.get("nearfield_mode"),
+                    "nearfield_ms": out.meta.get("nearfield_ms"),
+                    "nearfield_road_px": out.meta.get("nearfield_road_px"),
+                    "nearfield_skipped": out.meta.get("nearfield_skipped"),
+                    "nearfield_error": out.meta.get("nearfield_error"),
+                    "nearfield_injected_band_m": out.meta.get(
+                        "nearfield_injected_band_m"),
+                    "nearfield_cov": out.meta.get("nearfield_cov"),
                     # Freshness ages.  The safety monitor's "stale sensor"
                     # verdict is `max(all head ages, range, bev, lane) >
                     # STALE_SNAPSHOT_S`, and without these in the log a
@@ -4241,6 +4848,23 @@ class FSDriveSession:
                     # whether continuous loss has expired it.
                     "line_conf_current": out.meta.get("line_conf_current"),
                     "line_conf_history": out.meta.get("line_conf_history"),
+                    # T03 provenance: added pixels split by origin, the
+                    # source-event counters (refresh request vs. real new
+                    # source evidence), the accepted reference's own
+                    # current-vs-history support, and the per-band ages.
+                    "line_added_current_px": out.meta.get(
+                        "line_added_current_px"),
+                    "line_added_history_px": out.meta.get(
+                        "line_added_history_px"),
+                    "line_added_yellow_px": out.meta.get(
+                        "line_added_yellow_px"),
+                    "line_evidence_events": out.meta.get(
+                        "line_evidence_events"),
+                    "lane_ref_support": out.meta.get("lane_ref_support"),
+                    "lane_left_support": out.meta.get("lane_left_support"),
+                    "lane_right_support": out.meta.get("lane_right_support"),
+                    "line_evidence_bands": out.meta.get(
+                        "line_evidence_bands"),
                     "line_ev_age_s": out.meta.get("line_evidence_age_s"),
                     "line_ev_expired": out.meta.get("line_evidence_expired"),
                     "n_object_obstacles": int(
@@ -4255,7 +4879,10 @@ class FSDriveSession:
                     "change_right": int(out.meta.get("change_right", 0)),
                     "n_tracks": int(out.meta.get("n_tracks", 0)),
                     "fmap": int(out.feature_map is not None),
-                    "lane_dev_m": round(float(getattr(verd, "lane_dev_m", 0.0)), 3),
+                    # None = unmeasurable (no reference / no path), which is
+                    # NOT the same as 0.0 = aligned.
+                    "lane_dev_m": (None if getattr(verd, "lane_dev_m", None) is None
+                                   else round(float(verd.lane_dev_m), 3)),
                     "lat_left": lat_left,
                     "lat_right": lat_right,
                     "kind": str(out.meta.get("planner", {}).get("kind", "?")),
@@ -4299,6 +4926,9 @@ class FSDriveSession:
                     # read as "executed".
                     "cmd_seq": int(_cmd_seq),
                     "cmd_t": _cmd_t,
+                    "cmd_clock": "wall_time",
+                    "cmd_monotonic_t": _cmd_monotonic_t,
+                    "protective_commands": _protective_receipts,
                     # consumed: per head, which result_seq this tick acted
                     # on, from which source frame, and how old it was at
                     # command time.  A published result that never appears
@@ -4336,6 +4966,10 @@ class FSDriveSession:
                     # class among the tracked obstacles, the closest
                     # time-to-collision and the nearest graded distance.
                     "risk_kind": str(getattr(verd, "risk_kind", "") or ""),
+                    "risk_stop": int(bool(getattr(verd, "risk_stop", False))),
+                    "risk_n_braking": int(getattr(verd, "risk_n_braking", 0)),
+                    "risk_n_roadside": int(getattr(verd, "risk_n_roadside", 0)),
+                    "risk_n_unknown": int(getattr(verd, "risk_n_unknown", 0)),
                     "min_ttc": (round(float(verd.min_ttc_s), 2)
                                 if getattr(verd, "min_ttc_s", None)
                                 is not None else None),
@@ -4373,7 +5007,7 @@ class FSDriveSession:
                 # hands a body crossing back to the tick.
                 _sub_driving = (
                     chosen.path is not None and len(chosen.path) >= 2
-                    and not force_stop and not stuck and not climb
+                    and not final_stop and not stuck and not climb
                     and not rm.active and not reversing and not off_recover
                     and not (rem_end is not None and rem_end < END_STOP_M)
                     and _sig_final != "red")
@@ -4382,6 +5016,10 @@ class FSDriveSession:
                 # re-check uses.  Sub-steps never update either.
                 _plan_t = time.time()
                 _sub_tracks = list(getattr(out, "tracks", None) or [])
+                _sub_receipts = []
+                _sub_skip = ("disabled" if SUBSTEP_HZ <= 0.0
+                             else "control_not_eligible" if not _sub_driving
+                             else "no_control_slack")
                 if _sub_driving and SUBSTEP_HZ > 0.0:
                     _sub_until = min(_f0 + 1.0 / REALTIME_CTRL_HZ, t_end)
                     _sub_last = time.time()
@@ -4390,6 +5028,7 @@ class FSDriveSession:
                         try:
                             _ss = conn.get_state()
                         except Exception:
+                            _sub_skip = "state_unavailable"
                             break
                         _sp = np.asarray(_ss.pos, dtype=float)
                         _sh = float(_ss.heading)
@@ -4423,11 +5062,17 @@ class FSDriveSession:
                             risk_cap=(float(_risk.target_speed_cap)
                                       if _risk is not None else None))
                         if not _dec.ok:
+                            _sub_skip = _dec.reason
                             break
                         if _dec.stop:
-                            conn.control(throttle=0.0, brake=1.0,
-                                         steering=prev_steer, gear=gear_use,
-                                         parkingbrake=1.0)
+                            _commands.send(throttle=0.0, brake=1.0,
+                                           steering=prev_steer, gear=gear_use,
+                                           parkingbrake=1.0)
+                            prev_thr, prev_brk = 0.0, 1.0
+                            substeps += 1
+                            _sub_receipts.append(_commands.receipt(
+                                out.meta.get("head_sched"), 0.0))
+                            _sub_skip = _dec.reason
                             break
                         _s_steer = steer
                         if steer_path is not None and len(steer_path) >= 2:
@@ -4441,26 +5086,47 @@ class FSDriveSession:
                             _vsq = max(_sv * _sv, 2.0)
                             _cap = min(0.55, max(0.10, min(
                                 1.0, 5.0 * 2.9 / _vsq / 0.6)))
+                            # T04: the sub-step is a command send like any
+                            # other, so the tick's authority applies to it
+                            # as well.  Before this, a limiter that had
+                            # withdrawn authority in the main loop was
+                            # simply absent from the sub-steps (plan §2.3).
+                            _cap = min(_cap, float(_authority_cap))
                             _new = float(np.clip(_new, -_cap, _cap))
                             steer_shaper.value = float(prev_steer)
-                            _s_steer = steer_shaper.update(_new, _sdt)
+                            _s_steer = steer_shaper.update(_new, _sdt,
+                                                           cap=_cap)
+                            _s_post_away = clamp_steer_away_from_road(
+                                _s_steer, _sh, _ref_bearing(route_local, _sp))
+                            if abs(_s_post_away - _s_steer) > 1e-9:
+                                _s_steer = _s_post_away
+                                steer_shaper.force_state(_s_steer)
+                                _steer_final_clamped = True
+                            if abs(steer_shaper.value) > _cap + 1e-9:
+                                # backstop: never let a sub-step command
+                                # leave the authority
+                                _s_steer = float(np.clip(steer_shaper.value,
+                                                         -_cap, _cap))
+                                steer_shaper.force_state(_s_steer)
+                                _steer_final_clamped = True
                             prev_steer = _s_steer
                         _sthr, _sbrk = speed_ctrl.update(
                             _dec.target_speed, _sv,
                             dt=min(0.25, max(0.01, _sdt)))
                         _sthr, _sbrk = rate_limit_pedal(
                             _sthr, _sbrk, prev_thr, prev_brk, _sdt)
-                        if CTRL_WATCHDOG_ENABLED and _wd["due"]:
-                            # Past the pedal rate limit on purpose: the
-                            # limit exists to smooth normal driving, and
-                            # a stalled command stream is not that.  Same
-                            # conn.control path - no second channel.
-                            _sthr, _sbrk = 0.0, 1.0
-                        prev_thr, prev_brk = _sthr, _sbrk
-                        conn.control(throttle=_sthr, brake=_sbrk,
-                                     steering=_s_steer, gear=gear_use,
-                                     parkingbrake=pb)
+                        _sub_sent = _commands.send(
+                            throttle=_sthr, brake=_sbrk,
+                            steering=_s_steer, gear=gear_use, parkingbrake=pb)
+                        prev_thr, prev_brk = (_sub_sent["throttle"],
+                                             _sub_sent["brake"])
                         substeps += 1
+                        _sub_receipts.append(_commands.receipt(
+                            out.meta.get("head_sched"), _dec.target_speed))
+                        _sub_skip = ""
+                        if _commands.braked:
+                            _sub_skip = "command_deadline"
+                            break
                         _sl = (1.0 / SUBSTEP_HZ) - (time.time() - _sub_t0)
                         if _sl > 0.0:
                             time.sleep(_sl)
@@ -4471,6 +5137,19 @@ class FSDriveSession:
                 _slack = (1.0 / REALTIME_CTRL_HZ) - _elapsed
                 if _slack > 0.0:
                     time.sleep(_slack)
+                _control_interval = time.monotonic() - _frame_monotonic_t
+                _sub_digest = substep_digest(
+                    SUBSTEP_HZ, _control_interval,
+                    substeps - _substeps_before, _sub_skip)
+                hist[-1].update({
+                    "substeps": int(substeps),
+                    "substeps_executed": _sub_digest["executed"],
+                    "substeps_expected": _sub_digest["expected"],
+                    "substeps_shortfall": _sub_digest["shortfall"],
+                    "substeps_skip_reason": _sub_digest["skip_reason"],
+                    "control_interval_s": round(_control_interval, 3),
+                    "substep_commands": _sub_receipts,
+                })
                 frames += 1
                 if frames % 4 == 1:
                     _e2e_s = (f"e2e={e2e_ms:.0f}ms "
@@ -4483,7 +5162,7 @@ class FSDriveSession:
                           f"rev={int(reversing)} signed={signed:+.2f} "
                           f"lane={out.meta.get('lane_src', '?')}/"
                           f"{'P' if out.meta.get('lane_paired') else '1'} "
-                          f"dev={getattr(verd, 'lane_dev_m', 0.0):.2f}")
+                          f"dev={('--' if getattr(verd, 'lane_dev_m', None) is None else format(verd.lane_dev_m, '.2f'))}")
             _ll = [f["line_lat"] for f in hist if f.get("line_lat") is not None]
             if _ll:
                 _arr = np.asarray(_ll, dtype=float)
@@ -4586,6 +5265,15 @@ class FSDriveSession:
             except Exception:
                 pass
             conn.close()
+            if (_vis_index or []) and args.out:
+                try:
+                    Path(str(args.out) + ".vis_index.json").write_text(
+                        json.dumps(_vis_index, ensure_ascii=False, indent=1),
+                        encoding="utf-8")
+                    print(f"[fsd-drive] vis index -> {args.out}.vis_index.json "
+                          f"({len(_vis_index)} frames)", flush=True)
+                except Exception as _ve:
+                    print(f"[fsd-drive] vis index write failed: {_ve}")
             if hist and args.out:
                 try:
                     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
