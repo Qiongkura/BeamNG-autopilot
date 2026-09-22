@@ -45,8 +45,11 @@ import cv2
 import numpy as np
 
 from beamng_autopilot import config
+from beamng_autopilot.labeling import curve_schema as cs
 
-CLS_LINE, CLS_ROAD, CLS_BG = 2, 1, 0
+# The pixel classes live in the schema (T10), so the annotator and every
+# metric agree on what 0/1/2/255 mean: 255 is IGNORE, never background.
+CLS_LINE, CLS_ROAD, CLS_BG = cs.CLS_LINE, cs.CLS_ROAD, cs.CLS_BACKGROUND
 CLASS_NAME = {CLS_LINE: "line", CLS_ROAD: "road", CLS_BG: "erase"}
 WIN = "annotate"
 

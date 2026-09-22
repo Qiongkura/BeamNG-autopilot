@@ -118,6 +118,17 @@ def main() -> int:
     ap.add_argument("--traffic", type=int, default=0, metavar="N",
                     help="park N NPC vehicles along the route (YOLO / "
                          "obstacle-fusion verification; best-effort)")
+    ap.add_argument("--vis-on-flag", action="store_true",
+                    help="render ONLY the frames where perception claims a "
+                         "crossing / off-pavement (plus controls, see "
+                         "--vis-control-every); use with --vis-dir")
+    ap.add_argument("--vis-control-every", type=int, default=0,
+                    metavar="N",
+                    help="with --vis-on-flag: also render every N-th "
+                         "UNFLAGGED frame as a control (0 = none)")
+    ap.add_argument("--vis-dir", type=str, default=None,
+                    help="where --vis writes its frames (default "
+                         "logs/m5_vis/live; give each run its own folder)")
     ap.add_argument("--vis", type=int, default=0, metavar="N",
                     help="render a live lane-recognition overlay every N "
                          "ticks into logs/m5_vis/live/ (0 = off): camera "

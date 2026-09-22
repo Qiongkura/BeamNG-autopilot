@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import random
 import sys
 from pathlib import Path
@@ -32,6 +33,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+from beamng_autopilot.eval import STATUS_FAIL, STATUS_PASS, STATUS_UNKNOWN
+from beamng_autopilot.fsd_realism import SRC_UNAVAILABLE
 
 # Every scenario: the question, what must be measured, and what releases.
 SCENARIOS: dict[str, dict] = {
@@ -162,25 +166,153 @@ def summarise_effect(pairs: list[dict]) -> dict:
     }
 
 
+def _finite(value) -> bool:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except OverflowError:
+        return False
+
+
+def _flag(value):
+    """Only JSON booleans and exact binary numeric scalars are flags."""
+    if isinstance(value, bool):
+        return value
+    if _finite(value) and value in (0, 1):
+        return bool(value)
+    return None
+
+
+def _no_head_result(record) -> bool:
+    if not isinstance(record, dict) or "result_seq" not in record:
+        return False
+    if record["result_seq"] is not None:
+        return False
+    if "result_available" in record:
+        return _flag(record["result_available"]) is False
+    return record.get("state") == "async_idle_no_output"
+
+
+def _has_measurement(frame, col: str, *, allow_unavailable: bool = False) -> bool:
+    if not isinstance(frame, dict):
+        return False
+    # Keep the protocol name, accepting the actual fsd_drive JSON spelling.
+    # An explicitly invalid primary value must not be hidden by the alias.
+    key = "min_ttc" if col == "min_ttc_s" and col not in frame else col
+    if key not in frame:
+        return False
+    value = frame[key]
+    if col in ("road_checked", "body_cross_current"):
+        return _flag(value) is not None
+    if col in ("road_surface", "road_lost_s"):
+        if _flag(frame.get("road_checked")) is not True:
+            return False
+    if col in ("lat_left", "lat_right"):
+        if frame.get("lane_sel") == SRC_UNAVAILABLE:
+            return allow_unavailable and value is None
+    if col == "road_surface":
+        return isinstance(value, str) and value in (
+            "on_road", "off_road", "unknown")
+    if col == "corridor_state":
+        return isinstance(value, str) and value in (
+            "feasible", "infeasible", "unknown")
+    if col in ("reason", "corridor_reason"):
+        return isinstance(value, str)
+    if col == "watchdog":
+        return isinstance(value, str) and value in ("ok", "brake", "unknown")
+    if col in ("head_sched", "range_sched"):
+        if not isinstance(value, dict) or not value:
+            return False
+        records = value.values() if col == "head_sched" else [value]
+        return all(isinstance(rec, dict)
+                   and isinstance(rec.get("state"), str)
+                   and bool(rec["state"].strip())
+                   and ("result_available" not in rec
+                        or _flag(rec["result_available"]) is not None)
+                   for rec in records)
+    if col in ("head_age_s", "consumed"):
+        sched = frame.get("head_sched")
+        if (not isinstance(value, dict) or not value
+                or not isinstance(sched, dict) or not sched
+                or not set(sched).issubset(value)):
+            return False
+        for name, sample in value.items():
+            unavailable = _no_head_result(sched.get(name))
+            if unavailable and not allow_unavailable:
+                return False
+            if col == "head_age_s":
+                if not (sample is None if unavailable else _finite(sample)):
+                    return False
+            elif not isinstance(sample, dict):
+                return False
+            elif unavailable:
+                if (not all(k in sample for k in (
+                        "result_seq", "source_seq", "age_s"))
+                        or sample["result_seq"] is not None
+                        or sample["age_s"] is not None
+                        or not (sample["source_seq"] is None
+                                or _finite(sample["source_seq"]))):
+                    return False
+            elif not all(_finite(sample.get(k)) for k in (
+                    "result_seq", "source_seq", "age_s")):
+                return False
+        return True
+    if col == "tick_ms":
+        return isinstance(value, dict) and _finite(value.get("total"))
+    return _finite(value)
+
+
 def measurement_coverage(runs: list[dict], scenario: str) -> dict:
-    """Which required columns the runs for a scenario actually carry."""
+    """Required evidence, separating readings from recorded unavailability.
+
+    Critical numeric channels must be measured throughout a run.  F/E may
+    record expected boundary/output loss using existing explicit states;
+    those frames are NOT numeric readings.  Bare nulls remain UNKNOWN.
+    ``runs_with`` counts complete evidence, not mere key presence.
+    """
     req = SCENARIOS.get(scenario, {}).get("requires", [])
     missing = {}
+    columns = {}
     for col in req:
-        n = sum(1 for r in runs
-                if isinstance(r.get("frames"), list)
-                and any(col in f for f in r["frames"]))
-        if n < len(runs):
+        n = 0
+        counts = {"frames": 0, "measured_frames": 0, "unavailable_frames": 0,
+                  "unknown_frames": 0, "missing_column": 0}
+        for run in runs:
+            frames = run.get("frames")
+            if not isinstance(frames, list) or not frames:
+                continue
+            complete = True
+            for frame in frames:
+                counts["frames"] += 1
+                key = ("min_ttc" if col == "min_ttc_s"
+                       and isinstance(frame, dict) and col not in frame else col)
+                if not isinstance(frame, dict) or key not in frame:
+                    counts["missing_column"] += 1
+                if _has_measurement(frame, col):
+                    counts["measured_frames"] += 1
+                elif scenario in ("E", "F") and _has_measurement(
+                        frame, col, allow_unavailable=True):
+                    counts["unavailable_frames"] += 1
+                else:
+                    counts["unknown_frames"] += 1
+                    complete = False
+            n += int(complete)
+        counts["coverage"] = (counts["measured_frames"] / counts["frames"]
+                              if counts["frames"] else None)
+        columns[col] = counts
+        if not runs or n < len(runs):
             missing[col] = {"runs_with": n, "runs": len(runs)}
-    return {"required": req, "missing": missing,
+    return {"required": req, "missing": missing, "columns": columns,
             "complete": not missing}
 
 
 def gate(results: dict) -> dict:
     """Does the set release?  Every criterion, every scenario.
 
-    A scenario with no valid runs is not a pass and not a fail - it is
-    UNKNOWN, and UNKNOWN does not release.
+    As in eval.score_run, measured violations are FAIL; missing or invalid
+    evidence without a measured violation is UNKNOWN.  Only complete PASS
+    evidence releases, and declared exclusions supply no evidence.
     """
     checks = {}
     for sid in ALL_SCENARIOS:
@@ -189,34 +321,41 @@ def gate(results: dict) -> dict:
         # before anything else, because "we dropped it" with no reason is
         # how a bad run quietly leaves the sample.
         unrecorded = [r for r in results.get(sid, [])
-                      if r.get("excluded")
+                      if _flag(r.get("excluded", False)) is True
                       and r.get("exclusion_reason") not in VALID_EXCLUSIONS]
         if unrecorded:
-            checks[sid] = {"state": "FAIL",
+            checks[sid] = {"state": STATUS_FAIL,
                            "reason": "excluded without a declared reason"}
             continue
         runs = [r for r in results.get(sid, [])
-                if not r.get("excluded")]
+                if _flag(r.get("excluded", False)) is not True]
         if not runs:
-            checks[sid] = {"state": "UNKNOWN",
+            checks[sid] = {"state": STATUS_UNKNOWN,
                            "reason": "no valid runs"}
             continue
+        measured = measurement_coverage(runs, sid)
+        unknown = [f"{col}: required evidence missing or incomplete"
+                   for col in measured["missing"]]
+        if any(_flag(r.get("excluded", False)) is None for r in runs):
+            unknown.append("excluded: invalid flag")
         failures = []
         for key, want in scen["release"].items():
             for r in runs:
-                got = r.get("metrics", {}).get(key)
-                if got is None:
-                    failures.append(f"{key}: not measured")
-                elif isinstance(want, bool):
-                    if bool(got) != want:
-                        failures.append(f"{key}: {got} != {want}")
+                metrics = r.get("metrics")
+                got = metrics.get(key) if isinstance(metrics, dict) else None
+                valid = (_flag(got) is not None if isinstance(want, bool)
+                         else _finite(got))
+                if not valid:
+                    unknown.append(f"{key}: not measured or invalid")
                 elif got != want:
                     failures.append(f"{key}: {got} != {want}")
-        checks[sid] = ({"state": "PASS"} if not failures
-                       else {"state": "FAIL", "reason": "; ".join(
-                           sorted(set(failures)))})
+        state = (STATUS_FAIL if failures else
+                 STATUS_UNKNOWN if unknown else STATUS_PASS)
+        checks[sid] = {"state": state, "measurement_coverage": measured}
+        if failures or unknown:
+            checks[sid]["reason"] = "; ".join(sorted(set(failures + unknown)))
 
-    released = all(c["state"] == "PASS" for c in checks.values())
+    released = all(c["state"] == STATUS_PASS for c in checks.values())
     return {
         "scenarios": checks,
         "released": released,

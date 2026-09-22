@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -41,11 +42,11 @@ MIN_COVERAGE_FOR_A_CLAIM = 0.50
 
 def _num(frame: dict, key: str):
     v = frame.get(key)
-    if v is None:
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
         return None
     try:
-        return float(v)
-    except (TypeError, ValueError):
+        return float(v) if math.isfinite(v) else None
+    except OverflowError:
         return None
 
 
@@ -70,13 +71,39 @@ def longest_gap_runs(frames: list[dict], key: str) -> list[int]:
 
 
 def gap_duration_s(frames: list[dict], start: int, length: int):
-    """Wall seconds spanned by a run of frames, or None if not measurable."""
-    ts = [_num(f, "t") for f in frames]
-    lo = ts[start] if start < len(ts) else None
-    hi = ts[min(start + length, len(ts) - 1)] if ts else None
-    if lo is None or hi is None:
+    """Wall seconds spanned by a run of frames, or None if not measurable.
+
+    Like eval._episodes, each frame owns the interval to the next frame;
+    the final sample owns no time beyond the observed window.
+    """
+    if start < 0 or start >= len(frames) or length <= 0:
         return None
-    return max(0.0, hi - lo)
+    end = min(start + length, len(frames) - 1)
+    ts = [_num(f, "t") for f in frames[start:end + 1]]
+    if any(t is None for t in ts):
+        return None
+    if any(b < a for a, b in zip(ts, ts[1:])):
+        return None
+    duration = ts[-1] - ts[0]
+    return duration if math.isfinite(duration) else None
+
+
+def _gap_distance_m(frames: list[dict], start: int, length: int):
+    if gap_duration_s(frames, start, length) is None:
+        return None
+    end = min(start + length, len(frames) - 1)
+    if end == start:
+        return None
+    distance = 0.0
+    for i in range(start, end):
+        dt = _num(frames[i + 1], "t") - _num(frames[i], "t")
+        if dt == 0.0:
+            continue
+        speed = _num(frames[i], "speed")
+        if speed is None or speed < 0.0:
+            return None
+        distance += speed * dt
+    return distance if math.isfinite(distance) else None
 
 
 def coverage(frames: list[dict]) -> dict:
@@ -99,7 +126,7 @@ def coverage(frames: list[dict]) -> dict:
     for f in frames:
         st = f.get("road_surface")
         states[str(st)] = states.get(str(st), 0) + 1
-        if f.get("road_checked") is True:
+        if f.get("road_checked") is True or _num(f, "road_checked") == 1.0:
             checked += 1
     out["road_surface"] = {
         "states": states,
@@ -107,24 +134,25 @@ def coverage(frames: list[dict]) -> dict:
         "checked_coverage": (checked / n) if n else None,
     }
 
-    # Cost of the longest boundary gap, in metres.
-    speeds = [_num(f, "speed") for f in frames]
-    known = [s for s in speeds if s is not None]
-    mean_speed = (sum(known) / len(known)) if known else None
-    worst = max((out[k]["longest_gap_frames"] for k in BOUNDARY_CHANNELS),
-                default=0)
-    dur = None
-    if worst:
-        for i, f in enumerate(frames):
-            if not _has(f, "lat_left") and not _has(f, "lat_right"):
-                dur = gap_duration_s(frames, i, worst)
-                break
+    # Cost of the longest double-missing segment, not either side's gap.
+    worst = current = 0
+    start = 0
+    for i, f in enumerate(frames):
+        if not any(_has(f, key) for key in BOUNDARY_CHANNELS):
+            current += 1
+            if current > worst:
+                worst = current
+                start = i - current + 1
+        else:
+            current = 0
+    dur = gap_duration_s(frames, start, worst) if worst else None
+    distance = _gap_distance_m(frames, start, worst) if worst else None
     out["no_boundary_gap"] = {
         "longest_frames": worst,
         "duration_s": dur,
-        "mean_speed_mps": mean_speed,
-        "distance_m": (None if (dur is None or mean_speed is None)
-                       else dur * mean_speed),
+        "mean_speed_mps": (distance / dur
+                           if distance is not None and dur else None),
+        "distance_m": distance,
     }
 
     cov = [out[k]["coverage"] for k in BOUNDARY_CHANNELS

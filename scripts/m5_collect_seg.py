@@ -201,6 +201,8 @@ def main() -> None:
             "classes": ["background", "asphalt", "line"],
             "segments": segments, "frames_per_seg": per_seg,
             "frames": [], "segment_starts": [],
+            "map_name": str(getattr(args, "map", "") or "italy"),
+            "source_id": f"collect_{time.strftime('%Y%m%d_%H%M%S')}",
             **annotation_metadata(tech_annotations)}
     line_px_total = 0
     frame_i = 0
@@ -248,6 +250,7 @@ def main() -> None:
                     "i": frame_i, "seg": seg,
                     "pos": [round(float(v), 2) for v in st.pos],
                     "heading": round(float(st.heading), 4),
+                    "t_wall": round(float(time.time()), 3),
                     **audit,
                 })
                 line_px_total += audit["line_pixels"]

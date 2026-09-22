@@ -46,8 +46,8 @@ from beamng_autopilot.vision.segmentation import (
     SegUNet, N_CLASSES, CLASS_NAMES, iou_from_accum,
 )
 from beamng_autopilot.vision.dataset_split import (
-    FrameRef, coverage_digest, leak_check, select_weak_lines,
-    split_by_group,
+    FrameRef, coverage_digest, cross_view_leak, frame_refs_from_meta,
+    leak_check, select_weak_lines, split_by_group,
 )
 
 
@@ -118,6 +118,15 @@ def load_frames(
         rec["kept"] = n_kept
         rec["line_px_frac"] = line_px / max(1, n_run * n_pix)
         rec["end"] = len(frames)
+        # Real identities (T10): the collector's meta carries map/episode,
+        # wall clock and the exposure counter.  The run DIRECTORY name is
+        # kept only as a fallback, and the fallback is reported below.
+        meta_path = rd / "meta.json"
+        if meta_path.exists():
+            try:
+                rec["meta"] = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception as exc:
+                rec["meta_error"] = f"{type(exc).__name__}: {exc}"
         per_run[run_name] = rec
     if not frames:
         raise SystemExit(f"过滤后没有数据（min_line_frac={min_line_frac}）")
@@ -419,28 +428,83 @@ def main() -> None:
         # shuffling frames, and AUDIT the result: a group on both sides or
         # a map with no validation frames is reported, not trusted.
         refs = []
+        meta_notes: list[str] = []
         for _name, _rec in per_run.items():
             _fracs = _rec.get("fracs") or []
-            for _i in range(_rec["kept"]):
-                refs.append(FrameRef(index=_rec["start"] + _i, run=_name,
-                                     t=float(_i),
+            _meta = _rec.get("meta")
+            if _meta:
+                # identity comes from the recording; the INDEX comes from
+                # the kept sequence, because min_line_frac filtering drops
+                # frames and the meta's own counter knows nothing about it
+                _ident, _n = frame_refs_from_meta(_meta, run=_name)
+                meta_notes.extend(_n)
+                if _rec.get("meta_error"):
+                    meta_notes.append(f"{_name}: meta unreadable "
+                                      f"({_rec['meta_error']})")
+                if len(_ident) < _rec["kept"]:
+                    meta_notes.append(
+                        f"{_name}: meta has {len(_ident)} frames but "
+                        f"{_rec['kept']} were kept; the extra frames use the "
+                        f"run name only")
+                for _i in range(_rec["kept"]):
+                    _base = _ident[_i] if _i < len(_ident) else FrameRef()
+                    refs.append(FrameRef(
+                        index=_rec["start"] + _i, run=_name,
+                        map_name=_base.map_name, source_id=_base.source_id,
+                        t=_base.t, t_wall=_base.t_wall,
+                        t_is_index=_base.t_is_index, exposure=_base.exposure,
+                        view=_base.view,
+                        line_frac=(_fracs[_i] if _i < len(_fracs) else 0.0)))
+            else:
+                meta_notes.append(f"{_name}: no meta.json; the group is the "
+                                  f"directory name and t is a frame index")
+                refs.extend(FrameRef(index=_rec["start"] + _i, run=_name,
+                                     t=float(_i), t_is_index=True,
                                      line_frac=(_fracs[_i]
                                                 if _i < len(_fracs)
-                                                else 0.0)))
+                                                else 0.0))
+                            for _i in range(_rec["kept"]))
+        if meta_notes:
+            print(f"[train] 身份回退 {len(meta_notes)} 条 -> "
+                  f"{meta_notes[:4]}", flush=True)
         plan = split_by_group(refs, val_frac=args.val_frac)
         train_frames = [frames[r.index] for r in plan.train]
         val_frames = [frames[r.index] for r in plan.val]
         _leak = leak_check(plan)
         _cov = coverage_digest(plan)
         print(f"[train] split by-map-scene: {len(plan.groups_train)} 训练组 / "
-              f"{len(plan.groups_val)} 验证组, 泄漏={_leak['leak']}",
+              f"{len(plan.groups_val)} 验证组, "
+              f"帧重叠={len(_leak['leaked_frames'])}, "
+              f"共享组={len(_leak['leaked_groups'])}",
               flush=True)
         if _cov["maps_without_val"]:
             print(f"[train] 注意：以下组没有验证帧 -> "
                   f"{_cov['maps_without_val']}", flush=True)
-        if _leak["leak"]:
-            print(f"[train] 严重：划分泄漏 {_leak['leaked_frames'][:8]}",
-                  flush=True)
+        # Cross-view: the same exposure seen by two mounts is ONE instant,
+        # so those frames must stay on one side (T10).  No exposure
+        # counters means the check could not run - reported as such, never
+        # as "no leak".
+        _xv = cross_view_leak(plan, refs)
+        if not _xv["checked"]:
+            print(f"[train] 跨视角检查未执行：{_xv['reason']}", flush=True)
+        elif _xv["leaked_groups"]:
+            print(f"[train] 严重：同一曝光的多视角被切到两侧 "
+                  f"{_xv['leaked_groups'][:6]}", flush=True)
+        else:
+            print(f"[train] 跨视角同曝光分组 "
+                  f"{_xv['n_cross_view_groups']} 组，无跨侧泄漏", flush=True)
+        # Two different statements (plan T10): a FRAME on both sides is a
+        # hard leak; a GROUP on both sides is what the temporal-tail
+        # protocol does by construction and must be named as such instead
+        # of being reported as "no leak" (or lumped in with the former).
+        if _leak["leaked_frames"]:
+            print(f"[train] 严重：同一帧出现在两侧 "
+                  f"{_leak['leaked_frames'][:8]}", flush=True)
+        if _leak["leaked_groups"]:
+            print(f"[train] 协议提醒：{len(_leak['leaked_groups'])} 个组被"
+                  f"时间尾切分（这是 temporal-tail 开发验证，不是 episode/组"
+                  f"隔离；要组隔离请用 holdout_groups）-> "
+                  f"{_leak['leaked_groups'][:6]}", flush=True)
     if args.weak_line_oversample > 0 and train_frames:
         _refs = [FrameRef(index=i, run="", t=float(i),
                           line_frac=float((lb == 2).mean()))
