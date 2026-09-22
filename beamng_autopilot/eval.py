@@ -40,6 +40,21 @@ EDGE_OVER_M = 0.3
 STALL_SPEED_MPS = 0.5
 STALL_REM_END_M = 8.0       # only count stalls away from the end zone
 
+# --- canonical stop / creep definition (review handoff P0-1) -----------
+# One definition, used by every report and script, because the same run
+# could previously be quoted as "57 stops", "53 stops" or "62 stops"
+# depending on whether the reader counted speed < 0.3, speed <= 0.1,
+# final_stop, emergency or "reason == no drivable path".  Everything a
+# report quotes must come from :func:`stop_digest`, which states its own
+# spec and returns ``None`` (UNKNOWN) for any column the run lacks.
+STOP_SPEED_MPS = 0.3        # a "stop" frame: speed < this
+CREEP_SPEED_MPS = 1.0       # "creep" band: STOP_SPEED_MPS <= speed < this
+STOP_INTERVAL_RULE = (
+    "each settled frame owns the interval to the next FRAME of the run; "
+    "the last settled frame owns none")
+STOP_HARD_RULE = ("final_stop flag, or emergency == 1, "
+                  "or level == 'minimal_risk'")
+
 # --- benchmark hard targets -------------------------------------------
 # The FSD realism bar (README "FSD 结构栈现状"): a benchmark scenario
 # passes only with ZERO crossings, ZERO off-road frames, ZERO reversing
@@ -123,6 +138,259 @@ def _episodes(flags: list[bool],
             inside = False
             cur = 0.0
     return total, longest, episodes
+
+
+def stop_digest(hist: list[dict], *, settle_s: float = 0.0,
+                end_zone_m: float = STALL_REM_END_M) -> dict:
+    """One canonical stop/creep digest for a run (review handoff P0-1).
+
+    Every number a report may quote about stopping comes from here, and
+    the returned ``spec`` states exactly what each number means:
+
+    * ``settle_s`` - frames with ``t < settle_s`` are excluded from every
+      count (the post-teleport settling window); ``raw_frames`` still
+      counts them;
+    * ``interval_rule`` - durations use :data:`STOP_INTERVAL_RULE`;
+    * ``stop`` / ``creep`` - :data:`STOP_SPEED_MPS` / :data:`CREEP_SPEED_MPS`;
+    * ``hard_stop`` - :data:`STOP_HARD_RULE`, reported separately from the
+      speed-based stop so "commanded stop" and "slow" are never conflated;
+    * ``excl_end_zone`` - the same stop numbers with frames whose
+      ``rem_end <= end_zone_m`` removed (a stop at the goal is intended);
+    * ``by_reason`` - seconds/frames/longest per ``effective_rule`` (or
+      ``reason`` when that is empty), which is what "classify the stall by
+      cause" needs;
+    * ``unknown`` - a field whose source column is missing from every
+      settled frame is ``None`` and listed here.  It is never 0: a run
+      without a ``speed`` column has NOT measured "no stopping".
+    """
+    n = len(hist)
+    t = [_f(hist, "t", i, 0.0) or 0.0 for i in range(n)]
+    settled = [i for i in range(n) if float(t[i]) >= float(settle_s)]
+    unknown: list[str] = []
+
+    def _col(key: str, kind: str = "num"):
+        """Per-settled-frame values, or None when the column is absent.
+
+        ``kind`` matters: a flag column read as numeric turns every
+        ``True`` into "missing" (bools are not numbers here), and a text
+        column read as numeric turns every reason into "missing" - both
+        silently produced 0 counts in the first version of this function,
+        which is exactly the failure this digest exists to remove.
+        """
+        raw = [_f(hist, key, i) for i in settled]
+        if not raw:
+            unknown.append(key)
+            return None
+        vals: list = []
+        for v in raw:
+            if kind == "flag":
+                if isinstance(v, bool):
+                    vals.append(bool(v))
+                elif _num(v) and float(v) in (0.0, 1.0):
+                    vals.append(bool(v))
+                else:
+                    vals.append(None)
+            elif kind == "str":
+                vals.append(str(v) if isinstance(v, str) and v.strip()
+                            else None)
+            else:
+                vals.append(v if _num(v) else None)
+        if all(v is None for v in vals):
+            unknown.append(key)
+            return None
+        return vals
+
+    def _block(mask, idx) -> dict:
+        total, longest, eps = _episodes(mask, [t[i] for i in idx])
+        return {"frames": int(sum(1 for m in mask if m)),
+                "s": round(total, 2), "longest_s": round(longest, 2),
+                "episodes": int(eps)}
+
+    out: dict = {
+        "spec": {
+            "settle_s": float(settle_s),
+            "settle_rule": "frames with t < settle_s are excluded from "
+                           "every count; raw_frames keeps them",
+            "interval_rule": STOP_INTERVAL_RULE,
+            "stop": f"speed < {STOP_SPEED_MPS} m/s",
+            "creep": f"{STOP_SPEED_MPS} <= speed < {CREEP_SPEED_MPS} m/s",
+            "hard_stop": STOP_HARD_RULE,
+            "by_reason": "effective_rule when non-empty, else reason",
+            "by_reason_fields": (
+                "frames = settled frames carrying the reason; s/active_s = "
+                "seconds the reason was ACTIVE (not necessarily stopped); "
+                "stop_frames/stop_s = the subset that was also a stop; "
+                "longest_s = longest continuous stretch"),
+            "unknown_rule": "a column absent from every settled frame "
+                            "yields None and is listed in unknown[]",
+        },
+        "raw_frames": n,
+        "settled_frames": len(settled),
+    }
+
+    speed = _col("speed")
+    for thr, name in ((0.3, "speed_lt_0_3_frames"),
+                      (0.1, "speed_lt_0_1_frames")):
+        if speed is None:
+            out[name] = None
+        else:
+            out[name] = int(sum(1 for v in speed if v is not None and v < thr))
+    if speed is None:
+        out.update({"stop_frames": None, "stop_s": None,
+                    "stop_longest_s": None, "stop_episodes": None,
+                    "creep_frames": None, "creep_s": None})
+    else:
+        out.update(_block([v is not None and v < STOP_SPEED_MPS
+                           for v in speed], settled))
+        creep = [v is not None and STOP_SPEED_MPS <= v < CREEP_SPEED_MPS
+                 for v in speed]
+        _c = _block(creep, settled)
+        out.update({"creep_frames": _c["frames"], "creep_s": _c["s"],
+                    "stop_frames": out["frames"], "stop_s": out["s"],
+                    "stop_longest_s": out["longest_s"],
+                    "stop_episodes": out["episodes"]})
+        out.pop("frames", None)
+        out.pop("s", None)
+        out.pop("longest_s", None)
+        out.pop("episodes", None)
+
+    fs = _col("final_stop", "flag")
+    em = _col("emergency", "flag")
+    lv = _col("level", "str")
+    hard = None
+    if fs is not None or em is not None or lv is not None:
+        hard = []
+        for k in range(len(settled)):
+            hit = bool((fs is not None and fs[k]) or (em is not None and em[k])
+                       or (lv is not None and str(lv[k]) == "minimal_risk"))
+            hard.append(hit)
+    if hard is None:
+        out.update({"final_stop_frames": None, "final_stop_s": None,
+                    "emergency_frames": None, "emergency_s": None,
+                    "hard_stop_frames": None, "hard_stop_s": None})
+    else:
+        _h = _block(hard, settled)
+        out.update({"hard_stop_frames": _h["frames"],
+                    "hard_stop_s": _h["s"]})
+        if fs is None:
+            out.update({"final_stop_frames": None, "final_stop_s": None})
+        else:
+            _f_ = _block([bool(v) for v in fs], settled)
+            out.update({"final_stop_frames": _f_["frames"],
+                        "final_stop_s": _f_["s"]})
+        if em is None:
+            out.update({"emergency_frames": None, "emergency_s": None})
+        else:
+            _e = _block([bool(v) for v in em], settled)
+            out.update({"emergency_frames": _e["frames"],
+                        "emergency_s": _e["s"]})
+
+    rem = _col("rem_end")
+    if speed is None or rem is None:
+        out["excl_end_zone"] = None
+    else:
+        mask = [v is not None and v < STOP_SPEED_MPS
+                and (rem[k] is None or float(rem[k]) > float(end_zone_m))
+                for k, v in enumerate(speed)]
+        out["excl_end_zone"] = dict(
+            _block(mask, settled), end_zone_m=float(end_zone_m))
+
+    reason_keys = ("effective_rule", "reason")
+    cols = {k: _col(k, "str") for k in reason_keys}
+    if cols["effective_rule"] is None and cols["reason"] is None:
+        out["by_reason"] = None
+    else:
+        by_reason: dict = {}
+        stop_mask = ([v is not None and v < STOP_SPEED_MPS for v in speed]
+                     if speed is not None else None)
+        _rules: list[str] = []
+        for k, idx in enumerate(settled):
+            rule = ""
+            for key in reason_keys:
+                if cols[key] is not None:
+                    val = cols[key][k]
+                    if val is not None and str(val).strip():
+                        rule = str(val)
+                        break
+            _rules.append(rule)
+            if not rule:
+                continue
+            slot = by_reason.setdefault(rule, {"frames": 0, "s": 0.0})
+            slot["frames"] += 1
+            # ``s`` is how long this reason was ACTIVE, which is not how
+            # long the car was stopped for it: a rule can be in force while
+            # the car is creeping or even driving.  Both numbers are kept
+            # and named, because reading ``s`` as "seconds lost to this
+            # rule" overstates the stall (measured 2026-09-21: 25.89 s
+            # active vs 22.92 s actually stopped on the same run).
+            slot["active_s"] = slot.get("active_s", 0.0)
+            if k + 1 < len(settled):
+                _dt_reason = max(0.0, float(t[settled[k + 1]]) - float(t[idx]))
+                slot["s"] += _dt_reason
+                slot["active_s"] += _dt_reason
+            if stop_mask is not None and stop_mask[k]:
+                slot["stop_frames"] = slot.get("stop_frames", 0) + 1
+                slot.setdefault("stop_s", 0.0)
+                if k + 1 < len(settled):
+                    slot["stop_s"] += _dt_reason        # Longest CONTINUOUS stretch per reason, and (from the same walk)
+        # the longest continuous stop for each: one 20 s stall and twenty
+        # 1 s stalls are the same total and different driving failures.
+        for reason in by_reason:
+            _best = 0.0
+            _best_stop = 0.0
+            _run = 0.0
+            _run_stop = 0.0
+            for k in range(len(settled)):
+                if _rules[k] != reason:
+                    _run = 0.0
+                    _run_stop = 0.0
+                    continue
+                step = 0.0
+                if k + 1 < len(settled):
+                    step = max(0.0, float(t[settled[k + 1]])
+                               - float(t[settled[k]]))
+                _run += step
+                _best = max(_best, _run)
+                if stop_mask is not None and stop_mask[k]:
+                    _run_stop += step
+                    _best_stop = max(_best_stop, _run_stop)
+                else:
+                    _run_stop = 0.0
+            by_reason[reason]["longest_s"] = round(_best, 2)
+            by_reason[reason]["stop_longest_s"] = (
+                round(_best_stop, 2) if stop_mask is not None else None)
+        for slot in by_reason.values():
+            slot["s"] = round(slot["s"], 2)
+            slot["active_s"] = round(slot["active_s"], 2)
+            # 0.0 when the stop channel EXISTS and this reason never
+            # coincided with a stop ("measured: it caused no stopping");
+            # None only when the run has no stop measurement at all.  The
+            # two are different statements and this project has already
+            # been burned by collapsing them.
+            if stop_mask is not None:
+                slot["stop_s"] = round(float(slot.get("stop_s") or 0.0), 2)
+                slot["stop_frames"] = int(slot.get("stop_frames", 0))
+            else:
+                slot["stop_s"] = None
+                slot["stop_frames"] = None
+        out["by_reason"] = by_reason
+
+    if lv is not None:
+        by_level: dict = {}
+        for k, idx in enumerate(settled):
+            key = str(lv[k]) if lv[k] is not None else "?"
+            slot = by_level.setdefault(key, {"frames": 0, "s": 0.0})
+            slot["frames"] += 1
+            if k + 1 < len(settled):
+                slot["s"] += max(0.0, float(t[settled[k + 1]]) - float(t[idx]))
+        for slot in by_level.values():
+            slot["s"] = round(slot["s"], 2)
+        out["by_level"] = by_level
+    else:
+        out["by_level"] = None
+
+    out["unknown"] = sorted(set(unknown))
+    return out
 
 
 def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
@@ -216,6 +484,17 @@ def assess_run(hist: list[dict], goal=None, cruise: float | None = None,
     out["max_cross_centre_m"] = round(max(ll_v), 3) if ll_v else None
     out["max_cross_right_m"] = round(min(lr_v), 3) if lr_v else None
     out["lat_frames"] = len(ll_v)
+    # Per-side coverage (plan T01): the two crossing checks are separate
+    # measurements and one side can be missing while the other is fine.
+    # A frame with only ``lat_right`` published cannot say anything about
+    # the centre/oncoming side, and the old single counter let that frame
+    # read as "no crossing" on both sides.
+    out["lat_left_frames"] = len(ll_v)
+    out["lat_right_frames"] = len(lr_v)
+    out["lat_left_coverage"] = (round(len(ll_v) / len(settled), 3)
+                                if settled else None)
+    out["lat_right_coverage"] = (round(len(lr_v) / len(settled), 3)
+                                 if settled else None)
 
     # BODY-aware crossing: the car's yawed footprint extends its lateral
     # reach by half_w*|cos(dyaw)| + half_len*|sin(dyaw)|; the centre
@@ -519,6 +798,17 @@ def score_run(assessed: dict, require_goal: bool = False) -> dict:
         <= BENCH_MAX_STALL_FRAMES,
     }
     unknown: list[str] = []
+    # Lateral absence is UNMEASURED, not "no crossing" (plan T01/§1.4-15).
+    # Each side is its own target: ``lat_left`` missing means the
+    # centre/oncoming side was never measured, ``lat_right`` missing means
+    # the pavement-edge side was not, and either one is UNKNOWN - a run
+    # cannot clear a target whose column was empty for the whole run.
+    if int(assessed.get("lat_left_frames", 0) or 0) <= 0:
+        checks["no_centre_crossing"] = False
+        unknown.append("no_centre_crossing")
+    if int(assessed.get("lat_right_frames", 0) or 0) <= 0:
+        checks["no_edge_crossing"] = False
+        unknown.append("no_edge_crossing")
     # ``off_road_frames is None`` means no off-road source existed in the
     # run; that is unmeasured, not "on road".
     orf = assessed.get("off_road_frames")
