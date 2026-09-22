@@ -490,13 +490,21 @@ class TechCameraRingProvider(CameraProvider):
     """
 
     def __init__(self, conn, width: int = 1076, height: int = 806,
-                 roles: tuple[str, ...] | None = None) -> None:
+                 roles: tuple[str, ...] | None = None,
+                 annotations: bool = False) -> None:
         check_graphics_quality(conn.user_dir)
         from beamngpy.sensors import Camera
 
         self.conn = conn
         self.width = int(width)
         self.height = int(height)
+        # Annotation rendering is off by default: it costs an extra render
+        # target per camera and driving never consumes it.  A LABEL
+        # COLLECTION pass turns it on for every mount at once, so one
+        # drive round yields pixel ground truth for all eight views
+        # (``grab_ring_labels``) - otherwise every camera added to the ring
+        # would need its own hand labeling.
+        self.annotations = bool(annotations)
         if roles is None:
             self._roles = tuple(m.role for m in CAMERA_RING)
         else:
@@ -529,6 +537,7 @@ class TechCameraRingProvider(CameraProvider):
                     near_far_planes=(0.05, 150.0),
                     is_using_shared_memory=True,
                     is_render_colours=True,
+                    is_render_annotations=self.annotations,
                     is_visualised=False,
                 )
 
@@ -579,6 +588,45 @@ class TechCameraRingProvider(CameraProvider):
         out: dict[str, tuple[np.ndarray, CameraModel]] = {}
         for role, cam in self.cameras.items():
             out[role] = (self._poll(cam), models[role])
+        return out
+
+    def grab_ring_labels(self) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+        """Poll the ring returning ``{role: (rgb, annotation)}``.
+
+        The multi-view LABEL pass: every mount's annotated render target in
+        one round, so a dataset covering all eight cameras is collected by
+        driving once - no hand labeling per view.  Requires the provider to
+        have been created with ``annotations=True``; without it the
+        annotation frames do not exist and the dict comes back empty (a
+        silently empty label would be worse than a missing one).
+        """
+        out: dict[str, tuple[np.ndarray, np.ndarray]] = {}
+        if not self.annotations:
+            return out
+        for role, cam in self.cameras.items():
+            for _attempt in range(BLACK_FRAME_RETRIES + 2):
+                with self.conn.io_lock:
+                    data = cam.poll()
+                colour = data.get("colour")
+                ann = data.get("annotation")
+                if colour is None or ann is None:
+                    time.sleep(0.1)
+                    continue
+                colour = np.ascontiguousarray(
+                    np.asarray(colour)[..., :3], dtype=np.uint8)
+                ann = np.ascontiguousarray(
+                    np.asarray(ann)[..., :3], dtype=np.uint8)
+                # An annotation that renders nothing (a freshly authored
+                # buffer, or one flat colour) is not a label: saving it
+                # would teach "no road here" for a frame nobody saw.
+                # Measured 2026-09-21: the first grab after sensor
+                # creation returned an all-empty front_main annotation.
+                if (_frame_is_black(colour)
+                        or len(np.unique(ann.reshape(-1, 3), axis=0)) < 2):
+                    time.sleep(0.1)
+                    continue
+                out[role] = (colour, ann)
+                break
         return out
 
     def camera_model(self, pos, heading, width, height,
