@@ -44,6 +44,27 @@ ACC_OVERTAKE_MIN_SPEED_MPS = 3.0
 FALLBACK_LANE_WIDTH_M = 3.5
 
 
+def _as_bool(value) -> bool | None:
+    """Parse a JSON boolean that may arrive as a string.
+
+    ``bool("false")`` is True, so a flag serialised as a STRING flips
+    meaning; that class of bug is exactly what the round-5 plan keeps
+    finding, so the conversion is explicit here.
+    """
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    text = str(value).strip().lower()
+    if text in ("true", "1", "yes", "on"):
+        return True
+    if text in ("false", "0", "no", "off", ""):
+        return False
+    return None
+
+
 @dataclass
 class RoadRuleView:
     """Parsed view of the road map data under the ego vehicle.
@@ -102,8 +123,8 @@ class RoadRuleView:
             lane_direction=classify_lane_direction(lanes),
             drivability=drivability,
             road_type=data.get("type"),
-            right_hand_drive=bool(rhd) if rhd is not None else None,
-            turn_on_red=bool(turn_on_red) if turn_on_red is not None else None,
+            right_hand_drive=_as_bool(rhd),
+            turn_on_red=_as_bool(turn_on_red),
             n1=data.get("n1"),
             n2=data.get("n2"),
             lanes=lanes,
