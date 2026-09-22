@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
 from beamng_autopilot.lane import pair_lane_markings
 from beamng_autopilot.vision.lanes import LaneMarking
-from beamng_autopilot.lane.pairing import _pair_perspective_valid
+from beamng_autopilot.lane.pairing import (
+    _pair_perspective_valid,
+    _pair_world_geometry,
+)
 
 
 def _line(y: float, x0: float = 4.0, x1: float = 9.0,
@@ -145,3 +150,108 @@ def test_mirror_right_refused_when_it_crosses_the_centre_paint():
     else:
         # centre path or refusal - both are safe outcomes
         assert "centre_contradiction" in debug.get("mirror_reject", "")             or debug["mode"] in ("centre_line_own_lane", "none", "pair")
+
+
+def _world_pair_geometry(left, right, pos=None, heading=0.0):
+    pos = np.zeros(2) if pos is None else np.asarray(pos, dtype=float)
+    fwd = np.array([np.cos(heading), np.sin(heading)])
+    geometry = _pair_world_geometry(
+        SimpleNamespace(world=left), SimpleNamespace(world=right),
+        pos, fwd, 1.5, 18)
+    assert geometry is not None
+    return geometry
+
+
+def _nearest_segment_oracle(points, polyline):
+    """Scalar Euclidean projection, independent of the batched matcher."""
+    projected = []
+    covered = []
+    lengths = np.linalg.norm(np.diff(polyline, axis=0), axis=1)
+    for point in points:
+        best_dist = float("inf")
+        best_point = None
+        best_station = 0.0
+        station = 0.0
+        for a, b, length in zip(polyline[:-1], polyline[1:], lengths):
+            delta = b - a
+            squared = float(delta @ delta)
+            t = (float((point - a) @ delta) / squared
+                 if squared > 0.0 else 0.0)
+            t = min(1.0, max(0.0, t))
+            q = a + t * delta
+            distance = float(np.linalg.norm(point - q))
+            if distance < best_dist:
+                best_dist = distance
+                best_point = q
+                best_station = station + t * length
+            station += length
+        projected.append(best_point)
+        covered.append(0.5 <= best_station <= float(lengths.sum()) - 0.5)
+    return np.asarray(projected), np.asarray(covered)
+
+
+@pytest.mark.parametrize("right_x", [
+    [2.0, 18.0],
+    [4.0, 15.0],
+    [2.0, 2.0, 9.0, 18.0],
+])
+@pytest.mark.parametrize("heading_deg", [0.0, 37.0, 90.0, 180.0])
+def test_world_pair_projection_matches_scalar_oracle(right_x, heading_deg):
+    x = np.linspace(2.0, 18.0, 17)
+    left = np.column_stack([x, np.full_like(x, 1.75)])
+    right = np.column_stack([right_x, np.full(len(right_x), -1.75)])
+    heading = np.radians(heading_deg)
+    rotation = np.array([[np.cos(heading), -np.sin(heading)],
+                         [np.sin(heading), np.cos(heading)]])
+    origin = np.array([31.0, -7.0])
+    left = left @ rotation.T + origin
+    right = right @ rotation.T + origin
+    _, center, matched_left, matched_right, valid = _world_pair_geometry(
+        left, right, origin, heading)
+    expected, covered = _nearest_segment_oracle(matched_left, right)
+    np.testing.assert_allclose(matched_right, expected, atol=1e-10)
+    np.testing.assert_array_equal(valid, covered)
+    np.testing.assert_allclose(center, 0.5 * (matched_left + expected),
+                               atol=1e-10)
+    assert valid.any()
+    assert not valid.all(), "clamped endpoints are not a two-sided read"
+
+
+@pytest.mark.parametrize("heading_deg", [12.0, 45.0, 90.0, 180.0])
+def test_world_pair_is_rotation_and_translation_equivariant(heading_deg):
+    x = np.linspace(2.0, 18.0, 17)
+    left = np.column_stack([x, np.full_like(x, 1.75)])
+    right = np.column_stack([x, np.full_like(x, -1.75)])
+    base = _world_pair_geometry(left, right)
+    heading = np.radians(heading_deg)
+    rotation = np.array([[np.cos(heading), -np.sin(heading)],
+                         [np.sin(heading), np.cos(heading)]])
+    origin = np.array([31.0, -7.0])
+    moved = _world_pair_geometry(left @ rotation.T + origin,
+                                 right @ rotation.T + origin,
+                                 origin, heading)
+    np.testing.assert_allclose(moved[0], base[0], atol=1e-10)
+    np.testing.assert_array_equal(moved[4], base[4])
+    for before, after in zip(base[1:4], moved[1:4]):
+        np.testing.assert_allclose(after, before @ rotation.T + origin,
+                                   atol=1e-10)
+    valid = moved[4]
+    np.testing.assert_allclose(
+        np.linalg.norm(moved[2][valid] - moved[3][valid], axis=1), 3.5,
+        atol=1e-10)
+
+
+def test_world_pair_uses_true_curved_boundary_nearest_points():
+    theta = np.linspace(0.08, 0.75, 17)
+    radius = 20.0
+    left = np.column_stack([
+        (radius - 1.75) * np.sin(theta),
+        radius - (radius - 1.75) * np.cos(theta)])
+    right = np.column_stack([
+        (radius + 1.75) * np.sin(theta),
+        radius - (radius + 1.75) * np.cos(theta)])
+    _, _, matched_left, matched_right, valid = _world_pair_geometry(left, right)
+    expected, covered = _nearest_segment_oracle(matched_left, right)
+    np.testing.assert_allclose(matched_right, expected, atol=1e-10)
+    np.testing.assert_array_equal(valid, covered)
+    assert valid.any()

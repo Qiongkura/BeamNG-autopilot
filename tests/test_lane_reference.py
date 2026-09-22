@@ -425,18 +425,21 @@ def test_bev_fallback_is_labelled_bev_route() -> None:
 # mean=+1.18 m painted-line lateral (p50=+1.04 m).
 # --------------------------------------------------------------------------
 def _sensor_lane_at(y_center: float, *, paired: bool = True,
-                    confidence: float = 0.8) -> LaneFrame:
+                    confidence: float = 0.8,
+                    width: float | None = None) -> LaneFrame:
     """LaneFrame with the centre pinned at an arbitrary lateral y.
 
-    The width is fixed at the lane-width contract so the helper matches
-    what select_lane_reference consumes from a real perception read.
+    The width defaults to the lane-width contract so the helper matches
+    what select_lane_reference consumes from a real perception read; pass
+    ``width`` for the measured over-wide reads (a lane + shoulder).
     """
     xs = np.linspace(0.0, 30.0, 31)
+    w = LANE_W_M if width is None else float(width)
     return LaneFrame(
         center=np.column_stack([xs, np.full_like(xs, y_center)]),
-        left=np.column_stack([xs, np.full_like(xs, y_center + LANE_HALF_M)]),
-        right=np.column_stack([xs, np.full_like(xs, y_center - LANE_HALF_M)]),
-        width=LANE_W_M,
+        left=np.column_stack([xs, np.full_like(xs, y_center + w / 2)]),
+        right=np.column_stack([xs, np.full_like(xs, y_center - w / 2)]),
+        width=w,
         confidence=confidence,
         span_m=30.0,
         sources=("vision",),
@@ -497,6 +500,242 @@ def test_non_strict_sensor_lane_on_centreline_is_still_published() -> None:
     )
     assert ref.src == SRC_SENSOR
     assert ref.center is not None
+
+
+def test_a_refusal_publishes_the_offset_and_limit_that_caused_it() -> None:
+    """A side-gate refusal must be auditable from telemetry alone.
+
+    Without the measured offset and the threshold, "the gate said no"
+    cannot be told apart from a pairing error - the two need opposite
+    fixes.  The published numbers must be the ones the gate used.
+    """
+    ref = select_lane_reference(
+        lane_frame=_sensor_lane_at(-0.1),
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        lane_mode="sensor", strict_sensor=True,
+    )
+    assert ref.meta["lane_reject_reason"] == "side"
+    assert ref.meta["lane_side_off_m"] == pytest.approx(-0.1, abs=1e-6)
+    assert ref.meta["lane_side_limit_m"] == pytest.approx(-0.2)
+    assert ref.meta["pair_paired"] == 1
+    assert ref.meta["pair_width_m"] == pytest.approx(LANE_W_M, abs=1e-6)
+    assert ref.meta["pair_span_m"] == pytest.approx(30.0)
+    assert ref.meta["pair_sources"] == ["vision"]
+
+
+def test_an_accepted_lane_publishes_the_same_measurements() -> None:
+    ref = select_lane_reference(
+        lane_frame=_sensor_lane_at(-1.75),
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        lane_mode="sensor", strict_sensor=True,
+    )
+    assert ref.src == SRC_SENSOR
+    assert ref.meta["lane_side_off_m"] == pytest.approx(-1.75, abs=1e-6)
+    assert ref.meta["lane_side_limit_m"] == pytest.approx(-0.2)
+
+
+def test_unmeasurable_offset_is_reported_as_unknown_not_zero() -> None:
+    """A lane with no measurable overlap must not publish a 0.0 offset.
+
+    0.0 is the most dangerous value here (it reads as "on the centre
+    line"), so it must not be manufactured when nothing was measured.
+    """
+    ref = select_lane_reference(
+        lane_frame=LaneFrame(
+            center=np.array([[500.0, 500.0], [501.0, 500.0], [502.0, 500.0]]),
+            left=None, right=None, width=0.0, confidence=0.9,
+            span_m=3.0, sources=("vision",), paired=False),
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        lane_mode="sensor", strict_sensor=True,
+    )
+    assert ref.meta["lane_side_off_m"] is None
+    assert ref.meta["lane_side_limit_m"] == pytest.approx(-0.2)
+
+
+class _Marking:
+    """Minimal LaneMarking stand-in for the divider fallback."""
+
+    def __init__(self, world, kind="solid", color="white", confidence=0.8):
+        self.world = np.asarray(world, dtype=float)
+        self.kind, self.color, self.confidence = kind, color, confidence
+
+
+def _divider_marks(y: float, *, kind: str = "solid", length_m: float = 20.0,
+                   conf: float = 0.8, n: int = 41):
+    xs = np.linspace(0.0, length_m, n)
+    return [_Marking(np.column_stack([xs, np.full_like(xs, y)]),
+                     kind=kind, confidence=conf)]
+
+
+def _grid_full(n: int = 60, res: float = 0.5, *, drivable_y=(-6.0, 6.0),
+               observed: bool = True):
+    """Grid with a drivable/observed band.
+
+    ``grid.world_to_cell`` maps car-left (+y) to a SMALLER column, so a
+    cell's car-frame lateral is ``extent - (col + 0.5) * res``.  The band
+    ``[y_lo, y_hi]`` (left-positive) therefore spans the columns below.
+    """
+    grid = OccupancyGrid(n, n, float(res))
+    if drivable_y is not None:
+        extent = n * res / 2.0
+
+        def col(y: float) -> int:
+            return int(round((extent - float(y)) / res - 0.5))
+        lo, hi = col(max(drivable_y)), col(min(drivable_y))
+        grid.drivable[:, lo:hi + 1] = 1
+    if observed:
+        grid.observed[:] = 1
+    return grid
+
+
+def test_divider_beside_the_car_yields_the_own_lane_on_its_right() -> None:
+    """Stuck ON the centreline the whole-road reads are refused; the divider
+    is not.  A long solid marking lying on the route (car at y=0, paint at
+    y=-0.37) puts the own lane half a lane to its right."""
+    grid = _grid_full()
+    ref = select_lane_reference(
+        lane_frame=None,
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        grid=grid, lane_mode="sensor", strict_sensor=True,
+        markings=_divider_marks(-0.37),
+    )
+    assert ref.src == SRC_SENSOR
+    assert ref.center is not None
+    assert float(np.median(ref.center[:, 1])) == pytest.approx(
+        -0.37 - LANE_W_M / 2, abs=0.1)
+    assert ref.meta["lane_from"] == "divider_right_shift"
+    assert ref.boundaries is True          # the paint is a hard no-cross edge
+    assert ref.left is not None and len(ref.left) >= 2
+
+
+def test_a_marking_off_the_route_is_not_a_divider() -> None:
+    """A lane edge 2.5 m off the road centre is not the divider: shifting
+    the lane half a width off it would invent a lane on the shoulder."""
+    ref = select_lane_reference(
+        lane_frame=None,
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        grid=_grid_full(), lane_mode="sensor", strict_sensor=True,
+        markings=_divider_marks(-2.5),
+    )
+    assert ref.src == SRC_UNAVAILABLE
+    assert ref.center is None
+    assert ref.meta["lane_divider"]["reason"] == "no_divider_line"
+
+
+def test_short_paint_fragment_is_not_a_divider() -> None:
+    ref = select_lane_reference(
+        lane_frame=None,
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        grid=_grid_full(), lane_mode="sensor", strict_sensor=True,
+        markings=_divider_marks(-0.3, length_m=2.0, n=5),
+    )
+    assert ref.src == SRC_UNAVAILABLE
+    assert ref.meta["lane_divider"]["reason"] == "no_divider_line"
+
+
+def test_divider_lane_must_land_on_observed_pavement() -> None:
+    """The shift may not put the car where the sensors never saw road."""
+    grid = _grid_full(drivable_y=(0.5, 6.0))     # pavement starts LEFT of 0.5
+    ref = select_lane_reference(
+        lane_frame=None,
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        grid=grid, lane_mode="sensor", strict_sensor=True,
+        markings=_divider_marks(-0.37),
+    )
+    assert ref.src == SRC_UNAVAILABLE
+    assert ref.center is None
+    assert "off_drivable" in ref.meta["lane_divider"]["reason"]
+
+
+def test_divider_lane_needs_the_route_as_its_side_veto() -> None:
+    """No route -> no way to tell which side the own lane is on: refuse."""
+    ref = select_lane_reference(
+        lane_frame=None,
+        pos=np.zeros(3), heading=0.0,
+        route_ref=None, has_nav_route=False,
+        grid=_grid_full(), lane_mode="sensor", strict_sensor=True,
+        markings=_divider_marks(-0.37),
+    )
+    assert ref.src == SRC_UNAVAILABLE
+    assert ref.center is None
+
+
+def test_an_accepted_pair_off_the_observed_pavement_is_withdrawn() -> None:
+    """A 5.24 m "lane" 4.2 m right of the road centre sits past the right
+    edge of a ~7 m road.  The side gate passes it (it IS on the right
+    side); only the pavement check catches it."""
+    grid = _grid_full(drivable_y=(-3.2, 3.8))
+    frame = _sensor_lane_at(-4.2, width=5.24)
+    ref = select_lane_reference(
+        lane_frame=frame,
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        grid=grid, lane_mode="sensor", strict_sensor=True,
+    )
+    assert ref.src == SRC_UNAVAILABLE
+    assert ref.center is None
+    assert ref.meta["lane_drivable"]["reason"].startswith("centre off")
+
+
+def test_an_accepted_pair_on_the_observed_pavement_survives() -> None:
+    grid = _grid_full(drivable_y=(-3.2, 3.8))
+    frame = _sensor_lane_at(-LANE_HALF_M)
+    ref = select_lane_reference(
+        lane_frame=frame,
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        grid=grid, lane_mode="sensor", strict_sensor=True,
+    )
+    assert ref.src == SRC_SENSOR
+    assert ref.meta["lane_drivable"]["frac"] >= 0.6
+
+
+def test_no_drivable_evidence_abstains_and_says_so() -> None:
+    """No grid must not silently read as "on pavement" nor as "off"."""
+    frame = _sensor_lane_at(-LANE_HALF_M)
+    ref = select_lane_reference(
+        lane_frame=frame,
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        grid=None, lane_mode="sensor", strict_sensor=True,
+    )
+    assert ref.src == SRC_SENSOR
+    assert ref.meta["lane_drivable"]["frac"] is None
+    assert ref.meta["lane_drivable"]["reason"] == "not enough observed samples"
+
+
+def test_an_accepted_pair_still_wins_over_the_divider_fallback() -> None:
+    """The fallback only fills a gap - it never overrides an accepted lane."""
+    frame = _sensor_lane_at(-LANE_HALF_M)
+    ref = select_lane_reference(
+        lane_frame=frame,
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        grid=_grid_full(), lane_mode="sensor", strict_sensor=True,
+        markings=_divider_marks(-0.37),
+    )
+    assert ref.src == SRC_SENSOR
+    assert "lane_from" not in ref.meta
+    assert float(np.median(ref.center[:, 1])) == pytest.approx(
+        -LANE_HALF_M, abs=1e-6)
+
+
+def test_divider_needs_a_real_paint_kind_not_a_thin_skeleton() -> None:
+    ref = select_lane_reference(
+        lane_frame=None,
+        pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        grid=_grid_full(), lane_mode="sensor", strict_sensor=True,
+        markings=_divider_marks(-0.37, kind="thin"),
+    )
+    assert ref.src == SRC_UNAVAILABLE
 
 
 def test_map_mode_keeps_its_legacy_minus_0p4_tolerance() -> None:

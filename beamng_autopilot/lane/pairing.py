@@ -64,7 +64,29 @@ class LaneFrame:
                          # single-edge mirror fallback
     left_kind: str | None = None   # kind of the left boundary marking
     right_kind: str | None = None  # kind of the right boundary marking
+    # At least one published side is NOT a measurement of this frame: the
+    # missing side was mirrored or built from the lane-width contract (the
+    # painted centre line is the common case - it sets ``paired=True``
+    # because its own-lane geometry is trustworthy, while its right edge
+    # is a prior).  Consumers that hand out steering authority must read
+    # this, not ``paired`` alone (plan §2.2-A).
+    inferred: bool = False
+    # Which tick's sensor observation this frame carries.  A frame served
+    # from the fusion hold / coast keeps the OLD sequence number, so
+    # "survived several ticks" can never be mistaken for "observed again"
+    # (plan §3.2: no new vote from a replayed measurement).
+    obs_seq: int = 0
 
+    @property
+    def two_sided_measured(self) -> bool:
+        """Both boundaries are real detections of one observation.
+
+        This is the only shape that may earn full steering authority: a
+        constructed centre (centre line, mirror, width prior) is a valid
+        reference but not a two-sided measurement (plan §3.3-6).
+        """
+        return bool(self.paired and not self.inferred
+                    and self.left is not None and self.right is not None)
 
 def _unit_fwd(pos, heading: float, fwd=None) -> np.ndarray:
     if fwd is not None:
@@ -355,13 +377,13 @@ def _pair_world_geometry(l: _LineCandidate, r: _LineCandidate,
     w = (ticks - arc[idx - 1]) / np.maximum(
         arc[idx] - arc[idx - 1], 1e-12)
     ref_pts = ref[idx - 1] + w[:, None] * (ref[idx] - ref[idx - 1])
-    oseg = np.linalg.norm(np.diff(other, axis=0), axis=1)
+    dseg = other[1:] - other[:-1]
+    oseg = np.linalg.norm(dseg, axis=1)
     oarc = np.concatenate([[0.0], np.cumsum(oseg)])
     olen2 = np.maximum(oseg * oseg, 1e-12)
     rel = ref_pts[:, None, :] - other[None, :-1, :]
-    t = np.einsum("nki,k->nk", rel, oseg) / olen2[None, :]
+    t = np.einsum("nki,ki->nk", rel, dseg) / olen2[None, :]
     t = np.clip(t, 0.0, 1.0)
-    dseg = other[1:] - other[:-1]
     proj = other[None, :-1, :] + t[..., None] * dseg[None, :, :]
     d2 = np.sum((proj - ref_pts[:, None, :]) ** 2, axis=2)
     bi = np.argmin(d2, axis=1)
@@ -568,6 +590,7 @@ def _best_vision_pair(cands: list[_LineCandidate],
     left_near = {id(c): _near_stats(c) for c in left_pool}
     right_near = {id(c): _near_stats(c) for c in right_pool}
     best = None
+    best_spread = None
     best_score = 0.0
     # Per-combo rejection counters (debug only): which gate killed
     # every combination on frames that end up single-edge despite
@@ -638,6 +661,12 @@ def _best_vision_pair(cands: list[_LineCandidate],
             else:
                 width = float(np.median(width_vals))
                 center = float(np.median(center_vals))
+            # How much the two boundaries converge/diverge along the shared
+            # overlap.  Two edges of ONE lane hold a near-constant spacing;
+            # two lines seen at a shallow crossing angle (a near divider
+            # paired with a far roadside line) do not.  Recorded for every
+            # candidate so the threshold can be measured, not guessed.
+            _wspread = float(width_vals.max() - width_vals.min())
             if abs(center) > LANE_PAIR_CENTER_PREFER_M \
                     and width > LANE_OFF_CENTER_WIDTH_MAX_M:
                 rejects['center_prefer_width'] = rejects.get('center_prefer_width', 0) + 1
@@ -661,6 +690,20 @@ def _best_vision_pair(cands: list[_LineCandidate],
                 continue
             span = s_hi - s_lo
             avg_conf = 0.5 * (l.conf + r.conf)
+            if debug is not None:
+                cands_seen = debug.setdefault("pair_candidates", [])
+                if len(cands_seen) < 12:
+                    cands_seen.append({
+                        "l_med": round(float(l.med_lat), 2),
+                        "r_med": round(float(r.med_lat), 2),
+                        "l_kind": l.kind, "r_kind": r.kind,
+                        "width": round(float(width), 2),
+                        "width_spread": round(_wspread, 2),
+                        "center": round(float(center), 2),
+                        "span": round(float(span), 2),
+                        "score_span_ok": round(
+                            float(0.5 + 0.5 * min(1.0, span / 14.0)), 3),
+                    })
             center_ok = math.exp(
                 -0.5 * (center / LANE_PAIR_CENTER_PREFER_M) ** 2)
             near_ok = 1.0 / (1.0 + 0.35 * max(abs(_cand_near_lat(l)),
@@ -673,6 +716,7 @@ def _best_vision_pair(cands: list[_LineCandidate],
             score = avg_conf * span_ok * center_ok * near_ok * width_ok
             if score > best_score:
                 best_score = score
+                best_spread = _wspread
                 geom = None
                 if (l.world is not None and r.world is not None
                         and len(l.world) >= 2 and len(r.world) >= 2):
@@ -696,6 +740,8 @@ def _best_vision_pair(cands: list[_LineCandidate],
                         avg_conf, score, geom)
     if debug is not None:
         debug["pair_rejects"] = rejects
+        if best_spread is not None:
+            debug["pair_width_spread"] = round(float(best_spread), 2)
     return best
 
 
@@ -889,7 +935,9 @@ def _single_mirror_frame(best, side: int, pos: np.ndarray,
                      width=lane_width, confidence=conf, span_m=span,
                      sources=("vision",), paired=False,
                      left_kind=(best.kind if side > 0 else None),
-                     right_kind=(best.kind if side < 0 else None))
+                     right_kind=(best.kind if side < 0 else None),
+                     # one measured edge + a mirrored partner
+                     inferred=True)
 
 
 def _centre_line_own_lane(cand, pos, fwd, lane_width: float,
@@ -946,7 +994,10 @@ def _centre_line_own_lane(cand, pos, fwd, lane_width: float,
     return LaneFrame(center=center, left=left_pts, right=None,
                      width=float(lane_width), confidence=conf,
                      span_m=float(cand.span), sources=("vision",),
-                     paired=True, left_kind=cand.kind, right_kind=None)
+                     paired=True, left_kind=cand.kind, right_kind=None,
+                     # own lane to the RIGHT of the paint by a width
+                     # prior: the left edge is measured, the right is not
+                     inferred=True)
 
 
 def pair_lane_markings(

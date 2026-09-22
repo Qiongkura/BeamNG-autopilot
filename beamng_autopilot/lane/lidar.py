@@ -225,9 +225,11 @@ def _single_edge_lidar_frame(pts, pos, fwd, stations, station, max_lat,
             return LaneFrame(center=center[valid], left=edge_pts[valid],
                              right=None, width=LANE_WIDTH_DEFAULT_M,
                              confidence=conf, span_m=span,
-                             sources=("lidar", "left"), paired=False)
+                             sources=("lidar", "left"), paired=False,
+                             inferred=True)
         return LaneFrame(center=center[valid], left=None,
                          right=edge_pts[valid],
                          width=LANE_WIDTH_DEFAULT_M, confidence=conf,
-                         span_m=span, sources=("lidar", "right"), paired=False)
+                         span_m=span, sources=("lidar", "right"), paired=False,
+                         inferred=True)
     return None

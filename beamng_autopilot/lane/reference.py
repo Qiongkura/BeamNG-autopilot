@@ -262,6 +262,207 @@ def bev_corridor_lane_center(grid, pos, heading,
     return ahead if len(ahead) >= 3 else None
 
 
+# --- own lane beside a painted DIVIDER ---------------------------------
+# Minimum world length for a marking to be treated as a lane boundary
+# rather than a paint fragment.
+DIVIDER_LINE_MIN_LEN_M = 5.0
+# A marking whose median lateral offset from the nav ROUTE (the road
+# centreline) is inside this band is the road's divider / centre paint.
+# The route is used as a *road-centre metric* here, exactly as the side
+# gate uses it - never as a lateral setpoint.
+DIVIDER_ON_ROUTE_BAND_M = 0.85
+# The derived own-lane centre may sit at most this far from the divider:
+# beyond it the "half a lane to the right" read would be a lane change,
+# not a lane-keeping reference.
+DIVIDER_MAX_CENTRE_OFFSET_M = 2.6
+# Fraction of sampled centre points that must land on drivable, observed
+# pavement before the shift may steer the car.
+DIVIDER_DRIVABLE_MIN_FRAC = 0.6
+
+
+def own_lane_beside_divider(markings, pos, heading, route_ref, grid,
+                            lane_half_m: float = 0.5 * LANE_WIDTH_DEFAULT_M,
+                            debug: dict | None = None):
+    """Own-lane centre from a painted divider, inside observed pavement.
+
+    The failure this answers: the car stands ON the road centreline (a
+    teleport / placement that could not find a perception lane leaves it
+    on the route snap).  Perception then sees the WHOLE road - the divider
+    paint beside the car and the opposite edge - so the paired-lane read
+    is the road corridor, its centre IS the centreline, and the side gate
+    correctly refuses it.  Every read is refused, so a strict car can
+    never move off the line it is stuck on: the gate is right and the
+    behaviour is still useless.
+
+    A painted divider is unambiguous evidence about where the own lane is
+    under right-hand traffic: the lane lies ``lane_half_m`` to the RIGHT
+    of that paint.  This builds exactly that centreline and then requires
+    it to survive the same safety frame the other candidates do:
+
+    * the divider must be a long solid/dashed marking (a fragment is not
+      a boundary) whose median offset from the nav ROUTE is within
+      ``DIVIDER_ON_ROUTE_BAND_M`` - i.e. it sits on the road centre,
+      which is what makes it a divider and not a lane edge;
+    * the derived centre must pass the SIDE gate (right of the route);
+    * the derived centre must lie on pavement the sensors actually
+      OBSERVED as drivable (CNN road mask + LiDAR), for at least
+      ``DIVIDER_DRIVABLE_MIN_FRAC`` of the sampled points - so a wrong
+      "divider" cannot park the car on the shoulder;
+    * it must stay within ``DIVIDER_MAX_CENTRE_OFFSET_M`` of the divider.
+
+    Returns ``(center, left_boundary, line)`` or ``None``.  Perception
+    only: the route decides which SIDE, the paint and the pavement decide
+    WHERE.
+    """
+    if not markings or route_ref is None or len(route_ref) < 2:
+        return None
+    p = np.asarray(pos[:2], dtype=float)
+    fwd = np.array([math.cos(float(heading)), math.sin(float(heading))])
+    left_ax = np.array([-fwd[1], fwd[0]])
+    best = None
+    for mk in markings:
+        kind = str(getattr(mk, "kind", "") or "")
+        if kind not in ("solid", "dashed"):
+            continue
+        conf = float(getattr(mk, "confidence", 0.0) or 0.0)
+        if conf < 0.4:
+            continue
+        world = np.asarray(getattr(mk, "world", np.zeros((0, 2))), dtype=float)
+        if world.ndim != 2 or world.shape[0] < 2:
+            continue
+        world = world[:, :2]
+        world = world[np.isfinite(world).all(axis=1)]
+        if len(world) < 2:
+            continue
+        seg = np.linalg.norm(np.diff(world, axis=0), axis=1)
+        if float(seg.sum()) < DIVIDER_LINE_MIN_LEN_M:
+            continue
+        rel = world - p
+        lon = rel @ fwd
+        lat = rel @ left_ax
+        near = (lon >= -2.0) & (lon <= 18.0)
+        if int(near.sum()) < 3:
+            continue
+        # Car-frame offset: the divider must be beside the car, not a
+        # lane away (then the car is already somewhere else).
+        car_lat = float(np.median(lat[near]))
+        if abs(car_lat) > DIVIDER_MAX_CENTRE_OFFSET_M:
+            continue
+        route_lat = _median_lat_vs_ref(world, route_ref, p)
+        if route_lat is None or abs(route_lat) > DIVIDER_ON_ROUTE_BAND_M:
+            continue
+        score = (float(len(world)), conf)
+        if best is None or score > best[0]:
+            best = (score, world, kind, conf, car_lat, route_lat)
+    if best is None:
+        if debug is not None:
+            debug["reason"] = "no_divider_line"
+        return None
+    _score, world, kind, conf, car_lat, route_lat = best
+    # Order the divider near -> far and build its local right-hand normal.
+    order = np.argsort(np.linalg.norm(world - p[None, :], axis=1))
+    line = world[order]
+    if len(line) < 2:
+        return None
+    tang = line[-1] - line[0]
+    L = float(np.linalg.norm(tang))
+    if L < 1e-6:
+        return None
+    tang = tang / L
+    if float(tang @ fwd) < 0.0:          # orient along the travel direction
+        tang = -tang
+    right = np.array([tang[1], -tang[0]])
+    center = line + right[None, :] * float(lane_half_m)
+    off = float(np.median((center - p) @ left_ax))
+    if abs(off) > DIVIDER_MAX_CENTRE_OFFSET_M:
+        if debug is not None:
+            debug["reason"] = f"centre_too_far({off:.2f})"
+        return None
+    side = _median_lat_vs_ref(center, route_ref, p)
+    if side is None or float(side) > -0.2:
+        if debug is not None:
+            debug["reason"] = ("side_unmeasurable" if side is None
+                               else f"centre_not_right_of_route({side:.2f})")
+        return None
+    frac, n_obs = _drivable_fraction(center, grid)
+    if n_obs < 3 or frac < DIVIDER_DRIVABLE_MIN_FRAC:
+        if debug is not None:
+            debug["reason"] = (f"centre_off_drivable(obs={n_obs},"
+                               f"frac={frac:.2f})")
+        return None
+    if debug is not None:
+        debug.update({"line_lat_car_m": round(car_lat, 2),
+                      "line_lat_route_m": round(route_lat, 2),
+                      "centre_lat_car_m": round(off, 2),
+                      "centre_lat_route_m": round(float(side), 2),
+                      "kind": kind, "conf": round(conf, 2),
+                      "pts": int(len(line)),
+                      "drivable_frac": round(frac, 3),
+                      "drivable_obs": int(n_obs)})
+    return center, line, {"line_lat_car_m": round(car_lat, 2),
+                          "centre_lat_car_m": round(off, 2),
+                          "kind": kind}
+
+
+def _median_lat_vs_ref(pts, ref, pos) -> float | None:
+    """Median signed lateral (left +) of ``pts`` against ``ref``."""
+    arr = np.asarray(pts, dtype=float)[:, :2]
+    r = np.asarray(ref, dtype=float)[:, :2]
+    if len(arr) == 0 or len(r) < 2:
+        return None
+    seg = r[1:] - r[:-1]
+    l2 = np.maximum((seg * seg).sum(axis=1), 1e-12)
+    rel = arr[:, None, :] - r[None, :-1, :]
+    t = np.clip(np.einsum("kmi,mi->km", rel, seg) / l2[None, :], 0.0, 1.0)
+    proj = r[None, :-1, :] + t[..., None] * seg[None, :, :]
+    d = np.linalg.norm(proj - arr[:, None, :], axis=2)
+    bi = np.argmin(d, axis=1)
+    rows = np.arange(len(arr))
+    sy = arr[:, 1] - proj[rows, bi, 1]
+    sx = arr[:, 0] - proj[rows, bi, 0]
+    cross = seg[bi, 0] * sy - seg[bi, 1] * sx
+    val = np.where(cross > 0, 1.0, -1.0) * d[rows, bi]
+    keep = d[rows, bi] <= 25.0
+    if not keep.any():
+        return None
+    return float(np.median(val[keep]))
+
+
+def _drivable_fraction(center, grid) -> tuple[float, int]:
+    """(fraction of sampled centre points on observed-drivable, samples)."""
+    if grid is None or center is None or len(center) < 2:
+        return 0.0, 0
+    drv = getattr(grid, "drivable", None)
+    occ = getattr(grid, "obstacle", None)
+    obs = getattr(grid, "observed", None)
+    if drv is None or not getattr(drv, "any", lambda: False)():
+        return 0.0, 0
+    pts = np.asarray(center, dtype=float)[:, :2]
+    rows, cols, ok = [], [], []
+    for x, y in pts:
+        cell = grid.world_to_cell(float(x), float(y))
+        if cell is None:
+            continue
+        rows.append(int(cell[0]))
+        cols.append(int(cell[1]))
+        ok.append(True)
+    if not ok:
+        return 0.0, 0
+    rr = np.asarray(rows)
+    cc = np.asarray(cols)
+    if obs is not None and getattr(obs, "size", 0) and obs.shape == drv.shape:
+        seen = obs[rr, cc] > 0
+    else:
+        # No observed layer: the drivable mask itself is the evidence.
+        seen = np.ones(len(rr), dtype=bool)
+    if int(seen.sum()) < 3:
+        return 0.0, int(seen.sum())
+    good = drv[rr[seen], cc[seen]] > 0
+    if occ is not None and getattr(occ, "size", 0) and occ.shape == drv.shape:
+        good = np.logical_and(good, occ[rr[seen], cc[seen]] == 0)
+    return float(np.mean(good)), int(seen.sum())
+
+
 @dataclass
 class LaneReference:
     """One tick's lane-keep decision, ready for planner/safety/telemetry."""
@@ -280,16 +481,83 @@ class LaneReference:
     # True when a sensor lane frame existed this tick (the planner Scene
     # keeps a reference for it, unlike the BEV whole-road fallback).
     frame_used: bool = False
+    # --- evidence contract (plan §3.2/§3.3, T02) --------------------
+    # Both boundaries of this reference are real measurements of one
+    # observation.  Only this shape may earn full steering authority.
+    two_sided: bool = False
+    # The observation behind this reference was taken on THIS tick (not
+    # served from a fusion hold / coast / replayed result).
+    fresh_obs: bool = False
+    # At least one published side comes from a prior (mirror / width).
+    inferred: bool = False
     meta: dict = field(default_factory=dict)
+
+    @property
+    def geom_id(self) -> str:
+        """Identity of the FINAL accepted geometry (plan §3.3-4).
+
+        Every consumer of a tick must carry this same id; a planner that
+        reads a different centre than the controller (the slew-limiter
+        divergence) shows up as two different ids instead of as a silent
+        disagreement.  It is a pure function of the geometry, so it cannot
+        drift out of date.
+        """
+        import hashlib
+        h = hashlib.blake2b(digest_size=6)
+        for name, arr in (("c", self.center), ("l", self.left),
+                          ("r", self.right)):
+            if arr is None:
+                h.update(b"none")
+                continue
+            try:
+                a = np.asarray(arr, dtype=float)
+            except Exception:
+                h.update(f"{name}:unreadable".encode())
+                continue
+            h.update((name + str(a.shape)).encode())
+            h.update(np.nan_to_num(a, nan=-999.0).round(3).tobytes())
+        h.update(f"w{float(self.width):.3f}".encode())
+        return h.hexdigest()
+
+    @property
+    def publishable_sensor(self) -> bool:
+        """May this decision be published as a ``sensor`` reference?
+
+        Invariant (plan §3.3-1): an accepted ``sensor`` lateral reference
+        must carry non-empty, finite centre geometry.  A candidate revoked
+        by a gate must be reported unavailable/rejected, never published
+        with ``src=sensor`` and an empty centre - the state that let a
+        withdrawn read keep the perception label.
+
+        Note what this does NOT say: it does not authorise a centre that
+        exists but was withdrawn - the withdrawal clears the geometry
+        (``select_lane_reference``) so the two cannot disagree.
+        """
+        if self.src != SRC_SENSOR:
+            return True
+        if self.center is None:
+            return False
+        try:
+            arr = np.asarray(self.center, dtype=float)
+        except Exception:
+            return False
+        return bool(arr.ndim == 2 and len(arr) >= 3 and arr.shape[1] >= 2
+                    and np.isfinite(arr[:, :2]).all())
 
     @property
     def scene_ref(self) -> np.ndarray | None:
         """The lateral reference the planner Scene may use.
 
         The BEV whole-road centre is deliberately excluded: on a two-way
-        road it IS the centre line the car must never ride.
+        road it IS the centre line the car must never ride.  Every
+        ACCEPTED perception reference reaches the Scene - including the
+        ones built without a raw ``LaneFrame`` (pavement-edge and free
+        corridor fallbacks), which used to be dropped silently by the
+        ``frame_used`` test (plan §3.3-5).
         """
-        if self.map_lane is None and not self.frame_used:
+        if self.center is None:
+            return None
+        if self.src in (SRC_BEV_ROUTE, ""):
             return None
         return self.center
 
@@ -315,6 +583,8 @@ def select_lane_reference(
     warn=None,
     prev_ref=None,
     corridor=None,
+    markings=None,
+    tick_id: int = 0,
 ) -> LaneReference:
     """Decide which lane geometry may steer the car this tick.
 
@@ -409,14 +679,48 @@ def select_lane_reference(
     # boundaries below (never the sensor's own flickering edges).
     lane_rejected = False
     reject_reason = None
+    gate_meta: dict = {}
+    # Divider fallback state (strict mode only; declared here so the
+    # boundary/meta assembly below can read it on every path).
+    _divider = None
+    _divider_dbg: dict = {}
     if lane_frame is not None and (map_lane is not None or strict_lane):
         try:
             from beamng_autopilot.planning.arbiter import (
-                lane_heading_ok, lane_route_turn_ok, lane_side_ok)
+                lane_heading_ok, lane_route_turn_ok, lane_side_ok,
+                lane_side_offset_m)
             # Bearing gate: the lane must HEAD the same way as the route
             # (junction pairing onto a side road is rejected).
             side_bad = False
             corner_bad = False
+            # Where the sensor lane centre sits relative to the route, and
+            # the threshold the side gate will apply.  A refusal is only
+            # reviewable with the number that caused it: without it "the
+            # gate said no" cannot be told apart from a pairing error.
+            try:
+                _side_off = lane_side_offset_m(lane_ref, route_ref, pos)
+            except Exception:
+                _side_off = None
+            _side_limit = (-0.2 if strict_lane
+                           else (-0.4 if lane_mode == "map" else 0.5))
+            gate_meta = {
+                "lane_side_off_m": (None if _side_off is None
+                                    else round(float(_side_off), 3)),
+                "lane_side_limit_m": float(_side_limit),
+                # What the pairing actually produced: a lane-width pair is a
+                # lane read, a road-width one is the whole roadway.
+                "pair_width_m": (round(float(getattr(lane_frame, "width", 0.0)
+                                             or 0.0), 2)
+                                 if lane_frame is not None else None),
+                "pair_span_m": (round(float(getattr(lane_frame, "span_m", 0.0)
+                                            or 0.0), 2)
+                                if lane_frame is not None else None),
+                "pair_conf": (round(float(getattr(lane_frame, "confidence", 0.0)
+                                          or 0.0), 3)
+                              if lane_frame is not None else None),
+                "pair_paired": int(bool(getattr(lane_frame, "paired", False))),
+                "pair_sources": list(getattr(lane_frame, "sources", ()) or ()),
+            }
             if not lane_heading_ok(route_ref, lane_ref, pos, heading,
                                    max_yaw_deg=LANE_HEADING_MAX_YAW_DEG):
                 lane_rejected = True
@@ -469,9 +773,7 @@ def select_lane_reference(
             # the goal.  See gate_on_3.log and the screenshot in
             # docs/reviews/2026-09-20_strict_centerline.md.
             elif not lane_side_ok(
-                    lane_ref, route_ref, pos,
-                    left_max_m=(-0.2 if strict_lane
-                                else (-0.4 if lane_mode == "map" else 0.5))):
+                    lane_ref, route_ref, pos, left_max_m=_side_limit):
                 lane_rejected = True
                 side_bad = True
             if lane_rejected:
@@ -599,6 +901,62 @@ def select_lane_reference(
             and "vision" in tuple(getattr(lane_frame, "sources", ()) or ())
             and _single_conf >= _single_min_conf
             and lane_ref is not None and len(lane_ref) >= 3)
+        # Painted-divider fallback: the car stands on (or beside) the road
+        # centreline, so every whole-road read is refused by the side gate
+        # and a strict car could never leave the line it is stuck on.  A
+        # long solid/dashed marking ON the route is the divider; the own
+        # lane is half a lane to its right, and that centre must itself
+        # pass the side gate and land on observed drivable pavement.
+        if not (sensor_paired and lane_ref is not None and len(lane_ref) >= 3) \
+                and not _single_vision:
+            try:
+                _divider = own_lane_beside_divider(
+                    markings, pos, heading, route_ref, grid,
+                    lane_half_m=0.5 * float(LANE_WIDTH_DEFAULT_M),
+                    debug=_divider_dbg)
+            except Exception as exc:
+                _divider = None
+                _divider_dbg = {"reason": f"divider check failed: {exc}"}
+            if _divider is not None:
+                lane_ref = _divider[0]
+                lane_left = _divider[1]
+                lane_width = float(LANE_WIDTH_DEFAULT_M)
+        # On-pavement gate for EVERY accepted perception lane.  The side
+        # gate answers "which side of the road" but says nothing about
+        # whether the geometry is on the road at all: measured 2026-09-21
+        # a paired vision lane of width 5.24 m was accepted with its
+        # centre 4.22 m right of the road centre - past the right edge of
+        # a ~7 m road - which would have steered the car onto the
+        # shoulder.  The centre must lie where the sensors OBSERVED
+        # drivable surface.  No grid / no observed evidence abstains
+        # (recorded), and the check can only withdraw.
+        _drv_frac, _drv_n = _drivable_fraction(lane_ref, grid)
+        _drv_checked = bool(_drv_n >= 3)
+        if _drv_checked and _drv_frac < DIVIDER_DRIVABLE_MIN_FRAC:
+            _warn(warn, "lane_off_drivable",
+                  f"sensor lane centre off observed pavement "
+                  f"(frac={_drv_frac:.2f}, n={_drv_n})")
+            sensor_paired = False
+            lane_ref = None
+            lane_left = None
+            lane_right = None
+            lane_width = 0.0
+            gate_meta["lane_drivable"] = {
+                "frac": round(float(_drv_frac), 3), "n": int(_drv_n),
+                "reason": "centre off observed pavement"}
+            # The revocation must kill the pre-gate booleans too.  Both
+            # single-edge and divider fallbacks below re-publish the SAME
+            # frame's geometry, so leaving them set re-labelled a revoked
+            # candidate as ``sensor`` with an empty centre (plan §2.2-B,
+            # §3.3-2: never restore a source from a cached pre-veto flag).
+            _single_vision = False
+            _divider = None
+        elif lane_ref is not None:
+            gate_meta["lane_drivable"] = {
+                "frac": (round(float(_drv_frac), 3) if _drv_checked else None),
+                "n": int(_drv_n),
+                "reason": ("" if _drv_checked
+                           else "not enough observed samples")}
         if sensor_paired and lane_ref is not None and len(lane_ref) >= 3:
             lane_src_sel = SRC_SENSOR
         elif _single_vision:
@@ -606,6 +964,9 @@ def select_lane_reference(
             lane_left = getattr(lane_frame, "left", None)
             lane_right = getattr(lane_frame, "right", None)
             lane_width = float(getattr(lane_frame, "width", 0.0) or 0.0)
+        elif _divider is not None:
+            lane_src_sel = SRC_SENSOR
+            lane_right = None
         elif (paved_fallback and paved_ref is not None
               and getattr(paved_ref, "center", None) is not None
               and len(paved_ref.center) >= 3):
@@ -667,8 +1028,15 @@ def select_lane_reference(
     boundaries = bool(
         (lane_frame is not None and getattr(lane_frame, "paired", False))
         or lane_src_sel == SRC_PAVED
-        or map_lane is not None)
-    meta: dict = {}
+        or map_lane is not None
+        # The divider IS a detected painted edge, so the lane it implies
+        # publishes it as a real hard boundary (no-cross authority).
+        or (_divider is not None and lane_src_sel == SRC_SENSOR))
+    meta: dict = dict(gate_meta)
+    if _divider_dbg:
+        meta["lane_divider"] = _divider_dbg
+        if _divider is not None:
+            meta["lane_from"] = "divider_right_shift"
     if lane_rejected and reject_reason is not None:
         meta["lane_reject_reason"] = reject_reason
     if src_published:
@@ -715,7 +1083,7 @@ def select_lane_reference(
                                                      SRC_BEV_ROUTE)
         except Exception as exc:
             meta["lane_geom_error"] = str(exc)
-    return LaneReference(
+    ref_out = LaneReference(
         center=center,
         left=lane_left,
         right=lane_right,
@@ -728,5 +1096,35 @@ def select_lane_reference(
         strict=strict_lane,
         boundaries=boundaries,
         frame_used=bool(lane_frame is not None),
+        # Evidence provenance, read from the frame that was actually
+        # accepted (plan §3.3-6): ``paired`` alone is not enough - the
+        # painted centre line sets it while its right edge is a width
+        # prior, so ``two_sided_measured`` is the consumer-facing flag.
+        two_sided=bool(lane_frame is not None
+                       and getattr(lane_frame, "two_sided_measured", False)),
+        fresh_obs=bool(
+            lane_frame is not None and tick_id
+            and int(getattr(lane_frame, "obs_seq", 0) or 0) == int(tick_id)),
+        inferred=bool(lane_frame is not None
+                      and getattr(lane_frame, "inferred", False)),
         meta=meta,
     )
+    if not ref_out.publishable_sensor:
+        # Fail-closed backstop, independent of which branch produced the
+        # inconsistency: a ``sensor`` label without usable centre geometry
+        # is reported unavailable instead of steering anything (plan
+        # §3.3-1).  The geometry fields are cleared with it so no consumer
+        # can act on half a decision.
+        meta["lane_ref_invariant"] = (
+            "sensor source with empty/invalid centre -> unavailable")
+        ref_out.src = SRC_UNAVAILABLE
+        ref_out.src_published = True
+        ref_out.map_lane = None
+        ref_out.center = None
+        ref_out.left = None
+        ref_out.right = None
+        ref_out.width = 0.0
+        ref_out.boundaries = False
+        meta["lane_src_sel"] = SRC_UNAVAILABLE
+        meta["lane_src"] = _LABEL_BY_SRC.get(SRC_UNAVAILABLE, SRC_BEV_ROUTE)
+    return ref_out
