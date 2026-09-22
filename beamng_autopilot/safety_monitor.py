@@ -141,6 +141,28 @@ ROAD_LOST_STOP_S = 8.0
 ROAD_SURFACE_GATE_ENABLED = (
     os.environ.get("BEAMNG_ROAD_SURFACE_GATE", "0") != "0")
 
+# --- body drivable coverage (review handoff P1-3) ----------------------
+# The boundary route to "is the car off the pavement" is blind when no
+# boundary is published (``road_off`` returns 0 for BOTH "inside" and
+# "unmeasured" - the state the crash run was in).  This gate asks the
+# drivable mask instead, over the car's own footprint.  Thresholds: half
+# the OBSERVED footprint must be drivable; degrade after a second of
+# sustained "observed and not drivable", fail closed after three.
+# ``unknown`` (too little evidence) pauses the clock rather than clearing
+# it: not on-road, and not proof of off-road either.  Default OFF - the
+# thresholds come from one scenario and the interaction with the rule
+# fallback is unmeasured.
+BODY_COV_DEGRADE_S = 1.0
+BODY_COV_STOP_S = 3.0
+BODY_COV_CREEP_MPS = 1.5
+# A single tick may add at most this much to the confirmed-off-pavement
+# clock.  A slow tick (measured p95 ~0.85 s, and much worse when the
+# perception loop blocks) must not fabricate seconds of "confirmed" from
+# one measurement: the state was observed once, not for six seconds.
+BODY_COV_MAX_STEP_S = 1.0
+BODY_COVERAGE_GATE_ENABLED = (
+    os.environ.get("BEAMNG_BODY_COVERAGE_GATE", "0") != "0")
+
 # P2.3: use the structured feasibility answer instead of the bool.
 # Default OFF - the lateral model is kinematics, P2.2 has not calibrated
 # it, and turning this on is a behaviour change that has to earn that.
@@ -178,24 +200,16 @@ PATH_HOLD_MIN_LEN_M = 6.0     # minimum usable offered trajectory length
 # crossings and CURRENT body crossings keep the hard stop.
 
 # --- arbitration chain observability (plan P1) ------------------------
-# `_evaluate_core` returns on the FIRST rule that fires, so `reason` names
-# one rule and the rest of the chain never runs that tick.  Reading the
-# reason alone hides two things a failure review needs:
-#
-#   * which rules were never even evaluated (they sit AFTER the winner),
-#   * whether a SOFT winner masked a HARD rule further down - "scattered
-#     obstacle" (degraded, keep rolling) returns before the road-surface
-#     and body-cross rules, which are stops.  A run whose last frame says
-#     "scattered obstacle" therefore says nothing about those.
-#
-# The order below is the order the chain evaluates them; it is the only
-# thing that makes "unevaluated" meaningful, so it must track the code.
+# Soft rules accumulate caps; they never skip a later hard check.  The
+# trace records the rule predicates actually visited, including the final
+# obstacle-risk layer.  A rule's position alone is not coverage evidence.
 ARBITRATION_RULES: tuple[str, ...] = (
     "stale_sensor_planner",          # degraded
     "path_hold",                     # degraded
     "no_drivable_path",              # minimal_risk
     "perception_lane_unavailable",   # minimal_risk
     "road_surface",                  # degraded | minimal_risk
+    "body_off_pavement",             # degraded | minimal_risk
     "path_blocked",                  # minimal_risk
     "scattered_obstacle",            # degraded
     "path_grazes",                   # degraded
@@ -204,7 +218,8 @@ ARBITRATION_RULES: tuple[str, ...] = (
     "body_crosses_boundary",         # minimal_risk
     "path_off_lane",                 # minimal_risk
     "path_near_lane_edge",           # degraded
-    "obstacle_very_close",           # degraded
+    "obstacle_very_close",           # safe | degraded
+    "obstacle_risk",                 # safe | degraded | minimal_risk
 )
 
 # Worst level each rule can impose.  "road_surface" is listed at its worst
@@ -215,6 +230,7 @@ RULE_WORST_LEVEL: dict[str, str] = {
     "no_drivable_path": "minimal_risk",
     "perception_lane_unavailable": "minimal_risk",
     "road_surface": "minimal_risk",
+    "body_off_pavement": "minimal_risk",
     "path_blocked": "minimal_risk",
     "scattered_obstacle": "degraded",
     "path_grazes": "degraded",
@@ -224,6 +240,7 @@ RULE_WORST_LEVEL: dict[str, str] = {
     "path_off_lane": "minimal_risk",
     "path_near_lane_edge": "degraded",
     "obstacle_very_close": "degraded",
+    "obstacle_risk": "minimal_risk",
 }
 
 # reason string -> rule id.  The chain already writes a distinguishing
@@ -236,15 +253,20 @@ _REASON_TO_RULE: dict[str, str] = {
     "perception lane unavailable": "perception_lane_unavailable",
     "perceived road surface lost": "road_surface",
     "off perceived road surface": "road_surface",
+    "car body observed off the pavement": "body_off_pavement",
+    "car body observed off the pavement (creep)": "body_off_pavement",
     "path blocked by obstacle": "path_blocked",
     "scattered obstacle": "scattered_obstacle",
     "path grazes obstacle": "path_grazes",
     "lane boundary recovery": "lane_boundary_recovery",
     "planned boundary crossing ahead": "planned_boundary_crossing",
     "current vehicle body crosses lane boundary": "body_crosses_boundary",
+    "planned vehicle body crosses lane boundary": "body_crosses_boundary",
     "path off-lane": "path_off_lane",
     "path near lane edge": "path_near_lane_edge",
     "obstacle very close": "obstacle_very_close",
+    "obstacle contact risk": "obstacle_risk",
+    "obstacle stopping distance": "obstacle_risk",
 }
 
 
@@ -308,36 +330,24 @@ def rule_for_reason(reason: str | None) -> str | None:
     return _REASON_TO_RULE.get(reason)
 
 
-def arbitration_outcome(fired: str | None) -> dict:
-    """What one tick's arbitration did, given the rule that won.
+def arbitration_outcome(fired: str | None, *, evaluated=None,
+                        level: str | None = None) -> dict:
+    """Describe actual rule visits, never infer coverage from a reason.
 
-    ``evaluated`` is the winner plus everything before it (all of which
-    ran and did not fire).  ``unevaluated`` is everything after it - those
-    rules produced no verdict this tick, and a report that says "no rule
-    fired" about them would be reading absence as safety.
-    ``masked_hard`` is the subset of ``unevaluated`` that can impose a
-    STOP while the winner is only a slowdown: the winner's reason is then
-    not the whole story.
+    An absent trace is unknown.  ``masked_hard`` flags hard checks still
+    unvisited when a soft verdict is returned; it uses the ACTUAL level,
+    since the road rule can be either a slowdown or a stop.
     """
-    if fired is None:
-        return {"effective": None,
-                "evaluated": list(ARBITRATION_RULES),
-                "unevaluated": [],
-                "masked_hard": []}
-    if fired not in ARBITRATION_RULES:
-        # Unknown rule: nothing downstream is claimed to have been
-        # evaluated, because the position in the chain is not known.
+    if evaluated is None:
         return {"effective": fired, "evaluated": [], "unevaluated": [],
                 "masked_hard": []}
-    i = ARBITRATION_RULES.index(fired)
-    evaluated = list(ARBITRATION_RULES[:i + 1])
-    unevaluated = list(ARBITRATION_RULES[i + 1:])
-    winner = RULE_WORST_LEVEL.get(fired, "degraded")
+    visited = list(dict.fromkeys(evaluated))
+    unevaluated = [r for r in ARBITRATION_RULES if r not in visited]
     masked = []
-    if winner != "minimal_risk":
+    if fired in ARBITRATION_RULES and level != "minimal_risk":
         masked = [r for r in unevaluated
                   if RULE_WORST_LEVEL.get(r) == "minimal_risk"]
-    return {"effective": fired, "evaluated": evaluated,
+    return {"effective": fired, "evaluated": visited,
             "unevaluated": unevaluated, "masked_hard": masked}
 
 
@@ -350,7 +360,10 @@ class SafetyVerdict:
     target_speed: float = 0.0
     # structured diagnostics
     path_occupied_frac: float = 0.0
-    lane_dev_m: float = 0.0
+    # ``None`` = no lateral reference (or no path) to measure against.
+    # It is deliberately NOT 0.0: "unmeasurable" and "perfectly aligned"
+    # must not be the same number in the telemetry.
+    lane_dev_m: float | None = None
     closest_obs_m: float = 999.0
     stale_sensor: bool = False
     stale_planner: bool = False
@@ -372,24 +385,25 @@ class SafetyVerdict:
     # ``road_lost_s`` is how long the band has been missing (0.0 when it
     # is present) - the quantity the two thresholds compare against.
     #
-    # ``road_checked`` says whether the reader ran AT ALL.  The two
-    # defaults above are the same values a consulted-but-evidence-less
-    # read produces, so without this flag an early return ("no drivable
-    # path", "stale sensor", "perception lane unavailable" - all of which
-    # happen BEFORE the road check) published ``unknown`` + ``0.0`` and
-    # was indistinguishable from "the road is fine".  The 2026-09-20
-    # gate runs hit exactly that: ``town_1789890286`` reports two
-    # ``unknown`` frames whose reason is ``no drivable path``, i.e. the
-    # band was never read.  Read ``road_lost_s`` ONLY together with
-    # ``road_checked``.
+    # ``road_checked`` distinguishes a fresh read (including UNKNOWN)
+    # from missing/stale evidence.  Unread frames retain the last loss
+    # duration and interrupt recovery confirmation, never reset it.
     road_surface: str = ROAD_SURFACE_UNKNOWN
+    # Body-on-pavement coverage from the drivable mask (P1-3): the state,
+    # the fraction of the OBSERVED footprint that is drivable, how many
+    # cells that fraction came from, and how long the state has been
+    # "observed and not drivable".
+    body_cov_status: str = ""
+    body_cov_frac: float | None = None
+    body_cov_observed: int = 0
+    body_cov_footprint: int = 0
+    body_cov_observed_frac: float | None = None
+    body_cov_low_s: float = 0.0
+    body_cov_checked: bool = False
     road_lost_s: float = 0.0
     road_checked: bool = False
-    # Which arbitration rule won, and what that left unanswered.  The
-    # chain returns on the first rule that fires, so ``reason`` names one
-    # rule; these three say which rules ran, which never got the chance,
-    # and which of those could have imposed a STOP (see ARBITRATION_RULES).
-    # Empty lists mean "not computed", not "no rules apply".
+    # The rule that set the final verdict and the predicates actually
+    # visited.  Empty lists mean "not computed", not "all checks passed".
     effective_rule: str | None = None
     rules_evaluated: list = field(default_factory=list)
     rules_unevaluated: list = field(default_factory=list)
@@ -424,6 +438,13 @@ class SafetyVerdict:
     risk_kind: str = ""
     min_ttc_s: float | None = None
     risk_closest_m: float | None = None
+    # Why the risk layer stopped the car, and how many objects it graded
+    # into each class: a stop on one terrain speck and a stop on a
+    # confirmed object look identical in ``risk_kind`` alone.
+    risk_stop: bool = False
+    risk_n_braking: int = 0
+    risk_n_roadside: int = 0
+    risk_n_unknown: int = 0
 
     @property
     def safe(self) -> bool:
@@ -697,6 +718,8 @@ class SafetyMonitor:
         self.road_lost_degrade_s = float(road_lost_degrade_s)
         self.road_lost_stop_s = float(road_lost_stop_s)
         # ``None`` follows the module switch; tests pin it explicitly.
+        # ``None`` follows the module switch; tests pin it explicitly.
+        self.body_coverage_gate = bool(BODY_COVERAGE_GATE_ENABLED)
         self.road_surface_gate = (
             bool(ROAD_SURFACE_GATE_ENABLED) if road_surface_gate is None
             else bool(road_surface_gate))
@@ -711,6 +734,14 @@ class SafetyMonitor:
         # Last loss value actually READ, published (with checked=False)
         # on frames the band could not be read at all.
         self._road_lost_last: float = 0.0
+        # Body-coverage clock (P1-3), ACCUMULATED rather than derived from
+        # "now - first_seen": ``unknown`` must PAUSE it, and a wall-clock
+        # difference keeps growing while the car is blind.  ``last_t`` is
+        # the reference instant; ``accum_s`` only grows on off_road ticks.
+        self._body_cov_accum_s: float = 0.0
+        self._body_cov_last_t: float | None = None
+        self._body_cov_last: dict = {}
+        self._road_off_pending = False
         self.road_recover_confirm_s = ROAD_RECOVER_CONFIRM_S
         # Bounded PATH_HOLD state (plan phase B): the last verified
         # trajectory, re-servable inside its hold window when a tick
@@ -804,16 +835,20 @@ class SafetyMonitor:
         """
         return lateral_reference(scene)
 
-    def _lane_deviation(self, scene, path) -> tuple[float, str]:
+    def _lane_deviation(self, scene, path) -> tuple[float | None, str]:
         """(median lateral distance from the lane ref, ref source).
 
-        The source is ``REF_NONE`` when there is no reference to measure
-        against at all; a strict scene with no perception lane yields
-        that, and ``evaluate`` turns it into a minimal-risk stop.
+        ``None`` when there is nothing to measure against: no reference,
+        no path, or no projectable samples.  It used to return 0.0 in all
+        three cases, which is indistinguishable from "the path lies
+        exactly on the reference" - the same "missing value read as a
+        healthy number" failure the review handoff calls out.  Callers
+        must treat ``None`` as unmeasured (the strict gate already stops
+        the car on ``REF_NONE``), never as "aligned".
         """
         ref, src = self._lane_reference(scene)
         if ref is None or path is None or len(path) < 2:
-            return 0.0, src
+            return None, src
         path = np.asarray(path, dtype=float)[:, :2]
         pos = np.asarray(scene.pos[:2], dtype=float)
         d0 = np.linalg.norm(path - pos, axis=1)
@@ -822,14 +857,14 @@ class SafetyMonitor:
             near = path[: min(4, len(path))]
         offs = polyline_point_distances(near, ref)
         if not len(offs):
-            return 0.0, src
+            return None, src
         return float(np.median(offs)), src
 
     # ------------------------------------------------------------------
     def evaluate(self, scene, path, closed_loop_steer: float = 0.0,
                  snapshot_age_s: float = 0.0, planner_age_s: float = 0.0,
                  now_s: float | None = None,
-                 ego_speed_mps: float = 0.0) -> SafetyVerdict:
+                 ego_speed_mps: float | None = None) -> SafetyVerdict:
         """Arbitrate one tick.
 
         ``scene`` is a ``planning.Scene`` (occupancy grid + route/lane).
@@ -848,9 +883,15 @@ class SafetyMonitor:
         to cap.
         """
         v = self._evaluate_core(scene, path, closed_loop_steer,
-                                snapshot_age_s, planner_age_s, now_s)
-        return self._apply_obstacle_risk(v, scene, path,
-                                         float(ego_speed_mps))
+                                snapshot_age_s, planner_age_s, now_s,
+                                ego_speed_mps)
+        risk_path = v.held_path if v.path_hold_active else path
+        v.rules_evaluated.append("obstacle_risk")
+        # Keep the legacy stationary risk estimate for callers without
+        # speed; missing speed never authorizes the corridor escape hatch.
+        risk_speed = 0.0 if ego_speed_mps is None else float(ego_speed_mps)
+        v = self._apply_obstacle_risk(v, scene, risk_path, risk_speed)
+        return self._finish(v)
 
     def _apply_obstacle_risk(self, v: SafetyVerdict, scene, path,
                              ego_speed_mps: float) -> SafetyVerdict:
@@ -868,10 +909,18 @@ class SafetyMonitor:
         risk = assess_obstacles(
             tracks, scene.pos, float(scene.heading), float(ego_speed_mps),
             corridor_half_m=EASE_CORRIDOR_HALF_WIDTH_M,
-            path=(path if path is not None and len(path) >= 2 else None))
+            path=(path if path is not None and len(path) >= 2 else None),
+            # The fused occupancy corroborates a contact-band return: two
+            # sources disagreeing at contact distance must not park the car
+            # on the weaker one alone.
+            grid=getattr(scene, "grid", None))
         if risk.items:
             v.risk_kind = str(risk.kind)
             v.min_ttc_s = risk.min_ttc_s
+            v.risk_stop = bool(risk.stop)
+            v.risk_n_braking = int(risk.n_braking)
+            v.risk_n_roadside = int(risk.n_roadside)
+            v.risk_n_unknown = int(risk.n_unknown)
             v.risk_closest_m = (None if not math.isfinite(risk.closest_m)
                                 else float(risk.closest_m))
         if v.level == "minimal_risk":
@@ -880,134 +929,163 @@ class SafetyMonitor:
             v.level = "minimal_risk"
             v.reason = "obstacle contact risk"
             v.target_speed = 0.0
+            v.effective_rule = "obstacle_risk"
             return v
         if math.isfinite(risk.target_speed_cap):
-            v.target_speed = min(v.target_speed,
-                                 float(risk.target_speed_cap))
+            cap = float(risk.target_speed_cap)
+            if cap < v.target_speed:
+                v.target_speed = cap
+                v.effective_rule = "obstacle_risk"
+                v.reason = "obstacle stopping distance"
             if v.target_speed <= 0.0 and v.level == "safe":
                 v.level = "degraded"
-                v.reason = "obstacle stopping distance"
         return v
 
-    def _corridor_feasibility(self, scene):
-        """The P2.1 answer for this scene, or UNKNOWN if it cannot be had.
+    def _corridor_feasibility(self, scene, *, ego_speed_mps=None,
+                              closest_obs_m=None, bev_age_s=None):
+        """Use explicit current-tick inputs, or keep UNKNOWN closed.
 
-        An exception here is UNKNOWN, never True: the failure mode being
-        fixed is precisely a gate that opened the escape hatch when it
-        could not see.
+        Production Scene has no speed_mps/closest_obs_m/bev_age_s fields.
+        The caller owns those measurements; absent values are not zero
+        speed or fresh evidence.
         """
         from beamng_autopilot.planning.corridor_feasibility import (
-            UNKNOWN as FEAS_UNKNOWN,
             CorridorFeasibility,
             corridor_feasibility,
         )
-        try:
-            speed = float(getattr(scene, "speed_mps", 0.0) or 0.0)
-        except (TypeError, ValueError):
-            speed = 0.0
-        closest = getattr(scene, "closest_obs_m", None)
-        try:
-            closest = (None if closest is None else float(closest))
-        except (TypeError, ValueError):
-            closest = None
-        if closest is not None and (
-                not math.isfinite(closest)
-                or closest >= CLOSEST_NO_OBSTACLE_SENTINEL):
-            # 999 is how the logs write "no obstacle detected".  It is a
-            # sentinel, not a distance: as a required distance it would
-            # make every band look too short, and as a proximity it would
-            # be an obstacle a kilometre away.
+        res = CorridorFeasibility(evidence={"source": "bev"})
+        values = {}
+        for name, value in (("ego_speed_mps", ego_speed_mps),
+                            ("closest_obs_m", closest_obs_m),
+                            ("age_s", bev_age_s)):
+            try:
+                number = float(value)
+            except (TypeError, ValueError):
+                res.reason = f"{name} missing or unreadable"
+                return res
+            if not math.isfinite(number) or number < 0.0:
+                res.reason = f"{name} invalid"
+                return res
+            values[name] = number
+        res.evidence.update(values)
+        closest = values["closest_obs_m"]
+        if closest >= CLOSEST_NO_OBSTACLE_SENTINEL:
             closest = None
         try:
             return corridor_feasibility(
-                scene, ego_speed_mps=speed, required_distance_m=closest,
-                evidence={"source": "bev",
-                          "age_s": getattr(scene, "bev_age_s", None)})
+                scene, ego_speed_mps=values["ego_speed_mps"],
+                required_distance_m=closest, evidence=res.evidence)
         except Exception as exc:
-            res = CorridorFeasibility()
-            res.state = FEAS_UNKNOWN
             res.reason = f"feasibility failed: {exc}"
             return res
 
-    def _finish(self, v: "SafetyVerdict") -> "SafetyVerdict":
-        """Stamp the arbitration chain's provenance onto a verdict.
+    @staticmethod
+    def _cap_verdict(v: "SafetyVerdict", cap: float, reason: str,
+                     *, level: str = "degraded", rule: str | None = None):
+        """Accumulate a soft limit without relaxing an earlier verdict."""
+        if v.level == "minimal_risk":
+            return
+        cap = min(v.target_speed, float(cap))
+        if cap < v.target_speed or (v.level == "safe" and level == "degraded"):
+            v.reason = reason
+            v.effective_rule = rule or rule_for_reason(reason)
+        v.target_speed = cap
+        if level == "degraded":
+            v.level = "degraded"
 
-        EVERY exit of :meth:`_evaluate_core` goes through here.  Behaviour
-        is unchanged - this fills three fields - because the alternative
-        (a reason string per branch) is what made a soft winner look like
-        the whole story: "scattered obstacle" returns before the two rules
-        that stop the car, and nothing recorded that they never ran.
-        """
-        oc = arbitration_outcome(rule_for_reason(v.reason))
+    def _finish(self, v: "SafetyVerdict") -> "SafetyVerdict":
+        """Publish explicit coverage and the actual winning rule."""
+        fired = v.effective_rule or rule_for_reason(v.reason)
+        oc = arbitration_outcome(fired, evaluated=v.rules_evaluated,
+                                 level=v.level)
         v.effective_rule = oc["effective"]
         v.rules_evaluated = oc["evaluated"]
         v.rules_unevaluated = oc["unevaluated"]
         v.masked_hard_rules = oc["masked_hard"]
         return v
 
-    def _road_surface_gate(self, scene,
-                           now_s: float | None) -> tuple[str, float, bool]:
-        """As documented below, plus whether the reader actually ran.
+    def _road_surface_gate(self, scene, now_s: float | None, *,
+                           fresh: bool = True) -> tuple[str, float, bool]:
+        """Return raw road state, loss duration, and fresh-read coverage.
 
-        A scene with no grid never calls the reader, so its UNKNOWN is
-        "not checked" and must not be published as "checked, no answer" -
-        that was the exact shape of the 2026-09-20 false reading, where a
-        defaulted ``unknown`` was indistinguishable from a healthy one.
-        """
-        """Perceived road-surface state plus how long it has not been ON.
-
-        Returns ``(state, lost_s)``.  ``state`` is one of the
-        ``lane.perception_guard`` road-surface constants; ``lost_s`` is
-        0.0 while the band says the car is on the road, and the elapsed
-        time since it last did otherwise.
-
-        A scene with NO grid reports UNKNOWN but does NOT start the clock.
-        "This configuration builds no BEV at all" is a different failure
-        from "the BEV says nothing about the road": the pipeline-level
-        staleness rules own the former, and a grid-less scene would
-        otherwise stop the car after ``road_lost_stop_s`` with road
-        evidence never having existed.  A grid that EXISTS but carries no
-        road surface is the 2026-09-20 case, and that one does start it.
+        Missing/stale grids freeze the published loss value, but interrupt
+        an ON confirmation.  When evidence resumes, elapsed loss is still
+        measured from its original start, not from a fabricated recovery.
         """
         grid = getattr(scene, "grid", None)
         now = time.time() if now_s is None else float(now_s)
-        if grid is None:
-            # Not checked - so neither a recovery nor a new loss.  The
-            # old code cleared the clock here, which made an intermittent
-            # grid indistinguishable from the road coming back: one frame
-            # without a BEV reset a loss that had been running for
-            # seconds.  Freezing is the honest answer - it publishes the
-            # last reading and says it was not re-read.
+        if grid is None or not fresh:
+            self._road_last_on_s = None
             return ROAD_SURFACE_UNKNOWN, float(self._road_lost_last), False
         try:
             state, _bands = perceived_road_state(grid, HALF_WIDTH_M)
         except Exception:
-            # A grid without the layers the reader needs is unknown, not
-            # "on the road" - the same rule the rest of this module uses.
             state = ROAD_SURFACE_UNKNOWN
         (self._road_lost_since, self._road_last_on_s,
          lost_s) = road_loss_timer(
              state, now, self._road_lost_since, self._road_last_on_s,
              confirm_s=self.road_recover_confirm_s)
+        if state == ROAD_SURFACE_OFF:
+            self._road_off_pending = True
+        elif state == ROAD_SURFACE_ON and self._road_lost_since is None:
+            self._road_off_pending = False
         self._road_lost_last = lost_s
         return state, lost_s, True
+
+    def _body_coverage_gate(self, scene, now_s: float | None, *,
+                            fresh: bool = True) -> tuple[str, float, bool]:
+        """Body-on-pavement coverage from the drivable mask (P1-3).
+
+        Returns ``(status, low_s, checked)``.  ``low_s`` is how long the
+        footprint has been OBSERVED and mostly not drivable; ``unknown``
+        pauses that clock (no evidence neither confirms nor clears it) and
+        a stale read pauses it too, so a blind stretch is recorded but does
+        not by itself stop the car - the road-surface gate owns that case.
+
+        ``unknown`` is also the answer whenever the sensors observed too
+        little of the footprint (``observed_frac``).  With the ring's front
+        camera the nearest visible ground is ~2.4 m ahead of the ego
+        centre, so the body rectangle is mostly blind and the few cells it
+        does stamp are the fringe of the blind zone, where the road mask
+        reads "not road" - a verdict taken from those cells called a car on
+        open pavement ``off_road``.  ``BODY_COV_MIN_OBS_FRAC`` refuses that
+        sample; the measured ``observed_frac`` is published either way.
+        """
+        from beamng_autopilot.occupancy import body_drivable_coverage
+
+        now = time.time() if now_s is None else float(now_s)
+        grid = getattr(scene, "grid", None)
+        if grid is None or not fresh:
+            return ("", float(self._body_cov_last.get("low_s", 0.0)), False)
+        try:
+            rep = body_drivable_coverage(
+                grid, scene.pos, float(scene.heading),
+                HALF_LENGTH_M, HALF_WIDTH_M)
+        except Exception:
+            return ("", float(self._body_cov_last.get("low_s", 0.0)), False)
+        status = str(rep.get("status", ""))
+        prev_t = self._body_cov_last_t
+        dt = (0.0 if prev_t is None
+              else min(float(BODY_COV_MAX_STEP_S), max(0.0,
+                                                        now - float(prev_t))))
+        if status == "on_road":
+            self._body_cov_accum_s = 0.0
+        elif status == "off_road":
+            self._body_cov_accum_s += dt
+        # ``unknown``: accumulate nothing, but move the reference instant so
+        # the blind time is not charged to the next off_road stretch.
+        self._body_cov_last_t = now
+        low_s = float(self._body_cov_accum_s)
+        self._body_cov_last = {"status": status, "low_s": low_s, **rep}
+        return (status, low_s, True)
 
     def _evaluate_core(self, scene, path, closed_loop_steer: float = 0.0,
                        snapshot_age_s: float = 0.0,
                        planner_age_s: float = 0.0,
-                       now_s: float | None = None) -> SafetyVerdict:
-        """The layered arbitration proper (see :meth:`evaluate`)."""
+                       now_s: float | None = None,
+                       ego_speed_mps: float | None = None) -> SafetyVerdict:
+        """Evaluate hard checks even after a soft limit has fired."""
         closed_loop_steer = float(closed_loop_steer)
-        path_occ = self._path_occupied_fraction(scene, path)
-        lane_dev, lane_ref_src = self._lane_deviation(scene, path)
-        body_cross, cross_idx, cross_side = body_lane_cross_detail_m(
-            scene, path,
-            half_len=HALF_LENGTH_M + BODY_CROSS_MARGIN_M,
-            half_width=HALF_WIDTH_M + BODY_CROSS_MARGIN_M)
-        body_now_cross = body_pose_crosses_lane(
-            scene, scene.pos, float(scene.heading),
-            half_len=HALF_LENGTH_M + BODY_CROSS_MARGIN_M,
-            half_width=HALF_WIDTH_M + BODY_CROSS_MARGIN_M)
         freshness = _perception_freshness(scene, snapshot_age_s)
         # ``sensor_age`` stays the honest max over every modality for
         # telemetry; the stale decision separates three different things:
@@ -1021,6 +1099,22 @@ class SafetyMonitor:
                 and float(range_age) > STALE_RANGE_S)
             or float(snapshot_age_s or 0.0) > STALE_PIPELINE_S)
         stale_planner = planner_age_s > self.stale_s
+        served = None
+        if (path is None or len(path) < 2) and not stale_sensor and not stale_planner:
+            served = self._serve_hold(
+                scene, time.time() if now_s is None else float(now_s))
+            if served is not None:
+                path = served[0]
+        path_occ = self._path_occupied_fraction(scene, path)
+        lane_dev, lane_ref_src = self._lane_deviation(scene, path)
+        body_cross, cross_idx, cross_side = body_lane_cross_detail_m(
+            scene, path,
+            half_len=HALF_LENGTH_M + BODY_CROSS_MARGIN_M,
+            half_width=HALF_WIDTH_M + BODY_CROSS_MARGIN_M)
+        body_now_cross = body_pose_crosses_lane(
+            scene, scene.pos, float(scene.heading),
+            half_len=HALF_LENGTH_M + BODY_CROSS_MARGIN_M,
+            half_width=HALF_WIDTH_M + BODY_CROSS_MARGIN_M)
 
         closest = 999.0
         if scene.grid is not None and path is not None and len(path) > 1:
@@ -1070,84 +1164,93 @@ class SafetyMonitor:
             v.crossing_path_index = int(cross_idx)
             v.crossing_boundary_side = str(cross_side)
 
-        # --- stale sensors / planner -> degrade to minimal risk --------
+        v.rules_evaluated.append("stale_sensor_planner")
         if stale_sensor or stale_planner:
-            v.level = "degraded"
-            v.reason = f"stale {'sensor' if stale_sensor else 'planner'}"
-            v.target_speed = min(v.target_speed, self.min_risk_speed * 2.0)
-            return self._finish(v)
+            self._cap_verdict(
+                v, self.min_risk_speed * 2.0,
+                f"stale {'sensor' if stale_sensor else 'planner'}")
 
-        # --- path missing -> bounded hold, else minimal risk -----------
-        # A single frame without a path used to demand an instant full
-        # stop, which produced the stop/restart churn of short perception
-        # dropouts (17 stops in 40 s, 2026-09-19 live).  A path the
-        # monitor JUST verified may be re-served for the bounded hold
-        # window - re-checked against the CURRENT scene first - and the
-        # hold decays to a creep before failing closed to a stop.
-        if path is None or len(path) < 2:
-            served = self._serve_hold(
-                scene, time.time() if now_s is None else float(now_s))
-            if served is not None:
-                held_path, hold_age, hold_phase, hold_cap = served
-                v.level = "degraded"
-                v.reason = f"path hold ({hold_phase})"
-                v.target_speed = hold_cap
-                v.path_hold_active = True
-                v.path_hold_age_s = float(hold_age)
-                v.path_hold_phase = str(hold_phase)
-                v.held_path = held_path
-                return self._finish(v)
-            v.level = "minimal_risk"
-            v.reason = "no drivable path"
-            v.target_speed = 0.0
-            return self._finish(v)
+        v.rules_evaluated.append("path_hold")
+        if served is not None:
+            held_path, hold_age, hold_phase, hold_cap = served
+            self._cap_verdict(v, hold_cap, f"path hold ({hold_phase})")
+            v.path_hold_active = True
+            v.path_hold_age_s = float(hold_age)
+            v.path_hold_phase = str(hold_phase)
+            v.held_path = held_path
 
-        # --- strict perception: no sensor lane -> fail closed -----------
-        # A real FSD does not keep driving off the HD map when it cannot
-        # see the lane; it degrades.  Never measure lateral position
-        # against the nav route in strict mode.
-        if lane_ref_src == REF_NONE \
-                and getattr(scene, "strict_perception", False):
-            v.level = "minimal_risk"
-            v.reason = "perception lane unavailable"
-            v.target_speed = 0.0
-            return self._finish(v)
-
-        # --- perceived road surface -------------------------------------
-        # The boundaries the car actually receives (``lat_left`` /
-        # ``lat_right``) were absent on 82-99% of the 2026-09-20 town
-        # frames, so "how far past a DETECTED boundary" could not answer
-        # "am I still on the road" - it read 0.0 m while the car finished
-        # 6.96 m past the pavement edge.  This asks the drivable band
-        # instead (see the module constants) and treats its silence as
-        # UNKNOWN rather than as a safe state.
-        #
-        # Graded on purpose: positive evidence that the car is off the
-        # perceived road degrades at once (the band is read 2-12 m AHEAD,
-        # so a bend can slide it sideways - a crawl is recoverable, a
-        # stop on a hairpin is not), and only SUSTAINED loss fails closed.
+        # Road evidence belongs to the tick, not to whether a candidate
+        # exists.  An unavailable/stale read cannot confirm recovery.
         road_state, road_lost_s, road_checked = self._road_surface_gate(
-            scene, now_s)
+            scene, now_s, fresh=not stale_sensor)
         v.road_surface = road_state
         v.road_lost_s = road_lost_s
-        # True only when the reader actually ran, so the pair above is
-        # evidence rather than a default.  Every earlier return, and a
-        # scene with no grid, leave this False on purpose.
         v.road_checked = road_checked
-        if self.road_surface_gate and road_state != ROAD_SURFACE_ON:
+
+        # Body-on-pavement coverage (P1-3): measured every tick (so the
+        # A/B has the number), acted on only under its switch.
+        body_status, body_low_s, body_checked = self._body_coverage_gate(
+            scene, now_s, fresh=not stale_sensor)
+        _bc = dict(self._body_cov_last)
+        v.body_cov_status = body_status
+        v.body_cov_frac = _bc.get("coverage")
+        v.body_cov_observed = int(_bc.get("observed_cells", 0) or 0)
+        v.body_cov_footprint = int(_bc.get("footprint_cells", 0) or 0)
+        v.body_cov_observed_frac = _bc.get("observed_frac")
+        v.body_cov_low_s = round(float(body_low_s), 2)
+        v.body_cov_checked = bool(body_checked)
+
+        v.rules_evaluated.append("no_drivable_path")
+        if path is None or len(path) < 2:
+            v.level = "minimal_risk"
+            v.reason = "no drivable path"
+            v.effective_rule = "no_drivable_path"
+            v.target_speed = 0.0
+            return self._finish(v)
+
+        # A fresh, revalidated hold is the existing bounded exception to
+        # a missing current lane.  It still passes every hard check below.
+        v.rules_evaluated.append("perception_lane_unavailable")
+        if lane_ref_src == REF_NONE \
+                and getattr(scene, "strict_perception", False) \
+                and not v.path_hold_active:
+            v.level = "minimal_risk"
+            v.reason = "perception lane unavailable"
+            v.effective_rule = "perception_lane_unavailable"
+            v.target_speed = 0.0
+            return self._finish(v)
+
+        v.rules_evaluated.append("road_surface")
+        road_pending = (road_state != ROAD_SURFACE_ON
+                        or self._road_lost_since is not None)
+        if self.road_surface_gate and road_pending:
             if road_lost_s >= self.road_lost_stop_s:
                 v.level = "minimal_risk"
                 v.reason = "perceived road surface lost"
+                v.effective_rule = "road_surface"
                 v.target_speed = 0.0
                 return self._finish(v)
-            if road_state == ROAD_SURFACE_OFF \
+            if self._road_off_pending \
                     or road_lost_s >= self.road_lost_degrade_s:
-                v.level = "degraded"
-                v.reason = ("off perceived road surface"
-                            if road_state == ROAD_SURFACE_OFF
-                            else "perceived road surface lost")
-                v.target_speed = min(v.target_speed, self.min_risk_speed)
+                self._cap_verdict(
+                    v, self.min_risk_speed,
+                    "off perceived road surface" if self._road_off_pending
+                    else "perceived road surface lost")
+
+        # --- body coverage (P1-3) ---------------------------------------
+        v.rules_evaluated.append("body_off_pavement")
+        if self.body_coverage_gate and body_status == "off_road":
+            if body_low_s >= float(BODY_COV_STOP_S):
+                v.level = "minimal_risk"
+                v.reason = "car body observed off the pavement"
+                v.effective_rule = "body_off_pavement"
+                v.target_speed = 0.0
                 return self._finish(v)
+            if body_low_s >= float(BODY_COV_DEGRADE_S):
+                self._cap_verdict(
+                    v, float(BODY_COV_CREEP_MPS),
+                    "car body observed off the pavement (creep)",
+                    rule="body_off_pavement")
 
         # --- occupancy --------------------------------------------------
         corridor_open = False
@@ -1156,10 +1259,9 @@ class SafetyMonitor:
                 # P2.1 answers the question the escape hatch actually
                 # asks.  Default OFF: the numbers are kinematics, and
                 # P2.2 has not calibrated them yet.
-                from beamng_autopilot.planning.corridor_feasibility import (
-                    corridor_feasibility,
-                )
-                _feas = self._corridor_feasibility(scene)
+                _feas = self._corridor_feasibility(
+                    scene, ego_speed_mps=ego_speed_mps,
+                    closest_obs_m=closest, bev_age_s=freshness["bev_age_s"])
                 corridor_open = _feas.feasible
                 v.corridor_state = _feas.state
                 v.corridor_reason = _feas.reason
@@ -1172,88 +1274,70 @@ class SafetyMonitor:
                     corridor_open = False
                 v.corridor_state = ("feasible" if corridor_open
                                     else "infeasible")
+                v.corridor_reason = (
+                    "legacy corridor boolean; structured feasibility disabled")
+                v.corridor_evidence = {"method": "legacy_bool", "enabled": False}
         else:
             # No grid: the old gate returned True here, i.e. the scene it
             # could not read at all was the one that authorised cruise.
             v.corridor_state = "unknown"
         v.corridor_open = corridor_open
+        v.rules_evaluated.append("path_blocked")
         if path_occ >= self.occ_stop and not corridor_open:
             v.level = "minimal_risk"
             v.reason = "path blocked by obstacle"
+            v.effective_rule = "path_blocked"
             v.target_speed = 0.0
             return self._finish(v)
-        if path_occ >= self.occ_degrade:
-            if corridor_open:
-                # Connectivity says a free lateral band exists: scattered
-                # roadside/guardrail occupancy is a soft speed cap, not a
-                # path-graze failure.  A closed corridor still takes the
-                # hard path-graze branch below.
-                v.level = "degraded"
-                v.reason = "scattered obstacle"
-                v.target_speed = min(
-                    v.target_speed,
-                    self.max_speed * self.corridor_open_floor)
-                return self._finish(v)
-            v.level = "degraded"
-            v.reason = "path grazes obstacle"
-            v.target_speed = min(v.target_speed,
-                                 self.min_risk_speed * 2.5)
-            return self._finish(v)
+        v.rules_evaluated.append("scattered_obstacle")
+        if path_occ >= self.occ_degrade and corridor_open:
+            self._cap_verdict(v, self.max_speed * self.corridor_open_floor,
+                              "scattered obstacle")
+        v.rules_evaluated.append("path_grazes")
+        if path_occ >= self.occ_degrade and not corridor_open:
+            self._cap_verdict(v, self.min_risk_speed * 2.5,
+                              "path grazes obstacle")
 
-        # --- lane keep --------------------------------------------------
-        # Full-body envelope is a hard safety condition: a path whose
-        # centre is inside but whose projected corner crosses a boundary
-        # must stop before steering it (not merely degrade its speed).
-        if body_now_cross or body_cross > 0.0:
-            if body_now_cross and lane_ref_src == REF_SENSOR \
-                    and body_lane_cross_recovery(
-                        scene, path,
-                        half_len=HALF_LENGTH_M + BODY_CROSS_MARGIN_M,
-                        half_width=HALF_WIDTH_M + BODY_CROSS_MARGIN_M):
-                # The car already sits across the line.  The current-pose
-                # flag alone refuses EVERY path - including the one that
-                # steers it back - so the car froze in the crossing and
-                # the stuck detector then armed a reverse escape (live
-                # east_coast 2026-09-18).  A path that CONVERGES is the
-                # legal recovery, exactly as the centreline gate already
-                # allows (``lane_cross_dist_m``); it is capped to a creep,
-                # and a path that keeps or deepens the crossing still
-                # takes the hard stop below.
-                v.level = "degraded"
-                v.reason = "lane boundary recovery"
-                v.target_speed = min(v.target_speed,
-                                     self.min_risk_speed * 0.5)
-                return self._finish(v)
-            if not body_now_cross \
-                    and body_cross >= config.FSD_PLANNED_CROSS_HARD_M:
-                # Far-field PLANNED crossing (plan C1): the current body
-                # is clean and the first violation is still ahead - cap
-                # the speed and let the next tick re-plan instead of a
-                # full stop.  The crossing distance shrinks as the car
-                # advances, so a persistent crossing still converges to
-                # the hard stop below; only a far-end boundary-fit
-                # artefact gets smoothed out.
-                v.level = "degraded"
-                v.reason = "planned boundary crossing ahead"
-                v.target_speed = min(v.target_speed,
-                                     self.min_risk_speed * 2.0)
-                return self._finish(v)
+        # Keep the existing positive, sensor-derived convergence exception;
+        # neither stale evidence nor a soft road/obstacle cap can authorize it.
+        v.rules_evaluated.append("lane_boundary_recovery")
+        recovery = bool(
+            body_now_cross and lane_ref_src == REF_SENSOR
+            and not stale_sensor and not stale_planner
+            and body_lane_cross_recovery(
+                scene, path,
+                half_len=HALF_LENGTH_M + BODY_CROSS_MARGIN_M,
+                half_width=HALF_WIDTH_M + BODY_CROSS_MARGIN_M))
+        if recovery:
+            self._cap_verdict(v, self.min_risk_speed * 0.5,
+                              "lane boundary recovery")
+        v.rules_evaluated.append("planned_boundary_crossing")
+        far_crossing = bool(
+            not body_now_cross
+            and body_cross >= config.FSD_PLANNED_CROSS_HARD_M)
+        if far_crossing:
+            self._cap_verdict(v, self.min_risk_speed * 2.0,
+                              "planned boundary crossing ahead")
+        v.rules_evaluated.append("body_crosses_boundary")
+        if (body_now_cross or body_cross > 0.0) and not recovery and not far_crossing:
             v.level = "minimal_risk"
             v.reason = ("current vehicle body crosses lane boundary"
                         if body_now_cross
                         else "planned vehicle body crosses lane boundary")
+            v.effective_rule = "body_crosses_boundary"
             v.target_speed = 0.0
             return self._finish(v)
-        if lane_dev >= self.lane_stop_m:
+        v.rules_evaluated.append("path_off_lane")
+        if lane_dev is not None and lane_dev >= self.lane_stop_m:
             v.level = "minimal_risk"
             v.reason = "path off-lane"
+            v.effective_rule = "path_off_lane"
             v.target_speed = 0.0
             return self._finish(v)
-        if lane_dev >= self.lane_degrade_m:
-            v.level = "degraded"
-            v.reason = "path near lane edge"
-            v.target_speed = min(v.target_speed, self.min_risk_speed * 3.0)
-            return self._finish(v)
+        v.rules_evaluated.append("path_near_lane_edge")
+        if lane_dev is not None and lane_dev >= self.lane_degrade_m:
+            self._cap_verdict(v, self.min_risk_speed * 3.0,
+                              "path near lane edge")
 
         # --- obstacle approach speed ------------------------------------
         # A corridor-intruding obstacle AHEAD of the ego eases speed; a
@@ -1261,6 +1345,7 @@ class SafetyMonitor:
         # degrades/stops.  Roadside walls/trees beside the lane are lane
         # bounds and never touch this band (they used to pin the car to
         # the 2 m/s creep on every tree-lined road - run 2026-08-27).
+        v.rules_evaluated.append("obstacle_very_close")
         if closest < 8.0:
             # ease speed as the closest obstacle closes in (brake band)
             k = max(0.0, 1.0 - (8.0 - closest) / 6.0)
@@ -1285,8 +1370,8 @@ class SafetyMonitor:
             else:
                 # Real forward blockage: keep the creep / stop reserve.
                 eased = max(eased, self.min_risk_speed)
-            v.target_speed = min(v.target_speed, eased)
-            if not corridor_open and v.target_speed < 1.0:
-                v.level = "degraded"
-                v.reason = "obstacle very close"
+            self._cap_verdict(
+                v, eased, "obstacle very close",
+                level="degraded" if not corridor_open and eased < 1.0
+                else "safe", rule="obstacle_very_close")
         return self._finish(v)

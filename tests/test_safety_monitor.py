@@ -464,23 +464,20 @@ def test_road_surface_present_keeps_the_verdict_safe() -> None:
         assert v.target_speed == pytest.approx(12.0)
 
 
-def test_a_return_before_the_road_check_is_not_reported_as_checked() -> None:
-    """``unknown`` + ``0.0`` must not be readable as "the road is fine".
-
-    ``_evaluate_core`` returns on "no drivable path" BEFORE it reads the
-    band, so the pair keeps its dataclass defaults.  Without the flag
-    that is byte-identical to a consulted-but-evidence-less read, which
-    is what the 2026-09-20 gate runs published (``town_1789890286``,
-    frames 99-100: ``road_surface=unknown``, ``road_lost_s=0.0``,
-    reason ``no drivable path``).
-    """
+def test_road_observation_is_not_skipped_when_no_path_exists() -> None:
     mon = SafetyMonitor(max_speed=12.0, road_surface_gate=True)
     v = mon.evaluate(_road_scene(), None, now_s=0.0)
     assert v.reason == "no drivable path"
-    assert v.road_surface == "unknown"
+    assert v.road_surface == "on_road"
     assert v.road_lost_s == 0.0
-    # ... and this is the whole point: the reader never ran.
-    assert v.road_checked is False
+    assert v.road_checked is True
+    assert v.target_speed == 0.0
+
+    mon.evaluate(_scene(), None, now_s=1.0)
+    v = mon.evaluate(_scene(), _straight(), now_s=10.0)
+    assert v.reason == "perceived road surface lost"
+    assert v.road_lost_s == 9.0
+    assert v.target_speed == 0.0
 
 
 def test_the_road_check_is_flagged_on_a_grid_with_no_evidence() -> None:
@@ -626,3 +623,120 @@ def test_grid_less_scene_reports_unknown_without_starting_the_clock() -> None:
         assert v.road_surface == "unknown"
         assert v.road_lost_s == 0.0
         assert v.safe
+
+
+@pytest.mark.parametrize("crossing", ["current", "planned", "off_lane"])
+@pytest.mark.parametrize("soft", ["scattered", "graze", "stale", "road"])
+def test_soft_verdict_cannot_mask_a_hard_lane_rule(crossing, soft):
+    scene = _scene()
+    path = _straight()
+    if crossing == "current":
+        scene.lane_right = np.array([[-10., -0.5], [30., -0.5]])
+    elif crossing == "planned":
+        scene.lane_left = np.array([[-10., 1.5], [30., 1.5]])
+        path[:, 1] = 0.55
+    else:
+        scene.lane_ref[:, 1] = 7.0
+    if soft == "scattered":
+        scene.grid.mark_obstacle_region(12., float(path[-1, 1]), 3., 0.2)
+    elif soft == "graze":
+        for x in (7.75, 11.25, 14.75):
+            scene.grid.mark_obstacle_region(x, 0., 0.05, 20.)
+    mon = SafetyMonitor(max_speed=6., road_surface_gate=(soft == "road"),
+                        occ_fraction_degrade=0.05, occ_fraction_stop=0.9)
+    if soft == "road":
+        mon.evaluate(scene, path, now_s=0.)
+    v = mon.evaluate(scene, path, now_s=5.,
+                     snapshot_age_s=2. if soft == "stale" else 0.)
+    assert v.level == "minimal_risk"
+    assert v.target_speed == 0.0
+    rule = "path_off_lane" if crossing == "off_lane" else "body_crosses_boundary"
+    assert v.effective_rule == rule
+    assert rule in v.rules_evaluated
+    if soft in ("scattered", "graze"):
+        assert v.path_occupied_frac >= mon.occ_degrade
+        assert v.corridor_open is (soft == "scattered")
+
+
+@pytest.mark.parametrize("stale", [False, True])
+def test_road_slowdown_cannot_mask_a_blocked_path(stale):
+    scene = _scene(obs_at=(4., 0.), obs_half=50.)
+    mon = SafetyMonitor(max_speed=6., road_surface_gate=True)
+    mon.evaluate(scene, _straight(), now_s=0.)
+    v = mon.evaluate(scene, _straight(), now_s=5.,
+                     snapshot_age_s=2. if stale else 0.)
+    assert v.level == "minimal_risk"
+    assert v.target_speed == 0.
+    assert v.reason == "path blocked by obstacle"
+
+
+def test_stale_verdict_does_not_authorize_a_missing_path():
+    v = SafetyMonitor(max_speed=6.).evaluate(
+        _scene(), None, snapshot_age_s=2.)
+    assert v.level == "minimal_risk"
+    assert v.reason == "no drivable path"
+    assert v.target_speed == 0.
+
+
+def test_scattered_obstacles_preserve_the_convergence_recovery_cap():
+    scene = _scene()
+    scene.pos = np.array([10., 3.])
+    scene.heading = math.radians(18.)
+    scene.lane_left = np.array([[0., 4.], [30., 4.]])
+    scene.lane_right = np.array([[0., -4.], [30., -4.]])
+    scene.grid.mark_obstacle_region(14., 3., 0.4, 0.2)
+    path = np.column_stack([np.linspace(10., 15., 21), np.full(21, 3.)])
+    mon = SafetyMonitor(max_speed=6., occ_fraction_degrade=0.01,
+                        occ_fraction_stop=0.9)
+    v = mon.evaluate(scene, path)
+    assert v.path_occupied_frac >= mon.occ_degrade
+    assert v.corridor_open
+    assert v.level == "degraded"
+    assert v.reason == "lane boundary recovery"
+    assert v.target_speed == 1.
+    assert v.masked_hard_rules == []
+
+
+def test_road_stop_remains_until_on_confirmation_completes():
+    mon = SafetyMonitor(max_speed=6., road_surface_gate=True)
+    mon.road_recover_confirm_s = 2.
+    mon.evaluate(_scene(), _straight(), now_s=0.)
+    assert mon.evaluate(_scene(), _straight(), now_s=9.).target_speed == 0.
+    v = mon.evaluate(_road_scene(), _straight(), now_s=9.1)
+    assert v.road_surface == "on_road"
+    assert v.road_lost_s == pytest.approx(9.1)
+    assert v.target_speed == 0.
+    assert v.level == "minimal_risk"
+    v = mon.evaluate(_road_scene(), _straight(), now_s=11.2)
+    assert v.road_lost_s == 0.
+    assert v.target_speed == 6.
+
+
+def test_off_road_crawl_remains_during_unconfirmed_recovery():
+    mon = SafetyMonitor(max_speed=6., road_surface_gate=True)
+    mon.road_recover_confirm_s = 2.
+    mon.evaluate(_road_scene(y_lo=2.5, y_hi=8.), _straight(), now_s=0.)
+    v = mon.evaluate(_road_scene(), _straight(), now_s=0.1)
+    assert v.road_surface == "on_road"
+    assert v.level == "degraded"
+    assert v.target_speed == mon.min_risk_speed
+
+
+def test_stale_on_read_cannot_clear_an_existing_road_stop():
+    mon = SafetyMonitor(max_speed=6., road_surface_gate=True)
+    mon.evaluate(_scene(), _straight(), now_s=0.)
+    mon.evaluate(_scene(), _straight(), now_s=9.)
+    v = mon.evaluate(_road_scene(), _straight(), now_s=10., snapshot_age_s=2.)
+    assert v.road_checked is False
+    assert v.road_lost_s == 9.
+    assert v.level == "minimal_risk"
+    assert v.target_speed == 0.
+
+
+def test_contact_risk_updates_the_final_trace_winner():
+    v = SafetyMonitor(max_speed=6.).evaluate(
+        _monitor_scene([_track(2., 0., matches=1)]), _straight())
+    assert v.effective_rule == "obstacle_risk"
+    assert "obstacle_risk" in v.rules_evaluated
+    assert v.level == "minimal_risk"
+    assert v.masked_hard_rules == []
