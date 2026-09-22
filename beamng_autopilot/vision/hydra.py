@@ -80,6 +80,11 @@ class FrameContext:
     role: str = "front_main"
     # Capture time in seconds; None uses monotonic time for live callers.
     timestamp: float | None = None
+    # Per-source frame counter for THIS camera (plan §3.2/T03).  It is what
+    # lets an evidence accumulator tell "a new capture" from "the same
+    # capture processed again", whatever the processing time did.  None =
+    # the caller does not track sequences.
+    seq: int | None = None
 
 
 class HydraHead(Protocol):

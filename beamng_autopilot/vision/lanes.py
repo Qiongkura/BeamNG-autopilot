@@ -161,7 +161,7 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
                       ground_z: float | None = None,
                       min_area: int | None = None, min_height: int | None = None,
                       max_dist: float = 45.0, solid_len: float = 6.0,
-                      debug: dict | None = None
+                      debug: dict | None = None, rotation=None
                       ) -> list[LaneMarking]:
     """Turn a binary mask into LaneMarking polylines (shared pipeline).
 
@@ -179,8 +179,6 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
     ``kinds``.
     """
     import cv2
-
-    from beamng_autopilot.vision.detection import back_project
 
     if min_area is None or min_height is None:
         # Yellow centre paint on US maps is often thin/faded; keep more
@@ -253,23 +251,26 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
         xs = xs[order].astype(float)
         ys = ys[order].astype(float)
         step = max(1, int(len(xs) // 36))
-        world: list[tuple[float, float]] = []
-        pixels: list[tuple[float, float]] = []
-        for u, v in zip(xs[::step], ys[::step]):
-            wp = back_project(float(u), float(v), cam_model,
-                              pos, heading, ground_z=ground_z)
-            if wp is None:
-                continue
-            dist = math.hypot(wp[0] - p[0], wp[1] - p[1])
-            if dist < 2.0 or dist > max_dist:
-                continue
-            world.append(wp)
-            pixels.append((float(u), float(v)))
-        if len(world) < 4:
+        # One camera-pose build per component, with the same pixel order.
+        us, vs = xs[::step], ys[::step]
+        # Only pass the attitude when there IS one: duck-typed projection
+        # implementations (tests, alternate back-ends) keep working
+        # unchanged, and the level-pose path stays byte-identical.
+        if rotation is None:
+            world, valid = _back_project_many(
+                us, vs, cam_model, pos, heading, ground_z)
+        else:
+            world, valid = _back_project_many(
+                us, vs, cam_model, pos, heading, ground_z, rotation=rotation)
+        # Preserve scalar rounding at the inclusive distance thresholds.
+        dist = np.fromiter((math.hypot(wp[0] - p[0], wp[1] - p[1])
+                            for wp in world), dtype=float, count=len(world))
+        valid &= (dist >= 2.0) & (dist <= max_dist)
+        wpts = world[valid]
+        ppts = np.column_stack([us, vs])[valid]
+        if len(wpts) < 4:
             _drop(x, w, "too_few_world_pts", h, area, i)
             continue
-        wpts = np.asarray(world, dtype=float)
-        ppts = np.asarray(pixels, dtype=float)
         # Sort along the dominant world direction so a diagonal
         # line becomes a clean polyline instead of a zig-zag.
         wpts, ppts, span, world_len, perp_span = \
@@ -286,23 +287,16 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
             # The raw component is too wide in world space, but the
             # median-x skeleton may still be a real painted line.
             core, widths = _row_core_points(ys, xs)
-            core_world: list[tuple[float, float]] = []
-            core_pixels: list[tuple[float, float]] = []
-            for cu, cv in core:
-                wp = back_project(float(cu), float(cv), cam_model,
-                                  pos, heading, ground_z=ground_z)
-                if wp is None:
-                    continue
-                dist = math.hypot(wp[0] - p[0], wp[1] - p[1])
-                if dist < 2.0 or dist > max_dist:
-                    continue
-                core_world.append(wp)
-                core_pixels.append((float(cu), float(cv)))
-            if len(core_world) >= 4:
+            core_world, core_valid = _back_project_many(
+                core[:, 0], core[:, 1], cam_model, pos, heading, ground_z)
+            core_dist = np.fromiter(
+                (math.hypot(wp[0] - p[0], wp[1] - p[1]) for wp in core_world),
+                dtype=float, count=len(core_world))
+            core_valid &= (core_dist >= 2.0) & (core_dist <= max_dist)
+            if int(np.count_nonzero(core_valid)) >= 4:
                 c_wpts, c_ppts, c_span, c_len, c_perp = \
                     _order_world_polyline(
-                        np.asarray(core_world, dtype=float),
-                        np.asarray(core_pixels, dtype=float))
+                        core_world[core_valid], core[core_valid])
                 row_w_med = (float(np.median(widths))
                              if len(widths) else 0.0)
                 row_w_p90 = (float(np.percentile(widths, 90.0))
@@ -414,7 +408,8 @@ def group_world_fragments(frags, *, gap_max_m: float = DASHED_FRAG_GAP_MAX_M,
     return [g for g in groups.values() if len(g) >= 2]
 
 
-def _back_project_many(us, vs, cam_model, pos, heading, ground_z):
+def _back_project_many(us, vs, cam_model, pos, heading, ground_z,
+                       rotation=None, pitch_rad: float = 0.0):
     """Ground-plane world points for many pixels in one pass.
 
     ``back_project`` rebuilds the camera pose on every call, and that pose
@@ -424,6 +419,12 @@ def _back_project_many(us, vs, cam_model, pos, heading, ground_z):
     intersection with the same guards - but the pose is built once for the
     whole batch.
 
+    ``rotation`` (the vehicle quaternion) and ``pitch_rad`` (a pure camera
+    tilt about its right axis) are the T05 attitude inputs; with neither,
+    the plane is intersected from a level, yaw-only pose.  They are applied
+    separately on purpose: the vehicle's attitude and the mount's tilt are
+    different physical quantities.
+
     Returns ``(points, ok)`` where ``points`` is (N, 2) with NaNs where the
     ray missed and ``ok`` the boolean mask of hits.
     """
@@ -431,7 +432,18 @@ def _back_project_many(us, vs, cam_model, pos, heading, ground_z):
     vs = np.asarray(vs, dtype=float)
     if us.size == 0:
         return np.empty((0, 2)), np.zeros(0, dtype=bool)
-    C, r, f, u_axis = cam_model.camera_pose(pos, heading)
+    if rotation is None:
+        # Duck-typed camera models (tests, alternate back-ends) implement
+        # the two-argument pose; never hand them a keyword they never had.
+        C, r, f, u_axis = cam_model.camera_pose(pos, heading)
+    else:
+        C, r, f, u_axis = cam_model.camera_pose(pos, heading, rotation)
+    if abs(float(pitch_rad)) > 1e-12:
+        cp, sp = np.cos(float(pitch_rad)), np.sin(float(pitch_rad))
+        f2 = f * cp + u_axis * (-sp)
+        u2 = u_axis * cp + f * sp
+        f = f2 / np.linalg.norm(f2)
+        u_axis = u2 / np.linalg.norm(u2)
     d = (r[None, :] * ((us - cam_model.cx) / cam_model.fx)[:, None]
          + f[None, :]
          + u_axis[None, :] * ((cam_model.cy - vs) / cam_model.fy)[:, None])

@@ -15,6 +15,7 @@ Output masks are consumed by the existing geometry pipeline:
 from __future__ import annotations
 
 from pathlib import Path
+import time
 
 import cv2
 import numpy as np
@@ -129,8 +130,51 @@ def fill_interior_holes(mask: np.ndarray) -> np.ndarray:
     return np.maximum(m, holes.astype(np.uint8)).astype(bool)
 
 
+# A line COMPONENT is kept whole when at least this share of its pixels
+# lie on the (dilated) road region, and dropped when it lies mostly off
+# it.  Measured 2026-09-21 on a hand-labeled town frame: the one real
+# centre line was 60% inside the road mask (its far end outruns it) while
+# five model-invented lines were 100% inside and matched the human label
+# 0% - a pixel-wise intersection therefore deleted 40% of the real line
+# and none of the false ones, dropping line IoU from 0.42 (raw) to 0.22.
+LINE_ROAD_KEEP_FRAC = 0.5
+# Second tier: a line-SHAPED stroke (long and thin) is kept down to this
+# inside-fraction.  Chosen on 40 held-out hand-labeled frames, not on one.
+LINE_ROAD_ELONGATED_FRAC = 0.25
+# How much of the road mask must survive at all for the constraint to run.
+LINE_ROAD_MIN_MASK_FRAC = 0.005
+
+
+def filter_line_shape(line: np.ndarray) -> np.ndarray:
+    """Stage 4: keep line components that look like paint, not specks.
+
+    A real painted line (including a dashed fragment) is a long thin
+    stroke; texture / shadow specks are small blobs.  A component is kept
+    when it is big enough (``_LINE_MIN_AREA_PX``) or clearly elongated.
+    """
+    line = np.asarray(line, dtype=bool)
+    if not line.any():
+        return line
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(
+        line.astype(np.uint8), 8)
+    keep = np.zeros_like(line)
+    for i in range(1, n):
+        x, y, cw, ch, area = stats[i]
+        long_side = max(cw, ch)
+        short_side = min(cw, ch)
+        if area >= _LINE_MIN_AREA_PX or (
+                long_side >= 20 and short_side >= 2
+                and long_side >= 2.5 * short_side):
+            keep[labels == i] = True
+    return keep
+
+
 def constrain_line_to_road(line: np.ndarray, road: np.ndarray,
-                           ksize: int = 7) -> np.ndarray:
+                           ksize: int = 7,
+                           keep_frac: float = LINE_ROAD_KEEP_FRAC,
+                           elongated_frac: float | None =
+                           LINE_ROAD_ELONGATED_FRAC,
+                           ) -> np.ndarray:
     """Keep the line pixels that lie on the road surface.
 
     The model calls bright paint NOT asphalt, so the road mask carries
@@ -145,14 +189,67 @@ def constrain_line_to_road(line: np.ndarray, road: np.ndarray,
     holes are filled before the containment test.  The false lines this
     constraint exists for - grass edges, walls, stones - sit OUTSIDE the
     road region and are still rejected.
+
+    The test is per COMPONENT, not per pixel: a line that runs off the
+    end of the road mask keeps its whole stroke (the mask simply stopped),
+    while a stroke lying mostly off the road - grass edge, kerb, stone -
+    is dropped even if a few of its pixels touch the road.  See
+    ``LINE_ROAD_KEEP_FRAC`` for the measurement that forced this.
+
+    ``elongated_frac=None`` disables the second tier completely (only
+    components reaching ``keep_frac`` survive).  A NUMERIC value is the
+    lower bound the second tier allows, so ``0.0`` is not an off-switch -
+    it lets every component through that tier (plan T01).
     """
     m = np.asarray(line, dtype=bool)
     if not m.any():
         return m
-    rd = fill_interior_holes(np.asarray(road, dtype=bool)).astype(np.uint8)
+    road_b = np.asarray(road, dtype=bool)
+    if float(road_b.mean()) < LINE_ROAD_MIN_MASK_FRAC:
+        # No usable road evidence at all: the constraint cannot judge.
+        return m
+    rd = fill_interior_holes(road_b).astype(np.uint8)
     rd = cv2.dilate(rd, cv2.getStructuringElement(
-        cv2.MORPH_RECT, (int(ksize), int(ksize))))
-    return m & rd.astype(bool)
+        cv2.MORPH_RECT, (int(ksize), int(ksize)))).astype(bool)
+    # Rows the road mask never reached are not evidence about anything: a
+    # line whose far end runs past the mask's own horizon must not be
+    # judged on that end, or a model that predicts the line further than
+    # the road loses every stroke (measured 2026-09-21: one checkpoint's
+    # whole line output scored 0.43 raw and vanished entirely under a
+    # plain per-component fraction).
+    rows_known = rd.any(axis=1)
+    n, labels, _stats, _ = cv2.connectedComponentsWithStats(
+        m.astype(np.uint8), 8)
+    keep = np.zeros_like(m)
+    for i in range(1, n):
+        comp = labels == i
+        judged = comp & rows_known[:, None]
+        n_judged = int(judged.sum())
+        if n_judged <= 0:
+            keep |= comp          # nothing in this component can be judged
+            continue
+        inside = float(np.count_nonzero(comp & rd)) / float(n_judged)
+        if inside >= float(keep_frac):
+            keep |= comp
+            continue
+        # Second tier: a clearly LINE-SHAPED stroke that is partly on the
+        # road survives.  Without it a checkpoint whose lines run mostly
+        # just outside the road mask loses its entire output (measured:
+        # components at 0.43 / 0.33 / 0.44 -> line IoU 0.0 where the raw
+        # mask scored 0.43), and paint is exactly the class that runs off
+        # the end of a truncated road mask.
+        if elongated_frac is None:
+            continue                       # tier disabled on purpose
+        if inside < float(elongated_frac):
+            continue
+        ys, xs = np.nonzero(comp)
+        if len(ys) == 0:
+            continue
+        long_side = max(int(xs.max() - xs.min()) + 1, int(ys.max() - ys.min()) + 1)
+        short_side = min(int(xs.max() - xs.min()) + 1, int(ys.max() - ys.min()) + 1)
+        if long_side >= 20 and short_side >= 1 and long_side >= 2.5 * short_side:
+            keep |= comp
+    return keep
 
 
 class SegUNet(nn.Module):
@@ -277,12 +374,17 @@ class Segmenter:
 
     def _infer_logits(self, frame_rgb: np.ndarray):
         """One forward pass: the logits tensor for ``frame_rgb``."""
-        small = cv2.resize(frame_rgb, (_INFER_W, _INFER_H),
-                           interpolation=cv2.INTER_AREA)
-        x = torch.from_numpy(small).permute(2, 0, 1).float().div_(255.0)
-        x = x.unsqueeze(0).to(self.device)
-        if self.half:
-            x = x.half()
+        started = time.perf_counter()
+        try:
+            small = cv2.resize(frame_rgb, (_INFER_W, _INFER_H),
+                               interpolation=cv2.INTER_AREA)
+            x = torch.from_numpy(small).permute(2, 0, 1).float().div_(255.0)
+            x = x.unsqueeze(0).to(self.device)
+            if self.half:
+                x = x.half()
+        finally:
+            self._preprocess_ms = (time.perf_counter() - started) * 1000.0
+        self._inference_started_t = time.perf_counter()
         with torch.no_grad():
             return self.model(x)
 
@@ -295,9 +397,48 @@ class Segmenter:
 
     def predict(self, frame_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Return (road_mask, line_mask) at the input frame resolution."""
-        road, line = self._argmax_masks(self._infer_logits(frame_rgb),
-                                        frame_rgb)
-        return self._postprocess(frame_rgb, road, line)
+        road, line, _ = self._predict_timed(frame_rgb, with_probs=False)
+        return road, line
+
+    def _predict_timed(self, frame_rgb: np.ndarray, *, with_probs: bool):
+        """One inference with bounded, per-call wall-duration measurements.
+
+        ``inference_decode`` ends at the existing CPU mask readback, not
+        the CUDA kernel launch.  No extra device synchronization is added.
+        Unreached stages stay None, including after a failed prediction.
+        """
+        started = time.perf_counter()
+        timing = {name: None for name in (
+            "preprocess", "inference_decode", "postprocess",
+            "probabilities", "total")}
+        self.last_timing_ms = timing
+        self._preprocess_ms = None
+        self._inference_started_t = None
+        try:
+            try:
+                logits = self._infer_logits(frame_rgb)
+                road, line = self._argmax_masks(logits, frame_rgb)
+            finally:
+                timing["preprocess"] = self._preprocess_ms
+                if self._inference_started_t is not None:
+                    timing["inference_decode"] = (
+                        time.perf_counter() - self._inference_started_t) * 1000.0
+            stage_t = time.perf_counter()
+            try:
+                road, line = self._postprocess(frame_rgb, road, line)
+            finally:
+                timing["postprocess"] = (time.perf_counter() - stage_t) * 1000.0
+            maps = None
+            if with_probs:
+                stage_t = time.perf_counter()
+                try:
+                    maps, _, _ = self.predict_proba(frame_rgb, _logits=logits)
+                finally:
+                    timing["probabilities"] = (
+                        time.perf_counter() - stage_t) * 1000.0
+            return road, line, maps
+        finally:
+            timing["total"] = (time.perf_counter() - started) * 1000.0
 
     def _postprocess(self, frame_rgb: np.ndarray, road, line):
         """The existing mask pipeline: soil, morphology, hysteresis, gates."""
@@ -310,28 +451,9 @@ class Segmenter:
             road, frame_rgb,
             route_is_dirt=self.route_is_dirt)
         # 标线掩码形态学清理：去掉孤立噪点、弥合小断裂
-        k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-        line = cv2.morphologyEx(line.astype(np.uint8), cv2.MORPH_CLOSE,
-                                k).astype(bool)
-        # 时序组件滞回：只保留与上一帧标线（小膨胀容忍车体移动）重叠的
-        # 连通域。单帧闪现的假线（草边/阴影/石头）会被丢弃；整帧都无
-        # 稳定组件时（快速转弯/急变场景）保留原结果，避免误清空。这样
-        # 只删不增，不会像补间隙那样把线加粗。
-        if self.temporal_smooth and self._prev_line is not None and line.any() \
-                and self._prev_line.shape == line.shape:
-            k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-            prev_d = cv2.dilate(
-                self._prev_line.astype(np.uint8), k3).astype(bool)
-            n, labels, stats, _ = cv2.connectedComponentsWithStats(
-                line.astype(np.uint8), 8)
-            keep = np.zeros_like(line)
-            for i in range(1, n):
-                comp = labels == i
-                if float(comp[prev_d].mean()) >= 0.3:
-                    keep[comp] = True
-            if keep.any():
-                line = keep
-        self._prev_line = line.copy()
+        line = self._morph_close_line(line)
+        # 时序组件滞回（默认关）：只保留与上一帧标线重叠的连通域
+        line = self._temporal_line_gate(line)
         # 物理约束：标线必须位于路面上。石头/护墙/草地边缘与标线视觉
         # 特征相似，模型常把它们误检为线；这些物体不在沥青路面上，用
         # 膨胀后的路面掩码约束即可滤掉（标线紧贴路面，边缘容忍 ~3px）。
@@ -347,22 +469,38 @@ class Segmenter:
         # kept when it is elongated (major axis much longer than minor) or
         # big enough to be a real marking; scattered specks are dropped.
         line = constrain_line_to_road(line, road)
-        if line.any():
-            n, labels, stats, _ = cv2.connectedComponentsWithStats(
-                line.astype(np.uint8), 8)
-            keep = np.zeros_like(line)
-            for i in range(1, n):
-                x, y, cw, ch, area = stats[i]
-                # 细长判据：连通域包围盒的长边 vs 短边。真实标线（含
-                # 虚线片段）长宽比通常 >= 3；噪点块接近方形。
-                long_side = max(cw, ch)
-                short_side = min(cw, ch)
-                if area >= _LINE_MIN_AREA_PX or (
-                        long_side >= 20 and short_side >= 2
-                        and long_side >= 2.5 * short_side):
-                    keep[labels == i] = True
-            line = keep
+        line = filter_line_shape(line)
         return road, line
+
+    # ------------------------------------------------------------------
+    # The post-processing STAGES as named functions (review handoff P0-3).
+    # The stage evaluator calls these SAME functions, so a per-stage number
+    # in a report cannot drift from what the driving pipeline runs.
+    def _morph_close_line(self, line):
+        """Stage 2: morphological close (bridge breaks, drop isolated px)."""
+        k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        return cv2.morphologyEx(np.asarray(line, dtype=np.uint8),
+                                cv2.MORPH_CLOSE, k).astype(bool)
+
+    def _temporal_line_gate(self, line):
+        """Stage 2b: keep components overlapping the previous frame's line."""
+        line = np.asarray(line, dtype=bool)
+        if not (self.temporal_smooth and self._prev_line is not None
+                and line.any() and self._prev_line.shape == line.shape):
+            self._prev_line = line.copy()
+            return line
+        k3 = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
+        prev_d = cv2.dilate(self._prev_line.astype(np.uint8), k3).astype(bool)
+        n, labels, _stats, _ = cv2.connectedComponentsWithStats(
+            line.astype(np.uint8), 8)
+        keep = np.zeros_like(line)
+        for i in range(1, n):
+            comp = labels == i
+            if float(comp[prev_d].mean()) >= 0.3:
+                keep[comp] = True
+        line = keep if keep.any() else line
+        self._prev_line = line.copy()
+        return line
 
     def predict_proba(self, frame_rgb: np.ndarray, *, _logits=None):
         """Class probability maps at the input frame resolution (plan E1).
@@ -409,12 +547,7 @@ class Segmenter:
         gate on them (plan phase E1) without paying for a second
         inference.
         """
-        logits = self._infer_logits(frame_rgb)
-        road, line = self._argmax_masks(logits, frame_rgb)
-        road, line = self._postprocess(frame_rgb, road, line)
-        maps, _raw_road, _raw_line = self.predict_proba(
-            frame_rgb, _logits=logits)
-        return road, line, maps
+        return self._predict_timed(frame_rgb, with_probs=True)
 
     def reset(self) -> None:
         """Clear image-space hysteresis after a discontinuity."""
@@ -423,7 +556,8 @@ class Segmenter:
     def detect_lines(self, frame_rgb, cam_model, pos, heading,
                      ground_z: float | None = None, *,
                      line_mask: np.ndarray | None = None,
-                     road_mask: np.ndarray | None = None) -> list:
+                     road_mask: np.ndarray | None = None,
+                     rotation=None) -> list:
         """Line mask -> LaneMarking list (reuses the classic pipeline).
 
         The learned line mask is fused with a classic-CV bright-stroke
@@ -475,7 +609,7 @@ class Segmenter:
         if white_mask.any():
             out.extend(_mask_to_markings(
                 white_mask, "white", cam_model, pos, heading,
-                ground_z=ground_z))
+                ground_z=ground_z, rotation=rotation))
             # The shape gates above keep only long strokes, but the town
             # ``line`` class is mostly short blocks (median 17 components
             # per frame, median height 7 px), so a dashed lane line leaves
@@ -511,7 +645,8 @@ class Segmenter:
         if cv_yellow.any():
             for _ymk in _mask_to_markings(
                     cv_yellow.astype(np.uint8) * 255, "yellow",
-                    cam_model, pos, heading, ground_z=ground_z):
+                    cam_model, pos, heading, ground_z=ground_z,
+                    rotation=rotation):
                 # Yellow-paint candidates must be PAINT: linearly
                 # elongated, and lying ON the published road mask.  Live
                 # east_coast 2026-09-19: the classic yellow detector lit

@@ -8,6 +8,8 @@ markings the planner consumes.
 
 from __future__ import annotations
 
+import time
+
 import numpy as np
 
 from ..hydra import FrameContext, TaskOutput
@@ -89,15 +91,25 @@ class SemanticHead:
         return self.lane_detector
 
     def run(self, ctx: FrameContext) -> TaskOutput:
+        started = time.perf_counter()
         out = TaskOutput()
+        stage_ms = {name: None for name in (
+            "prediction", "yellow", "probability_gate", "evidence",
+            "markings", "classification", "total")}
+        out.meta["semantic_ms"] = stage_ms
         h, w = ctx.frame_rgb.shape[:2]
         road = np.ones((h, w), dtype=bool)
         line = np.zeros((h, w), dtype=bool)
         markings: list = []
         prediction_ok = False
         _prob_maps = None
+        seg = None
+        _road_timing_before = _line_timing_before = None
+        _line_ran = False
+        stage_t = time.perf_counter()
         try:
             seg = self._get_segmenter()
+            _road_timing_before = getattr(seg, "last_timing_ms", None)
             if ((SEG_PROB_GATE_ENABLED or SEG_ZONES_ENABLED)
                     and self.line_segmenter is None
                     and hasattr(seg, "predict_with_probs")):
@@ -107,6 +119,9 @@ class SemanticHead:
             else:
                 road, line = seg.predict(ctx.frame_rgb)
             if self.line_segmenter is not None and self.line_segmenter is not seg:
+                _line_timing_before = getattr(
+                    self.line_segmenter, "last_timing_ms", None)
+                _line_ran = True
                 _road_unused, line = self.line_segmenter.predict(ctx.frame_rgb)
                 # those probabilities would belong to the OTHER model
                 _prob_maps = None
@@ -118,6 +133,19 @@ class SemanticHead:
             # has no sensor lane this frame (existing fallback).
             road = np.ones((h, w), dtype=bool)
             line = np.zeros((h, w), dtype=bool)
+        finally:
+            stage_ms["prediction"] = (time.perf_counter() - stage_t) * 1000.0
+            # Copy only timings produced by THIS call, not a stub's old cache.
+            details = {"road": None, "line": None}
+            for name, model, previous, ran in (
+                    ("road", seg, _road_timing_before, seg is not None),
+                    ("line", self.line_segmenter, _line_timing_before, _line_ran)):
+                value = getattr(model, "last_timing_ms", None)
+                if ran and isinstance(value, dict) and value is not previous:
+                    details[name] = {key: value.get(key) for key in (
+                        "preprocess", "inference_decode", "postprocess",
+                        "probabilities", "total")}
+            out.meta["segmentation_ms"] = details
         raw_line = line
         out.meta["line_pixels_raw"] = int(np.count_nonzero(raw_line))
         # US yellow centre paint: UNet is white-line biased; union the HSV
@@ -126,6 +154,7 @@ class SemanticHead:
         import os
         _yellow_prior = None
         if prediction_ok and os.environ.get("BEAMNG_YELLOW_FUSION", "1") != "0":
+            stage_t = time.perf_counter()
             try:
                 from ..yellow_line_mask import yellow_line_mask
                 ym = yellow_line_mask(ctx.frame_rgb)
@@ -134,9 +163,12 @@ class SemanticHead:
                     line = line | _yellow_prior
             except Exception as exc:
                 out.meta.setdefault("line_errors", {})["yellow"] = str(exc)
+            finally:
+                stage_ms["yellow"] = (time.perf_counter() - stage_t) * 1000.0
         out.meta["line_pixels_yellow"] = int(
             np.count_nonzero(line) - np.count_nonzero(raw_line))
         if _prob_maps is not None:
+            stage_t = time.perf_counter()
             # Dual probability gate (plan E1) - or its per-zone form (plan
             # E2) when that switch is on.  Either way a line pixel must
             # clear the line threshold AND sit in road context; the zoned
@@ -172,7 +204,11 @@ class SemanticHead:
                     out.meta["seg_gate_mode"] = "flat"
             except Exception as exc:
                 out.meta.setdefault("line_errors", {})["seg_gate"] = str(exc)
+            finally:
+                stage_ms["probability_gate"] = (
+                    time.perf_counter() - stage_t) * 1000.0
         if prediction_ok and self.enable_evidence and ctx.role == "front_main":
+            stage_t = time.perf_counter()
             try:
                 if self._evidence is None:
                     from ..line_evidence import LineEvidenceAccumulator
@@ -191,7 +227,16 @@ class SemanticHead:
                 if callable(_fuse_conf):
                     line, _ev_info = _fuse_conf(
                         line, ctx.cam, ctx.pos, ctx.heading, ctx.ground_z,
-                        now=ctx.timestamp)
+                        now=ctx.timestamp,
+                        # Source identity (plan §3.2/T03): WHICH camera and
+                        # WHICH capture produced this evidence.  Votes are
+                        # per real observation, so a reprocessed frame adds
+                        # none and two cameras at one instant do not
+                        # double-count a single sighting.
+                        source_id=str(getattr(ctx, "role", "") or "unknown"),
+                        source_seq=getattr(ctx, "seq", None),
+                        capture_t=getattr(ctx, "timestamp", None),
+                        yellow_mask=_yellow_prior)
                     out.meta["line_evidence"] = dict(_ev_info)
                 else:
                     line = self._evidence.fuse(
@@ -201,6 +246,8 @@ class SemanticHead:
                 if self._evidence is not None:
                     self._evidence.reset()
                 out.meta.setdefault("line_errors", {})["evidence"] = str(exc)
+            finally:
+                stage_ms["evidence"] = (time.perf_counter() - stage_t) * 1000.0
         out.meta["line_pixels_added"] = int(np.count_nonzero(line & ~raw_line))
         out.masks["road"] = road
         out.masks["line"] = line
@@ -208,6 +255,7 @@ class SemanticHead:
         # Lane markings in world space (only meaningful on the front
         # camera; other roles leave this empty).
         if ctx.role == "front_main":
+            stage_t = time.perf_counter()
             if prediction_ok:
                 try:
                     _mark_seg = (self.line_segmenter
@@ -215,7 +263,11 @@ class SemanticHead:
                     markings = _mark_seg.detect_lines(
                         ctx.frame_rgb, ctx.cam, ctx.pos, ctx.heading,
                         ground_z=ctx.ground_z, line_mask=line,
-                        road_mask=road)
+                        road_mask=road,
+                        # T05: the real measured attitude, not a level
+                        # pose - the marking world geometry is what the
+                        # lateral reference is built from
+                        rotation=getattr(ctx, "rotation", None))
                     # Preserve the yellow prior's COLOR.  The bool union
                     # above is correct for segmentation, but passing that
                     # union as one mask to ``detect_lines`` labels the
@@ -252,7 +304,9 @@ class SemanticHead:
                                     markings.extend(_mask_to_markings(
                                         _ym.astype(np.uint8) * 255, "yellow",
                                         ctx.cam, ctx.pos, ctx.heading,
-                                        ground_z=ctx.ground_z))
+                                        ground_z=ctx.ground_z,
+                                        rotation=getattr(ctx, "rotation",
+                                                         None)))
                         except Exception as _cye:
                             out.meta.setdefault("line_errors", {})[
                                 "yellow_classic"] = str(_cye)
@@ -284,7 +338,9 @@ class SemanticHead:
                                 marking.kind = "thin"
                 except Exception:
                     markings = []
+            stage_ms["markings"] = (time.perf_counter() - stage_t) * 1000.0
         if MARK_CLASS_ENABLED and markings:
+            stage_t = time.perf_counter()
             # Plan E5: refine every candidate's class and keep the classes
             # that are not lane paint out of the geometry a lane may be
             # paired from.  A roadside artifact (reflector post, wall edge)
@@ -344,5 +400,9 @@ class SemanticHead:
                 out.meta["mark_class"] = _counts
             except Exception as exc:
                 out.meta.setdefault("line_errors", {})["mark_class"] = str(exc)
+            finally:
+                stage_ms["classification"] = (
+                    time.perf_counter() - stage_t) * 1000.0
         out.meta["markings"] = markings
+        stage_ms["total"] = (time.perf_counter() - started) * 1000.0
         return out
