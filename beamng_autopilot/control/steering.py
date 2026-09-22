@@ -24,6 +24,19 @@ asks to remove.
 ``force=True`` bypasses every limit for one call, because a limiter must
 never be able to delay a safety action - callers that own a hard stop
 decide, not this module.
+
+``cap`` is the OTHER direction: an upper bound on the command, i.e. the
+authority the car currently has (mode gain, reference-stability limit,
+post-veto steering budget).  The shaper is a comfort filter and used to
+override it - measured 2026-09-22: with the wheel at 0.55 and a new
+authority of 0.15, the next shaped command was still 0.49, so a
+"small corrections only" reference was driving at three times its
+permission for several hundred milliseconds.  When ``cap`` is given, the
+request AND the shaped output are clamped to it, and the internal
+value/rate are synchronised with the clamp so the state cannot keep
+pushing outward.  Safety outranks comfort: reaching the cap immediately
+is intended, and callers that also need to reduce speed do that in their
+own layer.
 """
 
 from __future__ import annotations
@@ -58,15 +71,50 @@ class SteeringShaper:
     started: bool = False
     reversals: int = 0
     suppressed: int = 0
+    capped: int = 0          # steps whose OUTPUT the authority cap clipped
     window_t: float | None = None
     _last_sign: int = 0     # sign of the last non-zero REQUESTED direction
     history: list = field(default_factory=list)
 
     # ------------------------------------------------------------------
+    def force_state(self, value: float) -> None:
+        """Adopt ``value`` as the current command, rate reset to 0.
+
+        Used after a constraint that had to be applied OUTSIDE the shaper
+        (a directional veto on the shaped output): the shaper must start
+        the next step from what was actually sent, not from the value it
+        wanted to send, or it keeps re-applying the vetoed command.
+        """
+        self.value = float(np.clip(float(value), -1.0, 1.0))
+        self.rate = 0.0
+        self.started = True
+
     def update(self, desired: float, dt: float, *, now: float | None = None,
-               force: bool = False) -> float:
-        """Shape ``desired`` into the commanded steering for this step."""
+               force: bool = False, cap: float | None = None) -> float:
+        """Shape ``desired`` into the commanded steering for this step.
+
+        ``cap`` (>= 0) is the current steering authority; ``None`` means
+        unbounded.  It is applied to the request and to the shaped output,
+        including the case where only the shaper's own state is outside it.
+        """
         desired = float(np.clip(float(desired), -1.0, 1.0))
+        cap_v: float | None = None
+        if cap is not None:
+            try:
+                cap_v = abs(float(cap))
+            except (TypeError, ValueError):
+                cap_v = None
+            if cap_v is not None and not np.isfinite(cap_v):
+                cap_v = None
+            if cap_v is not None:
+                desired = float(np.clip(desired, -cap_v, cap_v))
+                if self.started and abs(self.value) > cap_v + 1e-9:
+                    # The authority shrank below what the wheel is doing:
+                    # come inside at once and re-base the rate, or every
+                    # following step starts outside the cap again.
+                    self.capped += 1
+                    self.force_state(float(np.clip(self.value, -cap_v,
+                                                   cap_v)))
         if force:
             # A safety action owns this tick: pass it through untouched,
             # keep the limiter's state consistent for the next call.
@@ -89,6 +137,7 @@ class SteeringShaper:
             self.value = 0.0
             self.rate = 0.0
             self.started = True
+        _prev_value = float(self.value)
         # 1) what rate would reach the request, bounded
         want_rate = (desired - self.value) / dt
         want_rate = float(np.clip(want_rate, -self.max_rate_per_s,
@@ -124,6 +173,15 @@ class SteeringShaper:
             self._last_sign = req_sign
         self.rate = rate
         self.value = float(np.clip(self.value + rate * dt, -1.0, 1.0))
+        if cap_v is not None and abs(self.value) > cap_v + 1e-9:
+            # The shaped command still left the authority (the wheel was
+            # already outside it, or the limit changed under us).  Clip the
+            # OUTPUT and re-base the state so the next step starts inside.
+            self.capped += 1
+            self.value = float(np.clip(self.value, -cap_v, cap_v))
+            achieved = (self.value - _prev_value) / max(1e-3, float(dt))
+            self.rate = float(np.clip(achieved, -self.max_rate_per_s,
+                                      self.max_rate_per_s))
         self.history.append((float(now) if now is not None else None,
                              self.value, self.rate))
         if len(self.history) > 4096:
@@ -137,6 +195,7 @@ class SteeringShaper:
         self.started = False
         self.reversals = 0
         self.suppressed = 0
+        self.capped = 0
         self.window_t = None
         self._last_sign = 0
         self.history.clear()
@@ -148,4 +207,5 @@ class SteeringShaper:
             "rate": round(float(self.rate), 4),
             "reversals": int(self.reversals),
             "suppressed": int(self.suppressed),
+            "capped": int(self.capped),
         }
