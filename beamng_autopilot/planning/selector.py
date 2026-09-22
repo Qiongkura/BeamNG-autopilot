@@ -12,6 +12,9 @@ import math
 
 import numpy as np
 
+from .lateral_ref import lateral_reference
+from .trajectory import Candidate
+
 
 def _hold_heading_path(scene, length_m: float = 8.0, n: int = 9):
     """Ego-anchored straight-ahead polyline (current heading)."""
@@ -31,11 +34,12 @@ def _perception_hold_path(scene, length_m: float = 8.0, n: int = 9):
     """
     p = np.asarray(scene.pos[:2], dtype=float)
     ref = None
-    envelope = getattr(scene, "lane_envelope", None)
-    if envelope is not None:
-        ref = getattr(envelope, "center", None)
-    if ref is None and getattr(scene, "strict_perception", False):
-        ref = getattr(scene, "lane_ref", None)
+    if getattr(scene, "strict_perception", False):
+        ref, _ = lateral_reference(scene)
+    else:
+        envelope = getattr(scene, "lane_envelope", None)
+        if envelope is not None:
+            ref = getattr(envelope, "center", None)
     if ref is None:
         return _hold_heading_path(scene, length_m, n)
     ref = np.asarray(ref, dtype=float)
@@ -141,20 +145,35 @@ def select_trajectory(scene, candidate_set, constraints, *,
     if candidate_set is None or len(candidate_set) == 0:
         return None, {"why": "no candidates"}
     feasible = []
+    # Fresh tally per tick so the published reasons describe THIS tick.
+    try:
+        constraints.reject_counts = {}
+    except Exception:
+        pass
     for cand in candidate_set.candidates:
         cost, ok = constraints.score(scene, cand)
         if ok and np.isfinite(cost):
             feasible.append((cost, cand))
+    rejects = dict(getattr(constraints, "reject_counts", {}) or {})
     if not feasible:
         # Strict FSD: no perception lane -> never invent a hold path
         # (constraints already declined every candidate on purpose).
-        if (getattr(scene, "strict_perception", False)
-                and getattr(scene, "lane_ref", None) is None):
-            return None, {"why": "no feasible candidate"}
+        strict = bool(getattr(scene, "strict_perception", False))
+        if strict and lateral_reference(scene)[0] is None:
+            return None, {"why": "no feasible candidate",
+                          "rejects": rejects}
         path = _perception_hold_path(scene)
         path = _trim_before_body_cross(scene, path)
         if path is None:
             return None, {"why": "hold_heading_crosses_lane_boundary"}
+        if strict:
+            hold = Candidate(path=path, meta={"kind": "lane_center"})
+            cost, ok = constraints.score(scene, hold)
+            if not ok or not np.isfinite(cost):
+                return None, {"why": "hold_heading_constraints_rejected",
+                              "n_eval": 0,
+                              "rejects": dict(getattr(constraints,
+                                                      "reject_counts", {}) or {})}
         try:
             from .constraints import corridor_free_band
             open_corridor = bool(corridor_free_band(scene))
@@ -171,7 +190,7 @@ def select_trajectory(scene, candidate_set, constraints, *,
                 "n_eval": 0,
                 "hold_occ_frac": round(occ_frac, 3),
             }
-        return None, {"why": "no feasible candidate"}
+        return None, {"why": "no feasible candidate", "rejects": rejects}
     feasible.sort(key=lambda pair: pair[0])
     hyst_info = None
     if hysteresis is not None:
@@ -179,7 +198,7 @@ def select_trajectory(scene, candidate_set, constraints, *,
             feasible, time.time() if now_s is None else float(now_s),
             emergency=bool(emergency))
         if picked is None:
-            return None, {"why": "no feasible candidate"}
+            return None, {"why": "no feasible candidate", "rejects": rejects}
         cost, best, hyst_info = picked
     else:
         cost, best = feasible[0]

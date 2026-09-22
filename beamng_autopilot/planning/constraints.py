@@ -11,7 +11,7 @@ ego pose).
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -33,6 +33,11 @@ from ..vehicle_body import (
 @dataclass
 class Constraints:
     """Weights and feasibility thresholds for trajectory scoring."""
+
+    # Per-call rejection tally: reason -> count.  The selector clears it
+    # before scoring a tick's candidates and publishes the result, so
+    # "no drivable path" can be attributed to a gate instead of guessed.
+    reject_counts: dict = field(default_factory=dict)
 
     w_collision: float = 5.0
     # Body-swept obstacle cost: the centreline collision fraction misses a
@@ -159,11 +164,22 @@ class Constraints:
         return bool(float(fwd.max()) >= float(self.progress_min_m
                                               if min_m is None else min_m))
 
+    def _reject(self, reason: str) -> tuple[float, bool]:
+        """Count one rejection and return the (cost, feasible) pair.
+
+        The review's standing gap: every gate below returned ``1e9, False``
+        and dropped the reason, so "no drivable path" could not be
+        attributed to a boundary gate, a drivability gate or a blind-
+        evidence gate.  The tally is per tick and reset by the selector.
+        """
+        self.reject_counts[reason] = self.reject_counts.get(reason, 0) + 1
+        return 1e9, False
+
     def score(self, scene: Scene, candidate) -> tuple[float, bool]:
         """Return (cost, feasible)."""
         path = candidate.path
         if path is None or len(path) < 2:
-            return 1e9, False
+            return self._reject('no_path_geometry')
         # FSD realism: a strict scene with no perception lane has no
         # lateral authority at all.  Publishing ANY candidate - including
         # a raw kinematic arc, which carries no lane geometry - would hand
@@ -174,7 +190,7 @@ class Constraints:
         # (docs/fsd_realism.md §4).
         if getattr(scene, "strict_perception", False) \
                 and not _has_lane_reference(scene):
-            return 1e9, False
+            return self._reject('strict_no_perception_lane')
         # Strict mode also owns the ROAD SURFACE evidence: a tick whose
         # drivable layer is EMPTY has no road anywhere the sensors look
         # (measured live 2026-09-19 14:31 - the road mask vanished on a
@@ -186,12 +202,12 @@ class Constraints:
             _drv = getattr(scene.grid, "drivable", None) \
                 if scene.grid is not None else None
             if _drv is None or not bool((np.asarray(_drv) > 0).any()):
-                return 1e9, False
+                return self._reject('strict_empty_drivable_layer')
         kind = str(candidate.meta.get("kind", ""))
         min_m = self.progress_min_m_ref if kind in self.ref_kinds \
             else self.progress_min_m
         if not self._has_forward_progress(scene, path, min_m):
-            return 1e9, False
+            return self._reject('no_forward_progress')
         if kind in self.ref_kinds and len(path) >= 2:
             # Direction of the LANE just ahead of the ego, not the
             # ego-anchor diagonal.  References are re-anchored at the car
@@ -218,14 +234,14 @@ class Constraints:
                 _d = (_a - math.degrees(float(scene.heading)) + 180.0) \
                     % 360.0 - 180.0
                 if abs(_d) > self.ref_start_yaw_max_deg:
-                    return 1e9, False
+                    return self._reject('ref_start_yaw')
         if lane_cross_dist_m(scene, path, max_cross_m=self.lane_cross_max_m) > 0.0:
-            return 1e9, False
+            return self._reject('lane_cross')
         # Hard body envelope: no candidate is allowed to place any ego
         # corner across a detected boundary, even when its centreline is
         # still inside (full-vehicle projection, not centre-point proxy).
         if body_lane_cross_dist_m(scene, path) > 0.0:
-            return 1e9, False
+            return self._reject('body_cross')
         # Hard drivable-surface gate: never leave the road (grass/terrain
         # is not an obstacle cell, so the collision layer cannot catch it).
         _bdrv, _tdrv, _nbdrv, _ntdrv = _path_off_drivable(
@@ -233,10 +249,10 @@ class Constraints:
             min_evidence=self.off_drivable_min_evidence)
         if _tdrv:
             if (_bdrv / _tdrv) > self.off_drivable_fraction_max:
-                return 1e9, False
+                return self._reject('off_drivable_fraction')
             if _ntdrv >= 4 and \
                     (_nbdrv / _ntdrv) > self.off_drivable_near_fraction_max:
-                return 1e9, False
+                return self._reject('off_drivable_near')
         # Driving blind is not allowed.  A path that mostly crosses cells
         # the sensors never saw is not drivable - it is the loop-arc /
         # grass-escape failure mode, not a road.  Map-prior candidates
@@ -252,7 +268,7 @@ class Constraints:
         _kn, _kt = _path_known(scene, path, near_m=self.known_near_m)
         if kind not in self.ref_kinds and _kt >= 4 \
                 and (_kn / _kt) < self.known_min_frac:
-            return 1e9, False
+            return self._reject('blind_path')
         feasible = True
         cost = 0.0
         col = cost_collision(scene, path, self.collision_fraction_max)
@@ -353,7 +369,7 @@ def _path_infractions(scene: Scene, path, span: float = 2.0) -> list:
 
 def _path_body_collision(scene: Scene, path,
                          step_m: float = 0.6,
-                         far_m: float = 16.0) -> tuple[int, int]:
+                         far_m: float = 16.0) -> tuple[int, int, int]:
     """Fraction of swept body poses with a corner inside an obstacle cell.
 
     The centreline collision check misses a roadside box that sits beside
@@ -363,11 +379,12 @@ def _path_body_collision(scene: Scene, path,
     authoritative footprint rectangle; a corner inside an occupied cell
     counts as a body collision pose.
 
-    Returns ``(bad_poses, total_poses)``; ``(0, 0)`` without a grid.
+    Returns ``(bad_poses, total_poses, near_poses)``; all zero without
+    a grid or without poses in the sampling window.
     """
     path = np.asarray(path, dtype=float)[:, :2]
     if scene.grid is None or len(path) < 2:
-        return 0, 0
+        return 0, 0, 0
     pos = np.asarray(scene.pos[:2], dtype=float)
     extent = float(getattr(scene.grid, "extent", 0.0) or 0.0)
 
@@ -389,7 +406,7 @@ def _path_body_collision(scene: Scene, path,
                 poses.append((px, py, math.atan2(_v[1], _v[0])))
         s_cur += step_m
     if not poses:
-        return 0, 0
+        return 0, 0, 0
     bad = 0
     near = 0
     obstacle = scene.grid.obstacle

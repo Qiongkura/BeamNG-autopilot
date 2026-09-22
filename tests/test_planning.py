@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import math
 import numpy as np
+from pathlib import Path
+
 import pytest
 
 from beamng_autopilot.occupancy import OccupancyGrid
@@ -178,6 +180,7 @@ def test_selector_hold_heading_follows_sensor_lane_before_body_cross():
     from beamng_autopilot.planning.constraints import body_lane_cross_dist_m
 
     grid = OccupancyGrid(60, 60, 0.5)
+    grid.drivable[:] = 1
     lane = np.array([[0.0, 0.0], [3.0, 0.5], [6.0, 2.0],
                      [8.0, 4.0]], dtype=float)
     left = lane + np.array([0.0, 2.0])
@@ -189,6 +192,8 @@ def test_selector_hold_heading_follows_sensor_lane_before_body_cross():
 
     class _Reject:
         def score(self, scene, cand):
+            if cand.meta.get("kind") == "lane_center":
+                return Constraints().score(scene, cand)
             return 0.0, False
 
     class _One:
@@ -535,3 +540,27 @@ def test_body_lane_cross_detail_reports_segment_and_side() -> None:
     sc2 = _scene()
     sc2.lane_left = np.array([[0.0, 4.0], [30.0, 4.0]])
     assert body_lane_cross_detail_m(sc2, path) == (0.0, -1, "")
+
+
+def test_no_planning_module_imports_the_lane_package():
+    """Layering: planning must not depend on ``lane`` (T09).
+
+    ``planning/hold_audit.py`` originally reached the stopping-margin model
+    through ``lane.lateral_risk``.  That inversion showed up as a real
+    ImportError when this round's commits were checked one by one (the
+    planner commit landed before the lane commit), so the direction is
+    pinned here: the model lives in ``obstacle_risk`` and planning imports
+    it from there.
+    """
+    root = Path(__file__).resolve().parents[1] / "beamng_autopilot" / "planning"
+    offenders = []
+    for f in sorted(root.glob("*.py")):
+        text = f.read_text(encoding="utf-8")
+        if "beamng_autopilot.lane" in text or "from ..lane" in text \
+                or "from .lane" in text:
+            offenders.append(f.name)
+    assert offenders == [], f"planning imports lane in {offenders}"
+    from beamng_autopilot.planning import hold_audit
+    assert hold_audit.stopping_margin_m is not None
+    a = hold_audit.stopping_margin_m(10.0, latency_s=0.35, a_min_mps2=2.5)
+    assert a[0] == pytest.approx(24.0, abs=1e-6)

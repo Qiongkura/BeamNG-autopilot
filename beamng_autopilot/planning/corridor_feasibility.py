@@ -12,9 +12,9 @@ be not-completely-closed.
 This module answers a different question and returns the evidence with the
 answer:
 
-    FEASIBLE    a laterally free band exists, is wide enough for the body,
-                is CONNECTED row to row (not a gap that alternates sides),
-                and the car can still shift into it in the distance left
+    FEASIBLE    a geometric band passes width, row connectivity and the
+                lateral-reachability necessary conditions; this is NOT
+                proof that a particular trajectory is safe to execute
     INFEASIBLE  one of those fails - with which one in ``reason``
     UNKNOWN     the evidence needed to decide is missing, too old, or the
                 grid has no layer to read
@@ -38,6 +38,8 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from beamng_autopilot.vehicle_body import HALF_LENGTH_M
+
 FEASIBLE = "feasible"
 INFEASIBLE = "infeasible"
 UNKNOWN = "unknown"
@@ -53,23 +55,18 @@ DEFAULT_MIN_TURN_RADIUS_M = 5.50      # bicycle-model lateral ceiling
 DEFAULT_MAX_LATERAL_SPEED_MPS = 2.00
 DEFAULT_MAX_EVIDENCE_AGE_S = 2.00     # the freshness contract line
 
-# How much of the grid around the ego to skip: the car's own footprint and
-# the bumper zone are not evidence about the corridor ahead.
-EGO_BAND_FRAC = 0.12
-
-
 @dataclass
 class CorridorFeasibility:
     """The answer, plus what it was derived from."""
 
     state: str = UNKNOWN
     reason: str = ""
-    # Geometry of the band that was chosen, in metres relative to the
-    # grid centre line.  None when the answer is not FEASIBLE.
+    # Geometry of the last band examined, ego metres with left positive.
+    # Infeasible results may retain it to explain the rejected transition.
     width_m: float | None = None
     centre_lateral_m: float | None = None
-    # How far the band stays connected ahead of the car.  A band that
-    # ends in 3 m does not get you past an obstacle at 8 m.
+    # Forward distance from ego to the checked band's far edge.  The
+    # current footprint is excluded; scanning begins at its front bumper.
     clear_distance_m: float | None = None
     # Reachability: how far sideways the car must move, how far it has to
     # do it in, and how much the model says it can do in that distance.
@@ -165,15 +162,23 @@ def max_lateral_shift_m(distance_m: float, speed_mps: float,
 
     Both are kinematics.  Neither is a validated limit.
     """
-    s = max(0.0, float(distance_m))
-    by_geometry = (s * s) / (2.0 * max(1e-6, float(min_turn_radius_m)))
-    v = float(speed_mps)
+    s, v, radius, lateral_speed = map(float, (
+        distance_m, speed_mps, min_turn_radius_m, max_lateral_speed_mps))
+    if not all(math.isfinite(x) for x in (s, v, radius, lateral_speed)) \
+            or v < 0.0 or radius <= 0.0 or lateral_speed < 0.0:
+        raise ValueError("invalid lateral-reachability input")
+    s = max(0.0, s)
+    by_geometry = (s / radius) * (0.5 * s)
+    if not math.isfinite(by_geometry):
+        raise ValueError("lateral-reachability overflow")
     if v <= 1e-6:
         # Standstill: the geometry ceiling is the only honest bound.  A
         # time-based bound would return infinity, which is the "there is
         # a gap so I can take it" error in another form.
         return by_geometry
-    by_rate = float(max_lateral_speed_mps) * s / v
+    by_rate = lateral_speed * (s / v)
+    if not math.isfinite(by_rate):
+        raise ValueError("lateral-reachability overflow")
     return min(by_geometry, by_rate)
 
 
@@ -193,160 +198,206 @@ def corridor_feasibility(scene, *, ego_speed_mps: float = 0.0,
                          evidence: dict | None = None) -> CorridorFeasibility:
     """Can the car still get into a free lateral band ahead of it?
 
-    ``scene`` needs a ``grid`` with an ``obstacle`` layer (0 = free), a
-    ``res`` and ``n_rows`` / ``n_cols``, as the rest of ``planning`` uses.
-    A ``drivable`` layer, if present, is ANDed in so a gap off the
-    pavement, beyond the lane marking or on the wrong side of the road is
-    not a gap - the old gate never looked at drivability at all.
+    ``scene`` needs a ``grid`` with ``obstacle`` (0 = free), positive
+    ``drivable`` evidence, ``res`` and ``n_rows`` / ``n_cols``.  When an
+    ``observed`` layer exists, unobserved cells cannot authorise a band.
+    Missing road evidence is UNKNOWN, not free space.  Drivable road alone
+    does not establish lane legality; the candidate's detected-boundary
+    and swept-body checks remain mandatory.
 
-    ``required_distance_m`` is how far ahead the band has to stay open
-    (the obstacle's distance).  Without it the primitive reports how far
-    the band goes and lets the caller decide; it does not assume "to the
-    horizon" is good enough.
+    ``required_distance_m`` is the forward distance from ego to the last
+    row that must be checked.  Without it every row through the grid's
+    forward horizon is checked.  A request beyond that horizon is UNKNOWN.
+    Near-field lateral deadlines subtract the authoritative front bumper
+    distance, so distant free space cannot license a last-moment shift.
     """
-    res = CorridorFeasibility()
-    res.candidate_id = candidate_id
+    res = CorridorFeasibility(candidate_id=candidate_id)
     res.evidence = dict(evidence or {})
+    res.notes.append("geometry only; candidate sweep, lane legality and "
+                     "dynamic feasibility require separate validation")
 
-    # --- evidence first: an answer with no provenance is not an answer --
+    try:
+        speed, ego_lat, width, margin, radius, lateral_speed = map(float, (
+            ego_speed_mps, ego_lateral_m, vehicle_width_m, margin_m,
+            min_turn_radius_m, max_lateral_speed_mps))
+        required = (None if required_distance_m is None
+                    else float(required_distance_m))
+        max_age = (None if max_evidence_age_s is None
+                   else float(max_evidence_age_s))
+        values = (speed, ego_lat, width, margin, radius, lateral_speed)
+        if not all(math.isfinite(v) for v in values) \
+                or speed < 0.0 or width <= 0.0 or margin < 0.0 \
+                or radius <= 0.0 or lateral_speed < 0.0 \
+                or (required is not None and (not math.isfinite(required)
+                                             or required <= 0.0)) \
+                or (max_age is not None and (not math.isfinite(max_age)
+                                            or max_age < 0.0)):
+            raise ValueError("invalid geometry parameter")
+    except (TypeError, ValueError, OverflowError):
+        res.reason = "invalid geometry parameter"
+        return res
+
     age = res.evidence.get("age_s")
-    if age is not None and max_evidence_age_s is not None:
+    if age is not None:
         try:
-            if float(age) > float(max_evidence_age_s):
-                res.state = UNKNOWN
-                res.reason = "evidence too old"
-                res.notes.append(
-                    f"age {float(age):.2f}s > {float(max_evidence_age_s):.2f}s")
-                return res
-        except (TypeError, ValueError):
-            res.state = UNKNOWN
+            age = float(age)
+            if not math.isfinite(age) or age < 0.0:
+                raise ValueError("invalid age")
+        except (TypeError, ValueError, OverflowError):
             res.reason = "evidence age unreadable"
+            return res
+        if max_age is not None and age > max_age:
+            res.reason = "evidence too old"
             return res
 
     grid = getattr(scene, "grid", None)
     if grid is None:
-        res.state = UNKNOWN
         res.reason = "no grid"
         return res
     occ = getattr(grid, "obstacle", None)
-    if occ is None or np.asarray(occ).size == 0:
-        res.state = UNKNOWN
+    if occ is None:
         res.reason = "no obstacle layer"
         return res
-
-    occ = np.asarray(occ)
-    n_rows, n_cols = int(grid.n_rows), int(grid.n_cols)
-    cell = float(getattr(grid, "res", 0.0) or 0.0)
-    if n_cols < 4 or cell <= 0.0:
-        res.state = UNKNOWN
+    try:
+        occ = np.asarray(occ, dtype=float)
+    except (TypeError, ValueError):
+        res.reason = "invalid obstacle layer"
+        return res
+    if occ.size == 0:
+        res.reason = "no obstacle layer"
+        return res
+    try:
+        n_rows, n_cols = int(grid.n_rows), int(grid.n_cols)
+        cell = float(grid.res)
+        max_x = float(getattr(grid, "max_x", n_rows * cell / 2.0))
+        max_y = float(getattr(grid, "max_y", n_cols * cell / 2.0))
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        res.reason = "invalid grid geometry"
+        return res
+    if occ.ndim != 2 or occ.shape != (n_rows, n_cols) \
+            or not np.isfinite(occ).all() or bool((occ < 0).any()):
+        res.reason = "invalid obstacle layer"
+        return res
+    if n_cols < 4 or not all(math.isfinite(v) for v in (cell, max_x, max_y)) \
+            or cell <= 0.0 or max_x <= HALF_LENGTH_M \
+            or not math.isfinite(max_x / cell):
         res.reason = "grid too coarse to resolve a band"
-        res.notes.append(f"n_cols={n_cols} res={cell}")
         return res
 
-    drivable = getattr(grid, "drivable", None)
-    if drivable is not None:
-        drivable = np.asarray(drivable)
-        if drivable.shape != occ.shape:
-            # A mismatched mask cannot be ANDed in, and silently ignoring
-            # it would put the pavement check back to "not checked".
-            res.state = UNKNOWN
-            res.reason = "drivable mask shape mismatch"
+    layers = {}
+    for name in ("drivable", "observed"):
+        layer = getattr(grid, name, None)
+        if layer is None:
+            if name == "drivable":
+                res.reason = "no drivable layer"
+                return res
+            continue
+        try:
+            layer = np.asarray(layer, dtype=float)
+        except (TypeError, ValueError):
+            res.reason = f"invalid {name} layer"
             return res
+        if layer.shape != occ.shape:
+            res.reason = f"{name} mask shape mismatch"
+            return res
+        if not np.isfinite(layer).all() or bool((layer < 0).any()):
+            res.reason = f"invalid {name} layer"
+            return res
+        layers[name] = layer
+    drivable = layers["drivable"]
+    observed = layers.get("observed")
 
-    need_m = float(vehicle_width_m) + float(margin_m)
+    need_m = width + margin
+    if not math.isfinite(need_m / cell):
+        res.reason = "invalid geometry parameter"
+        return res
     min_cells = max(1, int(math.ceil(need_m / cell)))
     res.notes.append(f"need {need_m:.2f} m = {min_cells} cells")
+    goal = max_x if required is None else required
+    res.available_distance_m = round(goal, 3)
+    if goal < HALF_LENGTH_M:
+        res.reason = "required distance lies inside the current footprint"
+        return res
 
-    # Rows: 0 is the furthest ahead, the ego sits at n_rows/2.
-    ego_row = int(n_rows // 2)
-    ego_band = max(1, int(n_rows * EGO_BAND_FRAC))
-    start_row = ego_row - ego_band
-    if start_row < 1:
-        res.state = UNKNOWN
+    # Include the cell touching the nose, then visit EVERY cell row ahead.
+    # A grid-size fraction skipped real obstacles outside the bumper.
+    start_row = min(n_rows - 1,
+                    int(math.floor((max_x - HALF_LENGTH_M) / cell)))
+    if start_row < 0:
         res.reason = "grid has no rows ahead of the ego"
         return res
 
-    def row_intervals(r: int) -> list[tuple[int, int]]:
-        row = occ[r]
-        free = (np.asarray(row) == 0)
-        if drivable is not None:
-            free = free & (np.asarray(drivable[r]) != 0)
-        return free_intervals(free, min_cells)
-
-    # --- walk forward, keeping only bands that connect to the last row --
-    bands = row_intervals(start_row)
-    if not bands:
-        res.state = INFEASIBLE
-        res.reason = "no band wide enough at the entry"
-        res.notes.append(f"row {start_row} has no gap >= {min_cells} cells")
-        return res
-
-    clear_rows = 0
-    for r in range(start_row - 1, -1, -1):
-        nxt = row_intervals(r)
-        if not nxt:
-            break
-        # Keep the intervals in this row that some interval in the
-        # previous row actually leads into.  A gap that jumps from the
-        # left edge to the right edge between two rows is not a band,
-        # however many free cells each row counted.
-        joined = [iv for iv in nxt
-                  if any(intervals_connected(iv, pv) for pv in bands)]
-        if not joined:
-            break
-        bands = joined
-        clear_rows += 1
-
-    clear_distance_m = (clear_rows + 1) * cell
-    res.clear_distance_m = round(clear_distance_m, 3)
-
-    # --- pick the widest band, preferring the least lateral shift -------
-    centre_col = n_cols / 2.0
-    ego_col = centre_col + (float(ego_lateral_m) / cell)
-    scored = []
-    for a, b in bands:
-        width_m = (b - a + 1) * cell
-        mid = (a + b) / 2.0
-        scored.append((abs(mid - ego_col), width_m, mid))
-    scored.sort(key=lambda t: (t[0], -t[1]))
-    shift_cells, width_m, mid = scored[0]
-    shift_m = abs(mid - ego_col) * cell
-
-    res.width_m = round(float(width_m), 3)
-    res.centre_lateral_m = round((mid - centre_col) * cell, 3)
-    res.lateral_shift_m = round(float(shift_m), 3)
-
-    # --- does the band go far enough? ----------------------------------
-    if required_distance_m is not None:
-        res.available_distance_m = round(float(required_distance_m), 3)
-        if clear_distance_m < float(required_distance_m):
-            res.state = INFEASIBLE
-            res.reason = "band ends before the obstacle"
-            res.notes.append(f"clear {clear_distance_m:.2f} m < "
-                             f"required {float(required_distance_m):.2f} m")
+    bands = None
+    clear_distance = HALF_LENGTH_M
+    for row in range(start_row, -1, -1):
+        near_edge = max_x - (row + 1) * cell
+        far_edge = max_x - row * cell
+        free = (occ[row] == 0) & (drivable[row] > 0)
+        unknown = drivable[row] <= 0
+        if observed is not None:
+            free &= observed[row] > 0
+            unknown = observed[row] <= 0
+        intervals = free_intervals(free, min_cells)
+        if not intervals:
+            possible = free_intervals(
+                (occ[row] == 0) & (free | unknown), min_cells)
+            res.state = UNKNOWN if possible else INFEASIBLE
+            res.reason = ("road evidence missing in the required band"
+                          if possible else "no band wide enough at the entry"
+                          if bands is None else "band ends before the obstacle")
+            res.clear_distance_m = round(clear_distance, 3)
             return res
-    else:
-        res.available_distance_m = res.clear_distance_m
 
-    # --- can the car still get into it? --------------------------------
-    # Distance available to make the shift: the band has to be entered
-    # before the obstacle, so the shorter of "how far the band lasts" and
-    # "how far away the obstacle is" is what the car actually has.
-    budget_m = min(clear_distance_m,
-                   float(required_distance_m) if required_distance_m
-                   is not None else clear_distance_m)
-    reach_m = max_lateral_shift_m(
-        budget_m, ego_speed_mps, min_turn_radius_m=min_turn_radius_m,
-        max_lateral_speed_mps=max_lateral_speed_mps)
-    res.reachable_shift_m = round(float(reach_m), 3)
-    if shift_m > reach_m + 1e-9:
-        res.state = INFEASIBLE
-        res.reason = "band not reachable in the distance left"
-        res.notes.append(f"need {shift_m:.2f} m lateral, can do "
-                         f"{reach_m:.2f} m in {budget_m:.2f} m at "
-                         f"{float(ego_speed_mps):.2f} m/s")
-        return res
+        # Intervals describe admissible BODY CENTRES, not raw free cells.
+        # Overlapping a single cell cannot connect two car-width passages.
+        centers = []
+        for a, b in intervals:
+            lo = max_y - (b + 1) * cell + need_m / 2.0
+            hi = max_y - a * cell - need_m / 2.0
+            if hi >= lo:
+                centers.append((lo, hi, (b - a + 1) * cell))
+        if bands is not None:
+            centers = [iv for iv in centers
+                       if any(iv[0] <= old[1] and old[0] <= iv[1]
+                              for old in bands)]
+        if not centers:
+            res.state = INFEASIBLE
+            res.reason = "vehicle-centre bands disconnected"
+            res.clear_distance_m = round(clear_distance, 3)
+            return res
 
-    res.state = FEASIBLE
-    res.reason = ""
+        # Each row has its own entry deadline, measured from the bumper.
+        # A distant horizon must never authorise an impossible near shift.
+        budget = max(0.0, min(near_edge, goal) - HALF_LENGTH_M)
+        try:
+            reach = max_lateral_shift_m(
+                budget, speed, min_turn_radius_m=radius,
+                max_lateral_speed_mps=lateral_speed)
+        except ValueError:
+            res.reason = "invalid lateral reachability"
+            return res
+        nearest = min(centers, key=lambda iv: (
+            abs(min(max(ego_lat, iv[0]), iv[1]) - ego_lat), -iv[2]))
+        center = min(max(ego_lat, nearest[0]), nearest[1])
+        shift = abs(center - ego_lat)
+        res.width_m = round(nearest[2], 3)
+        res.centre_lateral_m = round(center, 3)
+        res.lateral_shift_m = round(shift, 3)
+        res.reachable_shift_m = round(reach, 3)
+        res.notes.append(f"row {row}: lateral budget {budget:.3f} m")
+        bands = [(max(lo, ego_lat - reach), min(hi, ego_lat + reach), w)
+                 for lo, hi, w in centers
+                 if lo <= ego_lat + reach and hi >= ego_lat - reach]
+        if not bands:
+            res.state = INFEASIBLE
+            res.reason = "band not reachable in the distance left"
+            res.clear_distance_m = round(clear_distance, 3)
+            return res
+        clear_distance = far_edge
+        res.clear_distance_m = round(clear_distance, 3)
+        if clear_distance >= goal:
+            res.state = FEASIBLE
+            return res
+
+    res.reason = "required distance exceeds observed grid horizon"
     return res
