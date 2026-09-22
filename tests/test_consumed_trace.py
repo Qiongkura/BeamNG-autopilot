@@ -8,6 +8,8 @@ fresh in the telemetry.
 
 from __future__ import annotations
 
+import pytest
+
 from beamng_autopilot.fsd_drive import consumed_from_head_sched
 from beamng_autopilot.fsd_stack import sched_record
 from beamng_autopilot.telemetry_contract import stage_of
@@ -35,7 +37,8 @@ def test_the_age_is_measured_at_command_time_not_publish_time():
     """The age that mattered is how old it was when the command went out."""
     got = consumed_from_head_sched(
         {"object": _pub("object", 7, T0 + 0.2)}, T0 + 0.45)
-    assert got["object"]["age_s"] == 0.25
+    assert got["object"]["age_s"] == 0.45
+    assert got["object"]["publish_age_s"] == 0.25
 
 
 def test_a_missing_publish_time_gives_none_not_a_plausible_age():
@@ -102,3 +105,30 @@ def test_an_old_but_matching_version_reads_consumed_stale():
     merged["consumed_result_seq"] = 9
     merged["consumed_age_s"] = 1.4
     assert stage_of(merged, stale_age_s=1.0) == "consumed_stale"
+
+
+def test_slow_inference_cannot_look_fresh_just_after_publication():
+    rec = _pub("semantic", 9, T0 + 1.2)
+    got = consumed_from_head_sched({"semantic": rec}, T0 + 1.25)
+    assert got["semantic"]["age_s"] == 1.25
+    assert got["semantic"]["publish_age_s"] == 0.05
+    merged = dict(rec, consumed_result_seq=9,
+                  consumed_age_s=got["semantic"]["age_s"])
+    assert stage_of(merged, stale_age_s=1.0) == "consumed_stale"
+
+
+@pytest.mark.parametrize("source_t", [None, "bad", float("nan"), float("inf"),
+                                     T0 + 5.0])
+def test_missing_or_invalid_source_age_is_unknown(source_t):
+    rec = _pub("semantic", 9, T0 + 0.2)
+    rec["source_t"] = source_t
+    got = consumed_from_head_sched({"semantic": rec}, T0 + 0.3)
+    assert got["semantic"]["age_s"] is None
+    assert got["semantic"]["publish_age_s"] == 0.1
+
+
+@pytest.mark.parametrize("cmd_t", ["bad", float("nan"), float("inf"), T0 - 1.0])
+def test_invalid_command_clock_does_not_manufacture_an_age(cmd_t):
+    got = consumed_from_head_sched({"semantic": _pub("semantic", 9, T0)}, cmd_t)
+    assert got["semantic"]["age_s"] is None
+    assert got["semantic"]["publish_age_s"] is None

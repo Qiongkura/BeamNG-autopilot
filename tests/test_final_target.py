@@ -6,7 +6,14 @@ longitudinal planner, the ramp, the corner governor - shapes HOW the car
 gets to a speed.  Shaping is not choosing.
 """
 
-from beamng_autopilot.fsd_drive import final_target_speed
+from __future__ import annotations
+
+import pytest
+
+from beamng_autopilot.fsd_drive import (
+    SPEED_TARGET_RAMP_MPS, _final_stop_controls, _ramped_target_speed,
+    final_target_speed,
+)
 
 
 def test_a_shaped_reference_above_the_cap_is_capped(self=None):
@@ -37,6 +44,7 @@ def test_an_unreadable_reference_does_not_relax_the_cap():
     # A None or non-numeric reference is not a higher ceiling.
     assert final_target_speed(None, 6.0, 3.3) == 3.3
     assert final_target_speed("nan", 6.0, 3.3) == 3.3
+    assert final_target_speed(float("-inf"), 6.0, 3.3) == 3.3
 
 
 def test_zero_cap_stays_zero():
@@ -46,3 +54,43 @@ def test_zero_cap_stays_zero():
 def test_a_negative_cap_is_not_corrected_upwards():
     # Clamping to 0 here would be a second decision; the caller owns it.
     assert final_target_speed(6.0, 6.0, -1.0) == -1.0
+
+
+@pytest.mark.parametrize("hard_cap", [None, "bad", float("nan"), float("inf")])
+def test_invalid_hard_cap_fails_closed(hard_cap):
+    assert final_target_speed(6.0, 6.0, hard_cap) == 0.0
+
+
+@pytest.mark.parametrize("cap", [3.3, 1.0, 0.0])
+def test_default_ramp_cannot_delay_a_lower_monitor_or_clearance_cap(cap):
+    assert _ramped_target_speed(6.0, cap, 6.0, 0.05) == cap
+
+
+def test_default_ramp_preserves_gradual_acceleration():
+    got = _ramped_target_speed(0.0, 6.0, 6.0, 0.1)
+    assert got == pytest.approx(SPEED_TARGET_RAMP_MPS * 0.1)
+    assert 0.0 < got < 6.0
+
+
+def test_default_ramp_preserves_the_lower_plan_ceiling():
+    assert _ramped_target_speed(6.0, 5.0, 2.0, 0.1) == 2.0
+
+
+@pytest.mark.parametrize("controls", [
+    (1.0, 0.0, 0.0, 0.0),
+    (0.15, 0.0, 0.4, 0.0),
+    (0.5, 0.2, -0.2, 0.0),
+])
+def test_final_stop_overrides_climb_alignment_and_pedal_ramp(controls):
+    assert _final_stop_controls(*controls, stop=True, speed=0.2) == (
+        0.0, 1.0, 0.0, 1.0)
+
+
+def test_final_stop_brakes_a_moving_car():
+    assert _final_stop_controls(0.8, 0.0, 0.4, 0.0,
+                                stop=True, speed=3.5) == (0.0, 1.0, 0.0, 0.0)
+
+
+def test_positive_converging_recovery_is_not_a_final_stop():
+    controls = (0.15, 0.0, 0.2, 0.0)
+    assert _final_stop_controls(*controls, stop=False, speed=0.2) == controls

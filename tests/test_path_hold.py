@@ -13,6 +13,7 @@ import math
 import numpy as np
 import pytest
 
+from beamng_autopilot import config
 from beamng_autopilot.config import (
     FSD_PATH_HOLD_GRACE_S,
     FSD_PATH_HOLD_MAX_S,
@@ -184,6 +185,44 @@ def test_no_offer_keeps_the_single_frame_stop() -> None:
     assert v.path_hold_active is False
 
 
+@pytest.mark.parametrize("stale", ["sensor", "planner"])
+def test_hold_cannot_reuse_stale_evidence(stale):
+    mon = SafetyMonitor(max_speed=6.)
+    mon.offer_verified_path(_straight(), 0., 5., now_s=_T0, strict=True)
+    v = mon.evaluate(_scene(), None, now_s=_T0 + 0.1,
+                     snapshot_age_s=2. if stale == "sensor" else 0.,
+                     planner_age_s=2. if stale == "planner" else 0.)
+    assert v.level == "minimal_risk"
+    assert v.target_speed == 0.
+    assert not v.path_hold_active
+
+
+def test_held_path_does_not_bypass_a_sustained_road_loss():
+    mon = SafetyMonitor(max_speed=6., road_surface_gate=True)
+    scene = _scene(strict=False)
+    mon.evaluate(scene, _straight(), now_s=_T0)
+    mon.offer_verified_path(_straight(), 0., 5., now_s=_T0 + 9., strict=True)
+    scene.lane_ref = None
+    scene.strict_perception = True
+    v = mon.evaluate(scene, None, now_s=_T0 + 9.1)
+    assert v.path_hold_active
+    assert v.road_checked
+    assert v.level == "minimal_risk"
+    assert v.reason == "perceived road surface lost"
+    assert v.target_speed == 0.
+    assert v.effective_rule == "road_surface"
+
+
+def test_hold_trace_keeps_hard_checks_after_its_soft_winner():
+    mon = SafetyMonitor(max_speed=6.)
+    mon.offer_verified_path(_straight(), 0., 5., now_s=_T0, strict=True)
+    v = mon.evaluate(_scene(), None, now_s=_T0 + 0.1)
+    assert v.effective_rule == "path_hold"
+    assert {"road_surface", "path_blocked", "body_crosses_boundary",
+            "path_off_lane", "obstacle_risk"} <= set(v.rules_evaluated)
+    assert v.masked_hard_rules == []
+
+
 # ---------------------------------------------------------------------------
 # current/planned crossing split
 # ---------------------------------------------------------------------------
@@ -236,3 +275,46 @@ def test_current_cross_sets_structured_fields() -> None:
     assert verdict.body_cross_current is True
     assert verdict.level == "minimal_risk"
     assert "vehicle body" in verdict.reason
+
+
+# --------------------------------------------------------------------------
+# T09: the joint conditions the plan asks for (contraction only)
+# --------------------------------------------------------------------------
+class TestJointConditionsStayOutOfTheWindow:
+    """This round does not approve extending the hold window."""
+
+    def test_the_window_numbers_are_untouched(self):
+        assert config.FSD_PATH_HOLD_GRACE_S == pytest.approx(0.30)
+        assert config.FSD_PATH_HOLD_MAX_S == pytest.approx(0.80)
+
+    def test_the_joint_gate_is_off_by_default(self):
+        from beamng_autopilot.planning import hold_audit
+        assert hold_audit.HOLD_JOINT_GATE is False
+
+    def test_an_expired_hold_stays_expired_when_asked_again(self):
+        """The plan's 反例: expired 后重复请求."""
+        ph = PathHold(grace_s=0.30, max_s=0.80)
+        path = np.column_stack([np.linspace(2.0, 14.0, 13), np.zeros(13)])
+        assert ph.offer(path, 0.0, 4.0, now_s=0.0)
+        assert ph.request(np.zeros(3), 0.5) is not None
+        assert ph.request(np.zeros(3), 1.5) is None       # expired
+        # asking again must NOT revive it, even at the same age
+        assert ph.request(np.zeros(3), 1.5) is None
+        assert ph.active is False
+        # and the joint audit reports the reason when asked about it
+        from beamng_autopilot.planning.hold_audit import audit_hold
+        a = audit_hold(path=path, pos=np.zeros(3), observation_age_s=1.6,
+                       travelled_since_obs_m=0.0, sigma_lat_m=0.1,
+                       sigma_theta_rad=0.01, speed_mps=1.0, latency_s=0.35,
+                       a_min_mps2=2.5)
+        assert a.satisfied is False
+        assert any("observation_age" in f for f in a.failed)
+
+    def test_a_hold_inside_the_window_can_still_be_audited_clean(self):
+        from beamng_autopilot.planning.hold_audit import audit_hold
+        path = np.column_stack([np.linspace(2.0, 20.0, 19), np.zeros(19)])
+        a = audit_hold(path=path, pos=np.zeros(3), observation_age_s=0.2,
+                       travelled_since_obs_m=2.0, sigma_lat_m=0.15,
+                       sigma_theta_rad=0.02, speed_mps=3.0, latency_s=0.35,
+                       a_min_mps2=2.5)
+        assert a.satisfied is True

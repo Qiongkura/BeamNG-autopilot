@@ -147,3 +147,115 @@ def test_every_mount_round_trips_a_pixel() -> None:
             assert bool(ok[0]), f"{cam}: ray must project back"
             assert np.hypot(float(uu[0]) - u, float(vv[0]) - v) < 0.5, (
                 f"{cam}: round trip drifted for pixel ({u},{v})")
+
+
+def test_batch_projection_matches_scalar_for_seeded_camera_poses():
+    from beamng_autopilot.vision.detection import back_project
+    from beamng_autopilot.vision.lanes import _back_project_many
+
+    rng = np.random.default_rng(20260921)
+    for mount in CAMERA_RING:
+        cam = mount.camera_model(536, 403)
+        for _ in range(4):
+            pos = rng.uniform(-100.0, 100.0, 3)
+            heading = rng.uniform(-np.pi, np.pi)
+            ground = float(pos[2]) - rng.uniform(0.0, 2.0)
+            us = rng.uniform(-20.0, 556.0, 80)
+            vs = rng.uniform(-20.0, 423.0, 80)
+            expected = [back_project(float(u), float(v), cam, pos,
+                                     heading, ground_z=ground)
+                        for u, v in zip(us, vs)]
+            points, valid = _back_project_many(us, vs, cam, pos, heading, ground)
+            np.testing.assert_array_equal(valid, [p is not None for p in expected])
+            if valid.any():
+                np.testing.assert_allclose(
+                    points[valid], [p for p in expected if p is not None],
+                    rtol=1e-12, atol=1e-10)
+            assert np.isnan(points[~valid]).all()
+
+
+@pytest.mark.parametrize("height", [-1.0, 0.0, 0.05, 1.0])
+def test_batch_projection_keeps_horizon_and_near_plane_guards(height):
+    from beamng_autopilot.vision.detection import back_project
+    from beamng_autopilot.vision.lanes import _back_project_many
+    from beamng_autopilot.vision.projection import CameraModel
+
+    # A level camera makes the horizon and 0.05 intersection exact.
+    cam = CameraModel(np.array([0.0, 0.0, height]),
+                      np.array([0.0, 1.0, 0.0]),
+                      np.array([0.0, 0.0, 1.0]), 90.0, 100, 100)
+    us = np.full(7, cam.cx)
+    vs = np.array([0.0, cam.cy, cam.cy + cam.fy * 0.5e-9,
+                   cam.cy + cam.fy * 1.5e-9, 51.0, 100.0, 101.0])
+    expected = [back_project(float(u), float(v), cam, np.zeros(3), 0.0)
+                for u, v in zip(us, vs)]
+    points, valid = _back_project_many(us, vs, cam, np.zeros(3), 0.0, 0.0)
+    np.testing.assert_array_equal(valid, [p is not None for p in expected])
+    if valid.any():
+        np.testing.assert_allclose(points[valid],
+                                   [p for p in expected if p is not None])
+
+
+def test_batch_projection_empty_input_does_not_query_camera():
+    from beamng_autopilot.vision.lanes import _back_project_many
+
+    points, valid = _back_project_many([], [], None, None, None, None)
+    assert points.shape == (0, 2)
+    assert valid.shape == (0,)
+
+
+def test_ring_label_pass_is_off_unless_requested():
+    """The multi-view label pass must not invent annotations.
+
+    A ring built without ``annotations=True`` has no annotation render
+    target, so ``grab_ring_labels`` returns nothing rather than an empty
+    label that a collector would save as "no road here" (measured
+    2026-09-21: a cold first frame did exactly that before this guard).
+    """
+    from beamng_autopilot_tech.providers import TechCameraRingProvider
+
+    stub = TechCameraRingProvider.__new__(TechCameraRingProvider)
+    stub.annotations = False
+    stub.cameras = {"front_main": object()}
+    assert stub.grab_ring_labels() == {}
+
+
+# --------------------------------------------------------------------------
+# T05: the ring's mounts are the geometry baseline's inputs
+# --------------------------------------------------------------------------
+class TestMountGeometry:
+    """Every mount's own extrinsics must agree with the independent oracle."""
+
+    @pytest.mark.parametrize("mount", [m.role for m in CAMERA_RING])
+    def test_mount_height_and_tilt_are_reported_consistently(self, mount):
+        from beamng_autopilot import geometry as G
+        from beamng_autopilot.vision.ring import camera_ring_models
+        cam = camera_ring_models(320, 240)[mount]
+        off = np.asarray(cam.offset, dtype=float)
+        # the mount's up component IS the camera height above the origin
+        assert off[2] > 0.0
+        # and the ground distance under the camera is that plus the gap
+        pos = np.array([0.0, 0.0, G.EGO_GROUND_GAP_M])
+        h = G.nearest_ground_distance_m(cam, pos)
+        if h is not None:
+            assert h > 0.1, (mount, h)
+
+    def test_the_two_forward_cameras_have_different_mounts(self):
+        from beamng_autopilot.vision.ring import camera_ring_models
+        ring = camera_ring_models(320, 240)
+        main, fish = ring["front_main"], ring["front_fisheye"]
+        assert not np.allclose(main.offset, fish.offset)
+        assert main.fov_deg < fish.fov_deg
+
+    def test_the_mount_frame_is_right_forward_up(self):
+        """The convention every geometry consumer depends on."""
+        from beamng_autopilot.vision.ring import CAMERA_RING, _fwd
+        for m in CAMERA_RING:
+            if m.role in ("front_main", "front_narrow", "front_fisheye"):
+                # pan 0 = forward: the local y axis dominates
+                assert abs(float(m.fwd_local[1])) > 0.9
+                # and the front cameras look slightly DOWN (negative z)
+                assert float(m.fwd_local[2]) <= 0.0
+        # _fwd's own convention: pan 0 -> +y, pan 90 -> +x (right)
+        assert np.allclose(_fwd(0.0), [0.0, 1.0, 0.0], atol=1e-9)
+        assert np.allclose(_fwd(90.0), [1.0, 0.0, 0.0], atol=1e-9)

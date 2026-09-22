@@ -1,12 +1,4 @@
-"""The arbitration chain must say what it did NOT evaluate.
-
-`_evaluate_core` returns on the first rule that fires.  A verdict whose
-reason says "scattered obstacle" therefore also says nothing at all about
-the road-surface rule and the body-cross rule, both of which stop the car
-and both of which sit further down the chain.  Reading that reason as
-"the monitor looked and found nothing worse" is the failure mode these
-tests exist to prevent.
-"""
+"""Safety traces report actual predicate visits and the final winner."""
 
 from beamng_autopilot.safety_monitor import (
     ARBITRATION_RULES,
@@ -46,70 +38,61 @@ class TestRuleForReason:
             "perception lane unavailable": "perception_lane_unavailable",
             "perceived road surface lost": "road_surface",
             "off perceived road surface": "road_surface",
+            "car body observed off the pavement": "body_off_pavement",
+            "car body observed off the pavement (creep)":
+                "body_off_pavement",
             "path blocked by obstacle": "path_blocked",
             "scattered obstacle": "scattered_obstacle",
             "path grazes obstacle": "path_grazes",
             "lane boundary recovery": "lane_boundary_recovery",
             "planned boundary crossing ahead": "planned_boundary_crossing",
             "current vehicle body crosses lane boundary": "body_crosses_boundary",
+            "planned vehicle body crosses lane boundary": "body_crosses_boundary",
             "path off-lane": "path_off_lane",
             "path near lane edge": "path_near_lane_edge",
             "obstacle very close": "obstacle_very_close",
+            "obstacle contact risk": "obstacle_risk",
+            "obstacle stopping distance": "obstacle_risk",
         }
         covered = {rule_for_reason(r) for r in reasons}
         assert covered == set(ARBITRATION_RULES)
 
 
 class TestArbitrationOutcome:
-    def test_no_rule_fired_means_everything_was_evaluated(self):
-        oc = arbitration_outcome(None)
-        assert oc["effective"] is None
+    def test_absent_trace_never_claims_full_coverage(self):
+        for fired in (None, "scattered_obstacle", "rule_from_a_newer_branch"):
+            oc = arbitration_outcome(fired)
+            assert oc["evaluated"] == []
+            assert oc["unevaluated"] == []
+            assert oc["masked_hard"] == []
+
+    def test_explicit_visits_do_not_stop_at_the_soft_winner(self):
+        oc = arbitration_outcome("scattered_obstacle",
+                                 evaluated=ARBITRATION_RULES,
+                                 level="degraded")
+        assert oc["effective"] == "scattered_obstacle"
         assert oc["evaluated"] == list(ARBITRATION_RULES)
         assert oc["unevaluated"] == []
         assert oc["masked_hard"] == []
 
-    def test_the_winner_and_everything_before_it_ran(self):
-        oc = arbitration_outcome("road_surface")
-        assert oc["evaluated"] == list(ARBITRATION_RULES[:5])
-
-    def test_everything_after_the_winner_never_ran(self):
-        oc = arbitration_outcome("road_surface")
-        assert oc["unevaluated"] == list(ARBITRATION_RULES[5:])
-        assert "body_crosses_boundary" in oc["unevaluated"]
-
-    def test_a_soft_winner_masks_the_hard_rules_below_it(self):
-        """The case the review asked for.
-
-        "scattered obstacle" is a slowdown that returns before both rules
-        that stop the car.  A report reading only the reason would
-        conclude the monitor found nothing worse.
-        """
-        oc = arbitration_outcome("scattered_obstacle")
-        assert RULE_WORST_LEVEL["scattered_obstacle"] == "degraded"
-        assert oc["masked_hard"] == [
-            r for r in ARBITRATION_RULES[7:]
-            if RULE_WORST_LEVEL[r] == "minimal_risk"]
-
-    def test_a_hard_winner_masks_nothing(self):
-        # A stop is the worst thing the chain can do, so nothing below it
-        # could have been stricter.
-        oc = arbitration_outcome("path_blocked")
-        assert oc["masked_hard"] == []
-
-    def test_the_last_rule_leaves_nothing_unevaluated(self):
-        oc = arbitration_outcome("obstacle_very_close")
-        assert oc["unevaluated"] == []
-
-    def test_an_unknown_rule_claims_no_coverage(self):
-        """Position in the chain is unknown, so nothing downstream may be
-        called evaluated - and nothing may be called masked either."""
-        oc = arbitration_outcome("rule_from_a_newer_branch")
-        assert oc["evaluated"] == []
-        assert oc["unevaluated"] == []
-        assert oc["masked_hard"] == []
+    def test_road_rule_uses_actual_not_worst_level(self):
+        visits = list(ARBITRATION_RULES[:5])
+        soft = arbitration_outcome("road_surface", evaluated=visits,
+                                   level="degraded")
+        assert "body_crosses_boundary" in soft["masked_hard"]
+        hard = arbitration_outcome("road_surface", evaluated=visits,
+                                   level="minimal_risk")
+        assert hard["masked_hard"] == []
+        assert hard["unevaluated"] == list(ARBITRATION_RULES[5:])
 
     def test_every_rule_has_a_worst_level(self):
         assert set(RULE_WORST_LEVEL) == set(ARBITRATION_RULES)
+
+    def test_unknown_reason_does_not_become_an_all_checked_verdict(self):
+        from beamng_autopilot.safety_monitor import SafetyVerdict
+        v = SafetyMonitor()._finish(SafetyVerdict(reason="something new"))
+        assert v.rules_evaluated == []
+        assert v.rules_unevaluated == list(ARBITRATION_RULES)
 
 
 class _Scene:

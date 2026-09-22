@@ -79,20 +79,14 @@ class _LaneWorldSemantic:
         h, w = ctx.frame_rgb.shape[:2]
         road = np.zeros((h, w), dtype=bool)
         road[h // 2:] = True
-        hdg = float(ctx.heading)
-        fwd = np.array([np.cos(hdg), np.sin(hdg)])
-        left = np.array([-fwd[1], fwd[0]])
         pos = np.asarray(ctx.pos[:2], dtype=float)
-        # Station origin = the point of the road centre directly below the
-        # car (the road runs along +x with centre line at world y=0).
-        origin = np.array([pos[0], 0.0])
         s = np.linspace(2.0, 18.0, 17)
 
         def line(road_lat, color, kind):
-            # Real painted markings in WORLD coordinates: fixed road
-            # latitude (centre line y=0, right edge y=-3.5), running
-            # ahead of the car. The head projects them into the car frame.
-            world = origin + s[:, None] * fwd + road_lat * left
+            # The road is fixed in world space; changing ego yaw must not
+            # rotate the observed paint or its ground-truth boundary.
+            world = np.column_stack([
+                pos[0] + s, np.full_like(s, road_lat)])
             return LaneMarking(world=world, pixels=world,
                                color=color, kind=kind, confidence=0.9)
 
@@ -100,6 +94,39 @@ class _LaneWorldSemantic:
             masks={"road": road, "line": road},
             meta={"markings": [line(0.0, "yellow", "solid"),
                                line(-3.5, "white", "solid")]})
+
+
+def test_straight_world_markings_do_not_rotate_or_shift_with_ego():
+    semantic = _LaneWorldSemantic()
+    for heading in (0.0, math.radians(12.0), math.radians(-25.0)):
+        for lateral in (-1.2, -1.75, -2.5):
+            output = semantic.run(SimpleNamespace(
+                frame_rgb=np.zeros((120, 160, 3), dtype=np.uint8),
+                heading=heading, pos=np.array([20.0, lateral, 0.0])))
+            for marking, expected_y in zip(output.meta["markings"], (0.0, -3.5)):
+                np.testing.assert_allclose(marking.world[:, 0],
+                                           np.linspace(22.0, 38.0, 17))
+                np.testing.assert_allclose(marking.world[:, 1], expected_y)
+
+
+def test_fixed_world_pair_and_envelope_share_the_detected_lane_geometry():
+    from beamng_autopilot.lane import pair_lane_markings
+    from beamng_autopilot.lane.envelope import SensorLaneEnvelope
+
+    pos = np.array([20.0, -1.2, 0.0])
+    heading = math.radians(12.0)
+    output = _LaneWorldSemantic().run(SimpleNamespace(
+        frame_rgb=np.zeros((120, 160, 3), dtype=np.uint8),
+        heading=heading, pos=pos))
+    frame = pair_lane_markings(output.meta["markings"], pos, heading)
+    assert frame is not None and frame.paired
+    np.testing.assert_allclose(frame.center[:, 1], -1.75, atol=1e-10)
+    envelope = SensorLaneEnvelope.from_lane_frame(frame, captured_at=0.0)
+    for name in ("center", "left", "right"):
+        original = getattr(frame, name)
+        copied = getattr(envelope, name)
+        np.testing.assert_array_equal(copied, original)
+        assert not np.shares_memory(copied, original)
 
 
 class _StubConn:

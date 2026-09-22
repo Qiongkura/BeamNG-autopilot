@@ -250,3 +250,194 @@ def test_support_mask_projects_history_without_voting():
     assert not empty.support_mask((H, W), CAM, (0.0, 0.0, 0.0), 0.0).any()
     # and a missing camera model degrades to an empty mask, not a crash
     assert not acc.support_mask((H, W), None, (0.0, 0.0, 0.0), 0.0).any()
+
+
+# --------------------------------------------------------------------------
+# T03: source identity, provenance split, local support
+# --------------------------------------------------------------------------
+def _obs(acc, pos, t, **kw):
+    """One observation of WORLD_LINE from the front camera."""
+    return acc.update(_project_mask(WORLD_LINE, pos, 0.0), CAM, pos, 0.0,
+                      now=t, **kw)
+
+
+def test_a_replayed_capture_cannot_vote_twice_at_a_new_processing_time():
+    """Same source, same sequence, later wall clock: still one vote.
+
+    The old rule only compared PROCESSING timestamps, so a reprocessed
+    frame with a moving clock added a second vote and could confirm a
+    single sighting (plan T03 反例: 同源不同处理时间).
+    """
+    acc = LineEvidenceAccumulator()
+    pos = np.zeros(3)
+    _obs(acc, pos, 10.0, source_id="front_main", source_seq=7,
+         capture_t=100.0)
+    ev = acc.source_events()
+    assert ev["accepted_observations"] == 1
+    # replayed later (new processing time), same capture
+    _obs(acc, pos, 10.4, source_id="front_main", source_seq=7,
+         capture_t=100.0)
+    ev = acc.source_events()
+    assert ev["accepted_observations"] == 1
+    assert ev["rejected_duplicate"] == 1
+    # a cell-level guard also exists for the "new seq, same capture" path
+    _obs(acc, pos, 10.8, source_id="front_main", source_seq=8,
+         capture_t=100.0)
+    ev = acc.source_events()
+    assert ev["accepted_observations"] == 2
+    assert ev["votes_suppressed_same_capture"] > 0
+
+
+def test_identical_content_from_two_real_captures_is_two_observations():
+    """Two genuine exposures are two votes even if the pixels match."""
+    acc = LineEvidenceAccumulator()
+    pos = np.zeros(3)
+    _obs(acc, pos, 10.0, source_id="front_main", source_seq=1,
+         capture_t=100.0)
+    _obs(acc, pos, 10.2, source_id="front_main", source_seq=2,
+         capture_t=100.2)
+    ev = acc.source_events()
+    assert ev["accepted_observations"] == 2
+    assert ev["votes_suppressed_same_capture"] == 0
+    assert ev["accepted_cell_votes"] > 0
+
+
+def test_out_of_order_and_wrapped_sequences():
+    acc = LineEvidenceAccumulator()
+    pos = np.zeros(3)
+    from beamng_autopilot.vision.line_evidence import SEQ_WRAP_GUARD
+    big = int(SEQ_WRAP_GUARD) + 50
+    _obs(acc, pos, 10.0, source_id="front_main", source_seq=big,
+         capture_t=100.0)
+    # a small backwards step is an out-of-order frame: rejected
+    _obs(acc, pos, 10.2, source_id="front_main", source_seq=big - 1,
+         capture_t=100.2)
+    ev = acc.source_events()
+    assert ev["rejected_out_of_order"] == 1
+    assert ev["accepted_observations"] == 1
+    # a huge backwards jump is a counter wrap: accepted, history KEPT
+    n_before = len(acc._cells)
+    _obs(acc, pos, 10.4, source_id="front_main", source_seq=3,
+         capture_t=100.4)
+    ev = acc.source_events()
+    assert ev["epoch_wrap"] == 1
+    assert ev["accepted_observations"] == 2
+    assert len(acc._cells) >= n_before, "a wrap must not clear history"
+
+
+def test_two_cameras_at_one_capture_instant_do_not_double_count():
+    """跨相机重复来源: one physical sighting is one vote per cell."""
+    acc = LineEvidenceAccumulator()
+    pos = np.zeros(3)
+    _obs(acc, pos, 10.0, source_id="front_main", source_seq=1,
+         capture_t=100.0)
+    _obs(acc, pos, 10.1, source_id="pillar_left", source_seq=1,
+         capture_t=100.0)
+    ev = acc.source_events()
+    assert ev["accepted_observations"] == 2      # two sources were seen
+    assert ev["votes_suppressed_same_capture"] > 0
+    assert set(ev["by_source"]) == {"front_main", "pillar_left"}
+
+
+def test_far_refresh_does_not_hide_a_near_expiry():
+    """The plan's 反例: 远处持续刷新、近处过期 is invisible in one ratio."""
+    acc = LineEvidenceAccumulator()
+    # both bands must be inside the front camera's real working range
+    # (its nearest visible ground is ~3.5 m, and the far end must project)
+    near = np.column_stack([np.linspace(5.0, 7.0, 20), np.full(20, 0.5)])
+    far = np.column_stack([np.linspace(12.0, 16.0, 20), np.full(20, 0.5)])
+    pos = np.zeros(3)
+    acc.update(_project_mask(near, pos, 0.0), CAM, pos, 0.0, now=10.0,
+               source_id="front_main", source_seq=1, capture_t=100.0)
+    acc.update(_project_mask(far, pos, 0.0), CAM, pos, 0.0, now=10.0,
+               source_id="front_main", source_seq=1, capture_t=100.0)
+    # only the far band is refreshed for longer than MAX_AGE_S
+    for i in range(1, 8):
+        acc.update(_project_mask(far, pos, 0.0), CAM, pos, 0.0,
+                   now=10.0 + 2.0 * i, source_id="front_main",
+                   source_seq=1 + i, capture_t=100.0 + 2.0 * i)
+    bands = acc.local_bands(pos, 0.0, now=10.0 + 2.0 * 7)
+    near_band = next(b for b in bands if b["from_m"] == 0.0)
+    far_band = next(b for b in bands if b["from_m"] == 10.0)
+    assert far_band["supported"] > 0 and far_band["current"] > 0
+    assert near_band["current"] == 0, "the near band must have expired"
+    # the near band is either pruned outright or holds only evidence older
+    # than the expiry window - never "current"
+    assert near_band["supported"] == 0 or near_band["oldest_age_s"] > 6.0
+
+
+def test_the_added_pixel_provenance_is_split_by_evidence_age():
+    acc = LineEvidenceAccumulator()
+    pos = np.zeros(3)
+    mask = _project_mask(WORLD_LINE, pos, 0.0)
+    # two real sightings first: HIT_MIN is what makes evidence supported
+    line, info = acc.fuse_with_confidence(
+        mask, CAM, pos, 0.0, now=10.0, source_id="front_main",
+        source_seq=1, capture_t=100.0)
+    assert info["added_pixels_history"] == 0     # nothing held yet
+    acc.fuse_with_confidence(mask, CAM, pos, 0.0, now=10.1,
+                             source_id="front_main", source_seq=2,
+                             capture_t=100.1)
+    # a capture with an EMPTY mask 0.5 s later: the support it supplies is
+    # still "current" (the car is still tracking that paint)
+    _line, info_fresh = acc.fuse_with_confidence(
+        np.zeros_like(mask), CAM, pos, 0.0, now=10.6, source_id="front_main",
+        source_seq=3, capture_t=100.6)
+    assert info_fresh["added_pixels_current"] > 0
+    assert info_fresh["added_pixels_history"] == 0
+    # ...and 2.4 s later the same pixels are HISTORY (older than the fresh
+    # window, still inside the expiry window)
+    line2, info2 = acc.fuse_with_confidence(
+        np.zeros_like(mask), CAM, pos, 0.0, now=12.5, source_id="front_main",
+        source_seq=4, capture_t=102.5)
+    assert info2["added_pixels_history"] > 0
+    assert info2["added_pixels_current"] == 0
+    assert info2["added_pixels"] == (info2["added_pixels_history"]
+                                     + info2["added_pixels_current"])
+
+
+def test_the_yellow_prior_is_attributed_separately():
+    acc = LineEvidenceAccumulator()
+    pos = np.zeros(3)
+    mask = _project_mask(WORLD_LINE, pos, 0.0)
+    _line, info = acc.fuse_with_confidence(
+        mask, CAM, pos, 0.0, now=10.0, source_id="front_main",
+        source_seq=1, capture_t=100.0, yellow_mask=mask.copy())
+    assert info["yellow_pixels_in_line"] > 0
+    assert info["added_pixels_yellow"] >= 0
+    _line2, info2 = acc.fuse_with_confidence(
+        mask, CAM, pos, 0.0, now=10.2, source_id="front_main",
+        source_seq=2, capture_t=100.2)
+    assert info2["yellow_pixels_in_line"] == 0   # no prior passed in
+
+
+def test_the_reference_support_digest_separates_current_from_history():
+    acc = LineEvidenceAccumulator()
+    pos = np.zeros(3)
+    mask = _project_mask(WORLD_LINE, pos, 0.0)
+    acc.update(mask, CAM, pos, 0.0, now=10.0, source_id="front_main",
+               source_seq=1, capture_t=100.0)
+    acc.update(mask, CAM, pos, 0.0, now=10.2, source_id="front_main",
+               source_seq=2, capture_t=100.2)
+    # the candidate's own geometry (an independent copy of the same line)
+    dig = acc.support_digest(WORLD_LINE, now=10.2)
+    assert dig["n_points"] == len(WORLD_LINE)
+    assert dig["n_supported"] > 0
+    # every SUPPORTED point was stamped by the latest observation
+    assert dig["n_current"] == dig["n_supported"]
+    assert dig["history_only_frac"] == pytest.approx(0.0, abs=1e-6)
+    # after a tick with no observation, the same geometry reads as history
+    acc.update(np.zeros_like(mask), CAM, pos, 0.0, now=10.6,
+               source_id="front_main", source_seq=3, capture_t=100.6)
+    dig2 = acc.support_digest(WORLD_LINE, now=10.6)
+    assert dig2["n_supported"] == dig["n_supported"]
+    assert dig2["n_current"] == 0
+    assert dig2["history_only_frac"] == pytest.approx(
+        dig2["supported_frac"], abs=1e-6)
+    assert dig2["min_age_s"] > 0.0
+
+
+def test_the_support_digest_is_none_without_geometry():
+    acc = LineEvidenceAccumulator()
+    assert acc.support_digest(None) is None
+    assert acc.support_digest(np.zeros((0, 2))) is None

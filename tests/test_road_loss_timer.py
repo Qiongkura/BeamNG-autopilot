@@ -115,6 +115,44 @@ class TestGateIntegration:
         assert checked is False
         # ... and the loss clock is where it was left, not restarted
         assert mon._road_lost_since == 10.0
+        assert lost2 == 4.0
+        _, resumed, checked = mon._road_surface_gate(self._Scene(object()), 20.0)
+        assert checked is True
+        assert resumed == 10.0
+
+    def test_gridless_gap_interrupts_recovery_confirmation(self, monkeypatch):
+        import beamng_autopilot.safety_monitor as sm
+        mon = self._mon(confirm_s=2.0)
+        monkeypatch.setattr(sm, "perceived_road_state",
+                            lambda *args: (ROAD_SURFACE_UNKNOWN, None))
+        mon._road_surface_gate(self._Scene(object()), 0.0)
+        monkeypatch.setattr(sm, "perceived_road_state",
+                            lambda *args: (ROAD_SURFACE_ON, None))
+        mon._road_surface_gate(self._Scene(object()), 9.0)
+        mon._road_surface_gate(self._Scene(None), 10.0)
+        _, lost, _ = mon._road_surface_gate(self._Scene(object()), 12.0)
+        assert lost == 12.0
+        assert mon._road_lost_since == 0.0
+        _, lost, _ = mon._road_surface_gate(self._Scene(object()), 14.0)
+        assert lost == 0.0
+        assert mon._road_lost_since is None
+
+    def test_stale_grid_does_not_count_as_an_on_observation(self, monkeypatch):
+        import beamng_autopilot.safety_monitor as sm
+        mon = self._mon(confirm_s=2.0)
+        monkeypatch.setattr(sm, "perceived_road_state",
+                            lambda *args: (ROAD_SURFACE_UNKNOWN, None))
+        mon._road_surface_gate(self._Scene(object()), 0.0)
+        monkeypatch.setattr(sm, "perceived_road_state",
+                            lambda *args: (ROAD_SURFACE_ON, None))
+        mon._road_surface_gate(self._Scene(object()), 9.0)
+        state, lost, checked = mon._road_surface_gate(
+            self._Scene(object()), 12.0, fresh=False)
+        assert state == ROAD_SURFACE_UNKNOWN
+        assert lost == 9.0 and checked is False
+        assert mon._road_last_on_s is None
+        _, lost, _ = mon._road_surface_gate(self._Scene(object()), 12.1)
+        assert lost == 12.1
 
 
 class TestThresholds:

@@ -66,3 +66,40 @@ def test_empty_line_mask_is_returned_untouched():
     road = np.ones((10, 10), dtype=bool)
     kept = constrain_line_to_road(np.zeros((10, 10), dtype=bool), road)
     assert not kept.any()
+
+
+# --- T01: the off-switch and the legacy arm -------------------------------
+def test_elongated_frac_none_disables_the_second_tier():
+    """``None`` is the off-switch; ``0.0`` is NOT (it lets everything pass).
+
+    Pinned because the four-arm report used ``elongated_frac=0.0`` while
+    describing the arm as "constraint without the elongated fallback" - a
+    stroke lying almost entirely off the road survived the tier it was
+    supposed to be excluded from (plan T01).
+    """
+    road = np.zeros((40, 60), dtype=bool)
+    road[:, :20] = True
+    line = _stripe((40, 60), 40, 8)      # 40 px right of the road region
+
+    assert not constrain_line_to_road(
+        line, road, elongated_frac=None).any()      # tier off -> dropped
+    assert constrain_line_to_road(
+        line, road, elongated_frac=0.0).any()       # 0.0 -> tier keeps it
+
+
+def test_the_legacy_pixel_constraint_is_not_a_bare_intersection():
+    """The two differ on exactly the road-mask holes paint sits in."""
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+    from m5_seg_stage_eval import legacy_pixel_road_constraint
+
+    road = np.zeros((40, 60), dtype=bool)
+    road[5:35, 5:55] = True
+    road[18:22, 25:35] = False           # a hole (the paint the model calls
+    line = np.zeros((40, 60), dtype=bool)  # "not asphalt")
+    line[18:22, 25:35] = True
+    bare = line & road
+    legacy = legacy_pixel_road_constraint(line, road)
+    assert not bare.any()
+    assert legacy.any(), "the legacy version fills the hole first"

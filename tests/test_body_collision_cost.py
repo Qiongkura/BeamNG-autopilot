@@ -83,3 +83,20 @@ def test_strict_with_an_empty_drivable_layer_is_infeasible():
     cost2, feas2 = Constraints(w_lane_align=0.0, w_curvature=0.0,
                                w_progress=0.0).score(scene2, cand)
     assert feas2
+
+
+def test_body_collision_empty_sampling_window_preserves_three_values():
+    scene = _scene_with_wall(gap_clear=True)
+    path = np.array([[0.0, 0.0], [1.5, 0.0], [2.2, 0.0]])
+    assert _path_body_collision(scene, path) == (0, 0, 0)
+    assert _path_body_collision(scene, path[:1]) == (0, 0, 0)
+    scene.grid = None
+    assert _path_body_collision(scene, path) == (0, 0, 0)
+
+
+def test_constraints_score_short_forward_candidate_without_unpack_error():
+    scene = _scene_with_wall(gap_clear=True)
+    path = np.array([[0.0, 0.0], [1.5, 0.0], [2.2, 0.0]])
+    candidate = SimpleNamespace(path=path, meta={"kind": "arc"})
+    cost, feasible = Constraints().score(scene, candidate)
+    assert feasible and np.isfinite(cost)

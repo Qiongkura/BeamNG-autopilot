@@ -1,130 +1,179 @@
-"""Wiring the feasibility answer into the escape hatch (plan P2.3).
+"""The corridor adapter consumes real Scene measurements, not stub fields."""
 
-The gate that is being replaced returned True when it could not see.  So
-the tests here are mostly about what happens when the evidence is missing:
-UNKNOWN has to stay closed, and an exception has to stay closed.
-"""
+from __future__ import annotations
+
+import importlib
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 from beamng_autopilot import safety_monitor as sm
+from beamng_autopilot.occupancy import OccupancyGrid
+from beamng_autopilot.planning import Scene
 
 
-class _Grid:
-    def __init__(self, obstacle, drivable=None, res=0.5):
-        self.obstacle = np.asarray(obstacle, dtype=np.int8)
-        self.n_rows, self.n_cols = self.obstacle.shape
-        self.res = res
-        self.drivable = drivable
+def _scene():
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.drivable[:] = 1.0
+    grid.observed[:] = 1
+    path = np.column_stack([np.linspace(0., 14., 29), np.zeros(29)])
+    scene = Scene(pos=np.array([0., 0.]), heading=0., grid=grid,
+                  lane_ref=path, strict_perception=True,
+                  meta={"bev_age_s": 0.1})
+    return scene, path
 
 
-class _Scene:
-    def __init__(self, grid=None, **kw):
-        self.grid = grid
-        self.speed_mps = kw.get("speed_mps", 0.0)
-        self.closest_obs_m = kw.get("closest_obs_m", None)
-        self.bev_age_s = kw.get("bev_age_s", None)
+def _feasible(mon, scene, **kw):
+    args = {"ego_speed_mps": 4., "closest_obs_m": 999., "bev_age_s": 0.1}
+    args.update(kw)
+    return mon._corridor_feasibility(scene, **args)
 
 
-def _open():
-    return np.zeros((40, 40), dtype=np.int8)
+def test_corridor_gate_stays_default_off():
+    assert sm.CORRIDOR_FEASIBILITY_GATE is False
+    verdict = sm.SafetyVerdict()
+    assert verdict.corridor_state == "unknown"
+    assert verdict.corridor_evidence == {}
 
 
-class TestDefaultOff:
-    def test_the_gate_is_off_unless_asked_for(self):
-        # Behaviour must not change because a new primitive exists.
-        assert sm.CORRIDOR_FEASIBILITY_GATE is False
-
-    def test_the_verdict_starts_unknown_not_open(self):
-        v = sm.SafetyVerdict()
-        assert v.corridor_state == "unknown"
-        assert v.corridor_reason == ""
-        assert v.corridor_evidence == {}
+def test_disabled_gate_labels_legacy_boolean_evidence(monkeypatch):
+    monkeypatch.setattr(sm, "CORRIDOR_FEASIBILITY_GATE", False)
+    scene, path = _scene()
+    v = sm.SafetyMonitor().evaluate(scene, path, ego_speed_mps=4.)
+    assert v.corridor_open
+    assert v.corridor_state == "feasible"
+    assert "structured feasibility disabled" in v.corridor_reason
+    assert v.corridor_evidence == {"method": "legacy_bool", "enabled": False}
 
 
-class TestCorridorFeasibilityMethod:
-    def test_no_grid_is_unknown_and_closed(self):
-        mon = sm.SafetyMonitor()
-        res = mon._corridor_feasibility(_Scene(None))
-        assert res.state == "unknown"
-        assert res.feasible is False
-
-    def test_an_open_corridor_is_feasible(self):
-        mon = sm.SafetyMonitor()
-        res = mon._corridor_feasibility(_Scene(_Grid(_open())))
-        assert res.state == "feasible"
-        assert res.feasible is True
-
-    def test_the_999_sentinel_is_not_passed_in_as_a_distance(self):
-        # 999 would make "required distance" 999 m and the band would
-        # always look too short - or, read the other way, it would be
-        # treated as an obstacle a kilometre away.
-        mon = sm.SafetyMonitor()
-        res = mon._corridor_feasibility(
-            _Scene(_Grid(_open()), closest_obs_m=999.0))
-        assert res.state == "feasible"
-
-    def test_a_real_distance_is_used(self):
-        mon = sm.SafetyMonitor()
-        res = mon._corridor_feasibility(
-            _Scene(_Grid(_open()), closest_obs_m=8.0))
-        # 8 m required, 8.5 m clear on a 40-row / 0.5 m grid
-        assert res.available_distance_m == 8.0
-
-    def test_stale_evidence_is_unknown(self):
-        mon = sm.SafetyMonitor()
-        res = mon._corridor_feasibility(
-            _Scene(_Grid(_open()), bev_age_s=9.0))
-        assert res.state == "unknown"
-        assert res.feasible is False
-
-    def test_an_unreadable_grid_is_unknown_not_open(self):
-        """A grid object that raises: the old gate's try/except set
-        corridor_open = False, but the P2.1 call has to fail the same
-        conservative way."""
-        class _Bad:
-            n_rows = 40
-            n_cols = 40
-            res = 0.5
-
-            @property
-            def obstacle(self):
-                raise RuntimeError("grid reader blew up")
-
-            drivable = None
-
-        mon = sm.SafetyMonitor()
-        res = mon._corridor_feasibility(_Scene(_Bad()))
-        assert res.state == "unknown"
-        assert res.feasible is False
-        assert "failed" in res.reason
-
-    def test_a_bad_speed_reads_as_zero_not_as_an_exception(self):
-        mon = sm.SafetyMonitor()
-        res = mon._corridor_feasibility(
-            _Scene(_Grid(_open()), speed_mps="not a number"))
-        assert res.state in ("feasible", "infeasible")
+def test_open_observed_pavement_is_feasible():
+    scene, _ = _scene()
+    res = _feasible(sm.SafetyMonitor(), scene)
+    assert res.feasible
+    assert res.evidence["age_s"] == 0.1
+    assert res.evidence["ego_speed_mps"] == 4.
 
 
-class TestUnknownDoesNotOpenTheHatch:
-    def test_every_unknown_shape_reports_closed(self, monkeypatch):
-        mon = sm.SafetyMonitor()
-        scenes = [
-            _Scene(None),
-            _Scene(_Grid(_open()), bev_age_s=99.0),
-        ]
-        for sc in scenes:
-            assert mon._corridor_feasibility(sc).feasible is False
+def test_no_grid_is_unknown_and_closed():
+    scene, _ = _scene()
+    scene.grid = None
+    res = _feasible(sm.SafetyMonitor(), scene)
+    assert res.state == "unknown"
+    assert not res.feasible
 
-    def test_a_gridless_scene_is_no_longer_treated_as_open(self, monkeypatch):
-        """The old code: grid is None -> corridor_free_band returns True.
 
-        That is what let a scene the pipeline could not read authorise
-        cruise.  With the gate on, the answer is unknown and stays closed.
-        """
-        monkeypatch.setattr(sm, "CORRIDOR_FEASIBILITY_GATE", True)
-        mon = sm.SafetyMonitor()
-        res = mon._corridor_feasibility(_Scene(None))
-        assert res.state == "unknown"
-        assert res.feasible is False
+@pytest.mark.parametrize("field", ["ego_speed_mps", "closest_obs_m", "bev_age_s"])
+@pytest.mark.parametrize("value", [None, "bad", float("nan"), float("inf"), -1.])
+def test_invalid_measurement_cannot_open_the_corridor(field, value):
+    scene, _ = _scene()
+    res = _feasible(sm.SafetyMonitor(), scene, **{field: value})
+    assert res.state == "unknown"
+    assert not res.feasible
+
+
+def test_missing_explicit_inputs_are_unknown_not_stationary_and_fresh():
+    scene, _ = _scene()
+    res = sm.SafetyMonitor()._corridor_feasibility(scene)
+    assert res.state == "unknown"
+    assert not res.feasible
+
+
+def test_stale_evidence_stays_closed():
+    scene, _ = _scene()
+    res = _feasible(sm.SafetyMonitor(), scene, bev_age_s=9.)
+    assert res.state == "unknown"
+    assert not res.feasible
+
+
+def test_exception_stays_unknown(monkeypatch):
+    primitive = importlib.import_module(
+        "beamng_autopilot.planning.corridor_feasibility")
+
+    def fail(*args, **kw):
+        raise RuntimeError("grid reader failed")
+
+    monkeypatch.setattr(primitive, "corridor_feasibility", fail)
+    scene, _ = _scene()
+    res = _feasible(sm.SafetyMonitor(), scene)
+    assert res.state == "unknown"
+    assert "failed" in res.reason
+
+
+@pytest.mark.parametrize("closest", [8., 999.])
+def test_adapter_passes_explicit_distance_not_scene_attributes(monkeypatch, closest):
+    primitive = importlib.import_module(
+        "beamng_autopilot.planning.corridor_feasibility")
+    seen = {}
+
+    def capture(scene, **kw):
+        seen.update(kw)
+        return primitive.CorridorFeasibility(state="feasible")
+
+    monkeypatch.setattr(primitive, "corridor_feasibility", capture)
+    scene, _ = _scene()
+    _feasible(sm.SafetyMonitor(), scene, closest_obs_m=closest)
+    assert seen["ego_speed_mps"] == 4.
+    assert seen["required_distance_m"] == (None if closest == 999. else closest)
+    assert seen["evidence"]["age_s"] == 0.1
+
+
+def test_evaluate_wires_real_speed_clearance_and_bev_age(monkeypatch):
+    primitive = importlib.import_module(
+        "beamng_autopilot.planning.corridor_feasibility")
+    seen = {}
+
+    def capture(scene, **kw):
+        seen.update(kw)
+        return primitive.CorridorFeasibility(
+            state="feasible", evidence=kw["evidence"])
+
+    monkeypatch.setattr(sm, "CORRIDOR_FEASIBILITY_GATE", True)
+    monkeypatch.setattr(primitive, "corridor_feasibility", capture)
+    scene, path = _scene()
+    scene.grid.mark_obstacle_region(9., 0., 0.25, 0.25)
+    assert not hasattr(scene, "speed_mps")
+    assert not hasattr(scene, "closest_obs_m")
+    assert not hasattr(scene, "bev_age_s")
+    v = sm.SafetyMonitor(max_speed=6.).evaluate(scene, path, ego_speed_mps=5.)
+    assert seen["ego_speed_mps"] == 5.
+    assert seen["required_distance_m"] == pytest.approx(v.closest_obs_m)
+    assert v.closest_obs_m < 999.
+    assert seen["evidence"]["age_s"] == 0.1
+    assert v.corridor_state == "feasible"
+    assert v.corridor_evidence["evidence"]["ego_speed_mps"] == 5.
+
+
+def test_evaluate_prefers_snapshot_bev_age(monkeypatch):
+    monkeypatch.setattr(sm, "CORRIDOR_FEASIBILITY_GATE", True)
+    scene, path = _scene()
+    scene.perception_snapshot = SimpleNamespace(
+        head_age_s={"semantic": 0.1}, tracks=[],
+        freshness=lambda: {"head_max_s": 0.1, "range_s": 0.1,
+                           "bev_s": 9., "lane_s": 0.1, "max_s": 9.})
+    v = sm.SafetyMonitor(max_speed=6.).evaluate(scene, path, ego_speed_mps=5.)
+    assert v.corridor_state == "unknown"
+    assert not v.corridor_open
+    assert v.corridor_evidence["evidence"]["age_s"] == 9.
+
+
+def test_evaluate_missing_speed_stays_unknown(monkeypatch):
+    monkeypatch.setattr(sm, "CORRIDOR_FEASIBILITY_GATE", True)
+    scene, path = _scene()
+    v = sm.SafetyMonitor(max_speed=6.).evaluate(scene, path)
+    assert v.corridor_state == "unknown"
+    assert not v.corridor_open
+    assert "ego_speed_mps" in v.corridor_reason
+
+
+def test_evaluate_unknown_age_cannot_relax_occupied_path(monkeypatch):
+    monkeypatch.setattr(sm, "CORRIDOR_FEASIBILITY_GATE", True)
+    scene, path = _scene()
+    scene.meta.clear()
+    scene.grid.mark_obstacle_region(12., 0., 4., 0.2)
+    v = sm.SafetyMonitor(max_speed=6.).evaluate(scene, path, ego_speed_mps=5.)
+    assert v.corridor_state == "unknown"
+    assert not v.corridor_open
+    assert v.path_occupied_frac >= sm.OCC_FRACTION_STOP
+    assert v.level == "minimal_risk"
+    assert v.target_speed == 0.

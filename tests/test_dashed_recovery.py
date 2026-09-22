@@ -174,3 +174,103 @@ def test_recovered_boundary_is_ordered_and_smooth() -> None:
     span = float(np.linalg.norm(w[-1] - w[0]))
     assert length < 1.15 * span, "the published chain must be a clean line"
 
+
+def _scalar_projection(us, vs, cam, pos, heading, ground_z):
+    from beamng_autopilot.vision.detection import back_project
+
+    points = np.full((len(us), 2), np.nan)
+    valid = np.zeros(len(us), dtype=bool)
+    for i, (u, v) in enumerate(zip(us, vs)):
+        point = back_project(float(u), float(v), cam, pos, heading, ground_z)
+        if point is not None:
+            points[i] = point
+            valid[i] = True
+    return points, valid
+
+
+@pytest.mark.parametrize("color", ["white", "yellow"])
+@pytest.mark.parametrize("ground_delta", [0.0, -0.55, 4.0])
+def test_batched_marking_extractor_preserves_scalar_outputs(
+        monkeypatch, color, ground_delta):
+    from beamng_autopilot.vision import lanes
+    from beamng_autopilot.vision.projection import default_camera
+
+    cam = default_camera(536, 403)
+    pos = np.array([24.0, -50.0, 3.0])
+    mask = np.zeros((403, 536), dtype=np.uint8)
+    mask[210:395, 240:245] = 255
+    mask[240:388, 312:328] = 255
+    mask[280:292, 350:356] = 255
+    mask[330:334, 80:130] = 255
+    debug_batch, debug_scalar = {}, {}
+    got = lanes._mask_to_markings(
+        mask, color, cam, pos, 0.7, ground_z=pos[2] + ground_delta,
+        debug=debug_batch)
+    monkeypatch.setattr(lanes, "_back_project_many", _scalar_projection)
+    expected = lanes._mask_to_markings(
+        mask, color, cam, pos, 0.7, ground_z=pos[2] + ground_delta,
+        debug=debug_scalar)
+    assert len(got) == len(expected)
+    assert debug_batch == debug_scalar
+    for actual, prior in zip(got, expected):
+        assert (actual.color, actual.kind) == (prior.color, prior.kind)
+        assert actual.confidence == pytest.approx(prior.confidence, abs=1e-12)
+        np.testing.assert_allclose(actual.world, prior.world, atol=1e-11)
+        np.testing.assert_array_equal(actual.pixels, prior.pixels)
+
+
+def test_marking_batch_accepts_duck_typed_camera_and_bounds_pose_calls(monkeypatch):
+    from beamng_autopilot.vision import lanes
+    from beamng_autopilot.vision.projection import default_camera
+
+    class Camera:
+        def __init__(self):
+            self.model = default_camera(536, 403)
+            self.calls = 0
+            for name in ("fx", "fy", "cx", "cy"):
+                setattr(self, name, getattr(self.model, name))
+
+        def camera_pose(self, pos, heading):
+            self.calls += 1
+            return self.model.camera_pose(pos, heading)
+
+    mask = np.zeros((403, 536), dtype=np.uint8)
+    mask[220:390, 250:257] = 255
+    cam = Camera()
+    got = lanes._mask_to_markings(mask, "white", cam, np.zeros(3), 0.0)
+    batch_calls = cam.calls
+    assert got and 1 <= batch_calls <= 2
+    cam.calls = 0
+    monkeypatch.setattr(lanes, "_back_project_many", _scalar_projection)
+    expected = lanes._mask_to_markings(mask, "white", cam, np.zeros(3), 0.0)
+    assert cam.calls > batch_calls
+    np.testing.assert_allclose(got[0].world, expected[0].world)
+
+
+def test_batch_marking_distance_gate_keeps_scalar_hypot_rounding(monkeypatch):
+    import math
+    from beamng_autopilot.vision import lanes
+    from beamng_autopilot.vision.projection import default_camera
+
+    # Find a last-bit rounding case deterministically, then make it the
+    # exact upper bound.  np.hypot must not change membership at that bound.
+    rng = np.random.default_rng(20260921)
+    candidates = rng.uniform(2.0, 20.0, (2000, 2))
+    vector = np.hypot(candidates[:, 0], candidates[:, 1])
+    scalar = np.array([math.hypot(x, y) for x, y in candidates])
+    indices = np.flatnonzero(vector > scalar)
+    if not len(indices):
+        pytest.skip("platform has identical hypot rounding for this fixture")
+    point = candidates[indices[0]]
+    limit = scalar[indices[0]]
+
+    def project(us, vs, *args):
+        return np.tile(point, (len(us), 1)), np.ones(len(us), dtype=bool)
+
+    monkeypatch.setattr(lanes, "_back_project_many", project)
+    mask = np.zeros((403, 536), dtype=np.uint8)
+    mask[230:390, 250:257] = 255
+    marks = lanes._mask_to_markings(mask, "white", default_camera(536, 403),
+                                    np.zeros(3), 0.0, max_dist=limit)
+    assert marks, "points exactly on max_dist must survive"
+

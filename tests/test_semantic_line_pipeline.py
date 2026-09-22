@@ -230,3 +230,133 @@ def test_task_replay_resets_and_uses_recording_time(tmp_path, monkeypatch):
     report = replay.measure(None, episodes)
     assert report["frames"] == 4
     assert events == ["reset", 10., 10.5, "reset", 1., 1.25]
+
+
+class _Clock:
+    def __init__(self):
+        self.now = 100.0
+
+    def __call__(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+
+def _timed_segmenter(monkeypatch, clock):
+    import torch
+    from beamng_autopilot.vision import segmentation as module
+
+    monkeypatch.setattr(module.time, "perf_counter", clock)
+    original_resize = module.cv2.resize
+
+    def resize(*args, **kwargs):
+        clock.advance(0.001)
+        return original_resize(*args, **kwargs)
+
+    monkeypatch.setattr(module.cv2, "resize", resize)
+    seg = object.__new__(Segmenter)
+    seg.device, seg.half = "cpu", False
+    seg._road_idx, seg._line_idx = 1, 2
+    seg.calls = 0
+
+    def model(x):
+        seg.calls += 1
+        clock.advance(0.005)
+        return torch.zeros((1, 3, 4, 4))
+
+    def postprocess(frame, road, line):
+        clock.advance(0.003)
+        return road, line
+
+    seg.model = model
+    seg._postprocess = postprocess
+    return seg
+
+
+def test_segmenter_times_one_inference_through_mask_materialization(monkeypatch):
+    clock = _Clock()
+    seg = _timed_segmenter(monkeypatch, clock)
+    road, line = seg.predict(_ctx().frame_rgb)
+    timing = dict(seg.last_timing_ms)
+    assert seg.calls == 1
+    assert not road.any() and not line.any()
+    assert timing["preprocess"] == pytest.approx(1.0)
+    assert timing["inference_decode"] == pytest.approx(6.0)
+    assert timing["postprocess"] == pytest.approx(3.0)
+    assert timing["probabilities"] is None
+    assert timing["total"] == pytest.approx(10.0)
+    seg.predict(_ctx().frame_rgb)
+    assert timing == seg.last_timing_ms
+    assert timing is not seg.last_timing_ms
+
+
+def test_probability_timing_reuses_the_same_logits(monkeypatch):
+    clock = _Clock()
+    seg = _timed_segmenter(monkeypatch, clock)
+    seen = []
+
+    def probabilities(frame, *, _logits=None):
+        assert _logits is not None
+        seen.append(_logits)
+        clock.advance(0.004)
+        return "maps", None, None
+
+    seg.predict_proba = probabilities
+    road, line, maps = seg.predict_with_probs(_ctx().frame_rgb)
+    assert seg.calls == 1 and len(seen) == 1 and maps == "maps"
+    assert seg.last_timing_ms["probabilities"] == pytest.approx(4.0)
+    assert seg.last_timing_ms["total"] == pytest.approx(14.0)
+
+
+def test_failed_inference_retains_timings_without_old_postprocess(monkeypatch):
+    clock = _Clock()
+    seg = _timed_segmenter(monkeypatch, clock)
+    seg.predict(_ctx().frame_rgb)
+
+    def fail(x):
+        clock.advance(0.008)
+        raise RuntimeError("model failed")
+
+    seg.model = fail
+    with pytest.raises(RuntimeError, match="model failed"):
+        seg.predict(_ctx().frame_rgb)
+    assert seg.last_timing_ms["preprocess"] == pytest.approx(1.0)
+    assert seg.last_timing_ms["inference_decode"] == pytest.approx(8.0)
+    assert seg.last_timing_ms["postprocess"] is None
+    assert seg.last_timing_ms["probabilities"] is None
+    assert seg.last_timing_ms["total"] == pytest.approx(9.0)
+
+
+def test_head_timing_keeps_skipped_stages_unknown_and_copies_per_call(monkeypatch):
+    from beamng_autopilot.vision.heads import semantic as module
+
+    clock = _Clock()
+    seg = _timed_segmenter(monkeypatch, clock)
+    monkeypatch.setattr(module, "SEG_PROB_GATE_ENABLED", False)
+    monkeypatch.setattr(module, "SEG_ZONES_ENABLED", False)
+    monkeypatch.setattr(module, "MARK_CLASS_ENABLED", False)
+    monkeypatch.setenv("BEAMNG_YELLOW_FUSION", "0")
+    head = SemanticHead(segmenter=seg, enable_evidence=False)
+    out = head.run(_ctx(role="pillar_left"))
+    timing = out.meta["semantic_ms"]
+    assert seg.calls == 1
+    assert timing["prediction"] == pytest.approx(10.0)
+    assert timing["total"] == pytest.approx(10.0)
+    for name in ("yellow", "probability_gate", "evidence", "markings", "classification"):
+        assert timing[name] is None
+    details = out.meta["segmentation_ms"]
+    assert details["line"] is None
+    assert details["road"] == seg.last_timing_ms
+    assert details["road"] is not seg.last_timing_ms
+    seg.last_timing_ms["total"] = -1.0
+    assert details["road"]["total"] == pytest.approx(10.0)
+
+
+def test_head_does_not_republish_old_segmenter_timing(monkeypatch):
+    monkeypatch.setenv("BEAMNG_YELLOW_FUSION", "0")
+    seg = _segmenter()
+    seg.last_timing_ms = {"total": 999.0}
+    out = SemanticHead(segmenter=seg, enable_evidence=False).run(
+        _ctx(role="pillar_left"))
+    assert out.meta["segmentation_ms"] == {"road": None, "line": None}
