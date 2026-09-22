@@ -363,7 +363,8 @@ def drivable_half_width_m(drivable, observed=None, res: float = 0.5,
 def project_road_mask_to_grid(grid: OccupancyGrid, road_mask: np.ndarray,
                               cam, pos, heading: float,
                               max_ahead_m: float = 45.0,
-                              step: int = 4) -> None:
+                              step: int = 4,
+                              ground_z: float | None = None) -> None:
     """Mark drivable cells from a camera road/line mask via inverse
     ground projection.
 
@@ -379,7 +380,14 @@ def project_road_mask_to_grid(grid: OccupancyGrid, road_mask: np.ndarray,
     """
     h, w = road_mask.shape[:2]
     C, r_vec, f_vec, u_vec = cam.camera_pose(pos, heading)
-    ground_z = float(pos[2]) if len(np.asarray(pos)) > 2 else 0.0
+    if ground_z is None:
+        # Historical behaviour: the plane through the ego ORIGIN, which
+        # sits EGO_ORIGIN_GROUND_GAP_M above the road.  Callers projecting
+        # steeply-downward rays (the near-field fisheye) pass the road
+        # plane instead - 0.17 m of height bias moves a 2 m reading by
+        # tens of centimetres.
+        ground_z = float(pos[2]) if len(np.asarray(pos)) > 2 else 0.0
+    ground_z = float(ground_z)
     fx, fy = cam.fx, cam.fy
     cx, cy = cam.cx, cam.cy
     us = np.arange(0, w, step)
@@ -434,3 +442,146 @@ def fuse_obstacles_to_grid(grid: OccupancyGrid, obstacles,
                                   half_thick=float(getattr(ob, "half_thick", 0.0)))
     for hx, hy in (ray_hits or []):
         grid.add_obstacle_point(hx, hy, weight=0.35)
+
+def nearfield_coverage(grid: OccupancyGrid, pos, heading: float,
+                       ahead_m: float = 4.0) -> dict:
+    """How much drivable evidence exists in the band ahead of the car.
+
+    Handoff P1-1 asks for 0-4 m coverage to be measured, not assumed: the
+    front camera's nearest visible ground is ~3.5 m, so this band is
+    exactly where "no drivable path" comes from.  Counts cells in the
+    ego-centred grid box ``0 <= forward <= ahead_m`` and reports
+
+    * ``observed_cells``  - cells the sensors have any evidence for,
+    * ``drivable_cells``  - of those, the ones marked drivable,
+    * ``drivable_frac``   - drivable/observed, or ``None`` when nothing was
+      observed (UNKNOWN, never 0 - "we saw nothing" and "we saw no road"
+      are different statements).
+    """
+    res = float(grid.res)
+    n = int(grid.n_rows)
+    lat = (np.arange(n) + 0.5) * res - float(grid.max_y)
+    # Cell rows run from far ahead (row 0, ex = +extent) toward the car and
+    # behind it (``world_to_cell``: (6, 0) -> row 18, (0, 0) -> row 30 in a
+    # 60x60/0.5 m grid).  "Ahead" is therefore SMALLER row indices.
+    fwd_lim = int(np.floor(float(ahead_m) / res))
+    mid = int(grid.n_rows) // 2
+    row0 = max(0, mid - fwd_lim)
+    row1 = min(int(grid.n_rows), mid + 1)
+    out = {"ahead_m": float(ahead_m), "band_cells": 0,
+           "observed_cells": 0, "observed_frac": None,
+           "drivable_cells": 0, "drivable_frac": None,
+           "lateral_span_m": (round(float(lat.min()), 2),
+                              round(float(lat.max()), 2))}
+    if row1 <= row0:
+        return out
+    obs = getattr(grid, "observed", None)
+    obs_slice = (obs[row0:row1] > 0) if obs is not None and obs.size else \
+        np.ones((row1 - row0, n), dtype=bool)
+    drv_slice = grid.drivable[row0:row1] > 0
+    out["band_cells"] = int(obs_slice.size)
+    out["observed_cells"] = int(np.count_nonzero(obs_slice))
+    out["drivable_cells"] = int(np.count_nonzero(drv_slice & obs_slice))
+    # ``observed_frac`` is the headline: how much of the 0-4 m band the
+    # sensors covered AT ALL.  ``drivable_frac`` is a fraction of a
+    # possibly tiny observed set (10 observed cells out of 540 still read
+    # "1.0" if all ten are drivable), so it must never be quoted alone.
+    if out["band_cells"]:
+        out["observed_frac"] = round(out["observed_cells"]
+                                     / out["band_cells"], 3)
+    if out["observed_cells"]:
+        out["drivable_frac"] = round(
+            out["drivable_cells"] / out["observed_cells"], 3)
+    return out
+
+
+# --- body drivable coverage (review handoff P1-3) -----------------------
+BODY_COV_ON_ROAD = "on_road"
+BODY_COV_OFF_ROAD = "off_road"
+BODY_COV_UNKNOWN = "unknown"
+# Fraction of the OBSERVED footprint cells that must be drivable.
+BODY_COV_MIN_FRAC = 0.5
+# Floor on the observed sample before a verdict may be "off_road": with two
+# observed cells a single miss would read as half the car off the road.
+BODY_COV_MIN_OBSERVED = 4
+# Fraction of the footprint that must have been OBSERVED at all.  The front
+# camera's nearest ground is metres ahead (measured: 2.4 m from the ego
+# centre, 0 cells in 0-2 m), so the few footprint cells it does stamp are the
+# fringe of the blind zone, where the road mask reads "not road" - judging
+# from them reported ``off_road`` for a car standing plainly on pavement
+# (logs/goal_20260921/body_cov).  A sample this thin is UNKNOWN, and saying
+# so is the only honest answer until something (the near-field fisheye,
+# handoff P1-1) actually observes the body.
+BODY_COV_MIN_OBS_FRAC = 0.3
+
+
+def body_drivable_coverage(grid: OccupancyGrid, pos, heading: float,
+                           half_len: float, half_width: float,
+                           margin_m: float = 0.0) -> dict:
+    """Is the CAR BODY standing on pavement the sensors can see? (P1-3)
+
+    The lane-boundary route to this question is blind whenever no boundary
+    is published (``road_off`` returns 0 for both "inside" and "unmeasured"),
+    which is exactly the state the crash run was in.  This asks the
+    drivable mask instead - a perception quantity that exists even when no
+    boundary was paired - and answers in four states:
+
+    * ``on_road``  - enough observed footprint cells, and enough of them
+      drivable;
+    * ``off_road`` - enough observed cells, most of them NOT drivable: the
+      body is standing where the sensors see no pavement;
+    * ``unknown``  - too few observed cells to judge (no evidence).  It is
+      deliberately NOT ``on_road``: "we did not see pavement under the car"
+      and "the car is on pavement" are different statements, and this
+      project has already been burned by the difference.
+    * obstacles are NOT this function's business (the obstacle-risk layer
+      owns "road observed but blocked").
+
+    Perception only: the mask comes from the semantic/LiDAR chain, the ego
+    pose from the vehicle state.  No map edge, no nav centreline.
+    """
+    res = float(grid.res)
+    p = np.asarray(pos, dtype=float)[:2]
+    ch, sh = math.cos(float(heading)), math.sin(float(heading))
+    fwd = np.array([ch, sh])
+    left = np.array([-sh, ch])
+    hl = float(half_len) + float(margin_m)
+    hw = float(half_width) + float(margin_m)
+    step = max(res * 0.5, 1e-6)
+    us = np.arange(-hl, hl + 1e-9, step)
+    vs = np.arange(-hw, hw + 1e-9, step)
+    uu, vv = np.meshgrid(us, vs)
+    wx = p[0] + uu.ravel() * fwd[0] + vv.ravel() * left[0]
+    wy = p[1] + uu.ravel() * fwd[1] + vv.ravel() * left[1]
+    rows, cols, ok = grid.world_to_cells(wx, wy)
+    cells = set(zip(np.asarray(rows)[ok].tolist(),
+                    np.asarray(cols)[ok].tolist()))
+    out = {"status": BODY_COV_UNKNOWN, "coverage": None,
+           "footprint_cells": len(cells), "observed_cells": 0,
+           "observed_frac": 0.0, "drivable_cells": 0,
+           "min_frac": BODY_COV_MIN_FRAC,
+           "min_observed": BODY_COV_MIN_OBSERVED,
+           "min_observed_frac": BODY_COV_MIN_OBS_FRAC}
+    if not cells:
+        return out
+    rr = np.array([c[0] for c in cells])
+    cc = np.array([c[1] for c in cells])
+    obs = getattr(grid, "observed", None)
+    if obs is not None and getattr(obs, "size", 0) \
+            and obs.shape == grid.drivable.shape:
+        seen = obs[rr, cc] > 0
+    else:
+        seen = np.ones(len(rr), dtype=bool)
+    n_obs = int(np.count_nonzero(seen))
+    out["observed_cells"] = n_obs
+    out["observed_frac"] = round(n_obs / len(cells), 3)
+    if n_obs < BODY_COV_MIN_OBSERVED \
+            or out["observed_frac"] < BODY_COV_MIN_OBS_FRAC:
+        return out                      # too little evidence -> UNKNOWN
+    drv = grid.drivable[rr[seen], cc[seen]] > 0
+    n_drv = int(np.count_nonzero(drv))
+    out["drivable_cells"] = n_drv
+    out["coverage"] = round(n_drv / n_obs, 3)
+    out["status"] = (BODY_COV_ON_ROAD if out["coverage"] >= BODY_COV_MIN_FRAC
+                     else BODY_COV_OFF_ROAD)
+    return out
