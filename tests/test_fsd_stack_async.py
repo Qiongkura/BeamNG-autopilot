@@ -346,3 +346,80 @@ def test_async_range_is_off_by_default(monkeypatch) -> None:
     assert out.meta.get("range_async") is None
     assert prov.fetches == 0
     assert not hasattr(st, "_range_worker")
+
+
+def test_async_adoption_keeps_job_source_and_actual_finish_time(monkeypatch):
+    from beamng_autopilot.workers import JobResult
+
+    class Clock:
+        value = 1000.0
+
+        def __call__(self):
+            return self.value
+
+    class Runner:
+        def __init__(self, *args, **kwargs):
+            self.token = 0
+            self.busy = False
+            self.result = None
+
+        def poll(self):
+            result, self.result = self.result, None
+            return result
+
+        def submit(self, fn, *args):
+            self.token += 1
+            self.job = (fn, args)
+            self.busy = True
+            return self.token
+
+        def complete(self):
+            fn, args = self.job
+            self.result = JobResult(value=fn(*args), token=self.token,
+                                    started_at=0.0, finished_at=0.25)
+            self.busy = False
+
+        def in_flight_s(self):
+            return 0.0
+
+        def digest(self):
+            return {}
+
+    clock = Clock()
+    monkeypatch.setattr(fs.time, "time", clock)
+    monkeypatch.setattr(fs, "LatestJobRunner", Runner)
+    st = _stack(_SlowHead("object", 0.0))
+    first = st.tick()
+    assert first.meta["head_sched"]["object"]["result_available"] is False
+    assert first.meta["perception_ms"]["heads_async_dispatch"] is not None
+    worker = st._head_workers["object"]
+    clock.value = 1000.25
+    worker.complete()
+    clock.value = 1001.0
+    adopted = st.tick()
+    rec = adopted.meta["head_sched"]["object"]
+    assert rec["state"] == "async_adopted"
+    assert rec["source_seq"] == 0
+    assert rec["source_t"] == 1000.0
+    assert rec["eligible_t"] == 1000.0
+    assert rec["dispatch_t"] == 1000.0
+    assert rec["finish_t"] == 1000.25
+    assert rec["attempt_eligible_t"] == 1001.0
+    assert rec["publish_t"] == 1001.0
+    assert rec["attempt_source_seq"] == 1
+    assert rec["attempt_dispatch_t"] == 1001.0
+    assert rec["result_seq"] == 1
+    assert rec["result_available"] is True
+    assert adopted.meta["head_age_s"]["object"] == 1.0
+    clock.value = 1001.25
+    reused = st.tick().meta["head_sched"]["object"]
+    assert reused["source_seq"] == 0 and reused["source_t"] == 1000.0
+    assert reused["publish_t"] == 1001.0
+    assert len(st._head_job_traces["object"]) == 1
+    clock.value = 1001.5
+    worker.complete()
+    clock.value = 1002.0
+    newer = st.tick().meta["head_sched"]["object"]
+    assert newer["source_seq"] == 1 and newer["source_t"] == 1001.0
+    assert newer["finish_t"] == 1001.5
+    assert newer["result_seq"] == 2

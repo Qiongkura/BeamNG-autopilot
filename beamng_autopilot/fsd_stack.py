@@ -29,9 +29,11 @@ import time
 
 import numpy as np
 
+from beamng_autopilot import geometry
 from beamng_autopilot.occupancy import (
     OccupancyGrid,
     fuse_obstacles_to_grid,
+    nearfield_coverage,
     project_road_mask_to_grid,
 )
 from beamng_autopilot.bev_fusion import (
@@ -61,6 +63,7 @@ from beamng_autopilot.planner import forward_clearance_m, path_forward_clearance
 from beamng_autopilot.vehicle_body import CORRIDOR_HALF_WIDTH_M
 from beamng_autopilot.lane import (
     LANE_WIDTH_DEFAULT_M,
+    ReferenceStabilityTracker,
     SensorLaneEnvelope,
     build_lidar_corridor,
     choose_sensor_lane,
@@ -102,6 +105,110 @@ RANGE_REUSE_INFLATE_MAX_M = 1.5
 # the cure nor the cause of the excursions.  The stage stays opt-in:
 # ``BEAMNG_LANE_REF_SLEW=1`` enables it.
 _LANE_REF_SLEW_ENABLED = os.environ.get("BEAMNG_LANE_REF_SLEW", "0") == "1"
+
+
+# --- near-field drivable evidence (review handoff P1-1) -----------------
+# The front camera's nearest visible ground is ~3.5 m, so the 0-4 m band
+# carries no drivable evidence and strict mode reports "no drivable path"
+# - the largest single stall cause measured.  This switch is the INPUT
+# half of the experiment: it changes the camera input only (no planner
+# threshold, no safety gate, no model change).
+#
+#   off      - current behaviour (front_main only)
+#   fisheye  - run the same Segmenter on the front FISHEYE frame and
+#              project its road mask into the same grid
+#   fuse     - front_main + fisheye (union)
+#   band     - **UPPER BOUND ONLY**: inject a fixed-width drivable strip in
+#              the 0-NEARFIELD_BAND_AHEAD_M window.  It answers "with
+#              near-field evidence, does the planner stop anyway?" and must
+#              never be shipped as a solution - it is not perception.
+NEARFIELD_CAM = os.environ.get("BEAMNG_NEARFIELD_CAM", "off").strip().lower()
+NEARFIELD_EVERY_N = max(1, int(os.environ.get("BEAMNG_NEARFIELD_EVERY_N", "1")
+                               or 1))
+NEARFIELD_MAX_AHEAD_M = 10.0     # fisheye projection horizon
+NEARFIELD_BAND_AHEAD_M = 4.0     # injected upper-bound band length
+NEARFIELD_BAND_HALF_M = 2.2      # injected band half width
+
+
+def nearfield_step(stack, out, snap, semantic, grid, pos, heading,
+                   tick_num) -> dict | None:
+    """Add near-field drivable evidence for this tick (P1-1).
+
+    Returns the telemetry for the step, or None when the mode is ``off``
+    or the pass did not run this tick.  Never raises into the tick: a
+    missing fisheye camera degrades to "no near-field evidence", which is
+    exactly the state the experiment is measuring.
+    """
+    _asked = NEARFIELD_CAM
+    if _asked in ("", "off", "0", "none"):
+        return None
+    # ``fisheye`` and ``fuse`` are THE SAME code path: the main view's road
+    # is already in the grid by the time this runs, so adding the fisheye is
+    # the fusion - there is no second algorithm.  The two names are kept
+    # (old experiment commands still run) but the telemetry reports the
+    # canonical mode and the alias separately, so nobody reads "fuse" as a
+    # distinct method (plan T05: name the real difference or merge them).
+    _alias = None
+    _mode = _asked
+    if _asked == "fuse":
+        _mode = "fisheye"
+        _alias = "fuse"
+    meta: dict = {"nearfield_mode": _mode}
+    if _alias:
+        meta["nearfield_alias"] = _alias
+        meta["nearfield_alias_note"] = (
+            "fuse == fisheye: one code path, the main view is already fused "
+            "into the same grid")
+    try:
+        if _mode == "band":
+            # Upper bound: paint the strip the car would need to see.
+            res = float(grid.res)
+            n = int(grid.n_rows)
+            rows = max(1, int(round(NEARFIELD_BAND_AHEAD_M / res)))
+            cols = max(1, int(round(NEARFIELD_BAND_HALF_M / res)))
+            c0 = max(0, n // 2 - cols)
+            c1 = min(n, n // 2 + cols)
+            # Ahead = smaller row index (see nearfield_coverage).
+            r0 = max(0, n // 2 - rows)
+            r1 = n // 2 + 1
+            grid.drivable[r0:r1, c0:c1] = 1.0
+            if getattr(grid, "observed", None) is not None:
+                grid.observed[r0:r1, c0:c1] = 1
+            meta["nearfield_injected_band_m"] = NEARFIELD_BAND_AHEAD_M
+            return meta
+        if tick_num % NEARFIELD_EVERY_N != 0:
+            meta["nearfield_skipped"] = "cadence"
+            return meta
+        if "front_fisheye" not in snap:
+            meta["nearfield_skipped"] = "no fisheye frame this tick"
+            return meta
+        # The SEGMENTER lives on the head INSTANCE, not on its TaskOutput
+        # (``head_outputs["semantic"]`` is the output object) - looking for
+        # it there raised every tick and silently turned the whole pass
+        # into a recorded error.
+        head = None
+        heads = getattr(getattr(stack, "hydra", None), "_heads", None)
+        if hasattr(heads, "get"):
+            head = heads.get("semantic")
+        if head is None or not hasattr(head, "_get_segmenter"):
+            meta["nearfield_skipped"] = "no semantic head instance"
+            return meta
+        import numpy as _np
+        t0 = time.time()
+        seg = head._get_segmenter()
+        fish_rgb, fish_cam = snap["front_fisheye"]
+        road_fish, _line_fish = seg.predict(fish_rgb)
+        ground_z = (float(pos[2]) - float(EGO_ORIGIN_GROUND_GAP_M)
+                    if len(pos) > 2 else None)
+        project_road_mask_to_grid(
+            grid, _np.asarray(road_fish, dtype=bool), fish_cam, pos, heading,
+            max_ahead_m=NEARFIELD_MAX_AHEAD_M, step=3, ground_z=ground_z)
+        meta["nearfield_ms"] = round((time.time() - t0) * 1000.0, 1)
+        meta["nearfield_road_px"] = int(_np.count_nonzero(road_fish))
+        return meta
+    except Exception as exc:                      # never break the tick
+        meta["nearfield_error"] = str(exc)
+        return meta
 
 
 # Heavy-head worker timeout (plan A4): a head that runs longer than this
@@ -298,8 +405,9 @@ def sched_record(head: str, state: str, *, source_seq, result_seq,
     ones are what let an anomaly land on a STAGE instead of on a bare age
     (see ``telemetry_contract``).
 
-    Times are monotonic wall-clock seconds, all from the same clock, so
-    ``span_ms`` can difference any pair of them.  ``None`` means "did not
+    Times are ``time.time()`` wall-clock seconds, matching the drive
+    command trace.  They are NOT monotonic; duration measurements use
+    separate ``perf_counter()`` differences.  ``None`` means "did not
     happen" and is never filled in with a plausible number.
     """
     return {
@@ -318,6 +426,14 @@ def sched_record(head: str, state: str, *, source_seq, result_seq,
         "finish_t": finish_t,
         "publish_t": publish_t,
     }
+
+
+def _run_head_job(head, ctx, trace):
+    """Measure a connection-free head on the command trace's wall clock."""
+    try:
+        return head.run(ctx)
+    finally:
+        trace["finish_t"] = time.time()
 
 
 def compensate_range_motion(sample: RangeSample | None,
@@ -386,6 +502,25 @@ def _warn_once(key: str, msg: str) -> None:
         return
     _WARNED.add(key)
     print(f"[fsd-stack] {msg}", flush=True)
+
+
+def _reference_geometry_id(ref) -> str | None:
+    """Geom id of an accepted reference, or None when there is none.
+
+    None is not the same as "a hash of an empty reference": a frame with no
+    accepted reference at all must publish no version, or a comparison
+    between two absent references looks like two matching geometries.  (A
+    live run on 2026-09-22 showed exactly that: 16 of 20 frames carried a
+    hex ``lane_ref_geom_id`` for a reference that did not exist.)
+    """
+    if ref is None:
+        return None
+    try:
+        if getattr(ref, "center", None) is None:
+            return None
+        return ref.geom_id
+    except Exception:
+        return None
 
 
 def _world_view(source_attr: str, name: str):
@@ -534,6 +669,10 @@ class FSDStack:
         # tick-to-tick slew (see ``limit_reference_slew``).
         self._lane_ref_prev = None
         self._lane_ref_hold_t = 0.0
+        # Cross-tick stability of the accepted reference (P1-2): side +
+        # near-field centre must agree for NEED_TICKS before the reference
+        # earns full steering authority; unpaired reads never do.
+        self._ref_stability = ReferenceStabilityTracker()
         # Per-head throttling: the expensive heads (semantic UNet
         # ~100-300 ms, YOLO object ~100-200 ms on the live 400x300
         # front frame) run every ``semantic_every_n`` / ``object_every_n``
@@ -734,6 +873,19 @@ class FSDStack:
             st = self.conn.get_state()
         pos = np.asarray(st.pos, dtype=float)
         heading = float(st.heading)
+        # T05: the MEASURED attitude (quaternion) and the ONE ground plane
+        # every consumer uses this tick.  Publishing both makes "which
+        # geometry produced this number" answerable from the run record
+        # instead of from the source.
+        _rotation = getattr(st, "rotation", None)
+        if not geometry.POSE_ROTATION_ENABLED:
+            _rotation = None
+        _ground_z = geometry.projection_ground_z(pos)
+        out.meta["pose_label"] = geometry.pose_label(
+            _rotation, enabled=geometry.POSE_ROTATION_ENABLED)
+        out.meta["ground_model"] = geometry.GROUND_MODEL_FLAT
+        out.meta["ground_z"] = round(float(_ground_z), 4)
+        out.meta["ego_ground_gap_m"] = float(geometry.EGO_GROUND_GAP_M)
         _tw = time.time()
         _times: dict[str, float] = {}
         _tick_cost0 = time.time()
@@ -748,6 +900,12 @@ class FSDStack:
         # compute time it actually spent.  Without it "the head is 113 s
         # old" cannot be told apart from "the head is broken".
         _sched: dict[str, dict] = {}
+        _perception_ms = {name: None for name in (
+            "camera_acquire", "heads", "heads_sync", "heads_async_poll",
+            "heads_async_dispatch")}
+        out.meta["perception_ms"] = _perception_ms
+        out.meta["head_trace_clock"] = "wall_time"
+        out.meta["head_source_clock_basis"] = "acquire_return"
         # Result sequence per head: incremented whenever a NEW result is
         # produced, so "the control tick consumed an older version" becomes
         # detectable instead of invisible.  Without it, a reused output and
@@ -756,19 +914,28 @@ class FSDStack:
         if _res_seq is None:
             _res_seq = {}
             self._head_result_seq = _res_seq
+        _result_trace = getattr(self, "_head_result_trace", None)
+        if _result_trace is None:
+            _result_trace = {}
+            self._head_result_trace = _result_trace
+        _new_heads: set[str] = set()
 
         # --- 1) camera ring -> HydraNet heads ---------------------------
         snap: dict = {}
         if self.ring is not None:
+            _acquire_t0 = time.perf_counter()
             try:
                 snap = self.ring.grab_ring()
             except Exception as exc:
                 out.errors["ring"] = str(exc)
-        # When the source frames were captured.  Everything downstream is
-        # measured from here, so "how stale is this result" is answerable
-        # without guessing at the tick start.
+            finally:
+                _perception_ms["camera_acquire"] = (
+                    time.perf_counter() - _acquire_t0) * 1000.0
+        # The provider exposes no exposure timestamp.  This is the observed
+        # acquisition-return boundary, not a claim about sensor capture time.
         _source_t = time.time()
         if snap:
+            _heads_t0 = time.perf_counter()
             role = "front_main" if "front_main" in snap \
                 else next(iter(snap))
             frame, cam = snap[role]
@@ -776,8 +943,14 @@ class FSDStack:
             out.cam = cam
             ctx = FrameContext(
                 frame_rgb=frame, cam=cam, pos=pos, heading=heading,
-                ground_z=float(pos[2]) if len(pos) > 2 else 0.0,
-                role=role, timestamp=float(_tick_cost0))
+                # the road plane, not the ego-origin plane (T05)
+                ground_z=float(_ground_z),
+                rotation=_rotation,
+                role=role, timestamp=float(_tick_cost0),
+                # Per-camera frame counter: the evidence layer keys its
+                # votes on (source, capture) so a reprocessed frame cannot
+                # add a vote (plan §3.2/T03).
+                seq=int(getattr(self, "_tick_num", 0)))
             heads: dict = {}
             head_ages: dict[str, float] = {}
             _tick_num = int(getattr(self, '_tick_num', 0))
@@ -821,8 +994,8 @@ class FSDStack:
                 _age_now = (None if _stamp_now is None
                             else max(0.0, time.time() - float(_stamp_now)))
                 # When this head became a candidate for this tick.  All the
-                # contract times come from this one clock read style
-                # (monotonic wall), so any pair can be differenced.
+                # contract times use time.time(), matching command traces;
+                # only the separate duration counters are monotonic.
                 _eligible_t = time.time()
                 if not _due:
                     _pub = _eligible_t
@@ -880,8 +1053,19 @@ class FSDStack:
                     if _frames is None:
                         _frames = {}
                         self._head_job_frame_t = _frames
+                    _job_maps = getattr(self, "_head_job_traces", None)
+                    if _job_maps is None:
+                        _job_maps = {}
+                        self._head_job_traces = _job_maps
+                    _jobs = _job_maps.setdefault(_name, {})
+                    _poll_t0 = time.perf_counter()
                     _res = _runner.poll() if _due or _runner.busy else None
-                    _finish_t = time.time() if _res is not None else None
+                    _perception_ms["heads_async_poll"] = (
+                        (_perception_ms["heads_async_poll"] or 0.0)
+                        + (time.perf_counter() - _poll_t0) * 1000.0)
+                    _job = (_jobs.pop(_res.token, {})
+                            if _res is not None else {})
+                    _finish_t = _job.get("finish_t")
                     _ran_ms = None
                     if _res is not None and _res.ok:
                         heads[_name] = _res.value
@@ -892,7 +1076,13 @@ class FSDStack:
                         # the output's age starts at the frame that
                         # produced it, not at this tick
                         _head_stamps[_name] = float(
-                            _frames.get(_name, _tick_cost0))
+                            _job.get("frame_t", _frames.get(_name, _tick_cost0)))
+                        _result_trace[_name] = {
+                            key: _job.get(key) for key in (
+                                "source_seq", "source_t", "eligible_t",
+                                "dispatch_t", "finish_t")}
+                        _result_trace[_name]["publish_t"] = time.time()
+                        _new_heads.add(_name)
                         _ran_ms = round(float(_res.duration_s) * 1000.0, 1)
                     if _name not in heads and _last.get(_name) is not None:
                         heads[_name] = _last[_name]
@@ -904,9 +1094,27 @@ class FSDStack:
                         else max(0.0, time.time() - float(_stamp)))
                     _dispatch_t = None
                     if _due and not _runner.busy:
-                        _runner.submit(_head.run, ctx)
-                        _frames[_name] = float(_tick_cost0)
                         _dispatch_t = time.time()
+                        _job_trace = {
+                            "source_seq": _tick_num, "source_t": _source_t,
+                            "eligible_t": _eligible_t,
+                            "dispatch_t": _dispatch_t, "finish_t": None,
+                            "frame_t": float(_tick_cost0)}
+                        _submit_t0 = time.perf_counter()
+                        _token = _runner.submit(_run_head_job, _head, ctx,
+                                                _job_trace)
+                        _perception_ms["heads_async_dispatch"] = (
+                            (_perception_ms["heads_async_dispatch"] or 0.0)
+                            + (time.perf_counter() - _submit_t0) * 1000.0)
+                        _jobs[_token] = _job_trace
+                        # At most one unread result plus one running job.
+                        for _old_token in sorted(_jobs)[:-2]:
+                            del _jobs[_old_token]
+                        _frames[_name] = float(_tick_cost0)
+                    if _res is not None and not _res.ok:
+                        # The failed job and the newly submitted job are
+                        # different attempts; keep the failure's own clock.
+                        _dispatch_t = _job.get("dispatch_t")
                     # An async head has four distinct "did not run this
                     # tick" meanings and only the runner knows which one
                     # applies: failed, still in flight, just submitted, or
@@ -914,9 +1122,10 @@ class FSDStack:
                     _pub_t = time.time()
                     if _res is not None and not _res.ok:
                         _sched[_name] = sched_record(
-                            _name, "async_failed", source_seq=_tick_num,
+                            _name, "async_failed", source_seq=_job.get("source_seq"),
                             result_seq=_res_seq.get(_name),
-                            eligible_t=_eligible_t, source_t=_source_t, age_s=_age_now,
+                            eligible_t=_eligible_t, source_t=_job.get("source_t"),
+                            age_s=_age_now,
                             compute_ms=_ran_ms, reason=str(_res.error),
                             dispatch_t=_dispatch_t, finish_t=_finish_t)
                     elif _res is not None and _res.ok:
@@ -991,6 +1200,12 @@ class FSDStack:
                     head_ages[_name] = 0.0
                     _retry.discard(_name)
                     _res_seq[_name] = _res_seq.get(_name, 0) + 1
+                    _result_trace[_name] = {
+                        "source_seq": _tick_num, "source_t": _source_t,
+                        "eligible_t": _eligible_t,
+                        "dispatch_t": _dispatch_t, "finish_t": _finish_t,
+                        "publish_t": time.time()}
+                    _new_heads.add(_name)
                     _sched[_name] = sched_record(
                         _name,
                         "keepalive_forced" if _keepalive_forced else "ran",
@@ -1010,7 +1225,34 @@ class FSDStack:
                         eligible_t=_eligible_t, source_t=_source_t, age_s=_age_now,
                         reason=str(_exc), dispatch_t=_dispatch_t,
                         finish_t=time.time())
+                finally:
+                    _perception_ms["heads_sync"] = (
+                        (_perception_ms["heads_sync"] or 0.0)
+                        + (time.perf_counter() - _t_run) * 1000.0)
             self._tick_num = _tick_num + 1
+            # Keep scheduling attempts distinct from the evidence actually
+            # served: a new submission must not relabel an older result.
+            for _name, _record in _sched.items():
+                _record["attempt_source_seq"] = _record.get("source_seq")
+                _record["attempt_source_t"] = _record.get("source_t")
+                _record["attempt_eligible_t"] = _record.get("eligible_t")
+                _record["attempt_dispatch_t"] = _record.get("dispatch_t")
+                _record["attempt_finish_t"] = _record.get("finish_t")
+                _record["result_available"] = _name in heads
+                if _name in heads:
+                    _trace = _result_trace.get(_name, {})
+                    for _key in ("source_seq", "source_t", "eligible_t",
+                                 "dispatch_t", "finish_t", "publish_t"):
+                        _record[_key] = _trace.get(_key)
+                else:
+                    _record["result_seq"] = None
+            _perception_ms["heads"] = (
+                time.perf_counter() - _heads_t0) * 1000.0
+            if "semantic" in _new_heads:
+                _sem_meta = getattr(heads.get("semantic"), "meta", {}) or {}
+                for _key in ("semantic_ms", "segmentation_ms"):
+                    if isinstance(_sem_meta.get(_key), dict):
+                        out.meta[_key] = _sem_meta[_key]
             # Every registered head gets an explicit age.  A missing output
             # is not silently "fresh": without a previous result it is
             # represented as +inf and SafetyMonitor can fail closed.
@@ -1063,7 +1305,21 @@ class FSDStack:
                     and "front_main" in snap:
                 project_road_mask_to_grid(
                     grid, semantic.masks["road"],
-                    snap["front_main"][1], pos, heading, step=4)
+                    snap["front_main"][1], pos, heading, step=4,
+                    ground_z=float(_ground_z))
+            # --- near-field drivable evidence (P1-1) --------------------
+            # ``semantic`` is bound inside the guard above and does not
+            # exist when the ring returned nothing; read it here instead.
+            _nf = nearfield_step(self, out, snap,
+                                 out.head_outputs.get("semantic"), grid, pos,
+                                 heading, int(getattr(self, "_tick_num", 0)))
+            if _nf:
+                out.meta.update(_nf)
+            # What the planner actually sees in the band that stalls it:
+            # reported every tick, in every mode (including ``off``), so the
+            # A/B compares the same measurement.
+            out.meta["nearfield_cov"] = nearfield_coverage(
+                grid, pos, heading, ahead_m=NEARFIELD_BAND_AHEAD_M)
             try:
                 # getattr defaults keep __new__-built test stubs
                 # (no __init__) working: they always scan.
@@ -1434,6 +1690,13 @@ class FSDStack:
         if paved_ref is not None:
             out.meta["paved_edge"] = dict(paved_ref.meta)
         lane_mode = getattr(self, "lane_mode", "map")
+        _sem_head = (out.head_outputs or {}).get("semantic")
+        _sem_marks = list(getattr(getattr(_sem_head, "meta", {}), "get",
+                                  lambda *a, **k: [])("markings", []) or [])
+        # Count published to telemetry: the lane policy may only use the
+        # painted lines it was actually handed, and an empty list here is
+        # otherwise indistinguishable from "no line was detected".
+        out.meta["lane_marks_n"] = len(_sem_marks)
         lane_ref_out = select_lane_reference(
             lane_frame=lane_frame,
             pos=pos,
@@ -1465,6 +1728,10 @@ class FSDStack:
             # when BEAMNG_LANE_GEOM is on.
             prev_ref=getattr(self, "_lane_ref_prev", None),
             corridor=self._lane_geom_corridor(out, pos, heading),
+            markings=_sem_marks,
+            # The tick's own observation number: a reference whose frame
+            # carries the same number rests on THIS tick's measurement.
+            tick_id=int(getattr(self, "_tick_num", 0)),
         )
         lane_ref = lane_ref_out.center
         # Single owner, no sideways teleport: the accepted own-lane
@@ -1490,8 +1757,102 @@ class FSDStack:
                 getattr(self, "_lane_ref_prev", None),
                 getattr(self, "_lane_ref_hold_t", 0.0),
                 lane_ref, time.time(), pos, heading)
+            # The limiter's result becomes THE accepted geometry: writing
+            # it back into the one published object is what keeps the
+            # planner Scene, the safety monitor and the controller on the
+            # same centre.  Sleighing a local copy while the Scene read
+            # ``scene_ref`` produced two different references in one tick
+            # (plan §2.2-C / §3.3-3).
+            self._publish_reference_geometry(lane_ref_out, lane_ref)
         self._lane_ref_prev = (None if lane_ref is None
                                else np.asarray(lane_ref, dtype=float)[:, :2])
+        # --- cross-tick reference stability (review handoff P1-2) --------
+        # ``paired`` = a two-sided perception read; ``fresh`` = the source
+        # is live perception this tick (a hold / rule / stale reference
+        # must not accumulate stability just by surviving).
+        try:
+            _tracker = getattr(self, "_ref_stability", None)
+            if _tracker is None:
+                _tracker = self._ref_stability = ReferenceStabilityTracker()
+            _st = _tracker.update(
+                ref=lane_ref, pos=pos, heading=heading,
+                # ``two_sided`` = both boundaries are real measurements of
+                # one observation (the painted-centre-line frame also sets
+                # ``paired=True`` while its right edge is a width prior);
+                # ``fresh_obs`` = the observation behind it was taken THIS
+                # tick.  Feeding the raw ``lane_frame.paired`` / a source
+                # label here let a held constructed reference promote
+                # itself to full authority (plan §2.2-A).
+                paired=bool(lane_ref_out.two_sided),
+                fresh=bool(lane_ref_out.fresh_obs))
+        except Exception as exc:
+            _warn_once("ref_stability", f"stability tracker failed: {exc}")
+            _tracker = getattr(self, "_ref_stability", None)
+            if _tracker is not None:
+                _tracker.reset()
+            _st = None
+        if _st is not None:
+            out.meta["ref_authority"] = _st.authority
+            out.meta["ref_stability_reason"] = _st.reason
+            out.meta["ref_side"] = _st.side
+            out.meta["ref_lat_m"] = _st.lat_m
+            out.meta["ref_stable_ticks"] = int(_st.stable_ticks)
+            out.meta["ref_side_flips"] = int(_st.flips_total)
+            out.meta["ref_flip"] = int(bool(_st.flip))
+        # --- T06 shadow lateral state (READ-ONLY) -----------------------
+        # (e, e_dot, theta, theta_dot) + covariance relative to the accepted
+        # reference, in the same identity, for comparison against the
+        # current behaviour.  Nothing here can move the steering: the drive
+        # loop only records it, and the control path never imports it.
+        try:
+            _shadow = getattr(self, "_lane_shadow", None)
+            if _shadow is None:
+                from beamng_autopilot.lane.shadow_state import (
+                    LateralShadowEstimator)
+                _shadow = self._lane_shadow = LateralShadowEstimator()
+            _shadow_state = _shadow.update(
+                ref=lane_ref_out.center, pos=pos, heading=heading,
+                speed_mps=float(getattr(st, "speed", 0.0) or 0.0),
+                now=time.time(),
+                two_sided=bool(lane_ref_out.two_sided),
+                inferred=bool(lane_ref_out.inferred),
+                fresh_obs=bool(lane_ref_out.fresh_obs),
+                width_m=float(lane_ref_out.width or 0.0),
+                lane_id=f"{lane_ref_out.src}|{out.meta.get('ref_side') or '?'}")
+            out.meta["lane_shadow"] = _shadow_state.as_dict()
+        except Exception as exc:
+            out.meta["lane_shadow_error"] = str(exc)
+        # --- T09 bounded lateral risk (read-only) -----------------------
+        # Signed gaps to the published boundaries, the first crossing (only
+        # while the car actually closes on one), the stopping margin with
+        # its declared inputs, and how current the evidence is.  UNKNOWN is
+        # published explicitly; nothing here is divided by a near-zero rate.
+        try:
+            from beamng_autopilot.lane.lateral_risk import lateral_risk
+            from beamng_autopilot.obstacle_risk import RISK_BRAKE_DECEL_MPS2
+            _sh = out.meta.get("lane_shadow") or {}
+            _risk = lateral_risk(
+                body_half_width_m=float(geometry.FOOTPRINT_HALF_WIDTH_M),
+                lat_left_m=(None if out.lane_left is None
+                            else float(np.median(np.asarray(
+                                out.lane_left, dtype=float)[:, 1])
+                                - float(pos[1]))),
+                lat_right_m=(None if out.lane_right is None
+                             else float(np.median(np.asarray(
+                                 out.lane_right, dtype=float)[:, 1])
+                                 - float(pos[1]))),
+                e_m=_sh.get("e_m"), e_dot_mps=_sh.get("e_dot_mps"),
+                speed_mps=float(getattr(st, "speed", 0.0) or 0.0),
+                latency_s=float(getattr(self, "risk_latency_s", 0.35)),
+                a_min_mps2=float(getattr(self, "a_min_mps2",
+                                         RISK_BRAKE_DECEL_MPS2)),
+                evidence_age_s=out.meta.get("line_evidence_age_s"),
+                history_only_frac=(out.meta.get("lane_ref_support") or {}
+                                   ).get("history_only_frac")
+                if isinstance(out.meta.get("lane_ref_support"), dict) else None)
+            out.meta["lateral_risk"] = _risk.as_dict()
+        except Exception as exc:
+            out.meta["lateral_risk_error"] = str(exc)
         lane_left = lane_ref_out.left
         lane_right = lane_ref_out.right
         lane_width = lane_ref_out.width
@@ -1501,6 +1862,48 @@ class FSDStack:
         strict_lane = lane_ref_out.strict
         out.meta.update(lane_ref_out.meta)
         out.lane_ref = lane_ref
+        # Version tags for the one-reference contract: the accepted object
+        # the controller consumes, and the geometry the planner Scene was
+        # built from.  They must match every tick; a live run or a test can
+        # check that instead of assuming it (plan §3.3-4).
+        out.meta["lane_ref_geom_id"] = _reference_geometry_id(lane_ref_out)
+        out.meta["lane_ref_two_sided"] = int(bool(lane_ref_out.two_sided))
+        out.meta["lane_ref_fresh_obs"] = int(bool(lane_ref_out.fresh_obs))
+        out.meta["lane_ref_inferred"] = int(bool(lane_ref_out.inferred))
+        # How much of the ACCEPTED reference's own geometry is current
+        # evidence vs only remembered history (plan T03: "选中边界 current
+        # 支持与 history-only 支持"), plus the per-band local ages that a
+        # single global ratio hides ("far refreshed, near expired").  Reads
+        # only - it never adds a vote.
+        try:
+            _ev_acc = getattr(
+                self.hydra._heads.get("semantic"), "_evidence", None)
+            if _ev_acc is not None and out.lane_ref is not None:
+                _now_ev = time.time()
+                _sup = getattr(_ev_acc, "support_digest", None)
+                if callable(_sup):
+                    # The published BOUNDARIES are the geometry that can sit
+                    # on paint cells; the lane CENTRE is a constructed
+                    # offset from them, so its own support is expected to be
+                    # low and is reported separately rather than conflated.
+                    if out.lane_left is not None:
+                        out.meta["lane_left_support"] = _sup(
+                            out.lane_left, now=_now_ev,
+                            role="lane_left_boundary")
+                    if out.lane_right is not None:
+                        out.meta["lane_right_support"] = _sup(
+                            out.lane_right, now=_now_ev,
+                            role="lane_right_boundary")
+                    out.meta["lane_ref_support"] = _sup(
+                        out.lane_ref, now=_now_ev,
+                        role="lane_centre (offset from the paint by "
+                             "construction)")
+                _bands = getattr(_ev_acc, "local_bands", None)
+                if callable(_bands):
+                    out.meta["line_evidence_bands"] = _bands(
+                        pos, heading, now=_now_ev)
+        except Exception as exc:
+            out.meta["lane_ref_support_error"] = str(exc)
         if lane_ref_out.boundaries:
             if lane_left is not None:
                 out.lane_left = np.asarray(lane_left, dtype=float)[:, :2]
@@ -1622,6 +2025,30 @@ class FSDStack:
         # Only sensor lanes (or the map-prior OWN lane) may steer the
         # planner's lateral alignment; the BEV whole-road centre must not.
         scene_lane_ref = lane_ref_out.scene_ref
+        # The planner's copy must be the SAME geometry the controller got
+        # (``out.lane_ref`` above, post-slew).  Publishing its id here makes
+        # the two comparable per tick: equal ids = one reference; different
+        # ids = the divergence this plan forbids (plan §3.3-4).
+        out.meta["scene_ref_geom_id"] = (
+            None if scene_lane_ref is None
+            else _reference_geometry_id(lane_ref_out))
+        # A frame either has no reference on either side (both ids None) or
+        # one geometry that both consumers share.  Anything else is the
+        # divergence this contract forbids, and it is flagged rather than
+        # left for a reader to notice.
+        if out.meta.get("scene_ref_geom_id") != out.meta.get("lane_ref_geom_id"):
+            out.meta["scene_ref_geom_mismatch"] = (
+                "planner Scene reference and the accepted reference the "
+                "controller consumes are not the same geometry (or one of "
+                "them is missing)")
+        elif scene_lane_ref is not None and out.lane_ref is not None:
+            _a = np.asarray(scene_lane_ref, dtype=float)
+            _b = np.asarray(out.lane_ref, dtype=float)
+            if _a.shape != _b.shape or not np.allclose(
+                    _a, _b, atol=1e-6, equal_nan=True):
+                out.meta["scene_ref_geom_mismatch"] = (
+                    "planner Scene reference differs from the accepted "
+                    "reference the controller consumes")
         # Routing intent: classify what the nav route does ahead (turn /
         # straight / u-turn) - the FSD Routing layer output.  It does not
         # steer by itself; it only informs the longitudinal plan (slow
@@ -1757,6 +2184,14 @@ class FSDStack:
             out.meta["path_fwd_clearance"] = round(
                 float(out.path_forward_clearance), 3)
         out.meta["planner"] = meta
+        # WHY every candidate was rejected this tick (review P1-3): the
+        # constraint layer used to drop the reason, so "no drivable path"
+        # could not be told apart from a boundary gate, a blind-evidence
+        # gate or an empty drivable layer.  Published whenever the planner
+        # declined, empty dict otherwise.
+        _rej = meta.get("rejects")
+        if _rej:
+            out.meta["plan_rejects"] = dict(_rej)
         out.meta["total_candidates"] = out.n_candidates
         # the chosen path's speed profile (planning-side longitudinal plan)
         sp = meta.get("speed_profile")
@@ -1840,6 +2275,26 @@ class FSDStack:
         center = np.asarray(center, dtype=float)[:, :2]
         return center if len(center) >= 2 else None
 
+    @staticmethod
+    def _publish_reference_geometry(ref, geometry) -> bool:
+        """Write the FINAL accepted geometry back into the reference object.
+
+        One tick has exactly one accepted lateral reference (plan §3.3):
+        whoever limits or smooths it must update the object every consumer
+        reads, not a local copy.  Returns True when the geometry was
+        adopted, False when there was nothing to write.
+        """
+        if ref is None or geometry is None:
+            return False
+        try:
+            arr = np.asarray(geometry, dtype=float)
+            if arr.ndim != 2 or len(arr) < 3:
+                return False
+            ref.center = arr[:, :2]
+            return True
+        except Exception:
+            return False
+
     def _sensor_lane(self, out, pos, heading):
         """Fused sensor lane: vision markings -> LiDAR corridor -> fusion.
 
@@ -1869,6 +2324,17 @@ class FSDStack:
         except Exception as exc:
             _warn_once("sensor_lane_fusion", f"lane fusion failed: {exc}")
             frame = vision or lidar
+        # Stamp WHICH observation each freshly built frame carries, before
+        # fusion can adopt or hold it.  A frame served from the hold/coast
+        # keeps the old number, so "the reference survived another tick"
+        # can never be read as "we measured it again" (T02/§3.2).
+        _obs_tick = int(getattr(self, "_tick_num", 0))
+        for _f in (vision, lidar):
+            if _f is not None:
+                try:
+                    _f.obs_seq = _obs_tick
+                except Exception:
+                    pass
         if frame is None:
             try:
                 from beamng_autopilot.lane import lane_frame_usable
@@ -2061,6 +2527,15 @@ def semantic_to_meta(head_outputs: dict) -> dict:
             meta["line_conf_history"] = ev.get("history_confidence")
             meta["line_evidence_age_s"] = ev.get("since_observation_s")
             meta["line_evidence_expired"] = int(bool(ev.get("expired")))
+            # T03 provenance: the added pixels split by ORIGIN (this
+            # observation / re-projected history / yellow prior) and the
+            # source-event counters that say whether a refresh actually
+            # produced new source evidence.
+            meta["line_added_current_px"] = ev.get("added_pixels_current")
+            meta["line_added_history_px"] = ev.get("added_pixels_history")
+            meta["line_added_yellow_px"] = ev.get("added_pixels_yellow")
+            meta["line_yellow_in_line_px"] = ev.get("yellow_pixels_in_line")
+            meta["line_evidence_events"] = ev.get("source_events")
     tr = head_outputs.get("traffic")
     if tr is not None:
         meta["signal_state"] = tr.meta.get("signal_state")

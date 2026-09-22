@@ -228,18 +228,130 @@ def test_fsd_tick_semantic_throttle_off_by_default() -> None:
     assert sem.calls == 2          # default runs every tick
 
 
+def test_stack_times_acquisition_separately_from_sync_heads(monkeypatch):
+    import beamng_autopilot.fsd_stack as module
+
+    class Clock:
+        value = 1000.0
+
+        def __call__(self):
+            return self.value
+
+    clock = Clock()
+    monkeypatch.setattr(module.time, "time", clock)
+    monkeypatch.setattr(module.time, "perf_counter", clock)
+    monkeypatch.setattr(module, "ASYNC_HEADS_ENABLED", False)
+
+    class Ring(_StubRing):
+        def grab_ring(self):
+            clock.value += 0.010
+            return super().grab_ring()
+
+    class Head(_FakeSemantic):
+        def run(self, ctx):
+            clock.value += 0.030
+            out = super().run(ctx)
+            out.meta["semantic_ms"] = {"total": 30.0}
+            out.meta["segmentation_ms"] = {"road": {"total": 12.0}, "line": None}
+            return out
+
+    st = _stack()
+    st.ring = Ring()
+    st.hydra.add(Head())
+    st.semantic_every_n = 2
+    first = st.tick()
+    stages = first.meta["perception_ms"]
+    assert stages["camera_acquire"] == pytest.approx(10.0)
+    assert stages["heads"] == pytest.approx(30.0)
+    assert stages["heads_sync"] == pytest.approx(30.0)
+    assert stages["heads_async_poll"] is None
+    assert stages["heads_async_dispatch"] is None
+    assert first.meta["tick_ms"]["ring"] == pytest.approx(40.0)
+    assert first.meta["tick_ms"]["total"] == pytest.approx(40.0)
+    assert first.meta["semantic_ms"] == {"total": 30.0}
+    assert first.meta["segmentation_ms"]["road"]["total"] == 12.0
+    assert first.meta["head_trace_clock"] == "wall_time"
+    assert first.meta["head_source_clock_basis"] == "acquire_return"
+    rec = first.meta["head_sched"]["semantic"]
+    assert rec["source_t"] == pytest.approx(1000.010)
+    second = st.tick()
+    reused = second.meta["head_sched"]["semantic"]
+    assert reused["source_t"] == rec["source_t"]
+    assert reused["source_seq"] == rec["source_seq"]
+    assert reused["result_seq"] == rec["result_seq"]
+    assert reused["publish_t"] == rec["publish_t"]
+    assert reused["eligible_t"] == rec["eligible_t"]
+    assert reused["eligible_t"] <= reused["dispatch_t"] <= reused["finish_t"]
+    assert reused["attempt_eligible_t"] > rec["eligible_t"]
+    assert reused["attempt_source_seq"] != rec["attempt_source_seq"]
+    assert reused["result_available"] is True
+    assert "semantic_ms" not in second.meta
+    assert "segmentation_ms" not in second.meta
+    assert second.meta["perception_ms"]["heads_sync"] is None
+
+
+def test_stack_records_failed_camera_and_head_durations(monkeypatch):
+    import beamng_autopilot.fsd_stack as module
+
+    class Clock:
+        value = 100.0
+
+        def __call__(self):
+            return self.value
+
+    clock = Clock()
+    monkeypatch.setattr(module.time, "perf_counter", clock)
+    monkeypatch.setattr(module, "ASYNC_HEADS_ENABLED", False)
+
+    class BrokenRing:
+        def grab_ring(self):
+            clock.value += 0.025
+            raise RuntimeError("camera unavailable")
+
+    st = _stack()
+    st.ring = BrokenRing()
+    out = st.tick()
+    assert out.meta["perception_ms"]["camera_acquire"] == pytest.approx(25.0)
+    assert out.meta["perception_ms"]["heads"] is None
+    assert out.errors["ring"] == "camera unavailable"
+
+    class BrokenHead:
+        name = "semantic"
+
+        def run(self, ctx):
+            clock.value += 0.040
+            raise RuntimeError("head unavailable")
+
+    st.ring = _StubRing()
+    st.hydra.add(BrokenHead())
+    out = st.tick()
+    assert out.meta["perception_ms"]["heads_sync"] == pytest.approx(40.0)
+    assert out.meta["head_sched"]["semantic"]["result_available"] is False
+    assert out.meta["head_sched"]["semantic"]["result_seq"] is None
+
+
 def test_fsd_tick_candidates_survive_progress_gate() -> None:
     """An ego-anchored lane reference must not silently kill the lane-shift
     candidates via the forward-progress gate.  At least the 11 arc fan plus
     the shift family should reach the selector (a couple of straight arcs
     can legitimately collide with the stub obstacle at (6, 0) and drop).
     Regression: the far-first lane reference once rejected every shift and
-    left only the arcs (town runs 2026-08-21)."""
+    left only the arcs (town runs 2026-08-21).
+
+    The threshold moved from 12 to 11 when T05 unified the ground plane:
+    the road mask is now lifted onto the ROAD plane (0.17 m below the ego
+    origin) instead of the origin plane, which shrinks the drivable mask
+    (measured on this stub: 198 -> 179 drivable cells, -9.6%) and can drop
+    one candidate at the progress gate.  The direction is deliberate -
+    the old plane was 0.17 m too high, so it claimed pavement further out
+    than the sensors actually saw - and the switch
+    ``BEAMNG_GEOM_GROUND_PLANE=0`` restores the old behaviour for an A/B.
+    """
     st = _stack()
     out = st.tick()
     meta = out.meta.get("planner", {})
     if meta.get("n_eval") is not None:
-        assert meta["n_eval"] >= 12, meta
+        assert meta["n_eval"] >= 11, meta
 
 
 class _CountingObject(_FakeSemantic):
@@ -709,3 +821,19 @@ def test_tick_freezes_the_snapshot_before_planning(monkeypatch) -> None:
     # Perception was complete at planning time, not back-filled afterwards.
     assert seen["bev"] is not None
     assert seen["snapshot"].tick_id == out.snapshot.tick_id
+
+
+def test_the_tick_publishes_the_reference_stability_verdict() -> None:
+    """P1-2 wiring guard: the stability verdict must reach out.meta.
+
+    A missing key here is invisible in the pure tracker tests and was
+    exactly how a NameError (a local read before its assignment) silently
+    removed the whole stability telemetry from four live runs.
+    """
+    st = _stack()
+    out = st.tick()
+    for key in ("ref_authority", "ref_stability_reason", "ref_side",
+                "ref_lat_m", "ref_stable_ticks", "ref_side_flips",
+                "ref_flip"):
+        assert key in out.meta, key
+    assert out.meta["ref_authority"] in ("full", "limited")
