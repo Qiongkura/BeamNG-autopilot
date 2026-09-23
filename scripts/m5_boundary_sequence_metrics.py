@@ -216,6 +216,20 @@ def analyse(seq_path: str, *, edge_px: float = DEFAULT_EDGE_PX,
                      "heading": round(heading, 5),
                      "ground_z": round(ground_z, 3),
                      "t_s": round(t_s, 3)}
+        if f"ann_counts_{i}" in z.files:
+            # engine annotation classes: the independent label for WHICH
+            # kind of edge this stretch has (GUARD_RAIL / GRASS / SIDEWALK)
+            try:
+                counts = json.loads(str(np.asarray(
+                    z[f"ann_counts_{i}"]).ravel()[0]))
+            except Exception:
+                counts = {}
+            if counts:
+                top = sorted(counts.items(), key=lambda kv: -kv[1])[:6]
+                row["ann_top"] = {str(k): int(v) for k, v in top}
+                for key in ("GUARD_RAIL", "GRASS", "NATURE", "SIDEWALK",
+                            "ASPHALT", "MUD", "SAND", "ROCK"):
+                    row[f"ann_{key.lower()}"] = int(counts.get(key, 0))
         if i > 0:
             p0 = np.asarray(z["pos_0"], dtype=float).ravel()[:3]
             row["travel_m"] = round(float(np.linalg.norm(pos[:2] - p0[:2])), 3)
@@ -341,6 +355,32 @@ def analyse(seq_path: str, *, edge_px: float = DEFAULT_EDGE_PX,
     summary["side_candidates_raw"] = {
         side: sum(r.get(f"proj_on_edge_raw_{side}", 0) or 0 for r in rows)
         for side in ("left", "right")}
+    # The SLOPE of the stretch, from the recorded ground height: the plan's
+    # acceptance matrix has a "slope" row, and a slope claim must come from
+    # the data, not from the operator remembering a hill.
+    travel = 0.0
+    gz = [r["ground_z"] for r in rows]
+    pos_all = [r["pos"] for r in rows]
+    for a, b in zip(pos_all, pos_all[1:]):
+        travel += float(math.hypot(b[0] - a[0], b[1] - a[1]))
+    if len(gz) > 1 and travel > 0.0:
+        summary["travel_m"] = round(travel, 3)
+        summary["dz_m"] = round(float(gz[-1] - gz[0]), 3)
+        summary["grade_pct"] = round(abs(float(gz[-1] - gz[0])) / travel * 100.0,
+                                     2)
+        local = [abs(float(gz[i + 1] - gz[i]))
+                 / max(1e-6, float(math.hypot(
+                     pos_all[i + 1][0] - pos_all[i][0],
+                     pos_all[i + 1][1] - pos_all[i][1])))
+                 for i in range(len(gz) - 1)]
+        summary["max_local_grade_pct"] = round(max(local) * 100.0, 2)
+    # Engine-label summary: which edge does this stretch actually have?
+    for key in ("guard_rail", "grass", "nature", "sidewalk", "asphalt"):
+        vals = [r.get(f"ann_{key}") for r in rows if isinstance(
+            r.get(f"ann_{key}"), int)]
+        summary[f"ann_{key}_p50"] = (None if not vals
+                                     else int(np.median(vals)))
+        summary[f"ann_{key}_frames"] = sum(1 for v in vals if v > 0)
     for tag in ("", "_line"):
         n = sum(r.get(f"proj_n{tag}", 0) or 0 for r in rows)
         edge_n = sum(r.get(f"proj_on_edge{tag}", 0) or 0 for r in rows)

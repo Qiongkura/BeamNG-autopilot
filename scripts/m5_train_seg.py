@@ -47,8 +47,26 @@ from beamng_autopilot.vision.segmentation import (
 )
 from beamng_autopilot.vision.dataset_split import (
     FrameRef, coverage_digest, cross_view_leak, frame_refs_from_meta,
-    leak_check, select_weak_lines, split_by_group,
+    leak_check, select_weak_lines, split_audit, split_by_group,
 )
+
+
+def _run_key(rd: Path) -> str:
+    """A per-directory key that is unique across ring collections.
+
+    ``<collection>/<view>`` dirs share the basename ``front_main``; keying
+    ``per_run`` by the basename collapsed six collections into one entry
+    (measured: --split by-map-scene then trained on 25 of 173 frames).  The
+    key is the path relative to LOGS_DIR when possible, else the path
+    itself, so every directory is its own split group.
+    """
+    p = Path(rd).resolve()
+    try:
+        base = Path(config.LOGS_DIR).resolve()
+        rel = p.relative_to(base)
+        return rel.as_posix()
+    except Exception:                        # noqa: BLE001
+        return p.as_posix()
 
 
 def load_frames(
@@ -77,11 +95,16 @@ def load_frames(
         fs = sorted(glob.glob(str(rd / "frame_*.npz")))
         if not fs:
             raise SystemExit(f"没有找到数据: {rd}")
-        run_name = rd.name
+        # The KEY must be unique per directory, not per basename: ring
+        # collections are passed as <collection>/<view>, so six collections
+        # all named "front_main" collided and per_run kept only the last -
+        # with --split by-map-scene that silently trained on 25 of the 173
+        # frames (measured 2026-09-24).  The basename stays as a label.
+        run_name = _run_key(rd)
         n_run = n_kept = 0
         n_pix = 0
         line_px = 0
-        rec = {"frames": len(fs), "kept": 0,
+        rec = {"frames": len(fs), "kept": 0, "dir_name": rd.name,
                "line_px_frac": 0.0, "start": len(frames), "end": len(frames)}
         for f in fs:
             d = np.load(f)
@@ -121,11 +144,25 @@ def load_frames(
         # Real identities (T10): the collector's meta carries map/episode,
         # wall clock and the exposure counter.  The run DIRECTORY name is
         # kept only as a fallback, and the fallback is reported below.
-        meta_path = rd / "meta.json"
-        if meta_path.exists():
+        # A ring collection keeps its meta at the collection root while the
+        # frames live in <root>/<view>/, so it is read from there and
+        # FILTERED to this view - passing all eight views' frames as this
+        # run's identity would mis-state counts and exposures.
+        meta, meta_level = None, None
+        if (rd / "meta.json").exists():
+            meta, meta_level = rd / "meta.json", "self"
+        elif (rd.parent / "meta.json").exists():
+            meta, meta_level = rd.parent / "meta.json", "parent"
+        if meta is not None:
             try:
-                rec["meta"] = json.loads(meta_path.read_text(encoding="utf-8"))
-            except Exception as exc:
+                blob = json.loads(meta.read_text(encoding="utf-8"))
+                if meta_level == "parent":
+                    blob = dict(blob, frames=[
+                        f for f in (blob.get("frames") or [])
+                        if str(f.get("view") or "").strip() == rd.name])
+                rec["meta"] = blob
+                rec["meta_level"] = meta_level
+            except Exception as exc:         # noqa: BLE001
                 rec["meta_error"] = f"{type(exc).__name__}: {exc}"
         per_run[run_name] = rec
     if not frames:
@@ -333,6 +370,9 @@ def main() -> None:
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--val-frac", type=float, default=0.2)
+    ap.add_argument("--split-gap-s", type=float, default=0.5,
+                    help="相邻帧判定的时间间隔（秒）；相差不超过它的两帧"
+                         "不应被切到 train/val 两侧")
     ap.add_argument("--split",
                     choices=["tail", "per-run", "by-map-scene"],
                     default="tail",
@@ -493,6 +533,31 @@ def main() -> None:
         else:
             print(f"[train] 跨视角同曝光分组 "
                   f"{_xv['n_cross_view_groups']} 组，无跨侧泄漏", flush=True)
+        # Duplicated samples and temporal adjacency, reported SEPARATELY
+        # (plan T10): a copied frame inflates one side while looking like
+        # two samples, and two frames a fraction of a second apart are the
+        # same moment of the drive.  Each section says whether it could be
+        # checked at all.
+        _audit = split_audit(plan, refs, gap_s=float(args.split_gap_s))
+        _dup = _audit["duplicates"]
+        _adj = _audit["temporal_adjacency"]
+        if not _dup["checked"]:
+            print(f"[train] 复制样本检查未执行：{_dup['reason']}", flush=True)
+        elif _dup["n_crossing"]:
+            print(f"[train] 严重：疑似同一批样本被切到两侧 "
+                  f"{_dup['detail']}", flush=True)
+        else:
+            print(f"[train] 复制样本分组 {_dup['n_groups']} 组，"
+                  f"无跨侧", flush=True)
+        if not _adj["checked"]:
+            print(f"[train] 时间邻近检查未执行：{_adj['reason']}", flush=True)
+        elif _adj["n_crossing"]:
+            print(f"[train] 注意：{_adj['n_crossing']} 对相差 ≤"
+                  f"{_adj['gap_s']}s 的相邻帧被切到两侧 -> "
+                  f"{_adj['detail'][:3]}", flush=True)
+        else:
+            print(f"[train] 时间邻近 {_adj['n_pairs']} 对（≤{_adj['gap_s']}s），"
+                  f"无跨侧", flush=True)
         # Two different statements (plan T10): a FRAME on both sides is a
         # hard leak; a GROUP on both sides is what the temporal-tail
         # protocol does by construction and must be named as such instead

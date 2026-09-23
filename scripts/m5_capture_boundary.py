@@ -30,6 +30,7 @@ import sys
 import time
 from pathlib import Path
 
+import cv2
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +40,9 @@ if str(ROOT) not in sys.path:
 from beamng_autopilot import config  # noqa: E402
 from beamng_autopilot import geometry as G  # noqa: E402
 from beamng_autopilot.connector import BeamNGConnector  # noqa: E402
+from beamng_autopilot_tech.annotations import (  # noqa: E402
+    annotation_palette,
+)
 from beamng_autopilot.runtime import (  # noqa: E402
     build_camera_ring_provider,
     build_range_provider,
@@ -107,6 +111,38 @@ def grab_mask(ring, net, pos, heading: float, ground_z: float, role_arg: str):
     return mask, cam, role
 
 
+def grab_annotation_counts(ring, palette_classes: dict, role_arg: str):
+    """Per-class pixel counts from the ENGINE's annotated frame.
+
+    This is the independent label for "what kind of edge is beside the
+    road" (GUARD_RAIL / GRASS / TERRAIN ...): counting them keeps the
+    acceptance-matrix row from resting on the operator's description.
+    Returns ``(counts, annotated_rgb_or_None)``.
+    """
+    grab = getattr(ring, "grab_ring_labels", None)
+    if not callable(grab):
+        return {}, None
+    try:
+        labels = grab()
+    except Exception as exc:
+        print(f"[capture] annotated grab failed: {exc}")
+        return {}, None
+    if not labels:
+        return {}, None
+    role = role_arg if role_arg in labels else next(iter(labels))
+    ann = np.asarray(labels[role][1])
+    if ann.ndim != 3 or ann.shape[2] < 3:
+        return {}, None
+    rgb = ann[:, :, :3].astype(np.int16)
+    counts: dict = {}
+    for name, col in palette_classes.items():
+        c = np.asarray(col, dtype=np.int16)
+        counts[str(name)] = int(np.count_nonzero(
+            (rgb[:, :, 0] == c[0]) & (rgb[:, :, 1] == c[1])
+            & (rgb[:, :, 2] == c[2])))
+    return {k: v for k, v in counts.items() if v > 0}, ann
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="capture boundary inputs")
     ap.add_argument("--runtime", choices=("auto", "steam", "tech"),
@@ -129,6 +165,13 @@ def main() -> int:
                     help="ticks to let pose and sensor settle after placing")
     ap.add_argument("--no-mask", action="store_true",
                     help="skip the semantic mask (no ring / no labels)")
+    ap.add_argument("--annotations", action="store_true",
+                    help="also grab the engine's annotated frame and count "
+                         "palette classes per frame (GUARD_RAIL / GRASS / ...)"
+                         " - this is the independent label for which kind of "
+                         "edge a stretch has, instead of the operator's word")
+    ap.add_argument("--save-ann", action="store_true",
+                    help="write the annotated frame as a PNG next to --out")
     ap.add_argument("--out", type=str, required=True)
     args = ap.parse_args()
 
@@ -143,11 +186,23 @@ def main() -> int:
             conn.attach_vehicle(already_open=True)
         except Exception:
             conn.load_scenario()
-        ring, mode = build_camera_ring_provider(conn, args.runtime, 320, 240)
+        ring, mode = build_camera_ring_provider(
+            conn, args.runtime, 320, 240, annotations=bool(args.annotations))
         range_prov, _ = build_range_provider(conn, args.runtime)
         net = None if (args.no_mask or ring is None) else HydraNet()
         if net is not None:
             net.add(SemanticHead())
+        palette_classes: dict = {}
+        if args.annotations and ring is not None:
+            get_ann = getattr(conn.bng, "get_annotations", None)
+            tech_ann = get_ann() if callable(get_ann) else None
+            try:
+                palette_classes = dict(annotation_palette(tech_ann)["classes"])
+            except Exception as exc:
+                print(f"[capture] annotation palette unavailable: {exc}")
+                palette_classes = {}
+            print(f"[capture] annotation classes: "
+                  f"{','.join(sorted(palette_classes)) or 'none'}")
         payload: dict = {"runtime": mode, "frames": np.array([frames]),
                          "step_m": np.array([float(args.step_m)]),
                          "role": np.array([args.role]),
@@ -187,6 +242,22 @@ def main() -> int:
             if net is not None:
                 mask, cam, role_used = grab_mask(ring, net, pos, heading,
                                                  ground_z, args.role)
+            if palette_classes:
+                counts, ann_img = grab_annotation_counts(ring, palette_classes,
+                                                        args.role)
+                if counts:
+                    payload[f"ann_counts_{i}"] = np.array(
+                        [json.dumps(counts, sort_keys=True)])
+                    payload[f"ann_n_{i}"] = np.array([sum(counts.values())])
+                    print(f"[capture] frame {i} ann: " + ", ".join(
+                        f"{k}={v}" for k, v in sorted(counts.items(),
+                                                      key=lambda kv: -kv[1])
+                        [:6]), flush=True)
+                if args.save_ann and ann_img is not None:
+                    out_png = Path(args.out).with_name(
+                        Path(args.out).stem + f"_ann_{i:02d}.png")
+                    out_png.parent.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(str(out_png), np.asarray(ann_img)[:, :, ::-1])
             payload[f"points_{i}"] = cloud
             payload[f"pos_{i}"] = pos
             if i == 0:
