@@ -37,9 +37,11 @@ def test_load_frames_filters_sparse(tmp_path):
 
     frames, per_run = _mod.load_frames([run_a, run_b], min_line_frac=0.05)
     assert len(frames) == 3                       # 稀疏 run_b 全部被过滤
-    assert per_run["run_a"]["kept"] == 3
-    assert per_run["run_b"]["kept"] == 0
-    assert per_run["run_b"]["line_px_frac"] == pytest.approx(1 / 64, abs=1e-6)
+    # keys are path-unique (basenames collide across ring collections)
+    ka, kb = _mod._run_key(run_a), _mod._run_key(run_b)
+    assert per_run[ka]["kept"] == 3
+    assert per_run[kb]["kept"] == 0
+    assert per_run[kb]["line_px_frac"] == pytest.approx(1 / 64, abs=1e-6)
 
 
 def test_split_frames_per_run_keeps_each_tail():

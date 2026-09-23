@@ -341,3 +341,134 @@ class TestCrossViewGrouping:
         rep = cross_view_leak(plan, refs)
         assert rep["checked"] is False and rep["leaked_groups"] == []
         assert "no exposure counters" in rep["reason"]
+
+    def test_a_single_view_list_says_that_is_why_it_could_not_check(self):
+        """The old reason claimed missing exposure counters even when every
+        ref carried one (measured: 173/173 refs, single-view list)."""
+        from beamng_autopilot.vision.dataset_split import (
+            SplitPlan, cross_view_leak)
+        refs = [_ref(0, t_wall=10.0, exposure=0),
+                _ref(1, t_wall=10.5, exposure=1)]
+        plan = SplitPlan(train=[refs[0]], val=[refs[1]])
+        rep = cross_view_leak(plan, refs)
+        assert rep["checked"] is False and rep["leaked_groups"] == []
+        assert rep["n_refs_with_exposure"] == 2
+        assert "no exposure counters" not in rep["reason"]
+        assert "more than one view" in rep["reason"]
+
+
+def _ref(index: int, *, t_wall=None, exposure=None, view="front_main",
+         path="", source="s1", map_name="italy", run="run_a"):
+    return FrameRef(index=index, run=run, map_name=map_name, source_id=source,
+                    t_wall=t_wall, exposure=exposure, view=view, path=path)
+
+
+class TestLeakKindsStaySeparate:
+    """T10: frame overlap, group overlap, adjacency and duplicates are
+    different statements and must never be merged into one 'no leak'."""
+
+    def test_a_copied_sample_is_a_duplicate_not_a_frame_overlap(self):
+        from beamng_autopilot.vision.dataset_split import (
+            SplitPlan, duplicate_groups, split_audit)
+        refs = [_ref(0, path="front_main/f0.npz"),
+                _ref(1, path="front_main/f0.npz")]   # the same FILE twice
+        dup = duplicate_groups(refs)
+        assert len(dup) == 1 and list(dup.values())[0]["why"] == "same_path"
+        plan = SplitPlan(train=[refs[0]], val=[refs[1]])
+        audit = split_audit(plan, refs)
+        assert audit["duplicates"]["n_crossing"] == 1
+        assert audit["frame_overlap"]["n"] == 0, \
+            "different indexes are not a frame overlap"
+        assert audit["group_overlap"]["n"] == 1, "same source is one group"
+
+    def test_the_same_relative_path_in_two_collections_is_not_a_duplicate(self):
+        """Collectors write collection-RELATIVE paths, so the path alone
+        cannot identify a frame: on a six-collection training list that
+        produced 39 false duplicate groups while every frame was unique."""
+        from beamng_autopilot.vision.dataset_split import duplicate_groups
+        refs = [_ref(0, path="front_main/frame_00000.npz", run="run_a",
+                     source="s1"),
+                _ref(1, path="front_main/frame_00000.npz", run="run_b",
+                     source="s2")]
+        assert duplicate_groups(refs) == {}, \
+            "same relative path, different collection: not the same file"
+        # ...and a genuine repeat inside one collection still fires
+        same = [_ref(0, path="front_main/f0.npz", run="run_a"),
+                _ref(1, path="front_main/f0.npz", run="run_a")]
+        assert len(duplicate_groups(same)) == 1
+
+    def test_two_views_of_one_exposure_are_not_duplicates(self):
+        from beamng_autopilot.vision.dataset_split import (
+            duplicate_groups, split_audit, SplitPlan)
+        refs = [_ref(0, t_wall=10.0, exposure=0, view="front_main"),
+                _ref(1, t_wall=10.0, exposure=0, view="front_fisheye")]
+        assert duplicate_groups(refs) == {}
+        audit = split_audit(SplitPlan(train=[refs[0]], val=[refs[1]]), refs)
+        assert audit["cross_view_exposure"]["n_crossing"] == 1
+        assert audit["temporal_adjacency"]["n_pairs"] == 0, \
+            "the same grab is reported as a cross-view case, not adjacency"
+
+    def test_adjacent_frames_across_the_split_are_reported(self):
+        from beamng_autopilot.vision.dataset_split import (
+            temporal_neighbours, split_audit, SplitPlan)
+        refs = [_ref(0, t_wall=10.0, exposure=0),
+                _ref(1, t_wall=10.2, exposure=1, source="s2")]
+        pairs = temporal_neighbours(refs, gap_s=0.5)
+        assert len(pairs) == 1 and pairs[0]["dt_s"] == pytest.approx(0.2)
+        audit = split_audit(SplitPlan(train=[refs[0]], val=[refs[1]]), refs)
+        assert audit["temporal_adjacency"]["n_crossing"] == 1
+        assert audit["duplicates"]["n_groups"] == 0
+
+    def test_duplicate_evidence_is_kept_once_at_its_strongest(self):
+        from beamng_autopilot.vision.dataset_split import duplicate_groups
+        # same file AND same grab/view: one finding, the strongest reason
+        refs = [_ref(0, t_wall=10.0, exposure=3, path="p/a.npz"),
+                _ref(1, t_wall=10.0, exposure=3, path="p/a.npz")]
+        dup = duplicate_groups(refs)
+        assert len(dup) == 1
+        assert list(dup.values())[0]["why"] == "same_path"
+        assert list(dup.values())[0]["indexes"] == [0, 1]
+
+    def test_an_uncheckable_recording_reports_unchecked_not_clean(self):
+        from beamng_autopilot.vision.dataset_split import (
+            split_audit, SplitPlan)
+        refs = [_ref(0), _ref(1, source="s2")]     # no path/exposure/clock
+        audit = split_audit(SplitPlan(train=[refs[0]], val=[refs[1]]), refs)
+        assert audit["temporal_adjacency"]["checked"] is False
+        assert "no wall clock" in audit["temporal_adjacency"]["reason"]
+        assert audit["duplicates"]["checked"] is False
+        assert "no duplicate evidence" in audit["duplicates"]["reason"]
+        assert audit["cross_view_exposure"]["checked"] is False
+
+    def test_a_clean_plan_reports_zeros_everywhere(self):
+        from beamng_autopilot.vision.dataset_split import (
+            split_audit, SplitPlan)
+        refs = [_ref(0, t_wall=10.0, exposure=0, path="a/f0.npz"),
+                _ref(1, t_wall=10.4, exposure=1, path="a/f1.npz"),
+                _ref(2, t_wall=20.0, exposure=2, path="a/f2.npz",
+                     source="s2"),
+                _ref(3, t_wall=20.4, exposure=3, path="a/f3.npz",
+                     source="s2")]
+        audit = split_audit(SplitPlan(train=refs[:2], val=refs[2:]), refs)
+        assert audit["frame_overlap"]["n"] == 0
+        assert audit["group_overlap"]["n"] == 0
+        assert audit["cross_view_exposure"]["n_crossing"] == 0
+        assert audit["duplicates"]["n_groups"] == 0
+        assert audit["temporal_adjacency"]["n_pairs"] == 2
+        assert audit["temporal_adjacency"]["n_crossing"] == 0
+
+    def test_checked_means_the_check_ran_not_that_it_found_something(self):
+        """Zero duplicates with full evidence is a CLEAN result, not an
+        uncheckable one; the old payload reported checked=False and the
+        reason 'no duplicate evidence' for a list where every frame had a
+        path, an exposure and a wall clock."""
+        from beamng_autopilot.vision.dataset_split import (
+            split_audit, SplitPlan)
+        refs = [_ref(0, t_wall=10.0, exposure=0, path="a/f0.npz"),
+                _ref(1, t_wall=10.4, exposure=1, path="a/f1.npz")]
+        audit = split_audit(SplitPlan(train=refs[:1], val=refs[1:]), refs)
+        dup = audit["duplicates"]
+        assert dup["checked"] is True and dup["n_groups"] == 0
+        assert dup["reason"] == ""
+        assert dup["n_evidence"] == {"path": 2, "exposure": 2,
+                                     "wall_clock": 2}

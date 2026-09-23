@@ -218,12 +218,36 @@ class TestArmsComparison:
 
 
 class TestRejectionsOnWrongMaps:
-    """错误地图必须能被拒绝（计划原话）。"""
+    """错误地图必须能被拒绝（计划原话）。
 
-    def test_a_map_pointing_the_other_way_is_rejected(self):
+    2026-09-24 更正：旧版把"链路方向"当**有向**的（`direction_rad=pi` 判硬冲突）。
+    标线**没有箭头**，所以"反向"不是反证；判据改为**轴比对**（mod 180），
+    "反向"作为**并列诊断**报告（`sense_delta_deg` / `direction_sense:*`）而不再否决。
+    实测量级：三次**沿路行驶**的实车运行（33/48/59 个候选）里弦参考的方向一致性都是 100%——
+    所以这个改动在车头朝路时是恒等变换，只在车头与道路无关时把伪 180° 去掉。
+    """
+
+    def test_a_map_pointing_the_other_way_is_reported_not_penalised(self):
         r = associate_candidate(_cand(bearing_rad=0.0),
                                 _prior(direction_rad=math.pi))
+        assert r.conflicts == [], "a lane marking has no arrowhead"
+        assert r.sense_delta_deg == pytest.approx(180.0)
+        assert any("direction_sense:flipped" in f for f in r.map_fields)
+        # the axis verdict itself is unchanged and still published
+        assert any("direction_source:chord" in f for f in r.map_fields)
+
+    def test_a_map_across_the_road_is_still_rejected(self):
+        """The axis test must not become a rubber stamp: 90 deg is 90 deg."""
+        r = associate_candidate(_cand(bearing_rad=0.0),
+                                _prior(direction_rad=math.pi / 2.0))
         assert any("direction_mismatch" in c for c in r.conflicts)
+        assert r.sense_delta_deg == pytest.approx(90.0)
+
+    def test_an_aligned_link_says_so(self):
+        r = associate_candidate(_cand(bearing_rad=0.0), _prior(direction_rad=0.0))
+        assert r.conflicts == []
+        assert r.sense_delta_deg == pytest.approx(0.0)
+        assert any("direction_sense:aligned" in f for f in r.map_fields)
 
     def test_a_one_way_map_with_a_two_sided_pair_is_flagged(self):
         r = associate_candidate(_cand(width_m=7.0),
@@ -244,3 +268,175 @@ class TestRejectionsOnWrongMaps:
             r = associate_candidate(_cand(), _prior(**kw))
             assert not hasattr(r, "authority")
             assert r.score <= 1.25      # bounded gain, never a permission
+
+
+class TestLocalTangent:
+    """T08: the direction prior must be the LOCAL tangent, not the chord.
+
+    Measured live: candidates on long links sat 33-45 deg off the chord
+    because the chord spans the whole link while the car is at one point of
+    it.  The arc model uses the link's OWN reported radius (inRadius /
+    outRadius from the same Lua call) - no new data source - and returns
+    BOTH turn signs, because BeamNG's radius sign convention is not
+    documented; the caller pins it empirically and `direction_source`
+    records what was graded against.
+    """
+
+    def test_the_arc_tangent_matches_the_analytic_rotation(self):
+        from beamng_autopilot.lane.map_association import local_tangent_rad
+        # chord along +x, 100 m long; ego 20 m along it; R = 50 m
+        t, t_alt, off, r = local_tangent_rad((20.0, 0.0, 0.0), (0.0, 0.0),
+                                             (100.0, 0.0), 50.0)
+        assert off == pytest.approx(20.0)
+        assert r == pytest.approx(50.0)
+        assert math.degrees(t) == pytest.approx(math.degrees(0.4), abs=1e-6)
+        assert math.degrees(t_alt) == pytest.approx(-math.degrees(0.4),
+                                                    abs=1e-6)
+
+    def test_the_offset_is_clamped_to_the_link(self):
+        from beamng_autopilot.lane.map_association import local_tangent_rad
+        t, _, off, _ = local_tangent_rad((500.0, 0.0, 0.0), (0.0, 0.0),
+                                         (100.0, 0.0), 50.0)
+        assert off == pytest.approx(100.0)
+        assert math.degrees(t) == pytest.approx(math.degrees(2.0), abs=1e-6)
+
+    def test_no_radius_means_no_tangent_rather_than_a_guess(self):
+        from beamng_autopilot.lane.map_association import local_tangent_rad
+        assert local_tangent_rad((10.0, 0.0, 0.0), (0.0, 0.0),
+                                 (100.0, 0.0), 0.0) == (None, None, None, None)
+        assert local_tangent_rad((10.0, 0.0, 0.0), (0.0, 0.0),
+                                 (0.0, 0.0), 50.0)[0] is None
+
+    def test_the_prior_records_which_direction_was_used(self):
+        from beamng_autopilot.lane.map_association import MapLinkPrior
+
+        class _Rule:
+            lanes = "++"
+            in_pos = (0.0, 0.0, 0.0)
+            out_pos = (100.0, 0.0, 0.0)
+            in_radius = 50.0
+            out_radius = 50.0
+            n1 = "a"
+            n2 = "b"
+            one_way = False
+            drivability = 1.0
+            right_hand_drive = False
+        straight = MapLinkPrior.from_road_rule(_Rule())
+        assert straight.direction_source == "chord" and straight.tangent_rad is None
+        with_pos = MapLinkPrior.from_road_rule(_Rule(), pos=(20.0, 3.0, 0.0))
+        assert with_pos.direction_source == "tangent_arc"
+        assert math.degrees(with_pos.tangent_rad) == pytest.approx(
+            math.degrees(0.4), abs=1e-6)
+        assert with_pos.arc_offset_m == pytest.approx(20.0)
+
+
+class TestChordIsTheDefaultReference:
+    """Measured: the arc tangent (from in/outRadius) is NOT usable here.
+
+    On a straight link the chord is constant while the tangent estimate
+    swept 4..166 deg, and the candidates' median |delta| was 17.9 deg
+    against the chord vs ~80 deg against either tangent sign - because
+    those radii are 3.5 m, not a road arc radius.  The graded reference is
+    therefore the chord unless the caller opts in, and the result records
+    which one was used.
+    """
+
+    def _cand(self):
+        from beamng_autopilot.lane.map_association import PerceptionCandidate
+        return PerceptionCandidate(cand_id="c", side="left", kind="solid",
+                                   bearing_rad=0.0, confidence=0.9,
+                                   span_m=5.0, fresh=True)
+
+    def _prior(self):
+        from beamng_autopilot.lane.map_association import MapLinkPrior
+        return MapLinkPrior(link_id="a->b", direction_rad=0.0, lanes_hint=2,
+                            tangent_rad=math.radians(80.0),
+                            tangent_alt_rad=math.radians(-80.0),
+                            arc_offset_m=5.0, radius_m=3.5,
+                            direction_source="tangent_arc")
+
+    def test_default_grades_the_chord(self):
+        from beamng_autopilot.lane.map_association import associate_candidate
+        res = associate_candidate(self._cand(), self._prior())
+        assert res.conflicts == [], "chord agrees with the candidate"
+        assert any("direction_source:chord" in f for f in res.map_fields)
+
+    def test_the_tangent_is_opt_in_and_then_disagrees(self):
+        from beamng_autopilot.lane.map_association import associate_candidate
+        res = associate_candidate(self._cand(), self._prior(), use_tangent=True)
+        assert any("direction_mismatch" in c for c in res.conflicts)
+        assert any("direction_source:tangent_arc" in f for f in res.map_fields)
+
+
+class TestTheRecordedSourceNeverOutrunsTheData:
+    """T08 余项: a second tangent source (the map graph's polyline) exists.
+
+    ``in/outRadius`` is 3.5 m on this map - not a road arc radius - so the
+    probe can grade against the map graph's centre-line polyline instead.
+    A declared source is a LABEL, and a label must never claim a reference
+    the test did not use: when no tangent was the reference (not asked for,
+    or none available) the source stays ``chord``.
+    """
+
+    def _cand(self, deg=0.0):
+        from beamng_autopilot.lane.map_association import PerceptionCandidate
+        return PerceptionCandidate(cand_id="c", side="left", kind="solid",
+                                   bearing_rad=math.radians(deg),
+                                   confidence=0.9, span_m=5.0, fresh=True)
+
+    def _prior(self, tangent_deg=None):
+        from beamng_autopilot.lane.map_association import MapLinkPrior
+        return MapLinkPrior(
+            link_id="a->b", direction_rad=0.0, lanes_hint=2,
+            tangent_rad=(None if tangent_deg is None
+                         else math.radians(tangent_deg)),
+            direction_source="chord")
+
+    def test_a_declared_source_is_only_recorded_when_a_tangent_was_used(self):
+        from beamng_autopilot.lane.map_association import (
+            associate_candidate, direction_reference_rad)
+        prior = self._prior(tangent_deg=25.0)
+        ref, src = direction_reference_rad(prior, use_tangent=True,
+                                          direction_source="tangent_roadnet")
+        assert src == "tangent_roadnet"
+        assert math.degrees(ref) == pytest.approx(25.0)
+        # not asked for -> chord, even though a label was offered
+        ref, src = direction_reference_rad(prior, direction_source="tangent_roadnet")
+        assert src == "chord" and math.degrees(ref) == pytest.approx(0.0)
+        # asked for but nothing to use -> still chord, never a phantom source
+        ref, src = direction_reference_rad(self._prior(), use_tangent=True,
+                                          direction_source="tangent_roadnet")
+        assert src == "chord" and ref == pytest.approx(0.0)
+        res = associate_candidate(self._cand(), self._prior(),
+                                  use_tangent=True,
+                                  direction_source="tangent_roadnet")
+        assert not any("tangent_roadnet" in f for f in res.map_fields)
+
+    def test_the_polyline_arm_is_graded_and_labelled_as_itself(self):
+        from beamng_autopilot.lane.map_association import associate_candidate
+        prior = self._prior(tangent_deg=25.0)
+        res = associate_candidate(self._cand(deg=25.0), prior,
+                                  use_tangent=True,
+                                  direction_source="tangent_roadnet")
+        assert res.conflicts == [], "candidate agrees with the polyline tangent"
+        assert any("direction_source:tangent_roadnet" in f
+                   for f in res.map_fields)
+
+    def test_compare_arms_passes_the_source_through(self):
+        from beamng_autopilot.lane.map_association import compare_arms
+        prior = self._prior(tangent_deg=25.0)
+        rep = compare_arms([self._cand(deg=25.0)], prior, use_tangent=True,
+                           direction_source="tangent_roadnet")
+        row = rep["arm_b"][0]
+        assert "direction_source:tangent_roadnet" in row["map_fields"]
+        assert row["conflicts"] == []
+
+    def test_the_delta_helper_is_the_same_quantity_the_test_grades(self):
+        from beamng_autopilot.lane.map_association import (
+            DIR_HARD_DEG, direction_delta_deg)
+        assert direction_delta_deg(0.0, math.radians(30.0)) == pytest.approx(30.0)
+        assert direction_delta_deg(math.radians(-179.0),
+                                   math.radians(179.0)) == pytest.approx(2.0)
+        assert direction_delta_deg(None, 0.0) is None
+        assert direction_delta_deg(0.0, None) is None
+        assert isinstance(DIR_HARD_DEG, float)

@@ -360,3 +360,152 @@ def test_head_does_not_republish_old_segmenter_timing(monkeypatch):
     out = SemanticHead(segmenter=seg, enable_evidence=False).run(
         _ctx(role="pillar_left"))
     assert out.meta["segmentation_ms"] == {"road": None, "line": None}
+
+
+class TestLineCandidateGate:
+    """T08: the union's classic-CV arm needs the gate the yellow arm has.
+
+    The union ``line | cv_white`` recovers paint the model misses, but the
+    classic arm is a brightness/contrast rule that fires on kerbs, seams
+    and shadows: measured against the engine's own annotation, 40-85% of
+    the union candidates lay off the pavement and none on labelled paint.
+    A candidate the LEARNED mask supports is kept as is - applying the
+    elongation rule to everything deleted all 100 mask-backed candidates
+    on an urban junction (zebra crossing = wide blocks).
+    """
+
+    def _mk(self, pixels, **kw):
+        from beamng_autopilot.vision.lanes import LaneMarking
+        import numpy as np
+        return LaneMarking(world=np.zeros((len(pixels), 2)),
+                           pixels=np.asarray(pixels, dtype=float),
+                           color=kw.get("color", "white"),
+                           kind=kw.get("kind", "thin"),
+                           confidence=1.0)
+
+    def test_an_unsupported_blob_is_dropped_and_an_elongated_on_road_kept(self):
+        import numpy as np
+        from beamng_autopilot.vision.segmentation import gate_line_candidates
+        h = w = 60
+        line = np.zeros((h, w), dtype=bool)
+        road = np.zeros((h, w), dtype=bool)
+        road[30:, :] = True
+        blob = self._mk([[20 + (i % 5), 40 + (i // 5)] for i in range(25)])
+        stroke = self._mk([[10 + i, 45] for i in range(20)])      # 20x1
+        kept, dropped, on = gate_line_candidates([blob, stroke], line, road)
+        assert on is True
+        assert kept == [stroke], "only the elongated, on-road one survives"
+        assert dropped.get("blob") == 1
+        assert kept[0].meta["learned_frac"] == 0.0
+        assert kept[0].meta["on_road_frac"] == 1.0
+        assert kept[0].meta["aspect"] >= 2.5
+
+    def test_an_unsupported_stroke_off_the_pavement_is_dropped(self):
+        import numpy as np
+        from beamng_autopilot.vision.segmentation import gate_line_candidates
+        line = np.zeros((40, 40), dtype=bool)
+        road = np.zeros((40, 40), dtype=bool)
+        road[30:, :] = True                     # pavement only at the bottom
+        off = self._mk([[2 + i, 5] for i in range(15)])           # top-left
+        kept, dropped, _ = gate_line_candidates([off], line, road)
+        assert kept == [] and dropped.get("off_pavement") == 1
+
+    def test_a_learned_backed_candidate_is_kept_whatever_its_shape(self):
+        import numpy as np
+        from beamng_autopilot.vision.segmentation import gate_line_candidates
+        line = np.zeros((60, 60), dtype=bool)
+        road = np.zeros((60, 60), dtype=bool)   # nothing on the road at all
+        wide = self._mk([[20 + (i % 10), 20 + (i // 10)] for i in range(50)])
+        for px, py in wide.pixels.astype(int):
+            line[py, px] = True                 # the learned mask supports it
+        kept, dropped, _ = gate_line_candidates([wide], line, road)
+        assert kept == [wide] and dropped == {}
+        assert kept[0].meta["learned_frac"] == 1.0
+
+    def test_the_gate_can_be_disabled_for_an_ab(self):
+        import numpy as np
+        from beamng_autopilot.vision.segmentation import gate_line_candidates
+        line = np.zeros((40, 40), dtype=bool)
+        road = np.zeros((40, 40), dtype=bool)
+        blob = self._mk([[2 + (i % 4), 2 + (i // 4)] for i in range(16)])
+        kept, dropped, on = gate_line_candidates([blob], line, road,
+                                                 gate_on=False)
+        assert on is False and kept == [blob] and dropped == {}
+
+    def test_a_candidate_without_pixels_is_counted_not_crashed(self):
+        import numpy as np
+        from beamng_autopilot.vision.lanes import LaneMarking
+        from beamng_autopilot.vision.segmentation import gate_line_candidates
+        empty = LaneMarking(world=np.zeros((0, 2)), pixels=np.zeros((0, 2)))
+        kept, dropped, _ = gate_line_candidates(
+            [empty], np.zeros((10, 10), dtype=bool), None)
+        assert kept == [] and dropped.get("no_pixels") == 1
+
+
+class TestLineMaskRefine:
+    """T11: the polarity-agnostic outlier test, and its measured limits.
+
+    Measured against the engine's annotation: the appearance test is a net
+    win on one dev scene (precision 0.194 -> 0.243 at unchanged recall) and
+    costs ~20 points of recall on another, so it ships as a switch, not a
+    default.  What these tests pin is the SEMANTICS: either polarity passes,
+    a pixel matching the local road statistics does not, and a pixel with no
+    road reference is KEPT and counted as unknown rather than dropped.
+    """
+
+    def test_paint_darker_or_brighter_than_the_road_both_pass(self):
+        import numpy as np
+        from beamng_autopilot.vision.seg_probs import refine_line_mask
+        grey_road = 180
+        img = np.full((60, 60, 3), grey_road, dtype=np.uint8)
+        road = np.ones((60, 60), dtype=bool)
+        dark = np.zeros((60, 60), dtype=bool); dark[30, 5:25] = True
+        bright = np.zeros((60, 60), dtype=bool); bright[40, 5:25] = True
+        img[30, 5:25] = 120          # darker than the road
+        img[40, 5:25] = 240          # brighter than the road
+        line = dark | bright
+        keep, stats = refine_line_mask(line, road, img, on_road_dilate_px=0,
+                                       z_min=1.2)
+        assert keep[30, 5:25].all() and keep[40, 5:25].all(), \
+            "polarity must not matter"
+        assert stats["kept"] == int(line.sum())
+
+    def test_a_pixel_matching_the_local_road_is_removed(self):
+        import numpy as np
+        from beamng_autopilot.vision.seg_probs import refine_line_mask
+        img = np.full((60, 60, 3), 180, dtype=np.uint8)
+        img[30, 5:25] = 182          # indistinguishable from the road
+        line = np.zeros((60, 60), dtype=bool); line[30, 5:25] = True
+        road = np.ones((60, 60), dtype=bool)
+        keep, stats = refine_line_mask(line, road, img, on_road_dilate_px=0)
+        assert keep.sum() == 0 and stats["not_outlier"] == 20
+
+    def test_without_a_road_reference_the_pixel_is_kept_as_unknown(self):
+        import numpy as np
+        from beamng_autopilot.vision.seg_probs import refine_line_mask
+        img = np.full((60, 60, 3), 180, dtype=np.uint8)
+        line = np.zeros((60, 60), dtype=bool); line[30, 5:25] = True
+        road = np.zeros((60, 60), dtype=bool)     # nothing to compare against
+        keep, stats = refine_line_mask(line, road, img,
+                                       on_road_dilate_px=0)
+        assert stats["unknown_kept"] == 20
+        assert keep.sum() == 20, "an unverifiable pixel is not 'not a line'"
+
+    def test_the_structural_test_removes_off_road_pixels(self):
+        import numpy as np
+        from beamng_autopilot.vision.seg_probs import refine_line_mask
+        img = np.full((80, 80, 3), 180, dtype=np.uint8)
+        img[10, 5:25] = 240          # a bright stroke on the building
+        line = np.zeros((80, 80), dtype=bool); line[10, 5:25] = True
+        road = np.zeros((80, 80), dtype=bool); road[50:, :] = True
+        keep, stats = refine_line_mask(line, road, img, on_road_dilate_px=4)
+        assert keep.sum() == 0 and stats["off_road"] == 20
+
+    def test_a_shape_mismatch_is_refused(self):
+        import numpy as np
+        import pytest as _pytest
+        from beamng_autopilot.vision.seg_probs import refine_line_mask
+        with _pytest.raises(ValueError):
+            refine_line_mask(np.zeros((10, 10), dtype=bool),
+                             np.zeros((9, 10), dtype=bool),
+                             np.zeros((10, 10, 3), dtype=np.uint8))
