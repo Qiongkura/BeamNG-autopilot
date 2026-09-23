@@ -321,6 +321,62 @@ def default_model_path() -> Path | None:
     return p if p.is_file() else None
 
 
+def gate_line_candidates(markings, line_mask, road_mask,
+                         *, gate_on: bool | None = None):
+    """Provenance + the gate the union's classic-CV arm needs (T08).
+
+    The union ``line | cv_white`` exists to recover paint the model misses,
+    but the classic arm is a brightness/contrast rule: on a light concrete
+    road it fires on kerbs, seams and shadows.  Measured against the
+    ENGINE's own annotation (20 real frames): 40-85% of the union
+    candidates lay off the pavement and none of them on labelled paint.
+
+    A candidate the LEARNED mask supports is kept as is - the mask is the
+    trusted arm, and applying the elongation rule to everything deleted
+    all 100 mask-backed candidates on an urban junction (the paint there
+    is a zebra crossing: wide blocks, aspect < 2.5).  The gate therefore
+    applies to the candidates with NO learned-mask support: those must be
+    elongated AND lie on the published pavement.  Returns
+    ``(kept, dropped_by_reason, gate_on)``.
+    """
+    if gate_on is None:
+        gate_on = os.environ.get("BEAMNG_LINE_CAND_GATE", "1") != "0"
+    line = np.asarray(line_mask, dtype=bool)
+    road = None if road_mask is None else np.asarray(road_mask, dtype=bool)
+    kept: list = []
+    dropped: dict = {}
+    for mk in markings or ():
+        pix = np.asarray(getattr(mk, "pixels", None), dtype=float)
+        if pix.ndim != 2 or len(pix) == 0:
+            dropped["no_pixels"] = dropped.get("no_pixels", 0) + 1
+            continue
+        ui = np.clip(pix[:, 0].astype(int), 0, line.shape[1] - 1)
+        vi = np.clip(pix[:, 1].astype(int), 0, line.shape[0] - 1)
+        learned = float(np.count_nonzero(line[vi, ui])) / len(pix)
+        on_road = (None if road is None else
+                   float(np.count_nonzero(road[vi, ui])) / len(pix))
+        bw = pix.max(axis=0) - pix.min(axis=0)
+        long_side = max(float(bw[0]), float(bw[1]))
+        short_side = max(1.0, min(float(bw[0]), float(bw[1])))
+        aspect = long_side / short_side
+        if getattr(mk, "meta", None) is not None:
+            mk.meta.update({"learned_frac": round(learned, 4),
+                            "on_road_frac": (None if on_road is None
+                                             else round(on_road, 4)),
+                            "aspect": round(aspect, 3)})
+        if not gate_on or learned >= 0.5:
+            kept.append(mk)
+            continue
+        if aspect < 2.5:
+            dropped["blob"] = dropped.get("blob", 0) + 1
+            continue
+        if on_road is not None and on_road < 0.5:
+            dropped["off_pavement"] = dropped.get("off_pavement", 0) + 1
+            continue
+        kept.append(mk)
+    return kept, dropped, bool(gate_on)
+
+
 class Segmenter:
     """UNet segmentation over an RGB frame, with mask post-processing."""
 
@@ -557,7 +613,7 @@ class Segmenter:
                      ground_z: float | None = None, *,
                      line_mask: np.ndarray | None = None,
                      road_mask: np.ndarray | None = None,
-                     rotation=None) -> list:
+                     rotation=None, debug: dict | None = None) -> list:
         """Line mask -> LaneMarking list (reuses the classic pipeline).
 
         The learned line mask is fused with a classic-CV bright-stroke
@@ -604,12 +660,34 @@ class Segmenter:
         ym = yellow_line_mask(frame_rgb)
         cv_yellow = cv_yellow | ym
         cv_white = cv_white & ~ym
+        # Optional appearance refinement of the mask the CANDIDATES are
+        # built from (T11/T08).  Default OFF: measured on dev scenes the
+        # polarity-agnostic outlier test is a clean win on one scene
+        # (precision 0.194 -> 0.243 at unchanged recall) and a 20-point
+        # recall cost on another, and it cannot repair a mask whose recall
+        # is zero - so it is a switch to A/B, not a new default.
+        # BEAMNG_LINE_REFINE=appearance enables it for the candidate path.
+        if os.environ.get("BEAMNG_LINE_REFINE", "off").lower() in (
+                "appearance", "1", "on"):
+            from beamng_autopilot.vision.seg_probs import refine_line_mask
+            line, _ref_stats = refine_line_mask(
+                line, road_mask if road_mask is not None else line, frame_rgb,
+                on_road_dilate_px=0)
+            if debug is not None:
+                debug["line_refine"] = dict(_ref_stats)
         out: list = []
         white_mask = (line | cv_white).astype(np.uint8) * 255
         if white_mask.any():
-            out.extend(_mask_to_markings(
+            _white = _mask_to_markings(
                 white_mask, "white", cam_model, pos, heading,
-                ground_z=ground_z, rotation=rotation))
+                ground_z=ground_z, rotation=rotation)
+            _kept, _dropped, _gate_on = gate_line_candidates(
+                _white, line, road_mask)
+            out.extend(_kept)
+            if debug is not None:
+                debug["line_candidate_gate"] = {"gate": _gate_on,
+                                               "kept": len(_kept),
+                                               "dropped": dict(_dropped)}
             # The shape gates above keep only long strokes, but the town
             # ``line`` class is mostly short blocks (median 17 components
             # per frame, median height 7 px), so a dashed lane line leaves

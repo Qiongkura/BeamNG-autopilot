@@ -264,6 +264,7 @@ class SemanticHead:
                         ctx.frame_rgb, ctx.cam, ctx.pos, ctx.heading,
                         ground_z=ctx.ground_z, line_mask=line,
                         road_mask=road,
+                        debug=out.meta.setdefault("line_candidates", {}),
                         # T05: the real measured attitude, not a level
                         # pose - the marking world geometry is what the
                         # lateral reference is built from

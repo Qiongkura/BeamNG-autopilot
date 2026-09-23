@@ -12,7 +12,7 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -140,6 +140,12 @@ class LaneMarking:
     color: str = "white"   # "white", "yellow" or "unknown"
     kind: str = "unknown"  # "solid", "dashed", "thin" or "unknown"
     confidence: float = 0.0
+    #: Provenance of THIS candidate (T08): which arm's pixels it is made of
+    #: and whether it lies on the published pavement.  Additive and default
+    #: empty so older consumers (and test stubs) keep working; the identity
+    #: probe reads it to tell a learned-mask candidate from a classic-CV
+    #: texture edge, which the engine labels showed are not the same thing.
+    meta: dict = field(default_factory=dict)
 
 
 def _color_masks(frame_rgb):

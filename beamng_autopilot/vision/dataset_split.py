@@ -64,6 +64,10 @@ class FrameRef:
     view: str = ""
     #: True when ``t`` is a frame index because no wall clock was recorded.
     t_is_index: bool = False
+    #: The recording's own file path, when the collector wrote one: the
+    #: strongest duplicate evidence there is (a copied "golden frame" has
+    #: two paths or two identical bytes, not two positions in time).
+    path: str = ""
 
     @property
     def group(self) -> str:
@@ -146,7 +150,8 @@ def frame_refs_from_meta(meta, *, run: str, start_index: int = 0):
             exposure=exposure,
             view=str(rec.get("view") or rec.get("role") or ""),
             line_frac=fraq,
-            hard_neg=float(rec.get("hard_neg") or 0.0)))
+            hard_neg=float(rec.get("hard_neg") or 0.0),
+            path=str(rec.get("path") or rec.get("file") or "")))
     notes: list[str] = []
     if not map_name:
         notes.append(f"{run}: no map_name in the recording; the group is "
@@ -183,7 +188,11 @@ def cross_view_leak(plan, refs=None) -> dict:
 
     Frames of the same exposure are the same instant of the same scene, so
     they must never be split - and a plan that has no exposure information
-    reports ``checked=False`` rather than a clean result.
+    reports ``checked=False`` rather than a clean result.  When the list
+    holds only ONE view the cross-view case cannot arise at all, and the
+    reason says so: it is NOT that the recording lacks exposure counters
+    (measured: a single-view training list was told "no exposure counters"
+    while all 173 refs carried one).
     """
     all_refs = list(refs if refs is not None else
                     (list(plan.train) + list(plan.val)))
@@ -194,10 +203,185 @@ def cross_view_leak(plan, refs=None) -> dict:
         sides = {(id(r) in in_train) for r in members}
         if len(sides) > 1:
             leaked.append(key)
+    with_exposure = sum(1 for r in all_refs if r.exposure is not None)
+    if groups:
+        reason = ""
+    elif with_exposure:
+        reason = ("no exposure carries more than one view in this list, so "
+                  "the cross-view case cannot arise here")
+    else:
+        reason = "no exposure counters in this recording"
     return {"checked": bool(groups), "n_cross_view_groups": len(groups),
             "leaked_groups": leaked,
-            "reason": ("" if groups else
-                       "no exposure counters in this recording")}
+            "n_refs_with_exposure": with_exposure,
+            "reason": reason}
+
+
+def duplicate_groups(refs) -> dict:
+    """Groups of frames that are the SAME SAMPLE recorded more than once.
+
+    The plan's T10 wants duplicate samples reported SEPARATELY from frame
+    and group overlap, because a copied "golden frame" inflates whichever
+    side it lands on while looking like two independent samples.  Evidence
+    is used in order of strength and each group says which one fired:
+
+    * ``same_path`` - the recording names the same file twice.  The path is
+      matched WITHIN one run: collectors write collection-relative paths
+      (``front_main/frame_00000.npz``), so keying on the path alone groups
+      identically-named frames of DIFFERENT collections - measured on a
+      six-collection training list that produced 39 false groups while
+      every frame was unique;
+    * ``same_exposure_view`` - the same grab, same camera, twice;
+    * ``same_wall_clock`` - the same instant in the same view twice.
+
+    Two VIEWS of one exposure are NOT duplicates (that is the cross-view
+    case, reported separately), and a recording without paths, exposures
+    or wall clocks yields an empty mapping - the caller must then report
+    that it could not check, not that it passed.
+    """
+    out: dict[str, dict] = {}
+    seen_path: dict[str, list] = {}
+    seen_exp: dict[tuple, list] = {}
+    seen_t: dict[tuple, list] = {}
+    for r in refs:
+        if r.path:
+            seen_path.setdefault(f"{r.run}|{r.path}", []).append(r)
+        if r.exposure is not None:
+            seen_exp.setdefault((r.group, int(r.exposure), r.view),
+                                []).append(r)
+        if r.t_wall is not None:
+            seen_t.setdefault((r.group, r.view, round(float(r.t_wall), 3)),
+                              []).append(r)
+    # One finding per set of frames, carrying the STRONGEST evidence that
+    # fired for it: a recording that writes paths AND exposures would
+    # otherwise report the same duplicate twice and inflate the count.
+    best: dict[frozenset, tuple] = {}
+
+    def _add(key: str, why: str, rank: int, members: list) -> None:
+        if len(members) <= 1:
+            return
+        ids = frozenset(int(m.index) for m in members)
+        if ids in best and best[ids][0] <= rank:
+            return
+        best[ids] = (rank, key, why, sorted(ids))
+
+    for path, members in sorted(seen_path.items()):
+        _add(f"path:{path}", "same_path", 0, members)
+    for (group, exp, view), members in sorted(seen_exp.items()):
+        _add(f"{group}#e{exp}:{view}", "same_exposure_view", 1, members)
+    for (group, view, t), members in sorted(seen_t.items()):
+        _add(f"{group}@{t}:{view}", "same_wall_clock", 2, members)
+    for _, key, why, ids in best.values():
+        out[key] = {"why": why, "n": len(ids), "indexes": ids}
+    return out
+
+
+def _same_sample_pairs(refs) -> set:
+    """Index pairs that are the same sample (duplicate or same exposure)."""
+    pairs = set()
+    for info in duplicate_groups(refs).values():
+        idx = info["indexes"]
+        for i, a in enumerate(idx):
+            for b in idx[i + 1:]:
+                pairs.add(frozenset((a, b)))
+    for members in cross_view_groups(refs).values():
+        idx = [int(m.index) for m in members]
+        for i, a in enumerate(idx):
+            for b in idx[i + 1:]:
+                pairs.add(frozenset((a, b)))
+    return pairs
+
+
+def temporal_neighbours(refs, *, gap_s: float = 0.5,
+                        exclude_pairs=None) -> list:
+    """Frame PAIRS closer in wall-clock time than ``gap_s``.
+
+    Adjacent segments that a split must not separate: two frames recorded
+    a fraction of a second apart are the same moment of the same drive,
+    so putting one in training and the other in validation leaks content
+    even when their indexes, groups and exposures all differ.  Pairs that
+    are already reported as duplicates or as one exposure seen by several
+    views are EXCLUDED (``exclude_pairs``), so the four statements stay
+    separate.  Only frames with a real wall clock participate.
+    """
+    skip = exclude_pairs or set()
+    timed = [r for r in refs if r.t_wall is not None]
+    timed.sort(key=lambda r: float(r.t_wall))
+    out = []
+    for a, b in zip(timed, timed[1:]):
+        if frozenset((int(a.index), int(b.index))) in skip:
+            continue
+        dt = abs(float(b.t_wall) - float(a.t_wall))
+        if dt <= float(gap_s):
+            out.append({"dt_s": round(dt, 4), "a": int(a.index),
+                        "b": int(b.index),
+                        "groups": sorted({a.group, b.group})})
+    return out
+
+
+def split_audit(plan, refs=None, *, gap_s: float = 0.5) -> dict:
+    """Report every leak kind SEPARATELY, each with whether it could run.
+
+    The plan's T10 lists statements that must not be merged into one "no
+    leak": frame overlap, group overlap, temporal adjacency, duplicated
+    samples, and the cross-view exposure case.  Each section carries
+    ``checked`` plus a reason when it could not run, so a recording
+    without clocks reports "unchecked" rather than "clean".
+    """
+    all_refs = list(refs if refs is not None else
+                    (list(plan.train) + list(plan.val)))
+    train_idx = {int(r.index) for r in plan.train}
+    base = leak_check(plan, all_refs)
+    dup = duplicate_groups(all_refs)
+    dup_cross = [k for k, v in dup.items()
+                 if len({i in train_idx for i in v["indexes"]}) > 1]
+    near = temporal_neighbours(all_refs, gap_s=gap_s,
+                               exclude_pairs=_same_sample_pairs(all_refs))
+    near_cross = [p for p in near
+                  if len({p["a"] in train_idx, p["b"] in train_idx}) > 1]
+    xview = cross_view_leak(plan, all_refs)
+    timed = [r for r in all_refs if r.t_wall is not None]
+    # "checked" must mean "the evidence existed to run this check", NOT
+    # "something was found": collapsing the two made a clean list report
+    # checked=False with the reason "no duplicate evidence available" even
+    # though all 173 refs carried a path, an exposure and a wall clock
+    # (measured on the T13 training list).
+    has_dup_evidence = any(r.path or r.exposure is not None
+                           or r.t_wall is not None for r in all_refs)
+    return {
+        "frame_overlap": {"checked": True,
+                          "n": len(base["leaked_frames"]),
+                          "detail": base["leaked_frames"][:8]},
+        "group_overlap": {"checked": True,
+                          "n": len(base["leaked_groups"]),
+                          "detail": base["leaked_groups"][:8]},
+        "temporal_adjacency": {
+            "checked": bool(timed),
+            "n_pairs": len(near),
+            "n_crossing": len(near_cross),
+            "gap_s": float(gap_s),
+            "detail": near_cross[:6],
+            "reason": ("" if timed else
+                       "no wall clock in this recording: adjacency "
+                       "unchecked")},
+        "duplicates": {"checked": has_dup_evidence,
+                       "n_groups": len(dup),
+                       "n_crossing": len(dup_cross),
+                       "n_evidence": {
+                           "path": sum(1 for r in all_refs if r.path),
+                           "exposure": sum(1 for r in all_refs
+                                           if r.exposure is not None),
+                           "wall_clock": len(timed)},
+                       "detail": dup_cross[:6],
+                       "reason": ("" if has_dup_evidence else
+                                  "no duplicate evidence available "
+                                  "(no path/exposure/wall clock)")},
+        "cross_view_exposure": {"checked": bool(xview["checked"]),
+                                "n_groups": int(xview["n_cross_view_groups"]),
+                                "n_crossing": len(xview["leaked_groups"]),
+                                "detail": xview["leaked_groups"][:6],
+                                "reason": xview["reason"]},
+    }
 
 
 def split_by_group(refs, val_frac: float = 0.2, *,

@@ -204,3 +204,96 @@ def gate_masks(maps: SegProbabilityMaps, *,
     if stats.line_after_road:
         stats.mean_road_context = float(road_ctx[line_mask].mean())
     return road_mask, line_mask, stats
+
+# ---------------------------------------------------------------------------
+# Appearance + structure refinement of the line mask (T11/T08).
+#
+# Measured against the engine's own annotation (20 real frames, urban
+# junction): the line mask's precision was 0.130 at 0.927 recall - 7x over
+# marking - and the false positives were NOT sky (0.1%) but man-made hard
+# surfaces: BUILDINGS 62.8% of the left-half FPs (11.6% of all building
+# pixels called line), ASPHALT 24-54%, SIDEWALK 12-13% (74.5% of sidewalk
+# pixels on one side!).  47-86% of those components are LINE-SHAPED, so a
+# shape gate cannot remove them.  Brightness is INVERTED on that scene: the
+# real paint is darker (153.9) than the FPs (185.0) and than the pavement
+# (186.1), so no fixed-polarity brightness rule works.
+#
+# The two tests here are therefore:
+#   structure - the pixel must lie on (or within a few px of) the published
+#               road surface; buildings, sidewalk and sky are off it;
+#   appearance- the pixel must be an OUTLIER against the LOCAL ROAD
+#               appearance in EITHER direction, so paint darker or brighter
+#               than the pavement both pass, while texture shadows/joints
+#               that match the local road statistics do not.
+# When the local road reference is unavailable the pixel is KEPT and counted
+# as unknown: an unverifiable pixel must not silently become "not a line".
+# ---------------------------------------------------------------------------
+SEG_LINE_ON_ROAD_DILATE_PX = 6
+SEG_LINE_OUTLIER_Z_MIN = 1.2
+SEG_LINE_REF_WINDOW_PX = 31
+SEG_LINE_REF_MIN_ROAD_PX = 40
+SEG_LINE_REF_SCALE_FLOOR = 6.0
+
+
+def refine_line_mask(line, road, frame_rgb, *,
+                     on_road_dilate_px: int = SEG_LINE_ON_ROAD_DILATE_PX,
+                     z_min: float = SEG_LINE_OUTLIER_Z_MIN,
+                     window_px: int = SEG_LINE_REF_WINDOW_PX,
+                     min_ref_px: int = SEG_LINE_REF_MIN_ROAD_PX,
+                     scale_floor: float = SEG_LINE_REF_SCALE_FLOOR):
+    """Refine a line mask with a structure test and a polarity-free outlier.
+
+    Returns ``(refined_mask, stats)``; ``stats`` separates WHY pixels went
+    (off_road / not_outlier), how many could not be judged (unknown_kept),
+    and keeps the input counts so a report can compute both precision and
+    recall without trusting the function's own arithmetic.
+    """
+    import cv2
+
+    line = np.asarray(line, dtype=bool)
+    road = np.asarray(road, dtype=bool)
+    if line.shape != road.shape:
+        raise ValueError("line and road masks must share a shape")
+    rgb = np.asarray(frame_rgb)
+    grey = (rgb[..., :3].astype(np.float32).mean(axis=2) if rgb.ndim == 3
+            else rgb.astype(np.float32))
+    stats = {"in": int(line.sum()), "road_px": int(road.sum())}
+    if stats["in"] == 0:
+        stats.update({"kept": 0, "off_road": 0, "not_outlier": 0,
+                      "unknown_kept": 0})
+        return line.copy(), stats
+    k = max(1, int(on_road_dilate_px))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * k + 1, 2 * k + 1))
+    # A missing road reference is UNKNOWN, not "off the road": with no road
+    # to judge against, deleting line evidence would turn a perception
+    # outage into a confident "no lines" (and the plan's rule is that
+    # unknown must not read as a negative).
+    road_missing = stats["road_px"] < int(min_ref_px)
+    stats["road_reference"] = "missing" if road_missing else "ok"
+    road_near = (np.ones_like(road) if road_missing else
+                 cv2.dilate(road.astype(np.uint8), kernel).astype(bool))
+    struct_ok = line & road_near
+    stats["off_road"] = int((line & ~road_near).sum())
+    if not struct_ok.any():
+        stats.update({"kept": 0, "not_outlier": 0, "unknown_kept": 0})
+        return np.zeros_like(line), stats
+    # LOCAL road appearance: masked box statistics inside the window
+    w = max(3, int(window_px) | 1)
+    road_f = road.astype(np.float32)
+    cnt = cv2.boxFilter(road_f, -1, (w, w), normalize=False)
+    s1 = cv2.boxFilter(grey * road_f, -1, (w, w), normalize=False)
+    s2 = cv2.boxFilter(grey * grey * road_f, -1, (w, w), normalize=False)
+    ref_ok = cnt >= float(min_ref_px)
+    mean = np.where(ref_ok, s1 / np.maximum(cnt, 1.0), 0.0)
+    var = np.where(ref_ok, np.maximum(s2 / np.maximum(cnt, 1.0) - mean * mean,
+                                      0.0), 0.0)
+    scale = np.maximum(np.sqrt(var), float(scale_floor))
+    z = np.abs(grey - mean) / scale
+    outlier_ok = (z >= float(z_min)) | ~ref_ok
+    keep = struct_ok & outlier_ok
+    stats["unknown_kept"] = int((struct_ok & ~ref_ok).sum())
+    stats["not_outlier"] = int((struct_ok & ref_ok & ~outlier_ok).sum())
+    stats["kept"] = int(keep.sum())
+    stats["z_p50_kept"] = (None if stats["kept"] == 0 else
+                           round(float(np.median(z[keep])), 3))
+    return keep, stats
