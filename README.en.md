@@ -120,33 +120,33 @@ GPU with 6GB VRAM or higher (required for YOLO detection + HUD visualization)
 
 1. **Install BeamNG.drive**：Install version 0.39+ via Steam。
 2. **Create Virtual Environment**：
-   ```powershell
+   ```pwsh
    python -m venv --system-site-packages .venv
    .venv\Scripts\python.exe -m pip install -r requirements.txt
    ```
 3. **Environment Self-check** (recommended before first use)：
-   ```powershell
+   ```pwsh
    .venv\Scripts\python.exe scripts\m5_env_check.py
    ```
 4. **Start Game** (or via console)：
-   ```powershell
+   ```pwsh
    .venv\Scripts\python.exe scripts\launch_game.py --runtime steam
    ```
 5. **Run Autopilot Assistant**：
-   ```powershell
+   ```pwsh
    # Attach to running game
    .venv\Scripts\python.exe scripts\m5_autopilot.py --attach
    # Or auto-start game and load map
    .venv\Scripts\python.exe scripts\m5_autopilot.py
    ```
 6. **Use GUI Console**：Double-click `启动自动驾驶.vbs` (Start Autopilot.vbs) in project root or manually run：
-   ```powershell
+   ```pwsh
    .venv\Scripts\python.exe scripts\m5_launcher.py
    ```
 
 ## Usage Example
 
-```powershell
+```pwsh
 # Smoke test: connect to game and drive straight for 3 seconds
 .venv\Scripts\python.exe scripts\m1_smoke_test.py
 
