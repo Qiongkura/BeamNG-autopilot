@@ -1007,3 +1007,98 @@ class TestRoadnetPolylineTangent:
         tool = self._tool()
         assert tool.roadnet_tangent_rad(None, np.zeros(3), 0.0) == (None, None,
                                                                     None)
+
+
+class TestCandidateReviewOverlay:
+    """候选复核图（方案："错误候选可回查原始帧、候选像素"）。
+
+    复核图只影响"看得到什么"，不得改变测量：``--overlay-limit`` 限制写几张图，
+    帧集仍由 ``--limit`` 决定。颜色编码必须能区分命中/未命中，且引擎漆线不能
+    把候选盖掉。
+    """
+
+    def _tool(self):
+        return _load("_m5_marking_identity_probe",
+                     "scripts/m5_marking_identity_probe.py")
+
+    def test_overlay_colours_matched_green_unmatched_red_and_engine_blue(self):
+        import numpy as np
+        tool = self._tool()
+        colour = np.full((10, 12, 3), 30, np.uint8)
+        label = np.zeros((10, 12), np.uint8)
+        label[2, 0:4] = 2                     # 引擎漆线（蓝）
+        m_hit = np.zeros((10, 12), bool)
+        m_hit[5, 5] = True
+        m_miss = np.zeros((10, 12), bool)
+        m_miss[7, 7] = True
+        cands = [{"matched": True, "lat_m": 0.1}, {"matched": False, "lat_m": 3.0}]
+        ov = tool.overlay_image(colour, label, cands, [m_hit, m_miss])
+        assert ov.shape == colour.shape
+        # 候选像素一定可见（红/绿分量主导），引擎线偏蓝
+        assert ov[7, 7][0] > ov[7, 7][2], "未命中候选应为红"
+        assert ov[5, 5][1] > ov[5, 5][0], "命中候选应为绿"
+        assert ov[2, 1][2] > ov[2, 1][0], "引擎漆线应为蓝"
+        assert tuple(ov[0, 0]) == tuple(colour[0, 0]), "未标注区域不得被涂改"
+
+    def test_caption_reports_counts_and_unmatched_lateral_distances(self):
+        import numpy as np
+        tool = self._tool()
+        label = np.zeros((4, 4), np.uint8)
+        label[0, 0] = 2
+        cands = [{"matched": True, "lat_m": 0.5},
+                 {"matched": False, "lat_m": -3.25}]
+        cap = tool.caption_for("frame_00003.npz", 3, cands, label)
+        assert "frame_00003.npz" in cap and "matched=1" in cap
+        assert "engine_px=1" in cap and "-3.25" in cap
+
+    def test_overlay_writes_a_png_and_does_not_touch_the_measurement(self,
+                                                                    tmp_path):
+        import numpy as np
+        tool = self._tool()
+        img = np.zeros((8, 8, 3), np.uint8)
+        fp = tool.write_overlay(tmp_path / "sub" / "review_000.png", img,
+                                "cap one | cap two")
+        assert fp.exists() and fp.stat().st_size > 0
+
+    def test_overlay_limit_is_a_write_cap_not_a_frame_cap(self):
+        import inspect
+        tool = self._tool()
+        sig = inspect.signature(tool.probe)
+        assert "overlay_limit" in sig.parameters and "limit" in sig.parameters
+        src = inspect.getsource(tool.probe)
+        assert "fs[:int(limit)]" in src, "帧集只受 limit 影响"
+        assert "n_overlays < int(overlay_limit)" in src, "写图数量单独限制"
+        opts = inspect.getsource(tool.main)
+        assert "--overlay-out" in opts and "--overlay-limit" in opts
+
+    def test_match_rate_with_reference_reports_its_denominator(self):
+        """按侧判定：该侧没有参考的候选进"未测"，不进匹配率的分母。"""
+        tool = self._tool()
+        rows = [
+            {"frame": 0, "engine_px_left": 0, "engine_px_right": 3000,
+             "candidates": [
+                 {"lat_m": -1.0, "matched": True},      # 右侧有参考 -> 计入
+                 {"lat_m": -2.0, "matched": False},     # 右侧有参考 -> 计入
+                 {"lat_m": +2.0, "matched": False}]},   # 左侧零参考 -> 未测
+            {"frame": 1, "engine_px_left": 800, "engine_px_right": 0,
+             "candidates": [{"lat_m": +1.0, "matched": True}]},
+        ]
+        r = tool.match_rate_with_reference(rows)
+        assert r["n_candidates"] == 4
+        assert r["n_candidates_with_reference"] == 3
+        assert r["n_candidates_no_reference"] == 1
+        assert r["match_rate_with_reference"] == pytest.approx(2 / 3, abs=1e-4)
+        # 逐候选能回查：所在侧与参考像素数
+        side, ref, ok = tool.candidate_side_reference(rows[0], +2.0)
+        assert side == "left" and ref == 0 and ok is False
+        side2, ref2, ok2 = tool.candidate_side_reference(rows[1], +1.0)
+        assert side2 == "left" and ref2 == 800 and ok2 is True
+
+    def test_the_reference_minimum_is_an_explicit_number(self):
+        tool = self._tool()
+        assert tool.MIN_REF_PX >= 1
+        rows = [{"engine_px_left": 40, "engine_px_right": 0,
+                 "candidates": [{"lat_m": +1.0, "matched": False}]}]
+        assert tool.match_rate_with_reference(rows)["n_candidates_no_reference"] == 1
+        assert tool.match_rate_with_reference(
+            rows, min_px=10)["n_candidates_with_reference"] == 1

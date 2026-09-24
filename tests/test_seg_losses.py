@@ -92,3 +92,70 @@ def test_linesegloss_zero_weights_equal_ce():
     crit = LineSegLoss(w_tversky=0.0, w_cldice=0.0)
     ce = torch.nn.functional.cross_entropy(logits, target)
     assert float(crit(logits, target)) == pytest.approx(float(ce))
+
+
+def test_a_masked_class_gets_exactly_zero_gradient():
+    """被屏蔽的类必须**既不收正样本也不收负样本**：line 列梯度恒为 0。
+
+    这是"整条通道忽略"的判据。只把类别权重置零做不到这一点——未标注像素仍
+    在 softmax 分母里当负样本（等于教"未标注的可见漆线=背景"）。
+    """
+    import torch
+
+    from beamng_autopilot.vision.seg_losses import (LINE_CLASS,
+                                                    masked_cross_entropy)
+    torch.manual_seed(0)
+    logits = torch.randn(2, 3, 6, 6, requires_grad=True)
+    target = torch.randint(0, 2, (2, 6, 6))          # 只有背景/路面
+    mask = torch.tensor([True, True, False])         # 屏蔽 line
+    loss = masked_cross_entropy(logits, target, mask)
+    loss.backward()
+    assert torch.count_nonzero(logits.grad[:, LINE_CLASS]) == 0, \
+        "line 通道拿到了梯度，说明它仍在分母里当负样本"
+    assert torch.count_nonzero(logits.grad[:, :2]) > 0, "其它类要正常学习"
+
+    # 逐样本掩码：第 1 个样本屏蔽 line、第 0 个不屏蔽
+    logits2 = torch.randn(2, 3, 6, 6, requires_grad=True)
+    per_sample = torch.tensor([[True, True, True], [True, True, False]])
+    masked_cross_entropy(logits2, target, per_sample).backward()
+    assert torch.count_nonzero(logits2.grad[1, LINE_CLASS]) == 0
+    assert torch.count_nonzero(logits2.grad[0, LINE_CLASS]) > 0
+
+
+def test_a_blocked_class_may_not_appear_as_a_target():
+    """自相矛盾的标签（屏蔽了 line 却又有 line 目标）要报错，不能算成 inf。"""
+    import pytest as _pytest
+    import torch
+
+    from beamng_autopilot.vision.seg_losses import masked_cross_entropy
+    logits = torch.randn(1, 3, 4, 4)
+    target = torch.zeros(1, 4, 4, dtype=torch.long)
+    target[0, 1, 1] = 2
+    with _pytest.raises(ValueError, match="被屏蔽的类出现在目标里"):
+        masked_cross_entropy(logits, target, torch.tensor([True, True, False]))
+
+
+def test_masking_the_line_channel_drops_the_region_terms():
+    """整通道屏蔽时不计算 line 区域项（Tversky/clDice 拿不到线目标）。"""
+    import pytest as _pytest
+    import torch
+
+    from beamng_autopilot.vision.seg_losses import (LineSegLoss,
+                                                    masked_cross_entropy)
+    torch.manual_seed(1)
+    logits = torch.randn(2, 3, 8, 8)
+    target = torch.randint(0, 2, (2, 8, 8))
+    mask = torch.tensor([True, True, False])
+    crit = LineSegLoss(w_tversky=1.0, w_cldice=1.0)
+    masked = crit(logits, target, class_mask=mask)
+    ce_only = masked_cross_entropy(logits, target, mask)
+    assert float(masked) == pytest.approx(float(ce_only), rel=1e-6), \
+        "区域项不该在整通道屏蔽时混进来"
+
+    # 混批（部分样本可信 line）+ 开着的区域项 = 调用方该拆批，直接报错
+    mixed = torch.tensor([[True, True, True], [True, True, False]])
+    with _pytest.raises(ValueError, match="请拆批"):
+        crit(logits, target, class_mask=mixed)
+    # 关掉区域项后，混批是可算的
+    assert float(LineSegLoss(w_tversky=0.0, w_cldice=0.0)(
+        logits, target, class_mask=mixed)) > 0.0

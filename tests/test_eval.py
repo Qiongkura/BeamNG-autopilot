@@ -226,3 +226,17 @@ def test_assess_run_reports_the_collision_fields() -> None:
     out2 = assess_run([{"t": 0.0, "speed": 2.0, "pos": [0.0, 0.0]}],
                       settle_s=0.0)
     assert out2["collision_count"] is None
+
+
+def test_worst_frames_ranks_measured_frames_and_skips_none():
+    """判定要能"点进具体帧"：逐帧排序时，没有分母的帧不进榜（那是"没得比"）。"""
+    from scripts.m5_seg_eval_matrix import worst_frames
+    per = [{"frame": "a.npz", "iou": 0.9, "gt_px": 10},
+           {"frame": "b.npz", "iou": 0.1, "gt_px": 20},
+           {"frame": "c.npz", "iou": None, "gt_px": 0},
+           {"frame": "d.npz", "iou": 0.5, "gt_px": 30}]
+    r = worst_frames(per, k=2)
+    assert r["n"] == 3 and r["n_no_denominator"] == 1
+    assert [x["frame"] for x in r["worst"]] == ["b.npz", "d.npz"]
+    assert [x["frame"] for x in r["best"]] == ["a.npz", "d.npz"]
+    assert r["worst"][0]["gt_px"] == 20

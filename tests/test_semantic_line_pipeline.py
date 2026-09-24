@@ -509,3 +509,66 @@ class TestLineMaskRefine:
             refine_line_mask(np.zeros((10, 10), dtype=bool),
                              np.zeros((9, 10), dtype=bool),
                              np.zeros((10, 10, 3), dtype=np.uint8))
+
+
+class TestOptionalSurfaceGate:
+    """可选收紧：连 learned-backed 候选也要求落在**模型自己的路面掩码**上。
+
+    默认**关闭**（`BEAMNG_LINE_CAND_SURFACE_GATE`）。注意判据**不能**写成
+    "路面 ∪ 线掩码"：``learned`` 的定义就是"像素在 line 掩码里的占比"，所以那个
+    并集对 learned-backed 候选恒真、等于没写（这版被本测试当场抓住）。可用的
+    运行期判据是"是否落在模型的路面区域内"。
+    """
+
+    def _mk(self, pixels, learned=1.0):
+        from beamng_autopilot.vision.lanes import LaneMarking
+
+        class _M(LaneMarking):
+            def __init__(self):
+                super().__init__(world=np.zeros((len(pixels), 3)), pixels=np.asarray(pixels),
+                                 color="white", kind="thin", confidence=0.9, meta={})
+        return _M()
+
+    def _masks(self, shape=(20, 40)):
+        """线掩码在路面之外（模拟"模型画到了自己路面区域之外"）。"""
+        import numpy as np
+        line = np.zeros(shape, bool)
+        line[2, 2:8] = True                 # 漆线在上方：既在 line 内、又在 road 外
+        road = np.zeros(shape, bool)
+        road[10:20, :] = True               # 路面在下半
+        return line, road
+
+    def test_off_by_default_keeps_learned_candidates_off_surface(self):
+        from beamng_autopilot.vision.segmentation import gate_line_candidates
+        line, road = self._masks()
+        mk = self._mk([[3, 2], [4, 2], [5, 2]])    # 在 line 掩码内（learned=1）
+        kept, dropped, _ = gate_line_candidates([mk], line, road)
+        assert len(kept) == 1 and not dropped, "默认行为不得改变"
+        assert mk.meta["learned_frac"] == 1.0, "该候选确实是 learned-backed"
+
+    def test_enabled_drops_learned_candidates_off_the_road_region(self):
+        from beamng_autopilot.vision.segmentation import gate_line_candidates
+        line, road = self._masks()
+        # 两个都 learned-backed：一个落在模型路面区域外，一个落在区域内
+        off = self._mk([[3, 2], [4, 2], [5, 2]])
+        inside = self._mk([[3, 12], [4, 12], [5, 12]])
+        line[12, 2:6] = True                  # 让 inside 也 learned-backed
+        kept, dropped, _ = gate_line_candidates([off, inside], line, road,
+                                               surface_gate=True)
+        ids = [id(m) for m in kept]
+        assert id(off) not in ids, "模型路面区域外的 learned 候选应被丢"
+        assert id(inside) in ids, "路面区域内的必须保留"
+        assert dropped.get("learned_off_road") == 1
+        # 注意：surface_frac（线∪路面）对 learned 候选恒为 1——它只是在 line 掩码里。
+        # 这正是"并集判据"对 learned 候选无效的原因，有区分度的是 on_road_frac。
+        assert off.meta["on_road_frac"] == 0.0 and off.meta["surface_frac"] == 1.0
+        assert inside.meta["on_road_frac"] == 1.0
+
+    def test_a_missing_road_mask_is_unknown_not_a_drop(self):
+        from beamng_autopilot.vision.segmentation import gate_line_candidates
+        line, _road = self._masks()
+        mk = self._mk([[5, 2], [6, 2]])
+        kept, dropped, _ = gate_line_candidates([mk], line, None,
+                                                surface_gate=True)
+        assert len(kept) == 1 and not dropped, "路面未知时不得据此丢弃"
+        assert mk.meta["surface_frac"] is None

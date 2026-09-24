@@ -145,3 +145,213 @@ def test_segmenter_exposes_the_loaded_checkpoint(tmp_path) -> None:
                ckpt)
     seg = Segmenter(model_path=ckpt, device="cpu", use_half=False)
     assert seg.model_path == ckpt
+
+
+class TestEvalMatrixMath:
+    """像素层指标的数学是纯函数：先把它钉死，模型加载不在单测范围里。"""
+
+    def _tool(self):
+        import importlib.util
+        import sys
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location(
+            "m5_seg_eval_matrix", root / "scripts" / "m5_seg_eval_matrix.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["m5_seg_eval_matrix"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_line_metrics_count_offroad_and_missed_separately(self):
+        import numpy as np
+        tool = self._tool()
+        label = np.zeros((4, 4), np.uint8)
+        label[0, :] = 1                      # 路面
+        label[1, 0] = 2                      # 真值标线
+        label[2, 0] = 2                      # 真值标线（会漏）
+        pred = np.zeros((4, 4), bool)
+        pred[1, 0] = True                    # 命中
+        pred[3, :2] = True                   # 画在背景上（路外假线）
+        m = tool.line_pixel_metrics(pred, label)
+        assert m["tp_px"] == 1 and m["fn_px"] == 1
+        assert m["missed_true_line_px"] == 1
+        assert m["offroad_false_line_px"] == 2
+        assert m["pred_line_px"] == 3
+
+    def test_ignore_pixels_never_count_as_errors(self):
+        import numpy as np
+        tool = self._tool()
+        label = np.full((3, 3), 255, np.uint8)     # 整帧 unknown
+        pred = np.ones((3, 3), bool)
+        m = tool.line_pixel_metrics(pred, label)
+        assert m["fp_px"] == 0 and m["fn_px"] == 0 and m["known_px"] == 0
+
+    def test_totals_report_none_instead_of_zero_without_denominator(self):
+        tool = self._tool()
+        acc = {"tp_px": 0, "fp_px": 0, "fn_px": 0, "pred_line_px": 0,
+               "gt_line_px": 0, "known_px": 100}
+        out = tool.totals_to_metrics(acc, n_frames=1, ms=[3.0])
+        assert out["line_precision"] is None and out["line_recall"] is None
+        assert "no predicted line pixels" in out["line_precision_missing"]
+        assert out["inference_ms_p50"] == 3.0
+
+    def test_totals_are_global_not_average_of_frames(self):
+        tool = self._tool()
+        acc = {}
+        tool.accumulate(acc, {"tp_px": 9, "fp_px": 1, "fn_px": 0,
+                              "pred_line_px": 10, "gt_line_px": 9,
+                              "known_px": 100})
+        tool.accumulate(acc, {"tp_px": 1, "fp_px": 9, "fn_px": 0,
+                              "pred_line_px": 10, "gt_line_px": 1,
+                              "known_px": 100})
+        out = tool.totals_to_metrics(acc, n_frames=2, ms=[1.0, 2.0])
+        assert out["line_precision"] == 0.5, "全局累加 = 10/20，不是逐帧平均"
+        assert out["inference_ms_p95"] >= 1.0
+
+    def test_model_argument_accepts_name_equals_path(self):
+        from pathlib import Path
+        tool = self._tool()
+        name, path = tool.parse_model_arg("armA=logs/x/best.pt")
+        assert name == "armA" and Path(path).name == "best.pt"
+        name, path = tool.parse_model_arg("logs/y/best.pt")
+        assert name == "best"
+        assert Path(path).name == "best.pt" and Path(path).parent.name == "y"
+
+
+class TestCheckpointDiff:
+    """T14 阶段 B：逐位比较两个 checkpoint（续训 ≈ 未中断 的验收工具）。"""
+
+    def _tool(self):
+        import importlib.util
+        import sys
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location(
+            "m5_seg_checkpoint_diff",
+            root / "scripts" / "m5_seg_checkpoint_diff.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["m5_seg_checkpoint_diff"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _save(self, path, value, *, dataset_id="ds1", next_epoch=4):
+        import torch
+        torch.save({"state_dict": {"w": torch.full((3,), float(value))},
+                    "optimizer": {}, "scheduler": {}, "next_epoch": next_epoch,
+                    "dataset_id": dataset_id}, path)
+        return path
+
+    def test_identical_checkpoints_are_equal_and_differences_are_located(
+            self, tmp_path):
+        tool = self._tool()
+        a = self._save(tmp_path / "a.pt", 1.0)
+        b = self._save(tmp_path / "b.pt", 1.0)
+        rep = tool.compare(a, b)
+        assert rep["equal"] is True and rep["weights"]["n_diff"] == 0
+        assert rep["a_dataset_id"] == rep["b_dataset_id"] == "ds1"
+        c = self._save(tmp_path / "c.pt", 1.5)
+        rep2 = tool.compare(a, c)
+        assert rep2["equal"] is False and rep2["weights"]["n_diff"] == 1
+        assert rep2["weights"]["max_key"] == "w"
+
+    def test_missing_resume_fields_are_reported_not_assumed(
+            self, tmp_path):
+        import torch
+        tool = self._tool()
+        legacy = tmp_path / "legacy.pt"
+        torch.save({"state_dict": {"w": torch.zeros(2)}, "optimizer": {},
+                    "scheduler": {}, "next_epoch": 2}, legacy)
+        rep = tool.compare(legacy, self._save(tmp_path / "b.pt", 0.0))
+        assert "torch_rng" in rep["a_missing_extras"]
+        assert "dataset_id" in rep["a_missing_extras"]
+
+
+class TestResumeTolerance:
+    """GPU 续训容差的统计是纯函数，先把它钉死，再谈实测数字。"""
+
+    def _tool(self):
+        import importlib.util
+        import sys
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location(
+            "m5_seg_resume_tolerance",
+            root / "scripts" / "m5_seg_resume_tolerance.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["m5_seg_resume_tolerance"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_summary_reports_the_distribution_and_the_ratio(self):
+        tool = self._tool()
+        pairs = {
+            "control": [{"max_abs_diff": 0.039, "n_diff": 92, "n_compared": 106,
+                         "max_rel_diff": 0.0033},
+                        {"max_abs_diff": 0.0014, "n_diff": 92,
+                         "n_compared": 106, "max_rel_diff": 0.0001}],
+            "resume": [{"max_abs_diff": 0.034, "n_diff": 92, "n_compared": 106,
+                        "max_rel_diff": 0.0029},
+                       {"max_abs_diff": 0.016, "n_diff": 92, "n_compared": 106,
+                        "max_rel_diff": 0.0014}],
+        }
+        s = tool.summarize(pairs)
+        assert s["control"]["max_abs_diff_max"] == 0.039
+        assert s["control"]["max_abs_diff_median"] == (0.039 + 0.0014) / 2
+        assert s["resume"]["max_abs_diff_max"] == 0.034
+        assert s["tolerance"]["ratio"] == pytest.approx(0.034 / 0.039, rel=1e-6)
+        assert s["control"]["n_diff_frac_max"] == pytest.approx(92 / 106)
+
+    def test_an_unmeasured_group_is_missing_not_zero(self):
+        tool = self._tool()
+        s = tool.summarize({"control": [], "resume": []})
+        assert s["control"]["n"] == 0 and "missing" in s["control"]
+        assert "tolerance" not in s, "没有两组数据就不能给比值"
+
+
+class TestThresholdProtocol:
+    """冻结阈值：哈希对不上就是被改过；续训容差要有判据方法。"""
+
+    def test_the_newest_version_wins_and_tampering_is_refused(self, tmp_path):
+        import importlib.util
+        import json as _json
+        import sys
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location(
+            "m5_seg_autoloop_t", root / "scripts" / "m5_seg_autoloop.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["m5_seg_autoloop_t"] = mod
+        spec.loader.exec_module(mod)
+        from beamng_autopilot.experiments.gates import Thresholds
+
+        # 新版本号优先
+        (tmp_path / "t14_thresholds.json").write_text("{}", encoding="utf-8")
+        v2 = tmp_path / "t14_thresholds_v2.json"
+        t = Thresholds()
+        v2.write_text(_json.dumps({
+            "thresholds": {**{k: v for k, v in
+                              __import__("dataclasses").asdict(t).items()}},
+            "config_hash": t.config_hash}), encoding="utf-8")
+        mod.THRESHOLDS_DIR = tmp_path
+        assert mod.newest_thresholds_file().name == "t14_thresholds_v2.json"
+        assert mod.thresholds().config_hash == t.config_hash
+
+        # 手改一个阈值 -> 哈希不符 -> 拒绝
+        blob = _json.loads(v2.read_text(encoding="utf-8"))
+        blob["thresholds"]["line_recall_min"] = 0.1
+        bad = tmp_path / "t14_thresholds_v3.json"
+        bad.write_text(_json.dumps(blob), encoding="utf-8")
+        with pytest.raises(ValueError) as err:
+            mod.thresholds(bad)
+        assert "改过" in str(err.value)
+
+    def test_the_resume_tolerance_has_a_verdict_helper(self):
+        from beamng_autopilot.experiments.gates import Thresholds
+        t = Thresholds()
+        assert t.resume_max_rel_diff >= t.resume_control_max_rel_diff, \
+            "容差必须不小于实测噪声，否则判据自相矛盾"
+        ok = t.resume_within_tolerance(t.resume_control_max_rel_diff)
+        assert ok["within_tolerance"] is True
+        assert "measured" in ok["basis"]
+        assert t.resume_within_tolerance(t.resume_max_rel_diff * 5)[
+            "within_tolerance"] is False
