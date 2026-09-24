@@ -7,7 +7,10 @@ from pathlib import Path
 # 项目内部目录
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DATA_DIR = PROJECT_ROOT / "data"
-LOGS_DIR = PROJECT_ROOT / "logs"
+# 运行产物目录。默认在仓库内；BEAMNG_LOGS_DIR 可重定向（测试、CI 与
+# 沙箱用），这样测试不会往真实 logs/ 里写东西。
+LOGS_DIR = Path(os.environ.get("BEAMNG_LOGS_DIR")
+                or (PROJECT_ROOT / "logs")).resolve()
 
 # BeamNG.drive 安装目录与用户目录。
 #
