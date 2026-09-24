@@ -271,6 +271,46 @@ def candidate_label_breakdown(pixels, label) -> dict:
             "off_road_frac": round(float((vals == 0).mean()), 4)}
 
 
+#: 一"侧"至少要有这么多引擎线像素，才算这一侧存在参考。低于它的时候，
+#: 候选"没配上"只说明**没得比**，不说明候选是错的（实测：三条开发路的引擎
+#: line 类≈中央线+右边缘，左边缘漆线常常一个像素都没有）。
+MIN_REF_PX = 50
+
+
+def candidate_side_reference(row: dict, lat_m: float,
+                            *, min_px: int = MIN_REF_PX) -> tuple:
+    """``(side, ref_px, available)``：候选所在侧的引擎参考像素与是否可用。"""
+    side = "left" if float(lat_m) > 0 else "right"
+    ref = int(row.get(f"engine_px_{side}") or 0)
+    return side, ref, ref >= int(min_px)
+
+
+def match_rate_with_reference(rows: list, *, min_px: int = MIN_REF_PX) -> dict:
+    """只在"候选所在侧有参考"的候选上算匹配率，并把覆盖一起报出来。
+
+    为什么另起一个数而不是改 ``match_rate``：旧数已被多处引用，直接改会让
+    历史结论不可比；但旧数的分母里混着"该侧没有参考"的候选（实测 38%），
+    把它当"未确认/假线"是错的口径。所以两个数并排给，分母都写清楚。
+    """
+    n_ref = n_noref = n_match_ref = 0
+    for r in rows:
+        for c in (r.get("candidates") or []):
+            _side, _px, ok = candidate_side_reference(r, c.get("lat_m") or 0.0,
+                                                      min_px=min_px)
+            if not ok:
+                n_noref += 1
+                continue
+            n_ref += 1
+            if c.get("matched"):
+                n_match_ref += 1
+    return {"n_candidates": n_ref + n_noref,
+            "n_candidates_with_reference": n_ref,
+            "n_candidates_no_reference": n_noref,
+            "min_ref_px": int(min_px),
+            "match_rate_with_reference": (None if not n_ref
+                                          else round(n_match_ref / n_ref, 4))}
+
+
 def match_candidate(cand_lat: float, engine: list, *,
                     tol_m: float = MATCH_M):
     """The engine line a candidate would be the SAME marking as."""
@@ -282,9 +322,80 @@ def match_candidate(cand_lat: float, engine: list, *,
     return None if best is None else best[1]
 
 
+def overlay_image(colour, label, cands, cand_masks) -> np.ndarray:
+    """复核图：原图 + 引擎漆线（蓝）+ 候选（命中=绿 / 未命中=红）。
+
+    方案要求"错误候选可回查原始帧、候选像素"。先画引擎线再画候选，保证候选
+    像素一定可见（两者重叠时以候选色为准，但底下的蓝仍然露在边缘）。
+    """
+    ov = np.array(colour, dtype=np.uint8, copy=True)
+    eng = np.asarray(label) == CLS_LINE
+    if eng.any():
+        ov[eng] = (0.35 * ov[eng] + 0.65 * np.array((40, 110, 255))
+                   ).astype(np.uint8)
+    for c, m in zip(cands, cand_masks):
+        if m is None or not np.any(m):
+            continue
+        col = np.array((0, 220, 0) if c.get("matched") else (255, 45, 45))
+        ov[m] = (0.30 * ov[m] + 0.70 * col).astype(np.uint8)
+    return ov
+
+
+def crop_window(mask, shape, *, half_w: int = 96, half_h: int = 72):
+    """围绕候选像素质心的裁剪窗口 ``(y0, y1, x0, x1)``，边界处自动收窄。"""
+    ys, xs = np.nonzero(np.asarray(mask))
+    if len(xs) == 0:
+        return None
+    cy, cx = int(np.median(ys)), int(np.median(xs))
+    h, w = int(shape[0]), int(shape[1])
+    y0, y1 = max(0, cy - half_h), min(h, cy + half_h)
+    x0, x1 = max(0, cx - half_w), min(w, cx + half_w)
+    return (y0, y1, x0, x1)
+
+
+def review_crop(image, mask, *, zoom: int = 2) -> np.ndarray:
+    """把候选附近放大，便于判"这是不是真漆线"（整帧缩略图上判不出来）。"""
+    import cv2
+    win = crop_window(mask, image.shape)
+    if win is None:
+        return image
+    y0, y1, x0, x1 = win
+    sub = image[y0:y1, x0:x1]
+    return cv2.resize(sub, (sub.shape[1] * zoom, sub.shape[0] * zoom),
+                      interpolation=cv2.INTER_NEAREST)
+
+
+def caption_for(frame_name: str, idx: int, cands, label) -> str:
+    """复核图的题注：帧名、候选数、命中数、引擎漆线像素数、未命中候选的横向距。"""
+    n_match = sum(1 for c in cands if c.get("matched"))
+    n_eng = int((np.asarray(label) == CLS_LINE).sum())
+    lats = ", ".join(f"{c['lat_m']:+.2f}" for c in cands
+                     if not c.get("matched"))[:60]
+    return (f"{frame_name} i={idx} cand={len(cands)} matched={n_match} "
+            f"engine_px={n_eng} unmatched_lat_m=[{lats}]")
+
+
+def write_overlay(path: Path, image, caption: str) -> Path:
+    """把复核图写盘（题注画在最上面，黑描边保证任何底色都读得出）。"""
+    import cv2
+    out = image.copy()
+    for i, line in enumerate(caption.split(" | ")):
+        y = 16 + i * 16
+        cv2.putText(out, line, (6, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (0, 0, 0), 3)
+        cv2.putText(out, line, (6, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
+                    (255, 255, 255), 1)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), cv2.cvtColor(out, cv2.COLOR_RGB2BGR))
+    return path
+
+
 def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
           limit: int | None = None, model_path: str | None = None,
-          null_shift_m: float | None = None) -> dict:
+          null_shift_m: float | None = None,
+          overlay_dir: Path | None = None,
+          overlay_limit: int | None = None,
+          crop_limit: int | None = None) -> dict:
     fs = sorted(run_dir.glob("frame_*.npz"))
     if not fs:
         return {"reason": f"no frame_*.npz in {run_dir}"}
@@ -300,6 +411,8 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
     else:
         net.add(SemanticHead())
     rows = []
+    n_overlays = 0
+    n_crops = 0
     for i, f in enumerate(fs):
         z = np.load(f)
         colour = np.asarray(z["colour"])
@@ -321,6 +434,7 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
         if cam is not None:
             eng_lines = engine_lines(label == CLS_LINE, cam)
             cands = []
+            cand_masks: list = []
             cand_px = np.zeros(label.shape, dtype=bool)
             for mk in ((out.meta.get("markings") if out is not None else None)
                        or []):
@@ -335,6 +449,9 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
                 gp = project_pixels(px[:, 0], px[:, 1], cam, stride=2)
                 if len(gp) == 0:
                     continue
+                m = np.zeros(label.shape, dtype=bool)
+                m[_vi, _ui] = True
+                cand_masks.append(m)
                 lat = float(np.median(gp[:, 1]))
                 prov = dict(getattr(mk, "meta", None) or {})
                 cands.append({"kind": mk.kind, "colour": mk.color,
@@ -357,6 +474,10 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
                 c["engine_lat_m"] = None if ln is None else ln["lat_m"]
                 c["engine_role"] = None if ln is None else ln["role"]
                 c["matched"] = ln is not None
+                _side, _ref, _ok = candidate_side_reference(stats, c["lat_m"])
+                c["side"] = _side
+                c["side_ref_px"] = _ref
+                c["reference_available"] = bool(_ok)
                 if ln is not None:
                     matched += 1
                     if ln["role"] == c["role"]:
@@ -401,6 +522,30 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
                 1 for c in cands
                 if (c.get("on_line_frac") or 0.0) < 0.5
                 and (c.get("on_road_frac") or 0.0) < 0.5)
+            # 复核图只影响"看得到什么"，不影响测量范围：帧集由 --limit 决定，
+            # overlay_limit / crop_limit 只限制写多少张
+            if overlay_dir is not None and (overlay_limit is None
+                                            or n_overlays < int(overlay_limit)):
+                base = overlay_image(colour, label, cands, cand_masks)
+                write_overlay(Path(overlay_dir) / f"review_{i:03d}.png", base,
+                              caption_for(f.name, i, cands, label))
+                n_overlays += 1
+                if crop_limit:
+                    k = 0
+                    for c, m in zip(cands, cand_masks):
+                        if c.get("matched") or k >= int(crop_limit):
+                            continue
+                        cap = (f"{f.name} i={i} lat={c['lat_m']:+.2f}m "
+                               f"on_line={(c.get('on_line_frac') or 0):.2f} "
+                               f"on_road={(c.get('on_road_frac') or 0):.2f} "
+                               f"off={(c.get('off_road_frac') or 0):.2f} "
+                               f"kind={c.get('kind')} "
+                               f"learned={(c.get('learned_frac') or 0):.2f}")
+                        write_overlay(
+                            Path(overlay_dir) / f"crop_{i:03d}_{k}.png",
+                            review_crop(base, m), cap)
+                        k += 1
+                        n_crops += 1
         rows.append(stats)
     def p50(key):
         vals = [r[key] for r in rows
@@ -442,6 +587,8 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
         "engine_lines_total": total_len("engine_lines"),
         # the three-valued statement per candidate, against the engine's
         # own classes: confirmed paint / on the road but unpainted / off it
+        # 按侧判定：分母只含"该侧有参考"的候选（见 match_rate_with_reference）
+        **match_rate_with_reference(rows),
         "candidates_on_engine_line": total("candidates_on_line"),
         "candidates_on_road_only": total("candidates_on_road_only"),
         "candidates_off_road": total("candidates_off_road"),
@@ -467,11 +614,20 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
             "A candidate with no engine line nearby is 'unconfirmed', not "
             "'false': the engine renders known materials only, so faded or "
             "worn paint can be unlabelled.",
+            "match_rate_with_reference conditions on the candidate's own "
+            "side having >=50 engine px: the raw match_rate also counts "
+            "candidates whose side has no reference at all, and those are "
+            "UNKNOWN rather than wrong (measured: the engine's line class "
+            "here is roughly centre+right edge, left edge often unlabelled).",
         ],
     }
     summary["model"] = str(model_path) if model_path else "default_model_path"
-    return {"run": str(run_dir), "view": view, "summary": summary,
-            "rows": rows}
+    out = {"run": str(run_dir), "view": view, "summary": summary, "rows": rows}
+    if overlay_dir is not None:
+        out["overlay_dir"] = str(overlay_dir)
+        out["n_overlays"] = n_overlays
+        out["n_crops"] = n_crops
+    return out
 
 
 def main(argv=None) -> int:
@@ -488,6 +644,15 @@ def main(argv=None) -> int:
                     help="segmentation checkpoint (default: "
                          "segmentation.default_model_path())")
     ap.add_argument("--json", default=None)
+    ap.add_argument("--overlay-out", default=None,
+                    help="把每帧复核图写到这个目录（原图 + 引擎漆线=蓝 + "
+                         "候选命中=绿/未命中=红 + 题注），供人工反例复核")
+    ap.add_argument("--overlay-limit", type=int, default=None,
+                    help="最多写多少张复核图（帧集仍由 --limit 决定，"
+                         "不影响测量范围）")
+    ap.add_argument("--crop-limit", type=int, default=0,
+                    help="每帧最多写几张『未匹配候选』的 2x 局部放大图，"
+                         "供人工判真线/假线（0=不写）")
     args = ap.parse_args(argv)
     meta = None
     if args.meta:
@@ -498,7 +663,11 @@ def main(argv=None) -> int:
         else:
             meta = json.loads(mp.read_text(encoding="utf-8"))
     res = probe(Path(args.run), meta, view=args.view, limit=args.limit,
-                model_path=args.model, null_shift_m=args.null_shift_m)
+                model_path=args.model, null_shift_m=args.null_shift_m,
+                overlay_dir=(Path(args.overlay_out) if args.overlay_out
+                             else None),
+                overlay_limit=args.overlay_limit,
+                crop_limit=args.crop_limit or None)
     if "reason" in res:
         print(f"[ident] {res['reason']}")
         return 2
