@@ -31,7 +31,7 @@
 
 命令：
 
-```powershell
+```pwsh
 .venv\Scripts\python.exe scripts\m5_drive_test.py --runtime steam --speed 6 --run 98
 ```
 

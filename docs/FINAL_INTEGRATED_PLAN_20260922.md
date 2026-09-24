@@ -504,7 +504,7 @@ T11 的网络升级按失败分桶推进；IMM 只在简单模型不足时进入
 
 以下在项目根目录执行，**本轮没有执行这些回归或驾驶命令**。尖括号为待替换输入；工具结果在 T01/T12 修正前只能按其已知局限解读。
 
-```powershell
+```pwsh
 .venv\Scripts\python.exe -m pytest tests/ -q
 .venv\Scripts\python.exe scripts\m5_offline_validate.py
 

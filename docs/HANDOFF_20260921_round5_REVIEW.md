@@ -415,7 +415,7 @@ E2E 当前候选被拒，应先解决域/视角/标定契约，不要用放宽�
 
 ### 单帧横向探针
 
-```powershell
+```pwsh
 .venv\Scripts\python.exe scripts\m5_lateral_scene_probe.py --runtime tech --attach `
   --teleport 779.7 735.6 -13 --goal 868.3 744.9 --ticks 2 `
   --json logs\goal_20260921\scene.json
@@ -423,7 +423,7 @@ E2E 当前候选被拒，应先解决域/视角/标定契约，不要用放宽�
 
 ### Tech 实车基线
 
-```powershell
+```pwsh
 .venv\Scripts\python.exe scripts\m5_fsd_drive.py --runtime tech --attach `
   --seconds 45 --speed 5 `
   --teleport 779.7 735.6 -13 --goal 868.3 744.9 `
@@ -435,14 +435,14 @@ E2E 当前候选被拒，应先解决域/视角/标定契约，不要用放宽�
 
 ### 多视角采集
 
-```powershell
+```pwsh
 .venv\Scripts\python.exe scripts\m5_collect_seg_ring.py --runtime tech --attach `
   --frames 200 --roles front_main front_fisheye pillar_left pillar_right
 ```
 
 ### 分割评估
 
-```powershell
+```pwsh
 .venv\Scripts\python.exe scripts\m5_eval_seg.py `
   --runs logs\m5_seg\manual_mountain_labeled `
          logs\m5_seg\manual_review_batch_labeled `
@@ -451,7 +451,7 @@ E2E 当前候选被拒，应先解决域/视角/标定契约，不要用放宽�
 
 ### 离线回归
 
-```powershell
+```pwsh
 .venv\Scripts\python.exe -m pytest tests\ -o addopts='' -q
 .venv\Scripts\python.exe scripts\m5_offline_validate.py
 ```

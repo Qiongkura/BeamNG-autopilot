@@ -281,7 +281,7 @@
 
 命令：
 
-```powershell
+```pwsh
 .venv\Scripts\python.exe scripts\m5_collect_seg_ring.py --runtime tech --attach `
     --frames 200 --roles front_main front_fisheye pillar_left pillar_right
 ```
@@ -362,7 +362,7 @@
 
 ## 12. 复现命令与产物清单
 
-```powershell
+```pwsh
 # 单帧横向真值（诊断"车在哪、线在哪"）
 .venv\Scripts\python.exe scripts\m5_lateral_scene_probe.py --runtime tech --attach `
     --teleport 779.7 735.6 -13 --goal 868.3 744.9 --ticks 2 --json logs\goal_20260921\scene.json

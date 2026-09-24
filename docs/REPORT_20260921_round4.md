@@ -236,7 +236,7 @@ JSON 落盘。验证包括：默认低限速、LONG_PLAN、DQN 主导的 0.6 m/s
 
 ## 可复现命令
 
-```powershell
+```pwsh
 .venv\Scripts\python.exe -m pytest tests/ -o addopts='' -q
 .venv\Scripts\python.exe scripts\m5_offline_validate.py
 $runs = @(Get-ChildItem logs\fsd_benchmark\town_*.json | Select-Object -ExpandProperty FullName)

@@ -13,7 +13,7 @@
   `STOP_SPEED_MPS=0.3`、`CREEP_SPEED_MPS=1.0`、`STOP_INTERVAL_RULE`、
   `STOP_HARD_RULE` 固化，并由返回值的 `spec` 字段自描述。
 - **一条命令**：
-  ```powershell
+  ```pwsh
   .venv\Scripts\python.exe scripts\m5_run_metrics.py --hist <run.json> [...] --table
   ```
   输出（节选，`--settle-s` 默认 8.0＝benchmark 口径）：

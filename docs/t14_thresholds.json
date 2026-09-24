@@ -1,0 +1,28 @@
+{
+ "schema": 1,
+ "thresholds": {
+  "candidate_identity_rate_min": 0.6,
+  "line_recall_min": 0.7,
+  "line_precision_min": 0.4,
+  "offroad_false_ratio_max": 0.1,
+  "inference_ms_p95_max": 45.0,
+  "noninferior_margin": 0.05,
+  "min_seeds": 3,
+  "frozen_at": "2026-09-24",
+  "source": "T13 measured baselines (docs/T13_LOCAL_TRAINING_20260924.md) + plan T14 §5; frozen before the T14 search starts"
+ },
+ "config_hash": "29a6f387201db6a4",
+ "primary_order": [
+  "candidate_identity_rate",
+  "line_recall",
+  "line_precision",
+  "offroad_false_line_px",
+  "inference_ms_p95"
+ ],
+ "auxiliary": [
+  "line_iou",
+  "val_miou",
+  "train_loss"
+ ],
+ "note": "frozen: changing any value creates a NEW config_hash"
+}

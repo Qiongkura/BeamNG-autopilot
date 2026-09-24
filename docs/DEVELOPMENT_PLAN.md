@@ -105,7 +105,7 @@ S5 研究/发布      ██░░░░░░░░  随里程碑
 
 ### 1.2 阶段验收命令
 
-```powershell
+```pwsh
 .venv\Scripts\python.exe scripts\m5_seg_task_eval.py --model <ckpt> --episode-names <pinned10>
 .venv\Scripts\python.exe scripts\m5_live_ab.py   # 实车 A/B，≥5 臂
 ```

@@ -192,7 +192,7 @@
 
 ## 7. 复现命令
 
-```powershell
+```pwsh
 # 覆盖度索引（131 个 town 跑次）
 .venv\Scripts\python.exe scripts\m5_coverage_index.py
 

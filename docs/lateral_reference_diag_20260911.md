@@ -463,7 +463,7 @@ run_town_truth_1329  120 帧  536x403  colour+label  标线 525 px/帧
 
 按 §13 交下来的公平对照，两次训练已在后台**顺序**执行（唯一变量是 `run_town_truth_1329`）：
 
-```powershell
+```pwsh
 # ARM A —— 不含新真值
 .venv\Scripts\python.exe scripts\m5_train_seg.py `
   --runs <logs/m5_seg/run_* 去掉 run_town_truth_1329> `
@@ -522,7 +522,7 @@ A/B。** 这一步的产出不是更好的模型，而是三个可用的量化�
 **去标注那 19 帧**（`m5_annotate_manual.py`，需人工），或扩充城镇手工标线集——这是唯一
 被证明能推动成对率的成分。命令已就绪：
 
-```powershell
+```pwsh
 .venv\Scripts\python.exe scripts\m5_annotate_manual.py `
   --frames-dir logs\m5_seg\manual_town_capture_20260910_233426 `
   --out logs\m5_seg\manual_town_labeled
@@ -579,7 +579,7 @@ A/B。** 这一步的产出不是更好的模型，而是三个可用的量化�
 §16 的复盘发现一件事：我跑的两条全量配方臂**都没带人工标线集**（ARM A/B 只有 tech_truth），
 而本会话已量化「手工标线是决定性成分」。所以这次把两者合起来跑，并用新的逐轮任务门选点：
 
-```powershell
+```pwsh
 .venv\Scripts\python.exe scripts\m5_train_seg.py `
   --runs logs\m5_seg\run_* `
   --line-only-runs logs\m5_seg\manual_review_batch_labeled manual_compare_batch_labeled `
