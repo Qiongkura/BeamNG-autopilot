@@ -109,6 +109,18 @@
 6. 不修改运行时生成物：`logs/`、`weights/`、`.yolo/`、`probe_out.txt`、`probe_route.json` 等。
 7. Python 3.10，模块开头使用 `from __future__ import annotations`。保持现有命名、注释与换行风格，不顺手格式化无关文件。
 8. 工作区已有未提交改动时，把它们当作用户工作：先读再改，不还原、不覆盖无关修改。
+9. **shell 约定（用户 2026-09-24 指定）：本项目用 PowerShell 7 工作**。`pwsh` 装在本机用户目录
+   `C:\Users\Administrator\AppData\Local\Programs\PowerShell\7.6.6\pwsh.exe`（免管理员、zip 版，删目录即卸载；
+   已加入用户级 PATH，所以 `pwsh` 可直接解析）。调用方式：多行命令一律写成 `.ps1` 后用
+   `pwsh -NoProfile -ExecutionPolicy Bypass -File <脚本>`（避免嵌套引号），单行才用 `-Command`；
+   每次调用先设 `[Console]::OutputEncoding = [Text.Encoding]::UTF8`，否则中文输出乱码。
+   不再手写 bash 管道做项目工作。**markdown 代码块一律用 ```pwsh 标签**（2026-09-24 已全仓替换，
+   只改标签不动命令原文）。
+   可复用的 PowerShell 入口放 `scripts\`（例如 `dev_validate.ps1`），**不要**把承重脚本留在
+   `.workbuddy-ai/`：那是 gitignore 的临时区，文档指向它等于给出跑不通的命令。
+10. **命令范围纪律（2026-09-24 事件后新增）**：不做宽范围递归扫描——`du`/`grep -r` 的根不得是仓库根、
+    `logs/` 或用户主目录；需要大小时只量点名的单个目录，或改用 `robocopy /l /nfl /ndl /njh /bytes /e` 枚举。
+   长命令被取消或中断后，**立即枚举并结束孤儿子进程**（Windows 下取消只杀外层 shell，`du.exe` 之类会继续跑）。
 
 ## 改动流程
 
@@ -123,6 +135,11 @@
 
 - 纯逻辑回归（不需要游戏）：`.venv\Scripts\python.exe -m pytest tests/ -q`
 - 深度离线回归（不需要游戏）：`.venv\Scripts\python.exe scripts\m5_offline_validate.py`
+- 上面两条的 PowerShell 7 一键版（推荐，跑完给 RESULT）：`pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\dev_validate.ps1`
 - 端到端（需要 Tech 游戏）：`.venv\Scripts\python.exe scripts\m5_e2e_test.py --attach --runtime tech`
 - 真实驾驶（需要 Tech 游戏）：`.venv\Scripts\python.exe scripts\m5_drive_test.py --runtime tech --speed 6 --run 10`
 - GUI 冒烟：`.venv\Scripts\python.exe scripts\m5_gui_smoke.py`
+- 分割模型评估矩阵（像素/性能，可多个 checkpoint 同一批输入）：
+  `.venv\Scripts\python.exe scripts\m5_seg_eval_matrix.py --model 名字=权重 --runs <冻结集目录> --json <报告>`
+- 数据集准入审计（逐通道覆盖 + 泄漏 + 内容重复）：`.venv\Scripts\python.exe scripts\m5_seg_dataset_audit.py --runs <帧目录> --digest-scan`
+- checkpoint 逐位比较（续训是否等价）：`.venv\Scripts\python.exe scripts\m5_seg_checkpoint_diff.py --a <A> --b <B> --atol 0`
