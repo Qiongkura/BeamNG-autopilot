@@ -321,7 +321,7 @@ BEV/向量空间 → 占用 → 规划 → 安全 → 影子数据闭环**。现
 
 ### 运行 FSD 栈
 
-```powershell
+```pwsh
 # 1) 环视相机会采（需 Tech，游戏运行中）
 .venv\Scripts\python.exe scripts\m5_ring_probe.py --runtime tech --attach
 
@@ -362,33 +362,33 @@ GPU 显存 6GB 以上（YOLO 检测 + HUD 可视化需要）
 
 1. **安装 BeamNG.drive**：通过 Steam 安装 0.39+ 版本。
 2. **创建虚拟环境**：
-   ```powershell
+   ```pwsh
    python -m venv --system-site-packages .venv
    .venv\Scripts\python.exe -m pip install -r requirements.txt
    ```
 3. **环境自检**（首次使用前建议运行）：
-   ```powershell
+   ```pwsh
    .venv\Scripts\python.exe scripts\m5_env_check.py
    ```
 4. **启动游戏**（或通过控制台启动）：
-   ```powershell
+   ```pwsh
    .venv\Scripts\python.exe scripts\launch_game.py --runtime steam
    ```
 5. **运行自动驾驶助手**：
-   ```powershell
+   ```pwsh
    # 附着到已运行的游戏
    .venv\Scripts\python.exe scripts\m5_autopilot.py --attach
    # 或自动启动游戏并加载地图
    .venv\Scripts\python.exe scripts\m5_autopilot.py
    ```
 6. **使用图形控制台**：双击项目根目录的 `启动自动驾驶.vbs` 或手动运行：
-   ```powershell
+   ```pwsh
    .venv\Scripts\python.exe scripts\m5_launcher.py
    ```
 
 抓帧性能对比探针（可选，需游戏窗口位于主屏；dxcam 需自行 `pip install dxcam`）：
 
-```powershell
+```pwsh
 .venv\Scripts\python.exe scripts\bench_grab_screen.py
 ```
 
@@ -412,7 +412,7 @@ GPU 显存 6GB 以上（YOLO 检测 + HUD 可视化需要）
 0.8-1.0m）。替代方案：用 BeamNG.tech 的 annotation 像素真值训练轻量 UNet
 （背景 / 路面 / 标线 3 类），推理只吃 RGB 帧，Steam / Tech 通用。
 
-```powershell
+```pwsh
 # 1. 采集训练数据（Tech 实例运行中，AI 沿路行驶自动采集）
 .venv\Scripts\python.exe scripts\m5_collect_seg.py --frames 500
 
@@ -493,7 +493,7 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
 - 开源发布时可整体不包含 `beamng_autopilot_tech/`；核心模块不在顶层
   导入它。
 
-```powershell
+```pwsh
 .venv\Scripts\python.exe scripts\launch_game.py --runtime steam
 .venv\Scripts\python.exe scripts\launch_game.py --runtime tech
 .venv\Scripts\python.exe scripts\m5_autopilot.py --runtime auto --attach
@@ -516,7 +516,7 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
 
 ## 运行
 
-```powershell
+```pwsh
 # 冒烟测试：连接游戏直行 3 秒
 .venv\Scripts\python.exe scripts\m1_smoke_test.py
 
