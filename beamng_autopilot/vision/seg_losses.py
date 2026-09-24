@@ -88,6 +88,38 @@ def soft_cldice_line_loss(prob: torch.Tensor, target: torch.Tensor,
     return 1.0 - 2.0 * tprec * trec / (tprec + trec + _EPS)
 
 
+def masked_cross_entropy(logits: torch.Tensor, target: torch.Tensor,
+                         class_mask, *, weight: torch.Tensor | None = None,
+                         ignore_index: int = 255) -> torch.Tensor:
+    """类屏蔽交叉熵：被屏蔽的类**从 softmax 的分母里去掉**。
+
+    为什么不能只把该类的权重置零：权重只影响"正样本"的拉力，未标注像素仍留在
+    分母里当负样本——那等于教模型"未标注的可见漆线就是背景"，正是 T14 §1 禁止的
+    错误监督（实测：引擎标注把可见漆线标成沥青）。把该类的 logit 置 ``-inf`` 后，
+    softmax 只在允许的类上归一化，该通道既无正样本也无负样本，反向梯度恒为 0。
+
+    ``class_mask`` 支持 ``[C]``（整批一致）与 ``[B, C]``（逐样本）；
+    被屏蔽的类**不允许**作为目标出现（否则是自相矛盾的标签，直接报错而不是
+    让损失变成 inf 混过去）。
+    """
+    mask = torch.as_tensor(class_mask, dtype=torch.bool, device=logits.device)
+    if mask.dim() == 1:
+        blocked = (~mask).view(1, -1, 1, 1).expand_as(logits)
+    elif mask.dim() == 2:
+        blocked = (~mask).view(mask.shape[0], mask.shape[1], 1, 1).expand_as(
+            logits)
+    else:
+        raise ValueError(f"class_mask 维度只支持 [C] 或 [B,C]，得到 {mask.shape}")
+    bad = blocked & (target.unsqueeze(1) == torch.arange(
+        logits.shape[1], device=logits.device).view(1, -1, 1, 1))
+    if bool(bad.any()):
+        raise ValueError(
+            "被屏蔽的类出现在目标里：先去掉该类的目标像素（例如 "
+            "mask_line_for_loss 把已标注 line 改成 255），否则损失无定义")
+    return F.cross_entropy(logits.masked_fill(blocked, float("-inf")), target,
+                           weight=weight, ignore_index=ignore_index)
+
+
 class LineSegLoss(nn.Module):
     """Weighted CE + line-channel Tversky + soft-clDice.
 
@@ -113,11 +145,40 @@ class LineSegLoss(nn.Module):
                              else torch.as_tensor(weight, dtype=torch.float32),
                              persistent=False)
 
-    def forward(self, logits: torch.Tensor,
-                target: torch.Tensor) -> torch.Tensor:
-        ce = F.cross_entropy(logits, target, weight=self.weight,
-                             ignore_index=self.ignore_index)
-        if self.w_tversky <= 0.0 and self.w_cldice <= 0.0:
+    def forward(self, logits: torch.Tensor, target: torch.Tensor,
+                class_mask=None) -> torch.Tensor:
+        """``class_mask`` 见 :func:`masked_cross_entropy`。
+
+        整条通道被屏蔽时（``class_mask`` 不含 ``LINE_CLASS``）**不计算**
+        line 的区域项：区域项拿不到"哪些像素是线"，硬算等于用未标注的像素当
+        负样本。逐样本掩码若与本批的 line 权重同用，说明这一批混了"可信/不可信"
+        两种帧——那是调用方该拆批的场景，直接报错而不是悄悄改损失口径。
+        """
+        line_allowed = True
+        if class_mask is not None:
+            m = torch.as_tensor(class_mask, dtype=torch.bool)
+            line_allowed = bool(m[LINE_CLASS]) if m.dim() == 1                 else bool(m[:, LINE_CLASS].all())
+            if not line_allowed and (self.w_tversky > 0.0
+                                     or self.w_cldice > 0.0):
+                if m.dim() == 2 and bool(m[:, LINE_CLASS].any()):
+                    raise ValueError(
+                        "这一批同时含'可信 line'与'不可信 line'的帧，而 line 区域"
+                        "项是开着的一一请拆批，或把 --line-tversky-weight / "
+                        "--line-cldice-weight 设为 0（路面通道实验的常规配方）")
+                # 整批禁用：丢掉区域项（不静默改口径，调用方在 CLI 里会看到提示）
+                region_w = 0.0
+            else:
+                region_w = 1.0
+        else:
+            region_w = 1.0
+        if class_mask is not None:
+            ce = masked_cross_entropy(logits, target, class_mask,
+                                      weight=self.weight,
+                                      ignore_index=self.ignore_index)
+        else:
+            ce = F.cross_entropy(logits, target, weight=self.weight,
+                                 ignore_index=self.ignore_index)
+        if not region_w or (self.w_tversky <= 0.0 and self.w_cldice <= 0.0):
             return ce
         prob = F.softmax(logits.float(), dim=1)[:, LINE_CLASS]
         tgt = (target == LINE_CLASS).float()

@@ -322,7 +322,8 @@ def default_model_path() -> Path | None:
 
 
 def gate_line_candidates(markings, line_mask, road_mask,
-                         *, gate_on: bool | None = None):
+                         *, gate_on: bool | None = None,
+                         surface_gate: bool | None = None):
     """Provenance + the gate the union's classic-CV arm needs (T08).
 
     The union ``line | cv_white`` exists to recover paint the model misses,
@@ -341,6 +342,17 @@ def gate_line_candidates(markings, line_mask, road_mask,
     """
     if gate_on is None:
         gate_on = os.environ.get("BEAMNG_LINE_CAND_GATE", "1") != "0"
+    #: 可选收紧（**默认关闭**）：连 learned-backed 候选也要求落在**模型自己的
+    #: 路面掩码**上（`road_mask`）。为什么不是"路面 ∪ 线掩码"：本函数里的
+    #: ``line`` 就是模型自己的线掩码，而 ``learned`` 正是"像素在 line 里的占比"，
+    #: 所以"线 ∪ 路面"对 learned-backed 候选**恒真**（写出来等于没写；这一版被
+    #: 单测当场抓住）。真正有区分度、且运行期可得的判据，是"它是否落在模型自己的
+    #: 路面区域内"——线掩码并不含在路面掩码里，所以它会真的筛掉东西。
+    #: 离线账面（在**引擎标签**空间算的代理，不是这里的模型空间）：T13 探针集
+    #: 阈值 0.5 会丢掉 417 个 learned 候选、其中落漆线的 0 个；两者不是同一个量，
+    #: 所以开关默认关闭，代价用管线实跑测量（见 docs/T14_PROGRESS_20260924.md）。
+    if surface_gate is None:
+        surface_gate = os.environ.get("BEAMNG_LINE_CAND_SURFACE_GATE", "0") != "0"
     line = np.asarray(line_mask, dtype=bool)
     road = None if road_mask is None else np.asarray(road_mask, dtype=bool)
     kept: list = []
@@ -355,6 +367,10 @@ def gate_line_candidates(markings, line_mask, road_mask,
         learned = float(np.count_nonzero(line[vi, ui])) / len(pix)
         on_road = (None if road is None else
                    float(np.count_nonzero(road[vi, ui])) / len(pix))
+        # 铺装面 = 路面 ∪ 线掩码；road 缺失时保持 None（未知≠不合格）
+        surface = (None if road is None else
+                   float(np.count_nonzero(line[vi, ui] | road[vi, ui]))
+                   / len(pix))
         bw = pix.max(axis=0) - pix.min(axis=0)
         long_side = max(float(bw[0]), float(bw[1]))
         short_side = max(1.0, min(float(bw[0]), float(bw[1])))
@@ -363,8 +379,15 @@ def gate_line_candidates(markings, line_mask, road_mask,
             mk.meta.update({"learned_frac": round(learned, 4),
                             "on_road_frac": (None if on_road is None
                                              else round(on_road, 4)),
+                            "surface_frac": (None if surface is None
+                                             else round(surface, 4)),
                             "aspect": round(aspect, 3)})
         if not gate_on or learned >= 0.5:
+            if (surface_gate and learned >= 0.5 and on_road is not None
+                    and on_road < 0.5):
+                dropped["learned_off_road"] = dropped.get(
+                    "learned_off_road", 0) + 1
+                continue
             kept.append(mk)
             continue
         if aspect < 2.5:
