@@ -20,13 +20,34 @@
 | `beamng_autopilot/experiments/monitor_ui.py` | 自包含 HTML+CSS+原生 JS：状态栏、12 张 canvas 图、悬停提示、滚轮缩放/双击复位、窗口切换、可配置平滑、直方图整数频次轴 |
 | `beamng_autopilot/experiments/monitor_server.py` | 只读 HTTP：`/`（页面）、`/metrics?since=<seq>`（增量）、`/state`、`/health`；仅绑 127.0.0.1 |
 | `scripts/m5_train_monitor.py` | 薄入口：`serve` / `snapshot` / `demo` / `probe` / `status` |
+| `scripts/m5_training_view.py` + 根目录 `启动训练看板.vbs` / `启动训练监控.vbs` / `启动训练台账.vbs` | 双击入口：自动挑最近一轮 → 渲染或起服务 → 开浏览器（台账不挑轮次）；VBS 只是壳，判断逻辑全在脚本里 |
+| `scripts/m5_training_history.py` | 历史台账：扫全仓 `train_hist.json` + `decision_*.json` → 一张自包含 HTML（+ `--json`）；只列事实、不做排行，缺列写"缺列"不写 0，缺列原因按产物自报字段（`line_ignored_frames`） |
 | `scripts/m5_train_seg.py` | 逐 step 指标、任务状态、硬件采样线程、**失败留痕**（`record_training_failure`） |
 | `beamng_autopilot/config.py` | `BEAMNG_LOGS_DIR` 可重定向产物目录（测试/CI 用），默认行为不变 |
 | `tests/test_train_monitor.py` | 18 例：存储/增量去重/半写行、统计与抽稀、采样不可用路径、界面契约、HTTP 端点、**真实小训练端到端**、失败留痕 |
 
 ## 3. 启动方法与配置项（规格 §5.4）
 
+**双击入口**（仓库根目录，自动挑 `logs/experiments/` 下最新的一轮）：
+
+- `启动训练看板.vbs`：渲染学习看板并打开浏览器（隐藏控制台，失败时弹退出码）；
+- `启动训练监控.vbs`：起实时监控并打开浏览器（**可见控制台**，因为服务本身要
+  一直跑——在那里读 URL、按 Ctrl+C 或关窗口停止；重复双击只会重开浏览器页）；
+- `启动训练台账.vbs`：扫全仓训练产物出历史台账（不挑轮次；看不到 run 目录的
+  写入，扫 ~300 个 run 约几秒）。
+
+三者都只是 `scripts/m5_training_view.py` 的壳，判断逻辑（挑哪一轮、没数据怎么
+报、端口冲突怎么办）都在那个脚本里，改行为改它，不用碰 VBS。
+
+命令行等价写法：
+
 ```pwsh
+# 0) 双击入口的等价命令（自动挑最新一轮；--run-id 可指定）
+.venv\Scripts\python.exe scripts\m5_training_view.py dashboard
+.venv\Scripts\python.exe scripts\m5_training_view.py monitor --port 8760
+.venv\Scripts\python.exe scripts\m5_training_view.py history
+.venv\Scripts\python.exe scripts\m5_training_view.py list
+
 # 1) 边训练边看：训练侧写指标，监控侧起服务
 .venv\Scripts\python.exe scripts\m5_train_seg.py `
     --runs logs\m5_seg\ident_probe_20260923\front_main --split tail --val-frac 0.2 `
