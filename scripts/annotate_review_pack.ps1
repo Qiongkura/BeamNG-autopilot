@@ -55,11 +55,25 @@ if (-not $NoPrefill -and -not (Test-Path $prefillPath)) {
 
 Push-Location $Repo
 try {
-    $pkgs = Get-ChildItem -Directory $pkgRoot -Filter 'pkg_*' | Sort-Object Name
+    $all = Get-ChildItem -Directory $pkgRoot -Filter 'pkg_*' | Sort-Object Name
+    $pkgs = $all
     if ($Only.Count -gt 0) {
-        $pkgs = $pkgs | Where-Object { $v = $_.Name; ($Only | Where-Object { $v -like "*$_*" }).Count -gt 0 }
+        # `pwsh -File` 会把 `-Only a,b` 当**一个字符串**传进来（不做数组解析），
+        # 所以这里自己按逗号拆——否则匹配为空（实测踩到："没有匹配的包"）。
+        $pats = @()
+        foreach ($o in $Only) {
+            $pats += @(($o -split ',') | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+        }
+        $pkgs = $all | Where-Object {
+            $n = $_.Name
+            @($pats | Where-Object { $n -like "*$_*" }).Count -gt 0
+        }
     }
-    if ($pkgs.Count -eq 0) { Write-Host "[annotate] 没有匹配的包"; exit 4 }
+    if ($pkgs.Count -eq 0) {
+        Write-Host "[annotate] -Only 没匹配到包。可用包名：" -ForegroundColor Yellow
+        foreach ($d in $all) { Write-Host ("  " + $d.Name) }
+        exit 4
+    }
 
     Write-Host ("[annotate] 共 {0} 个包；输出 -> {1}" -f $pkgs.Count, $OutRoot)
     Write-Host "[annotate] 键位：1=line 2=road 3=背景/擦除 · b 画笔/填充 · u 撤销 · c 清空 · a 上一帧 · s 保存并下一帧 · q 退出"
