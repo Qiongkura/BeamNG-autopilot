@@ -192,3 +192,51 @@ def test_a_view_level_meta_is_used_and_filtered_to_the_package(tmp_path):
     assert pkg.main(["--review-queue", str(q2), "--collection", str(coll2),
                      "--out", str(out2)]) == 0
     assert (out2 / "front_main" / "meta.json").is_file()
+
+
+def test_the_annotation_sidecar_records_who_reviewed_and_which_classes(tmp_path):
+    """验收要求「能查询任意帧是**谁**、何时、对哪些类别和区域做了复核」。
+
+    实测缺口：sidecar 有 tool/annotated_at/unknown_px，但没有复核人，也没有
+    "这一帧标了哪些类别"——于是"谁复核的"只能靠记忆。现在写
+    ``annotation.reviewer`` 与逐帧 ``classes_painted``。
+    """
+    import importlib.util
+    import sys
+    from pathlib import Path as _P
+
+    import numpy as np
+
+    root = _P(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_annotate_manual_t", root / "scripts" / "m5_annotate_manual.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["m5_annotate_manual_t"] = mod
+    spec.loader.exec_module(mod)
+
+    out = tmp_path / "annotated" / "front_main"
+    out.mkdir(parents=True)
+    label = np.zeros((6, 8), np.uint8)
+    label[1, :] = 2                     # line
+    label[2:5, :] = 1                   # road
+    label[5, :3] = 255                  # unknown
+    np.savez_compressed(out / "frame_00000.npz",
+                        colour=np.zeros((6, 8, 3), np.uint8), label=label)
+    rec = {"path": "frame_00000.npz", "view": "front_main", "exposure": 0,
+           "pos": [1.0, 2.0, 0.0], "heading": 0.0,
+           "classes_painted": {"line": int((label == 2).sum()),
+                               "road": int((label == 1).sum()),
+                               "background": int((label == 0).sum()),
+                               "unknown": int((label == 255).sum())}}
+    fp = mod.write_sidecar(out, [rec],
+                           identity={"map_name": "italy", "source_id": "ring_x"},
+                           annotation_reviewer="tester")
+    import json
+    blob = json.loads(fp.read_text(encoding="utf-8"))
+    assert blob["label_source"] == "human_revision", blob["label_source"]
+    assert blob["annotation"]["reviewer"] == "tester", blob["annotation"]
+    assert blob["annotation"]["annotated_at"], blob["annotation"]
+    got = blob["frames"][0]["classes_painted"]
+    assert got == {"line": 8, "road": 24, "background": 13, "unknown": 3}, got
+    # 复核人缺省不编名字（拿不到就空）
+    assert mod._default_reviewer() is not None

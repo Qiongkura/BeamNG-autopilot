@@ -364,7 +364,17 @@ def _sidecar_seed(out_dir: Path) -> tuple[dict, str]:
     return {}, "unavailable"
 
 
+def _default_reviewer() -> str:
+    """复核人缺省值：当前系统用户名（拿不到就写空，不编名字）。"""
+    try:
+        import getpass
+        return getpass.getuser()
+    except Exception:                                      # noqa: BLE001
+        return ""
+
+
 def write_sidecar(out_dir: Path, records: list, *, identity: dict,
+                  annotation_reviewer: str = "",
                   seed: tuple | None = None) -> Path:
     """Write/merge ``<out_dir>/meta.json``: run identity + per-frame identity.
 
@@ -390,6 +400,7 @@ def write_sidecar(out_dir: Path, records: list, *, identity: dict,
     side["label_source"] = "human_revision"
     side["annotation"] = {
         "tool": "m5_annotate_manual.py",
+        "reviewer": str(annotation_reviewer or ""),
         "annotated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "identity_source": identity.get("identity_source", "unavailable"),
         "identity_missing": list(identity.get("identity_missing") or []),
@@ -480,6 +491,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--grab", type=int, default=0,
                     help="capture N fresh frames from the live game first")
     ap.add_argument("--out", type=str, default=None)
+    ap.add_argument("--reviewer", type=str, default=None,
+                    help="复核人标识（缺省取 BEAMNG_REVIEWER，其次当前用户）："
+                         "验收要能查'这帧是谁复核的'")
     ap.add_argument("--prefill-model", type=str, default=None,
                     help="用分割模型预填 road/line，人工只需修正误检/漏检")
     ap.add_argument("--review-incomplete", action="store_true",
@@ -545,6 +559,9 @@ def main() -> int:
             print("[annotate] no incomplete frames found")
             return 0
 
+    reviewer = (args.reviewer or os.environ.get("BEAMNG_REVIEWER")
+                or _default_reviewer())
+    print(f"[annotate] 复核人 -> {reviewer}（写进 meta.json 的 annotation.reviewer）")
     prefill = None
     if args.prefill_model:
         try:
@@ -660,6 +677,13 @@ def main() -> int:
             "identity_missing": list(ident.get("identity_missing") or []),
             "unknown_px": unknown_counts(unk),
             "side_coverage": cov,
+            # 验收要查"对**哪些类别**做了复核"：直接记这一帧各类别的像素数
+            "classes_painted": {
+                "line": int((np.asarray(label) == CLS_LINE).sum()),
+                "road": int((np.asarray(label) == CLS_ROAD).sum()),
+                "background": int((np.asarray(label) == 0).sum()),
+                "unknown": int((np.asarray(label) == 255).sum()),
+            },
             "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         })
         ov = rgb.copy()
@@ -807,7 +831,8 @@ def main() -> int:
     cv2.destroyAllWindows()
     if saved_records:
         side_fp = write_sidecar(out_dir, saved_records, identity=run_identity,
-                                seed=sidecar_seed)
+                                seed=sidecar_seed,
+                                annotation_reviewer=reviewer)
         print(f"[annotate] sidecar -> {side_fp.name} "
               f"(map={run_identity.get('map_name') or 'UNKNOWN'} "
               f"source={run_identity.get('source_id') or 'UNKNOWN'}, "
