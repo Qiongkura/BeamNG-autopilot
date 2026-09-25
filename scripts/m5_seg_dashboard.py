@@ -1682,6 +1682,236 @@ def _decisions_state(path: Path | None) -> dict:
     return state
 
 
+#: 事件 (phase, status) -> 时间线阶段（方案 §11：采集 → 审计 → 标注 →
+#: 训练 → 评价 → 判定 → 下一轮）。
+STAGE_OF_EVENT = {
+    ("auditing", "collecting"): "采集",
+    ("auditing", "collect_ok"): "审计",
+    ("auditing", "collect_rejected"): "审计",
+    ("auditing", "collect_blocked"): "审计",
+    ("auditing", "collect_failed"): "审计",
+    ("auditing", "resource_blocked"): "资源门",
+    ("auditing", "resource_checked"): "资源门",
+    ("auditing", "stopped_before_start"): "停止",
+    ("auditing", "lease_blocked"): "资源门",
+    ("auditing", "no_data_configured"): "停止",
+    ("needs_review", "collect_rejected"): "标注/复核",
+    ("needs_review", "labels_missing"): "标注/复核",
+    ("training", "running"): "训练",
+    ("training", "train_error"): "训练",
+    ("evaluating", "running"): "评价",
+    ("evaluating", "evaluated"): "评价",
+    ("rejected", "decided"): "判定",
+    ("shadow_candidate", "decided"): "判定",
+    ("needs_evidence", "decided"): "判定",
+    ("paused", "paused"): "暂停",
+    ("failed", "failed"): "失败",
+}
+
+
+def _timeline_state(run_dir) -> dict:
+    """全流程时间线（方案 §11）：从既有产物重建，不新造数据库。
+
+    验收动作是「**从一个候选反查它来自哪次采集和哪份标签**」，所以除事件流外，
+    还要把 ``collect_*.json``（采集与身份审计）、``selection_collect_*.json``
+    （选样）、``review_queue_*.json``（复核队列）、
+    ``proposals_collect_*.json``（数据因子提议）与 ``decision_*.json``（判定）
+    串起来：候选 -> 数据目录 -> 采集记录 -> 标签来源。读不到就写"没有记录/
+    未测"，不猜、不补 0。
+    """
+    st = {"readable": False, "error": "", "candidates": [],
+          "n_collections": 0, "n_review_queues": 0, "n_selections": 0}
+    if run_dir is None:
+        st["error"] = "没有 run 目录"
+        return st
+    root = Path(run_dir)
+    if not root.is_dir():
+        st["error"] = f"{root} 不存在"
+        return st
+
+    def _loads(pattern):
+        out = []
+        for fp in sorted(root.glob(pattern)):
+            try:
+                out.append((fp, json.loads(fp.read_text(encoding="utf-8"))))
+            except Exception as exc:                       # noqa: BLE001
+                out.append((fp, {"_error": f"{type(exc).__name__}: {exc}"}))
+        return out
+
+    collects = _loads("collect_*.json")
+    selections = _loads("selection_collect_*.json")
+    queues = _loads("review_queue_*.json")
+    decisions = _loads("decision_*.json")
+    st["n_collections"] = len(collects)
+    st["n_selections"] = len(selections)
+    st["n_review_queues"] = len(queues)
+    if not any((collects, selections, queues, decisions)):
+        st["error"] = "run 目录里没有采集/选样/判定产物"
+        return st
+
+    coll_by_dir = {}
+    for fp, blob in collects:
+        if blob.get("_error"):
+            continue
+        d = str(blob.get("out_dir") or "")
+        if d:
+            coll_by_dir[d] = {"file": fp.name, "stamp": blob.get("stamp"),
+                              "map_name": blob.get("map_name"),
+                              "source_id": blob.get("source_id"),
+                              "frames_total": blob.get("frames_total"),
+                              "ok": blob.get("ok"),
+                              "group_spread": blob.get("group_spread"),
+                              "selection": blob.get("selection")}
+
+    def _norm(x) -> str:
+        return str(x).replace(chr(92), "/")
+
+    def _collection_of(run_paths):
+        """候选的数据目录 -> 它来自哪次采集（按目录前缀匹配，不模糊猜）。
+
+        同一采集的多个视角目录要合并成一行：否则一次四视角采集会在页面上
+        显示成"来自采集"四遍，看起来像四次采集。
+        """
+        hits: dict = {}
+        # 先按路径去重：同一个目录可能同时出现在 candidate_runs 与
+        # baseline_runs 里（基线臂=候选臂的起点），不该被数成两个目录。
+        for rp in sorted({str(x) for x in (run_paths or [])}):
+            rpn = _norm(rp)
+            for d, rec in coll_by_dir.items():
+                dn = _norm(d)
+                if rpn == dn or rpn.startswith(dn + "/"):
+                    key = (str(rec.get("stamp")), str(rec.get("source_id")))
+                    if key in hits:
+                        hits[key]["n_dirs"] += 1
+                        hits[key]["matched_runs"].append(str(rp))
+                    else:
+                        hits[key] = {**rec, "n_dirs": 1,
+                                     "matched_runs": [str(rp)]}
+                    break
+        return list(hits.values())
+
+    for fp, blob in decisions:
+        if blob.get("_error"):
+            continue
+        runs = list(blob.get("candidate_runs") or []) + \
+            list(blob.get("baseline_runs") or [])
+        res = blob.get("paint_source_resolution") or {}
+        st["candidates"].append({
+            "file": fp.name,
+            "candidate_id": blob.get("candidate_id"),
+            "factor": blob.get("factor"),
+            "data_runs": [str(r) for r in runs],
+            "collections": _collection_of(runs),
+            "label": {
+                "declared": blob.get("paint_sources"),
+                "research_only": blob.get("research_only"),
+                "why": res.get("reasons"),
+            },
+            "protocol_hash": (blob.get("protocol") or {}).get("hash"),
+            "decision": (blob.get("decision") or {}).get("decision"),
+            "reasons": list((blob.get("decision") or {}).get("reasons") or []),
+            "skipped_factors": blob.get("skipped_factors"),
+            "data_factor_note": blob.get("data_factor_note"),
+        })
+    st["readable"] = True
+    return st
+
+
+def _timeline_view(ctx: dict) -> str:
+    """全流程时间线 + 候选反查（方案 §11 的验收动作）。"""
+    tl = ctx.get("timeline") or {}
+    ev = ctx.get("events") or {}
+    out = ['<section id="timeline"><h2>全流程时间线</h2>',
+           '<p class="hint">采集 → 审计 → 标注/复核 → 训练 → 评价 → 判定 → '
+           '下一轮。时间来自事件流；ID 与帧数来自采集/选样/判定产物；'
+           '读不到就写"没有记录"，不补 0。</p>']
+    rows = ['<table><tr><th>时间</th><th>阶段</th><th>状态</th>'
+            "<th>候选/数据集</th><th>说明</th></tr>"]
+    n_rows = 0
+    for e in (ev.get("events") or []):
+        stage = STAGE_OF_EVENT.get((e.phase, e.status))
+        if not stage:
+            continue
+        rows.append(
+            f'<tr><td class="mono">{_esc(e.ts)}</td><td>{_esc(stage)}</td>'
+            f'<td class="mono">{_esc(e.phase)}/{_esc(e.status)}</td>'
+            f'<td class="mono">{_esc(e.candidate_id or "")}'
+            f'{(" · " + _esc(e.dataset_id)) if e.dataset_id else ""}</td>'
+            f'<td>{_esc(e.note or "")}</td></tr>')
+        n_rows += 1
+    if n_rows:
+        rows.append("</table>")
+        out.append("".join(rows))
+    else:
+        out.append("<p>" + _unknown("事件流里没有可识别的阶段事件"
+                                    "（采集/审计/训练/评价/判定/暂停）",
+                                    level=LEVEL_TRAIN) + "</p>")
+    out.append("<h3>候选反查：它来自哪次采集、哪份标签</h3>")
+    if not tl.get("readable"):
+        out.append("<p>" + _unknown(
+            f"反查不可用：{tl.get('error') or '没有产物'}", level=LEVEL_TRAIN)
+            + "</p></section>")
+        return "".join(out)
+    if not tl.get("candidates"):
+        out.append("<p>" + _unknown("还没有判定文件，无法反查候选",
+                                    level=LEVEL_TRAIN) + "</p></section>")
+        return "".join(out)
+    for c in tl["candidates"]:
+        out.append(f'<h4 class="mono">{_esc(c.get("candidate_id") or "?")}</h4>')
+        rows2 = ['<table><tr><th>项</th><th>内容</th></tr>']
+        rows2.append('<tr><td>因子</td><td class="mono">'
+                     + _esc(json.dumps(c.get("factor"), ensure_ascii=False))
+                     + "</td></tr>")
+        if c.get("collections"):
+            for col in c["collections"]:
+                sp = col.get("group_spread") or []
+                cov = ""
+                if sp:
+                    cov = (f' · 覆盖比 {_esc(sp[0].get("coverage_ratio"))}'
+                           f'（{_esc(sp[0].get("extent_m"))} m）')
+                rows2.append(
+                    f'<tr><td>来自采集</td><td class="mono">'
+                    f'{_esc(col.get("stamp"))} · {_esc(col.get("map_name"))}/'
+                    f'{_esc(col.get("source_id"))} · '
+                    f'{_esc(col.get("frames_total"))} 帧 · 身份审计'
+                    f'{"通过" if col.get("ok") else "未通过"} · '
+                    f'{_esc(col.get("n_dirs"))} 个目录{cov}</td></tr>')
+        else:
+            rows2.append('<tr><td>来自采集</td><td>'
+                         + _unknown("这些数据目录没有对应的采集记录"
+                                    "（可能是早期数据或手工目录）",
+                                    level=LEVEL_TRAIN) + "</td></tr>")
+        lab = c.get("label") or {}
+        lab_txt = _esc(json.dumps(lab.get("declared"), ensure_ascii=False))
+        if lab.get("research_only"):
+            lab_txt += ' <span class="badge">research_only：不晋级</span>'
+        rows2.append(f'<tr><td>标签来源</td><td class="mono">{lab_txt}</td></tr>')
+        rows2.append('<tr><td>协议哈希</td><td class="mono">'
+                     + _esc(c.get("protocol_hash") or "未记录") + "</td></tr>")
+        rows2.append(f'<tr><td>判定</td><td><b>{_esc(c.get("decision") or "未判定")}'
+                     "</b>"
+                     + ("".join(f"<div>{_esc(r)}</div>"
+                                for r in (c.get("reasons") or []))
+                        or '<div class="hint">没有理由记录</div>')
+                     + "</td></tr>")
+        if c.get("skipped_factors"):
+            rows2.append('<tr><td>未采用的因子</td><td class="mono">'
+                         + _esc(json.dumps(c["skipped_factors"],
+                                           ensure_ascii=False))
+                         + "</td></tr>")
+        if c.get("data_factor_note"):
+            rows2.append('<tr><td>下一轮输入</td><td>'
+                         + _esc(c["data_factor_note"]) + "</td></tr>")
+        rows2.append("</table>")
+        out.append("".join(rows2))
+    out.append(f'<p class="hint">产物计数：采集记录 {tl.get("n_collections")} · '
+               f'选样 {tl.get("n_selections")} · 复核队列 '
+               f'{tl.get("n_review_queues")} · 判定 '
+               f'{len(tl.get("candidates") or [])}</p>')
+    out.append("</section>")
+    return "".join(out)
+
+
 def _decisions_view(ctx: dict) -> str:
     """决策与成对比较：逐 seed 值、差值、ci95、硬门 UNKNOWN、淘汰理由。"""
     st = ctx.get("decisions") or {}
@@ -1747,7 +1977,10 @@ def _decisions_view(ctx: dict) -> str:
             out.append('<p class="hint">硬门未测（UNKNOWN）: '
                        f'{_esc(", ".join(it["hard_unknown"]))}'
                        "——这些项没有测量，既不算通过也不算违反。</p>")
-            ledger = st.get("gpu_minutes") or {}
+        # 账本与"有没有 UNKNOWN 硬门项"无关：原来它缩进在 if 里面，于是
+        # 硬门全部测到的判定文件一渲染就 UnboundLocalError（实测：真 run 的
+        # 判定文件 hard_unknown 为空，看板直接崩）。
+        ledger = st.get("gpu_minutes") or {}
         if ledger:
             days = ", ".join(f"{d}: {v.get('minutes')} min"
                              for d, v in sorted(ledger.items()))
@@ -3486,6 +3719,7 @@ def build_context(args: argparse.Namespace) -> dict:
         "tasks": _task_state(
             Path(args.tasks) if getattr(args, "tasks", None) else None),
         "guard": _guard_state(run_dir),
+        "timeline": _timeline_state(run_dir),
     }
     return ctx
 
@@ -3503,6 +3737,7 @@ def render_html(ctx: dict) -> str:
         _tasks_view(ctx),
         _compare_view(ctx),
         _decisions_view(ctx),
+        _timeline_view(ctx),
         _final_view(ctx),
         _data_view(ctx),
         _resources_view(ctx),
