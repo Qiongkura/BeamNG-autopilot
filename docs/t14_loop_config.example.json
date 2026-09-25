@@ -1,45 +1,47 @@
 {
-  "_comment": "T14 后台循环配置样例。直接可用：collect=off（只用现有数据）。把 collect 改成 tech 之前必须先得到用户明确授权，并在 docs/T14_PROGRESS_20260924.md 记录授权范围与时间；方案 §136 规定这两项未定前不得启动后台采集或常驻训练。",
-  "_pending_user_params": {
-    "1_collect_authorisation": "是否允许无人值守时自动启动 BeamNG.tech 采集（当前 off）",
-    "2_budget_window": "空闲时间窗 / 每日 GPU 时长上限 / 用户使用电脑时是否立即暂停（建议 00:00-08:00 / 120 min/日 / 立即暂停）"
-  },
-  "dataset_manifest": "logs/experiments/t14_loop/dataset.json",
-  "experiments_root": "logs/experiments",
-  "collect": "off",
-  "daily_gpu_minutes": 120.0,
-  "max_wall_minutes": 180.0,
-  "window_start_hour": 0,
-  "window_end_hour": 8,
-  "pause_while_user_active": true,
-  "min_free_vram_mb": 2048.0,
-  "min_free_disk_gb": 20.0,
-  "max_candidates": 6,
-  "max_rounds_without_gain": 3,
-  "seeds": [
-    42,
-    43,
-    44
-  ],
-  "dry_run": true,
-  "python": "",
-  "runs": [
-    "logs/m5_seg/diverse_town_20260924/front_main",
-    "logs/m5_seg/diverse_straightstreet_20260924/front_main"
-  ],
-  "baseline_runs": [
-    "logs/m5_seg/diverse_town_20260924/front_main"
-  ],
-  "eval_runs": [
-    "logs/m5_seg/diverse_wide_20260924/front_main",
-    "logs/m5_seg/diverse_plain_20260924/front_main"
-  ],
-  "proposals": "logs/experiments/t14_3h_20260924_1906/proposals_manual_data_factor.json",
-  "rounds": 2,
-  "epochs": 3,
-  "batch": 4,
-  "lr": 0.001,
-  "allow_road_only": true,
-  "equal_steps": true,
-  "trainer_script": "m5_train_seg.py"
+ "_comment": "T14 后台循环配置样例。直接可用：collect=off（只用现有数据）。把 collect 改成 tech 之前必须先得到用户明确授权，并在 docs/T14_PROGRESS_20260924.md 记录授权范围与时间；方案 §136 规定这两项未定前不得启动后台采集或常驻训练。",
+ "_pending_user_params": {
+  "1_collect_authorisation": "已授权（2026-09-25）：允许无人值守启动 BeamNG.tech 采集；collect=tech 时生效",
+  "2_budget_window": "空闲时间窗与活动暂停：仍未指定（当前 0-24 全天、不做活动检测）",
+  "3_daily_gpu_cap": "每日 GPU 上限：用户 2026-09-25 明确「不用限制 120min，只要没说就可以用」→ 0 = 不设上限；上限机制保留，填数字即收紧"
+ },
+ "dataset_manifest": "logs/experiments/t14_loop/dataset.json",
+ "experiments_root": "logs/experiments",
+ "collect": "off",
+ "daily_gpu_minutes": 0.0,
+ "max_wall_minutes": 180.0,
+ "window_start_hour": 0,
+ "window_end_hour": 8,
+ "pause_while_user_active": true,
+ "min_free_vram_mb": 2048.0,
+ "min_free_disk_gb": 20.0,
+ "max_candidates": 6,
+ "max_rounds_without_gain": 3,
+ "seeds": [
+  42,
+  43,
+  44
+ ],
+ "dry_run": true,
+ "python": "",
+ "runs": [
+  "logs/m5_seg/diverse_town_20260924/front_main",
+  "logs/m5_seg/diverse_straightstreet_20260924/front_main"
+ ],
+ "baseline_runs": [
+  "logs/m5_seg/diverse_town_20260924/front_main"
+ ],
+ "eval_runs": [
+  "logs/m5_seg/diverse_wide_20260924/front_main",
+  "logs/m5_seg/diverse_plain_20260924/front_main"
+ ],
+ "proposals": "logs/experiments/t14_3h_20260924_1906/proposals_manual_data_factor.json",
+ "rounds": 2,
+ "epochs": 12,
+ "batch": 4,
+ "lr": 0.001,
+ "allow_road_only": true,
+ "equal_steps": true,
+ "trainer_script": "m5_train_seg.py",
+ "_epochs_note": "平台期依据：同配方 3 epoch（15 步）时 road_iou 只在平凡基线附近抖动（±0.26），12 epoch（60 步）收敛到 ±0.03 并比平凡基线高 +0.47（见 docs/T14_VARIANCE_ATTRIBUTION_20260924.md 结论 2b）。换数据后要重测平台期；未到平台期的判定只算暂行。"
 }

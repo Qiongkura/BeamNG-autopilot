@@ -157,7 +157,7 @@ CUDA 上无法逐位：`nll_loss2d`（本项目交叉熵）**没有确定性实�
 | 手工标注集的**可信身份** | **缺口（已定量）** | 28 个带 `map_name` 的目录只有 8 个有来源；20 个（2508 帧）无来源、5 个目录名与 `italy` 矛盾；48 帧人工修订因无身份被拒且**不可恢复**（见 3h 轮 `report.md` 结论 1–4） |
 | 3h 轮的训练臂（步骤 3/5） | **未开始（停止门）** | 数据准入门不通过：无"带身份 + 可信漆线真值"的数据；按纪律不开训练 |
 | 训练器"整条标线通道忽略" | **已实现** | `masked_cross_entropy`（移出 softmax 分母、梯度恒为 0）+ `--ignore-line-class`（审计驱动）+ 评估补 `road_iou`；真实两臂 3 seed 已跑（机制测试，因果结论 needs_evidence：非等步数） |
-| 引擎 line 类作为漆线真值 | **不可用（已量化）** | 三条开发路引擎线像素左/右 = 0.021/0.234/0.193；`diverse_wide` 19/30 帧左侧为 0；放大图里**沥青上的白色左边缘线没有引擎标注**。→ 身份率/假线比在"无参考侧"一律 UNKNOWN（268 个未匹配候选中 102 个属此类），列 `review_queue_candidates.json` |
+| 引擎 line 类作为漆线真值 | **存在但不完整（2026-09-25 更正）** | 6 采集×8 帧逐帧统计 + 目视：引擎线像素覆盖 RGB 漆线候选 ~0.61（precision ~0.68），落在可见漆线上——**不是「line 类为空」**（旧结论来自更早的不同配置，已不再传播）。→ 不能当门槛真值（未标注的漆线会被算成假阳），但可作**弱监督**：`engine_annotation_partial`（valid=False, usable=True）+ `--research-arm`；实测把 line IoU 从 0 提到 0.13–0.32，硬门首次有了实数（recall 0.728 / precision 0.262 / offroad 0.203 / identity 0.149） |
 
 ---
 
@@ -176,6 +176,10 @@ CUDA 上无法逐位：`nll_loss2d`（本项目交叉熵）**没有确定性实�
 ---
 
 ## 6. 卡在用户侧的唯一事项（T14 §136）
+
+> **2026-09-25 更新**：第 1 项（无人值守采集）**已授权并已接通**，实测采到 2 组新路段；
+> 第 2 项（窗口/上限/暂停）用户仍未指定，本轮按宽松默认跑（见文末 §10）。
+
 
 阶段 E（新数据闭环）与 F（驾驶晋级）**未测**，因为没有这两项授权（已问过两次，未答复，按默认继续）：
 
@@ -255,3 +259,123 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\dev_validate.ps1
 | 冻结阈值与运行配置 | `docs/t14_thresholds_v2.json`、`docs/t14_loop_config.example.json` | — |
 | 本轮 16 个缺陷的证据 | 各提交信息 + §3.2 表 | `git log --oneline -20` |
 | 3 小时计划轮（停止门 + 身份修复 + rounds 接线） | `docs/T14_PROGRESS_20260924.md` 结论 9/10 | `logs/experiments/t14_3h_20260924_1906/`（`report.md` 八项、`02_dataset_audit.json`、`03_needs_review.json` 48 帧、`04/05` 身份证据、`06/07/08` 回归门日志） |
+
+---
+
+## 10. 2026-09-25 增补：无人值守采集轮（授权 E 之后）
+
+### 10.1 授权变化
+
+用户明确授权"允许无人值守启动 Tech 采集"（原话与范围见
+`docs/T14_PROGRESS_20260924.md` §4）。授权**只**放开自动启动游戏，不放开
+"把未人工修订的采集当真值"、不放开"少一道检查"、不放开生产权重替换。
+空闲窗口/每日上限/暂停三项用户未指定，本轮取宽松默认并在配置里显式写明。
+
+### 10.2 采集实测（全部无人值守，入口自己开游戏）
+
+| 时间戳 | rc | 结果 | 帧数 | 漆线帧 | 身份来源 |
+| --- | --- | --- | --- | --- | --- |
+| 20260925_120849 | 1 | 拒收（空目录） | 0 | 未测 | 系统 Python 无 `beamngpy`（缺陷 24） |
+| 20260925_121116 | 0 | 通过 | 120（4×30） | 30/30/17/17 | `session.get_current().level` |
+| 20260925_121718 | 0 | 通过 | 120（4×30） | 30/30/28/5 | `session.get_current().level` |
+
+起点用 `--collect-teleport` 接在上一次采集的终点，三段路相邻不重叠
+（第 2 次实测走 57 m）。复核队列按**每视角漆线像素前 15 帧**产出（只看总榜会被
+前向视角占满，左右侧视角是横向研究的证据来源）。
+
+### 10.3 四轮两臂对照（数据/预算因子，road-only，开发集 = wide + plain）
+
+| 轮 | 因子 | seed | epoch | 两臂步数 | 平台期 | 配对差均值 | 判定 |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| 1 | 加第 3 次采集（4×30 帧） | 3 | 12 | 60/60 | **否** | -0.01903 | rejected（**暂行**） |
+| 2 | 加第 2 次采集（30 帧） | 3 | 24 | 120/120 | 是 | +0.00583（ci95 ±0.0074） | rejected（硬门 UNKNOWN + inconclusive） |
+| 3 | 同第 2 轮，补 seed | 5 | 24 | 120/120 | 是 | +0.00476（ci95 ±0.0079） | 同上（要 **14** 个 seed 才判得出） |
+| 4 | **训练预算 24→48 epoch**（数据不动） | 5 | 24/48 | 120/240 | 是 | **+0.0092**（ci95 ±0.0078，5/5 非负） | `candidate_better`（**可引用**；硬门仍 UNKNOWN 故正式判定 rejected） |
+| 5 | **训练预算 48→96 epoch**（数据不动） | 5 | 48/96 | 240/480 | **否**（seed46 spread 0.33） | +0.0042（ci95 ±0.0078） | `inconclusive`（需 18 个 seed；**暂行**） |
+| 6 | **容量 width 1.0→2.0**（数据/步数/lr 都不动，参数 ×3.99） | 5 | 48/48 | 240/240 | — | +0.0039（ci95 ±0.0135）/ best 口径 −0.0057 | `inconclusive`（需 61 / 10 个 seed；两口径均值**符号相反**） |
+| 6b | **同 6 的独立重跑**（缺陷 30/31 修好后，正式判定落盘） | 5 | 48/48 | 240/240 | **两臂都到** | +0.00056（ci95 ±0.01119） | `rejected`（4 项硬门 UNKNOWN + inconclusive）——**复现了「容量不是杠杆」** |
+
+**结论（可引用）**：
+
+1. **单段新数据不是杠杆**：24 epoch 到平台期后效应量 **<1 个点且跨 0**，按当前 sd
+   需要 14 个 seed；继续加 seed 是给噪声烧 GPU（`seeds_needed_for_effect` 事前就把
+   这笔账算出来了）。第 1 轮那条 -0.019 之所以不能引用，正是因为它没到平台期。
+2. **训练预算才是杠杆，但有饱和点**：同样数据、同样开发集，24→48 epoch
+   （120→240 步）拿到 **+0.0092**（ci95 ±0.0078，5 个 seed 全非负，`candidate_better`，
+   只需 4 个 seed 即可判定）；再翻倍到 96 epoch（480 步）**没有可判定增益**
+   （+0.0042，需 18 个 seed，`inconclusive`）。→ **收益台阶在 120–240 步之间。**
+   第 5 轮还出现一个 seed 的末段大跳（spread 0.33）→ 该轮按纪律算暂行，
+   且说明"跑更久不一定更稳"。
+3. **"到平台期"≠"没有提升空间"**：24 epoch 时轮内 spread 已 ≤0.0133，但翻倍步数后
+   整体又上一个台阶——`all_at_plateau` 说明的是"轮内波动小、样本量够判"，不是"已最优"。
+4. **模型在进步，但按现行规则不能晋级**：硬门 4 项（标线/身份）没有测量（road-only），
+   正式判定一律 `rejected`。补标线真值（任务包见项目报告 §10.6）是唯一的解锁动作。
+
+### 10.4 新增缺陷（编号接 §3.2）
+
+| # | 缺陷 | 触发证据 | 修法 |
+| --- | --- | --- | --- |
+| 24 | **采集子进程用系统 Python** | `sys.executable` 没有 `beamngpy`：白起一局、rc=1、被身份审计拒收（闸门拦住了脏数据，但这轮时间白花） | `collector_python()`（配置 > 项目 venv > sys.executable，带来源）+ 启动前 `python_can_import()`，问不过就不启动（rc=6）；来源写进记录 |
+| 25 | **游戏进程名只按 Steam 版写** | Tech 的进程是 `BeamNG.tech.x64.exe`；只查 `BeamNG.drive.x64.exe` 会在别人开着 Tech 时报"没在跑"→ 去抢一个正在用的端口 | `GAME_IMAGES` 补齐并加测试钉住 |
+| 26 | **采集输出被父进程用管道收走** | 游戏继承了子进程 stdout 的写端：采集进程已退出、120 帧与 meta 都落盘，父进程仍在 `communicate()` 等 EOF → 实测卡 30 分钟到超时 | 输出重定向到 `<run>/collect_<stamp>.log`（文件句柄不被孙子进程拖住）；日志路径与尾巴进记录 |
+| 27 | **看板把"没有帧"写成 0** | 被拒收的采集（0 帧）漆线帧列显示 `0`，而 0 帧是**未测** | 三态：有帧无漆线写 `0（有帧但都没有漆线像素）`；一帧都没有写 `未测（一个帧都没有，不是 0）`；加看板测试 |
+| 28 | **因子改了轮数，判定却写基线轮数** | `epochs` 属 `TRAINER_FLAG_FACTORS`，候选臂实际跑 48 而判定文件写 24（记录与实际不一致） | `factor_epochs()` 从旗标里取实际值进判定；加测试 |
+
+| 29 | **采集结束后自己启动的游戏没关** | 采集器只关连接、进程留着：一局游戏 4.4 GB 显存从 12:17 挂到 13:50，期间第 3/4/5/6 轮的吞吐被拖慢一个量级、推理 p95 被污染，而那段时间不计 GPU 账 | `close_started_game()`：只结束**本次采集期间新出现**的游戏进程（差集，用户自己的会话永远不在里面）；进程列表探测不确定时**拒绝杀**并记原因；`game_pids_before`/`game_after_collect` 进产物（提交见 §10.7） |
+| 30 | **容量臂的 checkpoint 装不进评估链** | ① `Segmenter` 按默认宽度建 `SegUNet`，width=2 的权重一片 size mismatch → 整轮判定崩在写盘前；② `best.pt` 只存 state_dict + 一小撮字段，**缺 `arch_args`**，所以 width=2 的 best.pt 根本无法加载 | ① 评估链从 `train_args.arch_args.width` 建模型（缺字段按 1.0，与老权重逐位一致），结构不符给清楚报错；② 训练器 `best.pt` 改为与本轮 `checkpoint_last.pt` **同一份 payload** + `checkpoint_kind: best` + 该轮验证读数 |
+| 31 | **平台期结论在写判定时未定义** | `all_at_plateau` 的赋值被放在判定字典**之后** → 写盘那行 `UnboundLocalError`：训练全跑完却拿不到判定（第 6 轮白花 15 min GPU） | 赋值提到写判定之前；新增"整轮真的走到写判定"的回归（`tests/_stub_trainer_e2e.py` 桩训练器写合法 checkpoint + hist） |
+| 32 | **平台期守卫只看候选臂** | 只判候选臂时，"候选更好"可能只是候选训得更久（第 5 轮 96-epoch 臂 seed46 末段 spread 0.33 就是这种不稳定） | 两臂都判：`plateau_baseline_by_seed` 进判定；`all_at_plateau` 需两臂都过（缺测记 UNKNOWN，不当通过）；警告分别列出两臂仍动的 seed |
+
+| 33 | **每日 GPU 上限按 run 记账，换 run-id 就归零** | 今日实测：同一个 run-id 三次尝试累计 60.7 min，而另一个 run-id 看自己的账本是 0 —— "这台机器今天跑了多少"从来没被约束过 | `add_gpu_minutes` 同时写**机器级账本** `logs/experiments/gpu_ledger_machine.json`（含各 run 分项）；资源门取 `max(命令行, 本 run, 机器合计)`，并在入口打印两者；加测试（跨 run 累加、机器合计超限即拒绝训练） |
+
+| 34 | **后处理延迟取决于预测内容，p95 被「碎掩码」帧撑爆** | 逐 stage 实测：`constrain_line_to_road` 对每个连通域做 `labels == i`（每块扫全帧）→ 掩码碎成上千块的帧上 59 ms/帧、整条链 p95 121.7 ms；同架构不同 seed 的 p95 差 8.7 倍 | 判据不动，换成一次 `np.bincount` 直方图 + LUT（包围盒取连通域 stats）：1118 块上 181→**3.3 ms**、端到端 p95 121.7→**14.4 ms**、跨 seed 离散 8.7×→**1.03×**；与参考实现逐位一致（含 `elongated_frac=None/0.0` 两个语义）+ 回归测试 |
+
+| 35 | **标线质量被「不完整真值」系统性压低** | 同一批模型在引擎弱真值下 line IoU 只有 0.13–0.32、precision 0.26；逐帧核对后发现弱真值漏标约四成漆线，把**正确预测算成假阳** | 逐帧核对式标注（`agent_revision`：引擎标线∪细长亮条，宽亮带判背景，碎亮斑写 255=ignore，32 帧 4 视角逐帧目视复核并修掉 pillar_right 一处假阳）→ 换真值后同一批模型 **line IoU 0.50–0.58 / precision 0.57–0.65 / recall 0.77–0.85**，路外假线仅 1–2%（每帧 44–99 px）。来源 rank=`agent`：可训练可测，**晋级仍需人确认** |
+
+### 10.5 配方确定性与 OOM（计划 §7 第 4 条，已做完）
+
+* **CUDA + `--deterministic` 直接失败**（不是变慢）：`nll_loss2d_forward_out_cuda_template
+  does not have a deterministic implementation`（masked CE 走 `nll_loss2d`），rc=1。
+* **CPU**：38.2 s → 41.0 s（+**7.3%**），同一份数据 GPU 只要 8.5 s（CPU 约慢 4.5×）。
+* **OOM 注入**：`tests/test_seg_training_failure_recording.py` 钉住"异常退出必须写
+  `failed` 任务记录、失败记录里不许写 0 分、留痕失败不能掩盖原异常"。
+
+### 10.6 下一步优先级（替换 §7 的旧清单）
+
+1. **人工修订标线真值**（唯一能解锁晋级的动作）：任务包
+   `logs/m5_seg/annotate_pkg_20260925/`（32 帧 = 4 视角 × 8，身份齐全，两条命令即可开工）。
+   画完就能第一次**测**标线指标，硬门才会有实数。
+2. **模型侧三条杠杆都已测到边界，下一步换方向**：单段新数据 +0.005（需 14 seed）、
+   预算 120→240 步 **+0.0092（可判定）**、240→480 步 +0.004（需 18 seed）、
+   容量 width×2 +0.004/−0.006（需 61/10 seed，两口径符号相反）。
+   → 可判定的只有"把预算从 120 步翻到 240 步"这一条；**再调这三个旋钮都是给噪声烧 GPU**。
+   下一步要么补标线真值（换指标口径，也是晋级的唯一出路），要么换**输入/任务**
+   （多视角、时序），而不是继续调数据量/步数/宽度。
+3. **评估口径已复核并维持 `last`**：两种口径在两个 run 上判定一致；`best` 会按训练内
+   验证集逐臂选 epoch（多一层选择自由度，且 ci95 变小是选择带来的方差收缩，不是测得更准）。
+   要切换得先做成显式开关，不能顺手改（改了与前 6 轮不可比）。
+3. **跨 seed 稳定性**（0.8927–0.9283）：同配方跨 seed 散布仍未解；需要"最差 seed 报告"
+   口径与更多路段的训练数据。
+4. **延迟：已定位并修掉（见 §10.4 缺陷 34）**。静默协议重测证明了跨 seed 9.7 倍的漂移
+   是真的（同 seed 三次重复 ≤1.3 倍），逐 stage 拆开发现全在**后处理**：纯前向所有 seed
+   都是 4.2–4.3 ms，而 `constrain_line_to_road` 对每个连通域做 `labels == i`（每块扫全帧），
+   碎掩码帧上 59 ms/帧。向量化（直方图 + LUT，判据逐位不变）后端到端 p95
+   **121.7 → 14.4 ms**、跨 seed 离散 **8.7× → 1.03×**——延迟不再取决于模型预测得多碎。
+   另：采集后**必须关掉自己启动的游戏**（缺陷 29），否则游戏会一直占 GPU 并污染后续计时。
+5. 采集若继续跑：每轮换一段没采过的路（起点取上一轮终点），并把"哪些路段的什么数据
+   能提升"做成可比较的序列，而不是单点结论。
+
+### 10.7 证据索引（本轮）
+
+| 主题 | 产物 |
+| --- | --- |
+| 无人值守轮报告（八项 + 六步协议） | `logs/experiments/t14_auto_20260925/report.md` |
+| 采集记录与复核队列 | `logs/experiments/t14_auto_20260925/collect_*.json`、`review_queue_collect_*.json`、`logs/m5_seg/collect_t14_auto_20260925_*/` |
+| 四轮判定 | `logs/experiments/t14_auto_20260925{,_r2,_r3}/decision_*.json`、`t14_auto_20260925_steps/` |
+| 采集/训练代码与测试 | `beamng_autopilot/experiments/collection.py`、`scripts/m5_seg_autoloop.py`、`scripts/m5_annotate_package.py`、`tests/test_experiments_collection.py`、`tests/test_seg_collect_unattended.py`、`tests/test_annotate_package.py` |
+| 确定性/速度实测 | `logs/experiments/t14_perf_det/`（`train_on.log` 的 RuntimeError、CPU 两次计时） |
+| 人工修订任务包 | `logs/m5_seg/annotate_pkg_20260925/`（README + 32 帧） |
+| agent 核对式标线真值（32 帧 4 视角） | `logs/m5_seg/line_truth_agent_20260925/`（含 README：画法、逐帧复核结论、升级成 human_revision 的命令） |
+| 容量对照（width 1.0 vs 2.0） | `logs/experiments/t14_auto_20260925_width2/`（`eval_criterion.json`、`DECISION_MISSING.md`）与 `..._width2b/`（**正式判定** `decision_width2-r0.json`，独立复现） |
+| 计时复核（静默协议 + 后处理分解） | `logs/experiments/t14_auto_20260925/timing_retest_round3.json`、`report.md` §12 |
+| 评估口径对照（last vs best） | `logs/experiments/t14_auto_20260925_width2/eval_criterion.json`、`..._steps96/eval_criterion.json`、`report.md` §14 |

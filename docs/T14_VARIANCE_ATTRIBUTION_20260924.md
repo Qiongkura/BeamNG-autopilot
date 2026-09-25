@@ -55,6 +55,38 @@
   （全背景预测 → IoU 0，且 recall 无分母）已在 `totals_to_metrics` 里体现，
   但**可信标线真值到位前不退结论**（第 1 项）。
 
+## 结论 2b（补跑）：把基线训到 **12 epoch**，它才真的学会，而且到平台期后测量稳定
+
+- **原假设**：15–30 步的读数已经算"学到一些路面"。
+- **是否激活**：激活。同配方、同数据（`diverse_town`，20 训练帧）、同 batch，
+  只把 **epochs 3 → 12**（15 → 60 步），三个 seed 各跑一遍（共 3 次训练）。
+- **可复现输入**：`logs/experiments/t14_baseline_plateau/`（含逐 epoch checkpoint）；
+  分析 `logs/experiments/t14_variance/plateau_baseline.json`；命令：
+  ```pwsh
+  .venv\Scripts\python.exe scripts\m5_train_seg.py `
+      --runs logs\m5_seg\diverse_town_20260924\front_main --split tail --val-frac 0.2 `
+      --epochs 12 --batch 4 --lr 1e-3 --seed 42 --device cuda --save-every-epoch `
+      --ignore-line-class --line-tversky-weight 0 --line-cldice-weight 0 `
+      --out logs\experiments\t14_baseline_plateau\seed42
+  ```
+- **实测结果**（`road_iou`，平凡基线 0.40245）：
+
+  | epoch | 3 | 4 | 6 | 8 | 10 | **12** |
+  | --- | --- | --- | --- | --- | --- | --- |
+  | seed44 | 0.424 | 0.577 | 0.667 | 0.746 | 0.849 | **0.876** |
+  | seed43 | 0.430 | — | — | — | — | **0.9035** |
+  | seed42 | 0.424 | — | — | — | — | **0.876** |
+
+  三个 seed 在最后一轮收敛到 **0.876 / 0.9035 / 0.876（±0.03）**；
+  分解仍是"seed 内 96%"，但那已经是**单调的学习进程**而不是噪声。
+- **结论**：**支持**"训练太短"是主因。**3 epoch 的读数（0.42 ≈ 平凡基线 +0.02）
+  说明模型当时什么都没学会**——此前所有两臂比较（+0.1476 / +0.0401 / +0.0389 /
+  +0.0068）都发生在**瞬态区间**，作为"因子效果"的科学结论**作废**（机制结论仍有效）。
+  平台期判据：最后 3 轮验证指标变化 ≤ 0.02。
+- **未知与下一步**：12 epoch 是否是"够用"的步数，取决于数据量；换数据后要重测平台期。
+  `rounds` 现在会把 `plateau_by_seed` / `all_at_plateau` 写进判定，未到平台期时打印
+  警告并把该轮标记为**暂行判定**。
+
 ## 结论 3：`0.0` 不是"较差的模型"，而是**塌陷输出**；三次运行都没到平台期
 
 - **原假设**：0.0 只出现在少数帧（少数场景主导）。
