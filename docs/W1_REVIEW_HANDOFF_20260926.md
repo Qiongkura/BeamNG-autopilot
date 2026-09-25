@@ -5,6 +5,36 @@ E1（Tversky 复验）、E3（有证据的困难负例）、覆盖率/逐场景�
 
 ---
 
+## 0. 立刻开始（三条命令）
+
+```pwsh
+[Console]::OutputEncoding = [Text.Encoding]::UTF8
+Set-Location -LiteralPath 'I:\projectseamng-autopilot'
+
+# 1) 先看会执行什么（不开窗口）：确认包、帧数、类别、输出路径
+pwsh -NoProfile -ExecutionPolicy Bypass -File scriptsnnotate_review_pack.ps1 -List -Reviewer <你的名字>
+
+# 2) 真开始（逐个包；关掉一个窗口自动进下一个；14 帧）
+pwsh -NoProfile -ExecutionPolicy Bypass -File scriptsnnotate_review_pack.ps1 -Reviewer <你的名字>
+
+# 3) 只想做某几个包
+pwsh -NoProfile -ExecutionPolicy Bypass -File scriptsnnotate_review_pack.ps1 -Reviewer <你的名字> -Only pkg_town,pkg_plain
+```
+
+**键位**：`1`=line · `2`=road · `3`=背景/擦除 · `b` 画笔/填充切换 · `u` 撤销 ·
+`c` 清空 · `a` 上一帧 · `s` **保存并下一帧** · `q` 退出。画完一帧按 `s` 才算数。
+
+**输出**：写到新目录 `logs\experimentseview_pack_20260926eviewed\<包名>ront_main\`
+（源包不动，事后按两个目录算输入/输出哈希与差异）；每帧保存时写 `meta.json`，
+里面记 `annotation.reviewer`、`annotated_at`、`class_source=human_revision` 与逐帧
+`classes_painted`——这就是"谁、何时、对哪些类别复核过"的查询来源。
+
+**预填模型**：默认用 `t14_e0_20260925/seed43/checkpoint_last.pt` 预填（省时间），
+但**建议对"真无线铺装路/易混淆纹理"那几帧用 `-NoPrefill` 空白画**——那几帧要测的
+正是模型的错，预填会诱导你确认它画出来的假线。整包空白画也可以（只有 14 帧）。
+
+---
+
 ## 1. 现在就能打开的东西
 
 | 内容 | 路径 |
