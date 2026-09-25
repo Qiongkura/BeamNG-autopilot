@@ -45,9 +45,9 @@ from beamng_autopilot.experiments.final_set import (  # noqa: E402
     confirmation_check,
 )
 from beamng_autopilot.experiments.gates import (  # noqa: E402
-    HARD_CHECKS, SCENE_HARD_FIELDS, Thresholds, decide, missing_metrics_for,
-    paired_compare, per_seed_gate_violations, per_seed_missing, scene_report,
-    threshold_violations,
+    HARD_CHECKS, SCENE_HARD_FIELDS, Thresholds, decide, hard_split,
+    missing_metrics_for, paired_compare, per_seed_gate_violations,
+    per_seed_missing, scene_report, threshold_violations,
 )
 from beamng_autopilot.experiments.manifest import (  # noqa: E402
     DatasetManifest, dir_group,
@@ -1629,6 +1629,34 @@ def resolve_paint_sources(args) -> dict:
                             "effective": eff, "rank": rank,
                             "eligibility": eligibility(rank),
                             "can_promote": bool(ok), "notes": notes}
+    # 评价侧的资格**必须读 eval 目录自己的凭证**（方案 §6.1 / A1：agent 评价
+    # 标签**漏传** research 标志仍不能晋级）。原来只遍历 `--paint-source`：
+    # 不带这个参数时，agent 起草的评价真值会被当成可晋级参考——实测踩到
+    # （E2 那轮 research_only=False，而 wide/plain 的评价标签是 agent 档）。
+    for run in list(getattr(args, "eval_runs", None) or []):
+        key = str(run)
+        cred = read_dir_credentials(run)
+        cred_src = None if cred is None else str(cred.get("label_source") or "")
+        eff, notes = effective_source("", cred_src)
+        rank = PAINT_SOURCE_RANK.get(eff, "absent")
+        ok, why = sources_can_promote([eff])
+        if cred is None:
+            out["missing_credentials"].append(key)
+        if not ok:
+            out["research_only"] = True
+            out["reasons"].append(
+                f"{key}: evaluation reference source {eff!r} (rank {rank}) "
+                f"cannot be used as a promotion reference")
+        for n in notes:
+            out["notes"].append(f"{key}: {n}")
+        out["runs"].setdefault(key, {
+            "declared": "", "credential": cred_src,
+            "credential_path": (cred or {}).get("path"),
+            "credential_frames": (cred or {}).get("frames"),
+            "effective": eff, "rank": rank,
+            "eligibility": eligibility(rank),
+            "can_promote": bool(ok), "notes": notes,
+            "role": "evaluation_reference"})
     return out
 
 
@@ -2115,6 +2143,9 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
             print(f"[rounds] 来源资格：{_r}")
         # 分场景：跨 seed 汇总**每个场景自己的最差**——同一场景在不同 seed 的
         # 表现不能被平均掉（方案 §10.2：关键场景不允许被总体均值抵消）。
+        # road-only：标线/身份整通道屏蔽，逐 seed 与分场景只查可测口径
+        _pf = ("inference_ms_p95",) if road_only else None
+        _sf = (("inference_ms_p95",) if road_only else SCENE_HARD_FIELDS)
         per_scene: dict = {}
         for _ss in scene_by_seed.values():
             for _g, _sv in _ss.items():
@@ -2124,7 +2155,7 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                         continue
                     if cur is None or float(_v) < float(cur):
                         per_scene[_g][_k] = _v
-        _scene = scene_report(per_scene, t)
+        _scene = scene_report(per_scene, t, fields=_sf)
         # 分场景候选口径（匹配率/覆盖/左右角色）：**只上报不进硬门**——
         # 单场景候选数可能只有几个，逐场景身份门槛尚未标定（方案 §10.2）。
         _scene_keys = sorted({g for d in scene_ident_by_seed.values()
@@ -2139,11 +2170,20 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                                   for d in scene_ident_by_seed.values()])
                 for f in _cand_fields}
         # 缺测与硬门：总体、逐 seed、分场景三路都要进来（方案 §10.2/A7）
+        # 缺测与违反**分两路**（方案 §10.3 的判定顺序）：池化的硬门输入里
+        # 没测到的项原来被 threshold_violations 写成"违反"，于是 road-only
+        # 实验（标线整通道屏蔽、指标本就未测）被判成 rejected，读起来像"候选
+        # 不合格"，实际是"没测"——代码注释本来就写着"记 None 避免被硬门当违反"，
+        # 这里把注释兑现：缺测走 missing_metrics -> needs_evidence。
+        _hs = hard_split(hard, t)
         _missing = missing_metrics_for(
             paired, coverage_gate_frozen=COVERAGE_GATE_FROZEN)
-        _missing += per_seed_missing(hard_by_seed, t) + _scene["missing"]
-        _violations = (threshold_violations(hard, t)
-                       + per_seed_gate_violations(hard_by_seed, t)
+        _missing += [f"{n}: UNKNOWN (hard gate needs a measurement)"
+                     for n in _hs["missing"]]
+        _missing += per_seed_missing(hard_by_seed, t, fields=_pf)
+        _missing += _scene["missing"]
+        _violations = (_hs["violations"]
+                       + per_seed_gate_violations(hard_by_seed, t, fields=_pf)
                        + _scene["violations"])
         if _scene["violations"]:
             print(f"[rounds] 逐场景硬门不通过：{len(_scene['violations'])} 条"

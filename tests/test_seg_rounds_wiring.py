@@ -856,6 +856,84 @@ def test_a_final_confirmation_that_does_not_match_is_rejected(tmp_path):
     assert blob["decision"]["decision"] == "rejected", blob["decision"]
 
 
+def test_a_masked_channel_is_missing_evidence_not_a_violation():
+    """road-only：标线整通道屏蔽 -> 标线指标"未测" -> needs_evidence。
+
+    实测踩到（E2 那轮）：池化硬门把 None 写成 "UNKNOWN (hard gate needs a
+    measurement)" 塞进**违反**通道，判定成 rejected——读起来像"候选不合格"，
+    实际是"这个通道没测"（代码注释本来就写着记 None 是为了不被当违反）。
+    同时逐 seed / 分场景在屏蔽模式下只查可测口径，否则模型"没画线"的近零读数
+    会被当成逐 seed 违反。
+    """
+    loop = _load()
+    t = loop.Thresholds()
+    hard = {"line_recall": None, "line_precision": None,
+            "offroad_false_ratio": None, "candidate_identity_rate": None,
+            "inference_ms_p95": 18.0}
+    sp = loop.hard_split(hard, t)
+    assert sp["violations"] == [] and len(sp["missing"]) == 4, sp
+    per_seed = {"42": {"line_recall": 0.002, "inference_ms_p95": 18.0}}
+    masked = ("inference_ms_p95",)
+    assert loop.per_seed_gate_violations(per_seed, t, fields=masked) == []
+    assert loop.per_seed_missing(per_seed, t, fields=masked) == []
+    # 不限制字段时，屏蔽通道的近零读数会被当违反（这就是 road-only 下的假 rejected）
+    assert loop.per_seed_gate_violations(per_seed, t), "反例不成立"
+    dec = loop.decide(
+        pairings={"road_iou": loop.paired_compare("road_iou", [0.90] * 5,
+                                                  [0.88] * 5)},
+        thresholds=t,
+        missing_metrics=[f"{n}: UNKNOWN (hard gate needs a measurement)"
+                         for n in sp["missing"]],
+        hard_gate_violations=sp["violations"])
+    assert dec["decision"] == "needs_evidence", dec
+    assert any("UNKNOWN" in r for r in dec["reasons"]), dec["reasons"]
+
+
+def test_the_evaluation_reference_credentials_decide_eligibility(tmp_path):
+    """A1 反例：**漏传** --paint-source 时，agent 评价真值仍不能晋级。
+
+    实测踩到（E2 那轮）：资格原来只遍历 `--paint-source`，于是不带这个参数时
+    wide/plain 的 agent 起草评价真值被当成可晋级参考，判定写 research_only=False。
+    现在评价侧直接读 eval 目录自己的凭证（self -> parent）。
+    """
+    loop = _load()
+    dev = _agent_dir(tmp_path, "coll_eval_cred")   # annotation.json: agent_revision
+
+    class A:
+        paint_source = None
+        eval_runs = [str(dev)]
+
+    res = loop.resolve_paint_sources(A())
+    assert res["research_only"] is True, res
+    assert any("evaluation reference" in r for r in res["reasons"]), res
+    entry = res["runs"][str(dev)]
+    assert entry["rank"] == "agent" and entry["can_promote"] is False, entry
+    assert entry.get("role") == "evaluation_reference", entry
+
+    # 人工修订的凭证 -> 可当评价参考（不误伤）
+    dev2 = _frames(tmp_path, "coll_eval_human")
+    (dev2 / "annotation.json").write_text(json.dumps({
+        "label_source": "human_revision", "generator": "test",
+        "frames": [{"path": f"coll_eval_human/front_main/frame_{i:05d}.npz"}
+                   for i in range(3)]}, ensure_ascii=False), encoding="utf-8")
+
+    class B:
+        paint_source = None
+        eval_runs = [str(dev2)]
+
+    res2 = loop.resolve_paint_sources(B())
+    assert res2["research_only"] is False, res2
+    assert res2["runs"][str(dev2)]["rank"] == "verified", res2["runs"]
+
+    # 没有任何凭证的目录：保守判为不可晋级（缺证据不是通过）
+    class C:
+        paint_source = None
+        eval_runs = [str(tmp_path / "no_such_dir")]
+
+    res3 = loop.resolve_paint_sources(C())
+    assert res3["research_only"] is True, res3
+
+
 def test_evaluate_also_downgrades_a_research_source(tmp_path):
     """直接调 evaluate 也不能旁路：同一条资格规则（G03）。"""
     loop = _load()
