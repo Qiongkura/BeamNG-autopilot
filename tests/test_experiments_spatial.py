@@ -147,27 +147,49 @@ def test_group_spread_reveals_a_near_duplicate_collection():
     from beamng_autopilot.experiments.spatial import group_spread
 
     class R:
-        def __init__(self, path, group, pos):
+        def __init__(self, path, group, pos, exposure=0):
             self.path, self.group, self.map_name = path, group, "italy"
-            self.source_id, self.exposure, self.view = "ring_a", 0, "front_main"
+            self.source_id, self.exposure, self.view = ("ring_a", exposure,
+                                                        "front_main")
             self.pos = pos
 
-    near_dup = [R(f"f{i}", "italy/ring_a", (i * 0.43, 0.0)) for i in range(30)]
+    near_dup = [R(f"f{i}", "italy/ring_a", (i * 0.43, 0.0), i)
+                for i in range(30)]
     got = group_spread(near_dup, expect_step_m=2.0)
     assert len(got) == 1 and got[0]["step_ratio"] < 0.5, got
     assert got[0]["extent_m"] < 15, got
     # 正常采集（间距接近期望步长）不该被判成近重复
-    normal = [R(f"g{i}", "italy/ring_b", (i * 2.0, 0.0)) for i in range(30)]
+    normal = [R(f"g{i}", "italy/ring_b", (i * 2.0, 0.0), i) for i in range(30)]
     got2 = group_spread(normal, expect_step_m=2.0)
     assert 0.9 < got2[0]["step_ratio"] < 1.1, got2
     assert got2[0]["coverage_ratio"] > 0.9, got2
     # 间距正常但路径在小范围折返：覆盖比会很低（实测 west_coast_usa 那次：
-    # 间距 1.997 m≈期望，跨度只有 13.9 m，覆盖比 0.058）——两件事分开报
+    # 间距 1.997 m≈期望，跨度只有 13.9 m，按曝光算覆盖比 0.24）——两件事分开报
     loop = [R(f"l{i}", "italy/ring_d",
-              (float(i % 4) * 2.0, float(i // 4) * 2.0)) for i in range(30)]
+              (float(i % 4) * 2.0, float(i // 4) * 2.0), i)
+            for i in range(30)]
     got4 = group_spread(loop, expect_step_m=2.0)
     assert got4[0]["step_ratio"] > 0.5, got4
     assert got4[0]["coverage_ratio"] < 0.3, got4
+    # 多视角组：同一曝光的各视角位置相同，路径必须按**曝光**排——按文件名排会
+    # 在视角之间来回跳，把分母灌大成 4 倍（实测：116 帧 4 视角、沿路走 56 m，
+    # 覆盖比被算成 0.245，按曝光算是 0.973）
+    views = ("front_main", "front_fisheye", "pillar_left", "pillar_right")
+    multi = []
+    for e in range(30):
+        for v in views:
+            r = R(f"{v}/frame_{e:05d}.npz", "italy/ring_e", (e * 2.0, 0.0))
+            r.view, r.exposure = v, e
+            multi.append(r)
+    got5 = group_spread(multi, expect_step_m=2.0)
+    assert got5[0]["n_positioned"] == 120 and got5[0]["n_exposures"] == 30, got5
+    assert got5[0]["coverage_ratio"] > 0.9, got5
     # 位姿缺失不参与（不猜），且要能看出"没有可定位的帧"
     got3 = group_spread([R("x", "italy/ring_c", None)])
     assert got3[0]["extent_m"] is None and "unknown" in got3[0]["note"]
+    # 整组只有一个曝光（真的都是同一瞬间）：路径不存在 -> 覆盖比不可判，
+    # 不能拿 1e-9 当分母编出天文数字
+    one_exp = [R(f"o{i}", "italy/ring_e", (i * 2.0, 0.0), 0) for i in range(4)]
+    got6 = group_spread(one_exp, expect_step_m=2.0)
+    assert got6[0]["coverage_ratio"] is None, got6
+    assert "single exposure" in got6[0]["note"], got6
