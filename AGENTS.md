@@ -109,6 +109,12 @@
 6. 不修改运行时生成物：`logs/`、`weights/`、`.yolo/`、`probe_out.txt`、`probe_route.json` 等。
 7. Python 3.10，模块开头使用 `from __future__ import annotations`。保持现有命名、注释与换行风格，不顺手格式化无关文件。
 8. 工作区已有未提交改动时，把它们当作用户工作：先读再改，不还原、不覆盖无关修改。
+11. **测量纪律（2026-09-25 实测）：不要把回归门/其它 CPU 重活与实验并发跑。**
+    本机时延测量会被污染两次实测：并发跑 5 分钟回归时同一 checkpoint 的
+    `p95` = 158.26 ms（安静时 13.86 ms）；5 seed 实验里两次重复都是 46–149 ms
+    （正常 8–14 ms）。要测时延就单独跑，并把重复测量的**较小值**进硬门
+    （`rounds` 已按此协议记录 `timing_repeats`）。`road_iou` 这类确定性像素统计
+    不受影响，但任何单次 p95 都不能当模型属性。
 9. **shell 约定（用户 2026-09-24 指定）：本项目用 PowerShell 7 工作**。`pwsh` 装在本机用户目录
    `C:\Users\Administrator\AppData\Local\Programs\PowerShell\7.6.6\pwsh.exe`（免管理员、zip 版，删目录即卸载；
    已加入用户级 PATH，所以 `pwsh` 可直接解析）。调用方式：多行命令一律写成 `.ps1` 后用
