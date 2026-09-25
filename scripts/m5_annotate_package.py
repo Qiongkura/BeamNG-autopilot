@@ -88,6 +88,11 @@ def build_package(*, collection: Path, frames: list, out: Path,
     """写任务包；返回 ``{view: {"frames": n, "identity_ok": n, ...}}``。"""
     collection = Path(collection)
     out = Path(out)
+    # meta 的位置有两种（实测都遇到过）：
+    #   * 采集级 ``<collection>/meta.json``（采集器写的，含全部视角）；
+    #   * **视角级** ``<collection>/<view>/meta.json``（agent 标注池就是这种：
+    #     每个视角目录各有一份，里面列着全部视角的帧）。
+    # 只找采集级会在视角级池子上直接 FileNotFoundError（实测踩到）。
     meta_src = collection / "meta.json"
     picks = pick_per_view(frames, per_view)
     per: dict = {}
@@ -100,8 +105,36 @@ def build_package(*, collection: Path, frames: list, out: Path,
             continue
         d = out / view
         d.mkdir(parents=True, exist_ok=True)
-        (d / "meta.json").write_text(meta_src.read_text(encoding="utf-8"),
-                                     encoding="utf-8")
+        _meta_here = meta_src if meta_src.is_file() else (collection / view
+                                                          / "meta.json")
+        if not _meta_here.is_file():
+            per.setdefault(view, {"frames": 0, "missing": []})
+            per[view]["missing"].append(
+                f"meta.json for {src} (tried {meta_src} and "
+                f"{collection / view / 'meta.json'})")
+            continue
+        meta_src = _meta_here
+        _blob = json.loads(meta_src.read_text(encoding="utf-8"))
+        # 视角级 meta 列着**全部视角**的帧：只保留本包真正带的那些，避免
+        # 包里的 meta 出现"并不存在的帧"（下游按 meta 记身份就会记错）。
+        _names = {Path(str(x["path"])).name for x in picks
+                  if str(x["view"]) == view}
+        if _blob.get("frames"):
+            # 必须按**视角+文件名**匹配：不同视角的同名帧（front_main/
+            # frame_00000.npz 与 rear/frame_00000.npz）文件名相同，只按文件名
+            # 过滤会把别的视角的帧一起留下（实测：4 帧的包留下 32 条记录）。
+            _want = {f"{view}/{n}" for n in _names}
+
+            def _keep(r) -> bool:
+                rp = str(r.get("path") or "")
+                if rp:
+                    return rp in _want
+                return (str(r.get("view") or "") == view
+                        and Path(rp).name in _names)
+            _blob["frames"] = [r for r in _blob["frames"] if _keep(r)]
+            _blob["views_in_package"] = [view]
+        (d / "meta.json").write_text(
+            json.dumps(_blob, ensure_ascii=False, indent=1), encoding="utf-8")
         with np.load(src) as z:
             payload = {"colour": np.asarray(z["colour"], dtype=np.uint8)}
             if "annotation_raw" in z.files:
@@ -109,15 +142,15 @@ def build_package(*, collection: Path, frames: list, out: Path,
                                                        dtype=np.uint8)
         # 身份：先用帧自己的 npz 字段，再用采集 meta 里按 basename 匹配的记录
         ident = {k: None for k in ("map_name", "source_id", "pos", "heading")}
-        for rec in (json.loads(meta_src.read_text(encoding="utf-8")).get("frames")
-                    or []):
+        _blob2 = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+        for rec in (_blob2.get("frames") or []):
             if Path(str(rec.get("path") or "")).name == src.name:
                 ident.update({"map_name": rec.get("map_name"),
                               "source_id": rec.get("source_id"),
                               "pos": rec.get("pos"),
                               "heading": rec.get("heading")})
                 break
-        run_meta = json.loads(meta_src.read_text(encoding="utf-8"))
+        run_meta = _blob2
         ident["map_name"] = ident["map_name"] or run_meta.get("map_name")
         ident["source_id"] = ident["source_id"] or run_meta.get("source_id")
         np.savez_compressed(d / src.name, **payload,

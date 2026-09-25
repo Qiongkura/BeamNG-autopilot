@@ -149,3 +149,46 @@ def test_a_queue_pointing_at_a_missing_collection_fails_loudly(tmp_path):
                  encoding="utf-8")
     assert pkg.main(["--review-queue", str(q),
                      "--out", str(tmp_path / "p")]) == 2
+
+
+def test_a_view_level_meta_is_used_and_filtered_to_the_package(tmp_path):
+    """视角级 meta（agent 标注池那种）也要能打包，且只留包内帧。
+
+    实测踩到：agent 标注池每个**视角目录**各有一份 meta（里面列着全部视角的帧），
+    采集目录下没有 meta.json -> 打包直接 FileNotFoundError。回退到视角级 meta
+    后还必须**按视角+文件名过滤**：不同视角的同名帧文件名相同，只按文件名过滤
+    会把别的视角的帧一起留下（实测 4 帧的包留下 32 条记录）。
+    """
+    pkg = _load()
+    coll = _collection(tmp_path, views=("front_main", "pillar_left"), n=3)
+    # 把 meta 挪到视角目录（每个视角一份，列出全部视角的帧）
+    blob = json.loads((coll / "meta.json").read_text(encoding="utf-8"))
+    for v in ("front_main", "pillar_left"):
+        (coll / v / "meta.json").write_text(
+            json.dumps(blob, ensure_ascii=False), encoding="utf-8")
+    (coll / "meta.json").unlink()
+    frames = [f for f in blob["frames"] if f["view"] == "front_main"][:2]
+    q = tmp_path / "q_view_meta.json"
+    q.write_text(json.dumps({"why": "t", "frames": frames}),
+                 encoding="utf-8")
+    out = tmp_path / "pkg_view_meta"
+    rc = pkg.main(["--review-queue", str(q), "--collection", str(coll),
+                   "--out", str(out)])
+    assert rc == 0, rc
+    meta = json.loads((out / "front_main" / "meta.json").read_text(
+        encoding="utf-8"))
+    assert meta["map_name"] == "italy" and meta["source_id"] == "ring_test", meta
+    # 只留包内帧（2 帧），且不含别的视角
+    assert len(meta["frames"]) == 2, meta["frames"]
+    assert {r["view"] for r in meta["frames"]} == {"front_main"}, meta["frames"]
+    assert len(list((out / "front_main").glob("frame_*.npz"))) == 2
+    # 采集级 meta 仍然优先（老路径不变）
+    coll2 = _collection(tmp_path / "second", views=("front_main",), n=2)
+    q2 = tmp_path / "q2.json"
+    q2.write_text(json.dumps({"why": "t", "frames": json.loads(
+        (coll2 / "meta.json").read_text(encoding="utf-8"))["frames"]}),
+        encoding="utf-8")
+    out2 = tmp_path / "pkg_coll_meta"
+    assert pkg.main(["--review-queue", str(q2), "--collection", str(coll2),
+                     "--out", str(out2)]) == 0
+    assert (out2 / "front_main" / "meta.json").is_file()
