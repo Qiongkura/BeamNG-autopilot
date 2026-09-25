@@ -157,16 +157,22 @@ def filter_line_shape(line: np.ndarray) -> np.ndarray:
         return line
     n, labels, stats, _ = cv2.connectedComponentsWithStats(
         line.astype(np.uint8), 8)
-    keep = np.zeros_like(line)
-    for i in range(1, n):
-        x, y, cw, ch, area = stats[i]
-        long_side = max(cw, ch)
-        short_side = min(cw, ch)
-        if area >= _LINE_MIN_AREA_PX or (
-                long_side >= 20 and short_side >= 2
-                and long_side >= 2.5 * short_side):
-            keep[labels == i] = True
-    return keep
+    if n <= 1:
+        return np.zeros_like(line)
+    # 判据一个字没改，但不再"每块扫一遍全帧"（`keep[labels == i] = True`）：
+    # 掩码碎成上千块时那会从 ~2 ms 冲到 100 ms 以上——实测（2026-09-25）
+    # 后处理 p95 = 121 ms 里绝大部分就是这种全帧扫描，而驾驶 deadline 看 p95。
+    # 长短边直接取连通域包围盒（与原来的像素极值等价）。
+    area = stats[:, 4].astype(np.int64)
+    cw = stats[:, 2].astype(np.int64)
+    ch = stats[:, 3].astype(np.int64)
+    long_side = np.maximum(cw, ch)
+    short_side = np.minimum(cw, ch)
+    keep_ids = (area >= _LINE_MIN_AREA_PX) | (
+        (long_side >= 20) & (short_side >= 2)
+        & (long_side >= 2.5 * short_side))
+    keep_ids[0] = False                    # 0 号是背景，永远不保留
+    return keep_ids[labels]
 
 
 def constrain_line_to_road(line: np.ndarray, road: np.ndarray,
@@ -218,45 +224,62 @@ def constrain_line_to_road(line: np.ndarray, road: np.ndarray,
     # whole line output scored 0.43 raw and vanished entirely under a
     # plain per-component fraction).
     rows_known = rd.any(axis=1)
-    n, labels, _stats, _ = cv2.connectedComponentsWithStats(
+    n, labels, stats, _ = cv2.connectedComponentsWithStats(
         m.astype(np.uint8), 8)
-    keep = np.zeros_like(m)
-    for i in range(1, n):
-        comp = labels == i
-        judged = comp & rows_known[:, None]
-        n_judged = int(judged.sum())
-        if n_judged <= 0:
-            keep |= comp          # nothing in this component can be judged
-            continue
-        inside = float(np.count_nonzero(comp & rd)) / float(n_judged)
-        if inside >= float(keep_frac):
-            keep |= comp
-            continue
-        # Second tier: a clearly LINE-SHAPED stroke that is partly on the
-        # road survives.  Without it a checkpoint whose lines run mostly
-        # just outside the road mask loses its entire output (measured:
-        # components at 0.43 / 0.33 / 0.44 -> line IoU 0.0 where the raw
-        # mask scored 0.43), and paint is exactly the class that runs off
-        # the end of a truncated road mask.
-        if elongated_frac is None:
-            continue                       # tier disabled on purpose
-        if inside < float(elongated_frac):
-            continue
-        ys, xs = np.nonzero(comp)
-        if len(ys) == 0:
-            continue
-        long_side = max(int(xs.max() - xs.min()) + 1, int(ys.max() - ys.min()) + 1)
-        short_side = min(int(xs.max() - xs.min()) + 1, int(ys.max() - ys.min()) + 1)
-        if long_side >= 20 and short_side >= 1 and long_side >= 2.5 * short_side:
-            keep |= comp
-    return keep
+    if n <= 1:
+        return np.zeros_like(m)
+    # 判据逐块等价，但**一次直方图**就把"每块多少像素 / 其中多少在已知行内 /
+    # 多少在膨胀路面内"算完，不再每块扫全帧。实测（2026-09-25）：漆线掩码
+    # 碎掉的帧上块数上千，原来的循环把这个 stage 从 ~2 ms 推到 59 ms/帧，
+    # 整条链的 p95 = 121 ms 就是它撑起来的；驾驶 deadline 看的就是 p95。
+    on_road = np.bincount(labels[rd].ravel(), minlength=n)
+    if rows_known.all():
+        judged = np.bincount(labels.ravel(), minlength=n)
+    else:
+        judged = np.bincount(labels[rows_known].ravel(), minlength=n)
+    n_judged = judged.astype(np.float64)
+    inside = np.divide(on_road.astype(np.float64),
+                       np.maximum(n_judged, 1.0))
+    keep_ids = np.zeros(n, bool)
+    # 一行已知像素都没有的块 -> "无法判断" -> 整块保留（原实现的同一分支）
+    keep_ids[1:] = (n_judged[1:] <= 0) | (inside[1:] >= float(keep_frac))
+    # Second tier: a clearly LINE-SHAPED stroke that is partly on the
+    # road survives.  Without it a checkpoint whose lines run mostly
+    # just outside the road mask loses its entire output (measured:
+    # components at 0.43 / 0.33 / 0.44 -> line IoU 0.0 where the raw
+    # mask scored 0.43), and paint is exactly the class that runs off
+    # the end of a truncated road mask.
+    if elongated_frac is not None:
+        cw = stats[:, 2].astype(np.int64)
+        ch = stats[:, 3].astype(np.int64)
+        long_side = np.maximum(cw, ch)
+        short_side = np.minimum(cw, ch)
+        shape_ok = ((long_side >= 20) & (short_side >= 1)
+                    & (long_side >= 2.5 * short_side))
+        cand = ((~keep_ids) & (n_judged > 0)
+                & (inside >= float(elongated_frac)))
+        keep_ids |= cand & shape_ok
+    keep_ids[0] = False                # 0 号是背景，永远不保留
+    return keep_ids[labels]
 
 
 class SegUNet(nn.Module):
-    """Lightweight UNet: 3 encoder blocks + skip connections (~1.3M params)."""
+    """Lightweight UNet: 3 encoder blocks + skip connections (~1.3M params).
 
-    def __init__(self, in_channels: int = 3, n_classes: int = N_CLASSES):
+    ``width`` 是通道宽度倍数，供"容量"对照用（第 5 轮之后的下一条杠杆：
+    数据因子与训练预算都已测到回报边界，剩下的模型侧变量就是容量/结构）。
+    **``width=1.0`` 与原版逐位一致**（同样的层名与通道数），所以已有
+    checkpoint 照旧能加载；这就是默认值，不改变任何现有行为。
+    """
+
+    def __init__(self, in_channels: int = 3, n_classes: int = N_CLASSES,
+                 width: float = 1.0):
         super().__init__()
+        self.width = float(width)
+
+        def _c(base: int) -> int:
+            # 通道数必须是整数：取整后下限 8，避免小宽度把通道压到 0
+            return max(8, int(round(base * self.width)))
 
         def _blk(cin, cout):
             return nn.Sequential(
@@ -265,18 +288,18 @@ class SegUNet(nn.Module):
                 nn.Conv2d(cout, cout, 3, padding=1), nn.BatchNorm2d(cout),
                 nn.ReLU(inplace=True))
 
-        self.e1 = _blk(in_channels, 32)
-        self.e2 = _blk(32, 64)
-        self.e3 = _blk(64, 128)
+        self.e1 = _blk(in_channels, _c(32))
+        self.e2 = _blk(_c(32), _c(64))
+        self.e3 = _blk(_c(64), _c(128))
         self.pool = nn.MaxPool2d(2)
-        self.mid = _blk(128, 128)
-        self.up2 = nn.ConvTranspose2d(128, 64, 2, stride=2)
-        self.d2 = _blk(64 + 128, 64)   # up2(64) + skip e3(128)
-        self.up1 = nn.ConvTranspose2d(64, 32, 2, stride=2)
-        self.d1 = _blk(32 + 64, 32)    # up1(32) + skip e2(64)
-        self.up0 = nn.ConvTranspose2d(32, 16, 2, stride=2)
-        self.d0 = _blk(16 + 32, 32)    # up0(16) + skip e1(32)
-        self.head = nn.Conv2d(32, n_classes, 1)
+        self.mid = _blk(_c(128), _c(128))
+        self.up2 = nn.ConvTranspose2d(_c(128), _c(64), 2, stride=2)
+        self.d2 = _blk(_c(64) + _c(128), _c(64))   # up2 + skip e3
+        self.up1 = nn.ConvTranspose2d(_c(64), _c(32), 2, stride=2)
+        self.d1 = _blk(_c(32) + _c(64), _c(32))    # up1 + skip e2
+        self.up0 = nn.ConvTranspose2d(_c(32), _c(16), 2, stride=2)
+        self.d0 = _blk(_c(16) + _c(32), _c(32))    # up0 + skip e1
+        self.head = nn.Conv2d(_c(32), n_classes, 1)
 
     def forward(self, x):
         x1 = self.e1(x)
@@ -404,13 +427,24 @@ class Segmenter:
     """UNet segmentation over an RGB frame, with mask post-processing."""
 
     def __init__(self, model_path=None, device=None, use_half: bool = True,
-                 temporal_smooth: bool = False):
+                 temporal_smooth: bool = False, line_road_keep_frac=None,
+                 line_road_elongated_frac=None, line_road_ksize=None):
         path = Path(model_path) if model_path else default_model_path()
         if path is None:
             raise FileNotFoundError(
                 "分割模型不存在；先运行 scripts/m5_train_seg.py 训练，"
                 f"或传入 model_path（默认 {config.LOGS_DIR}/m5_seg/"
                 "seg_model/best.pt）")
+        # 标线的"离路约束"阈值可配：实测这批模型 offroad_false_ratio 0.20（门槛 0.10）、
+        # line_precision 0.26（门槛 0.40），而这两个指标恰好由这一步决定。做成可配，
+        # 就能用**同一批 checkpoint** 扫阈值，不必重训。None = 用模块默认。
+        self.line_road_keep_frac = (None if line_road_keep_frac is None
+                                    else float(line_road_keep_frac))
+        self.line_road_elongated_frac = (
+            None if line_road_elongated_frac is None
+            else float(line_road_elongated_frac))
+        self.line_road_ksize = (None if line_road_ksize is None
+                                else int(line_road_ksize))
         # Which checkpoint is loaded decides how every map behaves, so it
         # is kept on the instance: an unpinned run must be attributable
         # instead of silently using whatever happens to be deployed.
@@ -418,9 +452,20 @@ class Segmenter:
         self.device = device or (
             "cuda" if torch.cuda.is_available() else "cpu")
         ckpt = torch.load(path, map_location=self.device)
+        # 容量（通道宽度）必须从 checkpoint 自己读出来：容量对照跑出来的臂是
+        # width=2 的模型，按默认宽度建模型会 size mismatch（实测踩到：候选臂
+        # 的 checkpoint 装不进评估链，整轮判定失败）。缺字段时按 1.0 处理，
+        # 与老 checkpoint 逐位一致。
+        arch_args = (ckpt.get("train_args") or {}).get("arch_args") or {}
+        self.width = float(arch_args.get("width") or 1.0)
         self.model = SegUNet(
-            n_classes=int(ckpt.get("n_classes", N_CLASSES)))
-        self.model.load_state_dict(ckpt["state_dict"])
+            n_classes=int(ckpt.get("n_classes", N_CLASSES)),
+            width=self.width)
+        got = self.model.load_state_dict(ckpt["state_dict"])
+        if got.missing_keys or got.unexpected_keys:
+            raise RuntimeError(
+                f"checkpoint 与模型结构不匹配：缺 {list(got.missing_keys)[:3]}、"
+                f"多 {list(got.unexpected_keys)[:3]}（{path}）")
         self.model.to(self.device).eval()
         # GPU 上半精度推理：显存/延迟都减半，训练好的 BN 运行统计在
         # eval 模式下不受影响。CPU 保持 fp32。
@@ -547,7 +592,15 @@ class Segmenter:
         # stroke; texture / shadow specks are small blobs.  A component is
         # kept when it is elongated (major axis much longer than minor) or
         # big enough to be a real marking; scattered specks are dropped.
-        line = constrain_line_to_road(line, road)
+        # 阈值可配（见 __init__）：只影响这一步的判据输入，不动算法。
+        _kw = {}
+        if self.line_road_keep_frac is not None:
+            _kw["keep_frac"] = self.line_road_keep_frac
+        if self.line_road_elongated_frac is not None:
+            _kw["elongated_frac"] = self.line_road_elongated_frac
+        if self.line_road_ksize is not None:
+            _kw["ksize"] = self.line_road_ksize
+        line = constrain_line_to_road(line, road, **_kw)
         line = filter_line_shape(line)
         return road, line
 

@@ -116,6 +116,11 @@ def masked_cross_entropy(logits: torch.Tensor, target: torch.Tensor,
         raise ValueError(
             "被屏蔽的类出现在目标里：先去掉该类的目标像素（例如 "
             "mask_line_for_loss 把已标注 line 改成 255），否则损失无定义")
+    # 全 ignore 的帧（或全 ignore 的批）：`F.cross_entropy` 对"零个有效像素"
+    # 求均值会得到 **NaN**（实测：一张全 255 的标签就能让整步变 NaN）。
+    # 这里返回"零损失但保留计算图"：不 NaN、也不制造假的梯度。
+    if not bool((target != int(ignore_index)).any()):
+        return logits.sum() * 0.0
     return F.cross_entropy(logits.masked_fill(blocked, float("-inf")), target,
                            weight=weight, ignore_index=ignore_index)
 
@@ -154,6 +159,11 @@ class LineSegLoss(nn.Module):
         负样本。逐样本掩码若与本批的 line 权重同用，说明这一批混了"可信/不可信"
         两种帧——那是调用方该拆批的场景，直接报错而不是悄悄改损失口径。
         """
+        # 整帧/整批都是 ignore：没有任何监督可算。直接交给 F.cross_entropy
+        # 会得到 **NaN**（零个有效像素求均值），NaN 会顺着反向传播污染整步权重。
+        # 返回"零损失但保留计算图"：不 NaN、不制造假梯度（方案 W1 §6.2 的第 4 条）。
+        if not bool((target != self.ignore_index).any()):
+            return logits.sum() * 0.0
         line_allowed = True
         if class_mask is not None:
             m = torch.as_tensor(class_mask, dtype=torch.bool)
