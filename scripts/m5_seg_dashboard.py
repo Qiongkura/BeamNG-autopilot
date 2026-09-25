@@ -111,46 +111,83 @@ SPLIT_LABEL = {"dev": "开发集", "frozen": "冻结集", "final": "最终集",
 ARM_RE = re.compile(r"^(arm[A-Za-z]*?)[_-]?seed(\d+)$")
 
 CSS = """
-:root { color-scheme: dark; }
-body { margin: 0; padding: 0 0 40px; background: #0b0d12; color: #e6e8ee;
+:root { color-scheme: light;
+  --bg:#f5f6f8; --card:#ffffff; --ink:#1f2430; --muted:#6b7280;
+  --line:#e3e6ec; --accent:#2f6df6; --raw:#b8c2d6;
+  --ok:#2e9e6b; --warn:#c2410c; --bad:#b91c1c; }
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink);
   font: 13px/1.5 "Segoe UI", "Microsoft YaHei", system-ui, sans-serif; }
-header { padding: 18px 22px 6px; }
-h1 { font-size: 20px; margin: 0 0 6px; }
-h2 { font-size: 16px; margin: 0 0 10px; padding: 6px 0 6px 8px;
-  border-left: 4px solid #4c8dff; background: #11141c; }
-h3 { font-size: 14px; margin: 16px 0 6px; color: #cdd3e0; }
-p.sub { color: #8b93a7; margin: 3px 0; font-size: 12px; }
-section { margin: 16px 22px; padding: 12px 14px; background: #0f1219;
-  border: 1px solid #232838; border-radius: 6px; }
-section.sub { background: #0c0f15; border-style: dashed; margin: 12px 0; }
-table { border-collapse: collapse; width: 100%; margin: 6px 0 10px; }
-th, td { border: 1px solid #232838; padding: 4px 7px; text-align: left;
-  vertical-align: top; font-size: 12px; }
-th { background: #161a24; color: #aab2c5; font-weight: 600; }
+header { position: sticky; top: 0; z-index: 5; background: var(--card);
+  border-bottom: 1px solid var(--line); padding: 10px 16px; }
+h1 { font-size: 16px; margin: 0 0 2px; }
+p.sub { color: var(--muted); font-size: 12px; margin: 2px 0; }
+.statusbar { display: flex; flex-wrap: wrap; gap: 6px 22px;
+  align-items: baseline; margin-top: 6px; }
+.item { white-space: nowrap; }
+.item .k { color: var(--muted); margin-right: 6px; }
+.item .v { font-variant-numeric: tabular-nums; font-weight: 600; }
+.pill { padding: 1px 9px; border-radius: 10px; font-size: 12px;
+  font-weight: 600; background: #eef1f6; color: #374151; }
+.pill.running { background: #e6f0ff; color: #1d4ed8; }
+.pill.completed { background: #e7f7ee; color: #1d7a4d; }
+.pill.failed, .pill.rejected { background: #fdeaea; color: #b91c1c; }
+.pill.paused, .pill.needs_evidence, .pill.needs_review {
+  background: #f4efe3; color: #8a6d1f; }
+.pill.shadow_candidate { background: #e6f0ff; color: #1d4ed8; }
+.banner { margin: 8px 16px 0; padding: 8px 12px; border-radius: 8px;
+  font-size: 13px; }
+.banner.demo { background: #fff7e6; border: 1px solid #f3d9a4; color: #8a6d1f; }
+.banner.err { background: #fdeaea; border: 1px solid #f0b4b4; color: #8c1c1c; }
+.banner.note { background: #eef4ff; border: 1px solid #cfe0ff; color: #26406f; }
+.toolbar { display: flex; flex-wrap: wrap; gap: 10px 18px;
+  align-items: center; padding: 8px 16px 0; color: var(--muted); }
+.toolbar a, .toolbar .btn { padding: 3px 10px; border: 1px solid var(--line);
+  background: #fff; border-radius: 6px; color: var(--ink);
+  text-decoration: none; font-size: 12px; }
+.toolbar a.on { background: #e6f0ff; border-color: #9dbdf7; color: #1d4ed8; }
+main { display: grid; grid-template-columns: 1fr 1fr; gap: 12px;
+  padding: 12px 16px 28px; }
+@media (max-width: 1100px) { main { grid-template-columns: 1fr; } }
+.card { background: var(--card); border: 1px solid var(--line);
+  border-radius: 10px; padding: 8px 10px 6px; min-width: 0; }
+.card.wide { grid-column: 1 / -1; }
+.card h3 { margin: 0 0 2px; font-size: 13px; font-weight: 600; }
+.card .sub { color: var(--muted); font-size: 12px; margin-bottom: 4px; }
+.cv { position: relative; width: 100%; min-height: 150px; }
+.cv svg { display: block; border: 0; }
+.cv svg.fluid { width: 100%; height: auto; }   /* 只有"整卡大图"才铺满 */
+svg.spark { width: 150px; height: 34px; }      /* 汇总页的迷你曲线保持固定尺寸 */
+.stats { color: var(--muted); font-size: 12px; padding-top: 2px; }
+table { border-collapse: collapse; width: 100%; margin: 2px 0 2px; }
+th, td { border-bottom: 1px solid var(--line); padding: 3px 6px;
+  text-align: left; vertical-align: top; font-size: 12px; }
+th { background: #fafbfd; color: #4b5563; font-weight: 600; }
 td.num, th.num { text-align: right; font-variant-numeric: tabular-nums; }
-.lvl { display: inline-block; margin-left: 6px; padding: 0 5px; border-radius: 3px;
-  font-size: 11px; border: 1px solid #3a4156; color: #c8cede; white-space: nowrap; }
-.lvl.training { background: #1d2a44; border-color: #35507f; }
-.lvl.dev { background: #24301c; border-color: #4a6b2f; }
-.lvl.final { background: #3a2418; border-color: #8a5527; }
-.lvl.unmeasured { background: #2c1a1e; border-color: #7d3742; }
-.miss { color: #ff9b9b; }
-.unknown { color: #ffd479; }
-.ok { color: #7bd88f; }
-.hint { color: #8b93a7; font-size: 12px; }
+.lvl, .badge { display: inline-block; padding: 0 6px; border-radius: 3px;
+  font-size: 11px; border: 1px solid var(--line); color: #4b5563;
+  background: #fafbfd; white-space: nowrap; }
+.lvl.training { background: #eef4ff; border-color: #c7d9fb; color: #2b56b8; }
+.lvl.dev { background: #f2f9f0; border-color: #cfe6c6; color: #2e6b3a; }
+.lvl.final { background: #fdf5ef; border-color: #f0d8c4; color: #9a5216; }
+.lvl.unmeasured { background: #fdf3f3; border-color: #f0c2c2; color: var(--bad); }
+.miss { color: var(--bad); }
+.unknown { color: var(--warn); }
+.ok { color: var(--ok); }
+.hint { color: var(--muted); font-size: 12px; }
 .mono { font-family: Consolas, "Cascadia Mono", monospace; font-size: 12px; }
-figure { display: inline-block; margin: 8px 14px 8px 0; vertical-align: top; }
-figcaption { color: #9aa3b8; font-size: 12px; margin-top: 2px; }
-svg { background: #0d1117; border: 1px solid #232838; border-radius: 4px; }
-svg text.ax { fill: #8b93a7; font-size: 10px; text-anchor: end; }
-svg text.axlbl { fill: #aab2c5; font-size: 10px; text-anchor: middle; }
-svg text.legend { fill: #c8cede; font-size: 11px; }
-svg text.val { fill: #dfe4f0; font-size: 10px; }
-svg text.misspt { fill: #ff9b9b; font-size: 9px; text-anchor: middle; }
-svg text.xtick { fill: #8b93a7; font-size: 10px; text-anchor: middle; }
+svg { background: transparent; }
+svg text.ax { fill: var(--muted); font-size: 10px; text-anchor: end; }
+svg text.axlbl { fill: #4b5563; font-size: 10px; text-anchor: middle; }
+svg text.legend { fill: #4b5563; font-size: 11px; }
+svg text.val { fill: var(--ink); font-size: 10px; }
+svg text.misspt { fill: var(--bad); font-size: 9px; text-anchor: middle; }
+svg text.xtick { fill: var(--muted); font-size: 10px; text-anchor: middle; }
 ul.reasons { margin: 4px 0 4px 18px; padding: 0; }
-img.probe { max-width: 420px; border: 1px solid #232838; border-radius: 4px; }
-footer { margin: 18px 22px; color: #7d859a; font-size: 12px; }
+img.probe { max-width: 420px; border: 1px solid var(--line); border-radius: 4px; }
+figure { display: inline-block; margin: 8px 14px 8px 0; vertical-align: top; }
+figcaption { color: var(--muted); font-size: 12px; margin-top: 2px; }
+footer { margin: 0 16px 24px; color: var(--muted); font-size: 12px; }
 """
 
 
@@ -259,12 +296,147 @@ class Series:
         return sum(1 for _, v in self.points if v is not None)
 
 
-_PALETTE = ("#4c8dff", "#7bd88f", "#ffb454", "#ff7b9c", "#c792ea", "#4dd0e1",
-            "#f2f56b", "#9aa3b8")
+_PALETTE = ("#2f6df6", "#2e9e6b", "#c2410c", "#7c3aed", "#0891b2",
+            "#b45309", "#b91c1c", "#4b5563")
 
 
 def _series_colour(name: str) -> str:
     return _PALETTE[sum(ord(c) for c in name) % len(_PALETTE)]
+
+
+def _svg_multi(sers: list, *, width: int = 470, height: int = 205,
+               fluid: bool = True) -> str:
+    """把同一个指称的多条曲线（不同 seed/臂）画在**一张**图里。
+
+    为什么：用户嫌"分出这么多曲线"——300 张单曲线图里绝大多数可以合并
+    （同一场实验的不同 seed 本来就是同一条曲线的重复测量）。图例给出每条线的
+    末值，方便直接比。
+    """
+    sers = [x for x in (sers or []) if x is not None]
+    if not sers:
+        return '<span class="miss">未测</span>'
+    xs, ys = [], []
+    for se in sers:
+        for x, v in se.points:
+            if v is not None:
+                xs.append(float(x))
+                ys.append(float(v))
+    if not xs:
+        return '<span class="miss">未测</span>'
+    x0, x1 = min(xs), max(xs)
+    if x0 == x1:
+        x0, x1 = x0 - 0.5, x1 + 0.5
+    lo, hi = min(ys), max(ys)
+    if lo == hi:
+        span = max(abs(lo) * 0.1, 1e-6)
+        lo, hi = lo - span, hi + span
+    span = hi - lo
+    lo, hi = lo - span * 0.12, hi + span * 0.12
+    pad_l, pad_r, pad_t, pad_b = 58, 96, 22, 30
+    plot_w, plot_h = width - pad_l - pad_r, height - pad_t - pad_b
+
+    def sx(x):
+        return pad_l + (x - x0) / (x1 - x0) * plot_w
+
+    def sy(v):
+        return height - pad_b - (v - lo) / (hi - lo) * plot_h
+
+    size_attr = ('width="100%" height="auto"' if fluid
+                 else f'width="{width}" height="{height}"')
+    out = [f'<svg class="{"fluid" if fluid else ""}" viewBox="0 0 {width} '
+           f'{height}" {size_attr} role="img">',
+           f'<rect x="{pad_l}" y="{pad_t}" width="{plot_w}" height="{plot_h}" '
+           f'fill="#fbfcfe" stroke="#e3e6ec"/>']
+    for i in range(5):
+        v = lo + (hi - lo) * i / 4.0
+        y = sy(v)
+        out.append(f'<line x1="{pad_l}" y1="{y:.1f}" x2="{pad_l + plot_w}" '
+                   f'y2="{y:.1f}" stroke="#eef1f5"/>')
+        out.append(f'<text x="{pad_l - 5}" y="{y + 3.5:.1f}" class="ax">'
+                   f'{_esc(_fmt_point(v))}</text>')
+    for e in range(int(x0), int(x1) + 1):
+        if (x1 - x0) <= 14 or e % max(1, int((x1 - x0) / 8)) == 0:
+            out.append(f'<text x="{sx(e):.1f}" y="{height - pad_b + 13}" '
+                       f'class="xtick">{e}</text>')
+    legend_y = pad_t + 8
+    for i, se in enumerate(sers):
+        colour = _PALETTE[i % len(_PALETTE)]
+        segs, seg = [], []
+        for x, v in se.points:
+            if v is None:
+                if seg:
+                    segs.append(seg)
+                    seg = []
+                continue
+            seg.append((float(x), float(v)))
+        if seg:
+            segs.append(seg)
+        for sg in segs:
+            d = " ".join(("M" if k == 0 else "L") + f"{sx(x):.1f} {sy(v):.1f}"
+                         for k, (x, v) in enumerate(sg))
+            out.append(f'<path d="{d}" fill="none" stroke="{colour}" '
+                       f'stroke-width="1.6"/>')
+        last = [v for _x, v in se.points if v is not None]
+        tag = se.name.split("/")[-1] or se.name
+        out.append(f'<text x="{pad_l + plot_w + 6}" y="{legend_y:.0f}" '
+                   f'class="legend" fill="{colour}">{_esc(tag)} '
+                   f'{_esc(_fmt_point(last[-1]) if last else "未测")}</text>')
+        legend_y += 13
+    out.append("</svg>")
+    return "".join(out)
+
+
+def _sparkline(points, *, w: int = 130, h: int = 30, colour: str = "#2f6df6",
+               invert: bool = False) -> str:
+    """迷你曲线（无坐标轴），嵌在表格单元格里——一页能看很多条。
+
+    缺测处断线（与主图同一纪律：不跨过没测的点连线）。
+    """
+    vals = [(float(x), float(v)) for x, v in (points or []) if v is not None]
+    if not vals:
+        return '<span class="miss">未测</span>'
+    xs = [x for x, _ in vals]
+    x0, x1 = (min(xs), max(xs)) if len(xs) > 1 else (xs[0] - 1, xs[0] + 1)
+    lo, hi = min(v for _, v in vals), max(v for _, v in vals)
+    if lo == hi:
+        span = max(abs(lo) * 0.1, 1e-6)
+        lo, hi = lo - span, hi + span
+    pad = 2.0
+
+    def sx(x):
+        return pad + (x - x0) / (x1 - x0 or 1) * (w - 2 * pad)
+
+    def sy(v):
+        t = (v - lo) / (hi - lo or 1)
+        if invert:
+            t = 1 - t
+        return h - pad - t * (h - 2 * pad)
+
+    segs, seg, last_x = [], [], None
+    for x, v in (points or []):
+        if v is None:
+            if seg:
+                segs.append(seg)
+                seg = []
+            last_x = None
+            continue
+        if last_x is not None and abs(float(x) - last_x) > 1.5 and seg:
+            segs.append(seg)
+            seg = []
+        seg.append((float(x), float(v)))
+        last_x = float(x)
+    if seg:
+        segs.append(seg)
+    paths = []
+    for sg in segs:
+        d = " ".join(("M" if i == 0 else "L") + f"{sx(x):.1f} {sy(v):.1f}"
+                     for i, (x, v) in enumerate(sg))
+        paths.append(f'<path d="{d}" fill="none" stroke="{colour}" '
+                     f'stroke-width="1.4"/>')
+    dot = (f'<circle cx="{sx(vals[-1][0]):.1f}" cy="{sy(vals[-1][1]):.1f}" '
+           f'r="1.9" fill="{colour}"/>')
+    return (f'<svg class="spark" viewBox="0 0 {w} {h}" width="{w}" '
+            f'height="{h}" role="img">{"".join(paths)}{dot}</svg>')
 
 
 def _fmt_point(value: float) -> str:
@@ -273,7 +445,8 @@ def _fmt_point(value: float) -> str:
     return f"{value:.4g}"
 
 
-def _svg_series(series: Series, *, width: int = 470, height: int = 205) -> str:
+def _svg_series(series: Series, *, width: int = 470, height: int = 205,
+                fluid: bool = False) -> str:
     """一条序列一张图：只有自己的纵轴刻度与单位，缺测处断线并写"未测"。"""
     pad_l, pad_r, pad_t, pad_b = 62, 76, 26, 32
     xs = [float(e) for e, _ in series.points] or [0.0]
@@ -300,16 +473,18 @@ def _svg_series(series: Series, *, width: int = 470, height: int = 205) -> str:
         return height - pad_b - (y - lo) / (hi - lo) * plot_h
 
     colour = _series_colour(series.name + series.metric)
-    out = [f'<svg viewBox="0 0 {width} {height}" width="{width}" '
-           f'height="{height}" role="img">',
+    size_attr = ('width="100%" height="auto" style="max-height:230px"'
+                 if fluid else f'width="{width}" height="{height}"')
+    out = [f'<svg class="{"fluid" if fluid else ""}" '
+           f'viewBox="0 0 {width} {height}" {size_attr} role="img">',
            f"<title>{_esc(series.name)} · {_esc(series.metric)}</title>",
            f'<rect x="{pad_l}" y="{pad_t}" width="{plot_w}" height="{plot_h}" '
-           f'fill="#0d1117" stroke="#30363d"/>']
+           f'fill="#fbfcfe" stroke="#e3e6ec"/>']
     for i in range(5):
         v = lo + (hi - lo) * i / 4.0
         y = sy(v)
         out.append(f'<line x1="{pad_l}" y1="{y:.1f}" x2="{pad_l + plot_w}" '
-                   f'y2="{y:.1f}" stroke="#1c212c"/>')
+                   f'y2="{y:.1f}" stroke="#eef1f5"/>')
         out.append(f'<text x="{pad_l - 5}" y="{y + 3.5:.1f}" class="ax">'
                    f'{_esc(_fmt_point(v))}</text>')
     head = series.unit or series.metric
@@ -622,13 +797,22 @@ def _t13_state(arg: str | None, hints: list[Path], *,
         if not isinstance(blob, dict):
             state["error"] = f"{path}: train_hist.json is not an object"
             continue
-        tag = path.parent.name
+        # tag 必须**路径唯一**：baseline/seed42 与 round0/seed42 同名会撞在一起
+        # （实测：10 份历史塌成 5 个 seed × 4 指标，卡片重复一遍且臂名丢失）
+        try:
+            tag = str(path.parent.relative_to(state["root"] or path.parent)
+                      ).replace("\\", "/")
+        except Exception:                                 # noqa: BLE001
+            tag = path.parent.name
         epochs = blob.get("epoch") or []
         state["runs"].append({"run": tag, "path": str(path),
                               "epochs": len(epochs)})
         state["loaded"] += 1
         for metric, values in blob.items():
-            if metric in ("epoch", "lr") or not isinstance(values, list):
+            # epoch/lr 是横轴与调度量；line_ignored_frames 是**累计计数器**——
+            # 画成曲线看起来像"某个指标在涨"（实测在页面上就是一条 0→360 的线），
+            # 它已经在"训练超参"节里作为数据因子显示。
+            if metric in ("epoch", "lr", "line_ignored_frames")                     or not isinstance(values, list):
                 continue
             level = LEVEL_DEV if str(metric).startswith("val") else LEVEL_TRAIN
             pts, miss = [], []
@@ -878,11 +1062,19 @@ def _probe_state(path: Path | None, out_dir: Path) -> dict:
 # 视图 1：运行总览
 # ---------------------------------------------------------------------------
 def _run_label(ctx: dict) -> str:
+    """标题/页眉用的运行标签：优先事件流，其次 --run-dir 的目录名。
+
+    实测：只给 `--run-dir` 时（没有 events.jsonl 的单臂训练）标题会写成
+    "no run"——浏览器的标签页上就挂着这四个字，等于把"这是哪一轮"丢了。
+    """
     last = (ctx["events"].get("last") if ctx["events"].get("readable")
             else None)
-    if last is None:
-        return "no run"
-    return f'{last.run_id} / {last.candidate_id or "candidate: missing data"}'
+    if last is not None:
+        return f'{last.run_id} / {last.candidate_id or "candidate"}'
+    root = _run_root(ctx)
+    if root is not None:
+        return root.name
+    return "no run"
 
 
 def _overview_view(ctx: dict) -> str:
@@ -1186,7 +1378,7 @@ def _cases_html(cases: list[dict]) -> str:
         return ('<p class="hint">missing data: 没有确定性样例'
                 "（--tasks 未给出 case 字段）。</p>")
     rows = ['<table><tr><th>样例</th><th>证据等级</th><th>真值有效区</th>'
-            "<th>FP / FN</th><th>指标</th><th>判定 / 淘汰理由</th></tr>"]
+            "<th>FP / FN</th><th>指标<br><span style=font-weight:400;font-size:11px;color:#6b7280>成对比较用的主指标（当前 road_iou；标线指标缺真值时为 UNKNOWN）</span></th><th>判定 / 淘汰理由</th></tr>"]
     for case in cases:
         level = SPLIT_LEVEL.get(str(case.get("level") or "dev"), LEVEL_DEV)
         quality = case.get("quality") or {}
@@ -1441,11 +1633,18 @@ def _decisions_state(path: Path | None) -> dict:
     根本看不到。这里把它作为独立证据源喂进来（缺文件就报未测，不猜）。
     """
     state = {"path": str(path) if path else "", "readable": False, "error": "",
-             "items": []}
+             "items": [], "gpu_minutes": {}}
     if path is None:
         state["error"] = "no --decisions/--run-dir given"
         return state
     root = Path(path)
+    ledger = {}
+    lp = root / "gpu_minutes.json"
+    if lp.exists():
+        try:
+            ledger = json.loads(lp.read_text(encoding="utf-8"))
+        except Exception:                                 # noqa: BLE001
+            ledger = {}
     files = sorted(root.glob("decision_*.json"))
     if not files:
         state["error"] = f"{root} 下没有 decision_*.json"
@@ -1478,6 +1677,7 @@ def _decisions_state(path: Path | None) -> dict:
             "eval_checkpoint": blob.get("eval_checkpoint"),
             "epochs": blob.get("epochs"),
         })
+    state["gpu_minutes"] = ledger
     state["readable"] = bool([i for i in state["items"] if not i.get("error")])
     return state
 
@@ -1507,9 +1707,9 @@ def _decisions_view(ctx: dict) -> str:
                           f'{_esc(str(it["max_train_frames"]))}'
                           if it.get("equal_steps") else "")
                        + "</p>")
-        rows = ['<table><tr><th>指标</th><th>champion 每 seed</th>'
+        rows = ['<table><tr><th>指标<br><span style=font-weight:400;font-size:11px;color:#6b7280>成对比较用的主指标（当前 road_iou；标线指标缺真值时为 UNKNOWN）</span></th><th>champion 每 seed</th>'
                 "<th>candidate 每 seed</th><th>deltas</th>"
-                "<th>mean delta</th><th>ci95 半宽</th><th>verdict</th></tr>"]
+                "<th>mean delta</th><th>ci95 半宽</th><th>verdict<br><span style=font-weight:400;font-size:11px;color:#6b7280>candidate_better / champion_better / inconclusive</span></th></tr>"]
         for name, sp in sorted((it.get("pairings") or {}).items()):
             rows.append(
                 f"<tr><td>{_esc(name)}</td>"
@@ -1547,7 +1747,13 @@ def _decisions_view(ctx: dict) -> str:
             out.append('<p class="hint">硬门未测（UNKNOWN）: '
                        f'{_esc(", ".join(it["hard_unknown"]))}'
                        "——这些项没有测量，既不算通过也不算违反。</p>")
-            run_dir = Path(st.get("path") or "")
+            ledger = st.get("gpu_minutes") or {}
+        if ledger:
+            days = ", ".join(f"{d}: {v.get('minutes')} min"
+                             for d, v in sorted(ledger.items()))
+            out.append(f'<p class="hint">GPU 墙钟账本（跨进程累计，供每日上限）: '
+                       f'{_esc(days)}</p>')
+        run_dir = Path(st.get("path") or "")
         if run_dir.exists():
             shots = (sorted(run_dir.glob("review_overlays/*.png"))[:6]
                      + sorted(run_dir.glob("probes/**/*.png"))[:6])
@@ -1572,6 +1778,1046 @@ def _fmt_num(v) -> str:
         return f"{float(v):.4f}"
     except (TypeError, ValueError):
         return str(v)
+
+
+def _run_root(ctx: dict):
+    """本次渲染对应的运行目录（来自 --run-dir；没有就返回 None）。"""
+    st = ctx.get("decisions") or {}
+    p = Path(str(st.get("path") or ""))
+    return p if str(p) and p.exists() else None
+
+
+def _ckpt_params(run_root: Path, *, limit: int = 8) -> list:
+    """逐 (arm, seed) 读 checkpoint 里的训练超参（只读、weights_only）。"""
+    rows = []
+    if run_root is None:
+        return rows
+    try:
+        import torch
+    except Exception:                                     # noqa: BLE001
+        return rows
+    cks = sorted(run_root.glob("*/seed*/checkpoint_last.pt"))
+    if not cks:
+        cks = sorted(run_root.glob("seed*/checkpoint_last.pt"))
+    if not cks:
+        # 单臂、直接写在运行目录根下的 checkpoint（实测有这种布局）
+        cks = sorted(run_root.glob("checkpoint_last.pt"))
+    for ck in cks[:limit]:
+        try:
+            blob = torch.load(str(ck), map_location="cpu", weights_only=True)
+        except Exception as exc:                          # noqa: BLE001
+            rows.append({"arm": ck.parent.parent.name or ck.parent.name,
+                         "seed": ck.parent.name, "error":
+                         f"{type(exc).__name__}: {exc}"})
+            continue
+        ta = dict(blob.get("train_args") or {})
+        rows.append({
+            "arm": ck.parent.parent.name if ck.parent.parent != run_root
+                   else run_root.name,
+            "seed": ck.parent.name, "train_args": ta,
+            "dataset_id": blob.get("dataset_id"),
+            "git_commit": str(blob.get("git_commit") or "")[:8],
+            "env": dict(blob.get("env") or {}),
+            # 只是"有没有"，不能 bool() 一个含张量的结构（实测踩到
+            # RuntimeError: Boolean value of Tensor with more than one value）
+            "has_rng": (blob.get("rng_state") is not None
+                        or blob.get("torch_rng") is not None),
+        })
+    return rows
+
+
+def _train_dynamics(run_root: Path, *, limit: int = 8) -> list:
+    """逐 run 读 training metrics：lr 轨迹、梯度范数、吞吐（只读 jsonl）。"""
+    out = []
+    if run_root is None:
+        return out
+    cands = sorted((run_root.parent).glob(f"{run_root.name}-*/metrics.jsonl"))
+    if not cands:
+        cands = sorted(run_root.glob("*/metrics.jsonl"))
+    for fp in cands[:limit]:
+        steps, hdr = [], {}
+        try:
+            for line in fp.read_text(encoding="utf-8",
+                                     errors="replace").splitlines():
+                if not line.strip():
+                    continue
+                rec = json.loads(line)
+                if rec.get("kind") == "task":
+                    # 一个 run 可能有多条 task 记录（启动/收尾）：合并，非空优先
+                    for k, v in rec.items():
+                        if v is not None and (k not in hdr or hdr[k] is None):
+                            hdr[k] = v
+                elif rec.get("kind") == "train":
+                    steps.append(rec)
+        except Exception as exc:                          # noqa: BLE001
+            out.append({"run": fp.parent.name,
+                        "error": f"{type(exc).__name__}: {exc}"})
+            continue
+        lrs = [s_["lr"] for s_ in steps if s_.get("lr") is not None]
+        gns = [s_["grad_norm"] for s_ in steps
+               if s_.get("grad_norm") is not None]
+        sts = [s_["step_s"] for s_ in steps if s_.get("step_s") is not None]
+        def _pct(vals, q):
+            if not vals:
+                return None
+            v = sorted(float(x) for x in vals)
+            i = min(len(v) - 1, max(0, int(round(q * (len(v) - 1)))))
+            return round(v[i], 4)
+        out.append({
+            "run": fp.parent.name, "n_steps": len(steps),
+            "lr_first": (round(lrs[0], 6) if lrs else None),
+            "lr_last": (round(lrs[-1], 6) if lrs else None),
+            "grad_p50": _pct(gns, 0.5), "grad_p95": _pct(gns, 0.95),
+            "grad_max": (round(max(gns), 4) if gns else None),
+            "step_s_p50": _pct(sts, 0.5),
+            "steps_per_s": (None if not sts or _pct(sts, 0.5) in (None, 0)
+                            else round(1.0 / _pct(sts, 0.5), 3)),
+            "batch": hdr.get("batch"), "epochs": hdr.get("epochs"),
+            "seed": hdr.get("seed"), "total_steps": hdr.get("total_steps"),
+            "amp": hdr.get("amp"),
+        })
+    return out
+
+
+def _val_or_missing(v) -> str:
+    """把值渲染成字符串；**0 / 0.0 是真实值**，只有 None 与空串才是未测。
+
+    实测踩到：`eta_min=0.0`、`weight_decay=0.0` 被 `or "未测"` 吃成"未测"，
+    等于把"余弦退火到 0"这个关键事实从看板上抹掉。
+    """
+    if v is None or (isinstance(v, str) and not v.strip()):
+        return "未测"
+    return str(v)
+
+
+def _dl_params_view(ctx: dict) -> str:
+    """训练超参与训练动力学：迭代深度学习要看的那组数。"""
+    root = _run_root(ctx)
+    out = ['<section id="dlparams"><h2>训练超参与训练动力学</h2>',
+           '<p class="hint">每个 (臂, seed) 一行，直接读 checkpoint 的 train_args '
+           '与训练的 metrics.jsonl。缺项写「未测」，不猜；老 checkpoint 没有这些字段'
+           '时同样写未测（字段是 2026-09-25 起才补记的）。</p>']
+    rows = _ckpt_params(root)
+    n_all = 0
+    if root is not None:
+        n_all = len(sorted(root.glob("*/seed*/checkpoint_last.pt"))
+                    or sorted(root.glob("seed*/checkpoint_last.pt"))
+                    or sorted(root.glob("checkpoint_last.pt")))
+    if rows and n_all > len(rows):
+        out.append(f'<p class="hint">只显示前 {len(rows)}/{n_all} 个 checkpoint'
+                   '（避免一次读太多权重文件）。</p>')
+    if not rows:
+        out.append('<p class="hint">missing data: 没有可读的 checkpoint'
+                   '（用 --run-dir 指定运行目录）。</p>')
+    else:
+        out.append("<table><tr><th>臂/seed</th><th>arch / 参数量</th>"
+                   "<th>输入</th><th>batch × epochs<br><span style=font-weight:400;font-size:11px;color:#6b7280>批大小 × 训练轮数</span></th>"
+                   "<th>lr 初值 → 调度器</th><th>优化器<br><span style=font-weight:400;font-size:11px;color:#6b7280>优化器与其超参（Adam: betas / weight decay）</span></th>"
+                   "<th>AMP / 确定性</th><th>类别权重（bg/road/line）</th>"
+                   "<th>步/epoch</th><th>n_train/n_val</th>"
+                   "<th>数据因子<br><span style=font-weight:400;font-size:11px;color:#6b7280>这一轮改动的是哪一项数据/标签口径（line 屏蔽 / 截帧 / 采样权重…）</span></th><th>数据版本 / commit</th>"
+                   "<th>设备 / 环境</th></tr>")
+        for r in rows:
+            head = f'<td>{_esc(r["arm"])}/{_esc(r["seed"])}</td>'
+            if r.get("error"):
+                out.append(f'<tr>{head}<td colspan="12" class="miss">'
+                           f'未测：{_esc(r["error"])}</td></tr>')
+                continue
+            ta = dict(r["train_args"])
+            sch = dict(ta.get("scheduler") or {})
+            opt = dict(ta.get("optimizer") or {})
+            env = dict(r.get("env") or {})
+            cw = ta.get("class_weights")
+            factor = []
+            if ta.get("ignore_line_class"):
+                factor.append("line 通道屏蔽(paint_source="
+                              f"{ta.get('paint_source')}, "
+                              f"{ta.get('line_ignored_frames')} 帧)")
+            if ta.get("max_train_frames"):
+                factor.append(f"截帧 {ta['max_train_frames']}")
+            if ta.get("run_weights"):
+                factor.append(f"run 权重 {ta['run_weights']}")
+            if not factor:
+                factor.append("无（等权、全通道）")
+            cells = [
+                f'<td>{_esc(str(ta.get("arch") or "未测"))} / '
+                f'{_esc(str(ta.get("n_params") or "未测"))}</td>',
+                f'<td>{_esc(str(ta.get("input_size") or "未测"))}</td>',
+                f'<td>{_esc(str(ta.get("batch") or "未测"))} × '
+                f'{_esc(str(ta.get("epochs") or "未测"))}</td>',
+                f'<td>{_esc(str(ta.get("lr") or "未测"))} → '
+                f'{_esc(str(sch.get("name") or "未测"))}'
+                f'(T_max={_esc(_val_or_missing(sch.get("T_max")))}, '
+                f'eta_min={_esc(_val_or_missing(sch.get("eta_min")))})</td>',
+                f'<td>{_esc(str(opt.get("name") or "未测"))} '
+                f'betas={_esc(str(opt.get("betas") or "未测"))} '
+                f'wd={_esc(_val_or_missing(opt.get("weight_decay")))}</td>',
+                f'<td>amp={_esc(str(ta.get("amp")))} / '
+                f'det={_esc(str(ta.get("deterministic")))}</td>',
+                f'<td>{_esc(str(cw) if cw else "未测")}</td>',
+                f'<td>{_esc(str(ta.get("steps_per_epoch") or "未测"))}</td>',
+                f'<td>{_esc(str(ta.get("n_train") or "未测"))}/'
+                f'{_esc(str(ta.get("n_val") or "未测"))}</td>',
+                f'<td>{_esc("；".join(factor))}</td>',
+                f'<td>{_esc(str(r.get("dataset_id") or "未测"))} / '
+                f'{_esc(str(r.get("git_commit") or "未测"))}</td>',
+                f'<td>{_esc(str(env.get("device") or ta.get("device_name") or "未测"))}'
+                f' · torch {_esc(str(env.get("torch") or "未测"))}'
+                f' · cuda {_esc(str(env.get("cuda") or "未测"))}</td>',
+            ]
+            out.append("<tr>" + head + "".join(cells) + "</tr>")
+        out.append("</table>")
+        out.append('<p class="hint">类别权重来自 median-frequency balancing，'
+                   'line 类再乘 --line-weight；权重越小说明该类在训练集里越常见。</p>')
+    dyn = _train_dynamics(root)
+    if dyn:
+        out.append("<h3>训练动力学（逐 step 记录）</h3>"
+                   "<table><tr><th>run</th><th>步数<br><span style=font-weight:400;font-size:11px;color:#6b7280>本 run 实际记录的优化步数 / 计划步数</span></th>"
+                   "<th>lr 首 → 末</th><th>|grad| p50 / p95 / max</th>"
+                   "<th>step 耗时 p50</th><th>steps/s</th>"
+                   "<th>batch × epochs × seed</th></tr>")
+        for d in dyn:
+            if d.get("error"):
+                out.append(f'<tr><td>{_esc(d["run"])}</td>'
+                           f'<td colspan="6" class="miss">未测：'
+                           f'{_esc(d["error"])}</td></tr>')
+                continue
+            cells = (
+                f'<td class="mono">{_esc(d["run"])}</td>'
+                f'<td>{_esc(str(d["n_steps"]))}/'
+                f'{_esc(str(d.get("total_steps") or "?"))}</td>'
+                f'<td>{_esc(str(d["lr_first"]))} → {_esc(str(d["lr_last"]))}</td>'
+                f'<td>{_esc(str(d["grad_p50"]))} / {_esc(str(d["grad_p95"]))} / '
+                f'{_esc(str(d["grad_max"]))}</td>'
+                f'<td>{_esc(str(d["step_s_p50"]))} s</td>'
+                f'<td>{_esc(str(d["steps_per_s"]))}</td>'
+                f'<td>{_esc(str(d.get("batch")))} × {_esc(str(d.get("epochs")))}'
+                f' × {_esc(str(d.get("seed")))}</td>')
+            out.append("<tr>" + cells + "</tr>")
+        out.append("</table>")
+        out.append('<p class="hint">|grad| 是 unscale 之后算的（AMP 下直接统计会随 '
+                   'scaler 漂移）；NaN/Inf 一旦出现训练立即失败并留 failed 事件。</p>')
+    out.append("</section>")
+    return "".join(out)
+
+
+def _status_items(ctx: dict) -> str:
+    """header 里的状态栏：与监控页同款 .item(.k/.v) + 状态 Pill。"""
+    root = _run_root(ctx)
+    ev = ctx.get("events") or {}
+    last = ev.get("last") if ev.get("readable") else None
+    dec = (ctx.get("decisions") or {})
+    mf = ctx.get("manifest") or {}
+    _rn = root.name if root else "未指定"
+    items = [('<span class="item"><span class="k">运行</span>'
+              f'<span class="v">{_esc(_rn)}'
+              + (f"（{_esc(_run_label_cn(_rn))}）" if root is not None else "")
+              + "</span></span>")]
+    if last is not None:
+        items.append('<span class="item"><span class="k">阶段</span>'
+                     f'<span class="pill {_esc(last.phase)}">'
+                     f'{_esc(last.phase)}/{_esc(last.status)}</span></span>')
+    if mf.get("readable"):
+        items.append('<span class="item"><span class="k">数据集</span>'
+                     f'<span class="v">{_esc(str(mf.get("dataset_id") or "未测")[:16])}'
+                     "</span></span>")
+    first = ((dec.get("items") or [{}])[0] if dec.get("items") else {})
+    if first.get("decision"):
+        items.append('<span class="item"><span class="k">判定</span>'
+                     f'<span class="pill {_esc(str(first["decision"]))}">'
+                     f'{_esc(str(first["decision"]))}</span></span>')
+    led = (dec.get("gpu_minutes") or {})
+    if led:
+        today = sorted(led)[-1]
+        items.append('<span class="item"><span class="k">今日 GPU</span>'
+                     f'<span class="v">{_esc(str(led[today].get("minutes")))} min'
+                     "</span></span>")
+    items.append('<span class="item"><span class="k">生成</span>'
+                 f'<span class="v">{_esc(ctx.get("generated_at", ""))}</span></span>')
+    return '<div class="statusbar">' + "".join(items) + "</div>"
+
+
+def _toolbar(ctx: dict) -> str:
+    return ('<div class="toolbar">'
+            '<a class="btn on" href="#">一页卡片</a>'
+            '<span>表格可横向滚动；缺测写「未测」，不画 0</span></div>')
+
+
+def _statusbar(ctx: dict) -> str:
+    """顶部状态栏：与监控页同一套观感——一眼看到"这是哪一轮、到哪了、判定如何"。"""
+    root = _run_root(ctx)
+    ev = ctx.get("events") or {}
+    last = ev.get("last") if ev.get("readable") else None
+    dec = (ctx.get("decisions") or {})
+    items = [("运行", root.name if root else "未指定")]
+    if last is not None:
+        items.append(("阶段", f"{last.phase}/{last.status}"))
+    mf = ctx.get("manifest") or {}
+    if mf.get("readable"):
+        items.append(("数据集", str(mf.get("dataset_id") or "未测")[:16]))
+    led = (dec.get("gpu_minutes") or {})
+    if led:
+        today = sorted(led)[-1]
+        items.append(("今日 GPU", f"{led[today].get('minutes')} min"))
+    first = (dec.get("items") or [{}])[0] if dec.get("items") else {}
+    if first.get("decision"):
+        items.append(("判定", str(first["decision"])))
+    items.append(("生成", ctx.get("generated_at", "")))
+    cells = []
+    for i, (k, v) in enumerate(items):
+        if i:
+            cells.append('<span class="sep">|</span>')
+        cls = ""
+        if k == "判定":
+            cls = (" badge ok" if v in ("shadow_candidate", "approved_for_review")
+                   else " badge bad" if v in ("rejected", "failed")
+                   else " badge warn")
+        cells.append(f'<span class="k">{_esc(k)}</span>'
+                     f'<span class="v{" badge" + cls.split("badge")[1] if cls else ""}">{_esc(str(v))}</span>')
+    return '<div class="statusbar">' + " ".join(cells) + "</div>"
+
+
+def _series_stats(se) -> str:
+    """卡片下方的统计行：当前 / 均值 / 峰值 / 中位 / n（与监控页同格式）。"""
+    got = [float(v) for _x, v in (se.points if se else []) if v is not None]
+    if not got:
+        return '<span class="miss">未测</span>'
+    cur = got[-1]
+    mean = sum(got) / len(got)
+    vmax = max(got)
+    med = sorted(got)[len(got) // 2]
+    def f(v):
+        return f"{v:.4g}"
+    return (f"当前 {f(cur)} · 均值 {f(mean)} · 峰值 {f(vmax)} · 中位 {f(med)}"
+            f" · n={len(got)}"
+            "<span style=color:#6b7280;font-size:11px>"
+            "（当前=最后一个 epoch；均值/峰值/中位=整段；n=参与统计的 epoch 数）"
+            "</span>")
+
+
+def _card(title: str, sub: str, body: str, *, stats: str = "",
+          wide: bool = False) -> str:
+    cls = "card wide" if wide else "card"
+    return (f'<div class="{cls}"><h3>{_esc(title)}</h3>'
+            f'<div class="sub">{_esc(sub)}</div>'
+            f'<div class="cv">{body}</div>'
+            + (f'<div class="stats">{stats}</div>' if stats else "")
+            + "</div>")
+
+
+def _cards_view(ctx: dict) -> str:
+    """main 里的两列卡片网格：每 (seed, 指标) 一张图卡 + 若干表卡。"""
+    t13 = ctx.get("t13") or {}
+    series = list(t13.get("series") or [])
+    cards: list[str] = []
+    if t13.get("readable") and series:
+        # 先按"指标"分组再按臂/seed 交织，保证两种臂、多个 seed 都能露脸
+        # （按名字排序会把 8 张卡全给了 baseline/*）
+        want = ("train_loss", "val_miou", "val_line_iou", "val_acc")
+        names = sorted({se.name for se in series})
+        ordered: list = []
+        for metric in want:
+            key = "val_miou" if metric == "val_miou" else metric
+            for name in names:
+                se = next((x for x in series
+                           if x.name == name and x.metric == key), None)
+                if se is not None:
+                    ordered.append(se)
+        picked = [se for se in series if se.metric in want]
+        shown = 0
+        if True:
+            for se in ordered:
+                if shown >= 8:
+                    break
+                unit = {"train_loss": "loss 值", "val_miou": "mIoU",
+                        "val_line_iou": "line IoU", "val_acc": "acc"}.get(
+                            se.metric, se.metric)
+                cards.append(_card(
+                    f"{se.metric} · {se.name}",
+                    f"单位：{unit}　横轴：epoch（{'开发集' if se.metric.startswith('val') else '训练'}）",
+                    _svg_series(se, fluid=True),
+                    stats=_series_stats(se)))
+                shown += 1
+        if shown < len(picked):
+            cards.append(_card(
+                "更多曲线未显示",
+                f"共 {len(picked)} 条，本页最多 8 条",
+                '<div class="hint">用 --view full 看全部序列（每个指标一张大图）。</div>'))
+    else:
+        cards.append(_card(
+            "训练曲线", "没有训练历史（train_hist.json）",
+            f'<div class="hint">missing data：{_esc(str(t13.get("error") or "无"))}'
+            "。缺训练历史时不画任何数。</div>"))
+    # 表类卡片：复用既有分区的表格（它们本身就是 table 结构）
+    for sec in (_decisions_view(ctx), _dl_params_view(ctx), _data_view(ctx),
+                _resources_view(ctx), _final_view(ctx), _paths_view(ctx)):
+        cards.append(_card_wide_from_section(sec))
+    return "<main>" + "".join(cards) + "</main>"
+
+
+#: 运行 ID 前缀 → 人读标签（显示用；来源是 ID 本身，不是重新定义事实）。
+_RUN_LABELS = (
+    ("entry_accept", "后台入口验收（多轮/淘汰/中断恢复）"),
+    ("plateau_arm", "平台期两臂对比（主结论）"),
+    ("plateau_meta", "单臂训练（看板字段验证，含逐 step 指标）"),
+    ("plateau_live", "单臂训练（给实时监控页看的）"),
+    ("dlparams_probe", "超参字段探针（2 epoch 小实验）"),
+    ("monitor_e2e", "监控链路自测"),
+    ("monitor_check", "监控链路自测"),
+    ("roads3", "等步数/早停对照（road-only）"),
+    ("realgate", "数据准入门实测（未训练）"),
+)
+
+
+def _run_label_cn(name: str) -> str:
+    for key, label in _RUN_LABELS:
+        if key in name:
+            return label
+    return "实验运行"
+
+
+def _runs_card(ctx: dict) -> str:
+    """本次运行 + 历史运行：一个入口页，运行 ID 不再让人猜。"""
+    root = _run_root(ctx)
+    out_path = Path(str(ctx.get("out_path") or ""))
+    here = root.name if root is not None else "未指定"
+    rows = [f'<tr><td class="mono">{_esc(here)}</td>'
+            f'<td>{_esc(_run_label_cn(here))}</td><td class="ok">本页</td></tr>']
+    siblings = []
+    if out_path.parent.exists():
+        for hp in sorted(out_path.parent.glob("*.html")):
+            if hp.name in ("index.html", out_path.name):
+                continue
+            siblings.append(hp)
+    for hp in siblings[:12]:
+        rows.append(f'<tr><td class="mono">{_esc(hp.stem)}</td>'
+                    f'<td>{_esc(_run_label_cn(hp.stem))}</td>'
+                    f'<td><a href="{_esc(hp.name)}">打开</a></td></tr>')
+    body = ("<table><tr><th>运行 ID</th><th>是什么</th><th>链接</th></tr>"
+            + "".join(rows) + "</table>"
+            '<p class="hint">“本页”= 当前这一份；其余是历史运行，点开是同目录的'
+            '另一份 HTML。运行 ID 是执行时的目录名，这里只是给它配了人读标签。</p>')
+    return ('<div class="card wide"><h3>本次运行与历史运行</h3>'
+            '<div class="sub">一个入口页：默认显示最新的那次实验</div>'
+            f'<div>{body}</div></div>')
+
+
+def _card_wide_from_section(html: str) -> str:
+    """把既有 `<section><h2>标题</h2>…</section>` 转成一张宽卡（标题/副标题/内容）。"""
+    import re as _re
+    m = _re.match(r'<section[^>]*><h2>(.*?)</h2>(.*?)</section>$', html, _re.S)
+    if not m:
+        return f'<div class="card wide">{html}</div>'
+    title, body = m.group(1), m.group(2)
+    sub = ""
+    m2 = _re.match(r'\s*<p class="hint">(.*?)</p>(.*)$', body, _re.S)
+    if m2:
+        sub, body = m2.group(1), m2.group(2)
+    return (f'<div class="card wide"><h3>{title}</h3>'
+            + (f'<div class="sub">{sub}</div>' if sub else "")
+            + f'<div>{body}</div></div>')
+
+
+#: 汇总页的读取上限（诚实注明截断，不做无界扫描）。
+ALL_MAX_CKPTS = 24
+ALL_MAX_OVERLAYS = 12
+
+
+def _scan_all_runs(runs_root: Path, *, include_all: bool = False) -> dict:
+    """有界扫描运行目录：历史/指标/判定/数据版本/账本/checkpoint。"""
+    all_ck: list = []
+    out = {"root": str(runs_root), "runs": [], "skipped_runs": [],
+           "hist": [], "metrics": [], "decisions": [], "datasets": [],
+           "gpu": [], "ckpts": [], "n_ckpt_total": 0,
+           "collects": [], "include_all": bool(include_all)}
+    if not runs_root.exists():
+        return out
+    for rd in sorted(x for x in runs_root.iterdir() if x.is_dir()):
+        hists = sorted(rd.glob("**/train_hist.json"))
+        mets = sorted(rd.glob("metrics.jsonl")) + sorted(
+            runs_root.glob(rd.name + "-*/metrics.jsonl"))
+        decs = sorted(rd.glob("**/decision_*.json"))
+        ds = sorted(rd.glob("**/rounds_dataset.json"))
+        gpu = sorted(rd.glob("**/gpu_minutes.json"))
+        cols = sorted(rd.glob("collect_*.json"))
+        cks = sorted(rd.glob("*/seed*/checkpoint_last.pt")) + sorted(
+            rd.glob("seed*/checkpoint_last.pt"))
+        if not (hists or mets or decs or ds or cks or cols):
+            continue
+        # 默认只保留"真产出过结论"的运行：有判定或有逐 step 指标。
+        # 纯历史训练目录（T13 三臂、t14_rounds1-5、det*_steps、gpu_tol…）默认不进，
+        # 否则 150 份历史会被摊成 300 张图（用户实测反馈："为什么这么多曲线"）。
+        if not include_all and not (decs or mets or cols):
+            out["skipped_runs"].append(rd.name)
+            continue
+        out["runs"].append(rd.name)
+        for h in hists:
+            out["hist"].append({"run": rd.name, "path": h,
+                                "tag": _rel_tag(h.parent, rd)})
+        out["metrics"] += [{"run": rd.name, "path": m} for m in mets]
+        out["decisions"] += [{"run": rd.name, "path": d} for d in decs]
+        out["datasets"] += [{"run": rd.name, "path": d} for d in ds]
+        out["gpu"] += [{"run": rd.name, "path": g} for g in gpu]
+        out["collects"] += [{"run": rd.name, "path": c} for c in cols]
+        out["n_ckpt_total"] += len(cks)
+        all_ck += [(c, rd.name) for c in cks]
+    # 超参表读**最新**的 checkpoint，不按目录名字母序：实测踩到——按字母序时
+    # "t14_3h_*" 这类老 run 占满名额，字段最全的新 run 一个都没读到，整表看起来
+    # 全是"未测"（旧 checkpoint 里根本没有那些字段）。
+    all_ck.sort(key=lambda it: it[0].stat().st_mtime, reverse=True)
+    for c, run in all_ck[:max(0, ALL_MAX_CKPTS)]:
+        out["ckpts"].append({"run": run, "path": c})
+    return out
+
+
+def _rel_tag(d: Path, run_dir: Path) -> str:
+    try:
+        return str(d.relative_to(run_dir)).replace("\\", "/")
+    except Exception:                                     # noqa: BLE001
+        return d.name
+
+
+def _hist_series(path: Path, run: str, tag: str) -> list:
+    """读一份 train_hist.json → 系列（与单运行视图同一口径）。"""
+    try:
+        blob = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:                                     # noqa: BLE001
+        return []
+    epochs = blob.get("epoch") or []
+    out = []
+    for metric, values in sorted(blob.items()):
+        if metric in ("epoch", "lr", "line_ignored_frames") \
+                or not isinstance(values, list):
+            continue
+        pts = [(float(e), (None if i >= len(values) or values[i] is None
+                           else float(values[i])))
+               for i, e in enumerate(epochs)]
+        if not pts:
+            continue
+        out.append(Series(name=f"{run}/{tag}", metric=str(metric), unit="",
+                          level=(LEVEL_DEV if str(metric).startswith("val")
+                                 else LEVEL_TRAIN),
+                          source=f"{run}/{tag}/train_hist.json", points=pts,
+                          missing=[]))
+    return out
+
+
+def _metrics_summary(path: Path) -> dict:
+    """读一份 metrics.jsonl → lr/梯度/吞吐摘要（没有的项留 None=未测）。"""
+    steps, hdr = [], {}
+    try:
+        for line in path.read_text(encoding="utf-8",
+                                   errors="replace").splitlines():
+            if not line.strip():
+                continue
+            rec = json.loads(line)
+            if rec.get("kind") == "task":
+                for k, v in rec.items():
+                    if v is not None and (k not in hdr or hdr[k] is None):
+                        hdr[k] = v
+            elif rec.get("kind") == "train":
+                steps.append(rec)
+    except Exception:                                     # noqa: BLE001
+        return {}
+
+    def _pct(vals, q):
+        v = sorted(float(x) for x in vals if x is not None)
+        if not v:
+            return None
+        i = min(len(v) - 1, max(0, int(round(q * (len(v) - 1)))))
+        return round(v[i], 5)
+    lrs = [x.get("lr") for x in steps]
+    gns = [x.get("grad_norm") for x in steps]
+    sts = [x.get("step_s") for x in steps]
+    p50 = _pct(sts, 0.5)
+    return {"n_steps": len(steps), "total_steps": hdr.get("total_steps"),
+            "lr_first": _pct(lrs, 0.0), "lr_last": _pct(lrs, 1.0),
+            "grad_p50": _pct(gns, 0.5), "grad_p95": _pct(gns, 0.95),
+            "step_s_p50": p50,
+            "steps_per_s": (None if not p50 else round(1.0 / p50, 3)),
+            "seed": hdr.get("seed"), "batch": hdr.get("batch"),
+            "epochs": hdr.get("epochs")}
+
+
+def _all_ctx(runs_root: Path, *, include_all: bool = False) -> dict:
+    scan = _scan_all_runs(runs_root, include_all=include_all)
+    series = []
+    for h in scan["hist"]:
+        series += _hist_series(h["path"], h["run"], h["tag"])
+    # 指标总表：每 (run, tag) 一行，末值取自曲线；lr/梯度取自 metrics.jsonl
+    rows: dict = {}
+    for se in series:
+        key = se.name
+        row = rows.setdefault(key, {"run": se.name.split("/")[0], "name": se.name})
+        got = [(x, v) for x, v in se.points if v is not None]
+        if se.metric == "train_loss" and got:
+            row["loss_first"], row["loss_last"] = got[0][1], got[-1][1]
+        if se.metric.startswith("val") and got:
+            if row.get("val_last") is None or se.metric == "val_miou":
+                row["val_metric"] = se.metric
+                row["val_first"], row["val_last"] = got[0][1], got[-1][1]
+    dyn = {}
+    for m in scan["metrics"]:
+        s_ = _metrics_summary(m["path"])
+        if s_:
+            dyn[m["run"]] = s_
+            # 也挂到同名 run/tag（rounds 的每臂每 seed 指标目录名 = <run>-<arm>-s<seed>）
+            for key, row in rows.items():
+                if key.startswith(m["run"] + "-") or key.startswith(m["run"] + "/"):
+                    row["dyn"] = s_
+            rows.setdefault(m["run"], {"run": m["run"], "name": m["run"]})
+            rows[m["run"]]["dyn"] = s_
+    cols, col_stat = [], {"n": 0, "ok": 0, "rejected": 0, "frames": 0,
+                          "paint_frames": 0, "gpu_minutes": 0.0}
+    for c in scan["collects"]:
+        try:
+            b = json.loads(c["path"].read_text(encoding="utf-8"))
+        except Exception:                                 # noqa: BLE001
+            continue
+        b["_run"], b["_path"] = c["run"], str(c["path"])
+        cols.append(b)
+        col_stat["n"] += 1
+        col_stat["ok" if b.get("ok") else "rejected"] += 1
+        col_stat["frames"] += int(b.get("frames_total") or 0)
+        col_stat["paint_frames"] += sum(
+            int(v) for v in (b.get("paint_frames_by_role") or {}).values())
+        col_stat["gpu_minutes"] += float(b.get("gpu_minutes") or 0.0)
+    return {"scan": scan, "series": series, "rows": rows, "dyn": dyn,
+            "collects": cols, "collect_stats": col_stat}
+
+
+def _all_metrics_table(ctx: dict) -> str:
+    a = ctx.get("all") or {}
+    rows = a.get("rows") or {}
+    if not rows:
+        return '<p class="hint">missing data: 没有训练历史。</p>'
+    out = ["<table><tr><th>运行 / 臂-seed<br><span style=font-weight:400;font-size:11px;color:#6b7280>运行目录 / 实验臂 + 随机种子；同一 run 的每个臂每个 seed 一行</span></th><th>train loss 首→末<br><span style=font-weight:400;font-size:11px;color:#6b7280>训练集损失，越低越好；首末=第 0 轮与最后一轮</span></th>"
+           "<th>开发指标 首→末<br><span style=font-weight:400;font-size:11px;color:#6b7280>验证集指标，越高越好；取该 run 可用的 val_miou/val_line_iou/val_acc</span></th><th>lr 首→末<br><span style=font-weight:400;font-size:11px;color:#6b7280>学习率；余弦退火按 --epochs 收到接近 0（T_max=epochs）</span></th><th>|grad| p50/p95<br><span style=font-weight:400;font-size:11px;color:#6b7280>梯度 L2 范数（AMP 下 unscale 后统计），衡量每步更新幅度</span></th>"
+           "<th>步/s<br><span style=font-weight:400;font-size:11px;color:#6b7280>每秒优化步数（吞吐），由逐 step 耗时中位数换算</span></th><th>步数<br><span style=font-weight:400;font-size:11px;color:#6b7280>本 run 实际记录的优化步数 / 计划步数</span></th></tr>"]
+    for key in sorted(rows):
+        r = rows[key]
+        d = r.get("dyn") or {}
+
+        def f(v):
+            return "未测" if v is None else _fmt_point(float(v))
+        loss = (f"{f(r.get('loss_first'))} → {f(r.get('loss_last'))}"
+                if r.get("loss_first") is not None else "未测")
+        val = (f"{r.get('val_metric') or 'val'} {f(r.get('val_first'))} → "
+               f"{f(r.get('val_last'))}" if r.get("val_last") is not None
+               else "未测")
+        lr = (f"{d.get('lr_first')} → {d.get('lr_last')}"
+              if d.get("lr_first") is not None else "未测")
+        gn = (f"{f(d.get('grad_p50'))} / {f(d.get('grad_p95'))}"
+              if d.get("grad_p50") is not None else "未测")
+        out.append(f'<tr><td class="mono">{_esc(key)}</td><td class="mono">{loss}</td>'
+                   f'<td class="mono">{val}</td><td class="mono">{lr}</td>'
+                   f'<td class="mono">{gn}</td>'
+                   f'<td class="mono">{d.get("steps_per_s") or "未测"}</td>'
+                   f'<td class="mono">{d.get("n_steps") or "未测"}</td></tr>')
+    out.append("</table>")
+    return "".join(out)
+
+
+def _all_decisions_table(ctx: dict) -> str:
+    a = ctx.get("all") or {}
+    decs = (a.get("scan") or {}).get("decisions") or []
+    if not decs:
+        return '<p class="hint">missing data: 没有判定文件。</p>'
+    out = ["<table><tr><th>运行<br><span style=font-weight:400;font-size:11px;color:#6b7280>运行目录名：一次后台入口 / 一轮实验的产物都在这个目录里</span></th><th>候选<br><span style=font-weight:400;font-size:11px;color:#6b7280>候选 ID：提议的因子 + 轮次</span></th><th>指标<br><span style=font-weight:400;font-size:11px;color:#6b7280>成对比较用的主指标（当前 road_iou；标线指标缺真值时为 UNKNOWN）</span></th><th>逐 seed（champion / candidate）<br><span style=font-weight:400;font-size:11px;color:#6b7280>基线与候选在同一 seed 下的值，逐对比较</span></th>"
+           "<th>均值 / ci95<br><span style=font-weight:400;font-size:11px;color:#6b7280>配对差均值 / 95% 置信半宽；区间跨 0 = 不可判定（不是没效果）</span></th><th>verdict<br><span style=font-weight:400;font-size:11px;color:#6b7280>candidate_better / champion_better / inconclusive</span></th><th>判定<br><span style=font-weight:400;font-size:11px;color:#6b7280>晋级结论：rejected / needs_evidence / shadow_candidate</span></th></tr>"]
+    for d in decs:
+        try:
+            b = json.loads(d["path"].read_text(encoding="utf-8"))
+        except Exception:                                 # noqa: BLE001
+            continue
+        pairs = b.get("pairings") or {}
+        dec = (b.get("decision") or {}).get("decision") or ""
+        if not pairs:
+            continue
+        for name, sp in sorted(pairs.items()):
+            out.append(
+                f'<tr><td class="mono">{_esc(d["run"])}</td>'
+                f'<td class="mono">{_esc(str(b.get("candidate_id") or b.get("candidate") or ""))}</td>'
+                f'<td>{_esc(name)}</td>'
+                f'<td class="mono">{_esc(_fmt_list(sp.get("champion")))} / '
+                f'{_esc(_fmt_list(sp.get("candidate")))}</td>'
+                f'<td class="mono">{_esc(_fmt_num(sp.get("mean_delta")))} / '
+                f'{_esc(_fmt_num(sp.get("ci95_halfwidth")))}</td>'
+                f'<td>{_esc(str(sp.get("verdict") or ""))}</td>'
+                f'<td><span class="pill {_esc(dec)}">{_esc(dec)}</span></td></tr>')
+    out.append("</table>")
+    return "".join(out)
+
+
+def _all_datasets_table(ctx: dict) -> str:
+    a = ctx.get("all") or {}
+    items = (a.get("scan") or {}).get("datasets") or []
+    if not items:
+        return '<p class="hint">missing data: 没有数据版本文件。</p>'
+    out = ["<table><tr><th>运行<br><span style=font-weight:400;font-size:11px;color:#6b7280>运行目录名：一次后台入口 / 一轮实验的产物都在这个目录里</span></th><th>dataset_id<br><span style=font-weight:400;font-size:11px;color:#6b7280>帧内容+标签+划分的内容哈希；数据动一点就变</span></th><th>train 组<br><span style=font-weight:400;font-size:11px;color:#6b7280>训练用的采集组（map/source_id），整组隔离</span></th>"
+           "<th>dev 组<br><span style=font-weight:400;font-size:11px;color:#6b7280>开发集组；与训练组不得重叠</span></th><th>trainable<br><span style=font-weight:400;font-size:11px;color:#6b7280>有可用真值的帧数（路面或标线任一可用）</span></th><th>paint_ok<br><span style=font-weight:400;font-size:11px;color:#6b7280>漆线真值可用的帧数；0 = 标线类指标一律未测，不得当 0 分</span></th>"
+           "<th>被拒帧<br><span style=font-weight:400;font-size:11px;color:#6b7280>被准入门隔离的帧数（身份缺失/内容重复/泄漏）</span></th></tr>"]
+    for it in items:
+        try:
+            b = json.loads(it["path"].read_text(encoding="utf-8"))
+        except Exception:                                 # noqa: BLE001
+            continue
+        # 两种文件形状：DatasetManifest（coverage 按 split 嵌套 + groups）
+        # 与 `rounds` 的 rounds_dataset.json（coverage 就是 train 那段 + train_groups）
+        cov_raw = b.get("coverage") or {}
+        cov = cov_raw.get("train") if isinstance(cov_raw.get("train"), dict)             else cov_raw
+        groups = b.get("groups") or {}
+        train_g = ([g for g, v in groups.items() if v == "train"]
+                   or list(b.get("train_groups") or []))
+        dev_g = ([g for g, v in groups.items() if v == "dev"]
+                 or list(b.get("dev_groups") or []))
+        out.append(
+            f'<tr><td class="mono">{_esc(it["run"])}</td>'
+            f'<td class="mono">{_esc(str(b.get("dataset_id") or "")[:16])}</td>'
+            f'<td class="mono">{_esc(", ".join(train_g)[:60] or "未测")}</td>'
+            f'<td class="mono">{_esc(", ".join(dev_g)[:60] or "未测")}</td>'
+            f'<td class="mono">{_esc(str(cov.get("trainable_frames", "未测")))}</td>'
+            f'<td class="mono">{_esc(str(cov.get("paint_valid_frames", "未测")))}</td>'
+            f'<td class="mono">{_esc(str(len(b.get("rejected") or [])))}</td></tr>')
+    out.append("</table>")
+    return "".join(out)
+
+
+def _all_params_table(ctx: dict) -> str:
+    a = ctx.get("all") or {}
+    cks = (a.get("scan") or {}).get("ckpts") or []
+    total = (a.get("scan") or {}).get("n_ckpt_total") or 0
+    if not cks:
+        return '<p class="hint">missing data: 没有 checkpoint。</p>'
+    out = ["<table><tr><th>运行 / 臂-seed<br><span style=font-weight:400;font-size:11px;color:#6b7280>运行目录 / 实验臂 + 随机种子；同一 run 的每个臂每个 seed 一行</span></th><th>arch / 参数<br><span style=font-weight:400;font-size:11px;color:#6b7280>模型结构 / 可训练参数量</span></th><th>batch × epochs<br><span style=font-weight:400;font-size:11px;color:#6b7280>批大小 × 训练轮数</span></th>"
+           "<th>lr → 调度器<br><span style=font-weight:400;font-size:11px;color:#6b7280>初值学习率 → 调度器(T_max)；T_max 跟着 --epochs 走，改 epochs 等于换计划</span></th><th>优化器<br><span style=font-weight:400;font-size:11px;color:#6b7280>优化器与其超参（Adam: betas / weight decay）</span></th><th>类别权重<br><span style=font-weight:400;font-size:11px;color:#6b7280>median-frequency 平衡后的 bg/road/line 权重；line 再乘 --line-weight</span></th>"
+           "<th>数据因子<br><span style=font-weight:400;font-size:11px;color:#6b7280>这一轮改动的是哪一项数据/标签口径（line 屏蔽 / 截帧 / 采样权重…）</span></th><th>数据集 / commit<br><span style=font-weight:400;font-size:11px;color:#6b7280>数据版本（dataset_id）与代码提交</span></th></tr>"]
+    for c in cks:
+        try:
+            rows = _ckpt_params(c["path"].parent, limit=1)
+            r0 = rows[0] if rows else {}
+        except Exception:                                 # noqa: BLE001
+            r0 = {}
+        if not r0 or r0.get("error"):
+            continue
+        ta = r0["train_args"]
+        sch, opt = dict(ta.get("scheduler") or {}), dict(ta.get("optimizer") or {})
+        factors = [x for x in (
+            ("line 屏蔽" if ta.get("ignore_line_class") else ""),
+            (f"截帧 {ta['max_train_frames']}" if ta.get("max_train_frames") else ""),
+            (f"run 权重 {ta['run_weights']}" if ta.get("run_weights") else "")) if x]
+        out.append(
+            f'<tr><td class="mono">{_esc(c["run"])}/{_esc(_rel_tag(c["path"].parent, c["path"].parents[1]))}</td>'
+            f'<td class="mono">{_esc(_val_or_missing(ta.get("arch")))} / '
+            f'{_esc(_val_or_missing(ta.get("n_params")))}</td>'
+            f'<td class="mono">{_esc(_val_or_missing(ta.get("batch")))} × '
+            f'{_esc(_val_or_missing(ta.get("epochs")))}</td>'
+            f'<td class="mono">{_esc(_val_or_missing(ta.get("lr")))} → '
+            f'{_esc(str(sch.get("name") or "未测"))}'
+            f'(T_max={_esc(_val_or_missing(sch.get("T_max")))})</td>'
+            f'<td class="mono">{_esc(str(opt.get("name") or "未测"))} '
+            f'betas={_esc(str(opt.get("betas") or "未测"))}</td>'
+            f'<td class="mono">{_esc(str(ta.get("class_weights") or "未测"))}</td>'
+            f'<td class="mono">{_esc("；".join(factors) or "无")}</td>'
+            f'<td class="mono">{_esc(str(r0.get("dataset_id") or "未测"))} / '
+            f'{_esc(str(r0.get("git_commit") or "未测"))}</td></tr>')
+    out.append("</table>")
+    if total > len(cks):
+        out.append(f'<p class="hint">只读前 {len(cks)}/{total} 个 checkpoint'
+                   "（读权重有开销）；要全部请按运行逐个 --run-dir 渲染。</p>")
+    return "".join(out)
+
+
+def _all_collect_table(ctx: dict) -> str:
+    """无人值守采集：每次采集一行。**身份审计结果必须看得见**（拒收的采集不产出候选）。"""
+    a = ctx.get("all") or {}
+    cols = a.get("collects") or []
+    if not cols:
+        return ('<p class="hint">未测：没有采集记录（`collect_*.json` 只在后台入口'
+                '真的启动过采集时写出）。</p>')
+    span = "font-weight:400;font-size:11px;color:#6b7280"
+    out = ["<table><tr>",
+           "<th>运行<br><span style=font-weight:400;font-size:11px;color:#6b7280>运行目录名：一次后台入口 / 一轮实验的产物都在这个目录里</span></th>",
+           "<th>时间戳<br><span style=" + span + ">采集开始时刻（本地）</span></th>",
+           "<th>地图 / source_id<br><span style=" + span + ">身份读自运行中的会话，"
+           "不是命令行参数</span></th>",
+           "<th>帧数<br><span style=" + span + ">按视角分；总帧=各视角之和</span></th>",
+           "<th>身份审计<br><span style=" + span + ">ok=能进训练；拒收的采集不产出候选"
+           "</span></th>",
+           "<th>漆线帧<br><span style=" + span + ">line_pixels&gt;0 的帧数：引擎不给 "
+           "line 类，这些是「看得见漆线」的帧</span></th>",
+           "<th>复核队列<br><span style=" + span + ">按漆线像素排序的待人工修订帧清单"
+           "</span></th>",
+           "<th>解释器<br><span style=" + span + ">采集用的解释器：没有 beamngpy 会白起一局"
+           "</span></th>",
+           "<th>GPU 分钟<br><span style=" + span + ">本次采集墙钟；游戏也是 GPU 负载，"
+           "记进每日上限</span></th>",
+           "<th>rc<br><span style=" + span + ">0=通过；6=前置检查拦下（没启动）；"
+           "7=采集失败或审计拒收</span></th>",
+           "</tr>"]
+    for b in sorted(cols, key=lambda x: str(x.get("stamp") or ""), reverse=True):
+        roles = b.get("roles") or {}
+        roles_txt = "　".join(f"{k}:{v}" for k, v in sorted(roles.items())) \
+            or "未测"
+        paint = b.get("paint_frames_by_role") or {}
+        if paint:
+            paint_txt = "　".join(f"{k}:{v}"
+                                 for k, v in sorted(paint.items()))
+        elif int(b.get("frames_total") or 0) <= 0:
+            paint_txt = "未测（一个帧都没有，不是 0）"
+        else:
+            paint_txt = "0（有帧但都没有漆线像素）"
+        rq = b.get("review_queue")
+        rq_txt = ("有" if (rq and Path(rq).exists()) else "未测")
+        ident = (f"{b.get('map_name') or '未测'}<br>"
+                 f"<span class=mono>{_esc(str(b.get('source_id') or '未测'))}</span>")
+        if b.get("ok"):
+            ok_txt = f'<span class="pill ok">ok</span>'
+        else:
+            why = (b.get("reasons") or ["未写原因"])[0]
+            ok_txt = (f'<span class="pill bad">拒收</span><br>'
+                      f'<span style="{span}">{_esc(str(why)[:90])}</span>')
+        py_ = str(b.get("collector_python") or "未测")
+        src = str(b.get("collector_python_source") or "")
+        gpu = b.get("gpu_minutes")
+        gpu_txt = (f"{float(gpu):.2f}" if gpu is not None else "未测")
+        out.append(
+            f'<tr><td class="mono">{_esc(str(b.get("_run") or ""))}</td>'
+            f'<td class="mono">{_esc(str(b.get("stamp") or ""))}</td>'
+            f'<td>{ident}</td><td class="mono">{_esc(roles_txt)}</td>'
+            f'<td>{ok_txt}</td><td class="mono">{_esc(paint_txt)}</td>'
+            f'<td>{rq_txt}</td>'
+            f'<td class="mono">{_esc(Path(py_).name)}{_esc("（" + src + "）" if src else "")}</td>'
+            f'<td class="mono">{gpu_txt}</td>'
+            f'<td class="mono">{_esc(str(b.get("rc")))}</td></tr>')
+    out.append("</table>")
+    return "".join(out)
+
+
+def _all_gpu_table(ctx: dict) -> str:
+    a = ctx.get("all") or {}
+    items = (a.get("scan") or {}).get("gpu") or []
+    if not items:
+        return '<p class="hint">未测：没有 GPU 账本（只有后台入口运行会写）。</p>'
+    out = ["<table><tr><th>运行<br><span style=font-weight:400;font-size:11px;color:#6b7280>运行目录名：一次后台入口 / 一轮实验的产物都在这个目录里</span></th><th>日期<br><span style=font-weight:400;font-size:11px;color:#6b7280>本地日期</span></th><th>分钟<br><span style=font-weight:400;font-size:11px;color:#6b7280>该 run 当日累计 GPU 墙钟（跨进程累计，供每日上限）</span></th></tr>"]
+    for it in items:
+        try:
+            b = json.loads(it["path"].read_text(encoding="utf-8"))
+        except Exception:                                 # noqa: BLE001
+            continue
+        for day, slot in sorted(b.items()):
+            out.append(f'<tr><td class="mono">{_esc(it["run"])}</td>'
+                       f'<td class="mono">{_esc(day)}</td>'
+                       f'<td class="mono">{_esc(str((slot or {{}}).get("minutes")))}</td></tr>')
+    out.append("</table>")
+    return "".join(out)
+
+
+def _all_cards(ctx: dict) -> str:
+    """一页全汇总：每 (运行, 指标) 一张多 seed 图 + 各总表。"""
+    a = ctx.get("all") or {}
+    scan = a.get("scan") or {}
+    series = a.get("series") or []
+    order = ("train_loss", "val_miou", "val_line_iou", "val_acc")
+    # 按 (运行, 指标) 归并：同一场的所有 seed/臂画在一张图里
+    grouped: dict = {}
+    for se in series:
+        if se.metric not in order:
+            continue
+        run = se.name.split("/")[0]
+        grouped.setdefault((run, se.metric), []).append(se)
+    cards = []
+    for run in sorted({k[0] for k in grouped}):
+        # 每场只画两条：train_loss + 该场**最好的那个**开发指标
+        # （其余指标的数字在"指标总表"里，不必再各占一张图——用户反馈曲线太多）
+        picks = ["train_loss"]
+        for m in ("val_miou", "val_line_iou", "val_acc"):
+            if grouped.get((run, m)):
+                picks.append(m)
+                break
+        for metric in picks:
+            sels = grouped.get((run, metric))
+            if not sels:
+                continue
+            sels = sorted(sels, key=lambda x: x.name)
+            n_pts = sum(1 for x in sels for _p, v in x.points if v is not None)
+            if not n_pts:
+                continue
+            cards.append(_card(
+                f"{run} · {metric}",
+                f"单位：{metric}（{_CURVE_MEAN.get(metric, '')}）　"
+                f"横轴：epoch　线数：{len(sels)}（同场不同 seed/臂画在一张图里）",
+                _svg_multi(sels), stats=_series_stats(sels[0])))
+    tables = [
+        ("所有运行的指标总表", "每 运行/臂-seed 一行；lr/梯度/吞吐来自逐 step 指标",
+         _all_metrics_table(ctx)),
+        ("所有判定（成对比较）", "来自各运行的 decision_*.json", _all_decisions_table(ctx)),
+        ("所有数据版本", "来自各运行的 rounds_dataset.json", _all_datasets_table(ctx)),
+        ("所有训练超参", f"读最新 {len(scan.get('ckpts') or [])}/"
+         f"{scan.get('n_ckpt_total') or 0} 个 checkpoint", _all_params_table(ctx)),
+        ("无人值守采集", "每次采集一行：身份审计 + 复核队列 + GPU 分钟 + 解释器",
+         _all_collect_table(ctx)),
+        ("GPU 账本", "跨进程累计（含采集期间的游戏时间）", _all_gpu_table(ctx)),
+    ]
+    for title, sub, body in tables:
+        cards.append(f'<div class="card wide"><h3>{_esc(title)}</h3>'
+                     f'<div class="sub">{_esc(sub)}</div>'
+                     f'<div>{body}</div></div>')
+    return ("<main>" + "".join(cards) + "</main>")
+
+
+#: 曲线指标与统计行的含义（写在副标题/统计行里）
+_CURVE_MEAN = {"train_loss": "训练集损失，越低越好",
+               "val_miou": "验证集 mIoU，越高越好",
+               "val_line_iou": "验证集标线 IoU（缺可信真值时为未测）",
+               "val_acc": "验证集像素准确率，越高越好"}
+
+
+def _all_status_items(ctx: dict) -> str:
+    a = ctx.get("all") or {}
+    scan = a.get("scan") or {}
+    cs = a.get("collect_stats") or {}
+    items = [
+        ('<span class="item"><span class="k">范围</span>'
+         f'<span class="v">{_esc(str(scan.get("root") or ""))}</span></span>'),
+        ('<span class="item"><span class="k">运行</span>'
+         f'<span class="v">{len(scan.get("runs") or [])}</span></span>'),
+        ('<span class="item"><span class="k">曲线</span>'
+         f'<span class="v">{len(a.get("series") or [])}</span></span>'),
+        ('<span class="item"><span class="k">采集</span>'
+         f'<span class="v">{cs.get("ok", 0)}/{cs.get("n", 0)}</span></span>'
+         f'<span class="item"><span class="k">采集帧</span>'
+         f'<span class="v">{cs.get("frames", 0)}</span></span>'),
+        ('<span class="item"><span class="k">判定</span>'
+         f'<span class="v">{len(scan.get("decisions") or [])}</span></span>'),
+        ('<span class="item"><span class="k">数据版本</span>'
+         f'<span class="v">{len(scan.get("datasets") or [])}</span></span>'),
+        ('<span class="item"><span class="k">checkpoint</span>'
+         f'<span class="v">{scan.get("n_ckpt_total") or 0}</span></span>'),
+        ('<span class="item"><span class="k">生成</span>'
+         f'<span class="v">{_esc(ctx.get("generated_at", ""))}</span></span>'),
+    ]
+    return '<div class="statusbar">' + "".join(items) + "</div>"
+
+
+def _compact_rows(ctx: dict) -> list:
+    """每 (臂, seed) 一行：曲线首末值 + 训练动力学（按 run 名匹配）。"""
+    series = list((ctx.get("t13") or {}).get("series") or [])
+    by_key = {(se.name, se.metric): se for se in series}
+    names = sorted({se.name for se in series})
+    dyn = {d.get("run"): d for d in (ctx.get("dyn") or [])}
+    root = _run_root(ctx)
+    rows = []
+    for name in names:
+
+        def _ends(se):
+            if se is None:
+                return None, None
+            got = [(x, v) for x, v in se.points if v is not None]
+            return (got[0][1], got[-1][1]) if got else (None, None)
+
+        loss = by_key.get((name, "train_loss"))
+        val = next((by_key.get((name, m)) for m in
+                    ("val_miou", "val_line_iou", "val_acc")
+                    if by_key.get((name, m))), None)
+        l0, l1 = _ends(loss)
+        v0, v1 = _ends(val)
+        d = (dyn.get(f"{root.name}-{name}") if root is not None else None) \
+            or dyn.get(name) or {}
+        rows.append({
+            "name": name, "loss_series": loss, "val_series": val,
+            "loss_first": l0, "loss_last": l1,
+            "val_metric": (val.metric if val else ""),
+            "val_first": v0, "val_last": v1,
+            "lr_first": d.get("lr_first"), "lr_last": d.get("lr_last"),
+            "grad_p50": d.get("grad_p50"), "grad_p95": d.get("grad_p95"),
+            "steps_per_s": d.get("steps_per_s"), "n_steps": d.get("n_steps"),
+            "total_steps": d.get("total_steps"),
+        })
+    return rows
+
+
+def _paths_view(ctx: dict) -> str:
+    """探针图与可打开的复核图：紧凑视图里只列路径，不铺大图。
+
+    （大图留给 `--view full`；这里保证"存在什么、在哪"不被静默丢掉。）
+    """
+    st = ctx.get("probes") or {}
+    rows = []
+    if st.get("readable"):
+        for rec in st.get("probes", [])[:12]:
+            rows.append((rec.get("image") or rec.get("name") or "?",
+                         "sidecar 齐全" if not rec.get("sidecar_error")
+                         else f"无法验证：{rec['sidecar_error']}"))
+    root = _run_root(ctx)
+    extra = []
+    if root is not None:
+        extra = [str(p.relative_to(root)) for p in
+                 sorted(root.glob("review_overlays/*.png"))[:6]]
+    out = ['<section><h2>图像与可复核帧</h2>']
+    if rows:
+        out.append("<table><tr><th>探针图</th><th>sidecar</th></tr>"
+                   + "".join(f'<tr><td class="mono">{_esc(a)}</td><td>{_esc(b)}</td></tr>'
+                             for a, b in rows) + "</table>")
+    else:
+        out.append('<p class="hint">探针图：未测（没有 --probes 目录或目录为空）。'
+                   '用 --view full 看图像本身。</p>')
+    if extra:
+        out.append('<p class="hint">可打开的复核图（相对运行目录）：'
+                   + "、".join(f'<code>{_esc(x)}</code>' for x in extra) + "</p>")
+    out.append("</section>")
+    return "".join(out)
+
+
+def _compact_view(ctx: dict) -> str:
+    """一页看完：每 seed 一行（迷你曲线）+ 判定表 + 摘要 + 事件流。"""
+    t13 = ctx.get("t13") or {}
+    if not t13.get("readable"):
+        return ('<section><h2>一页总览</h2><p class="hint">missing data: '
+                + _esc(str(t13.get("error") or "没有训练历史"))
+                + "。缺训练历史时不画任何数，只说明缺什么。</p></section>")
+    rows = _compact_rows(ctx)
+    out = ['<section><h2>一页总览</h2>']
+    if rows:
+        out.append("<table><tr><th>臂 / seed</th>"
+                   "<th>train loss（迷你曲线 · 首→末）</th>"
+                   "<th>开发指标（迷你曲线 · 首→末）</th>"
+                   "<th>lr 首→末<br><span style=font-weight:400;font-size:11px;color:#6b7280>学习率；余弦退火按 --epochs 收到接近 0（T_max=epochs）</span></th><th>|grad| p50/p95<br><span style=font-weight:400;font-size:11px;color:#6b7280>梯度 L2 范数（AMP 下 unscale 后统计），衡量每步更新幅度</span></th><th>步/s<br><span style=font-weight:400;font-size:11px;color:#6b7280>每秒优化步数（吞吐），由逐 step 耗时中位数换算</span></th>"
+                   "<th>步数<br><span style=font-weight:400;font-size:11px;color:#6b7280>本 run 实际记录的优化步数 / 计划步数</span></th></tr>")
+        for r in rows:
+            loss_spark = _sparkline(r["loss_series"].points
+                                    if r["loss_series"] else None)
+            val_spark = _sparkline(r["val_series"].points
+                                   if r["val_series"] else None,
+                                   colour="#2e9e6b")
+            out.append(
+                f'<tr><td class="mono">{_esc(r["name"])}</td>'
+                f'<td>{loss_spark} <span class="mono">'
+                f'{_esc(_fmt_point(r["loss_first"]) if r["loss_first"] is not None else "未测")}'
+                f' → {_esc(_fmt_point(r["loss_last"]) if r["loss_last"] is not None else "未测")}'
+                "</span></td>"
+                f'<td>{val_spark} <span class="mono">{_esc(r["val_metric"])} '
+                f'{_esc(_fmt_point(r["val_first"]) if r["val_first"] is not None else "未测")}'
+                f' → {_esc(_fmt_point(r["val_last"]) if r["val_last"] is not None else "未测")}'
+                "</span></td>"
+                f'<td class="mono">{_esc(_val_or_missing(r["lr_first"]))} → '
+                f'{_esc(_val_or_missing(r["lr_last"]))}</td>'
+                f'<td class="mono">'
+                f'{_esc(_fmt_point(r["grad_p50"]) if r["grad_p50"] is not None else "未测")}'
+                f' / {_esc(_fmt_point(r["grad_p95"]) if r["grad_p95"] is not None else "未测")}</td>'
+                f'<td class="mono">{_esc(_val_or_missing(r["steps_per_s"]))}</td>'
+                f'<td class="mono">{_esc(_val_or_missing(r["n_steps"]))}'
+                + (f'/{_esc(str(r["total_steps"]))}' if r.get("total_steps")
+                   else "") + "</td></tr>")
+        out.append("</table>")
+        out.append('<p class="hint">迷你曲线：蓝=train loss（越低越好）、'
+                   '绿=开发指标（越高越好），缺测处断线。lr/梯度/吞吐来自逐 step '
+                   '指标文件，没有就是"未测"（不画 0）。</p>')
+    out.append('<p class="hint">判定、超参、数据、资源与图像分别在下面各节；'
+               '这一页按顺序往下滚就能看全（隐藏项在 --view full 里有大图与逐帧细节）。'
+               '</p>')
+    out.append("</section>")
+    return "".join(out)
 
 
 def _compare_view(ctx: dict) -> str:
@@ -1602,9 +2848,9 @@ def _compare_view(ctx: dict) -> str:
     if not promo["seeds"]:
         out.append('<p class="hint">missing data: 两个臂没有共同 seed，'
                    "成对差值未测（不取单 seed 晋级）。</p>")
-    table = ['<table><tr><th>指标</th><th>分子/分母</th><th>champion 每 seed</th>'
+    table = ['<table><tr><th>指标<br><span style=font-weight:400;font-size:11px;color:#6b7280>成对比较用的主指标（当前 road_iou；标线指标缺真值时为 UNKNOWN）</span></th><th>分子/分母</th><th>champion 每 seed</th>'
              "<th>candidate 每 seed</th><th>mean delta</th><th>ci95 半宽</th>"
-             "<th>verdict</th></tr>"]
+             "<th>verdict<br><span style=font-weight:400;font-size:11px;color:#6b7280>candidate_better / champion_better / inconclusive</span></th></tr>"]
     for row in promo["rows"]:
         metric = row["metric"]
         if not row["pairs"]:
@@ -1682,7 +2928,7 @@ def _compare_ident(ctx: dict) -> str:
         arms.setdefault(arm.group(1), {})[seed] = entry.get("summary") or {}
     out.append('<p class="hint">ident 跑在冻结集路段上（t13_testA2/t13_testB），'
                "口径是候选层 image-plane / 投影，与像素层不混算。</p>")
-    table = ['<table><tr><th>指标</th><th>模型</th><th>每 seed 值（分子/分母）'
+    table = ['<table><tr><th>指标<br><span style=font-weight:400;font-size:11px;color:#6b7280>成对比较用的主指标（当前 road_iou；标线指标缺真值时为 UNKNOWN）</span></th><th>模型</th><th>每 seed 值（分子/分母）'
              "</th></tr>"]
     rows: dict[str, dict[str, list]] = {}
     for label, field_key, num_key, den_key in (
@@ -1857,6 +3103,82 @@ def _coverage_row(records: list[dict], split: str) -> dict:
     return out
 
 
+#: 档位 -> 人读名字（看板与报告共用同一套说法）
+RANK_LABEL = {
+    "verified": "人工/独立验证真值",
+    "agent": "agent 逐帧核对（研究可用）",
+    "pseudo": "弱监督（引擎部分标注）",
+    "unreliable": "不可靠（引擎默认）",
+    "absent": "无来源/未复核",
+}
+
+
+def _label_source_view(records: list, ctx: dict) -> str:
+    """按**标签档位**分别计数（方案 §6.3 验收：四个计数分别可查）。
+
+    方案原话：「640 生成帧、实际训练帧、有效评价帧、人工确认帧四个计数分别可查」。
+    最容易犯的错是把"生成 640 帧"显示成"640 帧人工真值"——所以这里把
+    **生成帧**与**人工确认帧**分开写，并把"没测到"写"未测"而不是 0。
+    """
+    by_rank: dict = {}
+    by_view: dict = {}
+    for r in records:
+        q = ((r.get("quality") or {}).get("paint") or {})
+        rank = str(q.get("rank") or "")
+        key = rank or "unknown"
+        by_rank[key] = by_rank.get(key, 0) + 1
+        v = str(r.get("view") or "")
+        if v:
+            by_view[v] = by_view.get(v, 0) + 1
+    n_all = len(records)
+    n_verified = by_rank.get("verified", 0)
+    ev = ctx.get("eval") or {}
+    n_eval = 0
+    eval_measured = False
+    if ev.get("readable"):
+        for split in (ev.get("splits") or {}).values():
+            for entry in split.values():
+                n = entry.get("n_frames")
+                if n:
+                    n_eval += int(n)
+                    eval_measured = True
+    out = ["<h3>标签档位与复核覆盖（生成 ≠ 人工真值）</h3>"]
+    rows = ['<table><tr><th>计数</th><th>值</th><th>说明</th></tr>']
+    rows.append(f'<tr><td>生成帧（清单里全部记录）</td>'
+                f'<td class="num">{n_all}</td>'
+                f'<td class="hint">采集/标注产出的帧，不代表任何真值等级</td></tr>')
+    rows.append(f'<tr><td>人工确认帧（verified 档）</td>'
+                f'<td class="num">{n_verified}</td>'
+                f'<td class="hint">只有这一档能当晋级评价参考；'
+                f'{n_all - n_verified} 帧不属于此档</td></tr>')
+    rows.append('<tr><td>有效评价帧（评估矩阵实测）</td>'
+                f'<td class="num">{"未测" if not eval_measured else n_eval}</td>'
+                '<td class="hint">来自评估矩阵的 n_frames；'
+                '没有评估矩阵就是未测</td></tr>')
+    rows.append('</table>')
+    out.append("".join(rows))
+    if n_all and n_verified < n_all:
+        out.append('<p class="hint">提示：把生成帧数当作人工真值数是常见的过度声明；'
+                   "本页按档位分开计数。</p>")
+    rows2 = ['<table><tr><th>档位</th><th>帧数</th></tr>']
+    for rank in ("verified", "agent", "pseudo", "unreliable", "absent",
+                 "unknown"):
+        if rank in by_rank:
+            rows2.append(f'<tr><td>{_esc(RANK_LABEL.get(rank, rank))}'
+                         f'{_badge(LEVEL_TRAIN)}</td>'
+                         f'<td class="num">{by_rank[rank]}</td></tr>')
+    rows2.append("</table>")
+    out.append("".join(rows2))
+    if by_view:
+        rows3 = ['<table><tr><th>相机</th><th>帧数</th></tr>']
+        for v in sorted(by_view):
+            rows3.append(f'<tr><td class="mono">{_esc(v)}</td>'
+                         f'<td class="num">{by_view[v]}</td></tr>')
+        rows3.append("</table>")
+        out.append("<h4>相机覆盖</h4>" + "".join(rows3))
+    return "".join(out)
+
+
 def _data_view(ctx: dict) -> str:
     mf = ctx["manifest"]
     out = ['<section id="data"><h2>数据与标签</h2>']
@@ -1922,6 +3244,7 @@ def _data_view(ctx: dict) -> str:
             "</td></tr>")
     table.append("</table>")
     out.append("".join(table))
+    out.append(_label_source_view(records, ctx))
     rejected = [r for r in records if str(r.get("reject_reason") or "")]
     out.append(f'<h3>被隔离帧: {len(rejected)}{_badge(LEVEL_TRAIN)}</h3>'
                '<p class="hint">被隔离帧不进入任何划分，'
@@ -1986,6 +3309,65 @@ def _closed_loop_state(ctx: dict) -> dict:
     return found
 
 
+def _guard_state(run_dir) -> dict:
+    """运行保护观测：入口每次启动写的 `resource_state.json`（方案 §8.2/W6）。
+
+    **未接入就是未接入**：用户活动信号缺失时 ``user_active=None``、
+    ``source="not connected"``，页面必须显示"未接入"，不能显示成"用户不在"。
+    """
+    if run_dir is None:
+        return {"readable": False, "error": "没有 run 目录"}
+    p = Path(run_dir) / "resource_state.json"
+    if not p.is_file():
+        return {"readable": False, "error": "还没有资源观测（入口未跑过）"}
+    try:
+        return {"readable": True, "state": json.loads(p.read_text(
+            encoding="utf-8"))}
+    except Exception as e:                                 # noqa: BLE001
+        return {"readable": False, "error": f"读不了：{e}"}
+
+
+def _guard_view(ctx: dict) -> str:
+    """资源门 / 墙钟 / 用户活动信号——"未测不显示零"同样适用。"""
+    g = ctx.get("guard") or {}
+    out = ["<h3>运行保护（资源门 / 墙钟 / 用户活动）</h3>"]
+    if not g.get("readable"):
+        out.append("<p>" + _unknown(f"资源观测不可读：{g.get('error')}",
+                                    level=LEVEL_TRAIN) + "</p>")
+        return "".join(out)
+    st = g["state"]
+    src = str(st.get("user_activity_source") or "not connected")
+    idle = st.get("user_idle_s")
+    active = st.get("user_active")
+    if src in ("", "not connected", "unknown") or active is None:
+        act = _unknown("未接入：无法按用户活动暂停（不能声称已实现随用随停）",
+                       level=LEVEL_TRAIN)
+    else:
+        act = Evidence(name="user_active", level=LEVEL_TRAIN,
+                       value=1.0 if active else 0.0, unit="bool").cell()
+    wall = st.get("wall_minutes")
+    limit = st.get("max_wall_minutes")
+    wall_txt = ("未测" if wall is None else f"{float(wall):.1f} min")
+    limit_txt = ("不限制" if not limit or float(limit) <= 0
+                 else f"{float(limit):.0f} min")
+    rows = [
+        ("用户活动信号", act),
+        ("信号来源", _esc(src)),
+        ("原始空闲秒数", ("未测" if idle is None else f"{float(idle):.1f} s")),
+        ("本次连续运行", f"{wall_txt} / 上限 {limit_txt}"),
+        ("资源门", ("通过" if st.get("allowed") else
+                    "阻止：" + "；".join(st.get("reasons") or []))),
+        ("观测时间", _esc(str(st.get("ts") or ""))),
+    ]
+    out.append("<table><tr><th>项</th><th>值</th></tr>")
+    for k, v in rows:
+        out.append(f"<tr><td>{_esc(k)}</td><td>{v}</td></tr>")
+    out.append("</table>")
+    for w in (st.get("warnings") or [])[:4]:
+        out.append(f'<p class="hint">{_esc(w)}</p>')
+    return "".join(out)
+
+
 def _resources_view(ctx: dict) -> str:
     out = ['<section id="resources"><h2>资源与闭环</h2>']
     ev = ctx["eval"]
@@ -2033,6 +3415,7 @@ def _resources_view(ctx: dict) -> str:
     else:
         out.append("<p>" + _unknown("事件流里没有资源指标（GPU 显存/训练速度/"
                                     "每轮耗时）", level=LEVEL_TRAIN) + "</p>")
+    out.append(_guard_view(ctx))
     out.append("<h3>闭环字段</h3>")
     found = _closed_loop_state(ctx)
     if found:
@@ -2074,6 +3457,13 @@ def build_context(args: argparse.Namespace) -> dict:
     hints = [p.parent for p in (events_path, eval_path) if p is not None]
     ctx = {
         "generated_at": _utc_now(),
+        "refresh_sec": float(getattr(args, "refresh_sec", 0) or 0),
+        "compact": (getattr(args, "view", "compact") or "compact") == "compact",
+        "dyn": _train_dynamics(Path(args.run_dir)
+                              if getattr(args, "run_dir", None) else None),
+        "all": (_all_ctx(Path(getattr(args, "runs_root", "logs/experiments")),
+                         include_all=bool(getattr(args, "include_all", False)))
+                if getattr(args, "all_runs", False) else None),
         "out_path": out_path,
         "champion": getattr(args, "champion", None),
         "events": (merge_event_streams(run_dir) if run_dir is not None
@@ -2095,12 +3485,28 @@ def build_context(args: argparse.Namespace) -> dict:
             out_dir),
         "tasks": _task_state(
             Path(args.tasks) if getattr(args, "tasks", None) else None),
+        "guard": _guard_state(run_dir),
     }
     return ctx
 
 
 def render_html(ctx: dict) -> str:
     legend = " ".join(f"{_badge(l)}" for l in LEVELS)
+    all_mode = bool(ctx.get("all"))
+    compact = bool(ctx.get("compact"))
+    body_views = ([_all_cards(ctx)] if all_mode else
+                  [_cards_view(ctx)] if compact else [
+        _overview_view(ctx),
+        _curves_view(ctx),
+        _dl_params_view(ctx),
+        _probes_view(ctx),
+        _tasks_view(ctx),
+        _compare_view(ctx),
+        _decisions_view(ctx),
+        _final_view(ctx),
+        _data_view(ctx),
+        _resources_view(ctx),
+    ])
     parts = [
         "<!DOCTYPE html>",
         '<html lang="zh-CN">',
@@ -2108,6 +3514,8 @@ def render_html(ctx: dict) -> str:
         '<meta charset="utf-8">',
         '<meta name="viewport" content="width=device-width, initial-scale=1">',
         f"<title>M5/T14 只读学习看板 — {_esc(_run_label(ctx))}</title>",
+        (f'<meta http-equiv="refresh" content="{int(ctx["refresh_sec"])}">'
+         if int(ctx.get("refresh_sec") or 0) > 0 else ""),
         f"<style>{CSS}</style>",
         "</head>",
         "<body>",
@@ -2118,15 +3526,9 @@ def render_html(ctx: dict) -> str:
         '<p class="sub">只读：不训练、不连接游戏、不调用 ControlBridge、'
         "不写候选目录。缺测与 UNKNOWN 一律渲染成文字，从不当作 0。</p>",
         "</header>",
-        _overview_view(ctx),
-        _curves_view(ctx),
-        _probes_view(ctx),
-        _tasks_view(ctx),
-        _compare_view(ctx),
-        _decisions_view(ctx),
-        _final_view(ctx),
-        _data_view(ctx),
-        _resources_view(ctx),
+        (_all_status_items(ctx) + _toolbar(ctx)) if all_mode else
+        ((_status_items(ctx) + _toolbar(ctx)) if compact else _statusbar(ctx)),
+        *body_views,
         "<footer><p>本页由 scripts/m5_seg_dashboard.py 生成；关闭它不影响"
         "训练。缺少测量时本页只写未测，不写安全通过。</p></footer>",
         "</body>",
@@ -2369,9 +3771,27 @@ def main(argv: list[str] | None = None) -> int:
         description="M5/T14 只读学习看板（不训练、不接触游戏、不写候选目录）")
     sub = ap.add_subparsers(dest="cmd", required=True)
     render = sub.add_parser("render", help="渲染一次到 --out")
+    render.add_argument("--all-runs", action="store_true",
+                        help="把所有运行的数据汇总到一个网页（有界扫描）")
+    render.add_argument("--runs-root", default="logs/experiments",
+                        help="--all-runs 的扫描根（默认 logs/experiments）")
+    render.add_argument("--include-all", action="store_true",
+                        help="连纯历史训练目录也画（默认只画有判定/有指标的运行）")
+    render.add_argument("--view", choices=("compact", "full"), default="compact",
+                        help="compact=一页总览（默认）；full=原来 10 个分区的文档视图")
+    render.add_argument("--refresh-sec", type=float, default=0.0,
+                        help="给页面加自动刷新（秒）；默认 0=静态快照")
     _add_common(render)
     watch = sub.add_parser("watch", help="按 --every 秒反复渲染；Ctrl-C 退出")
     _add_common(watch)
+    watch.add_argument("--all-runs", action="store_true",
+                       help="把所有运行的数据汇总到一个网页（有界扫描）")
+    watch.add_argument("--runs-root", default="logs/experiments")
+    watch.add_argument("--include-all", action="store_true")
+    watch.add_argument("--view", choices=("compact", "full"), default="compact",
+                       help="compact=一页总览（默认）；full=10 分区文档视图")
+    watch.add_argument("--refresh-sec", type=float, default=10.0,
+                       help="页面自带自动刷新间隔（秒）；0=不刷新")
     watch.add_argument("--every", type=float, default=15.0,
                        help="重渲染间隔秒数（默认 15）")
     watch.add_argument("--once", action="store_true",

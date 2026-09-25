@@ -108,19 +108,33 @@ def line_supervision_flags(ys, paint_source: str) -> list:
     """逐样本判断：这一帧的 **line 通道**有没有可信真值。
 
     返回 False 的帧，其 line 类会被整通道屏蔽：既不做正样本也不做负样本。
-    判据来自仓库统一的标签审计 ``audit_label``，不是命令行声明——引擎标注的
-    paint 类在这批地图上不可用（可见漆线常被标成沥青），所以会被判 False 并
-    **不再产生错误监督**。审计抛异常时按"不可信"处理（拒绝监督是保守方向）。
+    判据来自仓库统一的标签审计 ``audit_label``，不是命令行声明。用 **usable**
+    而不是 valid：valid 是"能不能当门槛真值"，usable 是"能不能当监督"。
+    实测（2026-09-25）：引擎标注的漆线类存在但不完整（覆盖 RGB 漆线候选 ~0.61）
+    —— 不能判，但可以学；默认的 ``engine_annotation`` 仍然两者都不给（usable=False），
+    研究臂要显式指定 ``engine_annotation_partial``。审计抛异常按"不可信"处理。
     """
     from beamng_autopilot.experiments.labels import audit_label
     arr = np.asarray(ys.detach().cpu().numpy(), dtype=np.uint8)
     out = []
     for b in range(arr.shape[0]):
         try:
-            out.append(bool(audit_label(arr[b],
-                                        paint_source=paint_source).paint.valid))
+            q = audit_label(arr[b], paint_source=paint_source).paint
         except Exception:                                 # noqa: BLE001
             out.append(False)
+            continue
+        if not q.usable:
+            out.append(False)                    # 来源不可用：整通道屏蔽
+            continue
+        if q.valid:
+            # 已核验来源（人工/独立验证）：零标线帧是**真的没有标线**，
+            # 可以合法贡献负例（方案 §6.2 的"已确认的无线帧"）。
+            out.append(True)
+            continue
+        # 弱/agent 来源：**只保留确认过的标线正例**。零标线帧是"没标注"，
+        # 不是"确实没有标线"——把它当负例就是在教"看不见的地方没有漆线"
+        # （方案 §6.2 明确禁止）。
+        out.append(bool(int(q.pixels) > 0))
     return out
 
 
@@ -556,9 +570,13 @@ def main() -> None:
                     help="缺可信标线真值的帧：把 line 类从 softmax 分母里去掉"
                          "（既无正样本也无负样本），只训练路面/背景通道；"
                          "判据来自标签审计，不是命令行声明")
+    from beamng_autopilot.experiments.labels import PAINT_SOURCE_RANK
     ap.add_argument("--paint-source", default="engine_annotation",
-                    choices=("engine_annotation", "human_revision", "pseudo"),
-                    help="标记真值来源；只有审计判为可用时才监督 line 通道")
+                    choices=tuple(PAINT_SOURCE_RANK),
+                    help="标记真值来源；审计判为 usable 才监督 line 通道。"
+                         "取值直接来自 PAINT_SOURCE_RANK（单一事实来源）——"
+                         "实测踩到：硬编码列表会漏掉新来源（agent_revision），"
+                         "训练以 argparse 报错告终")
     ap.add_argument("--line-tversky-weight", type=float, default=1.0,
                     help="line-channel Tversky term weight (FN>FP, thin-line "
                          "recall); 0 disables and falls back to pure "
@@ -635,6 +653,10 @@ def main() -> None:
                          "use_deterministic_algorithms + CUBLAS workspace）："
                          "T14 要求『中断续训≈未中断』可验证；默认关闭，因为"
                          "它会让训练变慢，且部分算子没有确定性实现会直接报错")
+    ap.add_argument("--width", type=float, default=1.0,
+                    help="模型通道宽度倍数（容量对照用）：1.0 = 原版（与原"
+                         "checkpoint 逐位一致），2.0 = 通道翻倍（参数约 4 倍）。"
+                         "数据与步数不变时，它单独改变容量")
     ap.add_argument("--vram-frac", type=float, default=0.6,
                     help="max fraction of GPU VRAM training may use; keeps "
                          "headroom for the running game so its rendering "
@@ -871,7 +893,7 @@ def main() -> None:
                                    line_weight=args.line_weight)
     print(f"[train] 类别权重: {weights.tolist()}", flush=True)
 
-    model = SegUNet().to(device)
+    model = SegUNet(width=float(args.width)).to(device)
     if args.init:
         init_ckpt = torch.load(args.init, map_location=device,
                                weights_only=False)
@@ -1201,40 +1223,20 @@ def main() -> None:
                         "line class absent from the validation slice"),
                     "lr": _metric(sched.get_last_lr()[-1], "1"),
                 }))
-        if m_iou > best_miou:
+        _is_best = bool(m_iou > best_miou)
+        if _is_best:
             best_miou = m_iou
-            torch.save({
-                "state_dict": model.state_dict(),
-                "n_classes": N_CLASSES,
-                "class_names": CLASS_NAMES,
+            # 只记"这一轮是最优"，真正的 best.pt 在下面用**与本轮 checkpoint_last
+            # 相同的 payload** 落盘。实测缺陷（2026-09-25）：best.pt 过去只存
+            # state_dict + 一小撮字段，缺 arch_args —— 容量对照（width=2）的
+            # best.pt 因此**根本装不进评估链**（size mismatch），
+            # 而它恰恰是评估口径复核要用的文件。
+            _best_extra = {
                 "val_miou": round(m_iou, 4),
                 "val_ious": [round(float(v), 4) for v in va_ious],
                 "val_acc": round(float(va_acc), 4),
                 "weights": weights.tolist(),
-                # 超参随模型落盘：复现/对比不同 --line-weight 轮次有据可查
-                "train_args": {
-                    "line_weight": args.line_weight,
-                    "line_tversky_weight": args.line_tversky_weight,
-                    "line_cldice_weight": args.line_cldice_weight,
-                    "line_tversky_alpha": args.line_tversky_alpha,
-                    "line_tversky_beta": args.line_tversky_beta,
-                    "line_morph": args.line_morph,
-                    "amp": use_amp,
-                    "epochs": args.epochs,
-                    "batch": args.batch,
-                    "lr": args.lr,
-                    "val_frac": args.val_frac,
-                    "seed": args.seed,
-                    "runs": [str(p) for p in args.runs],
-                    "split": args.split,
-                    "min_line_frac": args.min_line_frac,
-                    "balance_runs": args.balance_runs,
-                    "n_train": len(train_frames),
-                    "n_val": len(val_frames),
-                },
-            }, out_dir / "best.pt")
-            print(f"[train] 保存最优 mIoU={m_iou:.4f} -> "
-                  f"{out_dir / 'best.pt'}", flush=True)
+            }
         if args.save_every_epoch:
             # 逐 epoch 快照：方案要求保存所有被评估过的 epoch（按下游指标重选），
             # 也是"续训到底哪一步开始不同"的定位手段
@@ -1280,6 +1282,32 @@ def main() -> None:
                 "n_val": len(val_frames),
                 "max_train_frames": int(args.max_train_frames),
                 "run_weights": dict(run_weights),
+                # ---- 迭代深度学习的关键超参（复现/解释一轮训练必需）----
+                "arch": type(model).__name__,
+                "arch_args": {"width": float(getattr(model, "width", 1.0))},
+                "input_size": [536, 403],
+                "n_params": int(sum(_p.numel() for _p in model.parameters())),
+                "scheduler": {
+                    "name": type(sched).__name__,
+                    "T_max": int(getattr(sched, "T_max", 0) or 0),
+                    "eta_min": float(getattr(sched, "eta_min", 0.0) or 0.0),
+                    "step_per": "epoch",
+                },
+                "optimizer": {
+                    "name": type(opt).__name__,
+                    "betas": list(opt.param_groups[0].get("betas") or ()),
+                    "weight_decay": float(
+                        opt.param_groups[0].get("weight_decay") or 0.0),
+                },
+                "class_weights": [round(float(w), 5)
+                                  for w in weights.tolist()],
+                "class_names": list(CLASS_NAMES),
+                "deterministic": bool(getattr(args, "deterministic", False)),
+                "device_name": (torch.cuda.get_device_name(0)
+                                if device == "cuda" and torch.cuda.is_available()
+                                else "cpu"),
+                "steps_per_epoch": max(1, -(-len(train_frames)
+                                            // max(1, args.batch))),
             },
             # T14：恢复所需的随机状态/数据版本/git/环境，缺一项就不能声称
             # "中断续训 = 未中断"。旧 checkpoint 读起来仍然兼容。
@@ -1288,6 +1316,13 @@ def main() -> None:
                                 run_id=args.run_id),
         }
         torch.save(ckpt, out_dir / "checkpoint_last.pt")
+        if _is_best:
+            # 与 checkpoint_last 同一份 payload（含 arch_args），再补该轮最优
+            # 的验证读数：两个文件都能被评估链独立加载
+            torch.save({**ckpt, **_best_extra, "checkpoint_kind": "best"},
+                       out_dir / "best.pt")
+            print(f"[train] 保存最优 m_iou={m_iou:.4f} -> "
+                  f"{out_dir / 'best.pt'}", flush=True)
 
         # 任务指标：按成对率（而非 mIoU）保留这一轮权重。评估吃刚落盘的
         # checkpoint_last.pt，因此与最终可复现的权重完全一致。

@@ -131,12 +131,16 @@ def dominant_frame_share(per_frame: list, *, worst_k: int = 5) -> dict:
 
 
 def checkpoints_in(run_dir: Path) -> list:
-    """``[(arm, seed, epoch, path), ...]``：baseline/ 与 round*/ 下的 epoch_*.pt。"""
+    """``[(arm, seed, epoch, path), ...]``。
+
+    认两种布局：``<run>/<arm>/seed*/epoch_*.pt``（rounds 的运行）与
+    ``<run>/seed*/epoch_*.pt``（单臂训练，arm 记作运行目录名）。
+    """
+    run_dir = Path(run_dir)
     out = []
-    for arm_dir in sorted(p for p in Path(run_dir).iterdir() if p.is_dir()):
-        if arm_dir.name.startswith(".") or arm_dir.name == "candidates":
-            continue
-        for seed_dir in sorted(arm_dir.glob("seed*")):
+
+    def _collect(arm_name: str, seed_root: Path) -> None:
+        for seed_dir in sorted(seed_root.glob("seed*")):
             for ck in sorted(seed_dir.glob("epoch_*.pt")):
                 try:
                     ep = int(ck.stem.split("_")[-1])
@@ -146,7 +150,14 @@ def checkpoints_in(run_dir: Path) -> list:
                     seed = int(seed_dir.name.replace("seed", ""))
                 except ValueError:
                     seed = -1
-                out.append((arm_dir.name, seed, ep, ck))
+                out.append((arm_name, seed, ep, ck))
+
+    if any(run_dir.glob("seed*/epoch_*.pt")):
+        _collect(run_dir.name, run_dir)
+    for arm_dir in sorted(p for p in run_dir.iterdir() if p.is_dir()):
+        if arm_dir.name.startswith(".") or arm_dir.name == "candidates":
+            continue
+        _collect(arm_dir.name, arm_dir)
     return out
 
 

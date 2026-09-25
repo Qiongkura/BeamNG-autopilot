@@ -20,10 +20,22 @@ Push-Location $Repo
 try {
     Write-Host "=== pytest tests/ ===" -ForegroundColor Cyan
     $t0 = [Diagnostics.Stopwatch]::StartNew()
+    # 全量输出落盘：原来只 Select-Object -Last 4，失败用例名被截掉——实测踩到
+    # 一次 1 failed 的门禁，事后无法定位是哪个用例（只知道总数），只能重跑碰运气。
+    $logDir = Join-Path $Repo 'logs\experiments'
+    New-Item -ItemType Directory -Force -Path $logDir | Out-Null
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $gateLog = Join-Path $logDir ("gate_" + $stamp + ".log")
     $pytestArgs = @('-m', 'pytest', 'tests/', '-o', 'addopts=', '-q')
     if ($Fast) { $pytestArgs += '-x' }
-    & $py @pytestArgs 2>&1 | Select-Object -Last 4
+    & $py @pytestArgs 2>&1 | Tee-Object -FilePath $gateLog | Select-Object -Last 4
     $pytestRc = $LASTEXITCODE
+    if ($pytestRc -ne 0) {
+        Write-Host "--- 失败用例（完整日志见 $gateLog）---" -ForegroundColor Red
+        Select-String -Path $gateLog -Pattern '^(FAILED|ERROR)' |
+            ForEach-Object { Write-Host $_.Line -ForegroundColor Red }
+    }
+    Write-Host ("pytest 日志: {0}" -f $gateLog)
     Write-Host ("pytest rc={0} wall={1}s" -f $pytestRc,
                 [math]::Round($t0.Elapsed.TotalSeconds, 1))
 

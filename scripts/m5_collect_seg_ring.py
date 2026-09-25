@@ -7,11 +7,18 @@ road class it provides is dense and automatic - measured 2026-09-21, road
 IoU of the deployed model against it is 0.89-0.96 on hand-checked frames.
 So a ring-wide label pass is a collection problem, not a labeling problem.
 
-What the annotation does NOT provide is the painted LINE class: on this map
-the game colours the lane paint as ASPHALT (measured: 3 px of SOLID_LINE in
-a frame with thousands of white-paint pixels).  Line supervision therefore
-still comes from the manual annotator (``m5_annotate_manual.py``) - and
-only once, because a line looks the same from every camera.
+What the annotation provides for the LINE class is **partial**: an earlier
+measurement on a different configuration found the paint rendered as
+ASPHALT, and that claim was propagated for a while - but re-measured
+2026-09-25 on every collection in ``logs/m5_seg`` (6 collections x 8 frames,
+per-frame statistics + visual overlay): the engine's line class is present
+and sits on the visible paint (it covers ~0.61 of the RGB paint candidates,
+precision ~0.68).  So it is **incomplete, not absent** - unusable as gating
+truth (unannotated paint would score as a false positive), but usable as
+weak supervision for the line channel (see
+``experiments.labels.PAINT_SOURCE_RANK['engine_annotation_partial']``).
+Hand annotation (``m5_annotate_manual.py``) is still what turns the line
+channel into something you can *judge* with.
 
 Layout written (one run directory per mount, which is what
 ``m5_train_seg.py --split per-run`` expects, so each view becomes its own

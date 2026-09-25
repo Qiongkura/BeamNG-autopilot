@@ -56,7 +56,11 @@ def line_pixel_metrics(pred_line: np.ndarray, label: np.ndarray) -> dict:
         "tp_px": tp, "fp_px": fp, "fn_px": fn,
         "missed_true_line_px": fn,
         "offroad_false_line_px": int((pr & (lab == 0)).sum()),
-        "pred_line_px": int(pred.sum()),
+        # 预测要分"有效区里"和"未知区里"两份（方案 G04）：未知区的预测既不算成功
+        # 也不算假线，但**必须单独上报**；任务指标的分母一律只用有效区那份。
+        "pred_line_known_px": int(pr.sum()),
+        "pred_line_unknown_px": int((pred & ~known).sum()),
+        "pred_line_px": int(pred.sum()),          # 兼容旧字段：全部预测（含未知区）
         "gt_line_px": int(gt.sum()),
         "known_px": int(known.sum()),
     }
@@ -81,6 +85,8 @@ def road_pixel_metrics(pred_road: np.ndarray, label: np.ndarray) -> dict:
     fp = int((pr & ~gt).sum())
     fn = int((gt & ~pr & known).sum())
     return {"r_tp_px": tp, "r_fp_px": fp, "r_fn_px": fn,
+            "r_pred_known_px": int(pr.sum()),
+            "r_pred_unknown_px": int((pred & ~known).sum()),
             "pred_road_px": int(pred.sum()), "gt_road_px": int(gt.sum()),
             # 名字必须与 line 通道的 known_px 区分：accumulate 是按 key 相加的，
             # 同名会把两个通道的"已知像素"叠加（实测把 0.4025 算成 0.2012）
@@ -115,6 +121,10 @@ def totals_to_metrics(acc: dict, *, n_frames: int, ms: list) -> dict:
     """总计 -> 指标。分母为 0 时返回 None，绝不返回 0 冒充"测过了"。"""
     tp, fp, fn = acc.get("tp_px", 0), acc.get("fp_px", 0), acc.get("fn_px", 0)
     pred, gt = acc.get("pred_line_px", 0), acc.get("gt_line_px", 0)
+    # 任务指标的分母：**有效区内的**预测标线像素（方案 G04）。
+    # 拿不到这个计数（老产物）时记 UNKNOWN，不拿"全部预测"顶替。
+    pred_known = acc.get("pred_line_known_px")
+    pred_unknown = acc.get("pred_line_unknown_px")
     rtp = acc.get("r_tp_px", 0)
     rfp = acc.get("r_fp_px", 0)
     rfn = acc.get("r_fn_px", 0)
@@ -149,10 +159,13 @@ def totals_to_metrics(acc: dict, *, n_frames: int, ms: list) -> dict:
                                                  / acc["r_known_px"], 5)),
         "road_iou_trivial_all_background": (None if not acc.get("gt_road_px")
                                             else 0.0),
-        "offroad_false_frac_of_pred": (None if pred == 0
+        "offroad_false_frac_of_pred": (None if not pred_known
                                        else round(acc.get(
-                                           "offroad_false_line_px", 0) / pred,
-                                           4)),
+                                           "offroad_false_line_px", 0)
+                                           / pred_known, 4)),
+        "pred_unknown_line_px": pred_unknown,
+        "offroad_ratio_denominator": ("pred_line_known_px" if pred_known
+                                      else "UNKNOWN"),
         "inference_ms_p50": (None if a.size == 0
                              else round(float(np.percentile(a, 50)), 2)),
         "inference_ms_p95": (None if a.size == 0
@@ -161,7 +174,12 @@ def totals_to_metrics(acc: dict, *, n_frames: int, ms: list) -> dict:
                               else round(float(a.mean()), 2)),
     }
     if out["line_precision"] is None:
-        out["line_precision_missing"] = "no predicted line pixels at all"
+        # 分清两种情况（方案 G04）：完全没预测，vs 只在未知区预测。
+        # 后者说明模型"画了但都画在看不清的地方"，与"什么都没画"是两回事。
+        out["line_precision_missing"] = (
+            "no predicted line pixels in the known area (predictions exist "
+            f"only in the unknown region: {int(pred_unknown or 0)} px)"
+            if pred_unknown else "no predicted line pixels at all")
     if out["line_recall"] is None:
         out["line_recall_missing"] = "no true line pixels in this set"
     return out
@@ -182,13 +200,12 @@ def load_frames(dirs: list) -> list:
     return frames
 
 
-def evaluate_model(model_path: Path, frames: list, *, device: str = "cuda"
-                   ) -> dict:
-    """在一个 checkpoint 上跑完整评估（学习掩码 + 后处理，走 Segmenter）。"""
-    from beamng_autopilot.experiments.checkpoint import file_sha16
-    seg = Segmenter(model_path=str(model_path))
-    acc: dict = {}
-    ms: list = []
+def _eval_frames(seg, frames: list, acc: dict, ms: list) -> list:
+    """把一批帧喂给同一个 ``Segmenter``，累加进 ``acc``/``ms``，返回逐帧明细。
+
+    抽出来是为了**只加载一次模型**就能分别评估多个场景（方案 §10.2：
+    坏场景不能被合并均值抵消——要为每个场景单独算一份，而不是把帧池起来）。
+    """
     per_frame: list = []
     for _name, colour, label in frames:
         road, line, _probs = seg.predict_with_probs(colour)
@@ -201,10 +218,56 @@ def evaluate_model(model_path: Path, frames: list, *, device: str = "cuda"
                           "iou": (None if denom == 0
                                   else rm["r_tp_px"] / denom),
                           "gt_px": rm["gt_road_px"]})
-    out = totals_to_metrics(acc, n_frames=len(frames), ms=ms)
+    return per_frame
+
+
+def _finalize(acc: dict, *, n_frames: int, ms: list, per_frame: list,
+              model_path) -> dict:
+    from beamng_autopilot.experiments.checkpoint import file_sha16
+    out = totals_to_metrics(acc, n_frames=n_frames, ms=ms)
     out["mask_compare"] = worst_frames(per_frame)
     out["model"] = str(model_path)
     out["sha256_16"] = file_sha16(model_path)
+    return out
+
+
+def evaluate_model(model_path: Path, frames: list, *, device: str = "cuda"
+                   ) -> dict:
+    """在一个 checkpoint 上跑完整评估（学习掩码 + 后处理，走 Segmenter）。"""
+    seg = Segmenter(model_path=str(model_path))
+    acc: dict = {}
+    ms: list = []
+    per_frame = _eval_frames(seg, frames, acc, ms)
+    return _finalize(acc, n_frames=len(frames), ms=ms,
+                     per_frame=per_frame, model_path=model_path)
+
+
+def evaluate_model_per_group(model_path: Path, by_group: dict, *,
+                             device: str = "cuda") -> dict:
+    """按**场景/组**分别评估，再给总体（方案 §10.2/A7）。
+
+    ``by_group``：``{组键: [(路径, colour, label), ...]}``。返回值与
+    :func:`evaluate_model` 同形状（所以调用方不用改），另加
+    ``per_group``：每个场景自己那一份完整指标（含它自己的 ``mask_compare``）。
+    **每个场景各自是一份独立测量**：坏场景不会被池化均值稀释掉。
+    """
+    seg = Segmenter(model_path=str(model_path))
+    acc: dict = {}
+    ms: list = []
+    per_frame: list = []
+    per_group: dict = {}
+    for gname, frames in (by_group or {}).items():
+        gacc: dict = {}
+        gms: list = []
+        gframes = _eval_frames(seg, frames, gacc, gms)
+        per_group[str(gname)] = totals_to_metrics(gacc, n_frames=len(frames),
+                                                  ms=gms)
+        accumulate(acc, gacc)
+        ms.extend(gms)
+        per_frame.extend(gframes)
+    out = _finalize(acc, n_frames=len(per_frame), ms=ms, per_frame=per_frame,
+                    model_path=model_path)
+    out["per_group"] = per_group
     return out
 
 

@@ -63,6 +63,64 @@ CLS_LINE, CLS_ROAD, CLS_BG = cs.CLS_LINE, cs.CLS_ROAD, cs.CLS_BACKGROUND
 CLASS_NAME = {CLS_LINE: "line", CLS_ROAD: "road", CLS_BG: "erase"}
 WIN = "annotate"
 
+#: 除 line/road/erase 之外的第四类标记：**"这里不能判断"**。它们写进 label 的
+#: 255(ignore)，同时把原因记在独立的 ``unknown_kind`` 数组里（1/2/3）——方案第 1 项
+#: 要求"同时标记遮挡、模糊和无法判断的区域"，而 label 只有 0/1/2/255 四个值，
+#: 原因必须另存，否则审计只能看到"这里被忽略了"，看不到为什么。
+UNKNOWN_KINDS = {1: "occluded", 2: "blurred", 3: "undecidable"}
+UNKNOWN_KEY_TO_KIND = {"4": 1, "5": 2, "6": 3}
+#: 画笔的显示名：label 三色 + 三个"不能判断"的原因
+BRUSH_NAME = {**CLASS_NAME, **UNKNOWN_KINDS}
+
+
+def unknown_kind_for_key(ch: str) -> int | None:
+    """键盘 4/5/6 → 遮挡/模糊/无法判断（其它键返回 None）。"""
+    return UNKNOWN_KEY_TO_KIND.get(str(ch))
+
+
+def side_line_counts(label, centre_col: int | None = None) -> dict:
+    """按图像左右半分列 line 像素数（左右两侧都标了没有，一眼可查）。"""
+    arr = np.asarray(label)
+    h, w = arr.shape[:2]
+    c = int(w // 2) if centre_col is None else int(centre_col)
+    left = int((arr[:, :c] == CLS_LINE).sum())
+    right = int((arr[:, c:] == CLS_LINE).sum())
+    return {"left": left, "right": right, "centre_col": c}
+
+
+def side_coverage_note(human_label, engine_label) -> dict:
+    """对比"人工 label"与"引擎 label"的逐侧 line 覆盖，给出可核查的提示。
+
+    方案第 1 项的验收要求"左右侧各有可核查的正反例"。单侧为 0 而引擎在那一侧
+    有线，通常意味着漏标（也可能是引擎把路缘当线）——两种都要写出来让人看，
+    不能静默通过。
+    """
+    h = side_line_counts(human_label)
+    e = side_line_counts(engine_label)
+    warn = []
+    for side in ("left", "right"):
+        if h[side] == 0 and e[side] > 0:
+            warn.append(f"{side}: 人工未标但引擎有 {e[side]} px"
+                        "（漏标？或引擎把路缘/墙根当线）")
+        elif h[side] > 0 and e[side] == 0:
+            warn.append(f"{side}: 人工标了 {h[side]} px 但引擎为 0"
+                        "（人工新增/引擎漏标——按方案这属于独立真值，保留）")
+    return {"human": {"left": h["left"], "right": h["right"]},
+            "engine": {"left": e["left"], "right": e["right"]},
+            "warnings": warn}
+
+
+def unknown_counts(kind_array) -> dict:
+    """unknown_kind 数组 → {occluded/blurred/undecidable: 像素数}。"""
+    arr = np.asarray(kind_array) if kind_array is not None else None
+    out = {name: 0 for name in UNKNOWN_KINDS.values()}
+    if arr is None or arr.size == 0:
+        return out
+    for k, name in UNKNOWN_KINDS.items():
+        out[name] = int((arr == int(k)).sum())
+    return out
+
+
 #: Fields an exported frame must carry so a later audit can group it
 #: (map/source), place it (pos/heading) and keep splits isolated.
 IDENTITY_FIELDS = ("map_name", "source_id", "pos", "heading")
@@ -133,6 +191,23 @@ def _frame_in_meta(meta, name: str) -> dict:
     return dict(by.get(name) or {})
 
 
+def load_engine_labels(frames_dir: Path) -> list:
+    """逐帧读**引擎** label（与 load_frame_dir 同一排序，逐帧对齐）。
+
+    人工标注时用来做左右侧覆盖核查：人工在某一侧没标、而引擎那一侧有线，
+    就提示"漏标？或引擎把路缘当线"；人工标了而引擎没有，则按独立真值保留。
+    """
+    out: list = []
+    for f in sorted(glob.glob(os.path.join(str(frames_dir), "*.npz"))):
+        try:
+            with np.load(f) as z:
+                out.append(np.asarray(z["label"], dtype=np.uint8)
+                           if "label" in z.files else None)
+        except Exception:                                 # noqa: BLE001
+            out.append(None)
+    return out
+
+
 def frame_identity(layers, *, source_path: str = "",
                    context: dict | None = None) -> dict:
     """Identity for one frame: first layer that carries a field wins.
@@ -193,6 +268,7 @@ def load_frame_dir(frames_dir: Path, *, out_dir=None):
     meta, meta_source = _read_dir_meta(frames_dir)
     frames: list = []
     idents: list = []
+    engine_labels: list = []
     resume_labels: dict[int, np.ndarray] = {}
     resume_paths: dict[int, tuple[Path, Path]] = {}
     in_place = out_dir is not None and \
@@ -256,10 +332,17 @@ def identity_npz_extras(ident: dict) -> dict:
 
 
 def export_frame(path: Path, rgb: np.ndarray, label: np.ndarray,
-                 ident: dict) -> None:
-    """Save one labelled frame *with* its identity."""
+                 ident: dict, unknown_kind=None) -> None:
+    """Save one labelled frame *with* its identity.
+
+    ``unknown_kind``（可选）逐像素记录"为什么这里是 255"：1=遮挡 2=模糊
+    3=无法判断。只有非零时才写，保持既有消费者不变。
+    """
+    extras = {}
+    if unknown_kind is not None and int(np.asarray(unknown_kind).sum()) > 0:
+        extras["unknown_kind"] = np.asarray(unknown_kind, dtype=np.uint8)
     np.savez_compressed(str(path), colour=rgb, label=label,
-                        **identity_npz_extras(ident))
+                        **identity_npz_extras(ident), **extras)
 
 
 def _sidecar_seed(out_dir: Path) -> tuple[dict, str]:
@@ -429,6 +512,7 @@ def main() -> int:
     elif args.frames_dir:
         frames, idents, resume_labels, resume_paths_by_source = \
             load_frame_dir(args.frames_dir, out_dir=args.out)
+        engine_labels = load_engine_labels(Path(args.frames_dir))
         meta_source = idents[0].get("meta_source", "unavailable") if idents \
             else "unavailable"
         run_identity = idents[0] if idents else {}
@@ -453,6 +537,8 @@ def main() -> int:
                 < float(args.min_road_frac)]
         frames = [frames[i] for i in keep]
         idents = [idents[i] for i in keep]
+        if engine_labels:
+            engine_labels = [engine_labels[i] for i in keep]
         print(f"[annotate] review-incomplete: {len(frames)}/{before} frames "
               f"(road < {args.min_road_frac:.2f})")
         if not frames:
@@ -488,6 +574,7 @@ def main() -> int:
               f"(meta: {run_identity.get('meta_source', meta_source)})")
 
     cls = CLS_LINE
+    unknown_kind = 0                 # 0=普通画笔；1/2/3=遮挡/模糊/无法判断
     tool = "pen"                     # pen | bucket
     zoom = 2
     fi = 0
@@ -514,11 +601,13 @@ def main() -> int:
 
     rgb, fidx = frames[0]
     label = _initial_label(rgb, fidx)
+    # 与 label 同形的"为什么这里是 255"数组（1/2/3），随 label 一起缓存/撤销
+    unk = np.zeros(label.shape, dtype=np.uint8)
     # Keep the current label in memory by SOURCE frame.  Going back must
     # restore the work (including unsaved fixes), and saving a revisited
     # frame must overwrite its existing output instead of creating a
     # duplicate training sample.
-    label_cache: dict[int, np.ndarray] = {0: label.copy()}
+    label_cache: dict[int, tuple] = {0: (label.copy(), unk.copy())}
     saved_paths: dict[int, tuple[Path, Path]] = {
         fi0: resume_paths_by_source[src_idx]
         for fi0, (_rgb0, src_idx) in enumerate(frames)
@@ -527,16 +616,19 @@ def main() -> int:
     last_pt = None
 
     def _cache_current() -> None:
-        label_cache[fi] = label.copy()
+        label_cache[fi] = (label.copy(), unk.copy())
 
     def _load_frame(target: int) -> None:
-        nonlocal fi, rgb, fidx, label
+        nonlocal fi, rgb, fidx, label, unk
         _cache_current()
         fi = int(target)
         rgb, fidx = frames[fi]
         cached = label_cache.get(fi)
-        label = (cached.copy() if cached is not None
-                 else _initial_label(rgb, fidx))
+        if cached is not None:
+            label, unk = cached[0].copy(), cached[1].copy()
+        else:
+            label = _initial_label(rgb, fidx)
+            unk = np.zeros(label.shape, dtype=np.uint8)
         undo_stack.clear()
 
     def _save_current() -> None:
@@ -548,7 +640,13 @@ def main() -> int:
                 out_dir / f"preview_{save_i[0]:05d}.png")
         fp, prev = saved_paths[fi]
         ident = idents[fi] if fi < len(idents) else {}
-        export_frame(fp, rgb, label, ident)
+        export_frame(fp, rgb, label, ident, unknown_kind=unk)
+        engine = (engine_labels[fi]
+                  if fi < len(engine_labels) and engine_labels[fi] is not None
+                  else None)
+        cov = side_coverage_note(label, engine) if engine is not None else None
+        if cov and cov["warnings"]:
+            print(f"[warn] {fp.name} 左右侧覆盖：{'; '.join(cov['warnings'])}")
         saved_records.append({
             "path": fp.name,
             "source_path": ident.get("source_path") or "",
@@ -560,6 +658,8 @@ def main() -> int:
             "heading": ident.get("heading"),
             "identity_source": ident.get("identity_source", "unavailable"),
             "identity_missing": list(ident.get("identity_missing") or []),
+            "unknown_px": unknown_counts(unk),
+            "side_coverage": cov,
             "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         })
         ov = rgb.copy()
@@ -573,7 +673,7 @@ def main() -> int:
               f"{ident.get('source_id') or 'UNKNOWN'})")
 
     def _push_undo():
-        undo_stack.append(label.copy())
+        undo_stack.append((label.copy(), unk.copy()))
         if len(undo_stack) > 25:
             undo_stack.pop(0)
 
@@ -584,18 +684,23 @@ def main() -> int:
         ov[m_road] = (ov[m_road] * 0.6
                       + np.array([255, 120, 0]) * 0.4).astype(np.uint8)
         ov[m_line] = (0, 255, 0)
+        if unk.any():                     # 遮挡/模糊/无法判断：洋红
+            ov[unk > 0] = (255, 0, 255)
         big = cv2.resize(ov, (ov.shape[1] * zoom, ov.shape[0] * zoom),
                          interpolation=cv2.INTER_NEAREST)
-        tool_txt = f"tool={tool} class={CLASS_NAME[cls]} " \
-                   f"undo={len(undo_stack)}"
+        _brush = UNKNOWN_KINDS.get(int(unknown_kind)) or CLASS_NAME[cls]
+        _sides = side_line_counts(label)
+        tool_txt = (f"tool={tool} class={_brush} undo={len(undo_stack)} "
+                    f"L={_sides['left']} R={_sides['right']}")
         idn = idents[fi] if fi < len(idents) else {}
         ident_txt = (f"{idn.get('map_name') or 'UNKNOWN'}/"
                      f"{idn.get('source_id') or 'UNKNOWN'}")
         for txt, row in (
                 (f"[{fi + 1}/{len(frames)}] src#{fidx} {ident_txt} "
                  f"{tool_txt}", 20),
-                ("1/2/3 class  b=tool  f=fill  p=pen  a/Left=back  "
-                 "u=undo  c=clear  z=zoom  s=save+next  q=quit", 40)):
+                ("1/2/3 class  4=遮挡 5=模糊 6=无法判断  b=tool  f=fill  "
+                 "p=pen  a/Left=back  u=undo  c=clear  z=zoom  s=save+next  "
+                 "q=quit", 40)):
             cv2.putText(big, txt, (8, row), cv2.FONT_HERSHEY_SIMPLEX,
                         0.5, (0, 0, 0), 3)
             cv2.putText(big, txt, (8, row), cv2.FONT_HERSHEY_SIMPLEX,
@@ -605,8 +710,14 @@ def main() -> int:
     def _paint(x, y):
         r, c = int(y / zoom), int(x / zoom)
         h, w = label.shape
-        cv2.circle(label, (min(max(c, 0), w - 1), min(max(r, 0), h - 1)),
-                   brush, cls, -1)
+        rr, cc = min(max(r, 0), h - 1), min(max(c, 0), w - 1)
+        if unknown_kind:
+            # "不能判断"：label 记 255(ignore)，原因写进 unk
+            cv2.circle(label, (cc, rr), brush, 255, -1)
+            cv2.circle(unk, (cc, rr), brush, int(unknown_kind), -1)
+        else:
+            cv2.circle(label, (cc, rr), brush, cls, -1)
+            cv2.circle(unk, (cc, rr), brush, 0, -1)
 
     def _bucket(x, y):
         r, c = int(y / zoom), int(x / zoom)
@@ -614,13 +725,15 @@ def main() -> int:
         if not (0 <= r < h and 0 <= c < w):
             return
         old = int(label[r, c])
-        if old == cls:
+        want = 255 if unknown_kind else cls
+        if old == want:
             return
         m = (label == old).astype(np.uint8)
         ff = np.zeros((h + 2, w + 2), np.uint8)
         cv2.floodFill(m, ff, (c, r), 0, loDiff=0, upDiff=0, flags=4)
         region = (m == 0) & (label == old)
-        label[region] = cls
+        label[region] = want
+        unk[region] = int(unknown_kind) if unknown_kind else 0
 
     def _mouse(event, x, y, flags, param):
         nonlocal painting, last_pt
@@ -660,11 +773,13 @@ def main() -> int:
         if key == ord("q"):
             break
         elif key == ord("1"):
-            cls = CLS_LINE
+            cls, unknown_kind = CLS_LINE, 0
         elif key == ord("2"):
-            cls = CLS_ROAD
+            cls, unknown_kind = CLS_ROAD, 0
         elif key == ord("3"):
-            cls = CLS_BG
+            cls, unknown_kind = CLS_BG, 0
+        elif key in (ord("4"), ord("5"), ord("6")):
+            unknown_kind = int(unknown_kind_for_key(chr(key)) or 0)
         elif key == ord("b"):
             tool = "bucket" if tool == "pen" else "pen"
         elif key == ord("f"):
@@ -672,10 +787,11 @@ def main() -> int:
         elif key == ord("p"):
             tool = "pen"
         elif key == ord("u") and undo_stack:
-            label[:] = undo_stack.pop()
+            label[:], unk[:] = undo_stack.pop()
         elif key == ord("c"):
             _push_undo()
             label[:] = 0
+            unk[:] = 0
         elif key == ord("z"):
             zoom = 1 if zoom == 2 else 2
         elif key in (ord("a"), 81):       # 81 = left arrow
