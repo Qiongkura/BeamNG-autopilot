@@ -208,6 +208,45 @@ class TestEvalMatrixMath:
         assert out["line_precision"] == 0.5, "全局累加 = 10/20，不是逐帧平均"
         assert out["inference_ms_p95"] >= 1.0
 
+    def test_per_group_evaluation_keeps_each_scene_separate(self, tmp_path):
+        """分场景评估：每个场景自己是一份独立测量（方案 §10.2/A7）。
+
+        这里证明的是**接线**：两个场景各 2 帧，各自出自己那份完整指标
+        （不是从池化结果里切一块），池化仍按总帧数算；没有真值可召回的
+        场景记 UNKNOWN（None）而不是 0。
+        "坏场景不被均值抵消"本身由 `gates.scene_report` 的判定测试覆盖。
+        """
+        import numpy as np
+        import torch
+        tool = self._tool()
+        from beamng_autopilot.vision.segmentation import SegUNet
+        ckpt = tmp_path / "per_group.pt"
+        torch.save({"state_dict": SegUNet(width=1.0).state_dict(),
+                    "train_args": {"arch_args": {"width": 1.0}}}, ckpt)
+
+        def frames(hit: bool):
+            out = []
+            for i in range(2):
+                colour = np.zeros((30, 40, 3), np.uint8)
+                label = np.zeros((30, 40), np.uint8)
+                label[6:26, :] = 1
+                label[15, :20] = 2
+                if not hit:
+                    label[:, :] = np.where(label == 2, 1, label)  # 场景 B 无标线
+                out.append((f"f{i}.npz", colour, label))
+            return out
+
+        per_group = {"italy/ring_a": frames(True), "italy/ring_b": frames(False)}
+        out = tool.evaluate_model_per_group(ckpt, per_group, device="cpu")
+        assert set(out["per_group"]) == {"italy/ring_a", "italy/ring_b"}, out["per_group"]
+        # 每个场景自己那一份都是完整指标（不是"总体里切出来的一个数"）
+        for g in out["per_group"]:
+            assert out["per_group"][g]["n_frames"] == 2, out["per_group"][g]
+            assert "line_recall" in out["per_group"][g]
+        # 场景 B 的真值标线被去掉 -> 它自己"没有真值标线可召回"（UNKNOWN 而非 0）
+        assert out["per_group"]["italy/ring_b"]["line_recall"] is None,             out["per_group"]["italy/ring_b"]
+        assert out["n_frames"] == 4, "总体仍按池化算"
+
     def test_model_argument_accepts_name_equals_path(self):
         from pathlib import Path
         tool = self._tool()
@@ -355,3 +394,38 @@ class TestThresholdProtocol:
         assert "measured" in ok["basis"]
         assert t.resume_within_tolerance(t.resume_max_rel_diff * 5)[
             "within_tolerance"] is False
+
+
+class TestE0Baseline:
+    """E0 基线工具：最差场景的方向不能搞反（越小越好的指标取最大值）。"""
+
+    def _tool(self):
+        import importlib.util
+        import sys
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location(
+            "m5_e0_baseline", root / "scripts" / "m5_e0_baseline.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["m5_e0_baseline"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_worst_scene_takes_the_right_direction(self):
+        tool = self._tool()
+        seeds = [
+            {"seed": 42, "eval": {"per_scene": {
+                "a": {"line_recall": 0.9, "offroad_false_frac_of_pred": 0.02},
+                "b": {"line_recall": 0.3, "offroad_false_frac_of_pred": 0.7}}}},
+            {"seed": 43, "eval": {"per_scene": {
+                "a": {"line_recall": 0.5, "offroad_false_frac_of_pred": 0.01}}}},
+        ]
+        w = tool.worst_scene_table(seeds)
+        # 召回越低越差 -> 取最小
+        assert w["line_recall"]["value"] == 0.3 and w["line_recall"]["scene"] == "b"
+        # 路外假线比例越高越差 -> 取**最大**（实测踩到：0.0018 被报成最差）
+        assert w["offroad_false_frac_of_pred"]["value"] == 0.7, w
+        assert w["offroad_false_frac_of_pred"]["lower_is_better"] is True
+        # 缺测不参与（不能把"没测"当成最差或最好）
+        seeds[0]["eval"]["per_scene"]["b"]["line_precision"] = None
+        assert "line_precision" not in tool.worst_scene_table(seeds)

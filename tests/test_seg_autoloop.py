@@ -150,7 +150,12 @@ class TestProposeAndEliminate:
         return p
 
     def test_the_auxiliary_iou_alone_cannot_promote(self, tmp_path):
-        """IoU 是辅助指标：只涨它不改主指标时，判定只能是 rejected。"""
+        """IoU 是辅助指标：只涨它不改主指标时，判定不能晋级。
+
+        规则更新（2026-09-25，W5/G09）：这里**一个任务主指标都没测**，
+        所以判定是 `needs_evidence`（"证据缺失"），而不是旧语义的 `rejected`
+        （"测了但没改善"）——方案 §10.3 的判定顺序把这两种分开。
+        """
         _load()
         p = tmp_path / "pairings.json"
         p.write_text(json.dumps({"line_iou": {
@@ -163,8 +168,8 @@ class TestProposeAndEliminate:
                                     "inference_ms_p95": 20.0}), encoding="utf-8")
         r = _run(None, ["evaluate", "--run-id", "loop_iou", "--candidate-id",
                         "iouonly", "--pairings", str(p), "--hard-gate",
-                        str(hard)], tmp_path, expect=1)
-        assert "no primary metric shows a credible improvement" in r.stdout
+                        str(hard)], tmp_path, expect=3)
+        assert "no primary (task) metric was measured" in r.stdout, r.stdout
 
     def test_a_net_negative_round_is_eliminated_with_reasons(self, tmp_path):
         _load()

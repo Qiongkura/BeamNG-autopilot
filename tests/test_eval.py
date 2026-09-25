@@ -240,3 +240,43 @@ def test_worst_frames_ranks_measured_frames_and_skips_none():
     assert [x["frame"] for x in r["worst"]] == ["b.npz", "d.npz"]
     assert [x["frame"] for x in r["best"]] == ["a.npz", "d.npz"]
     assert r["worst"][0]["gt_px"] == 20
+
+
+def test_predictions_in_the_unknown_region_do_not_move_the_offroad_ratio():
+    """G04 反例：向未知区添加预测，不能改变已知区的路外假线率。
+
+    旧实现用**全部预测像素**做分母，未知区（label=255）里的预测
+    会把这个比例**稀释下去**——于是「在看不清的地方多画线」
+    反而能让路外假线看起来更好。分母只能算有效区。
+    """
+    from scripts.m5_seg_eval_matrix import (
+        accumulate, line_pixel_metrics, totals_to_metrics,
+    )
+
+    label = np.zeros((40, 60), np.uint8)
+    label[5:35, 10:50] = 1                 # 路面
+    label[20, 12:30] = 2                   # 一段真标线
+    label[0:5, :] = 255                    # 上面一条未知区
+    pred_a = np.zeros_like(label, bool)
+    pred_a[20, 12:30] = True               # 命中真标线
+    pred_a[25, 12:20] = True               # 真标线之外、但在路面上（假阳）
+    pred_b = pred_a.copy()
+    pred_b[0:5, :] = True                  # 在**未知区**里多画一大片线
+
+    a = line_pixel_metrics(pred_a, label)
+    b = line_pixel_metrics(pred_b, label)
+    assert a["fp_px"] == b["fp_px"] and a["tp_px"] == b["tp_px"]
+    assert a["pred_line_known_px"] == b["pred_line_known_px"]
+    assert b["pred_line_px"] > a["pred_line_px"], "\u603b\u9884\u6d4b\u786e\u5b9e\u53d8\u4e86\uff08\u8fd9\u5c31\u662f\u7a00\u91ca\uff09"
+    assert b["pred_line_unknown_px"] > 0 and a["pred_line_unknown_px"] == 0
+
+    def _metrics(px: dict) -> dict:
+        acc: dict = {}
+        accumulate(acc, px)
+        return totals_to_metrics(acc, n_frames=1, ms=[10.0])
+
+    ma, mb = _metrics(a), _metrics(b)
+    assert ma["offroad_false_frac_of_pred"] == mb["offroad_false_frac_of_pred"], (
+        "分母只能算有效区：往未知区多画线不能改变这个比例",
+        ma["offroad_false_frac_of_pred"], mb["offroad_false_frac_of_pred"])
+    assert mb["pred_unknown_line_px"] == b["pred_line_unknown_px"]

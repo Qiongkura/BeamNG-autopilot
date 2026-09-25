@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pytest
+import numpy as np
 import torch
 
 from beamng_autopilot.vision.seg_losses import (
@@ -159,3 +160,39 @@ def test_masking_the_line_channel_drops_the_region_terms():
     # 关掉区域项后，混批是可算的
     assert float(LineSegLoss(w_tversky=0.0, w_cldice=0.0)(
         logits, target, class_mask=mixed)) > 0.0
+
+
+def _logits(*, line_hot: bool, h=16, w=16) -> torch.Tensor:
+    """(1, 3, h, w) 的 logits；``line_hot`` 决定在中间一行预测标线。"""
+    x = torch.zeros(1, 3, h, w)
+    x[:, 0] = 2.0                    # background 低
+    x[:, 1] = 1.0                    # road 中
+    if line_hot:
+        x[:, 2, h // 2, :] = 5.0     # 中间一行强烈预测 line
+    return x
+
+
+def _label(*, unknown_band=False, line=True, h=16, w=16) -> torch.Tensor:
+    lab = np.zeros((1, h, w), np.uint8)
+    lab[0, 4:12, :] = 1              # road
+    if line:
+        lab[0, h // 2, :] = 2
+    if unknown_band:
+        lab[0, 0:2, :] = 255         # 顶部一条未知区
+    return torch.from_numpy(lab.astype(np.int64))
+
+
+def test_an_unknown_region_contributes_no_supervision():
+    """1：把某区域改成 UNKNOWN 后，那里预测什么都不影响损失。"""
+    crit = LineSegLoss()
+    lab = _label(unknown_band=True)
+    a = _logits(line_hot=False)      # 未知区里没预测线
+    b = _logits(line_hot=True)       # 未知区外才有线；这里只改"未知区外"的预测
+    base = float(crit(a, lab, class_mask=None))
+    # 在**未知区之外**改预测 -> 损失必须变（说明监督还在）
+    assert abs(float(crit(b, lab, class_mask=None)) - base) > 1e-6
+    # 在**未知区之内**改预测 -> 损失必须不变
+    c = a.clone()
+    c[:, 2, 0:2, :] = 5.0            # 未知区里强烈预测 line
+    assert abs(float(crit(c, lab, class_mask=None)) - base) < 1e-6, \
+        "未知区不得贡献任何监督"

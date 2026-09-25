@@ -172,7 +172,10 @@ def test_an_unapplicable_factor_refuses_to_train(tmp_path):
     phases = [json.loads(ln)["phase"] for ln in
               (d / "events.jsonl").read_text(encoding="utf-8")
               .splitlines() if ln.strip()]
-    assert "needs_evidence" in phases
+    # 拒训事件必须落在**合法阶段**上：这里日志已经在 training（候选逐轮训练那条
+    # 先写了），从 training 只能到 evaluating/failed/paused —— 所以是 paused。
+    # 原来写 needs_evidence 会直接抛 ValueError，把整轮炸掉（实测踩到）。
+    assert phases[-1] in ("paused", "needs_review"), phases
 
 
 def test_road_only_masks_the_line_channel_in_both_arms(tmp_path):
@@ -378,9 +381,10 @@ def test_the_event_metric_is_named_after_the_paired_metric(tmp_path):
     实测缺陷：road-only 运行的候选事件流写死 `line_iou`，而那次运行根本没有 line
     监督——看板于是显示了一个并不存在的量。
     """
-    import inspect
     loop = _load()
-    src = inspect.getsource(loop.cmd_rounds)
+    # 扫**整个入口文件**而不是 cmd_rounds 的函数体：实现允许把主体拆到内部函数
+    # （例如加了机器级租约之后），但"事件里的指标名跟着 pair_metric"这条属性不变。
+    src = (ROOT / "scripts" / "m5_seg_autoloop.py").read_text(encoding="utf-8")
     assert "metrics={pair_metric:" in src, "事件流的指标名要跟着 pair_metric"
     assert '"line_iou": metric(' not in src, "不能把指标名写死成 line_iou"
 
@@ -399,3 +403,764 @@ def test_a_load_polluted_timing_is_flagged_not_reported(tmp_path):
     assert loop.timing_suspect(None, 158.0) is False
     assert loop.timing_suspect(12.4, None) is False
     assert loop.timing_suspect(0.0, 158.0) is False
+
+
+def test_plateau_check_flags_a_still_moving_metric(tmp_path):
+    """没到平台期的判定只能算暂行：读数还在动就要说出来。
+
+    实测：3 epoch 时 road_iou 摆 ±0.26、12 epoch 时收敛到 ±0.03，所以"最后 k 轮
+    验证指标还在动"是把瞬态读数当结论的信号。缺列时如实 UNKNOWN，不猜。
+    """
+    loop = _load()
+    moving = {"val_miou": [0.40, 0.42, 0.55, 0.70, 0.88]}
+    r = loop.plateau_check(moving, k=3, tol=0.02)
+    assert r["at_plateau"] is False and r["spread"] > 0.3
+    flat = {"val_miou": [0.86, 0.876, 0.878, 0.877, 0.879]}
+    assert loop.plateau_check(flat, k=3, tol=0.02)["at_plateau"] is True
+    # 缺列：UNKNOWN 而不是 False（不能把"没测"当"没到"）
+    assert loop.plateau_check({})["at_plateau"] is None
+    assert loop.plateau_check({"val_miou": []})["at_plateau"] is None
+    assert loop.plateau_check({"val_line_iou": [None, None]})["at_plateau"] is None
+
+
+def test_repeated_timing_keeps_the_least_contaminated_measurement(tmp_path):
+    """本机时延有间歇性负载：同 seed 测两次取较小值，两次都留档。
+
+    实测：同一 checkpoint 的 p50 在 9.95 与 21.67 ms 之间、p95 在 11.4 与 63.8 ms
+    之间跳（并发跑 pytest 时最坏 158 ms），所以单次测量不能进硬门。
+    """
+    loop = _load()
+    assert loop.min_positive(63.8, 11.4) == 11.4
+    assert loop.min_positive(None, 11.4) == 11.4
+    assert loop.min_positive(None, None) is None
+    assert loop.min_positive(11.4) == 11.4
+
+
+def test_every_arm_and_seed_streams_per_step_metrics(tmp_path):
+    """每臂每 seed 都要写逐 step 指标——否则监控器/看板没有实时曲线。
+
+    实测：`rounds` 一直没传 `--metrics-run`，最近 5 场运行都没有
+    `logs/experiments/<run>/metrics.jsonl`，工作区的训练监控器因此只能找到老 demo。
+    """
+    loop = _load()
+    a = _frames(tmp_path, "coll_a")
+    b = _frames(tmp_path, "coll_b")
+    p = _proposal(tmp_path, {"add_runs": [str(b)]})
+    r = _run(["rounds", "--run-id", "rw_m", "--rounds", "1", "--runs", str(a),
+              "--eval-runs", str(a), "--proposals", str(p), "--seeds", "42",
+              "43", "--plan-only"], tmp_path, expect=0)
+    base = [l for l in r.stdout.splitlines() if l.startswith("[plan] baseline")]
+    cand = [l for l in r.stdout.splitlines() if l.startswith("[plan] candidate")]
+    for line in base + cand:
+        toks = line.split()
+        assert "--metrics-run" in toks, line[:200]
+        rid = toks[toks.index("--metrics-run") + 1]
+        assert "rw_m" in rid and "-s4" in rid, rid
+    # 两臂的 run id 必须不同（否则两条曲线会写到同一个文件里互相覆盖）
+    base_ids = {l.split()[l.split().index("--metrics-run") + 1] for l in base}
+    cand_ids = {l.split()[l.split().index("--metrics-run") + 1] for l in cand}
+    assert not (base_ids & cand_ids), (base_ids, cand_ids)
+
+
+def test_a_recipe_factor_is_reported_with_its_own_epochs(tmp_path):
+    """配方类因子改了训练轮数，记录里就不能写基线轮的数值。
+
+    因子族里有 `epochs`（TRAINER_FLAG_FACTORS），旗标附在候选臂命令末尾、
+    覆盖 `--epochs`。若判定文件还写 24、实际跑了 48，就是"记录与实际不一致"。
+    """
+    loop = _load()
+    assert loop.factor_epochs(24, ["--epochs", "48"]) == 48
+    assert loop.factor_epochs(24, []) == 24
+    assert loop.factor_epochs(24, ["--lr", "0.002"]) == 24
+    # 命令行最后出现的 --epochs 胜出（与 argparse 一致）
+    assert loop.factor_epochs(24, ["--epochs", "48", "--epochs", "12"]) == 12
+    a = _frames(tmp_path, "coll_a")
+    dev = _frames(tmp_path, "coll_dev")
+    p = tmp_path / "prop_epochs.json"
+    p.write_text(json.dumps({"proposals": [{"candidate_id": "longer",
+                                            "factor": {"epochs": 48}}]}),
+                 encoding="utf-8")
+    r = _run(["rounds", "--run-id", "rw_epochs", "--rounds", "1",
+              "--runs", str(a), "--eval-runs", str(dev),
+              "--allow-road-only", "--proposals", str(p),
+              "--seeds", "42", "--epochs", "24", "--plan-only"],
+             tmp_path, expect=0)
+    cand = [ln for ln in r.stdout.splitlines() if ln.startswith("[plan] candidate")]
+    base = [ln for ln in r.stdout.splitlines() if ln.startswith("[plan] baseline")]
+    assert cand and "--epochs 48" in cand[0], cand[:1]
+    assert base and "--epochs 24" in base[0], base[:1]
+
+
+def test_a_capacity_factor_only_changes_the_candidate(tmp_path):
+    """容量族（`width`）必须走白名单变成 `--width`，且只加在候选臂上。
+
+    数据与步数都不动、只改模型宽度——这是"数据因子"和"训练预算"两条杠杆都测到
+    回报边界之后的第三条杠杆，命令行的逐项 diff 必须干净（基线臂不能被动到）。
+    """
+    loop = _load()
+    flags, skipped = loop.factor_to_flags({"width": 2.0})
+    assert flags == ["--width", "2.0"] and not skipped, (flags, skipped)
+    assert "width" in loop.TRAINER_FLAG_FACTORS
+    a = _frames(tmp_path, "coll_a")
+    dev = _frames(tmp_path, "coll_dev")
+    p = tmp_path / "prop_width.json"
+    p.write_text(json.dumps({"proposals": [{"candidate_id": "wide",
+                                            "factor": {"width": 2.0}}]}),
+                 encoding="utf-8")
+    r = _run(["rounds", "--run-id", "rw_width", "--rounds", "1",
+              "--runs", str(a), "--eval-runs", str(dev),
+              "--allow-road-only", "--proposals", str(p),
+              "--seeds", "42", "--epochs", "24", "--plan-only"],
+             tmp_path, expect=0)
+    cand = [ln for ln in r.stdout.splitlines() if ln.startswith("[plan] candidate")]
+    base = [ln for ln in r.stdout.splitlines() if ln.startswith("[plan] baseline")]
+    assert cand and "--width 2.0" in cand[0], cand[:1]
+    assert base and "--width" not in base[0], base[:1]
+
+
+def test_the_plateau_guard_needs_both_arms(tmp_path):
+    """平台期要两臂都判：只判候选臂时，"候选更好"可能只是候选训得更久。
+
+    实测来历：第 5 轮 96-epoch 臂有一个 seed 末段大跳（spread 0.33），而基线臂
+    的轮内波动一直很小——只看一臂会把这种不稳定读成"候选的容量/预算效应"。
+    """
+    loop = _load()
+    ok = {"42": {"at_plateau": True}}
+    bad = {"42": {"at_plateau": False}}
+    unknown = {"42": {"at_plateau": None}}
+    assert loop._both_at_plateau(ok, ok) is True
+    assert loop._both_at_plateau(ok, bad) is False
+    assert loop._both_at_plateau(ok, unknown) is None, "缺测是 UNKNOWN，不当通过"
+    assert loop._both_at_plateau({}, {}) is None
+    missing = loop.plateau_from_hist(tmp_path / "nope.json")
+    assert missing["at_plateau"] is None and "missing" in missing
+    good = tmp_path / "train_hist.json"
+    good.write_text(json.dumps({"epoch": [0, 1, 2, 3],
+                                "val_miou": [0.5, 0.6, 0.601, 0.602]}),
+                    encoding="utf-8")
+    assert loop.plateau_from_hist(good)["at_plateau"] is True
+
+
+def test_a_full_round_writes_a_decision_file(tmp_path):
+    """整轮跑到底（桩训练器写合法产物）→ 判定必须落盘。
+
+    实测踩到：把 `all_at_plateau` 的赋值放在判定字典**之后**，写盘那行直接
+    UnboundLocalError——训练全跑完却拿不到判定，一轮 GPU 白花。只测
+    `--plan-only`、或只测被栏下的路径都抓不到它，必须有一条"真的走到
+    写判定"的回归。
+    """
+    _load()
+    a = _frames(tmp_path, "coll_a")
+    b = _frames(tmp_path, "coll_b")
+    dev = _frames(tmp_path, "coll_dev")
+    stub = ROOT / "tests" / "_stub_trainer_e2e.py"
+    p = _proposal(tmp_path, {"add_runs": [str(b)]})
+    r = _run(["rounds", "--run-id", "rw_full", "--rounds", "1",
+              "--runs", str(a), "--eval-runs", str(dev),
+              "--allow-road-only", "--proposals", str(p), "--seeds", "42",
+              "--epochs", "24", "--device", "cpu",
+              "--trainer-script", str(stub)], tmp_path, expect=0)
+    d = tmp_path / "logs" / "experiments" / "rw_full"
+    decs = sorted(d.glob("decision_*.json"))
+    assert decs, r.stdout[-1400:] + r.stderr[-800:]
+    blob = json.loads(decs[0].read_text(encoding="utf-8"))
+    assert "all_at_plateau" in blob, sorted(blob)
+    assert "plateau_baseline_by_seed" in blob, "两臂平台期都要记"
+    assert blob["plateau_by_seed"]["42"]["at_plateau"] is True
+    assert blob["plateau_baseline_by_seed"]["42"]["at_plateau"] is True
+    assert blob["all_at_plateau"] is True
+    assert blob["pairings"]["road_iou"]["n"] == 1
+    # 步数来自 checkpoint 的 train_args（桩：n_train=2, batch=2 -> 1 步/轮 × 24）
+    assert blob["steps_by_arm"]["baseline"]["42"] == 24, blob["steps_by_arm"]
+    assert blob["steps_by_arm"]["candidate"]["42"] == 24, "等步数对照"
+
+
+def test_a_line_supervised_arm_trains_the_line_channel(tmp_path):
+    """研究臂：给了漆线来源就**不再屏蔽 line 通道**，两臂都带 --paint-source。
+
+    实测依据（2026-09-25）：引擎标注的漆线类存在但不完整（覆盖
+    RGB 漆线候选 ~0.61），可以当弱监督——不开它的时候模型
+    完全不产出标线（评估里 `no predicted line pixels at all`）。
+    """
+    loop = _load()
+    a = _frames(tmp_path, "coll_a")
+    dev = _frames(tmp_path, "coll_dev")
+    p = _proposal(tmp_path, {"line_tversky_weight": 2.0})
+    r = _run(["rounds", "--run-id", "rw_line", "--rounds", "1",
+              "--runs", str(a), "--eval-runs", str(dev),
+              "--paint-source", "coll_a=engine_annotation_partial",
+              "--research-arm", "--proposals", str(p),
+              "--seeds", "42", "--epochs", "24", "--plan-only"],
+             tmp_path, expect=0)
+    cand = [ln for ln in r.stdout.splitlines() if ln.startswith("[plan] candidate")]
+    base = [ln for ln in r.stdout.splitlines() if ln.startswith("[plan] baseline")]
+    assert cand and base, r.stdout[-600:]
+    for line in (cand[0], base[0]):
+        assert "--paint-source engine_annotation_partial" in line, line
+        assert "--ignore-line-class" not in line, "line 通道必须开着"
+    assert "--line-tversky-weight 2.0" in cand[0]
+    assert "--line-tversky-weight" not in base[0], "因子只加在候选臂"
+    # 路面方案的老行为不变：--allow-road-only 仍然屏蔽 line 通道
+    r2 = _run(["rounds", "--run-id", "rw_road", "--rounds", "1",
+               "--runs", str(a), "--eval-runs", str(dev),
+               "--allow-road-only", "--proposals", str(p),
+               "--seeds", "42", "--epochs", "24", "--plan-only"],
+              tmp_path, expect=0)
+    road = [ln for ln in r2.stdout.splitlines() if ln.startswith("[plan] candidate")]
+    assert road and "--ignore-line-class" in road[0]
+    assert "--paint-source" not in road[0]
+
+
+def test_a_research_arm_cannot_be_promoted():
+    """弱监督真值下不允许晋级：「精度达标」可能只是「只预测了
+
+    被标注的那部分」。非研究臂不受影响。
+    """
+    loop = _load()
+    assert loop._block_research_promotion(
+        {"decision": "shadow_candidate", "reasons": ["x"]},
+        False)["decision"] == "shadow_candidate"
+    got = loop._block_research_promotion(
+        {"decision": "shadow_candidate", "reasons": ["x"]}, True)
+    assert got["decision"] == "needs_evidence", got
+    assert "x" in got["reasons"] and any("research arm" in r
+                                        for r in got["reasons"]), got
+    assert loop._block_research_promotion(
+        {"decision": "approved_for_review"}, True)["decision"] == \
+        "needs_evidence"
+    # 已被拒/缺证据的结论不动
+    for d in ("rejected", "needs_evidence"):
+        assert loop._block_research_promotion({"decision": d}, True)["decision"] == d
+
+
+def test_paint_source_flag_parsing():
+    """--paint-source RUN=SOURCE → {run: source}；格式不对的条目不猜。
+
+    同时登记**规范化后的路径**：manifest 按 ``str(rd)`` 查来源，而 rd 由
+    runs/eval_runs 的字符串构造（Windows 下是反斜杠）——实测踩到：只用正斜杠的键
+    会静默回落 engine_annotation，审计报告里的 paint_ok 与原因就是错的。
+    """
+    loop = _load()
+    args = type("A", (), {"paint_source": [
+        " logs/m5_seg/x/front_main =engine_annotation_partial"]})()
+    got = loop.paint_sources_from(args)
+    assert got["logs/m5_seg/x/front_main"] == "engine_annotation_partial"
+    # 同时登记规范化路径：manifest 按 str(rd) 查来源（Windows 是反斜杠）
+    norm = str(Path("logs/m5_seg/x/front_main"))
+    assert got[norm] == "engine_annotation_partial", got
+    assert len(got) == 2, got
+    assert loop.paint_sources_from(type("A", (), {"paint_source": None})()) == {}
+    assert loop.paint_sources_from(type("A", (), {
+        "paint_source": ["no-equals-sign"]})()) == {}
+
+
+def _agent_dir(tmp_path: Path, name: str) -> Path:
+    """带「agent 逐帧核对」凭证的数据目录（凭证跟着帧走）。"""
+    d = _frames(tmp_path, name)
+    (d / "annotation.json").write_text(json.dumps({
+        "label_source": "agent_revision", "generator": "test",
+        "frames": [{"path": f"{name}/front_main/frame_{i:05d}.npz"}
+                   for i in range(3)]}, ensure_ascii=False),
+        encoding="utf-8")
+    return d
+
+
+def test_an_agent_source_cannot_be_promoted_even_without_the_flag(tmp_path):
+    """G03 反例：漏传 --research-arm 也不能让 agent 数据参与晋级。
+
+    原实现用"字符串以 _partial 结尾或等于 pseudo"判研究臂，
+    于是 `--paint-source X=agent_revision` 不带 flag 就能绕过；
+    现在资格由**逐帧凭证**派生。
+    """
+    loop = _load()
+    a = _agent_dir(tmp_path, "coll_a")
+    dev = _agent_dir(tmp_path, "coll_dev")
+    p = _proposal(tmp_path, {"line_tversky_weight": 2.0})
+    r = _run(["rounds", "--run-id", "rw_src1", "--rounds", "1",
+              "--runs", str(a), "--eval-runs", str(dev),
+              "--paint-source", f"{a}=agent_revision",
+              "--proposals", str(p), "--seeds", "42", "--epochs", "24",
+              "--plan-only"], tmp_path, expect=0)
+    assert r.returncode == 0
+    # plan-only 不写判定，所以直接验证解析结果
+    res = loop.resolve_paint_sources(type("A", (), {
+        "paint_source": [f"{a}=agent_revision"],
+        "research_arm": False})())
+    assert res["research_only"] is True, res
+    run = list(res["runs"].values())[0]
+    assert run["effective"] == "agent_revision" and run["can_promote"] is False
+    assert run["credential"] == "agent_revision", "凭证要能读到"
+
+
+def test_declaring_human_revision_cannot_upgrade_agent_data(tmp_path):
+    """命令行写 human_revision 不能把 agent 数据升格（凭证优先）。"""
+    loop = _load()
+    a = _agent_dir(tmp_path, "coll_b")
+    res = loop.resolve_paint_sources(type("A", (), {
+        "paint_source": [f"{a}=human_revision"], "research_arm": False})())
+    run = list(res["runs"].values())[0]
+    assert run["effective"] == "agent_revision", run
+    assert run["can_promote"] is False and res["research_only"] is True
+    assert any("using the credential" in n for n in res["notes"]), res["notes"]
+
+
+def test_a_full_round_records_the_source_resolution_and_replays_it(tmp_path):
+    """判定里存来源资格，replay 重放同一结论（方案 G10）。"""
+    loop = _load()
+    a = _agent_dir(tmp_path, "coll_c")
+    dev = _agent_dir(tmp_path, "coll_dev2")
+    stub = ROOT / "tests" / "_stub_trainer_e2e.py"
+    p = _proposal(tmp_path, {"line_tversky_weight": 2.0})
+    r = _run(["rounds", "--run-id", "rw_src2", "--rounds", "1",
+              "--runs", str(a), "--eval-runs", str(dev),
+              "--paint-source", f"{a}=agent_revision",
+              "--proposals", str(p), "--seeds", "42", "--epochs", "24",
+              "--device", "cpu", "--trainer-script", str(stub)],
+             tmp_path, expect=0)
+    d = tmp_path / "logs" / "experiments" / "rw_src2"
+    decs = sorted(d.glob("decision_*.json"))
+    assert decs, r.stdout[-1200:]
+    blob = json.loads(decs[0].read_text(encoding="utf-8"))
+    assert blob["research_only"] is True, "无 flag 也要记研究臂"
+    res = blob.get("paint_source_resolution") or {}
+    assert res.get("research_only") is True and res.get("runs"), res
+    # replay 必须重放出同一判定（包括研究臂后置降级）
+    r2 = _run(["replay", "--run-id", "rw_src2"], tmp_path, expect=0)
+    assert "相同 1" in r2.stdout and "不同 0" in r2.stdout, r2.stdout
+
+
+def test_the_decision_carries_a_self_checking_protocol_snapshot(tmp_path):
+    """判定文件必须能自查口径（方案 §10.3：保存完整协议快照及哈希）。
+
+    实测缺口：判定文件只记了"阈值来自哪个文件"，协议定义（分母/聚合/空间缓冲）
+    完全没进文件——旧口径消失后，没人能证明这份判定是对哪套口径做的。
+    另外，重放**不能**默默换成今天的最新阈值：快照被改过要报不一致。
+    """
+    loop = _load()
+    a = _frames(tmp_path, "coll_ps")
+    b = _frames(tmp_path, "coll_ps_b")
+    dev = _frames(tmp_path, "coll_ps_dev")
+    stub = ROOT / "tests" / "_stub_trainer_e2e.py"
+    p = _proposal(tmp_path, {"add_runs": [str(b)]})
+    _run(["rounds", "--run-id", "rw_proto", "--rounds", "1",
+          "--runs", str(a), "--eval-runs", str(dev), "--allow-road-only",
+          "--proposals", str(p), "--seeds", "42", "--epochs", "24",
+          "--device", "cpu", "--trainer-script", str(stub)],
+         tmp_path, expect=0)
+    dec = sorted((tmp_path / "logs" / "experiments" / "rw_proto"
+                  ).glob("decision_*.json"))[0]
+    blob = json.loads(dec.read_text(encoding="utf-8"))
+    snap = blob.get("protocol")
+    assert snap, "判定文件必须带协议快照"
+    ver = loop.verify_snapshot(snap)
+    assert ver["ok"], ver
+    assert ver["matches_current_protocol"], ver
+    # 快照里的阈值就是本轮真正用的那套（不是"此刻磁盘上最新的文件"）
+    assert snap["thresholds"]["line_recall_min"] ==         loop.Thresholds().line_recall_min
+    # 重放：一致 -> 相同 1；被改过 -> 明确报"协议快照不符"（不能静默按新口径算）
+    r = _run(["replay", "--run-id", "rw_proto"], tmp_path, expect=0)
+    assert "相同 1" in r.stdout, r.stdout
+    blob["protocol"]["spatial_buffer_m"] = 5.0
+    dec.write_text(json.dumps(blob, ensure_ascii=False), encoding="utf-8")
+    r2 = _run(["replay", "--run-id", "rw_proto"], tmp_path, expect=1)
+    assert "协议快照与记录的哈希不符" in r2.stdout, r2.stdout
+
+
+def test_final_confirmation_must_name_a_real_candidate_checkpoint():
+    """R2 绑定**具体 checkpoint**（方案 §10.3），不能登记一个跨 seed 的平均成绩。"""
+    loop = _load()
+    sha = {"42": "aaa", "43": "bbb", "44": "ccc"}
+    assert loop._match_confirmed_seed("bbb", sha) == ("43", [])
+    seed, issues = loop._match_confirmed_seed("zzz", sha)
+    assert seed is None and "not among this round's candidate checkpoints" in issues[0]
+    seed, issues = loop._match_confirmed_seed("", sha)
+    assert seed is None and "no model_sha16" in issues[0], issues
+
+
+def test_the_confirm_program_seals_confirms_and_consumes(tmp_path):
+    """端到端：封存 -> 唯一允许的读者评估一次 -> 再确认被拒（方案 §7）。
+
+    最终确认程序是**唯一**能读最终集的入口：搜索器读到封存目录会拒训
+    （另有测试），这里钉住确认程序自己：访问放行才评估、写绑定记录、
+    第二次确认被拒（失败也消费）。
+    """
+    import torch
+    from beamng_autopilot.vision.segmentation import SegUNet
+    loop = _load()          # 只为加载 scripts/ 到 sys.path
+    d = _frames(tmp_path, "final_scene")           # npz + meta（带身份）
+    frames = sorted(d.glob("frame_*.npz"))
+    assert len(frames) == 3
+    ckpt = tmp_path / "cand.pt"
+    torch.save({"state_dict": SegUNet(width=1.0).state_dict(),
+                "train_args": {"arch_args": {"width": 1.0}}}, ckpt)
+    seal_dir = tmp_path / "seal"
+    argv = [sys.executable, str(ROOT / "scripts" / "m5_final_set.py"),
+            "seal", "--name", "f1", "--dataset-id", "ds1", "--out", str(seal_dir)]
+    for f in frames:
+        argv += ["--frame", str(f)]
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0, r.stdout + r.stderr
+    rec_path = tmp_path / "confirmation.json"
+    r = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "m5_final_set.py"), "confirm",
+         "--out", str(seal_dir), "--dataset", str(d), "--candidate-id", "cand-A",
+         "--model", str(ckpt), "--record", str(rec_path), "--device", "cpu"],
+        capture_output=True, text=True, timeout=600)
+    assert r.returncode == 0, r.stdout + r.stderr
+    rec = json.loads(rec_path.read_text(encoding="utf-8"))
+    assert rec["kind"] == "final_confirmation" and rec["candidate_id"] == "cand-A"
+    assert rec["protocol_hash"] and rec["seal_digest"] and rec["model_sha16"]
+    assert rec["results"]["overall"]["n_frames"] == 3, rec["results"]
+    assert rec["notes"], "没测的口径必须写明（不能拿一部分口径冒充整套）"
+    # 第二次确认：已被消费 -> 拒绝，且不评估（rc=3）
+    r2 = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "m5_final_set.py"), "confirm",
+         "--out", str(seal_dir), "--dataset", str(d), "--candidate-id", "cand-A",
+         "--model", str(ckpt), "--device", "cpu"],
+        capture_output=True, text=True, timeout=300)
+    assert r2.returncode == 3, r2.stdout + r2.stderr
+    assert "already consumed" in r2.stdout, r2.stdout
+
+
+def test_a_final_confirmation_that_does_not_match_is_rejected(tmp_path):
+    """确认记录对不上 = 输入不一致 -> rejected（方案 §10.3 第一条）。
+
+    反例：拿另一个候选/另一套权重的确认来给本轮候选背书。没有记录则只记
+    R2 未确认（研究结论不受影响），两者不能混成一个通道。
+    """
+    loop = _load()
+    a = _frames(tmp_path, "coll_fc")
+    b = _frames(tmp_path, "coll_fc_b")
+    dev = _frames(tmp_path, "coll_fc_dev")
+    stub = ROOT / "tests" / "_stub_trainer_e2e.py"
+    p = _proposal(tmp_path, {"add_runs": [str(b)]})
+    rec = tmp_path / "bogus_confirmation.json"
+    rec.write_text(json.dumps({
+        "kind": "final_confirmation",
+        "protocol_hash": loop.snapshot_hash(loop.protocol_blob(
+            thresholds=loop.Thresholds().__dict__)),
+        "candidate_id": "some-other-candidate", "model_sha16": "deadbeef",
+        "seal_digest": "x"}), encoding="utf-8")
+    _run(["rounds", "--run-id", "rw_fc", "--rounds", "1", "--runs", str(a),
+          "--eval-runs", str(dev), "--allow-road-only", "--proposals", str(p),
+          "--seeds", "42", "--epochs", "24", "--device", "cpu",
+          "--trainer-script", str(stub), "--final-confirm", str(rec)],
+         tmp_path, expect=0)
+    blob = json.loads(sorted((tmp_path / "logs" / "experiments" / "rw_fc"
+                             ).glob("decision_*.json"))[0].read_text(
+                                 encoding="utf-8"))
+    conf = blob["final_confirmation"]
+    assert conf["status"] == "mismatch", conf
+    assert any("candidate" in i or "weights" in i for i in conf["issues"]), conf
+    assert blob["r2_confirmed"] is False
+    assert blob["decision"]["decision"] == "rejected", blob["decision"]
+
+
+def test_evaluate_also_downgrades_a_research_source(tmp_path):
+    """直接调 evaluate 也不能旁路：同一条资格规则（G03）。"""
+    loop = _load()
+    a = _agent_dir(tmp_path, "coll_e")
+    pairings = tmp_path / "pairings.json"
+    pairings.write_text(json.dumps({"line_iou": {
+        "champion": [0.10, 0.11, 0.12],
+        "candidate": [0.30, 0.31, 0.32]}}), encoding="utf-8")
+    gate = tmp_path / "gate.json"
+    gate.write_text(json.dumps({}), encoding="utf-8")
+    r = _run(["evaluate", "--run-id", "rw_ev",
+              "--candidate-id", "cand", "--pairings", str(pairings),
+              "--hard-gate", str(gate),
+              "--paint-source", f"{a}=agent_revision"],
+             tmp_path, expect=1)   # 不可晋级的判定 rc=1
+    d = tmp_path / "logs" / "experiments" / "rw_ev"
+    blob = json.loads(sorted(d.glob("decision_*.json"))[0].read_text(
+        encoding="utf-8"))
+    assert blob["research_only"] is True, blob.get("decision")
+    # 同时作为 G05 的反例：**只有 line_iou 改善**（任务主指标缺失）不能进入影子
+    # 候选，判定必须是 rejected（而不是被研究臂降级成的 needs_evidence）。
+    assert blob["decision"]["decision"] == "rejected", blob["decision"]
+    reasons = " ".join(blob["decision"]["reasons"])
+    assert "line_iou" in reasons, blob["decision"]["reasons"]
+
+
+def test_a_promotion_needs_a_task_metric_improvement_not_just_iou():
+    """G05 的三个关键判定例（方案 §10.3）。
+
+    实测缺口：`rounds` 只把 IoU 送进判定器，而判定要求**任务主指标**
+    有可信改善——于是任何候选都晋不了级（IoU 在判定里只是辅助指标）。
+    现在逐 seed 采集任务主指标并按 seed 成对。三个例子：
+
+    * 任务主指标可信改善 + 硬门全过 → ``shadow_candidate``；
+    * **IoU 改善但任务主指标变差** → ``rejected``（IoU 不能覆盖）；
+    * 任务指标缺测 → ``needs_evidence``（不当通过）。
+    """
+    loop = _load()
+    seeds = [42, 43, 44, 45, 46]
+    t = loop.Thresholds()
+
+    def _arm(base, jitter):
+        out = {}
+        for i, s in enumerate(seeds):
+            out[str(s)] = {k: v + jitter * (i - 2) * 0.001
+                           for k, v in base.items()}
+        return out
+
+    champ_base = {"candidate_identity_rate": 0.62, "line_recall": 0.72,
+                  "line_precision": 0.42, "offroad_false_line_px": 1000.0,
+                  "inference_ms_p95": 20.0}
+    # 情况 1：主指标全面变好
+    cand_good = {"candidate_identity_rate": 0.85, "line_recall": 0.88,
+                 "line_precision": 0.58, "offroad_false_line_px": 600.0,
+                 "inference_ms_p95": 16.0}
+    iou_up = loop.paired_compare("line_iou", [0.20] * 5, [0.30] * 5)
+    paired = loop.task_pairings(_arm(champ_base, 1.0), _arm(cand_good, 1.0),
+                                seeds, extra={"line_iou": iou_up})
+    for name in loop.TASK_METRICS:
+        assert name in paired, f"{name} 必须进成对比较"
+    assert paired["candidate_identity_rate"]["verdict"] == "candidate_better"
+    dec = loop.decide(pairings=paired, thresholds=t, missing_metrics=[],
+                      hard_gate_violations=[])
+    assert dec["decision"] == "shadow_candidate", dec
+
+    # 情况 2：IoU 改善、但主指标变差 -> rejected
+    cand_bad = {"candidate_identity_rate": 0.55, "line_recall": 0.60,
+                "line_precision": 0.35, "offroad_false_line_px": 1500.0,
+                "inference_ms_p95": 25.0}
+    paired2 = loop.task_pairings(_arm(champ_base, 1.0), _arm(cand_bad, 1.0),
+                                 seeds, extra={"line_iou": iou_up})
+    dec2 = loop.decide(pairings=paired2, thresholds=t, missing_metrics=[],
+                       hard_gate_violations=[])
+    assert dec2["decision"] == "rejected", dec2
+    assert any("line_recall" in r or "candidate_identity_rate" in r
+               for r in dec2["reasons"]), dec2["reasons"]
+
+    # 情况 3：任务指标测不到（缺测）-> needs_evidence，不当通过
+    empty = {str(s): {} for s in seeds}
+    paired3 = loop.task_pairings(empty, empty, seeds,
+                                 extra={"line_iou": iou_up})
+    assert paired3["line_recall"]["n"] == 0
+    dec3 = loop.decide(pairings=paired3, thresholds=t, missing_metrics=[],
+                       hard_gate_violations=[])
+    assert dec3["decision"] == "needs_evidence", dec3
+
+
+def test_seed_hard_covers_every_hard_check():
+    """接线漂移守卫：逐 seed 度量必须覆盖硬门表里的每一项。
+
+    实测缺口（G05）：判定要的指标没接线，于是任何候选都晋不了级；这类漂移
+    不会报错，只会永远给不出通过——所以用测试钉住键的对齐。
+    """
+    loop = _load()
+    got = loop._seed_hard({"line_recall": 0.5, "line_precision": 0.4,
+                           "offroad_false_frac_of_pred": 0.1},
+                          {"candidate_identity_rate": 0.7}, 18.0)
+    assert set(got) == {n for n, _l, _b in loop.HARD_CHECKS}, got
+    assert got["inference_ms_p95"] == 18.0
+    # 缺测写 None，不写 0（UNKNOWN ≠ 0）
+    assert loop._seed_hard({}, None, None)["line_recall"] is None
+
+
+def test_a_running_game_or_an_unknown_probe_blocks_the_timing():
+    """G06：游戏在跑、或探测失败（UNKNOWN）时，独占计时的前提不成立。
+
+    两种情况都必须返回原因（进判定文件的 timing_suspect，硬门 p95 记 None）；
+    只有"确认没有游戏"才允许引用本轮延迟。
+    """
+    loop = _load()
+    assert loop.timing_precondition(False) is None
+    running = loop.timing_precondition(True)
+    assert running and "game process is running" in running, running
+    unknown = loop.timing_precondition(None)
+    assert unknown and "UNKNOWN" in unknown, unknown
+
+
+def _located_frames(tmp_path: Path, name: str, *, source_id: str,
+                    pos, n: int = 3) -> Path:
+    """带地图身份与逐帧位姿的小数据目录（空间隔离要用）。"""
+    base = 10 + (sum(map(ord, name)) % 120)
+    d = tmp_path / "located" / name / "front_main"
+    d.mkdir(parents=True, exist_ok=True)
+    frames = []
+    for i in range(n):
+        colour = np.full((30, 40, 3), base + i * 5, np.uint8)
+        label = np.zeros((30, 40), np.uint8)
+        label[6:26, :] = 1
+        np.savez(d / f"frame_{i:05d}.npz", colour=colour, label=label)
+        frames.append({"path": f"front_main/frame_{i:05d}.npz",
+                       "view": "front_main", "exposure": i,
+                       "pos": [float(pos[0]) + i * 2.0, float(pos[1]), 0.0],
+                       "heading": 0.0})
+    (d.parent / "meta.json").write_text(json.dumps({
+        "map_name": "italy", "map_name_source": "test",
+        "source_id": source_id, "roles": {"front_main": n},
+        "frames": frames}, ensure_ascii=False), encoding="utf-8")
+    return d
+
+
+def test_the_audit_refuses_a_same_place_recollection(tmp_path):
+    """W2 反例：不同 source_id 但**同一地点**的采集不能绕过隔离。
+
+    实测依据：`diverse_straightstreet` 与 `ident_probe_straight` 首帧相距 **0 m**，
+    source_id 不同——整组隔离的字面实现会放过这种泄漏。
+    """
+    loop = _load()
+    train = _located_frames(tmp_path, "coll_p", source_id="ring_p",
+                           pos=(700.0, 700.0))
+    dev = _located_frames(tmp_path, "coll_q", source_id="ring_q",
+                          pos=(720.0, 700.0))     # 相距 20 m < 50 m 缓冲
+    # 因子必须**真能生效**（否则先被 factor_not_applied 拦下，测不到空间闸门）：
+    # 用训练器开关型因子，只改配方不改数据。
+    p = _proposal(tmp_path, {"line_tversky_weight": 2.0})
+    r = _run(["rounds", "--run-id", "rw_spatial", "--rounds", "1",
+              "--runs", str(train), "--eval-runs", str(dev),
+              "--allow-road-only", "--proposals", str(p),
+              "--seeds", "42", "--plan-only"], tmp_path, expect=0)
+    assert r.returncode == 0
+    # plan-only 不过审计，所以直接跑审计路径：用真的 rounds
+    r2 = _run(["rounds", "--run-id", "rw_spatial2", "--rounds", "1",
+               "--runs", str(train), "--eval-runs", str(dev),
+               "--allow-road-only", "--proposals", str(p),
+               "--seeds", "42", "--epochs", "24", "--device", "cpu",
+               "--trainer-script", str(ROOT / "tests" / "_stub_trainer_e2e.py")],
+              tmp_path, expect=3)
+    assert "空间隔离违规" in r2.stdout, r2.stdout[-600:]
+    d = tmp_path / "logs" / "experiments" / "rw_spatial2"
+    rep = json.loads((d / "rounds_dataset.json").read_text(encoding="utf-8"))
+    sp = rep.get("spatial") or {}
+    assert sp.get("violations") and sp["violations"][0]["why"] == "within_buffer"
+    # 帧内步距 2 m：最近的一对是 coll_p 的末帧(+4 m) 与 coll_q 的首帧(+0 m)
+    assert sp["min_distance_m"] == 16.0, sp
+    assert sp["buffer_m"] == 50.0
+    assert not (d / "round0").exists(), "拒绝后不得训练"
+
+
+
+
+
+def test_a_sealed_final_set_may_not_be_read_by_the_loop(tmp_path):
+
+    """最终集只允许确认程序读（方案 §7/§10.3）。
+
+
+
+    搜索/训练入口读到带封存文件的目录必须**拒训**（否则"独立最终集"就只是一句话）。
+
+    """
+
+    loop = _load()
+
+    train = _frames(tmp_path, "coll_final")
+
+    dev = _frames(tmp_path, "coll_dev_final")
+
+    (train / "final_set_seal.json").write_text(json.dumps({
+
+        "name": "f", "digest": "x", "protocol_hash": "p"}),
+
+        encoding="utf-8")
+
+    p = _proposal(tmp_path, {"line_tversky_weight": 2.0})
+
+    r = _run(["rounds", "--run-id", "rw_final", "--rounds", "1",
+
+              "--runs", str(train), "--eval-runs", str(dev),
+
+              "--allow-road-only", "--proposals", str(p),
+
+              "--seeds", "42", "--plan-only"], tmp_path, expect=0)
+
+    assert r.returncode == 0
+
+    r2 = _run(["rounds", "--run-id", "rw_final2", "--rounds", "1",
+
+               "--runs", str(train), "--eval-runs", str(dev),
+
+               "--allow-road-only", "--proposals", str(p),
+
+               "--seeds", "42", "--epochs", "24", "--device", "cpu",
+
+               "--trainer-script", str(ROOT / "tests" / "_stub_trainer_e2e.py")],
+
+              tmp_path, expect=3)
+
+    assert "最终集" in r2.stdout, r2.stdout[-500:]
+
+    d = tmp_path / "logs" / "experiments" / "rw_final2"
+
+    assert not (d / "round0").exists(), "拒绝后不得训练"
+
+
+
+
+
+def test_identity_metrics_report_coverage_and_roles(tmp_path):
+
+    """G09：候选匹配要**分口径报**（冻结匹配率 / 带参考匹配率 /
+
+
+
+    可测候选覆盖率 / 左右角色一致率）——旧口径的分母里混着
+
+    "该侧没有参考"的候选（实测约 38%），那些应记 UNKNOWN。
+
+    """
+
+    loop = _load()
+
+    d = _located_frames(tmp_path, "coll_id", source_id="ring_i",
+
+                        pos=(900.0, 900.0))
+
+
+
+    def fake(run, meta, *, view, model_path):
+
+        return {"summary": {"match_rate": 0.15,
+
+                            "match_rate_with_reference": 0.28,
+
+                            "role_agreement_rate": 0.42,
+
+                            "candidate_paint_recall": 0.31,
+
+                            "n_candidates": 100,
+
+                            "n_candidates_with_reference": 62}}
+
+
+
+    got = loop.identity_metrics(Path("ck.pt"), [str(d)], probe_fn=fake)
+
+    assert got["candidate_identity_rate"] == 0.15, got
+
+    assert got["candidate_identity_rate_with_reference"] == 0.28
+
+    assert got["candidate_reference_coverage"] == 0.62, got
+
+    assert got["left_right_role_agreement"] == 0.42
+
+    assert got["n_candidates"] == 100.0
+
+    # 测不到（没有 meta / 没有帧）就是 None，不写 0
+
+    got2 = loop.identity_metrics(Path("ck.pt"),
+
+                                 [str(tmp_path / "nope")], probe_fn=fake)
+
+    assert got2["candidate_identity_rate"] is None
+
+    assert got2["candidate_reference_coverage"] is None
+
+    # 覆盖率门槛尚未标定：阻止相应晋级（方案 §10.2）
+
+    assert loop.COVERAGE_GATE_FROZEN is False
+
+    # 逐场景明细必须真的有：调用方读 per_group 时静默拿到空字典，会看起来像
+
+    # "这个场景没有候选"，实际是没接线（实测踩到）
+
+    assert set(got["per_group"]) == {"italy/ring_i"}, got.get("per_group")
+
+    assert got["per_group"]["italy/ring_i"]["candidate_identity_rate"] == 0.15
+
+    assert got2["per_group"] == {}
+

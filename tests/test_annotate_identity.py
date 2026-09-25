@@ -243,3 +243,66 @@ def test_inplace_resume_paths_kept(tmp_path):
     assert set(resume_paths) == {0, 1}
     assert resume_paths[0][0].name == "frame_00000.npz"
     assert resume_paths[0][1].name == "preview_00000.png"
+
+
+# ------------------------------------------------- 遮挡/模糊/无法判断 + 左右侧
+
+def test_unknown_kinds_are_recorded_with_a_reason():
+    """label 只有 0/1/2/255：看不清的区域要能说明**为什么**（方案第 1 项）。
+
+    实测必要性：审计只看得到"这里被忽略"，看不到"是遮挡、模糊还是无法判断"，
+    补标的人无法复核。
+    """
+    import numpy as np
+    assert ann.unknown_kind_for_key("4") == 1
+    assert ann.unknown_kind_for_key("5") == 2
+    assert ann.unknown_kind_for_key("6") == 3
+    assert ann.unknown_kind_for_key("1") is None
+    assert sorted(ann.UNKNOWN_KINDS.values()) == ["blurred", "occluded",
+                                                  "undecidable"]
+    k = np.zeros((4, 4), np.uint8)
+    k[0, 0] = 1
+    k[1, :2] = 2
+    k[2, 0] = 3
+    assert ann.unknown_counts(k) == {"occluded": 1, "blurred": 2,
+                                     "undecidable": 1}
+    assert ann.unknown_counts(None) == {"occluded": 0, "blurred": 0,
+                                        "undecidable": 0}
+    # 非空时才写进 npz；空的时候不引入新键（既有消费者不变）
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        fp = Path(td) / "f.npz"
+        ann.export_frame(fp, np.zeros((4, 4, 3), np.uint8),
+                         np.zeros((4, 4), np.uint8), {}, unknown_kind=k)
+        with np.load(fp) as z:
+            assert "unknown_kind" in z.files
+            assert int(z["unknown_kind"].max()) == 3
+        fp2 = Path(td) / "g.npz"
+        ann.export_frame(fp2, np.zeros((4, 4, 3), np.uint8),
+                         np.zeros((4, 4), np.uint8), {})
+        with np.load(fp2) as z:
+            assert "unknown_kind" not in z.files
+
+
+def test_side_coverage_lists_both_sides_and_warns_on_a_gap():
+    """左右两侧都要可核查：单侧为 0 而引擎那一侧有线 → 明确提示。"""
+    import numpy as np
+    human = np.zeros((6, 10), np.uint8)
+    human[2, 1] = ann.CLS_LINE                     # 只标了左侧
+    engine = np.zeros((6, 10), np.uint8)
+    engine[2, 1] = ann.CLS_LINE                    # 引擎左侧
+    engine[2, 8] = ann.CLS_LINE                    # 引擎右侧（人工漏了）
+    note = ann.side_coverage_note(human, engine)
+    assert note["human"] == {"left": 1, "right": 0}
+    assert note["engine"] == {"left": 1, "right": 1}
+    assert any("right" in w and "漏标" in w for w in note["warnings"])
+    # 两侧都标了：没有警告
+    human[2, 8] = ann.CLS_LINE
+    assert ann.side_coverage_note(human, engine)["warnings"] == []
+    # 人工新增（引擎没有）：保留并按独立真值说明，不静默
+    human2 = np.zeros((6, 10), np.uint8)
+    human2[3, 1] = ann.CLS_LINE
+    human2[3, 8] = ann.CLS_LINE
+    note2 = ann.side_coverage_note(human2, np.zeros((6, 10), np.uint8))
+    assert len(note2["warnings"]) == 2
+    assert all("引擎为 0" in w for w in note2["warnings"])

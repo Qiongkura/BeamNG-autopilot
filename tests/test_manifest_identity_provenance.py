@@ -16,7 +16,9 @@ import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 
-from beamng_autopilot.experiments.manifest import DatasetManifest  # noqa: E402
+from beamng_autopilot.experiments.manifest import (  # noqa: E402
+    DatasetManifest, dir_group,
+)
 
 
 def _collection(tmp_path: Path, *, with_provenance: bool) -> Path:
@@ -52,3 +54,26 @@ def test_provenance_present_is_not_flagged(tmp_path):
     view = _collection(tmp_path, with_provenance=True)
     mf = DatasetManifest.build([view], root=ROOT)
     assert not [n for n in mf.notes if "no provenance" in n]
+
+
+def test_dir_group_reads_identity_and_never_guesses_from_the_name(tmp_path):
+    """场景/组键与 manifest 同一定义：`map/source_id`，缺身份不猜地图（W2）。
+
+    为什么要有独立测试：分场景硬门、空间隔离和数据清单必须指同一个"场景"，
+    否则"这个场景过没过门"会随入口而变；而按目录名猜地图会把
+    `coll_ring1` 当成地图名，污染分组。
+    """
+    d = tmp_path / "coll_a" / "front_main"
+    d.mkdir(parents=True)
+    (d.parent / "meta.json").write_text(json.dumps(
+        {"map_name": "italy", "source_id": "ring_a"}), encoding="utf-8")
+    assert dir_group(d) == "italy/ring_a", "身份在父目录也要读到"
+    # 没有 meta：不猜地图，也**不按目录名兜底**（两个采集的 front_main 同名，
+    # 按名字当键会把它们合成一个场景）——用完整路径保证不合并
+    e = tmp_path / "no_meta" / "front_main"
+    e.mkdir(parents=True)
+    g = dir_group(e)
+    assert g.startswith("dir/") and "front_main" in g and "no_meta" in g, g
+    f = tmp_path / "other" / "front_main"
+    f.mkdir(parents=True)
+    assert dir_group(f) != g, "同名视角目录绝不合并成一个场景"

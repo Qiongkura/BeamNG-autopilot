@@ -303,8 +303,15 @@ def _write_tasks(dirpath: Path) -> Path:
 
 
 def _render(tmp_path: Path, *args: str, out_name: str = "dash.html") -> str:
+    """默认用**文档视图**渲染（这些用例测的是 10 个分区的内容）。
+
+    看板的默认视图是 compact（一页总览）；想测它对每个用例单独调用
+    `dash.main(["render", ...])` 即可。
+    """
     out = tmp_path / out_name
     argv = ["render", "--out", str(out), *args]
+    if "--view" not in argv:
+        argv += ["--view", "full"]
     assert dash.main(argv) == 0
     return out.read_text(encoding="utf-8")
 
@@ -601,6 +608,11 @@ def test_watch_once_renders_and_exits(tmp_path):
     assert dash.main(["watch", "--events", str(log.path), "--out", str(out),
                       "--every", "1", "--once"]) == 0
     assert out.exists()
+    # 默认视图是监控页那样的卡片网格；--view full 才是 10 分区文档视图
+    text = out.read_text(encoding="utf-8")
+    assert 'class="card' in text and "<main>" in text
+    assert dash.main(["watch", "--events", str(log.path), "--out", str(out),
+                      "--every", "1", "--once", "--view", "full"]) == 0
     assert "运行总览" in out.read_text(encoding="utf-8")
 
 
@@ -654,7 +666,8 @@ def test_run_dir_merges_event_streams_and_decisions(tmp_path):
         "out": str(tmp_path / "d.html"), "run_dir": str(run),
         "events": None, "manifest": None, "eval": None, "ident": None,
         "t13_import": None, "probes": None, "tasks": None,
-        "champion": "baseline", "pack": None, "decisions": None})())
+        "champion": "baseline", "pack": None, "decisions": None,
+        "view": "full"})())
     html = dash.render_html(ctx)
     assert "判定与成对比较" in html
     assert "road_iou" in html and "0.0733" in html
@@ -662,3 +675,271 @@ def test_run_dir_merges_event_streams_and_decisions(tmp_path):
     assert "inconclusive" in html and "rejected" in html and "cand-r0" in html
     # 外部资源禁令在看板上仍然成立
     assert "http://" not in html and "https://" not in html
+
+
+def test_dl_params_section_reads_checkpoint_and_metrics(tmp_path):
+    """训练超参与训练动力学：看板要能读出迭代深度学习的关键参数。
+
+    新 checkpoint（有 train_args 的完整超参）→ 显示；老 checkpoint（缺字段）→ 未测；
+    逐 step 指标在 → 显示 lr 轨迹/梯度范数/吞吐。实测依据：没有这几项，别人复现时
+    "同样的 lr" 可能指完全不同的 LR 计划（T_max 跟着 --epochs 走）。
+    """
+    import torch
+
+    from beamng_autopilot.vision.segmentation import SegUNet
+    run = tmp_path / "run"
+    (run / "round0" / "seed42").mkdir(parents=True)
+    ck = {"state_dict": SegUNet().state_dict(),
+          "dataset_id": "ds_test", "git_commit": "abcdef1234",
+          "env": {"device": "cuda-test", "torch": "9.9.9", "cuda": "1.2"},
+          "train_args": {
+              "arch": "SegUNet", "n_params": 834931, "input_size": [536, 403],
+              "batch": 4, "epochs": 12, "lr": 0.001,
+              "scheduler": {"name": "CosineAnnealingLR", "T_max": 12,
+                            "eta_min": 0.0, "step_per": "epoch"},
+              "optimizer": {"name": "Adam", "betas": [0.9, 0.999],
+                            "weight_decay": 0.0},
+              "class_weights": [0.71543, 1.0, 40.0],
+              "class_names": ["background", "asphalt", "line"],
+              "amp": True, "deterministic": False,
+              "steps_per_epoch": 5, "n_train": 20, "n_val": 5,
+              "ignore_line_class": True, "paint_source": "engine_annotation",
+              "line_ignored_frames": 60,
+          }}
+    torch.save(ck, run / "round0" / "seed42" / "checkpoint_last.pt")
+    # 老式 checkpoint：只有 epochs/batch/lr/seed
+    (run / "baseline" / "seed42").mkdir(parents=True)
+    torch.save({"state_dict": SegUNet().state_dict(),
+                "train_args": {"epochs": 3, "batch": 4, "lr": 0.001,
+                               "seed": 42}},
+               run / "baseline" / "seed42" / "checkpoint_last.pt")
+    # 逐 step 指标（训练动力学）
+    mrun = tmp_path / "run-metrics-s42"
+    mrun.mkdir()
+    recs = [{"kind": "task", "batch": 4, "epochs": 1, "seed": 42,
+             "total_steps": 1, "lr": 0.001}]
+    recs += [{"kind": "train", "step": i, "epoch": 0, "lr": 1e-3 - i * 2e-4,
+              "grad_norm": 1.0 + i, "step_s": 0.05 + i * 0.01}
+             for i in range(5)]
+    (mrun / "metrics.jsonl").write_text(
+        chr(10).join(json.dumps(r) for r in recs), encoding="utf-8")
+
+    ctx = dash.build_context(type("A", (), {
+        "out": str(tmp_path / "d.html"), "run_dir": str(run),
+        "events": None, "manifest": None, "eval": None, "ident": None,
+        "t13_import": None, "probes": None, "tasks": None,
+        "champion": "baseline", "pack": None, "decisions": None,
+        "view": "full"})())
+    html = dash.render_html(ctx)
+    assert "训练超参与训练动力学" in html
+    for needle in ("CosineAnnealingLR", "Adam", "[0.9, 0.999]", "834931",
+                   "[0.71543, 1.0, 40.0]", "line 通道屏蔽",
+                   "cuda-test", "ds_test", "abcdef12"):
+        assert needle in html, needle
+    # 0 / 0.0 是真实值，不能被当成缺测（实测踩到：eta_min=0.0、weight_decay=0.0
+    # 被 `or "未测"` 吃掉，等于把"余弦退火到 0"这个关键事实从看板上抹掉）
+    assert "eta_min=0.0" in html and "wd=0.0" in html
+    # 老 checkpoint 的缺失字段必须写"未测"，不能编
+    assert html.count("未测") >= 1
+    # 动力学位移：lr 首末与梯度范数
+    assert "0.001 → 0.0002" in html
+    assert "grad" in html and "steps/s" in html
+
+
+def test_compact_view_is_the_default_and_fits_one_page(tmp_path):
+    """默认视图是"一页总览"：表 + 迷你曲线 + 摘要，不做成长文档。
+
+    用户要求"像原来的监控一样只有表和一些信息然后全在一页"。钉住：默认含
+    "一页总览"与迷你曲线（inline svg），**不含**原 10 分区的长文档节；
+    `--view full` 才回到文档视图。
+    """
+    hists = _write_t13_hists(tmp_path / "hists")
+    log = EventLog(tmp_path / "run_c")
+    log.append(Event(run_id="run_c", candidate_id="c", dataset_id="d",
+                     config_hash="h", seed=42, phase="queued", status="ok"))
+    out = tmp_path / "c.html"
+    assert dash.main(["render", "--events", str(log.path),
+                      "--t13-import", str(hists), "--out", str(out)]) == 0
+    html = out.read_text(encoding="utf-8")
+    # 默认 = 监控页同款画面：header 状态栏 + 两列卡片网格；表也在卡片里
+    assert "<main>" in html and 'class="card' in html
+    assert "grid-template-columns: 1fr 1fr" in html, "两列卡片网格"
+    assert 'class="statusbar"' in html and 'class="item"' in html
+    assert "<svg" in html, "卡片里应有曲线"
+    for table_section in ("判定与成对比较", "训练超参与训练动力学",
+                          "数据与标签", "资源与闭环", "图像与可复核帧"):
+        assert table_section in html, table_section
+    assert "<figure>" not in html, "卡片页不铺 470×205 的大图（那是 full 视图）"
+    assert "<img" not in html, "卡片页不嵌探针大图"
+    assert dash.main(["render", "--events", str(log.path),
+                      "--t13-import", str(hists), "--out", str(out),
+                      "--view", "full"]) == 0
+    full = out.read_text(encoding="utf-8")
+    assert "<figure>" in full or "<img" in full, "full 视图才有大图/探针图"
+    assert len(full) > len(html), "full 视图更长（含曲线大图与逐帧细节）"
+
+
+
+def test_every_table_header_carries_its_meaning(tmp_path):
+    """用户要求「把每个参数的含义都写在它标题的后面」：表头必须带小字含义。
+
+    没有含义的表头等于让人猜「均值是哪个均值、首末是哪两轮」。这里钉住
+    **所有**表头都有含义（含「运行」这种行键列），新增表时忘写含义会红。
+    """
+    hists = _write_t13_hists(tmp_path / "hists")
+    out = tmp_path / "m.html"
+    assert dash.main(["render", "--t13-import", str(hists), "--out",
+                      str(out), "--all-runs"]) == 0
+    html = out.read_text(encoding="utf-8")
+    ths = re.findall(r"<th>(.*?)</th>", html, re.S)
+    assert len(ths) >= 20, f"表头太少，渲染不完整：{len(ths)}"
+    missing = [re.sub(r"<[^>]+>", "", t)[:40] for t in ths
+               if "font-weight:400" not in t]
+    assert not missing, f"这些表头没写含义：{missing}"
+
+
+def test_collect_table_keeps_the_three_states_apart(tmp_path):
+    """无人值守采集表：身份、漆线帧、复核队列、GPU 分钟都要看得见。
+
+    三态纪律：一个**帧都没有**的采集，漆线帧不能写 0（那是未测）；
+    有帧但确实没有漆线像素才是 0。拒收的采集也要留在表里（附原因）。
+    """
+    runs = tmp_path / "experiments"
+    run = runs / "auto_run"
+    run.mkdir(parents=True)
+    ok_rec = {"ok": True, "rc": 0, "stamp": "20260925_121718",
+              "map_name": "italy",
+              "map_name_source": "session.get_current().level",
+              "source_id": "ring_20260925_121722",
+              "roles": {"front_main": 30, "pillar_left": 30},
+              "frames_total": 60,
+              "paint_frames_by_role": {"front_main": 30, "pillar_left": 28},
+              "gpu_minutes": 1.57, "review_queue": "",
+              "collector_python": "X:/proj/.venv/Scripts/python.exe",
+              "collector_python_source": "project-venv"}
+    bad_rec = {"ok": False, "rc": 7, "stamp": "20260925_120849",
+               "roles": {}, "frames_total": 0, "paint_frames_by_role": {},
+               "gpu_minutes": 0.0,
+               "reasons": ["meta 里 map_name 为空"]}
+    (run / "collect_20260925_121718.json").write_text(
+        json.dumps(ok_rec, ensure_ascii=False), encoding="utf-8")
+    (run / "collect_20260925_120849.json").write_text(
+        json.dumps(bad_rec, ensure_ascii=False), encoding="utf-8")
+    out = tmp_path / "c.html"
+    assert dash.main(["render", "--all-runs", "--runs-root", str(runs),
+                      "--out", str(out)]) == 0
+    html = out.read_text(encoding="utf-8")
+    assert "无人值守采集" in html
+    assert "italy" in html and "ring_20260925_121722" in html
+    assert "front_main:30" in html, "各视角帧数要看得见"
+    assert "project-venv" in html, "采集解释器要看得见（没有 beamngpy 会白起一局）"
+    assert "1.57" in html, "采集的 GPU 分钟要看得见"
+    assert "拒收" in html and "meta 里 map_name 为空" in html
+    assert "未测（一个帧都没有，不是 0）" in html, (
+        "没有帧的采集：漆线帧是未测，不能写 0")
+
+
+
+def test_params_table_reads_the_newest_checkpoints(tmp_path, monkeypatch):
+    """超参表要读**最新**的 checkpoint，不按目录名字母序。
+
+    实测踩到：按字母序时 `t14_3h_*` 这类老 run 占满名额（它们缺 arch/scheduler/
+    optimizer 字段），字段最全的新 run 一个都没读到，整张超参表看起来全是"未测"。
+    """
+    import os
+    import time
+
+    import torch
+
+    from beamng_autopilot.vision.segmentation import SegUNet
+
+    runs = tmp_path / "experiments"
+    old = runs / "aaa_old" / "round0" / "seed42"
+    new = runs / "zzz_new" / "round0" / "seed42"
+    old.mkdir(parents=True)
+    new.mkdir(parents=True)
+    torch.save({"state_dict": SegUNet().state_dict(),
+                "train_args": {"epochs": 3, "batch": 4, "lr": 0.001}},
+               old / "checkpoint_last.pt")
+    torch.save({"state_dict": SegUNet().state_dict(),
+                "train_args": {"arch": "SegUNet", "n_params": 834931,
+                               "epochs": 48, "batch": 4, "lr": 0.001,
+                               "scheduler": {"name": "CosineAnnealingLR",
+                                             "T_max": 48, "eta_min": 0.0},
+                               "optimizer": {"name": "Adam",
+                                             "betas": [0.9, 0.999],
+                                             "weight_decay": 0.0}}},
+               new / "checkpoint_last.pt")
+    # 默认视图只保留"真产出过结论"的 run（有判定或逐 step 指标）：这两个假 run
+    # 只给 checkpoint 会被跳过，超参表就不渲染了
+    for rd in (old, new):
+        (rd.parent.parent / "metrics.jsonl").write_text(
+            json.dumps({"kind": "task", "run_id": "x", "status": "done"}) + chr(10),
+            encoding="utf-8")
+    past = time.time() - 3600
+    os.utime(old / "checkpoint_last.pt", (past, past))
+    monkeypatch.setattr(dash, "ALL_MAX_CKPTS", 1)
+    out = tmp_path / "p.html"
+    assert dash.main(["render", "--all-runs", "--runs-root", str(runs),
+                      "--out", str(out)]) == 0
+    html = out.read_text(encoding="utf-8")
+    section = re.search(r"所有训练超参.*?</table>", html, re.S).group(0)
+    assert "zzz_new" in section, "最新 checkpoint 必须在超参表里"
+    assert "aaa_old" not in section, "名额被老 run 占满就是那个缺陷"
+    assert "834931" in section and "T_max=48" in section.replace(" ", "")
+
+
+def test_the_resource_guard_view_shows_an_unconnected_signal_as_unmeasured(
+        tmp_path):
+    """W6/§8.2：看板必须显示"未接入"，不能把缺失的活动信号画成"用户不在"。"""
+    mod = dash          # 本文件已 import 过，直接用（别再加载第二份模块）
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "resource_state.json").write_text(json.dumps({
+        "ts": "2026-09-25T10:00:00", "user_active": None, "user_idle_s": None,
+        "user_activity_source": "not connected",
+        "wall_minutes": 12.5, "max_wall_minutes": 180.0, "allowed": True,
+        "reasons": [], "warnings": ["user activity signal 未接入"]}),
+        encoding="utf-8")
+    html = mod._guard_view({"guard": mod._guard_state(run)})
+    assert "未接入" in html and "随用随停" in html, html
+    assert "12.5 min" in html and "180 min" in html, html
+    # 测到"用户在动"时显示状态值，而不是"未接入"
+    (run / "resource_state.json").write_text(json.dumps({
+        "ts": "2026-09-25T10:01:00", "user_active": True, "user_idle_s": 3.0,
+        "user_activity_source": "GetLastInputInfo (keyboard/mouse idle)",
+        "wall_minutes": 13.0, "max_wall_minutes": 180.0, "allowed": False,
+        "reasons": ["user is using the machine: paused by configuration"],
+        "warnings": []}), encoding="utf-8")
+    html2 = mod._guard_view({"guard": mod._guard_state(run)})
+    assert "未接入" not in html2, html2
+    assert "3.0 s" in html2 and "user is using the machine" in html2, html2
+    # 没有观测文件时是"未测"，不是 0
+    html3 = mod._guard_view({"guard": mod._guard_state(tmp_path / "nope")})
+    assert "不可读" in html3 or "未测" in html3, html3
+
+
+def test_generated_frames_are_not_shown_as_human_truth(tmp_path):
+    """§6.3 验收：四个计数分别可查，**生成帧 ≠ 人工确认帧**。
+
+    最容易犯的过度声明是把"生成了 640 帧标签"写成"640 帧人工真值"。这里钉住
+    看板把生成帧与 verified 档分开计数，且没测到的评价帧数写"未测"。
+    """
+    recs = []
+    for i in range(5):
+        recs.append({"path": f"f{i}.npz", "view": "front_main", "split": "train",
+                     "quality": {"paint": {"rank": "agent"}}})
+    for i in range(2):
+        recs.append({"path": f"h{i}.npz", "view": "pillar_left", "split": "dev",
+                     "quality": {"paint": {"rank": "verified"}}})
+    html = dash._label_source_view(recs, {"eval": {"readable": False}})
+    assert "生成帧" in html and ">7<" in html, html
+    assert "人工确认帧" in html and ">2<" in html, html
+    assert "未测" in html, html
+    assert "agent 逐帧核对" in html, html
+    # 全部都是 verified 时不再提示"不要把生成帧当人工真值"
+    html2 = dash._label_source_view(
+        [{"path": "a.npz", "view": "front_main",
+          "quality": {"paint": {"rank": "verified"}}}],
+        {"eval": {"readable": False}})
+    assert "过度声明" not in html2, html2

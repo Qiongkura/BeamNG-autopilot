@@ -288,3 +288,88 @@ def test_run_weights_resample_without_changing_the_epoch_size() -> None:
                                               np.random.default_rng(0))
     assert note_eq["quota"] == [10, 10, 10] and len(idx_eq) == 30
     assert sorted(int(i) for i in idx_eq) == list(range(30))
+
+
+def test_the_width_flag_is_recorded_in_the_checkpoint(tmp_path) -> None:
+    """容量因子跑出来的 checkpoint 必须自证容量（看板/复现都读这一项）。
+
+    `arch_args.width` 记不上，别人看到的就是一个"普通的 SegUNet"，
+    参数量对不上也解释不了——容量对照的结论就无从复核。
+    """
+    import json as _json
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+    import numpy as np
+    import torch
+
+    root = Path(__file__).resolve().parents[1]
+    d = tmp_path / "runs" / "front_main"
+    d.mkdir(parents=True)
+    for i in range(4):
+        colour = np.full((16, 20, 3), 40 + i * 5, np.uint8)
+        label = np.zeros((16, 20), np.uint8)
+        label[4:12, :] = 1
+        np.savez(d / f"frame_{i:05d}.npz", colour=colour, label=label)
+    env = dict(os.environ)
+    env["BEAMNG_LOGS_DIR"] = str(tmp_path / "logs")
+    out = tmp_path / "out_wide"
+    r = subprocess.run(
+        [sys.executable, str(root / "scripts" / "m5_train_seg.py"),
+         "--runs", str(d), "--split", "tail", "--val-frac", "0.5",
+         "--epochs", "1", "--batch", "2", "--width", "2.0",
+         "--device", "cpu", "--out", str(out),
+         "--metrics-run", "pytest_width",
+         "--ignore-line-class", "--line-tversky-weight", "0",
+         "--line-cldice-weight", "0"],
+        capture_output=True, text=True, env=env, timeout=900)
+    assert r.returncode == 0, r.stdout[-800:] + r.stderr[-400:]
+    blob = torch.load(out / "checkpoint_last.pt", map_location="cpu",
+                      weights_only=True)
+    args = blob["train_args"]
+    assert args["arch_args"]["width"] == 2.0, args.get("arch_args")
+    assert args["n_params"] == 3331811, args["n_params"]
+    # best.pt 必须与 checkpoint_last.pt 一样**自证结构**：实测缺陷（2026-09-25）
+    # best.pt 过去只存 state_dict + 一小撮字段，缺 arch_args -> width=2 的臂
+    # 的 best.pt 根本装不进评估链（size mismatch），而评估口径复核正要用它
+    bblob = torch.load(out / "best.pt", map_location="cpu", weights_only=True)
+    bargs = bblob["train_args"]
+    assert bargs["arch_args"]["width"] == 2.0, bargs.get("arch_args")
+    assert bargs["n_params"] == 3331811
+    assert bblob.get("checkpoint_kind") == "best"
+    assert "val_miou" in bblob, "最优轮次的验证读数也要在"
+    # 默认宽度也照记（1.0 不能因为"是默认"就省略）
+    out1 = tmp_path / "out_narrow"
+    r1 = subprocess.run(
+        [sys.executable, str(root / "scripts" / "m5_train_seg.py"),
+         "--runs", str(d), "--split", "tail", "--val-frac", "0.5",
+         "--epochs", "1", "--batch", "2", "--device", "cpu",
+         "--out", str(out1), "--metrics-run", "pytest_width1"],
+        capture_output=True, text=True, env=env, timeout=900)
+    assert r1.returncode == 0, r1.stdout[-500:]
+    b1 = torch.load(out1 / "checkpoint_last.pt", map_location="cpu",
+                    weights_only=True)
+    assert b1["train_args"]["arch_args"]["width"] == 1.0
+    assert b1["train_args"]["n_params"] == 834931
+
+
+def test_every_paint_source_in_the_rank_table_is_accepted():
+    """训练器的 --paint-source 取值必须跟随 PAINT_SOURCE_RANK（单一事实来源）。
+
+    实测踩到：硬编码的 choices 漏了新来源 `agent_revision`，整轮训练
+    直接以 argparse 报错告终（而且是在基线臂里才发现，白跑一次）。
+    """
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    from beamng_autopilot.experiments.labels import PAINT_SOURCE_RANK
+
+    root = Path(__file__).resolve().parents[1]
+    r = subprocess.run([sys.executable, str(root / "scripts" /
+                                           "m5_train_seg.py"), "--help"],
+                       capture_output=True, text=True, timeout=300)
+    assert r.returncode == 0
+    for name in PAINT_SOURCE_RANK:
+        assert f"{name}" in r.stdout, f"{name} 不在 --paint-source 的取值里"
