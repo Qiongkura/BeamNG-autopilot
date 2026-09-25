@@ -193,8 +193,9 @@ def main(argv=None) -> int:
         n_groups = len({f["group"] for f in pool}) or 1
         return max(2, -(-int(n) // n_groups))
 
-    def _sel(cat: str, n: int, *, for_plan: bool = False) -> list:
-        pool = pools[cat]
+    def _sel(cat: str, n: int, *, for_plan: bool = False,
+             pool: list | None = None) -> list:
+        pool = pools[cat] if pool is None else pool
         mpg = _max_per_group(pool, n) if for_plan else 2
         if cat == "clear_paint":
             return _pick(pool, n, key=lambda f: f.get("line_pixels"),
@@ -216,6 +217,46 @@ def main(argv=None) -> int:
 
     starter: list = []
     plan: dict = {}
+    # 跨类别去重：同一次采集（同 group）的**同一帧**可能被两个类别都选中
+    # （实测：pkg_plain 与 pkg_diverse_plain_20260924 是同一次采集，同一帧进了
+    # 两个包，审计按 colour 内容隔离了 1 帧，人工白标一遍）。
+    _used_frames: set = set()
+
+    def _key(f) -> tuple:
+        """同一张底层帧的键：**组 + 曝光**。
+
+        不能用文件名：同一次采集在不同目录里编号不同（实测：diverse_plain 的
+        frame_00007 与 agent 池 plain 的同名帧其实是同一次采集的同一些帧，
+        文件名一样但那是巧合；换一对目录就不一样了）。曝光缺失时才退回文件名。
+        """
+        e = f.get("exposure")
+        if e is not None:
+            return (str(f.get("group")), "e", int(e))
+        return (str(f.get("group")), "n", Path(str(f.get("path"))).name)
+
+    def _fresh(pool: list) -> list:
+        """去掉已被别的类别选走的帧，并在**池内**去重。
+
+        两处都要（实测都踩到）：
+        * 类别之间：选完再删会让批次缩水（town 从 4 帧掉到 3 帧），所以先过滤；
+        * 类别之内：一个类别的取材目录可能含**同一张帧的两份拷贝**
+          （diverse_plain 与 agent 池的 plain 是同一次采集），池内不去重就会
+          同批出现两份，人工白标一遍。
+        """
+        out, seen = [], set()
+        for f in pool:
+            k = _key(f)
+            if k in _used_frames or k in seen:
+                continue
+            seen.add(k)
+            out.append(f)
+        return out
+
+    def _mark(frames: list) -> list:
+        for f in frames:
+            _used_frames.add(_key(f))
+        return frames
+
     # 只收**有身份**的帧（方案 §7.1：缺身份的帧进隔离队列，不从目录名猜地图）。
     # 实测踩到：土路目录没有 meta.json，选出来的帧没有 map/source_id——
     # 这种帧进不了评价集（审计会拒收），必须先排除并记缺口。
@@ -229,16 +270,21 @@ def main(argv=None) -> int:
         pools[cat] = keep
         if dropped:
             pools.setdefault("_no_identity", {})[cat] = dropped
-    for cat, label, need in CATEGORIES:
+    # 选帧顺序按**池子大小升序**：多个类别共用同一批目录时，先满足稀缺的类别，
+    # 否则靠后的类别会被前面的吃光（实测：真无线铺装路只剩 1/20，因为
+    # 易混淆纹理先把它同一批目录里的帧选走了）。输出仍按 CATEGORIES 的规范顺序。
+    _order = sorted(CATEGORIES, key=lambda c: (len(pools[c[0]]), c[0]))
+    for cat, label, need in _order:
         n_starter = max(1, int(args.starter_per_category)) \
             if pools[cat] else 0
-        picked = _sel(cat, n_starter)
+        picked = _mark(_sel(cat, n_starter, pool=_fresh(pools[cat])))
         for f in picked:
             starter.append({**f, "category": cat, "category_label": label,
                             "why": f"{label}（{need}）："
                                    f"line_px={f.get('line_pixels')} "
                                    f"unknown={f.get('unknown_frac')}"})
-        full = _sel(cat, int(args.plan_per_category), for_plan=True)
+        full = _mark(_sel(cat, int(args.plan_per_category), for_plan=True,
+                          pool=_fresh(pools[cat])))
         plan[cat] = {
             "label": label, "needs": need,
             "n_available": len(pools[cat]), "n_selected": len(full),
