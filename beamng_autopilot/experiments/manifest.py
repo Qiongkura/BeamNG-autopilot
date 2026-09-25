@@ -25,10 +25,12 @@ from pathlib import Path
 
 import numpy as np
 
+from beamng_autopilot.experiments.credentials import read_dir_credentials
 from beamng_autopilot.experiments.labels import (
     audit_label,
     audit_summary,
 )
+from beamng_autopilot.experiments.protocol import effective_source
 
 SCHEMA = 1
 
@@ -97,6 +99,7 @@ class DatasetManifest:
         指定整组归属；其余组进 train。
         """
         paint_sources = paint_sources or {}
+        _missing_cred: list = []
         dev_groups = list(dev_groups or [])
         final_groups = list(final_groups or [])
         records: list[FrameRecord] = []
@@ -126,8 +129,34 @@ class DatasetManifest:
                     f"(meta lacks map_name_source) - a legacy collector may "
                     f"have written its argument as the map name; confirm with "
                     f"independent evidence before a decision")
-            src = paint_sources.get(rd.name) or paint_sources.get(str(rd)) \
-                or "engine_annotation"
+            # 资格以**目录自己的凭证**为准（方案 §6.1 / A1）：sidecar
+            # （annotation.json / meta.json 的 label_source）优先于调用方的声明，
+            # 调用方**不能**用字符串把来源抬高质量。原来这里 `or
+            # "engine_annotation"` 从不读凭证——人工复核过的帧会被判成
+            # unreliable / valid=False（实测踩到）。
+            _declared = (paint_sources.get(rd.name)
+                         or paint_sources.get(str(rd)) or "")
+            _cred = read_dir_credentials(rd)
+            _cred_src = None if _cred is None else str(
+                _cred.get("label_source") or "")
+            # 没有凭证也没有声明时，保持**旧默认**（引擎标注 = unreliable）：
+            # 这些帧确实带引擎 label，只是不能当门槛真值；写成 absent 会把
+            # "有引擎标注但不可信"误报成"来源不明"。
+            src, _src_notes = effective_source(
+                _declared or "engine_annotation", _cred_src)
+            if _cred is None:
+                _missing_cred.append(str(rd))
+            for _n in _src_notes:
+                notes.append(f"{rd}: {_n}")
+            if _cred is not None and _cred.get("readable") is False:
+                notes.append(f"{rd}: credential file is not parseable "
+                             f"({_cred.get('path')}) - treated as absent")
+            elif _cred is not None and not _cred_src:
+                notes.append(
+                    f"{rd}: credential file {_cred.get('path')} declares no "
+                    f"label_source ({_cred.get('why')}) - the declared value "
+                    f"or the engine default is used, which is not a verified "
+                    f"source")
             for f in files:
                 z = np.load(f)
                 colour = np.asarray(z["colour"], np.uint8) \
@@ -171,6 +200,12 @@ class DatasetManifest:
         _reject_content_duplicates(records)
         groups = _assign_splits(records, dev_groups=dev_groups,
                                final_groups=final_groups, notes=notes)
+        if _missing_cred:
+            notes.append(
+                f"{len(_missing_cred)} dir(s) have no credential sidecar "
+                f"(annotation.json/meta.json label_source): their paint source "
+                f"falls back to the declared value or engine_annotation - "
+                f"not a verified source. dirs: {_missing_cred[:4]}")
         did = _dataset_id(records, groups)
         mf = cls(dataset_id=did,
                  created=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
