@@ -20,6 +20,8 @@ import pytest
 sys.path.insert(0, os.fspath(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, os.fspath(Path(__file__).resolve().parents[1] / "scripts"))
 
+from beamng_autopilot.experiments import gates  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # 缺标签仍有可见漆线 / 部分标签损失屏蔽
@@ -226,6 +228,87 @@ def test_the_resource_gate_blocks_on_budget_and_vram() -> None:
     assert bad["allowed"] is False
     assert any("GPU budget" in r for r in bad["reasons"])
     assert any("VRAM" in r for r in bad["reasons"])
+
+
+def test_the_wall_clock_limit_is_consumed() -> None:
+    """G08 反例：`max_wall_minutes` 必须真的能停，不能只是配置里的一个数字。
+
+    实测缺口：`max_wall_minutes` 在核查的入口里**没有任何消费点**——配置写着
+    180 分钟，跑 8 小时也不会停（方案 §8.1：停止条件要在下一轮前检查）。
+    """
+    from beamng_autopilot.experiments.controller import LoopConfig, should_stop
+
+    cfg = LoopConfig(max_wall_minutes=60.0, daily_gpu_minutes=0.0,
+                     max_candidates=99, max_rounds_without_gain=99)
+    st = should_stop(cfg, [], gpu_minutes_today=0, candidates_used=0,
+                     wall_minutes=61.0)
+    assert st["stop"] is True, st
+    assert any("wall" in r.lower() for r in st["reasons"]), st["reasons"]
+    # 没到上限不停；上限 <= 0 = 不限制（与每日上限同一口径）
+    assert should_stop(cfg, [], gpu_minutes_today=0, candidates_used=0,
+                       wall_minutes=59.0)["stop"] is False
+    unlimited = LoopConfig(max_wall_minutes=0.0, daily_gpu_minutes=0.0,
+                           max_candidates=99, max_rounds_without_gain=99)
+    assert should_stop(unlimited, [], gpu_minutes_today=0, candidates_used=0,
+                       wall_minutes=9999.0)["stop"] is False
+
+
+def test_an_absent_user_activity_signal_is_unknown_not_false() -> None:
+    """G08/A6：用户活动信号**未接入**时记 UNKNOWN，不能写死 false 冒充检测。
+
+    方案 §8.2：「不能用写死的 user_active=false 冒充检测」「记录原始检测值和
+    状态变更」。所以三态：True（测到在用）/ False（测到没人）/ None（没接入）。
+    """
+    from beamng_autopilot.experiments.controller import (
+        LoopConfig, ResourceState, resource_gate, user_activity_probe)
+
+    cfg = LoopConfig(dry_run=False, pause_while_user_active=True,
+                     daily_gpu_minutes=0.0, min_free_vram_mb=0.0,
+                     min_free_disk_gb=0.0)
+    # 测到用户在动 -> 暂停
+    busy = resource_gate(cfg, ResourceState(now_hour=3, free_vram_mb=8000,
+                                            free_disk_gb=50,
+                                            gpu_minutes_today=0,
+                                            user_active=True, user_idle_s=1.0))
+    assert busy["allowed"] is False
+    assert any("user" in r for r in busy["reasons"])
+    # 没接入 -> 放行但**必须警告**"未接入"，且状态里保留 None（不是 False）
+    unknown = ResourceState(now_hour=3, free_vram_mb=8000, free_disk_gb=50,
+                            gpu_minutes_today=0, user_active=None,
+                            user_activity_source="not connected")
+    gate = resource_gate(cfg, unknown)
+    assert gate["allowed"] is True
+    assert any("未接入" in w or "not connected" in w for w in gate["warnings"]),         gate["warnings"]
+    assert unknown.user_active is None
+    # 探测函数在无法读取时必须返回 None（未接入），绝不回落到 False
+    probe = user_activity_probe(idle_probe=lambda: None)
+    assert probe["active"] is None and probe["source"] == "not connected", probe
+    # 有信号时给原始值与阈值，便于事后核对状态变更
+    probe2 = user_activity_probe(idle_probe=lambda: 5.0, idle_threshold_s=120.0)
+    assert probe2["active"] is True and probe2["idle_s"] == 5.0
+    probe3 = user_activity_probe(idle_probe=lambda: 600.0, idle_threshold_s=120.0)
+    assert probe3["active"] is False and probe3["idle_s"] == 600.0
+
+
+def test_the_run_clock_survives_a_restart_and_resets_after_a_stop() -> None:
+    """单次连续运行的墙钟：起点落盘（重启不重置），停止后重开一轮。"""
+    import time as _time
+
+    from beamng_autopilot.experiments.controller import RunClock
+
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        clk = RunClock(Path(td) / "run_state.json")
+        first = clk.start()
+        assert clk.minutes() < 1.0
+        # 第二次读取（模拟重启）不重置起点
+        again = RunClock(Path(td) / "run_state.json").start()
+        assert again["started_at"] == first["started_at"]
+        # 手改起点 -> 墙钟反映真实经过时间
+        clk.write_started_at(_time.time() - 3600)
+        assert 59.0 < clk.minutes() < 61.0
+        clk.reset()
+        assert clk.minutes() < 1.0
 
 
 def test_the_stop_rule_counts_consecutive_rounds_without_gain() -> None:
@@ -613,3 +696,214 @@ def test_seeds_needed_for_effect_tells_you_when_to_stop() -> None:
                           [0.4239, 0.5396, 0.4242])
     assert real["verdict"] == "inconclusive"
     assert real["seeds_needed_for_effect"] == 12
+
+def test_a_non_positive_daily_cap_means_no_cap():
+    """每日 GPU 上限：`<= 0` = 不设上限（用户 2026-09-25 的明确指示）。
+
+    上限机制本身必须还在（填数字就生效），且"不设上限"要**说出来**——资源门
+    打印警告说明依据，而不是静默放行；账本照记，随时能看到今天用了多少。
+    """
+    from beamng_autopilot.experiments.controller import (
+        LoopConfig, ResourceState, resource_gate, should_stop,
+    )
+
+    st = ResourceState(now_hour=12, free_vram_mb=9000.0, free_disk_gb=50.0,
+                       gpu_minutes_today=999.0)
+    free = resource_gate(LoopConfig(dry_run=False, daily_gpu_minutes=0.0), st)
+    assert free["allowed"] is True, free
+    assert any("不设上限" in w for w in free["warnings"]), free["warnings"]
+    assert should_stop(LoopConfig(daily_gpu_minutes=0.0), [],
+                       gpu_minutes_today=999.0, candidates_used=0)["stop"] is False
+
+    capped = resource_gate(LoopConfig(dry_run=False, daily_gpu_minutes=60.0), st)
+    assert capped["allowed"] is False, capped
+    assert any("exhausted" in r for r in capped["reasons"]), capped
+    assert should_stop(LoopConfig(daily_gpu_minutes=60.0), [],
+                       gpu_minutes_today=999.0, candidates_used=0)["stop"] is True
+    # 负值同样按"不设上限"处理（配置写 -1 不是"立刻停"）
+    neg = resource_gate(LoopConfig(dry_run=False, daily_gpu_minutes=-1.0), st)
+    assert neg["allowed"] is True, neg
+
+
+def test_paint_usable_is_separate_from_valid():
+    """标线真值：能学（usable）与 能判（valid）必须分开。
+
+    实测（2026-09-25）：引擎标注的漆线类**存在但不完整**
+    （覆盖 RGB 漆线候选约 0.61）——不能当门槛真值，但可以当弱监督。
+    只用一个 valid 会把"不能判"误当成"不能学"，白白丢掉唯一的
+    标线监督。默认来源（engine_annotation）行为一字未变：usable=False。
+    """
+    import numpy as np
+
+    from beamng_autopilot.experiments.labels import (
+        ClassQuality, PAINT_SOURCE_RANK, audit_label,
+    )
+
+    lab = np.zeros((20, 30), np.uint8)
+    lab[5:15, :] = 1
+    lab[10, :8] = 2
+    q = audit_label(lab, paint_source="engine_annotation").paint
+    assert (q.valid, q.usable) == (False, False), q
+    assert "不完整" in q.reason or "incomplete" in q.reason, q.reason
+    q2 = audit_label(lab, paint_source="engine_annotation_partial").paint
+    assert (q2.valid, q2.usable) == (False, True), q2
+    q3 = audit_label(lab, paint_source="human_revision").paint
+    assert (q3.valid, q3.usable) == (True, True), q3
+    assert PAINT_SOURCE_RANK["engine_annotation_partial"] == "pseudo"
+
+    # agent 逐帧核对式标注：可训练可测（usable），但晋级仍需人确认
+
+    assert PAINT_SOURCE_RANK["agent_revision"] == "agent"
+
+    q4 = audit_label(lab, paint_source="agent_revision").paint
+
+    assert (q4.valid, q4.usable) == (False, True), q4
+    # 老调用方语义不变：usable 缺省等于 valid
+    assert ClassQuality(True, "x").usable is True
+    assert ClassQuality(False, "x").usable is False
+    assert set(ClassQuality(True, "x").as_dict()) == {"valid", "reason",
+                                                      "pixels", "usable", "rank"}
+    # 档位要逐帧记下来：看板/报告要按档位分别计数（生成帧 ≠ 人工真值帧）
+    assert audit_label(lab, paint_source="human_revision").paint.rank == "verified"
+    assert audit_label(lab, paint_source="agent_revision").paint.rank == "agent"
+    assert audit_label(lab).paint.rank == "unreliable"
+
+
+def test_the_paired_interval_uses_a_documented_t_interval():
+    """不确定度用**明确记录的** t 区间（方案 §10.3）。
+
+    旧口径 `2*sd/sqrt(n)` 只是「乘子取 2」的近似，小样本下会低估区间
+    （n=3 时 t=4.303，差 2 倍以上）——而区间宽度直接决定 verdict。
+    本测试同时把分位表与 scipy 对照（判定路径不依赖 scipy，但表值要对）。
+    """
+    from beamng_autopilot.experiments.gates import (
+        T95_TABLE, paired_compare, t_critical,
+    )
+
+    assert t_critical(0) == float("inf")
+    assert t_critical(3) == 3.182 and t_critical(31) == 1.96
+    try:
+        from scipy import stats
+        for df, v in T95_TABLE.items():
+            assert abs(v - float(stats.t.ppf(0.975, df))) < 0.0005, df
+    except ImportError:
+        pass
+
+    r = paired_compare("m", [0.10, 0.12, 0.14], [0.20, 0.23, 0.25])
+    assert r["df"] == 2 and "t interval" in r["ci_method"]
+    assert r["ci95_halfwidth"] > 2.0 * r["ci95_halfwidth_approx_2sd"], (
+        "小样本下 t 区间必须比旧口径宽（旧口径低估）",
+        r["ci95_halfwidth"], r["ci95_halfwidth_approx_2sd"])
+    assert r["ci95_halfwidth_approx_2sd"] is not None, "旧值要照实报告"
+    assert r["verdict"] == "candidate_better"
+    # 同一批数据，区间变宽后结论会变：这是口径变更的直接后果
+    # 同一批数据在两种口径下结论不同（旧：candidate_better；新：inconclusive）——
+    # 这正是"不确定度方法必须写清"的理由：差值的散布大时，旧口径会给出假阳性。
+    r2 = paired_compare("m", [0.00, 0.00, 0.00], [0.10, 0.02, 0.20])
+    assert r2["mean_delta"] > r2["ci95_halfwidth_approx_2sd"], r2
+    assert r2["ci95_halfwidth"] > abs(r2["mean_delta"]), r2
+    assert r2["verdict"] == "inconclusive", r2
+
+
+def test_a_bad_seed_cannot_hide_behind_the_mean():
+    """A7 反例：单个坏 seed 不能被跨 seed 均值藏掉（方案 §10.2）。
+
+    实测口径：硬门原来只喂"跨 seed 均值"——4 个 seed 的 line_recall 都是 0.9、
+    第 5 个是 0.3，均值 0.78 照样过 0.70。真正待部署的是**具体 checkpoint**，
+    它必须自己满足门槛，所以逐 seed 检查必须进硬门。
+    """
+    t = gates.Thresholds()
+    good = {"line_recall": 0.90, "line_precision": 0.60,
+            "offroad_false_ratio": 0.02, "inference_ms_p95": 20.0,
+            "candidate_identity_rate": 0.80}
+    per_seed = {str(s): dict(good) for s in (42, 43, 44, 45)}
+    per_seed["46"] = {**good, "line_recall": 0.30}       # 一个坏 seed
+    mean = {k: sum(v[k] for v in per_seed.values()) / len(per_seed)
+            for k in good}
+    # 均值口径看不出问题（这就是缺口）
+    assert gates.threshold_violations(mean, t) == [], mean
+    v = gates.per_seed_gate_violations(per_seed, t)
+    assert v and "46" in v[0] and "line_recall" in v[0], v
+    # 逐 seed 违反进硬门 -> rejected（不能被均值抬成 shadow_candidate）
+    dec = gates.decide(pairings=_all_better_pairings(gates, t),
+                      thresholds=t, missing_metrics=[], hard_gate_violations=v)
+    assert dec["decision"] == "rejected", dec
+    assert any("line_recall" in r for r in dec["reasons"]), dec["reasons"]
+
+
+def test_a_bad_scene_cannot_hide_behind_the_pooled_mean():
+    """A7 反例：坏场景不能被合并均值抵消；缺测场景记 UNKNOWN（不是通过）。
+
+    方案 §10.2：关键场景不允许被总体均值抵消，覆盖不足时给 needs_evidence。
+    """
+    t = gates.Thresholds()
+    ok = {"line_recall": 0.90, "line_precision": 0.60,
+          "offroad_false_ratio": 0.02, "inference_ms_p95": 20.0,
+          "candidate_identity_rate": 0.80}
+    per_scene = {"italy/ring_a": dict(ok),
+                 "italy/ring_b": {**ok, "line_precision": 0.15},
+                 "italy/ring_c": dict(ok)}
+    rep = gates.scene_report(per_scene, t)
+    assert rep["violations"] and "ring_b" in rep["violations"][0], rep
+    assert rep["missing"] == [], rep
+    # 只有"没测到"的场景才算缺测 -> needs_evidence（不当通过）
+    per_scene["italy/ring_d"] = {}
+    rep2 = gates.scene_report(per_scene, t)
+    # 分场景只把**已标定**的口径当硬门（像素层 + 该场景耗时）；身份/候选类
+    # 指标单场景候选数可能只有几个，门槛未标定，所以只上报不进硬门。
+    assert len(rep2["missing"]) == len(gates.SCENE_HARD_FIELDS), rep2
+    assert all("ring_d" in x and "UNKNOWN" in x for x in rep2["missing"]), rep2
+    # 两个通道分开：坏场景 -> rejected（测了不达标）；缺测场景 -> needs_evidence
+    # （证据缺失，方案 §10.3 的判定顺序）。混在一起时硬门优先，所以分开断言。
+    dec_bad = gates.decide(pairings=_all_better_pairings(gates, t), thresholds=t,
+                          missing_metrics=[], hard_gate_violations=rep["violations"])
+    assert dec_bad["decision"] == "rejected", dec_bad
+    dec_gap = gates.decide(pairings=_all_better_pairings(gates, t), thresholds=t,
+                          missing_metrics=rep2["missing"],
+                          hard_gate_violations=[])
+    assert dec_gap["decision"] == "needs_evidence", dec_gap
+
+
+def _all_better_pairings(gates, t):
+    """一组"任务指标全面改善"的成对结果（用于把判定拉到只看硬门）。"""
+    seeds = [42, 43, 44, 45, 46]
+    base = {"candidate_identity_rate": 0.62, "line_recall": 0.72,
+            "line_precision": 0.42, "offroad_false_line_px": 1000.0,
+            "inference_ms_p95": 20.0}
+    cand = {"candidate_identity_rate": 0.85, "line_recall": 0.88,
+            "line_precision": 0.58, "offroad_false_line_px": 600.0,
+            "inference_ms_p95": 16.0}
+    a, b = {}, {}
+    for i, s in enumerate(seeds):
+        a[str(s)] = {k: v + (i - 2) * 0.001 for k, v in base.items()}
+        b[str(s)] = {k: v + (i - 2) * 0.001 for k, v in cand.items()}
+    lower = ("offroad_false_line_px", "inference_ms_p95")
+    return {k: gates.paired_compare(k, [a[str(s)][k] for s in seeds],
+                                    [b[str(s)][k] for s in seeds],
+                                    lower_is_better=k in lower)
+            for k in base}
+
+
+def test_an_unfrozen_gate_blocks_promotion_even_when_it_is_measured(tmp_path):
+    """G09/§10.2：门槛未标定时，**测到了也不许当通过**；replay 必须重放同一结论。
+
+    实测缺口：判定文件只落盘 pairings 与硬门违反，replay 从 pairings 重推缺测
+    ——于是"新硬门未标定"这条在线判定加进去、重放时消失，同输入不同决策。
+    """
+    t = gates.Thresholds()
+    cov = gates.paired_compare("candidate_reference_coverage",
+                              [0.80, 0.85], [0.86, 0.90])
+    assert cov["n"] == 2
+    # 未标定 -> 进缺测 -> needs_evidence
+    m = gates.missing_metrics_for({"candidate_reference_coverage": cov},
+                                coverage_gate_frozen=False)
+    assert any("unfrozen" in x for x in m), m
+    dec = gates.decide(pairings={"candidate_reference_coverage": cov}, thresholds=t,
+                      missing_metrics=m, hard_gate_violations=[])
+    assert dec["decision"] == "needs_evidence", dec
+    # 标定后（冻结）同一批数字不再被拦——门本身该由阈值管，不是永远拦住
+    assert gates.missing_metrics_for({"candidate_reference_coverage": cov},
+                                    coverage_gate_frozen=True) == []
+    # 没测到的口径任何时候都算缺测
+    none_cov = {"candidate_reference_coverage": {"metric": "x", "n": 0}}
+    assert gates.missing_metrics_for(none_cov, coverage_gate_frozen=True) ==         ["candidate_reference_coverage"]

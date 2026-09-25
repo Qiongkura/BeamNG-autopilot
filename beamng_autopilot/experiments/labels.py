@@ -33,7 +33,20 @@ IGNORE = 255
 PAINT_SOURCE_RANK = {
     "human_revision": "verified",     # 人工逐帧修订
     "engine_verified": "verified",    # 单独验证过的模拟器真值
-    "engine_annotation": "unreliable",  # 本图实测：漆线常被画成 ASPHALT
+    # 引擎标注的漆线类：**存在但不完整**。2026-09-25 更正：此前写的
+    # "漆线被画成 ASPHALT / line 类为空"在这批采集上不成立——逐帧目视 + 像素统计
+    # （6 个采集 × 8 帧）：引擎线像素覆盖了 RGB 漆线候选的 ~0.61（precision ~0.68）。
+    # 所以它不能当**门槛真值**（未标注的漆线会被算成假阳），但可以当**弱监督**
+    # 用于研究臂：先让模型学会"产出标线"（当前 road-only 配方完全不产出），
+    # 之后才谈得上压线判断。
+    "engine_annotation": "unreliable",
+    "engine_annotation_partial": "pseudo",  # 弱监督（研究臂，不得晋级）
+    # agent 逐帧核对式标注（2026-09-25，scripts/m5_line_truth_agent.py）：
+    # 机器提议（引擎标线 ∪ 细长亮条，宽亮带判背景，其余碎亮斑写 255=ignore）
+    # + **逐帧目视复核**（32 帧 4 视角全部看过，抓到并修掉 pillar_right 的一处假阳）。
+    # 它比引擎弱标签完整（补回虚线中线与右边缘线），但仍是**机器画的**：
+    # 可训练、可测，晋级仍需人确认 → valid=False, usable=True。
+    "agent_revision": "agent",
     "pseudo": "pseudo",               # HSV 注入等，不得当真值
     "none": "absent",
 }
@@ -41,15 +54,32 @@ PAINT_SOURCE_RANK = {
 
 @dataclass
 class ClassQuality:
-    """一个通道的判定：可用性 + 原因 + 计数。"""
+    """一个通道的判定：**可学性**（usable）+ **可判定性**（valid）+ 原因 + 计数。
+
+    这两件事必须分开，实测教训（2026-09-25）：引擎标注的漆线类**存在但不完整**
+    （覆盖 RGB 漆线候选 ~0.61），它不能当门槛真值（`valid=False`：未标注的漆线会
+    被算成假阳），但完全可以当**弱监督**让模型先学会产出标线（`usable=True`）。
+    只用一个 `valid` 会把"不能判"误当成"不能学"，等于白白丢掉唯一的标线监督。
+    默认 `usable == valid`，保持既有语义不变。
+    """
 
     valid: bool
     reason: str
     pixels: int = 0
+    usable: bool | None = None        # None = 跟 valid 一致（老调用方语义不变）
+    #: 标签来源档位（verified/agent/pseudo/unreliable/absent）。看板与报告要按
+    #: 档位分别计数（"640 生成帧"不等于"640 人工真值"），从散文 reason 里抠
+    #: 档位是脆的，所以直接记下来。
+    rank: str = ""
+
+    def __post_init__(self) -> None:
+        if self.usable is None:
+            self.usable = bool(self.valid)
 
     def as_dict(self) -> dict:
         return {"valid": bool(self.valid), "reason": self.reason,
-                "pixels": int(self.pixels)}
+                "pixels": int(self.pixels), "usable": bool(self.usable),
+                "rank": str(self.rank or "")}
 
 
 @dataclass
@@ -109,21 +139,33 @@ def audit_label(label, *, paint_source: str = "engine_annotation",
     rank = PAINT_SOURCE_RANK.get(str(paint_source), "absent")
     if rank == "verified":
         paint = ClassQuality(True, f"paint truth from {paint_source}",
-                             line_px)
+                             line_px, rank=rank)
     elif rank == "pseudo":
-        paint = ClassQuality(False,
-                             "pseudo labels (HSV injection) are not truth: "
-                             "research arm only", line_px)
+        # 弱监督：可以学（usable=True），但不能当门槛真值（valid=False）
+        paint = ClassQuality(
+            False,
+            f"weak/pseudo paint labels ({paint_source}): trainable as weak "
+            "supervision, never a gate", line_px, usable=True, rank=rank)
+    elif rank == "agent":
+        # agent 逐帧核对式标注：可训练、可测（报告里写清来源），但要晋级仍需人确认
+        paint = ClassQuality(
+            False,
+            f"agent-reviewed paint labels ({paint_source}): machine-drawn with "
+            "a per-frame visual pass - trainable and measurable, but promotion "
+            "still needs human sign-off", line_px, usable=True, rank=rank)
     elif line_px == 0 and rank == "unreliable":
         paint = ClassQuality(False,
                              "engine annotation provides no reliable paint "
                              "class; 0 line px is NOT evidence of no paint",
-                             0)
+                             0, rank=rank)
     else:
-        paint = ClassQuality(False,
-                             "engine annotation's paint class is unreliable "
-                             "on this map (paint renders as ASPHALT)",
-                             line_px)
+        paint = ClassQuality(
+            False,
+            "engine annotation's paint class exists but is incomplete "
+            "(measured 2026-09-25: covers ~0.61 of RGB paint candidates, "
+            "precision ~0.68) - unannotated paint would score as false "
+            "positives, so it is not admissible as gating truth", line_px,
+            rank=rank)
 
     road = ClassQuality(road_px >= int(road_min_px) and has_rgb,
                         "" if road_px >= int(road_min_px) else

@@ -37,7 +37,10 @@ ALLOWED_KEYS = {
 #: 必须一致（有测试钉住两边不漂移）。
 APPLICABLE_KEYS = ("add_runs", "drop_runs", "run_weights", "epochs", "lr",
                    "line_weight", "line_tversky_weight",
-                   "line_cldice_weight", "line_tversky_beta")
+                   "line_cldice_weight", "line_tversky_beta",
+                   # 容量族（模型宽度）：训练器已实现 --width，白名单要同步，
+                   # 否则提议会被判"训练器没有实现"而记 blocked
+                   "width")
 
 #: 这些桶说明问题在数据/场景，不该退到"训练更久"。
 _DATA_SIDE_BUCKETS = ("offroad_false_line", "candidates_not_on_paint",

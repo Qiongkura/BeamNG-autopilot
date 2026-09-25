@@ -63,6 +63,10 @@ class FrameRecord:
     quality: dict
     split: str = "none"
     reject_reason: str = ""
+    # 逐帧位姿（来自采集 meta）：空间隔离要用它判断"同地点重采"。
+    # 缺失就是 None —— 空间判定不猜（方案 W2：不能只靠字节重复）。
+    pos: tuple | None = None
+    heading: float | None = None
 
     @property
     def trainable(self) -> bool:
@@ -153,6 +157,11 @@ class DatasetManifest:
                                   else float(frame["t_wall"]))
                     rec.exposure = (None if frame.get("exposure") is None
                                     else int(frame["exposure"]))
+                    _p = frame.get("pos")
+                    rec.pos = (None if not _p else tuple(
+                        float(v) for v in _p[:2]))
+                    _h = frame.get("heading")
+                    rec.heading = (None if _h is None else float(_h))
         # map identity must be real: a collection that cannot name its map is
         # not admissible (the T13 round found a collector hardcoding "italy")
         for rec in records:
@@ -313,6 +322,29 @@ def _group_of(map_name: str, source_id: str, rd: Path) -> str:
     if map_name and source_id:
         return f"{map_name}/{source_id}"
     return f"dir/{rd.name}"
+
+
+def dir_group(d: str | Path) -> str:
+    """一个数据目录的场景/组键：``map_name/source_id``。
+
+    与 manifest 的分组规则**同一个定义**（方案 W2）：分场景硬门、空间隔离审计
+    和数据集清单必须指同一个东西，否则"这个场景过没过门"会随入口而变。
+    身份读 ``meta.json``（先本目录、再父目录），**不从目录名猜地图**。
+
+    没有身份时退到 ``dir/<完整路径>``：**绝不**用目录名兜底——两个采集的
+    ``front_main`` 目录同名，用名字当键会把它们合并成"一个场景"，
+    正是"坏场景被别处稀释"要防的事（这类目录本来就该被审计拒收）。
+    """
+    d = Path(d)
+    meta, _where = _read_meta(d)
+    if isinstance(meta, dict):
+        return _group_of(str(meta.get("map_name") or ""),
+                         str(meta.get("source_id") or ""), d)
+    try:
+        key = str(d.resolve())
+    except OSError:                                    # pragma: no cover
+        key = str(d)
+    return f"dir/{key}"
 
 
 def _reject_content_duplicates(records: list[FrameRecord]) -> None:
