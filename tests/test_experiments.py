@@ -907,3 +907,26 @@ def test_an_unfrozen_gate_blocks_promotion_even_when_it_is_measured(tmp_path):
     # 没测到的口径任何时候都算缺测
     none_cov = {"candidate_reference_coverage": {"metric": "x", "n": 0}}
     assert gates.missing_metrics_for(none_cov, coverage_gate_frozen=True) ==         ["candidate_reference_coverage"]
+
+
+def test_per_seed_checks_can_be_restricted_to_measurable_fields():
+    """整通道被屏蔽的实验里，逐 seed 检查只查可测口径（方案 §10.3）。
+
+    实测踩到（E2）：road-only 下模型不产出标线，逐 seed 的 line_recall 是
+    近零"读数"，被当成逐 seed 硬门违反 -> 判定 rejected，读起来像"候选不合格"，
+    实际是"这个通道没测"。
+    """
+    t = gates.Thresholds()
+    per_seed = {"42": {"line_recall": 0.002, "inference_ms_p95": 18.0},
+                "43": {"line_recall": 0.0, "inference_ms_p95": 55.0}}
+    masked = ("inference_ms_p95",)
+    # 屏蔽模式下：标线读数不参与，只有真正的耗时越界算违反
+    v = gates.per_seed_gate_violations(per_seed, t, fields=masked)
+    assert len(v) == 1 and "43" in v[0] and "inference_ms_p95" in v[0], v
+    assert gates.per_seed_missing(per_seed, t, fields=masked) == []
+    # 不限制字段时，标线读数会被当违反（就是那个假 rejected）
+    assert len(gates.per_seed_gate_violations(per_seed, t)) == 3
+    # 缺测与违反仍然分开：字段里的 None 进 missing，不进 violations
+    assert gates.per_seed_missing({"42": {"inference_ms_p95": None}}, t,
+                                  fields=masked) == [
+        "seed 42: inference_ms_p95: UNKNOWN (hard gate needs a measurement)"]

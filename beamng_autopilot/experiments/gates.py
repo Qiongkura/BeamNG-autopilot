@@ -400,8 +400,12 @@ def hard_split(measured: dict, thresholds: Thresholds,
     return {"violations": violations, "missing": missing}
 
 
-def per_seed_gate_violations(per_seed: dict, thresholds: Thresholds) -> list:
+def per_seed_gate_violations(per_seed: dict, thresholds: Thresholds,
+                            *, fields=None) -> list:
     """逐 seed 硬门：**每个 seed 的 checkpoint 自己**必须满足门槛（方案 §10.2）。
+
+    ``fields``：只查这些指标（整通道被屏蔽的实验用，例如 road-only 下
+    标线指标是"未测"而不是"很差"）。
 
     为什么不能只看跨 seed 均值：4 个 seed 的 ``line_recall`` 都 0.9、第 5 个
     0.3，均值 0.78 照样过 0.70——真正要部署的是具体 checkpoint，均值会把这个
@@ -410,16 +414,19 @@ def per_seed_gate_violations(per_seed: dict, thresholds: Thresholds) -> list:
     """
     out: list[str] = []
     for seed in sorted(per_seed, key=str):
-        for r in hard_split(per_seed[seed] or {}, thresholds)["violations"]:
+        for r in hard_split(per_seed[seed] or {}, thresholds,
+                            fields=fields)["violations"]:
             out.append(f"seed {seed}: {r}")
     return out
 
 
-def per_seed_missing(per_seed: dict, thresholds: Thresholds) -> list:
+def per_seed_missing(per_seed: dict, thresholds: Thresholds,
+                     *, fields=None) -> list:
     """逐 seed 缺测项（进 ``missing_metrics`` → ``needs_evidence``）。"""
     out: list[str] = []
     for seed in sorted(per_seed, key=str):
-        for name in hard_split(per_seed[seed] or {}, thresholds)["missing"]:
+        for name in hard_split(per_seed[seed] or {}, thresholds,
+                               fields=fields)["missing"]:
             out.append(f"seed {seed}: {name}: UNKNOWN (hard gate needs a "
                        f"measurement)")
     return out
