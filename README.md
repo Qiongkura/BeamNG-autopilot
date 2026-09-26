@@ -449,6 +449,37 @@ GPU 显存 6GB 以上（YOLO 检测 + HUD 可视化需要）
 `logs/m5_seg/seg_model/best.pt`（或用 `--seg-model <路径>` 指定），
 加载失败自动回退经典 CV。
 
+### 训练可视化（看板 / 实时监控 / 历史台账）
+
+三个只读面板：不占训练 GPU、不写候选目录、关掉不影响训练。
+
+- **双击入口**（仓库根目录）：`启动训练看板.vbs` 把最近一轮渲染成一张自包含
+  HTML 并打开浏览器；`启动训练监控.vbs` 给最近一轮带逐 step 指标的 run 起实时
+  12 图监控（可见控制台，Ctrl+C 停）；`启动训练台账.vbs` 把**所有轮**扫成一张
+  历史台账（谁在什么时候训了什么、训了多少、末轮数字、硬门判定）。前两个自动挑
+  `logs/experiments/` 下最新的那一轮，也可用 `--run-id` 指定；台账不挑轮次。
+- 命令行等价写法：
+
+```pwsh
+# 看板：最近一轮 → 自包含 HTML（7 视图：总览/曲线/探针/任务/对比/覆盖/资源闭环）
+.venv\Scripts\python.exe scripts\m5_training_view.py dashboard
+# 实时监控（12 图，Loss/Accuracy/梯度范数/学习率/直方图/显存功耗利用率…）
+.venv\Scripts\python.exe scripts\m5_training_view.py monitor --port 8760
+# 历史台账：全仓训练 run + 硬门判定（扫 ~300 个 run 约几秒）
+.venv\Scripts\python.exe scripts\m5_training_view.py history
+# 只列候选 run，不渲染不起服务
+.venv\Scripts\python.exe scripts\m5_training_view.py list
+```
+
+看板读 `events.jsonl`（实验循环每轮都写）；**实时监控的逐 step 指标只在训练带
+`--metrics-run <run_id>` 时才写**，没带的 run 只能看看板。台账读
+`train_hist.json` + `decision_*.json`，**只列事实、不做排行**（各 run 的数据集、
+划分、epoch 数都不同，跨 family 比大小没有意义），缺列一律写"缺列"而不是 0，
+缺列原因按产物自报的字段（如 `line_ignored_frames`）。底层命令
+（`m5_seg_dashboard.py render/watch`、`m5_train_monitor.py serve/snapshot/demo/
+probe/status`、`m5_training_history.py render/list`）与全部选项见
+`docs/TRAINING_MONITOR_20260924.md`。
+
 ## 双运行时（Steam / Tech）可并行开发
 
 **开发前提（2026-08 起）：优先基于 BeamNG.tech 研发**。感知以真传感器
