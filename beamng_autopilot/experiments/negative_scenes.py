@@ -55,6 +55,57 @@ def negative_line_counts(pred_line: np.ndarray, label: np.ndarray, *,
     return {PREFIX + k: v for k, v in out.items()}
 
 
+def negative_training_eligibility(dirs: list[dict], *, research: bool) -> dict:
+    """E1 前置：训练用的"困难负例"目录资格（方案 §S6/E1 + §3.5/T10）。
+
+    ``dirs``：逐目录汇总 ``[{"dir", "n_frames", "n_line_frames", "rank"}]``
+    （``n_line_frames`` = 该目录里有标线真值的帧数；``rank`` = 该目录标线标签
+    的档位）。
+
+    判定：
+
+    * ``n_line_frames > 0`` -> 普通训练数据（有正有负），不受本条约束；
+    * 全零标线 + ``rank == "verified"`` -> **合格负例**（人工确认无线）；
+    * 全零标线 + 非 verified -> 只能作**研究臂**负例：``research=False`` 时
+      **拒绝**（"全零"不构成确认无线——与 T10 同一逻辑；混进可晋级训练等于
+      教模型"这里没有线"，而实际可能有线），``research=True`` 时允许，但逐条
+      记为弱负例（必须在报告里可见，不得当成"已确认负例"）。
+
+    实测依据（2026-09-26，`logs/experiments/e1_readiness_20260926.json`）：
+    仓库里**没有**同时满足"评价集之外 + 有身份/位姿 + 人工确认无线"的负例目录
+    —— dirt_road_* 无身份（审计直接拒收）、引擎采集的 line 类"游戏不提供"
+    （全零是缺失而非确认）、评价包里的 verified 负例是开发帧（训练禁用）。
+    """
+    confirmed: list = []
+    weak: list = []
+    rejected: list = []
+    for d in dirs or []:
+        n_frames = int(d.get("n_frames") or 0)
+        n_line = int(d.get("n_line_frames") or 0)
+        rank = str(d.get("rank") or "")
+        if n_line > 0 or n_frames <= 0:
+            continue                     # 不是"全零"目录：普通训练数据
+        if rank == "verified":
+            confirmed.append({"dir": d.get("dir"), "n_frames": n_frames,
+                              "rank": rank})
+        elif research:
+            weak.append({"dir": d.get("dir"), "n_frames": n_frames,
+                         "rank": rank or "absent",
+                         "why": ("all-zero line labels with a non-verified "
+                                 "rank: weak research negative, not a "
+                                 "confirmed one")})
+        else:
+            rejected.append({"dir": d.get("dir"), "n_frames": n_frames,
+                             "rank": rank or "absent",
+                             "why": ("a training dir whose line labels are all "
+                                     "zero and not verified cannot be used as "
+                                     "a confirmed hard negative in a "
+                                     "promotion-eligible run (T10)")})
+    return {"confirmed": confirmed, "weak": weak, "rejected": rejected,
+            "note": (f"confirmed={len(confirmed)} weak={len(weak)} "
+                     f"rejected={len(rejected)} research={bool(research)}")}
+
+
 def negative_line_summary(acc: dict, *, n_frames: int) -> dict:
     """从逐帧计数汇总；旧产物或混合新旧计数不得冒充完整覆盖。"""
     missing = [k for k in COUNTERS if PREFIX + k not in acc]
