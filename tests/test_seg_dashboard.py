@@ -1054,3 +1054,50 @@ def test_the_decision_view_renders_when_every_hard_gate_input_was_measured():
         assert st["readable"] and st["gpu_minutes"], st
         html = dash._decisions_view({"decisions": st})
         assert "12.5 min" in html, html
+
+
+def test_the_decisions_view_shows_per_seed_and_per_scene(tmp_path):
+    """A9/§10.2：单坏 seed 与坏场景必须**看得见**（均值不能把它们藏掉）。
+
+    判定文件里已经落盘 hard_by_seed / per_scene / scene_candidates，但看板原来
+    只渲染池化值——于是"某个 seed 塌了"在页面上完全看不出来。
+    """
+    import json
+    import tempfile
+    from pathlib import Path as _P
+
+    with tempfile.TemporaryDirectory() as td:
+        root = _P(td)
+        (root / "decision_c.json").write_text(json.dumps({
+            "candidate_id": "c", "pairings": {}, "hard_gate": {},
+            "decision": {"decision": "rejected", "reasons": ["x"]},
+            "hard_by_seed": {
+                "42": {"candidate_identity_rate": 0.8, "line_recall": 0.9,
+                       "line_precision": 0.6, "offroad_false_ratio": 0.02,
+                       "inference_ms_p95": 18.0},
+                "43": {"candidate_identity_rate": 0.1, "line_recall": 0.2,
+                       "line_precision": None, "offroad_false_ratio": 0.9,
+                       "inference_ms_p95": 19.0}},
+            "per_scene": {
+                "italy/ring_a": {"line_recall": 0.9, "line_precision": 0.6,
+                                 "offroad_false_ratio": 0.01,
+                                 "inference_ms_p95": 17.0},
+                "italy/ring_b": {"line_recall": 0.2, "line_precision": 0.1,
+                                 "offroad_false_ratio": 0.8,
+                                 "inference_ms_p95": None}},
+            "scene_candidates": {
+                "italy/ring_b": {"candidate_reference_coverage": 0.26,
+                                 "left_right_role_agreement": 0.33}},
+            "missing_metrics": ["line_recall: UNKNOWN (hard gate needs a "
+                                "measurement)"],
+        }), encoding="utf-8")
+        st = dash._decisions_state(root)
+        html = dash._decisions_view({"decisions": st})
+        # 逐 seed：两行都在，坏 seed 的读数原样显示
+        assert "seed 42" in html and "seed 43" in html, html
+        assert "90.0%" in html and "20.0%" in html, html
+        # 逐场景：两个场景都在，坏场景的 80% 与未测的 p95 都能看到
+        assert "italy/ring_a" in html and "italy/ring_b" in html, html
+        assert "80.0%" in html, html
+        assert "未测" in html, "缺测场景的 p95 要显示未测，不能写 0"
+        assert "缺测清单" in html, html

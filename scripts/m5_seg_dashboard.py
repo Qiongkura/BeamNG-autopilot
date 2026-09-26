@@ -1676,6 +1676,12 @@ def _decisions_state(path: Path | None) -> dict:
             "trivial_all_road": blob.get("road_iou_trivial_all_road"),
             "eval_checkpoint": blob.get("eval_checkpoint"),
             "epochs": blob.get("epochs"),
+            # 逐 seed / 逐场景的**原始测量**（方案 §10.2/A7：坏 seed 或坏场景
+            # 不能被池化均值藏掉，所以页面上要能直接看到）
+            "hard_by_seed": blob.get("hard_by_seed") or {},
+            "per_scene": blob.get("per_scene") or {},
+            "scene_candidates": blob.get("scene_candidates") or {},
+            "missing_metrics": list(blob.get("missing_metrics") or []),
         })
     state["gpu_minutes"] = ledger
     state["readable"] = bool([i for i in state["items"] if not i.get("error")])
@@ -1973,6 +1979,62 @@ def _decisions_view(ctx: dict) -> str:
                     f"gt={_esc(str(f.get('gt_px')))})" for f in frames)
                 out.append(f"<li>seed {_esc(seed)}: {cells}</li>")
             out.append("</ul>")
+        _hbs = it.get("hard_by_seed") or {}
+        if _hbs:
+            out.append('<p class="hint">逐 seed 硬门输入（每个 seed 的 checkpoint '
+                       "必须**自己**满足门槛；某一行明显差就是那个 seed 不合格，"
+                       "池化均值会把它藏掉）:</p>")
+            _keys = ("candidate_identity_rate", "line_recall", "line_precision",
+                     "offroad_false_ratio", "inference_ms_p95")
+            rows_seed = ['<table><tr><th>seed</th>'
+                         + "".join(f"<th>{_esc(k)}</th>" for k in _keys)
+                         + "</tr>"]
+            for seed in sorted(_hbs, key=lambda x: str(x)):
+                cells = []
+                for k in _keys:
+                    v = (_hbs.get(seed) or {}).get(k)
+                    cells.append("<td>" + (Evidence(
+                        name=k, level=LEVEL_TRAIN, value=(None if v is None
+                                                          else float(v)),
+                        unit=("ms" if k == "inference_ms_p95" else "ratio"),
+                        missing=("" if v is not None else "该 seed 未测")
+                    ).cell()) + "</td>")
+                rows_seed.append(f'<tr><td class="mono">seed {_esc(seed)}</td>'
+                                 + "".join(cells) + "</tr>")
+            rows_seed.append("</table>")
+            out.append("".join(rows_seed))
+        _ps = it.get("per_scene") or {}
+        if _ps:
+            _sc = it.get("scene_candidates") or {}
+            out.append('<p class="hint">逐场景（跨 seed 取**最差**；场景用 '
+                       "map/source_id 分组，不能只报池化值）:</p>")
+            rows_sc = ['<table><tr><th>场景</th><th>line_recall</th>'
+                       "<th>line_precision</th><th>offroad_false_ratio</th>"
+                       "<th>inference_ms_p95</th><th>候选覆盖率</th>"
+                       "<th>左右角色</th></tr>"]
+            for g in sorted(_ps):
+                m = _ps.get(g) or {}
+                cand = _sc.get(g) or {}
+                def _cell(v, unit="ratio", miss="该场景未测"):
+                    return Evidence(name=g, level=LEVEL_TRAIN,
+                                    value=(None if v is None else float(v)),
+                                    unit=unit,
+                                    missing=("" if v is not None else miss)).cell()
+                rows_sc.append(
+                    f'<tr><td class="mono">{_esc(g)}</td>'
+                    f'<td>{_cell(m.get("line_recall"))}</td>'
+                    f'<td>{_cell(m.get("line_precision"))}</td>'
+                    f'<td>{_cell(m.get("offroad_false_ratio"))}</td>'
+                    f'<td>{_cell(m.get("inference_ms_p95"), "ms")}</td>'
+                    f'<td>{_cell(cand.get("candidate_reference_coverage"))}</td>'
+                    f'<td>{_cell(cand.get("left_right_role_agreement"))}</td>'
+                    "</tr>")
+            rows_sc.append("</table>")
+            out.append("".join(rows_sc))
+        if it.get("missing_metrics"):
+            out.append('<p class="hint">缺测清单（进 needs_evidence 的通道）: '
+                       + _esc("; ".join(map(str, it["missing_metrics"])))
+                       + "</p>")
         if it.get("hard_unknown"):
             out.append('<p class="hint">硬门未测（UNKNOWN）: '
                        f'{_esc(", ".join(it["hard_unknown"]))}'
