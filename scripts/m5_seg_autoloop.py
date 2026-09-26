@@ -41,6 +41,7 @@ from beamng_autopilot.experiments.controller import (  # noqa: E402
 )
 from beamng_autopilot.experiments.events import Event, EventLog, metric  # noqa: E402
 from beamng_autopilot.experiments.checkpoint import file_sha16 as _ckpt_sha16
+from beamng_autopilot.experiments.checkpoint import git_commit as _git_commit
 from beamng_autopilot.experiments.final_set import (  # noqa: E402
     confirmation_check,
 )
@@ -54,7 +55,8 @@ from beamng_autopilot.experiments.manifest import (  # noqa: E402
     DatasetManifest, dir_group,
 )
 from beamng_autopilot.experiments.proposer import (  # noqa: E402
-    bucket_errors, load_eval_artifacts, needs_review, propose,
+    bucket_errors, classify_round_outcome, factor_activity,
+    load_eval_artifacts, needs_review, propose,
 )
 from beamng_autopilot.experiments.spatial import (  # noqa: E402
     SPATIAL_BUFFER_M, group_exposure_leak, spatial_conflicts,
@@ -215,13 +217,18 @@ def cmd_propose(args) -> int:
         blocked.append({"family": "scene_mix",
                         "why": f"引用了不存在的训练目录：{missing}",
                         "top_bucket": ""})
+    # 线通道被屏蔽（road-only）时线损失键不会生效：提议阶段就挡住，别把
+    # "参数带着、实际不起作用"的因子送进轮次（方案 v2 §S5 / T14）。
+    _line_sup = not getattr(args, "allow_road_only", False)
     props = propose(buckets=buckets, dataset=dataset, champion=champ,
                     max_proposals=args.max_proposals, history=history,
-                    available_runs=avail, blocked=blocked)
+                    available_runs=avail, blocked=blocked,
+                    line_supervision=_line_sup)
     out = exp_dir(args.run_id)
     out.mkdir(parents=True, exist_ok=True)
     blob = {"buckets": [b.as_dict() for b in buckets],
             "needs_review": review,
+            "line_supervision": _line_sup,
             "proposals": [p.as_dict() for p in props],
             "blocked_families": blocked,
             "champion": champ, "dataset": dataset,
@@ -811,7 +818,10 @@ def cmd_run(args) -> int:
             hist.append(RoundRecord(
                 round_index=len(hist), candidate_id=blob["candidate_id"],
                 decision=blob["decision"]["decision"],
-                reasons=blob["decision"]["reasons"]))
+                reasons=blob["decision"]["reasons"],
+                # 归因字段随判定文件走：只有"有意义的无收益"计入停止连胜，
+                # 无效因子/缺标注/资格失败各有原因（旧文件无此字段则留空）
+                outcome=str(blob.get("round_outcome") or "")))
         # 单次连续运行的墙钟（方案 §8.1）：起点落在 run 目录，重启不重置
         clock = RunClock(exp_dir(args.run_id) / "run_state.json")
         wall = clock.minutes()
@@ -887,7 +897,8 @@ def cmd_run(args) -> int:
             hist2.append(RoundRecord(
                 round_index=len(hist2), candidate_id=blob["candidate_id"],
                 decision=blob["decision"]["decision"],
-                reasons=blob["decision"]["reasons"]))
+                reasons=blob["decision"]["reasons"],
+                outcome=str(blob.get("round_outcome") or "")))
         stop2 = should_stop(cfg, hist2, gpu_minutes_today=total_today,
                             candidates_used=len(hist2))
         note = (f"rounds rc={rc}; 停因: " + "; ".join(stop2["reasons"])
@@ -1186,13 +1197,20 @@ IDENTITY_FIELDS = ("candidate_identity_rate",
                    "candidate_paint_recall",
                    "n_candidates", "n_candidates_with_reference")
 def identity_metrics(model_path: Path, eval_runs: list, *,
-                     probe_fn=None) -> dict:
+                     probe_fn=None, frames_by_dir: dict | None = None) -> dict:
     """候选匹配的全口径：冻结匹配率 + 覆盖率 + 角色一致率。
 
     方案 G09 点名：原来只读原始 ``match_rate``，而它的分母里混着
     "该侧没有参考"的候选（实测约 38%）——那些候选应记 UNKNOWN，
     不能当"未确认/假线"。本函数把全部口径一起取回来（多段路取均值），
     缺测的字段一律 None。
+
+    ``frames_by_dir``：审计后的**唯一**逐帧清单（``{目录: [接受的帧路径]}``，
+    来自 ``_rounds_audit`` 的 ``dev_frames_by_dir``）。给了就按它调探针，
+    而不是让探针各自 glob —— 两个内容相同的目录会让计数翻倍（独立复核实测：
+    字节相同的两个目录把 C 从 10 变成 20，与标定的 10 不一致，方案 §S2 验收
+    要求标定/循环/评价逐项相同）。目录不在清单里 = 该目录没有可接受的帧，
+    按空清单处理（贡献 0，不退回 glob）。不传则维持旧行为（未去重口径）。
     """
     # 探针在 scripts/ 下：测试或别的入口直接调本函数时，sys.path 里可能没有它
     import sys as _sys
@@ -1217,8 +1235,14 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
         if not meta.exists():
             continue
         try:
+            # 只在给了唯一清单时传 frames：注入的假探针（测试）可能没有该参数，
+            # 未去重口径的行为因此与旧版逐字一致
+            _kw = {}
+            if frames_by_dir is not None:
+                _kw["frames"] = list(frames_by_dir.get(
+                    str(run).replace("\\", "/")) or [])
             res = probe_fn(run, json.loads(meta.read_text(encoding="utf-8")),
-                           view=run.name, model_path=str(model_path))
+                           view=run.name, model_path=str(model_path), **_kw)
         except Exception:                             # noqa: BLE001
             continue
         # 探针把 match_rate_with_reference 的字段**内联在 summary 里**
@@ -1612,6 +1636,21 @@ def _log_give_up(log, run_id: str, cand_id: str, status: str, note: str,
     raise
 
 
+def _git_dirty_paths(limit: int = 20) -> list:
+    """未提交路径（判定文件要能说明"当时工作区不干净"）。
+
+    读不到（不是 git 仓库/git 不在）返回 ``[]``——空列表在这里只表示"没读到"，
+    看板另有 git_commit 为空串可区分；不猜、不伪造干净状态。
+    """
+    try:
+        out = subprocess.run(["git", "status", "--porcelain"],
+                             cwd=str(ROOT), capture_output=True, text=True,
+                             timeout=30)
+    except Exception:                          # noqa: BLE001
+        return []
+    return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()][:limit]
+
+
 def paint_sources_from(args) -> dict:
     """``--paint-source RUN=SOURCE`` -> ``{run: source}``。
 
@@ -1765,10 +1804,26 @@ def _rounds_audit(args, train_runs, log) -> tuple:
                                buffer_m=SPATIAL_BUFFER_M)
     exp_leak = group_exposure_leak(list(mf_tr.records)
                                    + list(mf_dev.records))
+    # 评价集里**被接受**的帧（按目录分组）：身份/候选评价必须消费这份唯一
+    # 清单，而不是让探针各自 glob —— 目录复制会带回同一张图的多份拷贝，
+    # 实测 159 次输入里只有 136 张唯一图（独立复核实测：两个字节相同的目录
+    # 会让 rounds 的 C 从 10 变 20，与标定的 10 不一致）。
+    dev_frames_by_dir: dict = {}
+    for r in mf_dev.records:
+        if r.reject_reason:
+            continue
+        _k = str(Path(r.path).parent).replace("\\", "/")
+        dev_frames_by_dir.setdefault(_k, []).append(r.path)
     report = {"dataset_id": mf_tr.dataset_id,
               "dev_dataset_id": mf_dev.dataset_id,
               "train_groups": train_groups, "dev_groups": dev_groups,
               "group_overlap": overlap, "coverage": cov,
+              # 数据入口四计数（看板"数据入口"面板）需要的原始量：生成=清单全部
+              # 记录（含被拒），评价=开发集记录数，复核=开发集 paint 档位有效帧。
+              "n_records_train": len(mf_tr.records),
+              "n_records_dev": len(mf_dev.records),
+              "coverage_dev": mf_dev.coverage().get("dev", {}),
+              "dev_frames_by_dir": dev_frames_by_dir,
               "spatial": spatial, "exposure_leak": exp_leak,
               "rejected": rejected, "notes": mf_tr.notes + mf_dev.notes}
     out = exp_dir(args.run_id)
@@ -1887,6 +1942,7 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
     for r in _as_path_list(args.runs):
         if Path(r) not in all_train:
             all_train.append(Path(r))
+    _report: dict = {}      # 审计的逐通道覆盖（判定归因要看本轮依赖的标签）
     if not args.plan_only:
         _report, rc = _rounds_audit(args, all_train, log)
         if rc:
@@ -1903,13 +1959,35 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
         cand_id = f"{prop.get('candidate_id', 'cand')}-r{rnd}"
         if getattr(args, "resume", False) and                 (exp_dir(args.run_id) / f"decision_{cand_id}.json").exists():
             print(f"[rounds] 第 {rnd + 1} 轮 {cand_id} 已有判定：resume 跳过")
-            hist_done = json.loads(
+            _blob_done = json.loads(
                 (exp_dir(args.run_id) / f"decision_{cand_id}.json")
-                .read_text(encoding="utf-8"))["decision"]
+                .read_text(encoding="utf-8"))
+            hist_done = _blob_done["decision"]
             history.append(RoundRecord(round_index=rnd, candidate_id=cand_id,
                                        decision=hist_done["decision"],
-                                       reasons=hist_done["reasons"]))
+                                       reasons=hist_done["reasons"],
+                                       # 旧判定文件没有归因字段：留空串，
+                                       # should_stop 回退旧口径（不猜）
+                                       outcome=str(_blob_done.get(
+                                           "round_outcome") or "")))
             continue
+        # 因子是否**真会生效**（方案 v2 §S5 / T14）：road-only 把 line 类整通道
+        # 屏蔽时，线损失键会照样变成训练器旗标（extra 非空），但没有任何监督
+        # ——历史上有 5 轮就这么白跑了。这一步比"至少有一个键变成旗标"更严：
+        # 先判监督模式，再让 factor_to_flags/arm_runs 判实现是否存在。
+        _road_only = bool(getattr(args, "allow_road_only", False))
+        _fact_act = factor_activity(factor, line_supervision=not _road_only)
+        if not _fact_act["active"] and not args.plan_only:
+            _note = "factor_not_applied: " + _fact_act["why"]
+            _log_give_up(log, args.run_id, cand_id, "factor_not_applied",
+                         _note, phase="needs_review")
+            print(f"[rounds] 第 {rnd + 1} 轮拒绝训练：{_note}")
+            print("  无效因子会让候选臂与基线臂在**实际监督**上完全相同，"
+                  "跑出来的只是白跑一轮（无收益也不构成平台期证据）。")
+            return 3
+        if not _fact_act["active"]:
+            print(f"[plan] 第 {rnd + 1} 轮因子被判 inactive：{_fact_act['why']}"
+                  "（真实运行时这一轮会被拒绝）")
         extra, skipped = factor_to_flags(factor)
         cand_runs, data_note = arm_runs(args.runs, factor)
         # 因子未生效就拒绝训练：候选臂与基线臂输入相同，跑不出证据
@@ -1973,7 +2051,9 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 # 任务主指标也逐 seed 收（方案 G05）：判定要求主指标有可信改善，
                 # 只送 IoU 等于让任何候选都晋不了级。
                 _idb = identity_metrics(out / "checkpoint_last.pt",
-                                        args.eval_runs)
+                                        args.eval_runs,
+                                        frames_by_dir=_report.get(
+                                            "dev_frames_by_dir"))
                 champ_task[str(seed)] = {
                     name: task_metric_value(name, m, _idb)
                     for name in TASK_METRICS}
@@ -2037,7 +2117,8 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
         hard_measured: dict = {}
         hard_by_seed: dict = {}          # 每个 seed 自己的硬门度量
         scene_by_seed: dict = {}         # 每个 seed 的分场景度量
-        scene_ident_by_seed: dict = {}   # 分场景候选口径（只上报）
+        scene_ident_by_seed: dict = {}   # 分场景**整数计数**（判定用，下限按 R）
+        scene_ratios_by_seed: dict = {}  # 分场景比率（只上报，不参与判定）
         for seed in args.seeds:
             out = exp_dir(args.run_id) / f"round{rnd}" / f"seed{seed}"
             _cmd = train_cmd(args, cand_runs, out, seed, extra)
@@ -2058,7 +2139,9 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 metrics[_key] if metrics.get(_key) is not None
                 else metrics.get("line_iou") or 0.0)
             _idc = identity_metrics(out / "checkpoint_last.pt",
-                                    args.eval_runs)
+                                    args.eval_runs,
+                                    frames_by_dir=_report.get(
+                                        "dev_frames_by_dir"))
             cand_task[str(seed)] = {
                 name: task_metric_value(name, metrics, _idc)
                 for name in TASK_METRICS}
@@ -2131,9 +2214,19 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 scene_by_seed[str(seed)] = {
                     str(g): _seed_hard(gm, None, gm.get("inference_ms_p95"))
                     for g, gm in _pg.items()}
+            # 逐场景**整数计数**（判定用）与**比率**（只上报）必须分开取：
+            # 旧实现把 `_idc["per_group"]`（键是比率名）当计数读
+            # （键 P_frames/C/R/M/L/A），于是每个场景都被读成 P_frames=0，
+            # 真实有线场景被判 not_applicable，R<30 的下限在 rounds 路径
+            # 永不触发（独立复核实测：P=3,C=100,R=62,M=9 的输入判定全 0）。
+            if _idc.get("counts_by_group"):
                 scene_ident_by_seed[str(seed)] = {
-                    str(g): dict(iv or {})
-                    for g, iv in ((_idc.get("per_group") or {}).items())}
+                    str(g): dict(cv or {})
+                    for g, cv in _idc["counts_by_group"].items()}
+            if _idc.get("ratios_by_group"):
+                scene_ratios_by_seed[str(seed)] = {
+                    str(g): dict(rv or {})
+                    for g, rv in _idc["ratios_by_group"].items()}
         # 按 **seed** 配对：顺序/数量不一致说明对照不完整，拒绝而不是截断
         missing = [str(s) for s in args.seeds if str(s) not in champ_by_seed]
         if missing:
@@ -2250,7 +2343,9 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
             print(f"[rounds] 场景 UNKNOWN：{_m}")
         # 分场景候选口径（匹配率/覆盖/左右角色）：**只上报不进硬门**——
         # 单场景候选数可能只有几个，逐场景身份门槛尚未标定（方案 §10.2）。
-        _scene_keys = sorted({g for d in scene_ident_by_seed.values()
+        # 取的是**比率**字典（`ratios_by_group`），不是判定用的整数计数：
+        # 两者键空间不同，混用会把比率读成 None（旧实现正是这样读错的）。
+        _scene_keys = sorted({g for d in scene_ratios_by_seed.values()
                               for g in d})
         _cand_fields = ("candidate_identity_rate",
                         "candidate_reference_coverage",
@@ -2259,7 +2354,7 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
         for _g in _scene_keys:
             scene_candidates[_g] = {
                 f: _mean_or_none([(d.get(_g) or {}).get(f)
-                                  for d in scene_ident_by_seed.values()])
+                                  for d in scene_ratios_by_seed.values()])
                 for f in _cand_fields}
         # 缺测与硬门：总体、逐 seed、分场景三路都要进来（方案 §10.2/A7）
         # 缺测与违反**分两路**（方案 §10.3 的判定顺序）：池化的硬门输入里
@@ -2328,8 +2423,36 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                      confirmation_issues=_conf_issues,
                      hard_gate_violations=_violations)
         dec = _block_research_promotion(dec, _research)
+        # 单因归因（方案 v2 §S5）：停止条件只统计"有意义的无收益"。资格失败/
+        # 缺标注/无效因子各自另有原因，不能当"模型没有提升空间"的证据。
+        # labels_ok 看**本轮判定依赖的通道**：road-only 按 road_iou 晋级，
+        # 公路标签可用即可；线通道模式由审计的 paint 门保证。
+        # 审计报告里的 ``coverage`` 本身就是 train split 的逐通道覆盖
+        # （`mf_tr.coverage()["train"]`），不要再 .get("train") 一层
+        _cov_tr = (_report or {}).get("coverage") or {}
+        _labels_ok = bool(int(_cov_tr.get(
+            "road_valid_frames" if road_only else "paint_valid_frames") or 0))
+        _outcome = classify_round_outcome(
+            decision=dec["decision"], factor_active=bool(_fact_act["active"]),
+            labels_ok=_labels_ok, eligibility_ok=not _research)
         blob = {"candidate_id": cand_id,
                 "research_only": bool(_research),
+                "factor_activity": _fact_act,
+                "round_outcome": _outcome,
+                # 本轮身份（看板第一面板）：commit/dirty、实际设备、数据入口四计数。
+                # 定义写死在这里，避免看板各算一套：
+                #   generated=清单全部记录（含被拒）；reviewed=评价集 paint 档有效帧；
+                #   trained=训练集 trainable 帧；evaluated=评价集记录数。
+                "git_commit": _git_commit(ROOT),
+                "git_dirty": _git_dirty_paths(),
+                "device": str(getattr(args, "device", "") or ""),
+                "data_counts": {
+                    "generated": int(_report.get("n_records_train") or 0)
+                                 + int(_report.get("n_records_dev") or 0),
+                    "reviewed": int(((_report.get("coverage_dev") or {})
+                                     .get("paint_valid_frames")) or 0),
+                    "trained": int(_cov_tr.get("trainable_frames") or 0),
+                    "evaluated": int(_report.get("n_records_dev") or 0)},
                 "paint_sources": paint_sources_from(args),
                 "paint_source_resolution": _src_res,
                 "thresholds": {"config_hash": t.config_hash,
@@ -2352,6 +2475,10 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 "counts": _idc.get("counts") or {},
                 "counts_by_group": _idc.get("counts_by_group") or {},
                 "scene_counts": _scene_counts,
+                # 逐场景适用性（measured/not_applicable/unknown）：只写
+                # scene_counts 的话，看板只能显示"无数据"，看不到
+                # "确认真无线"与"有线但 R=0（UNKNOWN）"的分别（独立复核指出）。
+                "scene_applicability": _sc["scenes"],
                 "per_scene": per_scene,
                 "scene_candidates": scene_candidates,
                 "final_confirmation": _conf,
@@ -2470,7 +2597,8 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
               f"identity {hard['candidate_identity_rate']}）")
         history.append(RoundRecord(round_index=rnd, candidate_id=cand_id,
                                    decision=dec["decision"],
-                                   reasons=dec["reasons"]))
+                                   reasons=dec["reasons"],
+                                   outcome=_outcome))
         # 真实累计（方案 G08）：原来传 0，预算停止条件在 rounds 里永远不触发
         stop = should_stop(cfg, history,
                            gpu_minutes_today=machine_gpu_minutes_today(),
@@ -2541,6 +2669,9 @@ def main(argv=None) -> int:
     s.add_argument("--champion-steps", type=int, default=None)
     s.add_argument("--champion-epochs", type=int, default=3)
     s.add_argument("--max-proposals", type=int, default=3)
+    s.add_argument("--allow-road-only", action="store_true",
+                   help="road-only 配方：line 类整通道屏蔽，线损失键判 inactive，"
+                        "不产出这类提议（方案 v2 §S5/T14）")
     s.set_defaults(func=cmd_propose)
 
     s = sub.add_parser("evaluate",
