@@ -797,6 +797,19 @@ class Segmenter:
                     cam_model, pos, heading, ground_z=ground_z,
                     yellow_mask=ym))
         if cv_yellow.any():
+            # 黄色臂的**来源级**实验开关（默认 "1" = 现行为，不改生产默认）：
+            #   "0"/"off"      -> 整条黄色臂不产出候选（消融）
+            #   "corroborated" -> 只保留"学习掩码也覆盖到"的黄色候选（一致性）
+            # 实测（2026-09-27，136 帧人工真值、冻结模型、同一匹配口径）：
+            # **两种模式都与默认逐项相同**（C=848 / R=366 / M=114 / 身份 0.3115）
+            # —— 这条经典黄色臂在这批帧上**没有产出任何候选**。来源臂分解里的
+            # `colour="yellow"` 是**漆色属性**（学习掩码/虚线恢复也按色调标注），
+            # 不是"来自黄色臂"；按 colour 归因会得出错误结论（本轮踩过）。
+            # 注意：候选来源集合属于**冻结口径**（协议 v5 §3.3），本开关只用于
+            # 单因子测量；要改默认必须走协议新版本，不能为了分数临时删来源。
+            _yellow_mode = os.environ.get("BEAMNG_LINE_YELLOW_ARM", "1").lower()
+            if _yellow_mode in ("0", "off"):
+                return out
             for _ymk in _mask_to_markings(
                     cv_yellow.astype(np.uint8) * 255, "yellow",
                     cam_model, pos, heading, ground_z=ground_z,
@@ -823,6 +836,13 @@ class Segmenter:
                     if float(np.count_nonzero(
                             road_mask[_yy, _xx])) / len(_pix) < 0.5:
                         continue                 # off the pavement
+                if _yellow_mode == "corroborated":
+                    _lm = np.asarray(line, dtype=bool)
+                    _lh, _lw = _lm.shape[:2]
+                    _vy = np.clip(_pix[:, 1].astype(int), 0, _lh - 1)
+                    _ux = np.clip(_pix[:, 0].astype(int), 0, _lw - 1)
+                    if np.count_nonzero(_lm[_vy, _ux]) == 0:
+                        continue                 # 学习掩码完全没覆盖 -> 不可信
                 out.append(_ymk)
         return out
 
