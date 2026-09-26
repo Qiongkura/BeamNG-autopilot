@@ -558,6 +558,8 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
           limit: int | None = None, model_path: str | None = None,
           frames: list | None = None,
           device: str | None = None,
+          line_road_keep_frac: float | None = None,
+          line_road_elongated_frac: float | None = None,
           null_shift_m: float | None = None,
           overlay_dir: Path | None = None,
           overlay_limit: int | None = None,
@@ -639,8 +641,17 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
             # the checkpoint is chosen on the SEGMENTER, not on the head: the
             # head is the pipeline, the segmenter owns the weights
             from beamng_autopilot.vision.segmentation import Segmenter
-            _seg = (Segmenter(model_path=model_path, device=device)
-                    if device else Segmenter(model_path=model_path))
+            # 候选层旋钮（单因子实验用，方案 §S2/E2）：默认 None = 用生产常量。
+            # 只影响后处理的候选判据，不动权重；实际取值写进 summary 以便追溯。
+            _seg_kw: dict = {}
+            if device:
+                _seg_kw["device"] = device
+            if line_road_keep_frac is not None:
+                _seg_kw["line_road_keep_frac"] = float(line_road_keep_frac)
+            if line_road_elongated_frac is not None:
+                _seg_kw["line_road_elongated_frac"] = float(
+                    line_road_elongated_frac)
+            _seg = Segmenter(model_path=model_path, **_seg_kw)
             net.add(SemanticHead(segmenter=_seg))
             # 实际设备写进 summary（方案要求测量记录真实设备，不是声明值）：
             # 探针不猜，读 Segmenter 自己的 device 属性；读不到写 UNKNOWN。
@@ -951,6 +962,10 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
         # 实际推理设备（读 Segmenter 的 device；没给权重时是 none，读不到是
         # unknown）——测量记录真实设备，不写声明值
         "device": device_used,
+        # 候选层后处理旋钮的实际取值（None = 生产常量）：单因子实验必须能追溯
+        # "这份数是在哪个后处理配置下测的"
+        "line_road_keep_frac": line_road_keep_frac,
+        "line_road_elongated_frac": line_road_elongated_frac,
         # ground-projected identity, vehicle frame
         "candidates_total": n_cand,
         "candidates_matched": n_match,

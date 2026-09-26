@@ -67,6 +67,9 @@ from beamng_autopilot.experiments.credentials import (  # noqa: E402
 from beamng_autopilot.experiments.labels import (  # noqa: E402
     PAINT_SOURCE_RANK,
 )
+from beamng_autopilot.experiments.negative_scenes import (  # noqa: E402
+    negative_training_eligibility,
+)
 from beamng_autopilot.experiments.protocol import (  # noqa: E402
     COVERAGE_GATE_FROZEN, effective_source, eligibility, protocol_blob,
     snapshot_hash, sources_can_promote, verify_snapshot,
@@ -1706,6 +1709,34 @@ def _git_dirty_paths(limit: int = 20) -> list:
     return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()][:limit]
 
 
+def sum_negative_summaries(per_seed: dict) -> dict:
+    """把逐 seed 的 ``negative_line`` 汇总成一份：**整数相加后再算比率**。
+
+    与候选计数同一契约（方案 v2 §3.3）：先把各 seed 的帧数/像素数相加，再算
+    假线帧率与像素占比；缺计数的 seed 不参与（不按 0 相加）。
+    """
+    rows = [v for v in (per_seed or {}).values() if v]
+    if not rows:
+        return {}
+    keys = ("frames", "eligible_frames", "clean_frames",
+            "false_positive_frames", "false_positive_px", "eligible_px",
+            "positive_frames", "unknown_frames", "empty_frames",
+            "unverified_frames", "unverified_pred_line_px")
+    out = {k: sum(int((r or {}).get(k) or 0) for r in rows) for k in keys}
+    out["n_seeds"] = len(rows)
+    out["status"] = ("measured" if out["eligible_frames"]
+                     else "no_eligible_frames")
+    out["false_positive_frame_rate"] = (
+        None if not out["eligible_frames"]
+        else out["false_positive_frames"] / out["eligible_frames"])
+    out["false_positive_pixel_fraction"] = (
+        None if not out["eligible_px"]
+        else out["false_positive_px"] / out["eligible_px"])
+    out["excluded_frames"] = (out["unverified_frames"] + out["unknown_frames"]
+                              + out["empty_frames"])
+    return out
+
+
 def paint_sources_from(args) -> dict:
     """``--paint-source RUN=SOURCE`` -> ``{run: source}``。
 
@@ -1864,6 +1895,26 @@ def _rounds_audit(args, train_runs, log) -> tuple:
     # 拷贝（实测 159 次输入里只有 136 张唯一图）。键的构造与查法都在
     # `dev_frames_by_dir`/`_canon_dir` 里，避免"两边各写一套"（实测踩过两次）。
     _dev_frames = dev_frames_by_dir(mf_dev.records)
+    # E1 数据纪律（方案 §S6/E1 + §3.5/T10）：全零标线且非 verified 的目录只能作
+    # **弱**负例，且必须在报告里可见——"游戏不提供 line 类"导致的全零是**缺失**，
+    # 不是"确认无线"；可晋级运行里出现这种目录直接拒训。
+    _neg_by_dir: dict = {}
+    for _r in mf_tr.records:
+        if _r.reject_reason:
+            continue
+        _k = _canon_dir(Path(_r.path).parent)
+        _e = _neg_by_dir.setdefault(_k, {
+            "dir": str(Path(_r.path).parent), "n_frames": 0,
+            "n_line_frames": 0, "rank": ""})
+        _e["n_frames"] += 1
+        _e["n_line_frames"] += int(int(_r.line_px or 0) > 0)
+        _e["rank"] = ((_r.quality or {}).get("paint") or {}).get("rank") or _e["rank"]
+    _neg_gate = negative_training_eligibility(
+        list(_neg_by_dir.values()),
+        # 只有"来源全部可晋级"的运行才算 promotion-eligible：其余（含默认引擎
+        # 标签、road-only、显式研究臂）都按研究处理，弱负例允许但必须可见。
+        research=bool(getattr(args, "research_arm", False)) or bool(
+            resolve_paint_sources(args)["research_only"]))
     report = {"dataset_id": mf_tr.dataset_id,
               "dev_dataset_id": mf_dev.dataset_id,
               "train_groups": train_groups, "dev_groups": dev_groups,
@@ -1874,6 +1925,7 @@ def _rounds_audit(args, train_runs, log) -> tuple:
               "n_records_dev": len(mf_dev.records),
               "coverage_dev": mf_dev.coverage().get("dev", {}),
               "dev_frames_by_dir": _dev_frames,
+              "negative_training": _neg_gate,
               "spatial": spatial, "exposure_leak": exp_leak,
               "rejected": rejected, "notes": mf_tr.notes + mf_dev.notes}
     out = exp_dir(args.run_id)
@@ -1882,6 +1934,19 @@ def _rounds_audit(args, train_runs, log) -> tuple:
         json.dumps(report, indent=1, ensure_ascii=False), encoding="utf-8")
     print(f"[rounds] 审计：train groups={train_groups} dev groups={dev_groups} "
           f"trainable={trainable} paint_ok={paint_ok} rejected={len(rejected)}")
+    if _neg_gate["weak"] or _neg_gate["confirmed"] or _neg_gate["rejected"]:
+        print(f"[rounds] 负例目录资格：{_neg_gate['note']}")
+        for _w in _neg_gate["weak"]:
+            print(f"[rounds]   弱负例（研究臂，不得当已确认负例）："
+                  f"{_w['dir']} rank={_w['rank']} 帧={_w['n_frames']}")
+    if _neg_gate["rejected"]:
+        _note = ("weak_negative_training: " + "; ".join(
+            f"{r['dir']}（rank={r['rank']}）" for r in _neg_gate["rejected"]))
+        _log_give_up(log, args.run_id, "audit", "weak_negative_training",
+                     _note, phase="needs_review")
+        print("[rounds] 审计不通过：可晋级运行里出现'全零标线且非 verified'的"
+              "训练目录——它不构成已确认负例（T10），拒绝训练")
+        return report, 3
     for n in report["notes"]:
         print(f"[rounds]   审计提示：{n}")
     if rejected:
@@ -2082,6 +2147,7 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
         cand_epochs = factor_epochs(args.epochs, extra)
         if rnd == 0:
             champ_by_seed: dict = {}
+            base_neg: dict = {}      # 逐 seed 负例诊断（E1 主指标）
             for seed in args.seeds:
                 out = exp_dir(args.run_id) / "baseline" / f"seed{seed}"
                 cmd = train_cmd(args, base_runs, out, seed, [])
@@ -2098,6 +2164,9 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 champ_by_seed[str(seed)] = float(
                     m[_key] if m.get(_key) is not None
                     else m.get("line_iou") or 0.0)
+                # 负例诊断（T10 资格在评价矩阵里判）：两臂都要留档，否则
+                # "加困难负例有没有减少假线"这个 E1 问题在判定文件里看不到
+                base_neg[str(seed)] = m.get("negative_line") or {}
                 # 任务主指标也逐 seed 收（方案 G05）：判定要求主指标有可信改善，
                 # 只送 IoU 等于让任何候选都晋不了级。
                 _idb = identity_metrics(out / "checkpoint_last.pt",
@@ -2156,6 +2225,7 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
             return 3
         # ---- 候选臂 ------------------------------------------------
         cand_by_seed: dict = {}
+        cand_neg: dict = {}      # 逐 seed 负例诊断（E1 主指标）
         cand_task: dict = {}      # 逐 seed 任务主指标（G05）
         timing_repeats: list = []
         plateau_by_seed: dict = {}
@@ -2188,6 +2258,7 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
             cand_by_seed[str(seed)] = float(
                 metrics[_key] if metrics.get(_key) is not None
                 else metrics.get("line_iou") or 0.0)
+            cand_neg[str(seed)] = metrics.get("negative_line") or {}
             _idc = identity_metrics(out / "checkpoint_last.pt",
                                     args.eval_runs,
                                     frames_by_dir=_report.get(
@@ -2549,6 +2620,12 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 "baseline_runs": [str(r) for r in base_runs],
                 "candidate_runs": [str(r) for r in cand_runs],
                 "champ_by_seed": champ_by_seed, "cand_by_seed": cand_by_seed,
+                # 负例诊断逐 seed + 汇总（整数相加后再算比率）：E1 的
+                # "加困难负例有没有减少假线"必须能从判定文件直接读
+                "negative_line_by_seed": {"baseline": base_neg,
+                                          "candidate": cand_neg},
+                "negative_line": {"baseline": sum_negative_summaries(base_neg),
+                                  "candidate": sum_negative_summaries(cand_neg)},
                 "hard_gate": hard,
                 # 等步数对照的证据：两臂**实测**总步数（来自 checkpoint）
                 "steps_by_arm": {
