@@ -19,6 +19,11 @@ param(
     [double]$Hours = 8,
     [int]$GapSeconds = 300,
     [int]$MaxIterations = 0,
+    # 给了前缀就"每轮一个新 run"（见文件头注释）；缺省沿用同一个 RunId
+    [string]$RunIdPrefix = "",
+    # 给了目录就"每轮一个不同的单因子提议"：目录里放 proposals_iNN.json，
+    # 按轮次取（用完从头循环）。这样 4 小时里每轮都是新因子，不重复同一训练。
+    [string]$ProposalDir = "",
     [string]$Repo = (Split-Path -Parent $PSScriptRoot)
 )
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -34,20 +39,41 @@ $deadline = (Get-Date).AddHours($Hours)
 
 Push-Location $Repo
 try {
-    Write-Host ("[soak] run={0} window={1}h gap={2}s -> {3}" -f `
-        $RunId, $Hours, $GapSeconds, $runDir)
+    Write-Host ("[soak] run={0}{1} window={2}h gap={3}s -> {4}" -f `
+        $RunId, $(if ($RunIdPrefix) { " (每轮新 run: ${RunIdPrefix}_iNN)" } else { "" }),
+        $Hours, $GapSeconds, $runDir)
     $iter = 0
     while ((Get-Date) -lt $deadline) {
         if ($MaxIterations -gt 0 -and $iter -ge $MaxIterations) { break }
         $iter++
         $t0 = Get-Date
         $log = Join-Path $runDir ("soak_iter_{0:d3}.log" -f $iter)
-        & $py $entry 'run' '--run-id' $RunId '--no-dry-run' '--config' $Config `
+        if ($RunIdPrefix) {
+            $iterRun = "{0}_i{1:d2}" -f $RunIdPrefix, $iter
+            $iterCfg = Join-Path $runDir ("loop_config_i{0:d2}.json" -f $iter)
+            Copy-Item -LiteralPath $Config -Destination $iterCfg -Force
+            if ($ProposalDir) {
+                $cand = Get-ChildItem -Path $ProposalDir -Filter 'proposals_i*.json' |
+                    Sort-Object Name
+                if ($cand.Count -gt 0) {
+                    $pick = $cand[($iter - 1) % $cand.Count].FullName
+                    $blob = Get-Content -Raw -Encoding UTF8 $iterCfg | ConvertFrom-Json
+                    $blob.proposals = $pick
+                    ($blob | ConvertTo-Json -Depth 6) | Set-Content -Encoding UTF8 $iterCfg
+                    Write-Host ("[soak] iter {0}: 因子 <- {1}" -f $iter,
+                                (Split-Path -Leaf $pick))
+                }
+            }
+        } else {
+            $iterRun = $RunId
+            $iterCfg = $Config
+        }
+        & $py $entry 'run' '--run-id' $iterRun '--no-dry-run' '--config' $iterCfg `
             *>> $log
         $rc = $LASTEXITCODE
         $mins = [math]::Round(((Get-Date) - $t0).TotalMinutes, 2)
         $rec = [ordered]@{
-            iter = $iter; rc = $rc; minutes = $mins
+            iter = $iter; rc = $rc; minutes = $mins; run_id = $iterRun
             at = (Get-Date).ToString('s'); log = (Split-Path -Leaf $log)
         }
         Add-Content -Path $iterLog -Value ($rec | ConvertTo-Json -Compress) `

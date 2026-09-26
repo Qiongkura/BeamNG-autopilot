@@ -153,21 +153,35 @@ def cmd_audit(args) -> int:
                    note="逐通道覆盖 + 泄漏 + 身份检查"))
     trainable = coverage.get("train", {}).get("trainable_frames", 0)
     paint_ok = coverage.get("train", {}).get("paint_valid_frames", 0)
+    # 训练准入看"可用的漆线监督"（弱监督/agent 档 usable=True），晋级才看 valid。
+    # 原来只查 valid -> agent 档研究训练被误挡（实测：agentline 池子被判
+    # "标线真值不可用 -> needs_review"）。
+    paint_usable = coverage.get("train", {}).get("paint_usable_frames", 0)
     if not trainable:
         log.append(_ev(args.run_id, "auditing", "no_trainable_data",
                        dataset=mf.dataset_id,
                        note="没有任何通道有可用真值：停止，不训练"))
         print("[autoloop] 审计失败：没有可用真值，停止")
         return 2
-    if not paint_ok and not args.allow_road_only:
-        # 方案的准入门：有 Tech annotation 但无可靠标线真值 -> 进复核队列
+    _line_sup = bool(paint_sources_from(args))
+    if not paint_usable and not args.allow_road_only and not _line_sup:
+        # 准入门：**连可用的漆线监督都没有**才拒训（有 Tech annotation 但没标线类，
+        # 或来源不可靠且未复核）-> 进复核队列。
         log.append(_ev(args.run_id, "needs_review", "paint_truth_missing",
                        dataset=mf.dataset_id,
-                       note=("有 Tech annotation 但无可靠标线真值：标线通道被屏蔽，"
-                             "需人工修订或单独验证的模拟器真值；"
+                       note=("没有任何可用的标线监督（paint_usable=0）：标线通道"
+                             "无可学内容，需人工修订或单独验证的模拟器真值；"
                              "用 --allow-road-only 可只做路面通道实验")))
-        print("[autoloop] 审计：标线真值不可用 -> needs_review（未训练）")
+        print("[autoloop] 审计：没有可用的标线监督 -> needs_review（未训练）")
         return 3
+    if paint_usable and not paint_ok:
+        # 弱/agent 档：**可以训练**（研究），但真值不是门槛真值 -> 晋级由来源资格挡。
+        log.append(_ev(args.run_id, "auditing", "paint_truth_weak",
+                       dataset=mf.dataset_id,
+                       note=(f"标线监督是弱/agent 档（usable={paint_usable}、"
+                             f"valid=0）：可训练，**不能**当门槛真值或晋级参考")))
+        print(f"[autoloop] 审计：标线监督为弱/agent 档（usable={paint_usable}、"
+              f"valid=0）——可训练，晋级由来源资格挡住")
     log.append(_ev(args.run_id, "training", "ready", dataset=mf.dataset_id,
                    note=f"trainable={trainable} paint_ok={paint_ok}"))
     print(f"[autoloop] 审计通过：dataset_id={mf.dataset_id[:16]} "

@@ -218,6 +218,9 @@ def audit_summary(audits: list[LabelAudit]) -> dict:
     out = {"n_frames": n,
            "road_valid_frames": sum(1 for a in audits if a.road.valid),
            "paint_valid_frames": sum(1 for a in audits if a.paint.valid),
+           #: 可训练/可测量的漆线监督（弱监督与 agent 档算 usable、不算 valid）。
+           #: 训练准入看它；晋级门仍然只看 paint_valid_frames（方案 §6.1）。
+           "paint_usable_frames": sum(1 for a in audits if a.paint.usable),
            "pavement_valid_frames": sum(1 for a in audits
                                         if a.pavement.valid),
            "trainable_frames": sum(1 for a in audits if a.trainable),
@@ -233,4 +236,6 @@ def audit_summary(audits: list[LabelAudit]) -> dict:
     # 每个比例都带分母，避免"没有可比样本"被读成 0%
     out["paint_valid_frac"] = (None if n == 0
                                else round(out["paint_valid_frames"] / n, 4))
+    out["paint_usable_frac"] = (None if n == 0
+                                else round(out["paint_usable_frames"] / n, 4))
     return out
