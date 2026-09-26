@@ -57,6 +57,42 @@ CATEGORIES = (
     ("dirt_shoulder", "铺装/土肩与纯土路", "两种道路类型分别标记，不能混成 road 一类"),
 )
 
+#: 路型取值与必填说明：方案要求"两种道路类型分别标记，不能混成 road 一类就结束"，
+#: 而 worksheet 是复核结论的唯一载体，所以直接把 road_type 写进那几帧的 notes
+#: （不另造文件，也不让审计去猜字段在哪）。
+ROAD_TYPE_VALUES = ("gravel", "asphalt", "shoulder")
+ROAD_TYPE_NOTE = "road_type=（gravel / asphalt / shoulder）"
+ROAD_TYPE_CATEGORIES = ("dirt_shoulder", "no_line_pavement")
+
+
+def worksheet_notes(category: str) -> str:
+    """这一帧的 notes 预填什么：土路/无标线的帧必须补 road_type。
+
+    抽成函数是为了能离线断言"哪几类被要求补路型"——这段逻辑藏在 main() 里时，
+    少写一个类别不会有任何东西报警，而漏掉的正是方案点名的两类之一。
+    """
+    return ROAD_TYPE_NOTE if str(category) in ROAD_TYPE_CATEGORIES else ""
+
+
+def worksheet_rows(starter: list) -> list:
+    """逐帧工作表行：复核人填 reviewer/reviewed_at/verdict/regions(+notes)。"""
+    return [{"path": f["path"], "view": f["view"], "group": f["group"],
+             "category": f["category"], "why_selected": f["why"],
+             "reviewer": "", "reviewed_at": "", "verdict": "",
+             "regions": "", "notes": worksheet_notes(f["category"])}
+            for f in starter]
+
+
+def worksheet_table_md(rows: list) -> list:
+    """工作表表头 + 逐帧行（含 notes 列：路型就写在那一列里）。"""
+    md = ["| # | 帧 | 组 | 类别 | 选帧证据 | reviewer | reviewed_at | "
+          "verdict | regions | notes |",
+          "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
+    for i, r in enumerate(rows, 1):
+        md.append(f"| {i} | `{r['path']}` | `{r['group']}` | {r['category']} | "
+                  f"{r['why_selected']} | | | | | {r['notes']} |")
+    return md
+
 #: 每个类别的取材目录（front_main 优先：评价主视角）
 SOURCES = {
     "clear_paint": ("logs/m5_seg/line_truth_agent_full_20260925/town/front_main",),
@@ -349,13 +385,13 @@ def main(argv=None) -> int:
     worksheet = {
         "why": "逐帧复核工作表：验收要求『能查询任意帧是谁、何时、对哪些类别和区域"
                "做了复核』——复核人填 reviewer/reviewed_at/verdict/regions，"
-               "本文件就是那个查询的载体（不要另造一份）。",
+               "土路与无标线的帧还要在 notes 里补 road_type。本文件就是那个查询"
+               "的载体（不要另造一份）。",
         "categories": {c: {"label": lab, "needs": need}
                        for c, lab, need in CATEGORIES},
-        "rows": [{"path": f["path"], "view": f["view"], "group": f["group"],
-                  "category": f["category"], "why_selected": f["why"],
-                  "reviewer": "", "reviewed_at": "", "verdict": "",
-                  "regions": "", "notes": ""} for f in starter],
+        "road_type_values": list(ROAD_TYPE_VALUES),
+        "road_type_note": ROAD_TYPE_NOTE,
+        "rows": worksheet_rows(starter),
         "verdict_values": ["confirm", "relabel", "reject", "unsure"],
     }
     (out / "review_worksheet.json").write_text(
@@ -364,11 +400,10 @@ def main(argv=None) -> int:
           f"共 {len(worksheet['rows'])} 帧；`verdict` 取值：confirm / relabel / "
           "reject / unsure；`regions` 写「你实际看过并确认的区域」（例如 "
           "`line_left,line_right,road_edge`）。", "",
-          "| # | 帧 | 组 | 类别 | 选帧证据 | reviewer | reviewed_at | verdict | regions |",
-          "| --- | --- | --- | --- | --- | --- | --- | --- | --- |"]
-    for i, r in enumerate(worksheet["rows"], 1):
-        md.append(f"| {i} | `{r['path']}` | `{r['group']}` | {r['category']} | "
-                  f"{r['why_selected']} | | | | |")
+          f"`dirt_shoulder`（土路/土肩）与 `no_line_pavement`（真无线铺装路）的帧，"
+          f"notes 里已预填 `{ROAD_TYPE_NOTE}`，请改成实测值——这两类必须分别标出"
+          "路型，不能只写 road 就结束（方案原文）。", ""]
+    md += worksheet_table_md(worksheet["rows"])
     md += ["", "## 全量清单（6 类 × 20）的可用量与缺口", "",
            "| 类别 | 可用 | 已选 | 缺口 | 说明 |", "| --- | --- | --- | --- | --- |"]
     for cat, _l, _n in CATEGORIES:

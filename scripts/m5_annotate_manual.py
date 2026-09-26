@@ -28,12 +28,26 @@ Tools, all of them clickable in the toolbar at the top of the window:
                 otherwise the last stroke / fill / clear
     clear / zoom / prev / save+next   the other one-click actions
 
-Brushes (toolbar buttons too): line / road / erase plus the three
-"cannot judge" brushes (occluded / blurred / undecidable) which write
-255(IGNORE) and record the reason in the ``unknown_kind`` array.
+Brushes (toolbar buttons too):
+    line / road / erase          the pixel classes (0/1/2 in the label)
+    asphalt / gravel / shoulder  the ROAD TYPE, in its own group, recorded in a
+        separate ``road_type`` array (1/2/3) because the label contract
+        (0/1/2/255) cannot express a material.  The pixel class follows
+        AGENTS.md's driving constraints rather than "painted means road":
+        asphalt and a genuine gravel route are road(1); **shoulder is
+        background(0)** - with pavement present the soil shoulder must not
+        count as road - and it is tinted in the display so a shoulder stroke
+        is never invisible.
+    occluded / blurred / undecidable  write 255(IGNORE) plus the reason in
+        the ``unknown_kind`` array
+
+The interface is in Chinese (PIL renders Microsoft YaHei); with no CJK font
+installed it falls back to the English button names - the letters change, the
+functions do not.
 
 Controls (keyboard kept from the old flow; the buttons show their keys):
     1 / 2 / 3   brush = line / road / background(erase)
+    7 / 8 / 9   brush = asphalt / gravel / shoulder (road type)
     4 / 5 / 6   brush = occluded / blurred / undecidable
     p / f / b   pen / bucket / toggle between them
     l / v       straight line / smooth curve
@@ -73,9 +87,11 @@ import numpy as np
 from beamng_autopilot import config
 from beamng_autopilot.labeling import curve_schema as cs
 from beamng_autopilot.labeling.annotate_session import AnnotateSession
-# 左右侧统计只有一份实现：状态行与导出时的覆盖核查共用它（两个实现迟早会
-# 出现"HUD 说 R=0、导出说右侧漏标"这种自相矛盾）。
-from beamng_autopilot.labeling.annotate_tools import side_line_counts
+# 左右侧统计与路型计数都只有一份实现：状态行、导出核查、审计共用同一个口径
+# （两个实现迟早会出现"HUD 说有 R=0、导出说右侧漏标"这种自相矛盾）。
+from beamng_autopilot.labeling.annotate_tools import (
+    road_type_counts, side_line_counts,
+)
 
 # The pixel classes live in the schema (T10), so the annotator and every
 # metric agree on what 0/1/2/255 mean: 255 is IGNORE, never background.
@@ -342,15 +358,20 @@ def identity_npz_extras(ident: dict) -> dict:
 
 
 def export_frame(path: Path, rgb: np.ndarray, label: np.ndarray,
-                 ident: dict, unknown_kind=None) -> None:
+                 ident: dict, unknown_kind=None, road_type=None) -> None:
     """Save one labelled frame *with* its identity.
 
     ``unknown_kind``（可选）逐像素记录"为什么这里是 255"：1=遮挡 2=模糊
-    3=无法判断。只有非零时才写，保持既有消费者不变。
+    3=无法判断。``road_type``（可选）逐像素记录路面材质：1=沥青 2=碎石
+    3=路肩——方案要求"两种道路类型分别标记，不能混成 road 一类就结束"，而
+    label 的 0/1/2/255 契约表达不了材质，所以另存一列。两者都**只在非零时
+    才写**，既有消费者不变。
     """
     extras = {}
     if unknown_kind is not None and int(np.asarray(unknown_kind).sum()) > 0:
         extras["unknown_kind"] = np.asarray(unknown_kind, dtype=np.uint8)
+    if road_type is not None and int(np.asarray(road_type).sum()) > 0:
+        extras["road_type"] = np.asarray(road_type, dtype=np.uint8)
     np.savez_compressed(str(path), colour=rgb, label=label,
                         **identity_npz_extras(ident), **extras)
 
@@ -637,7 +658,7 @@ def main() -> int:
         for fi0, (_rgb0, src_idx) in enumerate(frames)
         if src_idx in resume_paths_by_source}
 
-    def _on_save(fi, rgb, src_idx, label, unk, ident):
+    def _on_save(fi, rgb, src_idx, label, unk, road_type, ident):
         """保存一帧：导出 npz + 预览图 + 逐帧记录（复标帧覆盖自己的输出）。"""
         if fi not in saved_paths:
             save_i[0] += 1
@@ -645,7 +666,8 @@ def main() -> int:
                 out_dir / f"frame_{save_i[0]:05d}.npz",
                 out_dir / f"preview_{save_i[0]:05d}.png")
         fp, prev = saved_paths[fi]
-        export_frame(fp, rgb, label, ident, unknown_kind=unk)
+        export_frame(fp, rgb, label, ident, unknown_kind=unk,
+                     road_type=road_type)
         engine = (engine_labels[fi]
                   if fi < len(engine_labels) and engine_labels[fi] is not None
                   else None)
@@ -664,6 +686,9 @@ def main() -> int:
             "identity_source": ident.get("identity_source", "unavailable"),
             "identity_missing": list(ident.get("identity_missing") or []),
             "unknown_px": unknown_counts(unk),
+            # 路型逐帧计数：方案要求"两种道路类型分别标记"，所以这里能查
+            # "这一帧标了多少沥青/碎石/路肩像素"，而不是只有 road 一个数
+            "road_type_px": road_type_counts(road_type),
             "side_coverage": cov,
             # 验收要查"对**哪些类别**做了复核"：直接记这一帧各类别的像素数
             "classes_painted": {
