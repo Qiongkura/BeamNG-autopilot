@@ -21,7 +21,8 @@ param(
     [string]$Prefill = "logs\experiments\t14_e0_20260925\seed43\checkpoint_last.pt",
     [switch]$NoPrefill,
     [string[]]$Only = @(),
-    [string]$Reviewer = "",      # 复核人标识（写进 meta.json 的 annotation.reviewer）
+    [string]$Reviewer = "",
+    [switch]$Full,               # 标注**全量**包（packages_full -> reviewed_full）      # 复核人标识（写进 meta.json 的 annotation.reviewer）
     [switch]$List,
     [string]$View = "front_main",
     [string]$Repo = (Split-Path -Parent $PSScriptRoot)
@@ -32,16 +33,25 @@ $ErrorActionPreference = 'Continue'
 $py = Join-Path $Repo '.venv\Scripts\python.exe'
 if (-not (Test-Path $py)) { Write-Error "python venv not found: $py"; exit 2 }
 $packRoot = Join-Path $Repo $PackDir
-$pkgRoot = Join-Path $packRoot 'packages'
+$pkgSub = if ($Full) { 'packages_full' } else { 'packages' }
+$pkgRoot = Join-Path $packRoot $pkgSub
 if (-not (Test-Path $pkgRoot)) { Write-Error "no packages under $pkgRoot"; exit 3 }
-if (-not $OutRoot) { $OutRoot = Join-Path $packRoot 'reviewed' }
+if (-not $OutRoot) {
+    $OutRoot = if ($Full) { Join-Path $packRoot 'reviewed_full' }
+               else { Join-Path $packRoot 'reviewed' }
+}
 
-# 工作表：把"这个包里有哪些类别"提示给标注人（类别是候选归类）
+# 类别提示：按**完整路径**匹配（不同采集里同名帧很常见，只按文件名查会串味——
+# 实测踩到：砾石土路的帧被显示成"清晰漆线"）。文件名只作兜底。
+$byPath = @{}
 $byName = @{}
-$wsPath = Join-Path $packRoot 'review_worksheet.json'
-if (Test-Path $wsPath) {
+foreach ($wsName in @('review_worksheet.json', 'review_worksheet_full.json')) {
+    $wsPath = Join-Path $packRoot $wsName
+    if (-not (Test-Path $wsPath)) { continue }
     $ws = Get-Content -Raw -Encoding UTF8 $wsPath | ConvertFrom-Json
     foreach ($row in $ws.rows) {
+        if (-not $row.path) { continue }
+        $byPath[$row.path] = $row.category
         $k = Split-Path -Leaf $row.path
         if (-not $byName.ContainsKey($k)) { $byName[$k] = $row.category }
     }
@@ -84,7 +94,9 @@ try {
         $frames = Get-ChildItem (Join-Path $pkg.FullName $View) -Filter 'frame_*.npz'
         $cats = @{}
         foreach ($f in $frames) {
-            $c = if ($byName.ContainsKey($f.Name)) { $byName[$f.Name] } else { '未标注类别' }
+            $c = if ($byPath.ContainsKey($f.FullName)) { $byPath[$f.FullName] }
+                 elseif ($byName.ContainsKey($f.Name)) { $byName[$f.Name] }
+                 else { '未标注类别' }
             $cats[$c] = ($cats[$c] + 1)
         }
         $catTxt = ($cats.GetEnumerator() | Sort-Object Name | ForEach-Object { "$($_.Key)×$($_.Value)" }) -join '、'

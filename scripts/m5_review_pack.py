@@ -382,6 +382,71 @@ def main(argv=None) -> int:
     (out / "review_pack.json").write_text(
         json.dumps(pack, indent=1, ensure_ascii=False), encoding="utf-8")
 
+    # ---- 全量可标注包（方案 §6.3 的 6 类 × 20 = 120，实际 117）----------
+    full_meta = []
+    for cat, label, need in CATEGORIES:
+        for f in plan[cat]["frames"]:
+            full_meta.append({**f, "category": cat, "category_label": label})
+    # 并入**已经复核过**的帧：它们是同一批池子里选出来的，没必要重标；
+    # 按 (组, 曝光) 去重，并标 already_reviewed 供监督器提示。
+    reviewed_dirs = sorted((Path(args.out) / "reviewed").glob("*/front_main"))
+    starter_cat = {}
+    ws = Path(args.out) / "review_worksheet.json"
+    if ws.is_file():
+        try:
+            for row in (json.loads(ws.read_text(encoding="utf-8")).get("rows")
+                        or []):
+                starter_cat[str(row.get("path"))] = row.get("category")
+        except Exception:                                  # noqa: BLE001
+            starter_cat = {}
+    have = {(str(f.get("group")), f.get("exposure")) for f in full_meta}
+    n_done = 0
+    for d in reviewed_dirs:
+        for f in sorted(d.glob("frame_*.npz")):
+            key = None
+            cat = starter_cat.get(str(f), "")
+            # 组与曝光：从所在包的 meta 里读（复核目录的 meta 是采集 meta 的子集）
+            try:
+                meta = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+                rec = next((r for r in (meta.get("frames") or [])
+                            if Path(str(r.get("path") or "")).name == f.name),
+                           {})
+                key = (str(meta.get("map_name") or "") + "/"
+                       + str(meta.get("source_id") or ""), rec.get("exposure"))
+            except Exception:                              # noqa: BLE001
+                key = None
+            if key and key in have:
+                n_done += 1          # 已在全量清单里：算已完成
+                continue
+            full_meta.append({
+                # 必须存**绝对路径**：打包工具按 collection/path 找源帧，相对路径
+                # 会拼成 collection/logs/... 从而全部"缺失"（实测踩到）
+                "path": str(Path(f).resolve()), "view": d.name,
+                "group": (key or ("", ""))[0],
+                "exposure": (key or (None, None))[1],
+                "line_pixels": None, "pos": None, "heading": None,
+                "category": cat or "already_reviewed",
+                "category_label": "已复核（并入全量包）",
+                "already_reviewed": True})
+            if key:
+                have.add(key)
+    print(f"[review-pack] 已复核帧：{n_done} 帧已在全量清单里、"
+          f"{len([f for f in full_meta if f.get('already_reviewed')])} 帧并入")
+    full_pack = {
+        "why": "W1 §6.3 **全量评价集**：6 类各 20 帧（实际 117，缺口见 "
+               "review_plan.json）。同组帧按曝光去重；类别是候选归类，"
+               "最终以复核人看到的为准。",
+        "view": args.view, "n_frames": len(full_meta),
+        "by_category": {c: plan[c]["n_selected"] for c, _l, _n in CATEGORIES},
+        "frames": [{k: f.get(k) for k in
+                    ("view", "path", "line_pixels", "pos", "heading",
+                     "exposure")} | {"category": f["category"],
+                                     "group": f["group"]}
+                   for f in full_meta],
+    }
+    (out / "review_pack_full.json").write_text(
+        json.dumps(full_pack, indent=1, ensure_ascii=False), encoding="utf-8")
+
     worksheet = {
         "why": "逐帧复核工作表：验收要求『能查询任意帧是谁、何时、对哪些类别和区域"
                "做了复核』——复核人填 reviewer/reviewed_at/verdict/regions，"
@@ -428,39 +493,50 @@ def main(argv=None) -> int:
         """帧路径 -> 它的采集目录（view 目录的父目录）。"""
         return Path(frame_path).parent.parent
 
-    per_coll: dict = {}
-    for f in starter:
-        per_coll.setdefault(str(_collection_of(f["path"])), []).append(f)
-    pkg_dir = out / "packages"
-    pkg_dir.mkdir(parents=True, exist_ok=True)
-    # 队列与包**分开放**：包目录会被整体重建（清掉重打），队列若放在里面会一起没
-    q_dir = out / "queues"
-    q_dir.mkdir(parents=True, exist_ok=True)
-    cmds = []
-    for coll, frames in sorted(per_coll.items()):
-        slug = Path(coll).name
-        q = q_dir / f"queue_{slug}.json"
-        q.write_text(json.dumps(
-            {"why": f"起步包的一个子集：来自 {coll}（一次采集一个包，"
-                    "身份才不会张冠李戴）",
-             "view": args.view, "n_frames": len(frames),
-             "frames": [{k: f.get(k) for k in
-                         ("view", "path", "line_pixels", "pos", "heading",
-                          "exposure")} for f in frames]},
-            indent=1, ensure_ascii=False), encoding="utf-8")
-        cmds.append((coll, slug, q))
-    ps1 = out / "build_packages.ps1"
-    lines = ["# 逐采集打标注包（起步包跨多次采集，必须分开打）",
-             "$ErrorActionPreference = 'Stop'",
-             "[Console]::OutputEncoding = [Text.Encoding]::UTF8"]
-    for coll, slug, q in cmds:
-        lines.append(
-            f"& .venv\Scripts\python.exe scripts\m5_annotate_package.py "
-            f"--review-queue '{q}' --collection '{coll}' "
-            f"--out '{pkg_dir / ('pkg_' + slug)}'")
-    ps1.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    def _split_and_emit(frames: list, tag: str, why: str) -> tuple:
+        """把一批帧按采集拆成队列 + 生成打包脚本（返回 (cmds, ps1)）。"""
+        per_coll: dict = {}
+        for f in frames:
+            per_coll.setdefault(str(_collection_of(f["path"])), []).append(f)
+        q_dir = out / f"queues{tag}"
+        q_dir.mkdir(parents=True, exist_ok=True)
+        cmds = []
+        for coll, group in sorted(per_coll.items()):
+            slug = Path(coll).name
+            q = q_dir / f"queue_{slug}.json"
+            q.write_text(json.dumps(
+                {"why": f"{why}：来自 {coll}（一次采集一个包，身份才不会张冠李戴）",
+                 "view": args.view, "n_frames": len(group),
+                 "frames": [{k: f.get(k) for k in
+                             ("view", "path", "line_pixels", "pos", "heading",
+                              "exposure")} for f in group]},
+                indent=1, ensure_ascii=False), encoding="utf-8")
+            cmds.append((coll, slug, q))
+        pkg_dir = out / f"packages{tag}"
+        pkg_dir.mkdir(parents=True, exist_ok=True)
+        ps1 = out / f"build_packages{tag}.ps1"
+        ps_lines = [f"# 逐采集打标注包（{why}；跨多次采集，必须分开打）",
+                    "$ErrorActionPreference = 'Stop'",
+                    "[Console]::OutputEncoding = [Text.Encoding]::UTF8"]
+        for coll, slug, q in cmds:
+            ps_lines.append(
+                "& .venv" + chr(92) + "Scripts" + chr(92) + "python.exe "
+                "scripts" + chr(92) + "m5_annotate_package.py "
+                f"--review-queue '{q}' --collection '{coll}' "
+                f"--per-view 80 "
+                f"--out '{pkg_dir / ('pkg_' + slug)}'")
+        ps1.write_text("\n".join(ps_lines) + "\n", encoding="utf-8")
+        return cmds, ps1
+
+    cmds, ps1 = _split_and_emit(starter, "", "起步包的一个子集")
     print(f"[review-pack] 起步包 {len(starter)} 帧 -> {out / 'review_pack.json'}")
-    print(f"[review-pack] 按采集拆成 {len(cmds)} 个包（命令 -> {ps1}）")
+    print(f"[review-pack]   按采集拆成 {len(cmds)} 个包（命令 -> {ps1}）")
+    cmds_full, ps1_full = _split_and_emit(
+        full_meta, "_full", "全量评价集的一个子集")
+    print(f"[review-pack] 全量包 {len(full_meta)} 帧 -> "
+          f"{out / 'review_pack_full.json'}")
+    print(f"[review-pack]   按采集拆成 {len(cmds_full)} 个包"
+          f"（命令 -> {ps1_full}）")
     for cat, label, _need in CATEGORIES:
         p = plan[cat]
         print(f"[review-pack]   {label}: 可用 {p['n_available']} / 已选 "
@@ -470,6 +546,9 @@ def main(argv=None) -> int:
     print(f"[review-pack] 工作表 -> {out / 'review_worksheet.md'} / .json")
     print(f"[review-pack] 全量清单 -> {out / 'review_plan.json'}")
     print("[review-pack] 下一步（可直接粘贴，逐采集各打一个包）：")
+    print(f"  # 全量 {len(full_meta)} 帧：")
+    print(f"  pwsh -NoProfile -ExecutionPolicy Bypass -File {ps1_full}")
+    print(f"  # 只要起步 {len(starter)} 帧：")
     print(f"  pwsh -NoProfile -ExecutionPolicy Bypass -File {ps1}")
     return 0
 

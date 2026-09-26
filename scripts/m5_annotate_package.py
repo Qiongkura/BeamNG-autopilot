@@ -165,6 +165,15 @@ def build_package(*, collection: Path, frames: list, out: Path,
         st["paint_px"] += int(f.get("line_pixels") or 0)
         if st["pos_first"] is None:
             st["pos_first"] = f.get("pos")
+    # 一帧都没拷到时给可读错误：原来会先写 README，而 out/<view> 没被创建 ->
+    # FileNotFoundError 栈（实测踩到：队列里的路径与 collection 拼不上时）
+    copied = sum(int(v.get("frames") or 0) for v in per.values())
+    if copied == 0:
+        print(f"[pkg] 一帧都没拷到：检查队列里的 path 与 --collection 能否拼上"
+              f"（collection={collection}，前几个缺失："
+              f"{[m for v in per.values() for m in (v.get('missing') or [])][:3]}）")
+        return per
+    out.mkdir(parents=True, exist_ok=True)
     _write_readme(out, collection=collection, per=per, prefill=prefill,
                   seed=seed, per_view=per_view)
     return per
