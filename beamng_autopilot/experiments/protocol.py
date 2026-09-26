@@ -21,7 +21,7 @@ import json
 from .labels import PAINT_SOURCE_RANK
 
 #: 协议版本：定义/覆盖/资格任一处改动都要递增，并写进判定文件
-PROTOCOL_VERSION = "t14-protocol-v4"
+PROTOCOL_VERSION = "t14-protocol-v5"
 
 # ---------------------------------------------------------------------------
 # 指标字典：name -> 定义
@@ -254,6 +254,62 @@ AGGREGATION: dict = {
 #: 参考可判）；无标线场景没有参考、覆盖率天然为 0，**不计入该门**。
 COVERAGE_GATE_FROZEN = True
 
+#: 候选计数契约（v5，方案 v2 §3.3/§3.4）：**先累加整数、再算比率**。
+#: 实现在 `experiments/candidate_metrics.py`，所有入口共用这一份。
+CANDIDATE_COUNTING = {
+    "counters": {
+        "P_frames": "frames whose truth explicitly contains line pixels "
+                    "(judged per frame, never per group)",
+        "C": "candidates produced inside P frames (the coverage denominator)",
+        "C_outside_P": "candidates in frames without line truth (reported only; "
+                       "never in the coverage denominator)",
+        "R": "candidates whose own side has a usable truth reference",
+        "M": "matched candidates (M is a subset of R)",
+        "L": "matched candidates with a judgeable left/right role (subset of M)",
+        "A": "role-agreeing candidates (subset of L)",
+    },
+    "ratios": {"candidate_reference_coverage": "R/C",
+               "candidate_identity_rate": "M/R",
+               "left_right_role_agreement": "A/L"},
+    "aggregation": "integer sums (micro) for the primary gate; macro may be "
+                   "shown only with its unit (one unit per scene with a "
+                   "denominator); never average per-directory ratios",
+    "zero_denominator": "null plus a reason - never 0 and never a full score",
+    "sample_floor": "per_scene_min_candidates counts R (the identity "
+                    "denominator), not C: C=100 with R=1 is still insufficient",
+    "legacy": {"candidate_identity_rate_legacy_match_rate":
+               "the old raw match_rate (denominator = all candidates, "
+               "including those without a reference); kept explicitly named, "
+               "not consumed by any gate"},
+}
+
+#: 适用性取值（方案 v2 §3.4）：只有可信输入与冻结任务范围能派生 not_applicable，
+#: 调用方不能自行写入以旁路硬门。
+APPLICABILITY = {
+    "measured": "counts are usable as a result",
+    "not_applicable": "confirmed line-free scene with complete reference: the "
+                      "coverage/recall gates do not apply (judge by the "
+                      "negative-line/boundary task instead)",
+    "unknown": "no line truth established, or no candidates to judge",
+    "unverified_labels": "labels are not verified: diagnostic only",
+}
+
+#: 负例（无标线）诊断：**版本化诊断指标**，本轮不设阈值、不进晋级门。
+NEGATIVE_DIAGNOSTIC = {
+    "source": "experiments/negative_scenes.py (exact per-frame counters)",
+    "eligibility": "verified labels, complete line supervision, non-empty "
+                   "evaluation area with no UNKNOWN, and no true line pixels",
+    "metrics": {
+        "false_positive_frame_rate": "frames with >=1 predicted line pixel / "
+                                     "eligible negative frames",
+        "false_positive_pixel_fraction": "false-positive pixels / total pixels "
+                                         "of those frames",
+    },
+    "not_comparable_with": "offroad_false_ratio (denominator = predicted line "
+                           "pixels in the known area)",
+    "gate": "none this round: no threshold before an independent calibration",
+}
+
 #: 候选口径门槛（v4 标定值；进 `protocol_blob()` 哈希）。
 CANDIDATE_GATES = {
     "candidate_reference_coverage_min": 0.80,
@@ -281,6 +337,9 @@ def protocol_blob(*, thresholds: dict | None = None) -> dict:
         "statistics": STATISTICS,
         "aggregation": AGGREGATION,
         "candidate_gates": CANDIDATE_GATES,
+        "candidate_counting": CANDIDATE_COUNTING,
+        "applicability": APPLICABILITY,
+        "negative_diagnostic": NEGATIVE_DIAGNOSTIC,
         "coverage_gate_frozen": bool(COVERAGE_GATE_FROZEN),
         "spatial_buffer_m": SPATIAL_BUFFER_M,
         "spatial_buffer_note": SPATIAL_BUFFER_NOTE,
@@ -293,7 +352,8 @@ def protocol_blob(*, thresholds: dict | None = None) -> dict:
 SNAPSHOT_FIELDS = ("version", "metrics", "coverage_requirements",
                    "min_eval_groups", "primary_eval_view", "source_eligibility",
                    "research_only_ranks", "statistics", "aggregation",
-                   "candidate_gates", "coverage_gate_frozen",
+                   "candidate_gates", "candidate_counting", "applicability",
+                   "negative_diagnostic", "coverage_gate_frozen",
                    "spatial_buffer_m", "spatial_buffer_note", "thresholds")
 
 
