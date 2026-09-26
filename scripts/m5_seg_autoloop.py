@@ -1346,6 +1346,9 @@ def _identity_rate(model_path: Path, eval_runs: list) -> float | None:
 #: 训练器开关型因子（值是标量）。``run_weights`` 是字典型，单独格式化。
 TRAINER_FLAG_FACTORS = ("epochs", "lr", "line_weight", "line_tversky_weight",
                         "line_cldice_weight", "line_tversky_beta",
+                        # FP/FN 方向旋钮（T15）：训练器一直有这个参数，但没进
+                        # 白名单 -> 提议器发不出来（S6 E2 需要它做方向实验）
+                        "line_tversky_alpha",
                         "run_weights",
                         # 容量族：数据与步数不动，只改模型宽度（参数约按平方增长）。
                         # 加这一族是因为前两条杠杆都测到了边界：单段新数据 <1 点且

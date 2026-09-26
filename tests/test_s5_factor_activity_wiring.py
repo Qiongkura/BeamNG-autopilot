@@ -174,3 +174,23 @@ def test_the_propose_cli_exposes_the_road_only_switch(tmp_path):
     """propose 子命令必须能拿到监督模式：否则提议阶段仍会产出线损失因子。"""
     r = _run(["propose", "--help"], tmp_path, expect=0)
     assert "--allow-road-only" in r.stdout, r.stdout
+
+
+def test_the_fp_fn_direction_knob_reaches_the_training_command(tmp_path):
+    """S6 E2 前置：`line_tversky_alpha` 必须能变成训练器旗标。
+
+    实测依据（T15）：只有 `beta/alpha` 比值决定 FP/FN 方向，而 alpha 一直不在
+    提议白名单里 -> 方向实验提议不出来。训练器本身早就有 `--line-tversky-alpha`。
+    """
+    loop = _load()
+    flags, skipped = loop.factor_to_flags({"line_tversky_alpha": 0.5})
+    assert flags == ["--line-tversky-alpha", "0.5"], flags
+    assert not skipped, skipped
+    # 方向旋钮属于线通道：road-only 下必须判 inactive（与其它线损失键一致）
+    from beamng_autopilot.experiments.proposer import (
+        LINE_LOSS_KEYS, factor_activity)
+    assert "line_tversky_alpha" in LINE_LOSS_KEYS
+    assert factor_activity({"line_tversky_alpha": 0.5},
+                           line_supervision=False)["active"] is False
+    assert factor_activity({"line_tversky_alpha": 0.5},
+                           line_supervision=True)["active"] is True
