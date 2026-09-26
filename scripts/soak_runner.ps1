@@ -24,6 +24,9 @@ param(
     # 给了目录就"每轮一个不同的单因子提议"：目录里放 proposals_iNN.json，
     # 按轮次取（用完从头循环）。这样 4 小时里每轮都是新因子，不重复同一训练。
     [string]$ProposalDir = "",
+    # 每轮后删掉逐 epoch 中间产物（epoch_*.pt）：4h 窗口实测它们会吃掉 ~25 GB，
+    # 把磁盘压到资源门以下、后 9 轮全被拦。checkpoint_last/best/判定/日志都保留。
+    [switch]$KeepEpochCheckpoints,
     [string]$Repo = (Split-Path -Parent $PSScriptRoot)
 )
 [Console]::OutputEncoding = [Text.Encoding]::UTF8
@@ -79,6 +82,23 @@ try {
         Add-Content -Path $iterLog -Value ($rec | ConvertTo-Json -Compress) `
             -Encoding UTF8
         Write-Host ("[soak] iter {0}: rc={1} {2} min" -f $iter, $rc, $mins)
+        if (-not $KeepEpochCheckpoints) {
+            $freed = 0
+            $n = 0
+            $iterDir = Join-Path $Repo ("logs\experiments\" + $iterRun)
+            if (Test-Path $iterDir) {
+                foreach ($f in Get-ChildItem -Path $iterDir -Recurse -Filter 'epoch_*.pt' `
+                        -ErrorAction SilentlyContinue) {
+                    $freed += $f.Length
+                    Remove-Item -LiteralPath $f.FullName -Force -ErrorAction SilentlyContinue
+                    $n++
+                }
+            }
+            if ($n -gt 0) {
+                Write-Host ("[soak]   清理逐 epoch 中间产物 {0} 个，释放 {1:N2} GB" -f `
+                    $n, ($freed / 1GB))
+            }
+        }
         if ((Get-Date) -ge $deadline) { break }
         Start-Sleep -Seconds $GapSeconds
     }
