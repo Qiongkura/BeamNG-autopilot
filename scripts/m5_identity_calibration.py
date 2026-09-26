@@ -33,21 +33,32 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
+from beamng_autopilot.experiments import candidate_metrics as cm  # noqa: E402
+from beamng_autopilot.experiments.checkpoint import file_sha16  # noqa: E402
 from beamng_autopilot.experiments.manifest import dir_group  # noqa: E402
 
 
-def audited_inventory(pack_dir: Path) -> dict:
-    """**唯一**评价清单：内容去重 + 拒绝理由 + 逐帧标签哈希（方案 v2 §3.1）。
+def audited_inventory(pack_dir: Path,
+                      *, trees: tuple = ("reviewed_full",)) -> dict:
+    """**唯一**评价清单：内容去重 + 冲突隔离 + 拒绝理由（方案 v2 §3.1）。
 
     标定与评价都消费这一份，禁止各自 glob（实测：两棵树重叠 -> 159 输入里
     只有 136 张唯一图、22 个重复内容组）。返回
-    ``{records, rejected, by_scene, by_dir, raw_inputs}``；``records`` 里每条带
-    ``path/group/view/label_sha16``。
+    ``{records, rejected, by_scene, by_dir, raw_inputs, conflicts, aliases}``；
+    ``records`` 里每条带 ``path/group/view/label_sha16``。
+
+    ``trees``：参与测量的目录树，**必须显式给出**（默认只取完成版
+    ``reviewed_full``）。实测（2026-09-26）：把早先的预览包 ``reviewed`` 一起
+    混进来会产生 24 个内容冲突组——同一张图在预览包里被复制进两个槽位、且两次
+    人工标注不同（打包缺陷，已在 ``m5_review_pack.py`` 的池内去重修掉）。
+    预览包是**被取代的**输入：把它计入测量等于用同一张图的两份矛盾标签；
+    排除它不等于"放行冲突"——冲突仍在 union 审计里逐条记录（见
+    ``audit_union``），只是不进入测量分母。完成版单独审计为 136/136 无冲突。
     """
     from beamng_autopilot.experiments.manifest import DatasetManifest
     dirs = []
     raw = 0
-    for tree in ("reviewed", "reviewed_full"):
+    for tree in trees:
         for d in sorted((pack_dir / tree).glob("*/front_main")):
             n = len(list(d.glob("frame_*.npz")))
             if n:
@@ -57,23 +68,28 @@ def audited_inventory(pack_dir: Path) -> dict:
     records = [{"path": r.path, "group": r.group, "view": r.view,
                 "label_sha16": r.label_sha16, "run": r.run}
                for r in mf.records if not r.reject_reason]
-    rejected = [{"path": r.path, "run": r.run, "reason": r.reject_reason}
+    rejected = [{"path": r.path, "run": r.run, "reason": r.reject_reason,
+                 "code": getattr(r, "reject_code", "")}
                 for r in mf.records if r.reject_reason]
     by_scene: dict = {}
     by_dir: dict = {}
     for r in records:
         by_scene.setdefault(r["group"], []).append(r["path"])
         by_dir.setdefault(str(Path(r["path"]).parent), []).append(r["path"])
-    # 同一内容多份拷贝（重复别名）：同一标签哈希出现在多个目录
-    aliases: dict = {}
-    for r in records:
-        aliases.setdefault(r["label_sha16"], []).append(r["path"])
-    dup_aliases = {k: v for k, v in aliases.items() if len(v) > 1}
+    # 冲突与别名取 **manifest 的同一份口径**（方案 v2 §3.1）：此前这里另抄一套
+    # 按 label_sha16 的分组，算出的别名组恒为 0，而 manifest 里同一内容多份
+    # 拷贝是真实存在的（实测 24 个冲突组）。
+    conflicts = [dict(c) for c in (getattr(mf, "conflicts", None) or [])]
+    _aliases = dict(getattr(mf, "aliases", None) or {})
+    alias_groups = {k: list((v or {}).get("paths") or [])
+                    for k, v in _aliases.items()}
     return {"records": records, "rejected": rejected, "by_scene": by_scene,
             "by_dir": by_dir, "raw_inputs": raw,
             "n_unique": len(records), "n_rejected": len(rejected),
-            "content_alias_groups": len(dup_aliases),
-            "content_aliases": {k: v for k, v in list(dup_aliases.items())[:10]},
+            "conflicts": conflicts, "n_conflicts": len(conflicts),
+            "content_alias_groups": len(alias_groups),
+            "content_aliases": {k: v for k, v in
+                                list(alias_groups.items())[:10]},
             "dirs": [str(d) for d in dirs]}
 
 
@@ -96,6 +112,22 @@ def _group_by_dir(paths: list) -> dict:
     return out
 
 
+def audit_union(pack_dir: Path,
+                *, trees: tuple = ("reviewed", "reviewed_full")) -> dict:
+    """把**所有**目录树一起审计：冲突/别名逐条留档（测量分母不取它）。
+
+    用途：证明"同一内容多份拷贝"确实被发现了，而不是靠"不扫它"来假装没有
+    冲突。测量清单（:func:`audited_inventory`）默认只取完成版，两者的差额
+    必须能逐条对上。
+    """
+    inv = audited_inventory(pack_dir, trees=trees)
+    return {"trees": list(trees), "raw_inputs": inv["raw_inputs"],
+            "n_unique": inv["n_unique"], "n_rejected": inv["n_rejected"],
+            "n_conflicts": inv["n_conflicts"], "conflicts": inv["conflicts"],
+            "rejected": inv["rejected"],
+            "content_alias_groups": inv["content_alias_groups"]}
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -106,15 +138,29 @@ def main(argv=None) -> int:
     ap.add_argument("--out", default=None)
     ap.add_argument("--limit", type=int, default=None,
                     help="每个目录最多用多少帧（调试用；缺省全用）")
+    ap.add_argument("--trees", nargs="+", default=["reviewed_full"],
+                    help="参与**测量**的目录树（默认只取完成版 reviewed_full；"
+                         "把预览包 reviewed 混进来会产生 24 个内容冲突组，见 "
+                         "audited_inventory 的说明）")
+    ap.add_argument("--device", default=None,
+                    help="推理设备（cpu/cuda）。缺省交给 Segmenter 默认；实际"
+                         "设备由探针读回并写进报告的 device 字段")
     args = ap.parse_args(argv)
 
     import m5_marking_identity_probe as probe_mod
     pack_dir = Path(args.pack_dir)
-    inv = audited_inventory(pack_dir)
+    inv = audited_inventory(pack_dir, trees=tuple(args.trees))
+    union = audit_union(pack_dir)
     by_scene = inv["by_scene"]
-    print(f"[calib] 审计清单：原始输入 {inv['raw_inputs']} 帧 -> 唯一 "
-          f"{inv['n_unique']} 帧，拒绝 {inv['n_rejected']}，重复别名组 "
+    print(f"[calib] 测量清单（trees={list(args.trees)}）：原始输入 "
+          f"{inv['raw_inputs']} 帧 -> 唯一 {inv['n_unique']} 帧，拒绝 "
+          f"{inv['n_rejected']}，内容冲突 {inv['n_conflicts']} 组，重复别名组 "
           f"{inv['content_alias_groups']}；场景 {len(by_scene)} 个")
+    print(f"[calib] 全部目录树审计（trees={union['trees']}）：原始输入 "
+          f"{union['raw_inputs']} -> 唯一 {union['n_unique']}，拒绝 "
+          f"{union['n_rejected']}，内容冲突 {union['n_conflicts']} 组"
+          + ("（测量清单不含被取代的预览包；冲突逐条留在 union_audit）"
+             if union["n_conflicts"] else ""))
     for r in inv["rejected"][:3]:
         print(f"[calib]   拒绝：{Path(r['path']).name} @ {r['run']} - {r['reason'][:80]}")
 
@@ -124,10 +170,13 @@ def main(argv=None) -> int:
         models.append((name.strip(), Path(path.strip())))
 
     out = {"pack_dir": str(pack_dir), "models": {},
+           "measure_trees": list(args.trees),
            "inventory": {k: inv[k] for k in
                          ("raw_inputs", "n_unique", "n_rejected",
-                          "content_alias_groups")},
+                          "content_alias_groups", "n_conflicts")},
+           "union_audit": union,
            "rejected": inv["rejected"],
+           "conflicts": inv["conflicts"],
            "content_aliases": inv["content_aliases"],
            "per_scene_frames": {g: len(ps)
                                 for g, ps in sorted(by_scene.items())}}
@@ -136,15 +185,15 @@ def main(argv=None) -> int:
             print(f"[calib] 缺权重 {path}")
             continue
         per_scene = {}
+        devices: set = set()
         for g, paths in sorted(by_scene.items()):
-            # 分母口径（探针 summary）：role_agreement_rate = roles_agreeing /
-            # **candidates_matched**（已匹配候选数），不是帧数——实测读错键会
-            # 把角色一致率当成 None。
-            agg = {"n_candidates": 0, "n_with_reference": 0,
-                   "matched": 0, "role_agree": 0, "role_total": 0,
-                   "off_road": 0, "frames": 0,
-                   "frames_with_line_ref": 0, "frames_skipped": 0,
-                   "n_errors": 0, "incomplete_runs": []}
+            # 计数**先累加整数、最后算一次比率**（方案 v2 §3.3）：本脚本不再另抄
+            # 一套公式，直接调用 `candidate_metrics` 的同一实现（S2 验收要求
+            # 标定/循环/评价逐项相同）。
+            acc = cm.empty()
+            extra = {"off_road": 0, "frames": 0, "frames_unknown": 0,
+                     "frames_skipped": 0, "n_errors": 0,
+                     "incomplete_runs": [], "frames_with_line_ref": 0}
             # 按目录分组、只喂**该目录已接受的帧**（显式清单，不再 glob）
             for d_str, dir_paths in sorted(
                     _group_by_dir(paths).items()):
@@ -155,48 +204,51 @@ def main(argv=None) -> int:
                 res = probe_mod.probe(d, meta, view=d.name,
                                       model_path=str(path),
                                       frames=dir_paths,
+                                      device=args.device,
                                       limit=args.limit)
                 s = res.get("summary") or {}
-                if not s:
-                    print(f"[calib]   {g} / {d.name}: 无 summary（{res.get('reason')}）")
-                    continue
-                # 按探针**实际** schema 读：frames/frames_processed（不是 n_frames），
-                # 计数以 counts 的整数为准（先加总再算比率）
+                if s.get("device"):
+                    devices.add(str(s["device"]))
                 _c = s.get("counts") or {}
-                agg["frames"] += int(s.get("frames_processed")
-                                     or s.get("frames") or 0)
-                agg["n_candidates"] += int(_c.get("C", 0))
-                agg["n_with_reference"] += int(_c.get("R", 0))
-                agg["matched"] += int(_c.get("M", 0))
-                agg["role_agree"] += int(_c.get("A", 0))
-                agg["role_total"] += int(_c.get("L", 0))
-                # 有帧被跳过 -> 计数不完整：标出来，不把它当完整样本
+                if not s or not _c:
+                    # 没有 summary/计数 = **缺测**，不是"测了 0 帧"：不往计数里
+                    # 加 0（那会让缺测与实测 0 无法区分），单独记账并标明原因。
+                    extra["frames_unknown"] += len(dir_paths)
+                    extra["incomplete_runs"].append(str(d))
+                    print(f"[calib]   {g} / {d.name}: 缺测（"
+                          f"{res.get('reason') or 'no counts in summary'}）")
+                    continue
+                cm.accumulate(acc, _c)
+                # 按探针**实际** schema 读（frames_processed，不是 n_frames）；
+                # 字段缺失记 unknown，不用 `or 0` 静默当已处理。
+                if s.get("frames_processed") is None:
+                    extra["frames_unknown"] += len(dir_paths)
+                    extra["incomplete_runs"].append(str(d))
+                else:
+                    extra["frames"] += int(s["frames_processed"])
                 _sk = int(s.get("frames_skipped") or 0)
-                agg["frames_skipped"] += _sk
-                agg["n_errors"] += int(s.get("n_errors") or 0)
+                extra["frames_skipped"] += _sk
+                extra["n_errors"] += int(s.get("n_errors") or 0)
                 if _sk or int(s.get("n_errors") or 0):
-                    agg["incomplete_runs"].append(str(d))
-                agg["off_road"] += int(s.get("candidates_off_road") or 0)
+                    extra["incomplete_runs"].append(str(d))
+                extra["off_road"] += int(s.get("candidates_off_road") or 0)
                 # 有标线参考的帧数：无标线场景（人确认无线）没有参考，
                 # 覆盖率在那里天然为 0——门槛标定必须把它们分开算。
-                agg["frames_with_line_ref"] += int(
+                extra["frames_with_line_ref"] += int(
                     s.get("frames_with_engine_line")
                     or _c.get("P_frames") or 0)
-            n_cand = agg["n_candidates"]
-            n_ref = agg["n_with_reference"]
+            r = cm.ratios(acc)
+            n_cand, n_ref = int(acc["C"]), int(acc["R"])
             per_scene[g] = {
-                **agg,
-                "counts_complete": not agg["incomplete_runs"],
-                "has_line_reference": bool(agg["frames_with_line_ref"]),
+                **extra, **{k: int(acc[k]) for k in cm.COUNTERS}, **r,
+                # 兼容旧键名（下游/报告沿用）：同一批整数计数的别名
+                "n_candidates": n_cand, "n_with_reference": n_ref,
+                "matched": int(acc["M"]), "role_agree": int(acc["A"]),
+                "role_total": int(acc["L"]),
+                "counts_complete": not extra["incomplete_runs"],
+                "has_line_reference": bool(extra["frames_with_line_ref"]),
                 "off_road_frac": (None if not n_cand
-                                  else round(agg["off_road"] / n_cand, 4)),
-                "candidate_reference_coverage": (None if not n_cand
-                                                 else round(n_ref / n_cand, 4)),
-                "candidate_identity_rate": (None if not n_ref
-                                            else round(agg["matched"] / n_ref, 4)),
-                "left_right_role_agreement": (
-                    None if not agg["role_total"]
-                    else round(agg["role_agree"] / agg["role_total"], 4)),
+                                  else round(extra["off_road"] / n_cand, 4)),
             }
         tot_c = sum(v["n_candidates"] for v in per_scene.values())
         tot_r = sum(v["n_with_reference"] for v in per_scene.values())
@@ -207,7 +259,13 @@ def main(argv=None) -> int:
         rc = sum(v["n_candidates"] for v in ref_scenes)
         rr = sum(v["n_with_reference"] for v in ref_scenes)
         out["models"][name] = {
-            "path": str(path), "per_scene": per_scene,
+            "path": str(path),
+            # 模型身份与真实设备（方案 §8.1：路径/hash/device 都要留档）
+            "sha256_16": file_sha16(path),
+            "device": (sorted(devices)[0] if len(devices) == 1
+                       else (sorted(devices) if devices else "unknown")),
+            "device_requested": args.device or "default(Segmenter)",
+            "per_scene": per_scene,
             "reference_scenes_only": {
                 "n_scenes": len(ref_scenes), "n_candidates": rc,
                 "n_with_reference": rr,

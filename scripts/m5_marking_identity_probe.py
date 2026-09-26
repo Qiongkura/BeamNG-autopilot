@@ -557,6 +557,7 @@ def refusal(reason: str, **extra) -> dict:
 def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
           limit: int | None = None, model_path: str | None = None,
           frames: list | None = None,
+          device: str | None = None,
           null_shift_m: float | None = None,
           overlay_dir: Path | None = None,
           overlay_limit: int | None = None,
@@ -630,13 +631,21 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
     if limit:
         fs = fs[:int(limit)]
     cam = camera_from_meta(meta or {}, view)
+    # 没给权重就没有前向；给了权重先记"请求值"，成功装配后再读实际设备覆盖它
+    device_used = (f"requested:{device}" if device else "none")
     try:
         net = HydraNet()
         if model_path:
             # the checkpoint is chosen on the SEGMENTER, not on the head: the
             # head is the pipeline, the segmenter owns the weights
             from beamng_autopilot.vision.segmentation import Segmenter
-            net.add(SemanticHead(segmenter=Segmenter(model_path=model_path)))
+            _seg = (Segmenter(model_path=model_path, device=device)
+                    if device else Segmenter(model_path=model_path))
+            net.add(SemanticHead(segmenter=_seg))
+            # 实际设备写进 summary（方案要求测量记录真实设备，不是声明值）：
+            # 探针不猜，读 Segmenter 自己的 device 属性；读不到写 UNKNOWN。
+            _dev = getattr(_seg, "device", None)
+            device_used = str(_dev) if _dev is not None else "unknown"
         else:
             net.add(SemanticHead())
     except Exception as exc:                          # noqa: BLE001
@@ -646,6 +655,7 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
         return refusal(f"probe setup failed before any frame was measured: "
                        f"{type(exc).__name__}: {exc}",
                        frames_total=len(fs), camera_model_used=cam is not None,
+                       device=device_used,
                        run=str(run_dir), view=view)
     rows = []
     errors: list = []
@@ -673,7 +683,7 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
                         n_frames_processed_before_refusal=len(rows),
                         frames_skipped=sum(1 for e in errors
                                            if e.get("skipped")),
-                        frames_total=len(fs))
+                        frames_total=len(fs), device=device_used)
                 label = np.asarray(z["label"])
             if colour.ndim != 3 or label.ndim != 2:
                 raise ValueError(f"bad array shapes colour={colour.shape} "
@@ -899,6 +909,9 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
                        errors=errors, n_errors=len(errors),
                        unknowns=unknowns, frames_unknown=len(unknowns),
                        frames_skipped=len(errors), frames_total=len(fs),
+                       # 设备在失败结果里也要可见：不知道实际设备时写 requested，
+                       # 不写"测过"的样子（方案 §8.1 要真实设备）
+                       device=device_used,
                        camera_model_used=cam is not None)
     def p50(key):
         vals = [r[key] for r in rows
@@ -935,6 +948,9 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
     summary = {
         "frames": len(rows),
         "frames_with_engine_line": n_engine_seen,
+        # 实际推理设备（读 Segmenter 的 device；没给权重时是 none，读不到是
+        # unknown）——测量记录真实设备，不写声明值
+        "device": device_used,
         # ground-projected identity, vehicle frame
         "candidates_total": n_cand,
         "candidates_matched": n_match,

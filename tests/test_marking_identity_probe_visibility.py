@@ -443,3 +443,53 @@ class TestPFrameSemantics:
         assert s["frames_truth_line_unchained"] == 1
         assert s["frames_with_chained_engine_line"] == 0
         assert s["frames_total"] == 1 and s["frames_processed"] == 1
+
+
+class TestDeviceIsRecorded:
+    """方案 §8.1：测量要记录**实际**设备，不是命令行声明值。
+
+    实测依据（2026-09-26）：标定报告里 device 一直缺失，无法回答"这份数是用
+    什么设备跑的"。探针现在把请求值交给 Segmenter，再**读回**它的 device 属性；
+    读不到就写 UNKNOWN，不回显入参冒充实际设备。
+    """
+
+    def test_the_device_is_read_back_from_the_segmenter(
+            self, probe, cam, monkeypatch, tmp_path):
+        run = tmp_path / "front_main"
+        run.mkdir()
+        _write_frame(run, 0, _rgb(), _p_frame(probe, cam))
+        seen: dict = {}
+
+        class _FakeSeg:
+            def __init__(self, model_path=None, device=None):
+                seen["requested"] = device
+                # 故意**不**回显入参：实际设备由 Segmenter 自己决定
+                self.device = "fake:0"
+
+        import beamng_autopilot.vision.segmentation as segmod
+        monkeypatch.setattr(segmod, "Segmenter", _FakeSeg)
+        _fake_net(monkeypatch, probe, [
+            _TaskOut(np.zeros((H, W), bool), [_mark(cam, 2.0, learned=1.0)])])
+        res = probe.probe(run, META, view="front_main", model_path="fake.pt",
+                          device="cpu")
+        assert seen["requested"] == "cpu", "请求的设备必须交给 Segmenter"
+        assert res["summary"]["device"] == "fake:0", \
+            "报告里的 device 必须是读回的实际值，不是回显入参"
+
+    def test_a_setup_failure_still_reports_the_requested_device(
+            self, probe, cam, monkeypatch, tmp_path):
+        run = tmp_path / "front_main"
+        run.mkdir()
+        _write_frame(run, 0, _rgb(), _p_frame(probe, cam))
+
+        class _BrokenSeg:
+            def __init__(self, model_path=None, device=None):
+                raise RuntimeError("no cuda device")
+
+        import beamng_autopilot.vision.segmentation as segmod
+        monkeypatch.setattr(segmod, "Segmenter", _BrokenSeg)
+        res = probe.probe(run, META, view="front_main", model_path="fake.pt",
+                          device="cuda")
+        assert "summary" not in res
+        assert res["device"] == "requested:cuda", \
+            "装配失败时写请求值并标明 requested，不写'测过'的样子"
