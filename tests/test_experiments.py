@@ -930,3 +930,36 @@ def test_per_seed_checks_can_be_restricted_to_measurable_fields():
     assert gates.per_seed_missing({"42": {"inference_ms_p95": None}}, t,
                                   fields=masked) == [
         "seed 42: inference_ms_p95: UNKNOWN (hard gate needs a measurement)"]
+
+
+def test_a_reviewer_road_type_map_makes_the_pavement_channel_judgeable():
+    """路型列（标注器另存）让"铺装/土肩"从"不可分"变成可判（方案 §6.3）。
+
+    实测背景：label 的 0/1/2/255 契约表达不了材质，所以 pavement 通道一直判
+    "pavement vs shoulder is not separable..."；标注器现在把材质另存一列
+    （1=沥青 2=碎石 3=路肩，路肩按背景处理），审计据此可判，并把各材质像素数
+    记进覆盖表（否则"有路型图的帧"在汇总里看不见）。
+    """
+    import numpy as np
+    from beamng_autopilot.experiments.labels import audit_label
+
+    lab = np.zeros((20, 30), np.uint8)
+    lab[5:15, :] = 1                     # road
+    lab[10, :6] = 2                      # line
+    rt = np.zeros((20, 30), np.uint8)
+    rt[5:10, :] = 1                      # asphalt
+    rt[10:13, :] = 2                     # gravel
+    rt[13:15, :] = 3                     # shoulder
+    a = audit_label(lab, paint_source="human_revision", road_type=rt)
+    assert a.pavement.valid is True, a.pavement
+    assert a.road_type_px == {"asphalt": 150, "gravel": 90, "shoulder": 60}, \
+        a.road_type_px
+    assert "shoulder is background" in a.pavement.reason, a.pavement.reason
+    # 没有路型列的帧保持原判据（不假装可分）
+    b = audit_label(lab, paint_source="human_revision")
+    assert b.pavement.valid is False and b.road_type_px == {}, b.pavement
+    assert "not separable" in b.pavement.reason, b.pavement.reason
+    # 形状不匹配的路型列不参与（不猜）
+    c = audit_label(lab, paint_source="human_revision",
+                    road_type=np.zeros((3, 3), np.uint8))
+    assert c.pavement.valid is False, c.pavement

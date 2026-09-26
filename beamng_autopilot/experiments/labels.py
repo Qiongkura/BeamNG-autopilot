@@ -90,12 +90,19 @@ class LabelAudit:
     unknown_reason: str = ""
     line_masked_px: int = 0
     frame_unknown_frac: float = 0.0
+    #: 逐像素路型计数（沥青/碎石/路肩）；空 = 该帧没有路型图（老帧）
+    road_type_px: dict = None                     # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.road_type_px is None:
+            self.road_type_px = {}
     label_sha256_16: str = ""
     notes: list[str] = field(default_factory=list)
 
     def as_dict(self) -> dict:
         return {"road": self.road.as_dict(), "paint": self.paint.as_dict(),
                 "pavement": self.pavement.as_dict(),
+                "road_type_px": dict(self.road_type_px),
                 "unknown_reason": self.unknown_reason,
                 "line_masked_px": int(self.line_masked_px),
                 "frame_unknown_frac": round(float(self.frame_unknown_frac), 5),
@@ -113,9 +120,13 @@ def label_sha16(label: np.ndarray) -> str:
     return hashlib.sha256(a.tobytes()).hexdigest()[:16]
 
 
+#: 路型图取值（标注器的 road_type 列）：1=沥青 2=碎石 3=路肩
+ROAD_TYPE_NAMES = {1: "asphalt", 2: "gravel", 3: "shoulder"}
+
+
 def audit_label(label, *, paint_source: str = "engine_annotation",
                 palette_ok: bool = True, road_min_px: int = 200,
-                has_rgb: bool = True) -> LabelAudit:
+                has_rgb: bool = True, road_type=None) -> LabelAudit:
     """逐帧判三个通道的可用性。
 
     ``paint_source`` 来自采集元数据的 ``label_source`` 或人工修订记录；
@@ -171,10 +182,29 @@ def audit_label(label, *, paint_source: str = "engine_annotation",
                         "" if road_px >= int(road_min_px) else
                         f"road px {road_px} < {int(road_min_px)}", road_px)
     # 铺装/土肩需要独立确认：默认不声称可用，直到有单独验证的标签来源。
-    pavement = ClassQuality(False,
-                            "pavement vs shoulder is not separable from the "
-                            "road class alone; needs its own verified labels",
-                            road_px)
+    # 铺装/土肩：label 的 0/1/2/255 表达不了材质，所以要么有**逐像素路型图**
+    # （标注器另存的一列：1=沥青 2=碎石 3=路肩），要么判"不可分"。路肩按背景
+    # 处理（有铺装时土肩不算道路），因此"路面材质"这一列是可判的独立证据。
+    _rt_counts: dict = {}
+    _rt_ok = False
+    _rt_reason = ("pavement vs shoulder is not separable from the road class "
+                  "alone; needs its own verified labels")
+    if road_type is not None:
+        rt = np.asarray(road_type)
+        if rt.shape == lab.shape:
+            for _v, _name in ROAD_TYPE_NAMES.items():
+                _n = int((rt == _v).sum())
+                if _n:
+                    _rt_counts[_name] = _n
+            _rt_ok = bool(_rt_counts)
+            if _rt_ok:
+                _rt_reason = (
+                    "road type is marked per pixel by the reviewer ("
+                    + ", ".join(f"{k}: {v}px" for k, v in sorted(
+                        _rt_counts.items()))
+                    + "); shoulder is background, so it never counts as road")
+    pavement = ClassQuality(bool(_rt_ok), _rt_reason, road_px,
+                            usable=bool(_rt_ok), rank=rank)
 
     unknown_reason = ""
     if not road.valid:
@@ -185,7 +215,8 @@ def audit_label(label, *, paint_source: str = "engine_annotation",
     return LabelAudit(road=road, paint=paint, pavement=pavement,
                       unknown_reason=unknown_reason,
                       line_masked_px=line_px, frame_unknown_frac=unknown_px / max(1, n_px),
-                      label_sha256_16=label_sha16(lab), notes=notes)
+                      label_sha256_16=label_sha16(lab), notes=notes,
+                      road_type_px=dict(_rt_counts))
 
 
 def line_channel_mask(label, audit: LabelAudit) -> np.ndarray:
@@ -221,6 +252,8 @@ def audit_summary(audits: list[LabelAudit]) -> dict:
            #: 可训练/可测量的漆线监督（弱监督与 agent 档算 usable、不算 valid）。
            #: 训练准入看它；晋级门仍然只看 paint_valid_frames（方案 §6.1）。
            "paint_usable_frames": sum(1 for a in audits if a.paint.usable),
+           #: 有路型图（沥青/碎石/路肩逐像素标记）的帧数：pavement 通道可判的前提
+           "road_type_frames": sum(1 for a in audits if a.road_type_px),
            "pavement_valid_frames": sum(1 for a in audits
                                         if a.pavement.valid),
            "trainable_frames": sum(1 for a in audits if a.trainable),

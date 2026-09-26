@@ -167,8 +167,12 @@ class DatasetManifest:
                     notes.append(f"{f}: missing colour/label - RGB/annotation "
                                  f"alignment is a gate, not a warning")
                     continue
+                # 路型列（标注器另存）：有它 pavement 通道才可判（方案 §6.3
+                # "两种道路类型分别标记"）。老帧没有这一列 -> 保持"不可分"。
+                _rt = (np.asarray(z["road_type"], np.uint8)
+                       if "road_type" in z.files else None)
                 audit = audit_label(label, paint_source=src,
-                                    road_min_px=min_road_px)
+                                    road_min_px=min_road_px, road_type=_rt)
                 rec = FrameRecord(
                     path=str(Path(f).resolve()), run=rd.name, view=view,
                     group=_group_of(map_name, source_id, rd),
@@ -456,7 +460,9 @@ def _audit_from_dict(q: dict):
         line_masked_px=q.get("line_masked_px", 0),
         frame_unknown_frac=q.get("frame_unknown_frac", 0.0),
         label_sha256_16=q.get("label_sha256_16", ""),
-        notes=q.get("notes", []))
+        notes=q.get("notes", []),
+        # 路型计数要回到重建的审计对象（覆盖表按它统计"有路型图的帧"）
+        road_type_px=dict(q.get("road_type_px") or {}))
 
 
 def _count(items) -> dict:
