@@ -1,0 +1,34 @@
+{
+ "schema": 1,
+ "thresholds": {
+  "candidate_identity_rate_min": 0.6,
+  "line_recall_min": 0.7,
+  "line_precision_min": 0.4,
+  "offroad_false_ratio_max": 0.1,
+  "inference_ms_p95_max": 45.0,
+  "noninferior_margin": 0.05,
+  "min_seeds": 3,
+  "candidate_reference_coverage_min": 0.8,
+  "left_right_role_agreement_min": 0.7,
+  "per_scene_min_candidates": 30,
+  "resume_tolerance_factor": 3.0,
+  "resume_control_max_rel_diff": 0.0033,
+  "resume_max_rel_diff": 0.01,
+  "frozen_at": "2026-09-26",
+  "source": "T13 baselines + plan T14 §5; candidate gates calibrated 2026-09-26 on the 136-frame authoritative human-truth set (docs/CANDIDATE_GATE_CALIBRATION_20260926.md); v4 restates the SAME numbers under the v5 counting contract (docs/metric_protocol_v5.json / t14-protocol-v5): the candidate coverage denominator counts only candidates produced on P frames (R/C), the per-scene sample floor counts R (the identity denominator), not total candidates C; applicability is one of measured/not_applicable/unknown/unverified_labels; the negative-scene diagnostics are diagnostic-only (no threshold this round)"
+ },
+ "config_hash": "a02e4db5b46feeaa",
+ "primary_order": [
+  "candidate_identity_rate",
+  "line_recall",
+  "line_precision",
+  "offroad_false_line_px",
+  "inference_ms_p95"
+ ],
+ "auxiliary": [
+  "line_iou",
+  "val_miou",
+  "train_loss"
+ ],
+ "note": "v4: numbers identical to docs/t14_thresholds_v3.json (same config_hash); only the note/source restate the v5 counting contract - coverage denominator = P-frame candidates (R/C), per-scene sample floor counted on R, applicability in {measured, not_applicable, unknown, unverified_labels}, negative-scene diagnostics carry no threshold. Changing any value creates a NEW config_hash."
+}
