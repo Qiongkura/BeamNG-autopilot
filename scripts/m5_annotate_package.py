@@ -135,7 +135,20 @@ def build_package(*, collection: Path, frames: list, out: Path,
                     return rp in _want
                 return (str(r.get("view") or "") == view
                         and Path(rp).name in _names)
-            _blob["frames"] = [r for r in _blob["frames"] if _keep(r)]
+            _cat = {Path(str(x.get("path") or "")).name: str(
+                x.get("category") or "") for x in picks
+                if str(x["view"]) == view}
+            _kept = []
+            for r in _blob["frames"]:
+                if not _keep(r):
+                    continue
+                # 类别是**复核用**的候选归类：写进包内 meta，监督器直接读，
+                # 不再靠工作表按源路径猜（包内是副本，按文件名会串味）。
+                _c = _cat.get(Path(str(r.get("path") or "")).name)
+                if _c:
+                    r = {**r, "category": _c}
+                _kept.append(r)
+            _blob["frames"] = _kept
             _blob["views_in_package"] = [view]
         (d / "meta.json").write_text(
             json.dumps(_blob, ensure_ascii=False, indent=1), encoding="utf-8")

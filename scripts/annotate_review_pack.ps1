@@ -107,9 +107,21 @@ try {
     foreach ($pkg in $pkgs) {
         $i++
         $frames = Get-ChildItem (Join-Path $pkg.FullName $View) -Filter 'frame_*.npz'
+        # 类别**优先读包内 meta**（打包时写进去的，权威且无同名冲突）
+        $catOf = @{}
+        $metaP = Join-Path (Join-Path $pkg.FullName $View) 'meta.json'
+        if (Test-Path $metaP) {
+            $metaBlob = Get-Content -Raw -Encoding UTF8 $metaP | ConvertFrom-Json
+            foreach ($rec in $metaBlob.frames) {
+                if ($rec.category) {
+                    $catOf[(Split-Path -Leaf $rec.path)] = $rec.category
+                }
+            }
+        }
         $cats = @{}
         foreach ($f in $frames) {
-            $c = if ($byPath.ContainsKey($f.FullName)) { $byPath[$f.FullName] }
+            $c = if ($catOf.ContainsKey($f.Name)) { $catOf[$f.Name] }
+                 elseif ($byPath.ContainsKey($f.FullName)) { $byPath[$f.FullName] }
                  elseif ($byName.ContainsKey($f.Name)) { $byName[$f.Name] }
                  else { '未标注类别' }
             $cats[$c] = ($cats[$c] + 1)

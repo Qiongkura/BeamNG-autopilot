@@ -507,9 +507,11 @@ def main(argv=None) -> int:
             q.write_text(json.dumps(
                 {"why": f"{why}：来自 {coll}（一次采集一个包，身份才不会张冠李戴）",
                  "view": args.view, "n_frames": len(group),
-                 "frames": [{k: f.get(k) for k in
-                             ("view", "path", "line_pixels", "pos", "heading",
-                              "exposure")} for f in group]},
+                 "frames": [{**{k: f.get(k) for k in
+                                 ("view", "path", "line_pixels", "pos",
+                                  "heading", "exposure")},
+                             "category": f.get("category", "")}
+                            for f in group]},
                 indent=1, ensure_ascii=False), encoding="utf-8")
             cmds.append((coll, slug, q))
         pkg_dir = out / f"packages{tag}"
