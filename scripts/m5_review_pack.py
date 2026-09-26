@@ -63,12 +63,27 @@ SOURCES = {
     "curve_junction": ("logs/m5_seg/diverse_curve_20260924/front_main",
                        "logs/m5_seg/t13_junction2/front_main",
                        "logs/m5_seg/t13_corner/front_main"),
+    # 退化与遮挡：除了宽/镇两组，也收 2026-09-26 两轮补采——砾石那轮有很重的
+    # 树影（阴影/亮度变化），无标线铺装那轮有岩壁反光与背光。
     "degraded_occluded": ("logs/m5_seg/line_truth_agent_full_20260925/wide/front_main",
-                          "logs/m5_seg/line_truth_agent_full_20260925/town/front_main"),
+                          "logs/m5_seg/line_truth_agent_full_20260925/town/front_main",
+                          "logs/m5_seg/collect_t14_collect_dirt_20260926_20260926_123625/front_main",
+                          "logs/m5_seg/collect_t14_collect_plain2_20260926_20260926_123944/front_main"),
+    # 2026-09-26 补采（都带身份、四视角全程零漆线像素）：
+    #   * collect_..._plain2...（italy/ring_20260926_123950）：无标线**铺装**路，
+    #     左护栏 + 右岩壁 + 砾石路肩 -> 同时喂"真无线铺装路"与"易混淆纹理"；
+    #   * collect_..._dirt...（italy/ring_20260926_123638）：砾石土路 -> 土路类别。
     "confusable_texture": ("logs/m5_seg/diverse_plain_20260924/front_main",
-                           "logs/m5_seg/line_truth_agent_full_20260925/plain/front_main"),
-    "no_line_pavement": ("logs/m5_seg/line_truth_agent_full_20260925/plain/front_main",),
-    "dirt_shoulder": ("logs/m5_seg/dirt_road_labeled",),
+                           "logs/m5_seg/line_truth_agent_full_20260925/plain/front_main",
+                           "logs/m5_seg/collect_t14_collect_plain2_20260926_20260926_123944/front_main"),
+    "no_line_pavement": ("logs/m5_seg/line_truth_agent_full_20260925/plain/front_main",
+                         "logs/m5_seg/collect_t14_collect_plain2_20260926_20260926_123944/front_main"),
+    # 土路：旧目录（dirt_road_labeled / dirt_road_pkg）**没有地图身份**，帧进不了
+    # 评价集（审计拒收），所以 2026-09-26 在 italy 上沿 plain 区航向外推 400 m
+    # 重采了一次（砾石路、四视角全程零漆线像素，身份 italy/ring_20260926_123638）。
+    # 旧的 45 帧仍留在盘上作为"手涂 road 参照"，但不进评价包。
+    "dirt_shoulder": ("logs/m5_seg/collect_t14_collect_dirt_20260926_20260926_123625/front_main",
+                      "logs/m5_seg/dirt_road_labeled"),
 }
 
 
