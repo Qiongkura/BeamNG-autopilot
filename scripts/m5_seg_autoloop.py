@@ -257,8 +257,13 @@ def cmd_evaluate(args) -> int:
         compared[name] = paired_compare(
             name, spec.get("champion", []), spec.get("candidate", []),
             lower_is_better=bool(spec.get("lower_is_better", False)))
-    violations = threshold_violations(hard, t)
+    # 缺测与违反分两路（与 rounds 同规则，方案 §10.3）：硬门里没测到的项是
+    # "证据缺失" -> needs_evidence；原来合并成 violations 会判成 rejected。
+    _hs = hard_split(hard, t)
+    violations = _hs["violations"]
     missing = [k for k, v in compared.items() if not v.get("n")]
+    missing += [f"{n}: UNKNOWN (hard gate needs a measurement)"
+                for n in _hs["missing"]]
     decision = decide(pairings=compared, thresholds=t,
                       missing_metrics=missing,
                       production_mismatch=bool(args.production_mismatch),
@@ -1097,6 +1102,9 @@ def _seed_hard(metrics: dict, ident: dict | None, p95: float | None) -> dict:
     ident = ident or {}
     return {
         "candidate_identity_rate": ident.get("candidate_identity_rate"),
+        # v4 新增的两道候选门：必须逐 seed 可测（否则记缺测阻止晋级）
+        "candidate_reference_coverage": ident.get("candidate_reference_coverage"),
+        "left_right_role_agreement": ident.get("left_right_role_agreement"),
         "line_recall": (metrics or {}).get("line_recall"),
         "line_precision": (metrics or {}).get("line_precision"),
         "offroad_false_ratio": (metrics or {}).get("offroad_false_frac_of_pred"),
@@ -2028,6 +2036,12 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 # "点进具体帧"：判定文件带上该 seed 最差的几帧（路径+IoU+真值像素），
                 # 人可以从一次失败判定直接看到是哪张图、差在哪
                 worst_by_seed[str(seed)] = metrics["mask_compare"]["worst"]
+            # 候选口径（覆盖率/左右角色）也进池化硬门：v4 起它们是硬门输入
+            hard_measured.setdefault("candidate_reference_coverage",
+                                     []).append(
+                _idc.get("candidate_reference_coverage"))
+            hard_measured.setdefault("left_right_role_agreement", []).append(
+                _idc.get("left_right_role_agreement"))
             hard_measured.setdefault("line_recall", []).append(
                 metrics.get("line_recall"))
             hard_measured.setdefault("line_precision", []).append(
@@ -2104,6 +2118,8 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
             # （记 None 而不是 0，避免"没测"被读成"很差"或被硬门当违反）
             hard = {"line_recall": None, "line_precision": None,
                     "candidate_identity_rate": None,
+                    "candidate_reference_coverage": None,
+                    "left_right_role_agreement": None,
                     "offroad_false_ratio": None,
                     "inference_ms_p95": _mean_or_none(
                         hard_measured.get("inference_ms_p95")),
@@ -2112,6 +2128,10 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
         else:
             hard = {"line_recall": _mean_or_none(
                         hard_measured.get("line_recall")),
+                    "candidate_reference_coverage": _mean_or_none(
+                        hard_measured.get("candidate_reference_coverage")),
+                    "left_right_role_agreement": _mean_or_none(
+                        hard_measured.get("left_right_role_agreement")),
                     "line_precision": _mean_or_none(
                         hard_measured.get("line_precision")),
                     "offroad_false_ratio": _mean_or_none(

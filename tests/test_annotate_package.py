@@ -240,3 +240,42 @@ def test_the_annotation_sidecar_records_who_reviewed_and_which_classes(tmp_path)
     assert got == {"line": 8, "road": 24, "background": 13, "unknown": 3}, got
     # 复核人缺省不编名字（拿不到就空）
     assert mod._default_reviewer() is not None
+
+
+def test_the_sidecar_seed_keeps_the_input_meta(tmp_path):
+    """标注输出的 meta 要以**输入目录**的 meta 为种子（否则丢 cameras）。
+
+    实测踩到：`--out` 与 `--frames-dir` 不同（逐采集打包正是这样）时，种子只看
+    输出目录 -> 空 -> 写出的 meta 只剩 map/source/annotation/frames，**丢了
+    `cameras`（内外参）**。身份探针的投影依赖它，于是 136 帧权威真值集上
+    "候选身份/覆盖率"根本测不出来（R2 要的正是这些指标）。
+    """
+    import importlib.util
+    import sys
+    from pathlib import Path as _P
+
+    root = _P(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_annotate_manual_seed", root / "scripts" / "m5_annotate_manual.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["m5_annotate_manual_seed"] = mod
+    spec.loader.exec_module(mod)
+
+    inp = tmp_path / "in" / "front_main"
+    inp.mkdir(parents=True)
+    (inp.parent / "meta.json").write_text(json.dumps({
+        "map_name": "italy", "source_id": "ring_x", "width": 536,
+        "cameras": {"front_main": {"fov": 70}},
+        "frames": [{"path": "front_main/frame_00000.npz"}]}), encoding="utf-8")
+    out = tmp_path / "out" / "front_main"
+    seed = mod._sidecar_seed_from_inputs(inp, out)
+    assert seed[0].get("cameras"), seed
+    assert seed[1].startswith("input:"), seed
+    out.mkdir(parents=True)
+    fp = mod.write_sidecar(out, [{"path": "frame_00000.npz"}],
+                           identity={"map_name": "italy", "source_id": "ring_x"},
+                           seed=seed)
+    blob = json.loads(fp.read_text(encoding="utf-8"))
+    assert blob.get("cameras"), blob.keys()
+    assert blob.get("width") == 536, blob
+    assert blob["label_source"] == "human_revision", blob

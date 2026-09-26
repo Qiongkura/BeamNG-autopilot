@@ -376,6 +376,19 @@ def export_frame(path: Path, rgb: np.ndarray, label: np.ndarray,
                         **identity_npz_extras(ident), **extras)
 
 
+def _sidecar_seed_from_inputs(frames_dir: Path, out_dir: Path) -> tuple[dict, str]:
+    """种子优先级：**输入目录的 meta** > 输出目录树。
+
+    输入目录的 meta 是采集/打包时写的完整 meta（含 `cameras` 内外参、width/height/
+    classes/palette_source）。只在输出目录找会丢掉这些键，而身份探针的投影依赖
+    `cameras`——丢了就测不出候选身份/覆盖率（实测踩到）。
+    """
+    m, tag = _read_dir_meta(Path(frames_dir))
+    if m:
+        return m, f"input:{tag}"
+    return _sidecar_seed(out_dir)
+
+
 def _sidecar_seed(out_dir: Path) -> tuple[dict, str]:
     """Seed for ``<out_dir>/meta.json``: its own meta, else its parent's.
 
@@ -606,7 +619,7 @@ def main() -> int:
     out_dir = (Path(args.out) if args.out
                else config.LOGS_DIR / "m5_seg" / f"manual_{stamp}")
     out_dir.mkdir(parents=True, exist_ok=True)
-    sidecar_seed = _sidecar_seed(out_dir)
+    sidecar_seed = _sidecar_seed_from_inputs(args.frames_dir, out_dir)
     print(f"[annotate] {len(frames)} frames | output -> {out_dir}")
     _ident_txt = (f"{run_identity.get('map_name') or 'UNKNOWN'}/"
                   f"{run_identity.get('source_id') or 'UNKNOWN'}")

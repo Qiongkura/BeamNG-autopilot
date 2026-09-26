@@ -948,14 +948,16 @@ def test_evaluate_also_downgrades_a_research_source(tmp_path):
               "--candidate-id", "cand", "--pairings", str(pairings),
               "--hard-gate", str(gate),
               "--paint-source", f"{a}=agent_revision"],
-             tmp_path, expect=1)   # 不可晋级的判定 rc=1
+             tmp_path, expect=3)   # 空硬门=证据缺失 -> needs_evidence（v4/§10.3）
     d = tmp_path / "logs" / "experiments" / "rw_ev"
     blob = json.loads(sorted(d.glob("decision_*.json"))[0].read_text(
         encoding="utf-8"))
     assert blob["research_only"] is True, blob.get("decision")
     # 同时作为 G05 的反例：**只有 line_iou 改善**（任务主指标缺失）不能进入影子
-    # 候选，判定必须是 rejected（而不是被研究臂降级成的 needs_evidence）。
-    assert blob["decision"]["decision"] == "rejected", blob["decision"]
+    # 候选，判定只能是 needs_evidence（缺测，不是被研究臂降级）。
+    assert blob["decision"]["decision"] == "needs_evidence", blob["decision"]
+    assert any("UNKNOWN (hard gate needs a measurement)" in x
+               for x in blob["decision"]["reasons"]), blob["decision"]["reasons"]
     reasons = " ".join(blob["decision"]["reasons"])
     assert "line_iou" in reasons, blob["decision"]["reasons"]
 
@@ -1230,7 +1232,9 @@ def test_identity_metrics_report_coverage_and_roles(tmp_path):
 
     # 覆盖率门槛尚未标定：阻止相应晋级（方案 §10.2）
 
-    assert loop.COVERAGE_GATE_FROZEN is False
+    # 覆盖率门槛**已标定并冻结**（协议 v4，2026-09-26，门槛 0.80；标定证据见
+    # docs/CANDIDATE_GATE_CALIBRATION_20260926.md）
+    assert loop.COVERAGE_GATE_FROZEN is True
 
     # 逐场景明细必须真的有：调用方读 per_group 时静默拿到空字典，会看起来像
 
