@@ -1,0 +1,203 @@
+{
+ "version": "t14-protocol-v4",
+ "metrics": {
+  "road_iou": {
+   "level": "pixel",
+   "unit": "ratio",
+   "denominator": "road TP+FP+FN over the known area (label != 255)",
+   "unknown_rule": "no prediction or no known area -> UNKNOWN (never 0)",
+   "note": "道路像素代理；不能证明没有把土肩当道路（那要铺装/土肩单独指标）"
+  },
+  "line_iou": {
+   "level": "pixel",
+   "unit": "ratio",
+   "denominator": "line TP+FP+FN over the known area (label != 255)",
+   "unknown_rule": "no predicted line px or no known line px -> UNKNOWN",
+   "note": "研究结论用；单独改善不能变成模型晋级（见 gates.PRIMARY_ORDER）"
+  },
+  "line_precision": {
+   "level": "pixel",
+   "unit": "ratio",
+   "denominator": "predicted line px **inside the known area**",
+   "unknown_rule": "no predicted line px -> UNKNOWN",
+   "note": "未知区里的预测不参与分子分母，但要单独计数上报"
+  },
+  "line_recall": {
+   "level": "pixel",
+   "unit": "ratio",
+   "denominator": "reference line px inside the known area",
+   "unknown_rule": "no reference line px -> UNKNOWN",
+   "note": "只在有效标线参考上统计；**必须报告场景覆盖**（参考缺失的帧不进分母）"
+  },
+  "offroad_false_ratio": {
+   "level": "pixel",
+   "unit": "ratio",
+   "denominator": "predicted line px inside the known area (NOT all predicted px)",
+   "unknown_rule": "no known-area prediction -> UNKNOWN",
+   "note": "实测口径缺陷（G04）：旧实现用全部预测像素当分母，未知区的预测会稀释它"
+  },
+  "pred_unknown_line_px": {
+   "level": "pixel",
+   "unit": "count",
+   "denominator": "count",
+   "unknown_rule": "always a count (0 is a real value here)",
+   "note": "落在未知区的预测像素：不算成功、不算假线，但必须上报"
+  },
+  "candidate_identity_rate": {
+   "level": "candidate",
+   "unit": "ratio",
+   "denominator": "candidates that have a usable reference (projection match within the frozen tolerance)",
+   "unknown_rule": "no reference for a candidate -> that candidate is UNKNOWN, not a miss",
+   "note": "当前实现是投影候选匹配率；不等于左右车道身份正确，必须与角色一致率分开报"
+  },
+  "candidate_reference_coverage": {
+   "level": "candidate",
+   "unit": "ratio",
+   "denominator": "all candidates in the evaluated frames",
+   "unknown_rule": "no candidates at all -> coverage UNKNOWN",
+   "note": "可测候选覆盖率：覆盖率本身要过门，不能只在容易区域算高匹配率"
+  },
+  "left_right_role_agreement": {
+   "level": "candidate",
+   "unit": "ratio",
+   "denominator": "matched candidates with a side label on both sides",
+   "unknown_rule": "missing side label -> UNKNOWN",
+   "note": "左右角色一致率：与 identity_rate 分开报"
+  },
+  "inference_ms_p95": {
+   "level": "performance",
+   "unit": "ms",
+   "denominator": "n/a (percentile over per-frame totals)",
+   "unknown_rule": "no clean repeat -> UNKNOWN (polluted repeats are recorded, not averaged)",
+   "note": "离线分割链（预处理+前向+后处理）；**不能**替代完整驾驶 tick deadline"
+  },
+  "tick_deadline_miss_ratio": {
+   "level": "control",
+   "unit": "ratio",
+   "denominator": "all ticks in the run",
+   "unknown_rule": "no Tech run -> UNKNOWN",
+   "note": "完整驾驶闭环指标，离线实验一律未测"
+  }
+ },
+ "coverage_requirements": [
+  {
+   "scene": "clear_paint",
+   "what": "左/右边缘、中央线、白/黄线、实/虚线",
+   "min_frames": 20,
+   "min_groups": 2
+  },
+  {
+   "scene": "curve_and_junction",
+   "what": "斜线、断线、交汇、不同远近尺度",
+   "min_frames": 20,
+   "min_groups": 2
+  },
+  {
+   "scene": "degraded_occluded",
+   "what": "阴影、磨损、车辆遮挡、亮度变化",
+   "min_frames": 20,
+   "min_groups": 2
+  },
+  {
+   "scene": "confusable_texture",
+   "what": "路缘石、排水槽、护栏反光、墙面、轮胎印",
+   "min_frames": 20,
+   "min_groups": 2
+  },
+  {
+   "scene": "no_paint_paved",
+   "what": "能确认整片评价区域无线，保留边界信息",
+   "min_frames": 20,
+   "min_groups": 2
+  },
+  {
+   "scene": "pavement_vs_shoulder",
+   "what": "铺装/土肩与纯土路分别标记",
+   "min_frames": 20,
+   "min_groups": 2
+  }
+ ],
+ "min_eval_groups": 6,
+ "primary_eval_view": "front_main",
+ "source_eligibility": {
+  "verified": {
+   "can_train": true,
+   "can_measure": true,
+   "can_promote": true
+  },
+  "agent": {
+   "can_train": true,
+   "can_measure": true,
+   "can_promote": false
+  },
+  "pseudo": {
+   "can_train": true,
+   "can_measure": true,
+   "can_promote": false
+  },
+  "unreliable": {
+   "can_train": false,
+   "can_measure": false,
+   "can_promote": false
+  },
+  "absent": {
+   "can_train": false,
+   "can_measure": false,
+   "can_promote": false
+  }
+ },
+ "research_only_ranks": [
+  "agent",
+  "pseudo"
+ ],
+ "statistics": {
+  "interval": "paired t interval",
+  "confidence": 0.95,
+  "df_rule": "n_pairs - 1",
+  "assumption": "paired deltas iid approximately normal",
+  "t_table": "T95_TABLE (df 1..30) + normal 1.96 beyond (no scipy dependency)",
+  "seeds_needed_formula": "n = (2*sd/|delta|)^2 (conservative: strict paired t design would use (1.96+0.84)^2=7.84)",
+  "raw_distribution_reported": true
+ },
+ "aggregation": {
+  "hard_gate": "every seed and every evaluated scene must pass on its own; the cross-seed mean may not rescue a bad seed or scene",
+  "per_seed": "measured per seed; missing counts as UNKNOWN -> needs_evidence",
+  "per_scene": "measured per map/source_id group; a scene with no measurement is UNKNOWN -> needs_evidence",
+  "reported_alongside": [
+   "mean",
+   "macro average",
+   "worst scene",
+   "each seed"
+  ]
+ },
+ "candidate_gates": {
+  "candidate_reference_coverage_min": 0.8,
+  "left_right_role_agreement_min": 0.7,
+  "per_scene_min_candidates": 30,
+  "identity_rate_min": 0.6,
+  "coverage_denominator": "candidates produced on frames that HAVE a line reference; scenes with no line truth are negative scenes judged by the negative-line metric instead",
+  "calibrated_on": "2026-09-26, 136-frame authoritative human-truth set",
+  "evidence": "docs/CANDIDATE_GATE_CALIBRATION_20260926.md"
+ },
+ "coverage_gate_frozen": true,
+ "spatial_buffer_m": 50.0,
+ "spatial_buffer_note": "frozen from the front camera's visible range at 536x403 (~40-60 m of road): a conservative 50 m buffer. Changing the camera or resolution requires recalibration and a new protocol version.",
+ "thresholds": {
+  "candidate_identity_rate_min": 0.6,
+  "line_recall_min": 0.7,
+  "line_precision_min": 0.4,
+  "offroad_false_ratio_max": 0.1,
+  "inference_ms_p95_max": 45.0,
+  "noninferior_margin": 0.05,
+  "min_seeds": 3,
+  "candidate_reference_coverage_min": 0.8,
+  "left_right_role_agreement_min": 0.7,
+  "per_scene_min_candidates": 30,
+  "resume_tolerance_factor": 3.0,
+  "resume_control_max_rel_diff": 0.0033,
+  "resume_max_rel_diff": 0.01,
+  "frozen_at": "2026-09-26",
+  "source": "T13 baselines + plan T14 §5; candidate gates calibrated 2026-09-26 on the 136-frame authoritative human-truth set (docs/CANDIDATE_GATE_CALIBRATION_20260926.md)"
+ },
+ "hash": "73520d38c89fce68"
+}
