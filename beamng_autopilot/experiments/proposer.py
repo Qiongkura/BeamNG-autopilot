@@ -29,7 +29,11 @@ ALLOWED_KEYS = {
     "scene_mix": ("add_runs", "drop_runs", "group_weights"),
     "hard_negative_sampling": ("oversample_runs", "hard_neg_manifest"),
     "loss_weights": ("line_weight", "line_tversky_weight",
-                     "line_cldice_weight", "line_tversky_beta"),
+                     "line_cldice_weight", "line_tversky_beta",
+                     # FP/FN **方向**旋钮（T15：只有 beta/alpha 比值决定方向，
+                     # 整体权重只改幅度）。训练器早已支持 --line-tversky-alpha，
+                     # 白名单漏了它 -> 方向实验一直提议不出来（S6 E2 前置）。
+                     "line_tversky_alpha"),
     "epochs": ("epochs", "lr"),
 }
 

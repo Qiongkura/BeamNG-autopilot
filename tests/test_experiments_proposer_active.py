@@ -30,16 +30,27 @@ from beamng_autopilot.experiments.proposer import (  # noqa: E402
 )
 
 #: 训练器（TRAINER_FLAG_FACTORS）支持的线损失键：与 proposer 的键表钉在一起。
-TRAINER_LINE_KEYS = ("line_weight", "line_tversky_weight",
-                     "line_cldice_weight", "line_tversky_beta")
+#: 训练器（TRAINER_FLAG_FACTORS）支持的线损失键：**从 autoloop 现场派生**，
+#: 不再手抄一份（本轮实测踩到：白名单加了 `line_tversky_alpha`，手抄的表没跟上，
+#: 于是"防漂移"的钉子自己先漂了）。
+def _trainer_line_keys() -> tuple:
+    spec = importlib.util.spec_from_file_location(
+        "m5_seg_autoloop",
+        Path(__file__).resolve().parents[1] / "scripts" / "m5_seg_autoloop.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["m5_seg_autoloop"] = mod
+    spec.loader.exec_module(mod)
+    return tuple(k for k in mod.TRAINER_FLAG_FACTORS if "line" in k)
 
 
 # ---------------------------------------------------------------------------
 # factor_activity：road-only 下线损失键一律 inactive
 def test_road_only_marks_every_line_loss_key_inactive() -> None:
-    assert set(LINE_LOSS_KEYS) == set(TRAINER_LINE_KEYS), \
-        "线损失键表漂移了：训练器的线损失键必须逐个覆盖"
-    for key in TRAINER_LINE_KEYS:
+    trainer_keys = _trainer_line_keys()
+    assert set(LINE_LOSS_KEYS) == set(trainer_keys), \
+        f"线损失键表漂移了：proposer={sorted(LINE_LOSS_KEYS)} " \
+        f"trainer={sorted(trainer_keys)}"
+    for key in trainer_keys:
         act = factor_activity({key: 1.5}, line_supervision=False)
         assert act["active"] is False, f"{key} 在 road-only 下必须判 inactive"
         assert key in act["inactive_keys"], \
@@ -49,7 +60,7 @@ def test_road_only_marks_every_line_loss_key_inactive() -> None:
 
 
 def test_line_loss_keys_are_active_when_line_channel_is_supervised() -> None:
-    for key in TRAINER_LINE_KEYS:
+    for key in _trainer_line_keys():
         act = factor_activity({key: 1.5}, line_supervision=True)
         assert act["active"] is True, f"{key} 在有 line 监督时必须 active"
         assert act["inactive_keys"] == []
