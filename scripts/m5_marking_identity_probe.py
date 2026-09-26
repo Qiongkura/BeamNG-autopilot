@@ -22,6 +22,10 @@ Two limits are part of the result, not footnotes:
   left boundary, which the divider) needs the camera model and a ground
   projection; the ring collector now saves the model per view, but a run
   recorded before that cannot answer the per-candidate question.
+* a frame with no camera model is UNKNOWN - missing evidence, never a
+  negative (plan v2 §3.4/T09).  Such frames are reported per frame under
+  ``unknowns`` and are NOT counted as processed measurements, so a run with
+  no camera is refused instead of looking "processed but empty".
 
 Usage::
 
@@ -377,6 +381,31 @@ def candidate_side_reference(row: dict, lat_m: float,
     return side, ref, ref >= int(min_px)
 
 
+def frame_counts(cands, *, in_p: bool) -> dict:
+    """一帧的整数计数（C/R/M/L/A；公式只此一份，方案 v2 §3.3）。
+
+    ``in_p`` 由调用方按**逐帧真值**给出：该帧真值明确有漆线像素时为 True，
+    全部候选进 ``C``（覆盖率分母）；否则候选进 ``C_outside_P``，不产生任何
+    R/M/L/A（``R⊆C`` 是契约不变量，实测踩到过覆盖率 >1）。
+
+    P 的判定**不在**这里做：同一个 ``P_frames`` 键不允许有两种含义。主口径
+    （真值有漆线像素）与诊断口径（引擎线能链成线）由调用方各判一次、分别
+    传入，分别落在 ``counts`` 与 ``counts_chained_engine_line`` 两个键上。
+    """
+    sel = list(cands) if in_p else []
+    matched = [c for c in sel
+               if c.get("reference_available") and c.get("matched")]
+    return {
+        "P_frames": 1 if in_p else 0,
+        "C": len(sel),
+        "C_outside_P": 0 if in_p else len(cands),
+        "R": sum(1 for c in sel if c.get("reference_available")),
+        "M": len(matched),
+        "L": len(matched),
+        "A": sum(1 for c in matched if c.get("role_agrees")),
+    }
+
+
 def match_rate_with_reference(rows: list, *, min_px: int = MIN_REF_PX) -> dict:
     """只在"候选所在侧有参考"的候选上算匹配率，并把覆盖一起报出来。
 
@@ -495,6 +524,36 @@ def frame_error_entry(name, index: int, exc: Exception, *,
             "skipped": str(stage) == "measure"}
 
 
+def frame_unknown_entry(name, index: int, reason: str, *,
+                        stage: str = "camera",
+                        n_engine_px: int | None = None) -> dict:
+    """单帧**缺证据（UNKNOWN）**的结构化条目（方案 v2 §3.4 / T09）。
+
+    与 ``frame_error_entry`` 的区别：UNKNOWN 不是异常，也**不等于"无线"**——
+    帧读得动、真值也可能有漆线，只是这个测量问题（逐候选身份）缺少证据
+    （当前只有"缺相机模型"一种）。它**不进 ``rows``**（不是成功测量，不进
+    任何计数或 p50），以 ``status="unknown"`` 进 ``unknowns``；``n_engine_px``
+    照记，保证"有真漆线却缺相机"没有被改写成"无线"后排除（§3.3）。
+    """
+    entry = {"frame": str(name), "index": int(index), "stage": str(stage),
+             "status": "unknown", "reason": str(reason)}
+    if n_engine_px is not None:
+        entry["n_engine_px"] = int(n_engine_px)
+        entry["truth_has_line_px"] = int(n_engine_px) > 0
+    return entry
+
+
+def refusal(reason: str, **extra) -> dict:
+    """结构化拒绝结果：``reason`` + **真实**帧数（T11：processed 不许缺省成 0
+    后被当成成功）。调用方按实际进度覆盖 ``frames_*``/``errors``/``unknowns``。
+    """
+    out = {"reason": str(reason), "errors": [], "n_errors": 0,
+           "unknowns": [], "frames_unknown": 0, "frames_processed": 0,
+           "frames_skipped": 0, "frames_total": 0}
+    out.update(extra)
+    return out
+
+
 def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
           limit: int | None = None, model_path: str | None = None,
           frames: list | None = None,
@@ -535,43 +594,62 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
     交叉口径 ``dashed_recovery`` 与 ``yellow_classic``（不参与求和）。
 
     帧数口径：``frames_processed`` = ``len(rows)``（读成功并跑完测量）；
-    ``frames_with_counts`` = 真的产出 counts 的帧；``frames_no_line_mask`` =
-    head 没给线掩码的帧（合法结果，不是错误）；``frames_skipped`` = 被异常
-    跳过的帧数，``skipped_frames`` 是帧名清单。既有 ``counts["P_frames"]``
-    口径（有引擎漆线**像素**的帧数，= ``frames_with_engine_line``）保持不变；
-    逐帧 ``P_frame`` 是"引擎线能链成线"，两者在"有像素但链不成线"的帧上会差，
-    所以另报 ``frames_with_chained_engine_line``，不合并两个口径。
+    ``frames_with_counts`` = 真的产出 counts 的帧（**缺失 ≠ 0**，绝不给没测的
+    帧补 0）；``frames_no_line_mask`` = head 没给线掩码的帧（合法结果，不是
+    错误）；``frames_skipped``/``skipped_frames`` = 被异常跳过的帧；
+    ``frames_unknown``/``unknown_frames``/``unknowns`` = 缺证据的 UNKNOWN 帧
+    （当前只有"缺相机模型"，§3.4/T09）——**不进 rows、不进任何计数与 p50**，
+    也不冒充"无线"负例；``frames_total`` == processed + skipped + unknown，
+    帧数守恒、不静默少帧。
+
+    ``counts["P_frames"]`` 的**唯一**口径（方案 §3.3 表 / 协议 v5）：该帧真值
+    **明确有漆线像素**，逐帧判断，= summary 的 ``frames_with_engine_line``；
+    它的候选进覆盖率分母 ``C``——真值有漆线却投影/链线失败属于缺证据，不许当
+    "无线"排除（§3.3）。"引擎线能**链成线**"是**另一个量**，不占 ``P_frames``：
+    逐帧 ``P_frame_chained`` 与 ``counts_chained_engine_line``，summary 汇总为
+    ``frames_with_chained_engine_line``、``frames_truth_line_unchained`` 与
+    ``counts_chained_engine_line``（诊断口径，不进覆盖率主口径）。
     """
     run_dir = Path(run_dir)
     if not run_dir.is_dir():
         # "读不到" 与 "没有帧" 必须分开报：目录不存在时 glob 会静默给空表，
         # 把"路径写错/盘没挂上"伪装成"这个 run 没采到帧"。
-        return {"reason": f"cannot read run dir {run_dir}: not a directory"}
+        return refusal(f"cannot read run dir {run_dir}: not a directory")
     if frames is not None:
         fs = [Path(f) for f in frames]
         if not fs:
-            return {"reason": f"no frame_*.npz in {run_dir}: "
-                              f"explicit frame list is empty"}
+            return refusal(f"no frame_*.npz in {run_dir}: "
+                           f"explicit frame list is empty")
     else:
         try:
             fs = sorted(run_dir.glob("frame_*.npz"))
         except OSError as exc:
-            return {"reason": f"cannot read run dir {run_dir}: {exc}"}
+            return refusal(f"cannot read run dir {run_dir}: {exc}")
         if not fs:
-            return {"reason": f"no frame_*.npz in {run_dir}"}
+            return refusal(f"no frame_*.npz in {run_dir}")
     if limit:
         fs = fs[:int(limit)]
     cam = camera_from_meta(meta or {}, view)
-    net = HydraNet()
-    if model_path:
-        # the checkpoint is chosen on the SEGMENTER, not on the head: the
-        # head is the pipeline, the segmenter owns the weights
-        from beamng_autopilot.vision.segmentation import Segmenter
-        net.add(SemanticHead(segmenter=Segmenter(model_path=model_path)))
-    else:
-        net.add(SemanticHead())
+    try:
+        net = HydraNet()
+        if model_path:
+            # the checkpoint is chosen on the SEGMENTER, not on the head: the
+            # head is the pipeline, the segmenter owns the weights
+            from beamng_autopilot.vision.segmentation import Segmenter
+            net.add(SemanticHead(segmenter=Segmenter(model_path=model_path)))
+        else:
+            net.add(SemanticHead())
+    except Exception as exc:                          # noqa: BLE001
+        # T11：探针自己装配失败（坏权重/CUDA OOM/依赖缺失）也必须**显式可见**，
+        # 不能抛出去被调用方的 except 静默吞掉后当成"这个 run 没东西"。返回
+        # 结构化 reason + 真实已处理帧数（0），绝不返回 frames=0 的成功 summary。
+        return refusal(f"probe setup failed before any frame was measured: "
+                       f"{type(exc).__name__}: {exc}",
+                       frames_total=len(fs), camera_model_used=cam is not None,
+                       run=str(run_dir), view=view)
     rows = []
     errors: list = []
+    unknowns: list = []
     n_overlays = 0
     n_crops = 0
     for i, f in enumerate(fs):
@@ -587,10 +665,15 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
                 if "label" not in z.files:
                     # 这不是"某一帧坏了"，而是这个 run 不是带标注的产物：
                     # 整体拒绝，但要写清是缺 label 数组，不是读不到。
-                    return {"reason": f"{f.name}: no label array "
-                                      f"(not a labelled run)",
-                            "errors": errors,
-                            "n_frames_processed_before_refusal": len(rows)}
+                    return refusal(
+                        f"{f.name}: no label array (not a labelled run)",
+                        errors=errors, n_errors=len(errors),
+                        unknowns=unknowns, frames_unknown=len(unknowns),
+                        frames_processed=len(rows),
+                        n_frames_processed_before_refusal=len(rows),
+                        frames_skipped=sum(1 for e in errors
+                                           if e.get("skipped")),
+                        frames_total=len(fs))
                 label = np.asarray(z["label"])
             if colour.ndim != 3 or label.ndim != 2:
                 raise ValueError(f"bad array shapes colour={colour.shape} "
@@ -598,6 +681,19 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
             if label.shape[:2] != colour.shape[:2]:
                 raise ValueError(f"label {label.shape[:2]} does not match "
                                  f"colour {colour.shape[:2]}")
+            if cam is None:
+                # 方案 v2 §3.3/§3.4、T09：缺相机 = **缺证据（UNKNOWN）**，不是
+                # "处理过但为空"，更不是"没有线"。该帧不进 rows（不算成功测量、
+                # 不进任何计数/p50），逐帧结构化条目进 unknowns；真值有没有漆线
+                # 像素照记，防止把缺相机写成"无线"后排除（§3.3）。
+                # 不跑 head：没有相机模型就回答不了逐候选身份问题，为一个无法
+                # 回答的问题推理只是浪费；图像面统计留给有相机的 run。
+                unknowns.append(frame_unknown_entry(
+                    f.name, i,
+                    f"no camera model for view {view!r} (meta missing or "
+                    f"malformed): per-candidate identity is UNKNOWN",
+                    n_engine_px=int((np.asarray(label) == CLS_LINE).sum())))
+                continue
             ctx = FrameContext(frame_rgb=colour, cam=cam, pos=np.zeros(3),
                                heading=0.0, ground_z=0.0, role=view)
             # HydraNet 把 head 异常吞进 net.errors（run 不抛），只看 out 会把
@@ -614,7 +710,8 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
             if line_mask is None:
                 if head_failed:
                     raise RuntimeError(f"semantic head failed ({head_failed})")
-                rows.append({"frame": i, "reason": "no line mask from the head"})
+                rows.append({"frame": i, "status": "no_line_mask",
+                             "reason": "no line mask from the head"})
                 continue
             if line_mask.shape != label.shape[:2]:
                 raise ValueError(f"line mask {line_mask.shape} does not match "
@@ -693,29 +790,24 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
                 stats["candidate_roles"] = by_role
                 # 逐帧整数计数（方案 v2 §3.3）：C 全部候选 / R 该侧有参考 /
                 # M 匹配（⊆R）/ L 可判角色（⊆M）/ A 一致（⊆L）。判据**复用**
-                # 上面同一循环写下的逐候选标志，公式不重复实现。
-                _p_frame = bool(eng_lines)
-                # **P 帧之外不产生任何计数**（R⊆C 是契约不变量）：那些候选只进
-                # C_outside_P。实测踩到：R 把非 P 帧候选也算进去 -> 覆盖率 >1。
-                _in_p = [_c for _c in cands if _p_frame]
-                stats["counts"] = {
-                    # 覆盖率分母只含 **P 帧**（该帧真值明确有漆线）内的候选
-                    "P_frames": 1 if _p_frame else 0,
-                    "C": len(_in_p),
-                    "C_outside_P": 0 if _p_frame else len(cands),
-                    "R": sum(1 for c in _in_p if c.get("reference_available")),
-                    "M": sum(1 for c in _in_p
-                             if c.get("reference_available")
-                             and c.get("matched")),
-                    "L": sum(1 for c in _in_p
-                             if c.get("reference_available")
-                             and c.get("matched")),
-                    "A": sum(1 for c in _in_p
-                             if c.get("reference_available")
-                             and c.get("matched")
-                             and c.get("role_agrees")),
-                }
+                # 上面同一循环写下的逐候选标志，公式只此一份（frame_counts）。
+                #
+                # ``counts["P_frames"]`` 的**唯一主口径**（§3.3 表 + 协议 v5）：
+                # 该帧真值**明确有漆线像素**，逐帧判断——与"能不能链成线"无关。
+                # 真值有漆线却投影/链线失败属于**缺证据**，不许当"无线"排除
+                # （§3.3），所以它的候选仍进覆盖率分母 C。
+                # "引擎线能链成线"是**另一个量**，另立显式键、不占 P_frames：
+                # 逐帧 ``P_frame_chained`` + ``counts_chained_engine_line``；
+                # summary 汇总为 ``frames_with_chained_engine_line`` 与
+                # ``counts_chained_engine_line``（诊断口径，不进覆盖率主口径）。
+                _p_frame = int(stats.get("n_engine_px") or 0) > 0
+                _p_chained = bool(eng_lines)
+                stats["counts"] = frame_counts(cands, in_p=_p_frame)
+                stats["counts_chained_engine_line"] = frame_counts(
+                    cands, in_p=_p_chained)
                 stats["P_frame"] = _p_frame
+                stats["P_frame_chained"] = _p_chained
+                stats["status"] = "measured"
                 # 逐帧来源分解（方案 v2 §3.3 末段）：本帧**全部**候选按
                 # kind/颜色/来源臂计数，不删任何来源；非 P 帧也记，否则"只在
                 # 非 P 帧出现的困难来源"会在 summary 里消失。summary 再分两份
@@ -789,20 +881,33 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
                 errors.append(frame_error_entry(f.name, i, exc,
                                                 stage="overlay"))
     if not rows:
-        # 全部帧都失败：返回"不可测"的 reason + 结构化 errors，不返回空
-        # summary 冒充"测过但没东西"（读不到/没有帧已在上面分开报过）。
+        # 全部帧都测不了（失败和/或缺证据 UNKNOWN）：返回"不可测"的 reason +
+        # 结构化 errors/unknowns 与**真实**帧数，不返回空 summary 冒充"测过但
+        # 没东西"（读不到/没有帧已在上面分开报过）。帧数缺测时也不默认成 0
+        # 后继续报成功（方案 T11）。
         first = errors[0] if errors else None
-        detail = (f"{first['frame']}: {first['error']}: {first['message']}"
-                  if first else "no frame produced a measurement")
-        return {"reason": (f"no frame in {run_dir} could be measured "
-                           f"({len(errors)} frame error(s)); first: {detail}"),
-                "errors": errors, "n_errors": len(errors),
-                "frames_skipped": len(errors)}
+        first_unknown = unknowns[0] if unknowns else None
+        if first is not None:
+            detail = f"{first['frame']}: {first['error']}: {first['message']}"
+        elif first_unknown is not None:
+            detail = f"{first_unknown['frame']}: {first_unknown['reason']}"
+        else:
+            detail = "no frame produced a measurement"
+        return refusal(f"no frame in {run_dir} could be measured "
+                       f"({len(errors)} frame error(s), {len(unknowns)} "
+                       f"UNKNOWN frame(s)); first: {detail}",
+                       errors=errors, n_errors=len(errors),
+                       unknowns=unknowns, frames_unknown=len(unknowns),
+                       frames_skipped=len(errors), frames_total=len(fs),
+                       camera_model_used=cam is not None)
     def p50(key):
         vals = [r[key] for r in rows
                 if isinstance(r.get(key), (int, float)) and r[key] is not None]
         return None if not vals else round(float(np.median(vals)), 4)
+    # 有真值漆线像素的帧数（只可能出现在有 counts 的帧上：无掩码帧根本没算
+    # n_engine_px；缺相机的帧已进 unknowns、不在 rows 里冒充）
     n_engine_seen = sum(1 for r in rows if (r.get("n_engine_px") or 0) > 0)
+
     def total(key):
         """Sum an integer counter across rows (bool is not a counter)."""
         vals = [r.get(key) for r in rows]
@@ -819,7 +924,8 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
     n_agree = total("n_role_agreement")
     # 失败可见性（方案 v2 §3.3）：被跳过的帧数与帧名必须在 summary 里可查
     n_skipped = sum(1 for e in errors if e.get("skipped"))
-    n_chained_p = sum(1 for r in rows if r.get("P_frame"))
+    # "引擎线能链成线"是诊断口径（另一个键），与 counts["P_frames"] 无关
+    n_chained_p = sum(1 for r in rows if r.get("P_frame_chained"))
     # 来源分解：P 帧口径（Σ == counts["C"]）与全帧口径（Σ == candidates_total）
     src_pframe = merge_source_breakdowns(
         [r.get("candidate_sources") for r in rows
@@ -849,25 +955,41 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
         # own classes: confirmed paint / on the road but unpainted / off it
         # 按侧判定：分母只含"该侧有参考"的候选（见 match_rate_with_reference）
         **match_rate_with_reference(rows),
-        # 整数计数总计（先加总、再算比率；见 experiments/candidate_metrics.py）
-        "counts": {**cm.totals([r.get("counts") or {} for r in rows]),
-                   "P_frames": n_engine_seen},
-        # 帧数口径（方案 v2 §3.3）：processed = 读成功并跑完测量；
-        # with_counts = 真的产出 counts（失败帧绝不混进来当 0）；no_line_mask
-        # = head 没给线掩码（合法结果，不是错误）；skipped = 被异常跳过的帧，
+        # 整数计数总计（先加总、再算比率；见 experiments/candidate_metrics.py）。
+        # P_frames 的**唯一**口径 = 真值明确有漆线像素的帧（逐帧）；这里不做
+        # 任何"覆盖成有像素帧数"的二次赋值——同一键只有一种含义。
+        "counts": cm.totals([r.get("counts") or {} for r in rows]),
+        # 同一批帧、同样公式，但 P 只取"引擎线能链成线"的帧（诊断口径，**不进**
+        # 覆盖率主口径）：二者之差就是"有漆线像素却链不成线"的缺证据帧，方案
+        # §3.3 不许把它们当"无线"排除，所以主口径 counts 仍含它们的候选。
+        "counts_chained_engine_line": cm.totals(
+            [r.get("counts_chained_engine_line") or {} for r in rows]),
+        # 帧数口径（方案 v2 §3.3/§3.4）：processed = 读成功并跑完测量；
+        # with_counts = 真的产出 counts（缺 counts 的帧**不补 0**，也不混进
+        # 计数；缺失与"实测 0"因此可区分）；no_line_mask = head 没给线掩码
+        # （合法结果，不是错误）；unknown = 缺证据的 UNKNOWN 帧（缺相机），
+        # **不进 rows**、不进计数与 p50；skipped = 被异常跳过的帧，
         # skipped_frames 是帧名清单；overlay 阶段失败只进 errors 不跳帧。
         "frames_processed": len(rows),
         "frames_with_counts": sum(1 for r in rows
                                   if isinstance(r.get("counts"), dict)),
         "frames_no_line_mask": sum(1 for r in rows if r.get("reason")),
+        "frames_unknown": len(unknowns),
+        "unknown_frames": [u["frame"] for u in unknowns],
+        "unknowns": unknowns,
         "frames_skipped": n_skipped,
         "skipped_frames": [e["frame"] for e in errors if e.get("skipped")],
         "n_errors": len(errors),
         "errors": errors,
-        # counts["P_frames"] 沿用"有引擎漆线像素"的帧口径（= frames_with_
-        # engine_line）；逐帧 P_frame 是"引擎线能链成线"。两者在"有像素但链
-        # 不成线"的帧上会差，所以单独报，不合并两个口径。
+        # 帧数守恒：frames_total == frames_processed + frames_skipped +
+        # frames_unknown（UNKNOWN/失败都不进 rows，帧不会静默消失）。
+        "frames_total": len(fs),
+        # counts["P_frames"] 主口径 = 真值明确有漆线**像素**的帧（逐帧，
+        # = frames_with_engine_line）；"引擎线能**链成线**"是另一个量，落在
+        # frames_with_chained_engine_line / counts_chained_engine_line 两个
+        # 独立键上，两者之差 = 有像素但链不成线的缺证据帧数。
         "frames_with_chained_engine_line": n_chained_p,
+        "frames_truth_line_unchained": n_engine_seen - n_chained_p,
         # 候选来源分解（方案 v2 §3.3 末段，定义见 candidate_source_breakdown）：
         # candidate_sources 只含 **P 帧**候选（Σ == counts["C"]）；
         # candidate_sources_all 含全部已处理帧（Σ == candidates_total）。
@@ -912,7 +1034,8 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
     }
     summary["model"] = str(model_path) if model_path else "default_model_path"
     out = {"run": str(run_dir), "view": view, "summary": summary, "rows": rows,
-           "errors": errors}
+           "errors": errors, "unknowns": unknowns,
+           "n_unknown": len(unknowns)}
     if overlay_dir is not None:
         out["overlay_dir"] = str(overlay_dir)
         out["n_overlays"] = n_overlays
@@ -949,7 +1072,8 @@ def main(argv=None) -> int:
         mp = Path(args.meta)
         if not mp.is_file():
             print(f"[ident] no meta at {mp}; the camera model is unavailable, "
-                  f"so only image-plane numbers will be produced")
+                  f"so per-candidate identity is UNKNOWN for every frame "
+                  f"(T09: 缺相机 -> UNKNOWN, not a measured zero)")
         else:
             meta = json.loads(mp.read_text(encoding="utf-8"))
     res = probe(Path(args.run), meta, view=args.view, limit=args.limit,
