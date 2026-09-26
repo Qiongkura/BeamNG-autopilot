@@ -2293,6 +2293,19 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                              .get("n_train") or 0),
                             args.batch) * int(cand_epochs))
                         for s in args.seeds}},
+                # 实际入训**样本数**（来自 checkpoint 的 train_args，不是配置声称）：
+                # 等步数对照的另一半证据，也是"四个计数"里"实际入训"的来源。
+                "n_train_frames_by_arm": {
+                    "baseline": {
+                        str(s): (_ckpt_train_args(
+                            exp_dir(args.run_id) / "baseline" / f"seed{s}"
+                            / "checkpoint_last.pt").get("n_train"))
+                        for s in args.seeds},
+                    "candidate": {
+                        str(s): (_ckpt_train_args(
+                            exp_dir(args.run_id) / f"round{rnd}" / f"seed{s}"
+                            / "checkpoint_last.pt").get("n_train"))
+                        for s in args.seeds}},
                 "timing_suspect": timing_notes,
                 "timing_repeats": timing_repeats,
                 # 评估的是哪个阶段的权重 + 平凡基线参照（见 eval matrix）：

@@ -1669,6 +1669,7 @@ def _decisions_state(path: Path | None) -> dict:
             "decision": dec.get("decision") or "",
             "reasons": list(dec.get("reasons") or []),
             "steps_by_arm": blob.get("steps_by_arm"),
+            "n_train_frames_by_arm": blob.get("n_train_frames_by_arm") or {},
             "max_train_frames": blob.get("max_train_frames"),
             "equal_steps": blob.get("equal_steps_requested"),
             "factor": blob.get("factor"),
@@ -1979,6 +1980,28 @@ def _decisions_view(ctx: dict) -> str:
                     f"gt={_esc(str(f.get('gt_px')))})" for f in frames)
                 out.append(f"<li>seed {_esc(seed)}: {cells}</li>")
             out.append("</ul>")
+        _ntf = it.get("n_train_frames_by_arm") or {}
+        if _ntf:
+            out.append('<p class="hint">两臂**实际入训样本数**（来自 checkpoint 的 '
+                       "train_args；等步数对照的另一半证据）:</p>")
+            rows_n = ['<table><tr><th>seed</th><th>基线臂</th><th>候选臂</th></tr>']
+            _seeds = sorted(set(_ntf.get("baseline") or {})
+                            | set(_ntf.get("candidate") or {}),
+                            key=lambda x: str(x))
+            for sd in _seeds:
+                b = (_ntf.get("baseline") or {}).get(sd)
+                c = (_ntf.get("candidate") or {}).get(sd)
+                def _n(v):
+                    return (Evidence(name=sd, level=LEVEL_TRAIN,
+                                     value=(None if v is None else float(v)),
+                                     unit="count",
+                                     missing=("" if v is not None
+                                              else "checkpoint 里没有 n_train")
+                                     ).cell())
+                rows_n.append(f'<tr><td class="mono">seed {_esc(sd)}</td>'
+                              f"<td>{_n(b)}</td><td>{_n(c)}</td></tr>")
+            rows_n.append("</table>")
+            out.append("".join(rows_n))
         _hbs = it.get("hard_by_seed") or {}
         if _hbs:
             out.append('<p class="hint">逐 seed 硬门输入（每个 seed 的 checkpoint '
