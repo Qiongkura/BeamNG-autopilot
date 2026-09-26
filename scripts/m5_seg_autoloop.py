@@ -1227,12 +1227,16 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
     counts_by_group: dict = {}
     acc: dict = {k: [] for k in IDENTITY_FIELDS}
     gacc: dict = {}          # 逐场景（map/source_id 组）明细
+    run_errors: list = []    # 被跳过的评价 run（T11：缺测必须可见，不静默丢）
     for r in eval_runs:
         run = Path(r)
         meta = run / "meta.json"
         if not meta.exists() and (run.parent / "meta.json").exists():
             meta = run.parent / "meta.json"
         if not meta.exists():
+            # 旧实现直接 continue：整个 run 消失、计数为 0，看起来像"没有候选"。
+            # 缺 meta 是**缺测**，必须能定位（方案 v2 §S2 验收）。
+            run_errors.append({"run": str(run), "why": "no meta.json"})
             continue
         try:
             # 只在给了唯一清单时传 frames：注入的假探针（测试）可能没有该参数，
@@ -1243,7 +1247,11 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
                     str(run).replace("\\", "/")) or [])
             res = probe_fn(run, json.loads(meta.read_text(encoding="utf-8")),
                            view=run.name, model_path=str(model_path), **_kw)
-        except Exception:                             # noqa: BLE001
+        except Exception as exc:                      # noqa: BLE001
+            # 探针异常同样不许静默丢 run：结构化记账，调用方（判定文件/看板）
+            # 能看出"这个 run 没测到"，而不是把它当成 0 候选。
+            run_errors.append({"run": str(run),
+                               "why": f"{type(exc).__name__}: {exc}"})
             continue
         # 探针把 match_rate_with_reference 的字段**内联在 summary 里**
         # （`**match_rate_with_reference(rows)`），所以这里直接读 summary。
@@ -1299,6 +1307,9 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
     out["per_group"] = {
         g: {k: round(sum(v) / len(v), 4) for k, v in d.items()}
         for g, d in gacc.items()}
+    # 缺测的 run 逐条可见（T11）：空列表 = 每个 run 都测到了
+    out["eval_run_errors"] = run_errors
+    out["n_eval_run_errors"] = len(run_errors)
     return out
 
 
@@ -2142,6 +2153,11 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                                     args.eval_runs,
                                     frames_by_dir=_report.get(
                                         "dev_frames_by_dir"))
+            if _idc.get("eval_run_errors"):
+                print(f"[rounds] 第 {rnd + 1} 轮 seed {seed}："
+                      f"{_idc['n_eval_run_errors']} 个评价 run 没测到"
+                      f"（判定记 UNKNOWN，不当 0 候选）："
+                      f"{_idc['eval_run_errors'][:2]}")
             cand_task[str(seed)] = {
                 name: task_metric_value(name, metrics, _idc)
                 for name in TASK_METRICS}
@@ -2474,6 +2490,9 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 # 否则 replay 无法按新分母重判（legacy_replay_note 会明确说明）。
                 "counts": _idc.get("counts") or {},
                 "counts_by_group": _idc.get("counts_by_group") or {},
+                # 评价 run 的缺测（T11）：空列表才是"每个 run 都测到了"，
+                # 有内容时必须能在判定文件/看板上看到，不许当成 0 候选
+                "eval_run_errors": _idc.get("eval_run_errors") or [],
                 "scene_counts": _scene_counts,
                 # 逐场景适用性（measured/not_applicable/unknown）：只写
                 # scene_counts 的话，看板只能显示"无数据"，看不到

@@ -210,3 +210,44 @@ def test_identity_metrics_counts_by_group_matches_the_total(tmp_path,
     for k in ("P_frames", "C", "R", "M", "L", "A", "C_outside_P"):
         assert sum(int(v.get(k, 0)) for v in out["counts_by_group"].values()) \
             == int(out["counts"][k]), k
+
+
+def test_a_failed_eval_run_is_visible_not_silently_dropped(tmp_path,
+                                                           monkeypatch):
+    """T11：缺 meta / 探针异常的 run 必须逐条可见，不许 `except: continue`。
+
+    旧实现静默丢掉整个 run：计数为 0，读起来像"这个场景没有候选"。
+    """
+    loop = _load()
+    good = _frames(tmp_path, "coll_good", source_id="ring_good")
+    bad = tmp_path / "runs" / "coll_bad" / "front_main"
+    bad.mkdir(parents=True, exist_ok=True)
+    for i in range(2):
+        np.savez(bad / f"frame_{i:05d}.npz",
+                 colour=np.full((20, 24, 3), 60 + i, np.uint8),
+                 label=np.zeros((20, 24), np.uint8))
+    # 没有 meta.json（也不在父目录）-> 旧实现直接 continue
+
+    def probe(run, meta, *, view=None, model_path=None, frames=None):
+        name = Path(run).parent.name
+        if name == "coll_boom":
+            raise RuntimeError("probe blew up")
+        n = len(frames) if frames is not None else len(
+            list(Path(run).glob("frame_*.npz")))
+        return {"summary": {
+            "counts": {"P_frames": n, "C": n, "R": n, "M": 0, "L": 0, "A": 0,
+                       "C_outside_P": 0},
+            "n_candidates": n, "n_candidates_with_reference": n,
+            "match_rate": 0.0, "match_rate_with_reference": 0.0,
+            "role_agreement_rate": None, "candidate_paint_recall": None}}
+
+    boom = _frames(tmp_path, "coll_boom", source_id="ring_boom")
+    import m5_marking_identity_probe as ip
+    monkeypatch.setattr(ip, "probe", probe)
+    out = loop.identity_metrics(Path("model.pt"), [good, bad, boom])
+    assert out["n_eval_run_errors"] == 2, out["eval_run_errors"]
+    whys = " | ".join(e["why"] for e in out["eval_run_errors"])
+    assert "no meta.json" in whys and "probe blew up" in whys, whys
+    # 好目录照常计数（不是被整批吞成 0）
+    assert out["counts"]["P_frames"] == 2, out["counts"]
+    assert out["counts_by_group"]["italy/ring_good"]["C"] == 2
