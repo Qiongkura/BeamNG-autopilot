@@ -217,6 +217,9 @@ def test_gap_and_outside_clicks_hit_nothing():
     ("tool_pen", lambda s: s.tool == "pen"),
     ("tool_straight", lambda s: s.tool == "straight"),
     ("tool_curve", lambda s: s.tool == "curve"),
+    ("rt_asphalt", lambda s: (s.road_kind, s.cls) == (1, cs.CLS_ROAD)),
+    ("rt_gravel", lambda s: (s.road_kind, s.cls) == (2, cs.CLS_ROAD)),
+    ("rt_shoulder", lambda s: (s.road_kind, s.cls) == (3, cs.CLS_BACKGROUND)),
     ("act_zoom", lambda s: s.zoom == 1),
 ])
 def test_clicking_a_button_changes_the_state(item_id, check):
@@ -272,7 +275,8 @@ def test_clear_button_wipes_the_label_and_is_undoable():
 def test_save_and_prev_buttons_drive_the_frame():
     saved: list = []
     sess = _mk(3, cls=cs.CLS_LINE, brush=3,
-               on_save=lambda fi, rgb, src, lab, unk, ident: saved.append(fi))
+               on_save=lambda fi, rgb, src, lab, unk, rt, ident:
+               saved.append(fi))
     _click_item(sess, "act_next")
     assert saved == [0] and sess.fi == 1
     _click_item(sess, "act_prev")
@@ -527,6 +531,9 @@ def test_painting_after_unknown_clears_the_reason():
     (ord("4"), lambda s: s.unknown_kind == 1),
     (ord("5"), lambda s: s.unknown_kind == 2),
     (ord("6"), lambda s: s.unknown_kind == 3),
+    (ord("7"), lambda s: (s.road_kind, s.cls) == (1, cs.CLS_ROAD)),
+    (ord("8"), lambda s: (s.road_kind, s.cls) == (2, cs.CLS_ROAD)),
+    (ord("9"), lambda s: (s.road_kind, s.cls) == (3, cs.CLS_BACKGROUND)),
     (ord("l"), lambda s: s.tool == "straight"),
     (ord("v"), lambda s: s.tool == "curve"),
     (ord("p"), lambda s: s.tool == "pen"),
@@ -595,11 +602,11 @@ def test_undo_stack_resets_per_frame():
 def test_save_callback_receives_the_frame_and_its_identity():
     seen: list = []
     sess = _mk(2, cls=cs.CLS_LINE, brush=3,
-               on_save=lambda fi, rgb, src, lab, unk, ident:
-               seen.append((fi, src, lab.any(), ident.get("source_id"))))
+               on_save=lambda fi, rgb, src, lab, unk, rt, ident:
+               seen.append((fi, src, lab.any(), rt.max(), ident.get("source_id"))))
     _drag(sess, (10, 20), (40, 20))
     sess.on_key(ord("s"))
-    assert seen == [(0, 0, True, "s")]
+    assert seen == [(0, 0, True, 0, "s")]
     assert sess.fi == 1
 
 
@@ -629,3 +636,100 @@ def test_label_for_may_return_a_pair_for_prefilled_frames():
     sess = _mk(label_for=_label_for)
     assert (sess.label == cs.CLS_ROAD).any()
     assert (sess.unk == 2).any()
+
+
+# ---------------------------------------------------------------------------
+# 路型（沥青/碎石/路肩）：与普通路面分开，像素类别按驾驶约束定
+# ---------------------------------------------------------------------------
+
+
+def test_roadtype_is_its_own_group_right_after_the_classes():
+    """三个路型自成一组：方案要求两种道路类型分别标记，不能混成 road 一类。"""
+    ids = [it.id for it in at.ITEMS]
+    assert at.GROUP_ORDER.index("roadtype") == at.GROUP_ORDER.index("class") + 1
+    assert ids.index("rt_asphalt") > ids.index("cls_erase")
+    assert [it.id for it in at.ITEMS if it.group == "roadtype"] == [
+        "rt_asphalt", "rt_gravel", "rt_shoulder"]
+    assert sorted(at.ROAD_TYPE_NAMES.values()) == ["asphalt", "gravel", "shoulder"]
+
+
+@pytest.mark.parametrize("item_id,pixel_cls,rt", [
+    ("rt_asphalt", cs.CLS_ROAD, 1),
+    ("rt_gravel", cs.CLS_ROAD, 2),
+    ("rt_shoulder", cs.CLS_BACKGROUND, 3),
+])
+def test_road_type_paints_its_pixel_class_and_records_the_material(
+        item_id, pixel_cls, rt):
+    """沥青与纯土路算路面；**路肩不算路面**（约束：有铺装时土肩不得算道路）。"""
+    sess = _mk(brush=4)
+    _click_item(sess, item_id)
+    assert (sess.road_kind, sess.cls) == (rt, pixel_cls)
+    _drag(sess, (10, 20), (40, 20))
+    band = np.s_[18:23, 12:38]
+    assert (sess.label[band] == pixel_cls).all()
+    assert (sess.paint.road_type[band] == rt).all()
+    assert not (sess.paint.unknown[band] > 0).any()
+
+
+def test_two_road_types_coexist_in_one_frame():
+    """同帧里沥青与碎石必须能分别标出，而不是都变成同一个"路面"。"""
+    sess = _mk(brush=3)
+    _click_item(sess, "rt_asphalt")
+    _drag(sess, (10, 12), (60, 12))
+    _click_item(sess, "rt_gravel")
+    _drag(sess, (10, 40), (60, 40))
+    rt = sess.paint.road_type
+    assert (rt[10:15, 12:58] == 1).all(), "上半幅应为沥青"
+    assert (rt[38:43, 12:58] == 2).all(), "下半幅应为碎石"
+    assert (sess.label[10:15, 12:58] == cs.CLS_ROAD).all()
+    assert (sess.label[38:43, 12:58] == cs.CLS_ROAD).all()
+    counts = at.road_type_counts(rt)
+    assert counts["asphalt"] > 0 and counts["gravel"] > 0
+    assert counts["shoulder"] == 0
+
+
+def test_selecting_a_class_or_an_unknown_brush_leaves_the_road_type():
+    sess = _mk()
+    _click_item(sess, "rt_gravel")
+    assert sess.road_kind == 2
+    _click_item(sess, "cls_line")
+    assert (sess.road_kind, sess.cls) == (0, cs.CLS_LINE)
+    _click_item(sess, "rt_shoulder")
+    assert (sess.road_kind, sess.cls) == (3, cs.CLS_BACKGROUND)
+    _click_item(sess, "unk_blurred")
+    assert (sess.road_kind, sess.unknown_kind) == (0, 2)
+
+
+def test_unknown_brush_clears_the_road_type_column():
+    """255 的像素不该还留着路型，否则导出会出现"忽略但知道材质"的怪字段。"""
+    sess = _mk(brush=4)
+    _click_item(sess, "rt_gravel")
+    _drag(sess, (10, 20), (40, 20))
+    assert (sess.paint.road_type > 0).any()
+    _click_item(sess, "unk_blurred")
+    _drag(sess, (10, 20), (40, 20))
+    assert not (sess.paint.road_type > 0).any()
+    assert (sess.label == cs.CLS_IGNORE).any()
+
+
+def test_a_shoulder_stroke_is_visible_on_the_canvas():
+    """路肩写的是背景，必须单独着色——否则"画了看不见"，复核人会以为没生效。"""
+    sess = _mk(brush=5)
+    before = sess.canvas().copy()
+    _click_item(sess, "rt_shoulder")
+    _drag(sess, (10, 30), (60, 30))
+    after = sess.canvas()
+    assert (sess.paint.road_type == 3).any()
+    assert not (sess.label == cs.CLS_ROAD).any()
+    band = sess.band_h
+    changed = (before[band:] != after[band:]).any(axis=2)
+    assert int(changed.sum()) > 100, "路肩画完画面上没有变化"
+
+
+def test_every_button_has_a_name_in_both_languages():
+    """中文与英文名都不能缺：缺中文名会显示空白，缺英文名就没有退回方案。"""
+    for it in at.ITEMS:
+        assert it.label.strip(), it.id
+        assert it.ascii.strip(), it.id
+    assert at.button_text(at.ITEM_BY_ID["cls_road"]) == "路面(2)"
+    assert at.button_text(at.ITEM_BY_ID["cls_road"], variant="ascii") == "Road(2)"

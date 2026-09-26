@@ -3,25 +3,32 @@
 为什么把状态机从脚本搬进库：脚本里的闭包没法离线测试，而"点顶端某个按钮
 应该切到哪个工具""拖完一条曲线到底落了哪些像素""缩放后窗口坐标 (x,y) 对应
 哪个图像像素"全是最容易错的地方。搬进库以后测试可以直接喂合成的鼠标事件，
-断言 ``(label, unknown_kind)``、撤回栈和命中结果。
+断言 ``(label, unknown_kind, road_type)``、撤回栈和命中结果。
 
-分工：本模块只管**交互**（选择、草稿、栅格化、画布）；CLI、来源身份、
+分工：本模块只管**交互与显示**（选择、草稿、栅格化、画布）；CLI、来源身份、
 文件导出与 sidecar 仍留在 ``scripts/m5_annotate_manual.py``，由 ``on_save``
 回调把落盘接回去。
 
 交互约定（鼠标为主，键盘保留原快捷键）：
 
-* 顶端工具栏每一项都能点：类别 / "不能判断" / 工具是单选，动作项点一次执行。
+* 顶端工具栏每一项都能点：类别 / 路型 / "不能判断" / 工具是单选，动作项点一次
+  执行。**路型与普通路面分成两组**（方案要求两种道路类型分别标记，不能混成
+  road 一类）。
 * pen：按住拖动画笔；bucket：点一下填连通区（右键同）。
 * straight（直线）：拖动 = 起止两点；或点两下（先起点、再终点）。
-* curve（平滑曲线）：拖动 = 自由手绘，松手时抽稀 + Catmull-Rom 平滑；
+* curve（平滑曲线）：拖动 = 自由手绘，松手时等距化 + 去抖 + 抽稀 + Catmull-Rom；
   或点若干下放控制点，Enter 落笔。
 * 草稿可以放弃：Esc，或再点一次当前工具按钮；Undo 在草稿上表示"退掉最后一个
   控制点"，没有草稿时退掉上一笔笔画。
 
-键盘保留原来的快捷键（按钮上印的就是生效的键）：1/2/3 类别、4/5/6 不能判断、
-p 笔、f 油漆桶、b 笔↔油漆桶互切、l 直线、v 曲线、u 撤回、c 清空、z 缩放、
-a 与左方向键上一帧、s 保存并下一帧、q 退出；ENTER 落笔曲线、ESC 放弃草稿。
+显示用中文（PIL 渲染微软雅黑一类字体）；找不到中文字体时退回英文名——退回的
+是字，不是功能。路肩像素在 label 里是背景（AGENTS.md 约束：有铺装时土肩不得
+算作道路），所以它**单独着色**，否则"画了看不见"。
+
+键盘保留原来的快捷键（按钮上印的就是生效的键）：1/2/3 类别、7/8/9 路型、
+4/5/6 不能判断、p 画笔、f 油漆桶、b 画笔↔油漆桶互切、l 直线、v 曲线、u 撤回、
+c 清空、z 缩放、a 与左方向键上一帧、s 保存并下一帧、q 退出；ENTER 落笔曲线、
+ESC 放弃草稿。
 """
 
 from __future__ import annotations
@@ -36,21 +43,32 @@ from beamng_autopilot.labeling import curve_schema as cs
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 TEXT_SCALE = 0.45
-BAND_BG = (30, 30, 30)
-BTN_BG = (62, 62, 62)
-BTN_HOVER = (96, 96, 96)
-BTN_ACTIVE = (26, 128, 52)
-BTN_BORDER = (120, 120, 120)
-STATUS_FG = (235, 235, 235)
+#: 配色（RGB）：深底 + 扁平圆角块 + 单一强调色，尽量少用边框。
+BAND_BG = (23, 24, 27)
+BAND_LINE = (42, 45, 51)
+CHIP_BG = (38, 40, 45)
+CHIP_HOVER = (52, 55, 62)
+CHIP_ACTIVE = (61, 111, 181)
+CHIP_BORDER = (56, 59, 66)
+TEXT_ON = (255, 255, 255)
+TEXT_OFF = (200, 204, 212)
+TEXT_STATUS = (143, 150, 163)
+LABEL_SIZE = 14
+STATUS_SIZE = 13
+STATUS_LINE_H = 17
 #: 类别叠加色（RGB，与既有渲染一致：路面半透明橙、标线绿、未知洋红）
 ROAD_RGB = (255, 120, 0)
 LINE_RGB = (0, 255, 0)
 UNK_RGB = (255, 0, 255)
+GRAVEL_RGB = (198, 152, 96)        # 碎石/土路：土色，叠在路面上分得出来
+SHOULDER_RGB = (116, 124, 140)     # 路肩：青灰（label 是背景，必须单独着色）
 BRUSH_RGB = {cs.CLS_ROAD: (255, 170, 0), cs.CLS_LINE: (0, 255, 0),
-             cs.CLS_BACKGROUND: (255, 255, 255)}
-DRAFT_RGB = (255, 255, 0)          # 草稿中心线：亮黄，和任何类别色都不同
-STATUS_LINE_H = 15
+             cs.CLS_BACKGROUND: (230, 230, 230)}
+DRAFT_RGB = (255, 220, 90)         # 草稿中心线：亮黄
 UNKNOWN_BY_VALUE = {it.value: it.id for it in at.ITEMS if it.group == "unknown"}
+ROAD_TYPE_BY_VALUE = {it.value: it.id for it in at.ITEMS
+                      if it.group == "roadtype"}
+TOOL_ID_BY_NAME = {v: k for k, v in at.TOOL_IDS.items()}
 #: 左方向键的码：不同后端不一样（GTK 65361、Windows 0x250000），81 是旧代码
 #: 里用的那个值，一并保留。
 LEFT_ARROW_CODES = (81, 65361, 2424832)
@@ -84,12 +102,12 @@ class AnnotateSession:
         self.cls = int(cls)
         self.tool = str(tool)
         self.unknown_kind = 0
+        self.road_kind = 0
 
         self._rgb, self._src_idx = self._frames[0]
-        self.label, self.unk = self._initial(0)
-        self._label_cache: dict[int, tuple] = {
-            0: (self.label.copy(), self.unk.copy())}
-        self._undo: list[tuple] = []
+        self.paint = self._initial(0)
+        self._cache: dict[int, at.PaintState] = {0: self.paint.copy()}
+        self._undo: list[at.PaintState] = []
 
         self._painting = False
         self._last_pt: tuple | None = None
@@ -119,6 +137,19 @@ class AnnotateSession:
         return self._idents[self.fi] if self.fi < len(self._idents) else {}
 
     @property
+    def label(self) -> np.ndarray:
+        return self.paint.label
+
+    @property
+    def unk(self) -> np.ndarray:
+        return self.paint.unknown
+
+    @property
+    def road_type(self) -> np.ndarray:
+        """逐像素路型（0=未指定 1=沥青 2=碎石 3=路肩）。"""
+        return self.paint.road_type
+
+    @property
     def undo_depth(self) -> int:
         return len(self._undo)
 
@@ -130,25 +161,35 @@ class AnnotateSession:
     def painting(self) -> bool:
         return self._painting
 
+    @property
+    def cjk(self) -> bool:
+        """有中文字体就用中文，否则退回英文（布局与显示同时切，不许半中半英）。"""
+        return at.load_font(LABEL_SIZE) is not None
+
     def layout(self) -> at.Layout:
         """工具栏布局：按当前画布宽度缓存（缩放变化时宽度变，重新算）。"""
         width = int(self._rgb.shape[1]) * self.zoom
-        if self._layout is None or self._layout.width != max(80, width):
-            self._layout = at.toolbar_layout(width)
+        variant = "cjk" if self.cjk else "ascii"
+        if (self._layout is None or self._layout.width != max(80, width)
+                or self._layout.variant != variant):
+            self._layout = at.toolbar_layout(width, variant=variant,
+                                             label_size=LABEL_SIZE)
         return self._layout
 
     @property
     def band_h(self) -> int:
-        return self.layout().total_h + 2 * STATUS_LINE_H + 4
+        return self.layout().total_h + 2 * STATUS_LINE_H + 6
 
     # ------------------------------------------------------------------
     # 状态查询（渲染与测试都用它，避免"高亮"和"实际生效"两套判断）
     # ------------------------------------------------------------------
 
     def active_item_id(self) -> str:
-        """当前生效的画笔/工具项 id（渲染高亮与状态行共用）。"""
+        """当前生效的画笔（渲染高亮与状态行共用）。"""
         if self.unknown_kind:
             return UNKNOWN_BY_VALUE.get(int(self.unknown_kind), "")
+        if self.road_kind:
+            return ROAD_TYPE_BY_VALUE.get(int(self.road_kind), "")
         for it in at.ITEMS:
             if it.group == "class" and int(it.value) == int(self.cls):
                 return it.id
@@ -158,15 +199,23 @@ class AnnotateSession:
         """工具栏高亮：动作项从不常亮，其余按组单选。"""
         if item.momentary:
             return False
-        if item.group in ("class", "unknown"):
+        if item.group in ("class", "unknown", "roadtype"):
             return item.id == self.active_item_id()
         if item.group == "tool":
             return at.TOOL_IDS.get(item.id) == self.tool
         return False
 
     def brush_name(self) -> str:
-        it = at.ITEM_BY_ID.get(self.active_item_id())
-        return it.label if it is not None else "?"
+        item = at.ITEM_BY_ID.get(self.active_item_id())
+        if item is None:
+            return "?"
+        return item.label if self.cjk else (item.ascii or item.label)
+
+    def tool_name(self) -> str:
+        item = at.ITEM_BY_ID.get(TOOL_ID_BY_NAME.get(self.tool, ""))
+        if item is None:
+            return self.tool
+        return item.label if self.cjk else (item.ascii or item.label)
 
     # ------------------------------------------------------------------
     # 坐标
@@ -193,9 +242,16 @@ class AnnotateSession:
         if item is None:
             return None
         if item.group == "class":
-            self.cls, self.unknown_kind = int(item.value), 0
+            self.cls, self.unknown_kind, self.road_kind = int(item.value), 0, 0
+        elif item.group == "roadtype":
+            # 路型是一支"带材质的画笔"：同时定像素类别（路肩是背景，见
+            # ROAD_TYPE_CLS）与 road_type 列，并清掉忽略原因。
+            self.road_kind = int(item.value)
+            self.cls = int(at.ROAD_TYPE_CLS[int(item.value)])
+            self.unknown_kind = 0
         elif item.group == "unknown":
             self.unknown_kind = int(item.value)
+            self.road_kind = 0
         elif item.group == "tool":
             tool = at.TOOL_IDS[item.id]
             if tool == self.tool:
@@ -211,8 +267,7 @@ class AnnotateSession:
             elif item.id == "act_clear":
                 self.cancel_draft()
                 self._push_undo()
-                self.label[:] = 0
-                self.unk[:] = 0
+                self.paint = at.PaintState.zeros(self.label.shape)
             elif item.id == "act_zoom":
                 self.toggle_zoom()
             elif item.id == "act_prev":
@@ -236,7 +291,7 @@ class AnnotateSession:
                 self._draft = None
             return True
         if self._undo:
-            self.label[:], self.unk[:] = self._undo.pop()
+            self.paint = self._undo.pop()
             return True
         return False
 
@@ -244,19 +299,16 @@ class AnnotateSession:
     # 帧间
     # ------------------------------------------------------------------
 
-    def _initial(self, index: int) -> tuple[np.ndarray, np.ndarray]:
+    def _initial(self, index: int) -> at.PaintState:
         got = self._label_for(self._frames[index][0], self._frames[index][1])
+        if isinstance(got, at.PaintState):
+            return got.copy()
         if isinstance(got, tuple):
-            lab, unk = got
-        else:
-            lab, unk = got, None
-        lab = np.asarray(lab, dtype=np.uint8)
-        unk = (np.zeros(lab.shape, dtype=np.uint8) if unk is None
-               else np.asarray(unk, dtype=np.uint8))
-        return lab.copy(), unk.copy()
+            return at.coerce_paint_state(*got)
+        return at.coerce_paint_state(got)
 
     def _cache_current(self) -> None:
-        self._label_cache[self.fi] = (self.label.copy(), self.unk.copy())
+        self._cache[self.fi] = self.paint.copy()
 
     def load_frame(self, target: int) -> None:
         """切帧：先把当前帧（含未保存修改）缓存起来，再恢复目标帧。"""
@@ -269,11 +321,8 @@ class AnnotateSession:
         self._last_pt = None
         self.fi = target
         self._rgb, self._src_idx = self._frames[target]
-        cached = self._label_cache.get(target)
-        if cached is not None:
-            self.label, self.unk = cached[0].copy(), cached[1].copy()
-        else:
-            self.label, self.unk = self._initial(target)
+        cached = self._cache.get(target)
+        self.paint = cached.copy() if cached is not None else self._initial(target)
         self._undo.clear()
 
     def save_and_advance(self) -> bool:
@@ -281,7 +330,7 @@ class AnnotateSession:
         self._cache_current()
         if self._on_save is not None:
             self._on_save(self.fi, self._rgb, self._src_idx, self.label,
-                          self.unk, self.ident)
+                          self.unk, self.road_type, self.ident)
         if self.fi >= len(self._frames) - 1:
             return False
         self.load_frame(self.fi + 1)
@@ -292,26 +341,31 @@ class AnnotateSession:
     # ------------------------------------------------------------------
 
     def _push_undo(self) -> None:
-        self._undo.append((self.label.copy(), self.unk.copy()))
+        self._undo.append(self.paint.copy())
         if len(self._undo) > 25:
             self._undo.pop(0)
 
+    def _stamp(self, points) -> None:
+        """把一段几何落进三个数组（不压撤回栈：调用方决定时机）。"""
+        pts = np.asarray(points, dtype=float).reshape(-1, 2)
+        if len(pts) == 0:
+            return
+        mask = at.rasterize(self.label.shape, pts, at.brush_thickness(self.brush))
+        at.apply_mask(self.paint, mask, cls=self.cls,
+                      unknown_kind=self.unknown_kind,
+                      road_type=self.road_kind)
+
     def _commit(self, points) -> bool:
-        """把一段几何落进 (label, unk)：撤销栈先存一份，再整段盖上去。"""
+        """落笔一笔：先存撤销栈，再整段盖上去。"""
         pts = np.asarray(points, dtype=float).reshape(-1, 2)
         if len(pts) == 0:
             return False
         self._push_undo()
-        mask = at.rasterize(self.label.shape, pts, at.brush_thickness(self.brush))
-        at.apply_mask(self.label, self.unk, mask, cls=self.cls,
-                      unknown_kind=self.unknown_kind)
+        self._stamp(pts)
         return True
 
     def _pen_to(self, p: tuple[int, int]) -> None:
-        pts = [self._last_pt, p] if self._last_pt is not None else [p]
-        mask = at.rasterize(self.label.shape, pts, at.brush_thickness(self.brush))
-        at.apply_mask(self.label, self.unk, mask, cls=self.cls,
-                      unknown_kind=self.unknown_kind)
+        self._stamp([self._last_pt, p] if self._last_pt is not None else [p])
         self._last_pt = p
 
     def _bucket(self, p: tuple[int, int]) -> None:
@@ -321,7 +375,7 @@ class AnnotateSession:
             return
         old = int(self.label[r, c])
         want = cs.CLS_IGNORE if self.unknown_kind else int(self.cls)
-        if old == want:
+        if old == want and not self.road_kind:
             return
         m = (self.label == old).astype(np.uint8)
         ff = np.zeros((h + 2, w + 2), np.uint8)
@@ -329,6 +383,7 @@ class AnnotateSession:
         region = (m == 0) & (self.label == old)
         self.label[region] = want
         self.unk[region] = int(self.unknown_kind) if self.unknown_kind else 0
+        self.road_type[region] = int(self.road_kind) if self.road_kind else 0
 
     def cancel_draft(self) -> None:
         self._draft = None
@@ -339,8 +394,7 @@ class AnnotateSession:
         d = self._draft
         if d is None or d.tool != "curve" or len(d.points) < 2:
             return False
-        pts = at.catmull_rom(d.points)
-        ok = self._commit(pts)
+        ok = self._commit(at.catmull_rom(d.points))
         self._draft = None
         return ok
 
@@ -470,7 +524,7 @@ class AnnotateSession:
         if raw == ord("q"):
             return "quit"
         ch = chr(raw) if 32 <= raw < 127 else ""
-        if ch == "b":                          # 旧键：笔 / 油漆桶 互切
+        if ch == "b":                          # 旧键：画笔 / 油漆桶 互切
             self.activate("tool_bucket" if self.tool != "bucket" else "tool_pen")
             return None
         item = at.ITEM_BY_KEY.get(ch)
@@ -485,76 +539,152 @@ class AnnotateSession:
     def brush_rgb(self) -> tuple:
         if self.unknown_kind:
             return UNK_RGB
+        if int(self.road_kind) == 2:
+            return GRAVEL_RGB
+        if int(self.road_kind) == 3:
+            return SHOULDER_RGB
+        if self.road_kind:
+            return ROAD_RGB
         return BRUSH_RGB.get(int(self.cls), LINE_RGB)
 
     def status_line(self) -> str:
         idn = self.ident
         sides = at.side_line_counts(self.label)
+        n_shoulder = int((self.road_type == 3).sum())
+        n_gravel = int((self.road_type == 2).sum())
+        if self.cjk:
+            return (f"[{self.fi + 1}/{self.n_frames}] 源#{self.src_idx} "
+                    f"{idn.get('map_name') or '未知地图'}/"
+                    f"{idn.get('source_id') or '未知来源'}　"
+                    f"工具={self.tool_name()}　画笔={self.brush_name()}　"
+                    f"撤回={len(self._undo)}　左={sides['left']}　"
+                    f"右={sides['right']}　碎石={n_gravel}　路肩={n_shoulder}　"
+                    f"缩放={self.zoom}x")
         return (f"[{self.fi + 1}/{self.n_frames}] src#{self.src_idx} "
                 f"{idn.get('map_name') or 'UNKNOWN'}/"
                 f"{idn.get('source_id') or 'UNKNOWN'} tool={self.tool} "
                 f"brush={self.brush_name()} undo={len(self._undo)} "
-                f"L={sides['left']} R={sides['right']} zoom={self.zoom}x "
-                f"brush_px={self.brush}")
+                f"L={sides['left']} R={sides['right']} gravel={n_gravel} "
+                f"shoulder={n_shoulder} zoom={self.zoom}x")
 
     def hint_line(self) -> str:
         """当前工具怎么用（键位不在这里重复——按钮上已经印了）。"""
+        cjk = self.cjk
         if self.tool == "straight":
-            head = ("straight: drag A->B, or click A then B"
-                    + ("  [draft started: click B]" if self._draft else ""))
+            head = ("直线：拖动 A→B，或先点 A 再点 B" if cjk
+                    else "straight: drag A->B, or click A then B")
+            if self._draft:
+                head += "　[已起手，点终点]" if cjk else "  [draft: click B]"
         elif self.tool == "curve":
             n = len(self._draft.points) if self._draft else 0
-            head = ("curve: drag = freehand (auto-smoothed), or click points "
+            head = (f"曲线：拖动=自由手绘（自动平滑），或点若干点后按回车落笔　"
+                    f"[已放点 {n}]" if cjk else
+                    "curve: drag = freehand (auto-smoothed), or click points "
                     f"then ENTER  [points={n}]")
         elif self.tool == "bucket":
-            head = "bucket: click a region to fill it (right-click too)"
+            head = ("油漆桶：点一下填连通区域（右键同）" if cjk
+                    else "bucket: click a region to fill it (right-click too)")
         else:
-            head = "pen: hold the left button and drag to paint"
-        return head + "   |   ENTER finish curve   ESC cancel   q quit"
+            head = ("画笔：按住左键拖动，涂当前画笔" if cjk
+                    else "pen: hold the left button and drag to paint")
+        tail = ("　｜　回车=落笔　ESC=放弃草稿　q=退出" if cjk
+                else "   |   ENTER finish curve   ESC cancel   q quit")
+        return head + tail
 
-    @staticmethod
-    def _fit_text(canvas: np.ndarray, text: str, x: int, y: int) -> None:
-        """画一行文字，超出画布宽度就先截短再加省略号（不许画到边界外面）。"""
-        room = int(canvas.shape[1]) - x - 4
-        if at.text_width(text) > room:
-            cut = text
-            while cut and at.text_width(cut + "...") > room:
-                cut = cut[:-1]
-            text = (cut.rstrip() + "...") if cut else ""
-        if text:
-            cv2.putText(canvas, text, (x, y), FONT, TEXT_SCALE,
-                        STATUS_FG, 1, cv2.LINE_AA)
+    # ------------------------------------------------------------------
+    # 渲染
+    # ------------------------------------------------------------------
 
-    def _draw_toolbar(self, band: np.ndarray, layout: at.Layout) -> None:
-        for b in layout.buttons:
-            if self.is_active(b.item):
-                fill = BTN_ACTIVE
-            elif self._hover_id == b.item.id:
-                fill = BTN_HOVER
-            else:
-                fill = BTN_BG
-            cv2.rectangle(band, (b.x0, b.y0), (b.x1 - 1, b.y1 - 1), fill, -1)
-            cv2.rectangle(band, (b.x0, b.y0), (b.x1 - 1, b.y1 - 1), BTN_BORDER, 1)
-            text = (f"{b.item.label}({b.item.key})" if b.item.key
-                    else b.item.label)
-            (tw, th), _base = cv2.getTextSize(text, FONT, TEXT_SCALE, 1)
-            cv2.putText(band, text,
-                        (b.x0 + max(2, (b.w - tw) // 2),
-                         b.y0 + (b.h + th) // 2),
-                        FONT, TEXT_SCALE, (255, 255, 255), 1, cv2.LINE_AA)
-        # 组分隔：同一行里换组的地方画一条竖线
+    def _fit_text(self, canvas: np.ndarray, text: str, x: int, y: int,
+                  size: int, color: tuple, font=None) -> None:
+        """画一行文字，超出画布宽度就先截短加省略号；无字体时退回 cv2 英文。"""
+        room = int(canvas.shape[1]) - x - 6
+        while text and at.text_width(text, size=size) > room:
+            text = text[:-1]
+            if text and at.text_width(text + "…", size=size) <= room:
+                text += "…"
+                break
+        if not text:
+            return
+        if font is not None:
+            from PIL import Image, ImageDraw
+            img = Image.fromarray(canvas)
+            ImageDraw.Draw(img).text((x, y), text, font=font, fill=color)
+            canvas[:] = np.asarray(img)
+        else:
+            cv2.putText(canvas, text, (x, y + size - 3), FONT,
+                        size / 30.0, color, 1, cv2.LINE_AA)
+
+    def _draw_band(self, band: np.ndarray, layout: at.Layout) -> None:
+        """工具栏 + 两行状态：PIL 圆角块与中文，无字体时退回 cv2 英文块。"""
+        band[:] = BAND_BG
+        font = at.load_font(layout.label_size) if layout.variant == "cjk" else None
+        status_font = at.load_font(STATUS_SIZE) if font is not None else None
+        if font is not None:
+            from PIL import Image, ImageDraw
+            img = Image.fromarray(band)
+            draw = ImageDraw.Draw(img)
+            for b in layout.buttons:
+                if self.is_active(b.item):
+                    fill, fg = CHIP_ACTIVE, TEXT_ON
+                elif self._hover_id == b.item.id:
+                    fill, fg = CHIP_HOVER, TEXT_ON
+                else:
+                    fill, fg = CHIP_BG, TEXT_OFF
+                draw.rounded_rectangle([b.x0, b.y0, b.x1 - 1, b.y1 - 1],
+                                       radius=6, fill=fill,
+                                       outline=CHIP_BORDER, width=1)
+                text = at.button_text(b.item, variant=layout.variant)
+                tw = at.text_width(text, size=layout.label_size)
+                draw.text((b.x0 + max(4, (b.w - tw) // 2),
+                           b.y0 + (b.h - layout.label_size) // 2 + 1),
+                          text, font=font, fill=fg)
+            self._group_separators(draw, layout)
+            band[:] = np.asarray(img)
+        else:
+            self._draw_band_cv2(band, layout)
+        self._draw_status(band, layout, status_font)
+
+    def _group_separators(self, draw, layout: at.Layout) -> None:
+        """分组：只在同排换组处画一条浅竖线，不加多余边框（简约）。"""
         for i in range(len(layout.buttons) - 1):
             a, b = layout.buttons[i], layout.buttons[i + 1]
             if a.y0 != b.y0 or a.item.group == b.item.group:
                 continue
             x = (a.x1 + b.x0) // 2
-            cv2.line(band, (x, a.y0), (x, a.y1), BTN_BORDER, 1)
+            draw.line([(x, a.y0 + 5), (x, a.y1 - 5)], fill=BAND_LINE, width=1)
 
-    def _draw_status(self, band: np.ndarray, layout: at.Layout) -> None:
-        y = layout.total_h + STATUS_LINE_H - 3
+    def _draw_band_cv2(self, band: np.ndarray, layout: at.Layout) -> None:
+        """没有中文字体时的英文退回（功能不变，只是字换掉）。"""
+        for b in layout.buttons:
+            if self.is_active(b.item):
+                fill, fg = CHIP_ACTIVE, TEXT_ON
+            elif self._hover_id == b.item.id:
+                fill, fg = CHIP_HOVER, TEXT_ON
+            else:
+                fill, fg = CHIP_BG, TEXT_OFF
+            cv2.rectangle(band, (b.x0, b.y0), (b.x1 - 1, b.y1 - 1), fill, -1)
+            cv2.rectangle(band, (b.x0, b.y0), (b.x1 - 1, b.y1 - 1),
+                          CHIP_BORDER, 1)
+            text = at.button_text(b.item, variant=layout.variant)
+            (tw, th), _b = cv2.getTextSize(text, FONT, TEXT_SCALE, 1)
+            cv2.putText(band, text,
+                        (b.x0 + max(2, (b.w - tw) // 2), b.y0 + (b.h + th) // 2),
+                        FONT, TEXT_SCALE, fg, 1, cv2.LINE_AA)
+        for i in range(len(layout.buttons) - 1):
+            a, b = layout.buttons[i], layout.buttons[i + 1]
+            if a.y0 != b.y0 or a.item.group == b.item.group:
+                continue
+            x = (a.x1 + b.x0) // 2
+            cv2.line(band, (x, a.y0 + 5), (x, a.y1 - 5), BAND_LINE, 1)
+
+    def _draw_status(self, band: np.ndarray, layout: at.Layout, font) -> None:
+        y = layout.total_h + 4
         for text in (self.status_line(), self.hint_line()):
-            self._fit_text(band, text, 6, y)
+            self._fit_text(band, text, 8, y, STATUS_SIZE, TEXT_STATUS, font)
             y += STATUS_LINE_H
+        cv2.line(band, (0, layout.total_h - 2),
+                 (band.shape[1] - 1, layout.total_h - 2), BAND_LINE, 1)
 
     def _draw_preview(self, canvas: np.ndarray) -> None:
         """把草稿/手势画在**显示层**上（不进 label，所以放弃草稿不脏数据）。"""
@@ -587,22 +717,33 @@ class AnnotateSession:
             cv2.polylines(canvas, [poly], False, DRAFT_RGB, thickness=1,
                           lineType=cv2.LINE_8)
 
-    def canvas(self) -> np.ndarray:
-        """合成一帧显示画布：顶部工具栏与状态条 + 图像（含标签叠加与草稿）。"""
+    def _overlay(self) -> np.ndarray:
+        """标签叠加：路面/标线/未知 + 路型（碎石叠土色，路肩单独着色）。"""
         ov = self._rgb.copy()
         m_road = self.label == cs.CLS_ROAD
-        m_line = self.label == cs.CLS_LINE
-        ov[m_road] = (ov[m_road] * 0.6
-                      + np.array(ROAD_RGB) * 0.4).astype(np.uint8)
-        ov[m_line] = LINE_RGB
+        ov[m_road] = (ov[m_road] * 0.6 + np.array(ROAD_RGB) * 0.4).astype(np.uint8)
+        ov[self.label == cs.CLS_LINE] = LINE_RGB
+        rt = self.road_type
+        gravel = (rt == 2) & m_road
+        if gravel.any():
+            ov[gravel] = (ov[gravel] * 0.55 + np.array(GRAVEL_RGB) * 0.45
+                          ).astype(np.uint8)
+        shoulder = rt == 3
+        if shoulder.any():
+            ov[shoulder] = (ov[shoulder] * 0.45 + np.array(SHOULDER_RGB) * 0.55
+                            ).astype(np.uint8)
         if self.unk.any():
             ov[self.unk > 0] = UNK_RGB
+        return ov
+
+    def canvas(self) -> np.ndarray:
+        """合成一帧显示画布：顶部工具栏与状态条 + 图像（含标签叠加与草稿）。"""
         z = self.zoom
+        ov = self._overlay()
         big = cv2.resize(ov, (ov.shape[1] * z, ov.shape[0] * z),
                          interpolation=cv2.INTER_NEAREST)
         self._draw_preview(big)
         layout = self.layout()
-        band = np.full((self.band_h, big.shape[1], 3), BAND_BG, np.uint8)
-        self._draw_toolbar(band, layout)
-        self._draw_status(band, layout)
+        band = np.zeros((self.band_h, big.shape[1], 3), np.uint8)
+        self._draw_band(band, layout)
         return np.vstack([band, big])

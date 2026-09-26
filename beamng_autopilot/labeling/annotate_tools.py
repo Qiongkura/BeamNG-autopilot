@@ -15,18 +15,17 @@
 它，脚本只负责画。这样"顶端能点到的操作"和"按键能触发的操作"不可能各说
 一套（表里没有的操作两边都没有）。
 
-按钮文字用 ASCII（``cv2.putText`` 只有 Hershey 字体，画不出中文），与
-界面其它文字一致；中文对应关系：
-
-    Road=路  Lane=标线  Erase=擦除
-    Occl=遮挡  Blur=模糊  Undec=无法判断
-    Pen=笔  Bucket=油漆桶  Straight=直线  Curve=曲线
-    Undo=撤回  Clear=清空  Zoom=缩放  Prev=上一帧  Save+Next=保存并下一帧
+界面文字用中文：``cv2.putText`` 只有 Hershey 字体、画不出汉字，所以工具栏与
+状态行改用 PIL 渲染（字体在 ``%WINDIR%\\Fonts`` 里找微软雅黑 / 黑体 / 等线）。
+找不到中文字体时退回 ``Item.ascii`` 的英文名——**退回的是字，不是功能**：
+按钮集合、快捷键、取值、几何全都不变。
 """
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -49,44 +48,67 @@ class Item:
     ``group`` 决定单选语义：同一个组里选中一个就取消同组其它项；
     ``momentary`` 的动作项（撤回/清空/缩放/翻帧/保存）点一下执行一次，
     不保持选中状态。
+
+    ``label`` 是界面显示名（中文，PIL 渲染）；``ascii`` 是找不到中文字体时的
+    退回显示名——退回的是**字**，不是功能：按钮集合、快捷键、取值都不变。
     """
 
     id: str
-    label: str                 # 按钮文字（ASCII）
-    group: str                 # "class" | "unknown" | "tool" | "action"
+    label: str                 # 界面显示名（中文）
+    group: str                 # "class" | "roadtype" | "unknown" | "tool" | "action"
+    ascii: str = ""            # 无中文字体时的退回名
     key: str | None = None     # 快捷键字符（显示在按钮上，也是按键入口）
-    value: int | None = None   # class/unknown 项的像素取值
+    value: int | None = None   # class/unknown/roadtype 项的取值
     momentary: bool = False
-    hint: str = ""             # 中文名（写进文档与帮助行）
 
 
 #: 顺序 = 工具栏上从左到右的顺序。类别组按原快捷键 1/2/3 排列，避免按钮上的
-#: 数字看起来是乱的。
+#: 数字看起来是乱的；**路型组单独一组**（方案要求"两种道路类型分别标记，不能
+#: 混成 road 一类"），用空闲的 7/8/9，不占用原来的 4/5/6。
 ITEMS: tuple[Item, ...] = (
-    Item("cls_line", "Lane", "class", key="1", value=cs.CLS_LINE, hint="标线"),
-    Item("cls_road", "Road", "class", key="2", value=cs.CLS_ROAD, hint="路"),
-    Item("cls_erase", "Erase", "class", key="3", value=cs.CLS_BACKGROUND,
-         hint="擦除"),
-    Item("unk_occluded", "Occl", "unknown", key="4", value=1, hint="遮挡"),
-    Item("unk_blurred", "Blur", "unknown", key="5", value=2, hint="模糊"),
-    Item("unk_undecidable", "Undec", "unknown", key="6", value=3, hint="无法判断"),
-    Item("tool_pen", "Pen", "tool", key="p", hint="笔"),
-    Item("tool_bucket", "Bucket", "tool", key="f", hint="油漆桶"),
-    Item("tool_straight", "Straight", "tool", key="l", hint="直线"),
-    Item("tool_curve", "Curve", "tool", key="v", hint="平滑曲线"),
-    Item("act_undo", "Undo", "action", key="u", momentary=True, hint="撤回"),
-    Item("act_clear", "Clear", "action", key="c", momentary=True, hint="清空"),
-    Item("act_zoom", "Zoom", "action", key="z", momentary=True, hint="缩放"),
-    Item("act_prev", "Prev", "action", key="a", momentary=True, hint="上一帧"),
-    Item("act_next", "Save+Next", "action", key="s", momentary=True,
-         hint="保存并下一帧"),
+    Item("cls_line", "标线", "class", ascii="Lane", key="1", value=cs.CLS_LINE),
+    Item("cls_road", "路面", "class", ascii="Road", key="2", value=cs.CLS_ROAD),
+    Item("cls_erase", "擦除", "class", ascii="Erase", key="3",
+         value=cs.CLS_BACKGROUND),
+    Item("rt_asphalt", "沥青", "roadtype", ascii="Asphalt", key="7", value=1),
+    Item("rt_gravel", "碎石", "roadtype", ascii="Gravel", key="8", value=2),
+    Item("rt_shoulder", "路肩", "roadtype", ascii="Shoulder", key="9", value=3),
+    Item("unk_occluded", "遮挡", "unknown", ascii="Occl", key="4", value=1),
+    Item("unk_blurred", "模糊", "unknown", ascii="Blur", key="5", value=2),
+    Item("unk_undecidable", "未知", "unknown", ascii="Undec", key="6", value=3),
+    Item("tool_pen", "画笔", "tool", ascii="Pen", key="p"),
+    Item("tool_bucket", "油漆桶", "tool", ascii="Bucket", key="f"),
+    Item("tool_straight", "直线", "tool", ascii="Straight", key="l"),
+    Item("tool_curve", "曲线", "tool", ascii="Curve", key="v"),
+    Item("act_undo", "撤回", "action", ascii="Undo", key="u", momentary=True),
+    Item("act_clear", "清空", "action", ascii="Clear", key="c", momentary=True),
+    Item("act_zoom", "缩放", "action", ascii="Zoom", key="z", momentary=True),
+    Item("act_prev", "上一帧", "action", ascii="Prev", key="a", momentary=True),
+    Item("act_next", "保存并下一帧", "action", ascii="Save+Next", key="s",
+         momentary=True),
 )
 
 ITEM_BY_ID: dict[str, Item] = {it.id: it for it in ITEMS}
 ITEM_BY_KEY: dict[str, Item] = {it.key: it for it in ITEMS if it.key}
-GROUP_ORDER = ("class", "unknown", "tool", "action")
+GROUP_ORDER = ("class", "roadtype", "unknown", "tool", "action")
 TOOL_IDS = {"tool_pen": "pen", "tool_bucket": "bucket",
             "tool_straight": "straight", "tool_curve": "curve"}
+
+#: 路型（``road_type`` 数组取值）：与 ``unknown_kind`` 同一套设计——像素类别只有
+#: 0/1/2/255 不够表达"这是什么路面"，原因/类型另存一列，导出时一起带走。
+ROAD_TYPE_NAMES = {1: "asphalt", 2: "gravel", 3: "shoulder"}
+ROAD_TYPE_BY_ITEM = {"rt_asphalt": 1, "rt_gravel": 2, "rt_shoulder": 3}
+
+#: 路型对应的**像素类别**，按 AGENTS.md 的驾驶约束定，不按"画了就算路"：
+#:
+#: * 沥青：铺装面 -> 路面(1)；
+#: * 碎石/土路：路线本身就是土路时土才算路面（``strip_soil_from_road`` 的
+#:   ``route_is_dirt`` 同一口径）-> 路面(1)，类型另记为 gravel；
+#: * 路肩：**有铺装路面时土肩不得算作道路**（约束 1/2），所以写背景(0)而不是
+#:   路面——否则一次手滑就能把土肩算进路面掩码。类型记 3，导出可查，
+#:   界面上也会着色显示，不存在"画了看不见"。
+ROAD_TYPE_CLS = {1: cs.CLS_ROAD, 2: cs.CLS_ROAD, 3: cs.CLS_BACKGROUND}
+UNKNOWN_NAMES = {1: "occluded", 2: "blurred", 3: "undecidable"}
 
 
 @dataclass(frozen=True)
@@ -117,11 +139,13 @@ class Button:
 
 @dataclass(frozen=True)
 class Layout:
-    """一整条工具栏：按钮清单 + 它占的高度。"""
+    """一整条工具栏：按钮清单 + 它占的高度（附渲染用的字号与文字变体）。"""
 
     buttons: tuple[Button, ...]
     total_h: int
     width: int
+    variant: str = "cjk"
+    label_size: int = 14
 
     def hit(self, x: int, y: int) -> Item | None:
         """点选命中：返回按钮对应的操作，点在缝里/条外返回 None。"""
@@ -137,26 +161,77 @@ class Layout:
         return None
 
 
-def text_width(text: str, *, scale: float = 0.45) -> int:
-    """一段文字在画布上的像素宽度（按钮排布与状态行截断共用同一把尺）。"""
-    (w, _h), _b = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, scale, 1)
-    return int(w)
+def text_width(text: str, *, size: int = 14) -> int:
+    """估算一段文字的像素宽度：CJK 一字约等于字号，ASCII 约 0.55 字号。
+
+    刻意不调用任何字体后端：布局必须是纯函数（测试要断言"点按钮中心必命中、
+    按钮互不重叠、全都落在画布内"），估宽只要够准就行。
+    """
+    return sum(size if ord(ch) > 0x2E7F else max(1, int(size * 0.55))
+               for ch in (text or " "))
+
+
+#: 找中文字体的候选顺序（Windows 自带；``.ttc`` 是字体集合，PIL 能直接读）。
+CJK_FONT_FILES = ("msyh.ttc", "msyhl.ttc", "simhei.ttf", "deng.ttf",
+                  "simsun.ttc", "msjh.ttc")
+
+
+def fonts_dir() -> Path:
+    """系统字体目录（从 ``WINDIR`` 推，不硬编码机器路径）。"""
+    win = os.environ.get("WINDIR") or r"C:\Windows"
+    return Path(win) / "Fonts"
+
+
+def cjk_font_path() -> Path | None:
+    """第一个存在的中文字体文件；一个都没有返回 None（调用方退回 ASCII）。"""
+    for name in CJK_FONT_FILES:
+        cand = fonts_dir() / name
+        if cand.exists():
+            return cand
+    return None
+
+
+_FONT_CACHE: dict[int, object] = {}
+
+
+def load_font(size: int):
+    """按字号取 PIL 字体（缓存）；没有中文字体或没装 PIL 时返回 None。"""
+    size = int(size)
+    if size in _FONT_CACHE:
+        return _FONT_CACHE[size]
+    font = None
+    path = cjk_font_path()
+    if path is not None:
+        try:
+            from PIL import ImageFont
+            font = ImageFont.truetype(str(path), size)
+        except Exception:                                  # noqa: BLE001
+            font = None
+    _FONT_CACHE[size] = font
+    return font
+
+
+def button_text(item: Item, *, variant: str = "cjk") -> str:
+    """按钮上的文字：显示名 + 键位（无中文字体时用 ``ascii`` 名）。"""
+    name = item.label if variant == "cjk" else (item.ascii or item.label)
+    return f"{name}({item.key})" if item.key else name
 
 
 def toolbar_layout(width: int, items: tuple[Item, ...] = ITEMS, *,
-                   btn_h: int = 24, gap: int = 4, group_gap: int = 10,
-                   pad: int = 6, scale: float = 0.45) -> Layout:
+                   btn_h: int = 26, gap: int = 5, group_gap: int = 11,
+                   pad: int = 7, label_size: int = 14,
+                   variant: str = "cjk") -> Layout:
     """把操作排成若干行（装不下就换行），返回按钮矩形与总高度。
 
-    宽度取按钮文字实测宽度（``cv2.getTextSize``），所以加一个按钮或改文字
-    不会让布局和文字错位。
+    宽度按文字实测宽度估（``text_width``），所以加一个按钮或改文字不会让布局
+    和文字错位；``variant`` 决定量的是中文名还是退回的英文名。
     """
     width = max(80, int(width))
     widths = []
     for it in items:
-        text = f"{it.label}({it.key})" if it.key else it.label
-        widths.append(min(max(34, text_width(text, scale=scale) + 18),
-                          max(34, width - 2 * pad)))
+        text = button_text(it, variant=variant)
+        widths.append(min(max(30, text_width(text, size=label_size) + 16),
+                          max(30, width - 2 * pad)))
     buttons: list[Button] = []
     x, y = pad, pad
     row_started = False
@@ -169,7 +244,7 @@ def toolbar_layout(width: int, items: tuple[Item, ...] = ITEMS, *,
         x += w + (group_gap if last_in_group else gap)
         row_started = True
     total_h = y + btn_h + pad
-    return Layout(tuple(buttons), total_h, width)
+    return Layout(tuple(buttons), total_h, width, variant, label_size)
 
 
 # ---------------------------------------------------------------------------
@@ -276,6 +351,17 @@ def brush_thickness(brush: int) -> int:
     return max(1, 2 * int(brush))
 
 
+def road_type_counts(road_type) -> dict:
+    """``road_type`` 数组 → ``{asphalt/gravel/shoulder: 像素数}``（全 0 也返回）。"""
+    arr = np.asarray(road_type) if road_type is not None else None
+    out = {name: 0 for name in ROAD_TYPE_NAMES.values()}
+    if arr is None or arr.size == 0:
+        return out
+    for value, name in ROAD_TYPE_NAMES.items():
+        out[name] = int((arr == int(value)).sum())
+    return out
+
+
 def side_line_counts(label, centre_col: int | None = None) -> dict:
     """按图像左右半分列 line 像素数（左右两侧都标了没有，一眼可查）。
 
@@ -314,19 +400,60 @@ def rasterize(shape, points, thickness: int) -> np.ndarray:
     return mask
 
 
-def apply_mask(label: np.ndarray, unk: np.ndarray, mask: np.ndarray, *,
-               cls: int, unknown_kind: int = 0) -> None:
-    """把掩码落到 ``(label, unknown_kind)``：两边必须一起改。
+@dataclass
+class PaintState:
+    """一帧的三个并列数组：像素类别 / 忽略原因 / 路面类型。
 
-    "不能判断"的画笔写 255(ignore) 并把原因写进 ``unk``；普通画笔写类别值
-    并把 ``unk`` 清零——只写一边会让导出留下"255 但不知道为什么"的帧。
+    为什么分三列：``label`` 的取值被训练与评测契约钉死（0/1/2/255），而"这里
+    为什么标不了"和"这是什么路面"都不是那个契约能表达的东西——把它们硬塞进
+    label 会悄悄改掉训练格式，另存一列则既保住了契约，又能被审计查到。
+    """
+
+    label: np.ndarray
+    unknown: np.ndarray
+    road_type: np.ndarray
+
+    @classmethod
+    def zeros(cls, shape) -> PaintState:
+        first = np.zeros(tuple(shape[:2]), dtype=np.uint8)
+        return cls(first.copy(), first.copy(), first.copy())
+
+    def copy(self) -> PaintState:
+        return PaintState(self.label.copy(), self.unknown.copy(),
+                          self.road_type.copy())
+
+
+def coerce_paint_state(label, unknown=None, road_type=None) -> PaintState:
+    """把外部给的数组（或数组组）整理成 ``PaintState``，形状不对外报错。"""
+    lab = np.asarray(label, dtype=np.uint8)
+    if isinstance(label, PaintState):
+        return label.copy()
+    unk = (np.zeros(lab.shape, np.uint8) if unknown is None
+           else np.asarray(unknown, dtype=np.uint8))
+    rt = (np.zeros(lab.shape, np.uint8) if road_type is None
+          else np.asarray(road_type, dtype=np.uint8))
+    return PaintState(lab.copy(), unk.copy(), rt.copy())
+
+
+def apply_mask(state: PaintState, mask: np.ndarray, *, cls: int,
+               unknown_kind: int = 0, road_type: int = 0) -> None:
+    """把掩码落到三个数组上，三边的口径必须同时成立。
+
+    * "不能判断"画笔：label 写 255(ignore)、原因进 ``unknown``、路型清 0；
+    * 路型画笔：label 写该路型的像素类别（路肩是背景，见 ``ROAD_TYPE_CLS``）、
+      类型进 ``road_type``、忽略原因清 0；
+    * 普通画笔：label 写类别，另外两列都清 0。
+
+    只写其中一边会让导出留下"255 但不知道为什么""是路面但不知道什么材质"的帧。
     """
     sel = mask > 0
     if not sel.any():
         return
     if unknown_kind:
-        label[sel] = cs.CLS_IGNORE
-        unk[sel] = int(unknown_kind)
+        state.label[sel] = cs.CLS_IGNORE
+        state.unknown[sel] = int(unknown_kind)
+        state.road_type[sel] = 0
     else:
-        label[sel] = int(cls)
-        unk[sel] = 0
+        state.label[sel] = int(cls)
+        state.unknown[sel] = 0
+        state.road_type[sel] = int(road_type)
