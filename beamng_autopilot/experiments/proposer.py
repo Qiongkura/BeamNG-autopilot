@@ -46,6 +46,10 @@ ALLOWED_KEYS = {
 APPLICABLE_KEYS = ("add_runs", "drop_runs", "run_weights", "epochs", "lr",
                    "line_weight", "line_tversky_weight",
                    "line_cldice_weight", "line_tversky_beta",
+                   # FP/FN 方向旋钮（T15）：训练器早有 --line-tversky-alpha，
+                   # 这里与 TRAINER_FLAG_FACTORS 必须同步，否则提议被判
+                   # "训练器没有实现"（S6 E2 需要它）
+                   "line_tversky_alpha",
                    # 容量族（模型宽度）：训练器已实现 --width，白名单要同步，
                    # 否则提议会被判"训练器没有实现"而记 blocked
                    "width")
