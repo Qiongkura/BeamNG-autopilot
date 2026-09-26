@@ -304,3 +304,41 @@ def test_frames_by_dir_lookup_matches_relative_and_absolute_keys(
     assert out2["n_eval_run_errors"] == 1, out2["eval_run_errors"]
     assert "no accepted frames" in out2["eval_run_errors"][0]["why"]
     assert out2["counts"]["P_frames"] == 0, out2["counts"]
+
+
+def test_dev_frames_by_dir_keys_are_directories_not_frame_files(tmp_path):
+    """实测缺陷（E2 两轮）：清单键必须是**目录**的规范化路径。
+
+    第一次：键用帧文件路径 -> 查不到；第二次：键没规范化（绝对 vs 相对）-> 也查不到。
+    两次都是 frames=[] -> 探针拒测 -> 身份率静默 UNKNOWN。这里直接用真实
+    manifest 记录钉住键的构造。
+    """
+    from beamng_autopilot.experiments.manifest import DatasetManifest
+
+    loop = _load()
+    d = tmp_path / "runs" / "coll_eval" / "front_main"
+    d.mkdir(parents=True)
+    for i in range(2):
+        np.savez(d / f"frame_{i:05d}.npz",
+                 colour=np.full((20, 24, 3), 90 + i, np.uint8),
+                 label=np.zeros((20, 24), np.uint8))
+    (tmp_path / "runs" / "coll_eval" / "meta.json").write_text(json.dumps({
+        "map_name": "italy", "source_id": "ring_eval",
+        "frames": [{"i": i, "view": "front_main", "exposure": i,
+                    "path": f"front_main/frame_{i:05d}.npz"}
+                   for i in range(2)]}), encoding="utf-8")
+    mf = DatasetManifest.build([d], root=tmp_path,
+                               paint_sources={"front_main": "engine_annotation"})
+    by_dir = loop.dev_frames_by_dir(mf.records)
+    assert list(by_dir) == [loop._canon_dir(d)], \
+        f"键必须是目录的规范化路径，实际 {list(by_dir)}"
+    assert len(by_dir[loop._canon_dir(d)]) == 2
+    # 用调用方常见的**相对**写法查得到（cwd = tmp_path）
+    import os
+    old = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        rel_key = loop._canon_dir(Path("runs/coll_eval/front_main"))
+        assert rel_key in by_dir, (rel_key, list(by_dir))
+    finally:
+        os.chdir(old)

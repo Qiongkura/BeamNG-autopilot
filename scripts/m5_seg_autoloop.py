@@ -1208,6 +1208,21 @@ def _canon_dir(p) -> str:
         return Path(p).as_posix().lower()
 
 
+def dev_frames_by_dir(records) -> dict:
+    """评价集里**被接受**的帧按目录分组（键 = ``_canon_dir(目录)``）。
+
+    身份/候选评价消费这份唯一清单；键必须与 ``identity_metrics`` 的查法一致
+    （实测两次踩到：把帧文件路径或未规范化的相对路径当键 -> 查不到 -> 空清单
+    -> 探针拒测 -> 身份率静默 UNKNOWN）。
+    """
+    out: dict = {}
+    for r in records:
+        if getattr(r, "reject_reason", ""):
+            continue
+        out.setdefault(_canon_dir(Path(r.path).parent), []).append(r.path)
+    return out
+
+
 def identity_metrics(model_path: Path, eval_runs: list, *,
                      probe_fn=None, frames_by_dir: dict | None = None) -> dict:
     """候选匹配的全口径：冻结匹配率 + 覆盖率 + 角色一致率。
@@ -1844,19 +1859,11 @@ def _rounds_audit(args, train_runs, log) -> tuple:
                                buffer_m=SPATIAL_BUFFER_M)
     exp_leak = group_exposure_leak(list(mf_tr.records)
                                    + list(mf_dev.records))
-    # 评价集里**被接受**的帧（按目录分组）：身份/候选评价必须消费这份唯一
-    # 清单，而不是让探针各自 glob —— 目录复制会带回同一张图的多份拷贝，
-    # 实测 159 次输入里只有 136 张唯一图（独立复核实测：两个字节相同的目录
-    # 会让 rounds 的 C 从 10 变 20，与标定的 10 不一致）。
-    dev_frames_by_dir: dict = {}
-    for r in mf_dev.records:
-        if r.reject_reason:
-            continue
-        # 键用**规范化绝对路径**：清单里 r.path 是绝对路径，而调用方（rounds）
-        # 拿到的 --eval-runs 常常是相对路径。实测踩到：键不匹配 -> frames=[]
-        # -> 探针拒测 -> 身份率静默变 UNKNOWN（E2 轮真实发生）。
-        _k = _canon_dir(r.path)
-        dev_frames_by_dir.setdefault(_k, []).append(r.path)
+    # 评价集里**被接受**的帧（按目录分组，规范化键）：身份/候选评价必须消费
+    # 这份唯一清单，而不是让探针各自 glob —— 目录复制会带回同一张图的多份
+    # 拷贝（实测 159 次输入里只有 136 张唯一图）。键的构造与查法都在
+    # `dev_frames_by_dir`/`_canon_dir` 里，避免"两边各写一套"（实测踩过两次）。
+    _dev_frames = dev_frames_by_dir(mf_dev.records)
     report = {"dataset_id": mf_tr.dataset_id,
               "dev_dataset_id": mf_dev.dataset_id,
               "train_groups": train_groups, "dev_groups": dev_groups,
@@ -1866,7 +1873,7 @@ def _rounds_audit(args, train_runs, log) -> tuple:
               "n_records_train": len(mf_tr.records),
               "n_records_dev": len(mf_dev.records),
               "coverage_dev": mf_dev.coverage().get("dev", {}),
-              "dev_frames_by_dir": dev_frames_by_dir,
+              "dev_frames_by_dir": _dev_frames,
               "spatial": spatial, "exposure_leak": exp_leak,
               "rejected": rejected, "notes": mf_tr.notes + mf_dev.notes}
     out = exp_dir(args.run_id)
