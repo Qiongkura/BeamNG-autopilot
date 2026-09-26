@@ -1196,6 +1196,18 @@ IDENTITY_FIELDS = ("candidate_identity_rate",
                    "left_right_role_agreement",
                    "candidate_paint_recall",
                    "n_candidates", "n_candidates_with_reference")
+def _canon_dir(p) -> str:
+    """目录的规范化键：解析成绝对路径 + posix 形式 + 小写（Windows 不区分大小写）。
+
+    清单侧与调用侧的路径写法不同（绝对 vs 相对、`\\` vs `/`），键必须统一，
+    否则唯一清单会"查不到"而被当成空清单（实测：身份率静默 UNKNOWN）。
+    """
+    try:
+        return Path(p).resolve().as_posix().lower()
+    except OSError:
+        return Path(p).as_posix().lower()
+
+
 def identity_metrics(model_path: Path, eval_runs: list, *,
                      probe_fn=None, frames_by_dir: dict | None = None) -> dict:
     """候选匹配的全口径：冻结匹配率 + 覆盖率 + 角色一致率。
@@ -1243,8 +1255,22 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
             # 未去重口径的行为因此与旧版逐字一致
             _kw = {}
             if frames_by_dir is not None:
-                _kw["frames"] = list(frames_by_dir.get(
-                    str(run).replace("\\", "/")) or [])
+                _frames = frames_by_dir.get(_canon_dir(run))
+                if _frames is None:
+                    # 兜底：按后缀匹配（键可能是绝对路径、调用方给相对路径）
+                    _suf = Path(run).as_posix().lower()
+                    for _k, _v in frames_by_dir.items():
+                        if Path(_k).as_posix().lower().endswith(_suf):
+                            _frames = _v
+                            break
+                if _frames is None:
+                    # 查不到 = 缺测，必须可见：空清单会让探针拒测，静默变 UNKNOWN
+                    run_errors.append({
+                        "run": str(run),
+                        "why": ("no accepted frames in the audited inventory "
+                                "for this eval run (frames_by_dir key "
+                                "mismatch, or every frame was rejected)")})
+                _kw["frames"] = list(_frames or [])
             res = probe_fn(run, json.loads(meta.read_text(encoding="utf-8")),
                            view=run.name, model_path=str(model_path), **_kw)
         except Exception as exc:                      # noqa: BLE001
@@ -1826,7 +1852,10 @@ def _rounds_audit(args, train_runs, log) -> tuple:
     for r in mf_dev.records:
         if r.reject_reason:
             continue
-        _k = str(Path(r.path).parent).replace("\\", "/")
+        # 键用**规范化绝对路径**：清单里 r.path 是绝对路径，而调用方（rounds）
+        # 拿到的 --eval-runs 常常是相对路径。实测踩到：键不匹配 -> frames=[]
+        # -> 探针拒测 -> 身份率静默变 UNKNOWN（E2 轮真实发生）。
+        _k = _canon_dir(r.path)
         dev_frames_by_dir.setdefault(_k, []).append(r.path)
     report = {"dataset_id": mf_tr.dataset_id,
               "dev_dataset_id": mf_dev.dataset_id,

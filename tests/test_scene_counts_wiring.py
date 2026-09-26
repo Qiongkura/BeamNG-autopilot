@@ -251,3 +251,56 @@ def test_a_failed_eval_run_is_visible_not_silently_dropped(tmp_path,
     # 好目录照常计数（不是被整批吞成 0）
     assert out["counts"]["P_frames"] == 2, out["counts"]
     assert out["counts_by_group"]["italy/ring_good"]["C"] == 2
+
+
+def test_frames_by_dir_lookup_matches_relative_and_absolute_keys(
+        tmp_path, monkeypatch):
+    """实测缺陷：清单键是**绝对**路径、调用方给**相对**路径 -> frames=[] ->
+    探针拒测 -> 身份率静默变 UNKNOWN（E2 方向实验轮真实发生，判定里
+    candidate_identity_rate=None 而 eval_run_errors 是空的）。
+    """
+    loop = _load()
+    monkeypatch.chdir(tmp_path)
+    rel = Path("runs/coll_rel/front_main")
+    rel.mkdir(parents=True)
+    for i in range(2):
+        np.savez(rel / f"frame_{i:05d}.npz",
+                 colour=np.full((20, 24, 3), 70 + i, np.uint8),
+                 label=np.zeros((20, 24), np.uint8))
+    (tmp_path / "runs" / "coll_rel" / "meta.json").write_text(json.dumps({
+        "map_name": "italy", "source_id": "ring_rel",
+        "frames": [{"i": i, "view": "front_main", "exposure": i,
+                    "path": f"front_main/frame_{i:05d}.npz"}
+                   for i in range(2)]}), encoding="utf-8")
+    # 清单侧键是绝对路径（与 _rounds_audit 的 r.path 一致）
+    abs_dir = (tmp_path / "runs" / "coll_rel" / "front_main").resolve()
+    frames_by_dir = {abs_dir.as_posix().lower(): [
+        str(abs_dir / f"frame_{i:05d}.npz") for i in range(2)]}
+
+    seen: dict = {}
+
+    def probe(run, meta, *, view=None, model_path=None, frames=None):
+        seen["frames"] = frames
+        n = len(frames or [])
+        return {"summary": {
+            "counts": {"P_frames": n, "C": n, "R": n, "M": 0, "L": 0, "A": 0,
+                       "C_outside_P": 0},
+            "n_candidates": n, "n_candidates_with_reference": n,
+            "match_rate": 0.0, "match_rate_with_reference": 0.0,
+            "role_agreement_rate": None, "candidate_paint_recall": None}}
+
+    import m5_marking_identity_probe as ip
+    monkeypatch.setattr(ip, "probe", probe)
+    out = loop.identity_metrics(Path("model.pt"), [rel],
+                                frames_by_dir=frames_by_dir)
+    assert len(seen["frames"]) == 2, \
+        f"相对路径也要查到唯一清单，实际 frames={seen['frames']}"
+    assert out["counts"]["P_frames"] == 2, out["counts"]
+    assert out["n_eval_run_errors"] == 0, out["eval_run_errors"]
+
+    # 键完全对不上时必须**可见**（不许静默 UNKNOWN）
+    out2 = loop.identity_metrics(Path("model.pt"), [rel],
+                                 frames_by_dir={"nowhere/else": ["x.npz"]})
+    assert out2["n_eval_run_errors"] == 1, out2["eval_run_errors"]
+    assert "no accepted frames" in out2["eval_run_errors"][0]["why"]
+    assert out2["counts"]["P_frames"] == 0, out2["counts"]
