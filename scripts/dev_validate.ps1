@@ -16,8 +16,14 @@ if (-not (Test-Path $py)) {
     Write-Error "python venv not found: $py"
     exit 2
 }
+# Console 编码不会改变 Python 的 locale；父进程与子进程必须一起用 UTF-8。
+# 否则 subprocess(text=True) 的 GBK 读取线程会失败，stdout 甚至变成 None。
+$savedPythonUtf8 = $env:PYTHONUTF8
+$savedPythonIoEncoding = $env:PYTHONIOENCODING
 Push-Location $Repo
 try {
+    $env:PYTHONUTF8 = '1'
+    $env:PYTHONIOENCODING = 'utf-8'
     Write-Host "=== pytest tests/ ===" -ForegroundColor Cyan
     $t0 = [Diagnostics.Stopwatch]::StartNew()
     # 全量输出落盘：原来只 Select-Object -Last 4，失败用例名被截掉——实测踩到
@@ -50,5 +56,7 @@ try {
     exit ([int]($pytestRc -ne 0) -bor ([int]($offRc -ne 0)))
 }
 finally {
+    $env:PYTHONUTF8 = $savedPythonUtf8
+    $env:PYTHONIOENCODING = $savedPythonIoEncoding
     Pop-Location
 }

@@ -28,13 +28,37 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from beamng_autopilot.vision.segmentation import Segmenter  # noqa: E402
+from beamng_autopilot.experiments.negative_scenes import (  # noqa: E402
+    negative_line_counts, negative_line_summary,
+)
 
 #: 与 vision.segmentation 的训练契约一致
 CLS_LINE = 2
 IGNORE = 255
 
 
-def line_pixel_metrics(pred_line: np.ndarray, label: np.ndarray) -> dict:
+def _frame_rank(d) -> str:
+    """目录的标签档位（从**标注凭证**派生，不看目录名）。读不到 -> "absent"。"""
+    try:
+        from beamng_autopilot.experiments.credentials import (
+            read_dir_credentials)
+        from beamng_autopilot.experiments.labels import PAINT_SOURCE_RANK
+        cred = read_dir_credentials(d) or {}
+        return PAINT_SOURCE_RANK.get(str(cred.get("label_source") or ""),
+                                     "absent")
+    except Exception:                                      # noqa: BLE001
+        return "absent"
+
+
+def _unpack(frame):
+    """帧元组兼容 3 元（旧调用方）与 4 元（带档位）。"""
+    if len(frame) == 4:
+        return frame[0], frame[1], frame[2], frame[3]
+    return frame[0], frame[1], frame[2], None
+
+
+def line_pixel_metrics(pred_line: np.ndarray, label: np.ndarray, *,
+                       label_rank: str | None = None) -> dict:
     """一帧的 line 像素统计。纯函数，无模型、无 I/O。
 
     ``offroad_false_line_px`` = 预测为标线但真值类别为背景(0) 的像素数，
@@ -63,6 +87,8 @@ def line_pixel_metrics(pred_line: np.ndarray, label: np.ndarray) -> dict:
         "pred_line_px": int(pred.sum()),          # 兼容旧字段：全部预测（含未知区）
         "gt_line_px": int(gt.sum()),
         "known_px": int(known.sum()),
+        # 负例资格带档位（方案 v2 §3.5/T10）：非 verified 的"标签全零"不是负例
+        **negative_line_counts(pred, lab, label_rank=label_rank),
     }
 
 
@@ -131,6 +157,7 @@ def totals_to_metrics(acc: dict, *, n_frames: int, ms: list) -> dict:
     a = np.asarray(ms, dtype=float) if ms else np.asarray([], dtype=float)
     out = {
         "n_frames": int(n_frames),
+        "negative_line": negative_line_summary(acc, n_frames=n_frames),
         "tp_px": tp, "fp_px": fp, "fn_px": fn,
         "missed_true_line_px": acc.get("missed_true_line_px", 0),
         "offroad_false_line_px": acc.get("offroad_false_line_px", 0),
@@ -185,8 +212,25 @@ def totals_to_metrics(acc: dict, *, n_frames: int, ms: list) -> dict:
     return out
 
 
-def load_frames(dirs: list) -> list:
-    """读 npz 帧：``[(repo 相对路径, colour, label)]``，按文件名排序。"""
+def frames_by_group(dirs: list) -> dict:
+    """按 ``map/source_id`` 分组装载帧（同组多目录合并）。
+
+    身份读目录的 meta（先本目录、再父目录），**不从目录名猜**；没有身份的目录
+    退到 ``dir/<完整路径>``（`dir_group` 的规则），绝不按目录名合并。
+    """
+    from beamng_autopilot.experiments.manifest import dir_group
+    out: dict = {}
+    for d in dirs:
+        out.setdefault(dir_group(d), []).extend(load_frames([d]))
+    return out
+
+
+def load_frames(dirs: list, *, with_rank: bool = True) -> list:
+    """读 npz 帧：``[(repo 相对路径, colour, label[, rank])]``，按文件名排序。
+
+    ``with_rank``（默认真）：每帧带上**目录的标签档位**（来自标注凭证），
+    负例资格要用它（方案 v2 §3.5）；``with_rank=False`` 时退回 3 元组。
+    """
     frames = []
     for d in dirs:
         for f in sorted(Path(d).glob("frame_*.npz")):
@@ -195,8 +239,9 @@ def load_frames(dirs: list) -> list:
                 rel = str(Path(f).resolve().relative_to(ROOT))
             except ValueError:
                 rel = str(f)
-            frames.append((rel, np.asarray(z["colour"], np.uint8),
-                           np.asarray(z["label"], np.uint8)))
+            item = (rel, np.asarray(z["colour"], np.uint8),
+                    np.asarray(z["label"], np.uint8))
+            frames.append(item + (_frame_rank(d),) if with_rank else item)
     return frames
 
 
@@ -207,10 +252,12 @@ def _eval_frames(seg, frames: list, acc: dict, ms: list) -> list:
     坏场景不能被合并均值抵消——要为每个场景单独算一份，而不是把帧池起来）。
     """
     per_frame: list = []
-    for _name, colour, label in frames:
+    for _frame in frames:
+        _name, colour, label, _rank = _unpack(_frame)
         road, line, _probs = seg.predict_with_probs(colour)
         ms.append(float((seg.last_timing_ms or {}).get("total") or 0.0))
-        accumulate(acc, line_pixel_metrics(np.asarray(line) > 0, label))
+        accumulate(acc, line_pixel_metrics(np.asarray(line) > 0, label,
+                                          label_rank=_rank))
         rm = road_pixel_metrics(np.asarray(road) > 0, label)
         accumulate(acc, rm)
         denom = rm["r_tp_px"] + rm["r_fp_px"] + rm["r_fn_px"]
@@ -234,12 +281,14 @@ def _finalize(acc: dict, *, n_frames: int, ms: list, per_frame: list,
 def evaluate_model(model_path: Path, frames: list, *, device: str = "cuda"
                    ) -> dict:
     """在一个 checkpoint 上跑完整评估（学习掩码 + 后处理，走 Segmenter）。"""
-    seg = Segmenter(model_path=str(model_path))
+    seg = Segmenter(model_path=str(model_path), device=device)
     acc: dict = {}
     ms: list = []
     per_frame = _eval_frames(seg, frames, acc, ms)
-    return _finalize(acc, n_frames=len(frames), ms=ms,
-                     per_frame=per_frame, model_path=model_path)
+    out = _finalize(acc, n_frames=len(frames), ms=ms,
+                    per_frame=per_frame, model_path=model_path)
+    out["device"] = str(seg.device)
+    return out
 
 
 def evaluate_model_per_group(model_path: Path, by_group: dict, *,
@@ -251,7 +300,7 @@ def evaluate_model_per_group(model_path: Path, by_group: dict, *,
     ``per_group``：每个场景自己那一份完整指标（含它自己的 ``mask_compare``）。
     **每个场景各自是一份独立测量**：坏场景不会被池化均值稀释掉。
     """
-    seg = Segmenter(model_path=str(model_path))
+    seg = Segmenter(model_path=str(model_path), device=device)
     acc: dict = {}
     ms: list = []
     per_frame: list = []
@@ -268,6 +317,7 @@ def evaluate_model_per_group(model_path: Path, by_group: dict, *,
     out = _finalize(acc, n_frames=len(per_frame), ms=ms, per_frame=per_frame,
                     model_path=model_path)
     out["per_group"] = per_group
+    out["device"] = str(seg.device)
     return out
 
 
@@ -302,13 +352,18 @@ def main(argv=None) -> int:
         except Exception:                    # noqa: BLE001
             device = "cpu"
 
-    frozen = load_frames(args.runs)
-    dev = load_frames(args.dev_runs) if args.dev_runs else []
-    print(f"[eval-matrix] frozen {len(frozen)} frames, dev {len(dev)} frames, "
-          f"device={device}", flush=True)
+    frozen_groups = frames_by_group(args.runs)
+    dev_groups = frames_by_group(args.dev_runs) if args.dev_runs else {}
+    frozen = [f for g in frozen_groups.values() for f in g]
+    dev = [f for g in dev_groups.values() for f in g]
+    print(f"[eval-matrix] frozen {len(frozen)} frames / "
+          f"{len(frozen_groups)} 场景, dev {len(dev)} frames / "
+          f"{len(dev_groups)} 场景, device={device}", flush=True)
     out = {"frozen": {}, "dev": {},
            "frozen_runs": [str(r) for r in args.runs],
-           "dev_runs": [str(r) for r in args.dev_runs]}
+           "dev_runs": [str(r) for r in args.dev_runs],
+           "frozen_groups": sorted(frozen_groups),
+           "dev_groups": sorted(dev_groups)}
     for spec in args.model:
         name, path = parse_model_arg(spec)
         if not path.exists():
@@ -316,9 +371,13 @@ def main(argv=None) -> int:
             out["frozen"][name] = {"error": f"missing checkpoint: {path}"}
             continue
         try:
-            out["frozen"][name] = evaluate_model(path, frozen, device=device)
-            if dev:
-                out["dev"][name] = evaluate_model(path, dev, device=device)
+            # 分场景评估（总体形状不变，另有 per_group）：坏场景不能被池化均值
+            # 抵消，所以 CLI 也按组算（方案 §10.2/A7）。
+            out["frozen"][name] = evaluate_model_per_group(
+                path, frozen_groups, device=device)
+            if dev_groups:
+                out["dev"][name] = evaluate_model_per_group(
+                    path, dev_groups, device=device)
         except Exception as exc:             # noqa: BLE001
             out["frozen"][name] = {"error": f"{type(exc).__name__}: {exc}"}
         f = out["frozen"][name]
@@ -329,6 +388,15 @@ def main(argv=None) -> int:
               f"offroadFP={f.get('offroad_false_line_px')} "
               f"p50={f.get('inference_ms_p50')}ms p95={f.get('inference_ms_p95')}"
               f"ms | dev IoU={d.get('line_iou')}", flush=True)
+        # 逐场景一行：池化值漂亮但某个场景塌掉时，这一行能直接看见
+        for g, m in sorted((f.get("per_group") or {}).items()):
+            print(f"[eval-matrix]   {name} @ {g}: "
+                  f"IoU={m.get('line_iou')} R={m.get('line_recall')} "
+                  f"P={m.get('line_precision')} "
+                  f"offroad={m.get('offroad_false_frac_of_pred')} "
+                  f"negativeFP={m.get('negative_line', {}).get('false_positive_frame_rate')} "
+                  f"negativeN={m.get('negative_line', {}).get('eligible_frames')} "
+                  f"n={m.get('n_frames')}", flush=True)
     if args.json:
         Path(args.json).parent.mkdir(parents=True, exist_ok=True)
         Path(args.json).write_text(

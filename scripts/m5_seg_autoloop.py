@@ -41,19 +41,22 @@ from beamng_autopilot.experiments.controller import (  # noqa: E402
 )
 from beamng_autopilot.experiments.events import Event, EventLog, metric  # noqa: E402
 from beamng_autopilot.experiments.checkpoint import file_sha16 as _ckpt_sha16
+from beamng_autopilot.experiments.checkpoint import git_commit as _git_commit
 from beamng_autopilot.experiments.final_set import (  # noqa: E402
     confirmation_check,
 )
 from beamng_autopilot.experiments.gates import (  # noqa: E402
-    HARD_CHECKS, SCENE_HARD_FIELDS, Thresholds, decide, missing_metrics_for,
-    paired_compare, per_seed_gate_violations, per_seed_missing, scene_report,
-    threshold_violations,
+    HARD_CHECKS, SCENE_HARD_FIELDS, Thresholds, decide, hard_split,
+    legacy_replay_note, missing_metrics_for, paired_compare,
+    per_seed_gate_violations, per_seed_missing, scene_count_violations,
+    scene_report, threshold_violations,
 )
 from beamng_autopilot.experiments.manifest import (  # noqa: E402
     DatasetManifest, dir_group,
 )
 from beamng_autopilot.experiments.proposer import (  # noqa: E402
-    bucket_errors, load_eval_artifacts, needs_review, propose,
+    bucket_errors, classify_round_outcome, factor_activity,
+    load_eval_artifacts, needs_review, propose,
 )
 from beamng_autopilot.experiments.spatial import (  # noqa: E402
     SPATIAL_BUFFER_M, group_exposure_leak, spatial_conflicts,
@@ -153,21 +156,35 @@ def cmd_audit(args) -> int:
                    note="逐通道覆盖 + 泄漏 + 身份检查"))
     trainable = coverage.get("train", {}).get("trainable_frames", 0)
     paint_ok = coverage.get("train", {}).get("paint_valid_frames", 0)
+    # 训练准入看"可用的漆线监督"（弱监督/agent 档 usable=True），晋级才看 valid。
+    # 原来只查 valid -> agent 档研究训练被误挡（实测：agentline 池子被判
+    # "标线真值不可用 -> needs_review"）。
+    paint_usable = coverage.get("train", {}).get("paint_usable_frames", 0)
     if not trainable:
         log.append(_ev(args.run_id, "auditing", "no_trainable_data",
                        dataset=mf.dataset_id,
                        note="没有任何通道有可用真值：停止，不训练"))
         print("[autoloop] 审计失败：没有可用真值，停止")
         return 2
-    if not paint_ok and not args.allow_road_only:
-        # 方案的准入门：有 Tech annotation 但无可靠标线真值 -> 进复核队列
+    _line_sup = bool(paint_sources_from(args))
+    if not paint_usable and not args.allow_road_only and not _line_sup:
+        # 准入门：**连可用的漆线监督都没有**才拒训（有 Tech annotation 但没标线类，
+        # 或来源不可靠且未复核）-> 进复核队列。
         log.append(_ev(args.run_id, "needs_review", "paint_truth_missing",
                        dataset=mf.dataset_id,
-                       note=("有 Tech annotation 但无可靠标线真值：标线通道被屏蔽，"
-                             "需人工修订或单独验证的模拟器真值；"
+                       note=("没有任何可用的标线监督（paint_usable=0）：标线通道"
+                             "无可学内容，需人工修订或单独验证的模拟器真值；"
                              "用 --allow-road-only 可只做路面通道实验")))
-        print("[autoloop] 审计：标线真值不可用 -> needs_review（未训练）")
+        print("[autoloop] 审计：没有可用的标线监督 -> needs_review（未训练）")
         return 3
+    if paint_usable and not paint_ok:
+        # 弱/agent 档：**可以训练**（研究），但真值不是门槛真值 -> 晋级由来源资格挡。
+        log.append(_ev(args.run_id, "auditing", "paint_truth_weak",
+                       dataset=mf.dataset_id,
+                       note=(f"标线监督是弱/agent 档（usable={paint_usable}、"
+                             f"valid=0）：可训练，**不能**当门槛真值或晋级参考")))
+        print(f"[autoloop] 审计：标线监督为弱/agent 档（usable={paint_usable}、"
+              f"valid=0）——可训练，晋级由来源资格挡住")
     log.append(_ev(args.run_id, "training", "ready", dataset=mf.dataset_id,
                    note=f"trainable={trainable} paint_ok={paint_ok}"))
     print(f"[autoloop] 审计通过：dataset_id={mf.dataset_id[:16]} "
@@ -200,13 +217,18 @@ def cmd_propose(args) -> int:
         blocked.append({"family": "scene_mix",
                         "why": f"引用了不存在的训练目录：{missing}",
                         "top_bucket": ""})
+    # 线通道被屏蔽（road-only）时线损失键不会生效：提议阶段就挡住，别把
+    # "参数带着、实际不起作用"的因子送进轮次（方案 v2 §S5 / T14）。
+    _line_sup = not getattr(args, "allow_road_only", False)
     props = propose(buckets=buckets, dataset=dataset, champion=champ,
                     max_proposals=args.max_proposals, history=history,
-                    available_runs=avail, blocked=blocked)
+                    available_runs=avail, blocked=blocked,
+                    line_supervision=_line_sup)
     out = exp_dir(args.run_id)
     out.mkdir(parents=True, exist_ok=True)
     blob = {"buckets": [b.as_dict() for b in buckets],
             "needs_review": review,
+            "line_supervision": _line_sup,
             "proposals": [p.as_dict() for p in props],
             "blocked_families": blocked,
             "champion": champ, "dataset": dataset,
@@ -243,8 +265,13 @@ def cmd_evaluate(args) -> int:
         compared[name] = paired_compare(
             name, spec.get("champion", []), spec.get("candidate", []),
             lower_is_better=bool(spec.get("lower_is_better", False)))
-    violations = threshold_violations(hard, t)
+    # 缺测与违反分两路（与 rounds 同规则，方案 §10.3）：硬门里没测到的项是
+    # "证据缺失" -> needs_evidence；原来合并成 violations 会判成 rejected。
+    _hs = hard_split(hard, t)
+    violations = _hs["violations"]
     missing = [k for k, v in compared.items() if not v.get("n")]
+    missing += [f"{n}: UNKNOWN (hard gate needs a measurement)"
+                for n in _hs["missing"]]
     decision = decide(pairings=compared, thresholds=t,
                       missing_metrics=missing,
                       production_mismatch=bool(args.production_mismatch),
@@ -321,6 +348,7 @@ def cmd_replay(args) -> int:
         print("[autoloop] 没有可重放的判定（先跑 evaluate）")
         return 2
     same, diff = 0, []
+    legacy: list = []         # 早于 v5 计数契约的判定（不能按新分母重判）
     proto: list = []          # 每个判定文件的协议快照自查结果
     tampered: list = []       # 快照内容与记录哈希不符（被改过/截断）
     for p in decs:
@@ -340,6 +368,11 @@ def cmd_replay(args) -> int:
         t = thresholds(
             Path(blob["thresholds"]["source"])
             if Path(blob["thresholds"]["source"]).exists() else None)
+        # v5：早于计数契约的判定**不能**按新分母重判，也不许补 0——显式说明。
+        _note = legacy_replay_note(blob)
+        if _note:
+            legacy.append({"file": p.name, "note": _note})
+            continue
         compared = {name: spec for name, spec in blob["pairings"].items()}
         # 缺测清单**优先用判定文件里落盘的那份**：它可能含逐 seed/分场景缺测
         # 以及"新硬门未标定"这类不由 pairings 推导出来的条目；旧判定文件
@@ -372,7 +405,10 @@ def cmd_replay(args) -> int:
             continue
         print(f"  {pr['file']}: 按**旧协议** {pr['recorded']} 留档（当前 "
               f"{pr['current']}）——结论有效，但不能与当前口径混比")
+    for lg in legacy:
+        print(f"  {lg['file']}: {lg['note']}")
     print(f"[autoloop] 重放 {len(decs)} 个判定：相同 {same}，不同 {len(diff)}"
+          + (f"，早于 v5 计数契约 {len(legacy)}" if legacy else "")
           + (f"，协议不一致 {len(tampered)}" if tampered else ""))
     for d in diff:
         print(f"  {d['file']}: 决策或理由不一致 -> 判定不可复现")
@@ -782,7 +818,10 @@ def cmd_run(args) -> int:
             hist.append(RoundRecord(
                 round_index=len(hist), candidate_id=blob["candidate_id"],
                 decision=blob["decision"]["decision"],
-                reasons=blob["decision"]["reasons"]))
+                reasons=blob["decision"]["reasons"],
+                # 归因字段随判定文件走：只有"有意义的无收益"计入停止连胜，
+                # 无效因子/缺标注/资格失败各有原因（旧文件无此字段则留空）
+                outcome=str(blob.get("round_outcome") or "")))
         # 单次连续运行的墙钟（方案 §8.1）：起点落在 run 目录，重启不重置
         clock = RunClock(exp_dir(args.run_id) / "run_state.json")
         wall = clock.minutes()
@@ -858,7 +897,8 @@ def cmd_run(args) -> int:
             hist2.append(RoundRecord(
                 round_index=len(hist2), candidate_id=blob["candidate_id"],
                 decision=blob["decision"]["decision"],
-                reasons=blob["decision"]["reasons"]))
+                reasons=blob["decision"]["reasons"],
+                outcome=str(blob.get("round_outcome") or "")))
         stop2 = should_stop(cfg, hist2, gpu_minutes_today=total_today,
                             candidates_used=len(hist2))
         note = (f"rounds rc={rc}; 停因: " + "; ".join(stop2["reasons"])
@@ -1083,6 +1123,9 @@ def _seed_hard(metrics: dict, ident: dict | None, p95: float | None) -> dict:
     ident = ident or {}
     return {
         "candidate_identity_rate": ident.get("candidate_identity_rate"),
+        # v4 新增的两道候选门：必须逐 seed 可测（否则记缺测阻止晋级）
+        "candidate_reference_coverage": ident.get("candidate_reference_coverage"),
+        "left_right_role_agreement": ident.get("left_right_role_agreement"),
         "line_recall": (metrics or {}).get("line_recall"),
         "line_precision": (metrics or {}).get("line_precision"),
         "offroad_false_ratio": (metrics or {}).get("offroad_false_frac_of_pred"),
@@ -1153,14 +1196,48 @@ IDENTITY_FIELDS = ("candidate_identity_rate",
                    "left_right_role_agreement",
                    "candidate_paint_recall",
                    "n_candidates", "n_candidates_with_reference")
+def _canon_dir(p) -> str:
+    """目录的规范化键：解析成绝对路径 + posix 形式 + 小写（Windows 不区分大小写）。
+
+    清单侧与调用侧的路径写法不同（绝对 vs 相对、`\\` vs `/`），键必须统一，
+    否则唯一清单会"查不到"而被当成空清单（实测：身份率静默 UNKNOWN）。
+    """
+    try:
+        return Path(p).resolve().as_posix().lower()
+    except OSError:
+        return Path(p).as_posix().lower()
+
+
+def dev_frames_by_dir(records) -> dict:
+    """评价集里**被接受**的帧按目录分组（键 = ``_canon_dir(目录)``）。
+
+    身份/候选评价消费这份唯一清单；键必须与 ``identity_metrics`` 的查法一致
+    （实测两次踩到：把帧文件路径或未规范化的相对路径当键 -> 查不到 -> 空清单
+    -> 探针拒测 -> 身份率静默 UNKNOWN）。
+    """
+    out: dict = {}
+    for r in records:
+        if getattr(r, "reject_reason", ""):
+            continue
+        out.setdefault(_canon_dir(Path(r.path).parent), []).append(r.path)
+    return out
+
+
 def identity_metrics(model_path: Path, eval_runs: list, *,
-                     probe_fn=None) -> dict:
+                     probe_fn=None, frames_by_dir: dict | None = None) -> dict:
     """候选匹配的全口径：冻结匹配率 + 覆盖率 + 角色一致率。
 
     方案 G09 点名：原来只读原始 ``match_rate``，而它的分母里混着
     "该侧没有参考"的候选（实测约 38%）——那些候选应记 UNKNOWN，
     不能当"未确认/假线"。本函数把全部口径一起取回来（多段路取均值），
     缺测的字段一律 None。
+
+    ``frames_by_dir``：审计后的**唯一**逐帧清单（``{目录: [接受的帧路径]}``，
+    来自 ``_rounds_audit`` 的 ``dev_frames_by_dir``）。给了就按它调探针，
+    而不是让探针各自 glob —— 两个内容相同的目录会让计数翻倍（独立复核实测：
+    字节相同的两个目录把 C 从 10 变成 20，与标定的 10 不一致，方案 §S2 验收
+    要求标定/循环/评价逐项相同）。目录不在清单里 = 该目录没有可接受的帧，
+    按空清单处理（贡献 0，不退回 glob）。不传则维持旧行为（未去重口径）。
     """
     # 探针在 scripts/ 下：测试或别的入口直接调本函数时，sys.path 里可能没有它
     import sys as _sys
@@ -1169,23 +1246,63 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
         _sys.path.insert(0, _sd)
     import m5_marking_identity_probe as ip
     probe_fn = probe_fn or ip.probe
+    # 新口径：**累加整数计数**，最后算一次比率（方案 v2 §3.3）。
+    # 旧实现把各目录的比率取平均、并用"全部候选"当分母，确定性输入会算出
+    # 覆盖率 0.40（应 0.80）——所以这里只加 counts。
+    from beamng_autopilot.experiments import candidate_metrics as _cm
+    counts_acc = _cm.empty()
+    counts_by_group: dict = {}
     acc: dict = {k: [] for k in IDENTITY_FIELDS}
     gacc: dict = {}          # 逐场景（map/source_id 组）明细
+    run_errors: list = []    # 被跳过的评价 run（T11：缺测必须可见，不静默丢）
     for r in eval_runs:
         run = Path(r)
         meta = run / "meta.json"
         if not meta.exists() and (run.parent / "meta.json").exists():
             meta = run.parent / "meta.json"
         if not meta.exists():
+            # 旧实现直接 continue：整个 run 消失、计数为 0，看起来像"没有候选"。
+            # 缺 meta 是**缺测**，必须能定位（方案 v2 §S2 验收）。
+            run_errors.append({"run": str(run), "why": "no meta.json"})
             continue
         try:
+            # 只在给了唯一清单时传 frames：注入的假探针（测试）可能没有该参数，
+            # 未去重口径的行为因此与旧版逐字一致
+            _kw = {}
+            if frames_by_dir is not None:
+                _frames = frames_by_dir.get(_canon_dir(run))
+                if _frames is None:
+                    # 兜底：按后缀匹配（键可能是绝对路径、调用方给相对路径）
+                    _suf = Path(run).as_posix().lower()
+                    for _k, _v in frames_by_dir.items():
+                        if Path(_k).as_posix().lower().endswith(_suf):
+                            _frames = _v
+                            break
+                if _frames is None:
+                    # 查不到 = 缺测，必须可见：空清单会让探针拒测，静默变 UNKNOWN
+                    run_errors.append({
+                        "run": str(run),
+                        "why": ("no accepted frames in the audited inventory "
+                                "for this eval run (frames_by_dir key "
+                                "mismatch, or every frame was rejected)")})
+                _kw["frames"] = list(_frames or [])
             res = probe_fn(run, json.loads(meta.read_text(encoding="utf-8")),
-                           view=run.name, model_path=str(model_path))
-        except Exception:                             # noqa: BLE001
+                           view=run.name, model_path=str(model_path), **_kw)
+        except Exception as exc:                      # noqa: BLE001
+            # 探针异常同样不许静默丢 run：结构化记账，调用方（判定文件/看板）
+            # 能看出"这个 run 没测到"，而不是把它当成 0 候选。
+            run_errors.append({"run": str(run),
+                               "why": f"{type(exc).__name__}: {exc}"})
             continue
         # 探针把 match_rate_with_reference 的字段**内联在 summary 里**
         # （`**match_rate_with_reference(rows)`），所以这里直接读 summary。
         summary = res.get("summary") or {}
+        # 整数计数（新口径的唯一来源）
+        _c = summary.get("counts") or {}
+        if _c:
+            _cm.accumulate(counts_acc, _c)
+            _cm.accumulate(counts_by_group.setdefault(dir_group(r), _cm.empty()),
+                           _c)
         n_cand = summary.get("n_candidates")
         n_ref = summary.get("n_candidates_with_reference")
         vals = {
@@ -1206,12 +1323,34 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
                     float(v))
     out = {k: (round(sum(v) / len(v), 4) if v else None)
            for k, v in acc.items()}
+    # 旧原始匹配率**显式改名**（S2：旧指标不得继续被硬门消费）
+    if out.get("candidate_identity_rate") is not None:
+        out["candidate_identity_rate_legacy_match_rate"] = out[
+            "candidate_identity_rate"]
+    # 新口径：计数汇总 -> 比率；同时给出整数（n_candidates=C、
+    # n_candidates_with_reference=R、candidates_matched=M、role_compared=L）
+    _r = _cm.ratios(counts_acc)
+    out.update({
+        "candidate_reference_coverage": _r["candidate_reference_coverage"],
+        "candidate_identity_rate": _r["candidate_identity_rate"],
+        "left_right_role_agreement": _r["left_right_role_agreement"],
+        "counts": dict(counts_acc),
+        "counts_by_group": {g: dict(v) for g, v in counts_by_group.items()},
+        "ratios_by_group": {g: _cm.ratios(v) for g, v in counts_by_group.items()},
+        "n_candidates": float(counts_acc.get("C", 0)),
+        "n_candidates_with_reference": float(counts_acc.get("R", 0)),
+        "candidates_matched": float(counts_acc.get("M", 0)),
+        "role_compared": float(counts_acc.get("L", 0)),
+    })
     # 逐场景明细（方案 §10.2：分场景候选口径只上报，不进硬门）。没有它，
     # 调用方读 `per_group` 会**静默拿到空字典**——看起来像"没有候选"，
     # 实际是没接线（实测踩到）。
     out["per_group"] = {
         g: {k: round(sum(v) / len(v), 4) for k, v in d.items()}
         for g, d in gacc.items()}
+    # 缺测的 run 逐条可见（T11）：空列表 = 每个 run 都测到了
+    out["eval_run_errors"] = run_errors
+    out["n_eval_run_errors"] = len(run_errors)
     return out
 
 
@@ -1248,6 +1387,9 @@ def _identity_rate(model_path: Path, eval_runs: list) -> float | None:
 #: 训练器开关型因子（值是标量）。``run_weights`` 是字典型，单独格式化。
 TRAINER_FLAG_FACTORS = ("epochs", "lr", "line_weight", "line_tversky_weight",
                         "line_cldice_weight", "line_tversky_beta",
+                        # FP/FN 方向旋钮（T15）：训练器一直有这个参数，但没进
+                        # 白名单 -> 提议器发不出来（S6 E2 需要它做方向实验）
+                        "line_tversky_alpha",
                         "run_weights",
                         # 容量族：数据与步数不动，只改模型宽度（参数约按平方增长）。
                         # 加这一族是因为前两条杠杆都测到了边界：单段新数据 <1 点且
@@ -1549,6 +1691,21 @@ def _log_give_up(log, run_id: str, cand_id: str, status: str, note: str,
     raise
 
 
+def _git_dirty_paths(limit: int = 20) -> list:
+    """未提交路径（判定文件要能说明"当时工作区不干净"）。
+
+    读不到（不是 git 仓库/git 不在）返回 ``[]``——空列表在这里只表示"没读到"，
+    看板另有 git_commit 为空串可区分；不猜、不伪造干净状态。
+    """
+    try:
+        out = subprocess.run(["git", "status", "--porcelain"],
+                             cwd=str(ROOT), capture_output=True, text=True,
+                             timeout=30)
+    except Exception:                          # noqa: BLE001
+        return []
+    return [ln.strip() for ln in out.stdout.splitlines() if ln.strip()][:limit]
+
+
 def paint_sources_from(args) -> dict:
     """``--paint-source RUN=SOURCE`` -> ``{run: source}``。
 
@@ -1629,6 +1786,34 @@ def resolve_paint_sources(args) -> dict:
                             "effective": eff, "rank": rank,
                             "eligibility": eligibility(rank),
                             "can_promote": bool(ok), "notes": notes}
+    # 评价侧的资格**必须读 eval 目录自己的凭证**（方案 §6.1 / A1：agent 评价
+    # 标签**漏传** research 标志仍不能晋级）。原来只遍历 `--paint-source`：
+    # 不带这个参数时，agent 起草的评价真值会被当成可晋级参考——实测踩到
+    # （E2 那轮 research_only=False，而 wide/plain 的评价标签是 agent 档）。
+    for run in list(getattr(args, "eval_runs", None) or []):
+        key = str(run)
+        cred = read_dir_credentials(run)
+        cred_src = None if cred is None else str(cred.get("label_source") or "")
+        eff, notes = effective_source("", cred_src)
+        rank = PAINT_SOURCE_RANK.get(eff, "absent")
+        ok, why = sources_can_promote([eff])
+        if cred is None:
+            out["missing_credentials"].append(key)
+        if not ok:
+            out["research_only"] = True
+            out["reasons"].append(
+                f"{key}: evaluation reference source {eff!r} (rank {rank}) "
+                f"cannot be used as a promotion reference")
+        for n in notes:
+            out["notes"].append(f"{key}: {n}")
+        out["runs"].setdefault(key, {
+            "declared": "", "credential": cred_src,
+            "credential_path": (cred or {}).get("path"),
+            "credential_frames": (cred or {}).get("frames"),
+            "effective": eff, "rank": rank,
+            "eligibility": eligibility(rank),
+            "can_promote": bool(ok), "notes": notes,
+            "role": "evaluation_reference"})
     return out
 
 
@@ -1674,10 +1859,21 @@ def _rounds_audit(args, train_runs, log) -> tuple:
                                buffer_m=SPATIAL_BUFFER_M)
     exp_leak = group_exposure_leak(list(mf_tr.records)
                                    + list(mf_dev.records))
+    # 评价集里**被接受**的帧（按目录分组，规范化键）：身份/候选评价必须消费
+    # 这份唯一清单，而不是让探针各自 glob —— 目录复制会带回同一张图的多份
+    # 拷贝（实测 159 次输入里只有 136 张唯一图）。键的构造与查法都在
+    # `dev_frames_by_dir`/`_canon_dir` 里，避免"两边各写一套"（实测踩过两次）。
+    _dev_frames = dev_frames_by_dir(mf_dev.records)
     report = {"dataset_id": mf_tr.dataset_id,
               "dev_dataset_id": mf_dev.dataset_id,
               "train_groups": train_groups, "dev_groups": dev_groups,
               "group_overlap": overlap, "coverage": cov,
+              # 数据入口四计数（看板"数据入口"面板）需要的原始量：生成=清单全部
+              # 记录（含被拒），评价=开发集记录数，复核=开发集 paint 档位有效帧。
+              "n_records_train": len(mf_tr.records),
+              "n_records_dev": len(mf_dev.records),
+              "coverage_dev": mf_dev.coverage().get("dev", {}),
+              "dev_frames_by_dir": _dev_frames,
               "spatial": spatial, "exposure_leak": exp_leak,
               "rejected": rejected, "notes": mf_tr.notes + mf_dev.notes}
     out = exp_dir(args.run_id)
@@ -1796,6 +1992,7 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
     for r in _as_path_list(args.runs):
         if Path(r) not in all_train:
             all_train.append(Path(r))
+    _report: dict = {}      # 审计的逐通道覆盖（判定归因要看本轮依赖的标签）
     if not args.plan_only:
         _report, rc = _rounds_audit(args, all_train, log)
         if rc:
@@ -1812,13 +2009,35 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
         cand_id = f"{prop.get('candidate_id', 'cand')}-r{rnd}"
         if getattr(args, "resume", False) and                 (exp_dir(args.run_id) / f"decision_{cand_id}.json").exists():
             print(f"[rounds] 第 {rnd + 1} 轮 {cand_id} 已有判定：resume 跳过")
-            hist_done = json.loads(
+            _blob_done = json.loads(
                 (exp_dir(args.run_id) / f"decision_{cand_id}.json")
-                .read_text(encoding="utf-8"))["decision"]
+                .read_text(encoding="utf-8"))
+            hist_done = _blob_done["decision"]
             history.append(RoundRecord(round_index=rnd, candidate_id=cand_id,
                                        decision=hist_done["decision"],
-                                       reasons=hist_done["reasons"]))
+                                       reasons=hist_done["reasons"],
+                                       # 旧判定文件没有归因字段：留空串，
+                                       # should_stop 回退旧口径（不猜）
+                                       outcome=str(_blob_done.get(
+                                           "round_outcome") or "")))
             continue
+        # 因子是否**真会生效**（方案 v2 §S5 / T14）：road-only 把 line 类整通道
+        # 屏蔽时，线损失键会照样变成训练器旗标（extra 非空），但没有任何监督
+        # ——历史上有 5 轮就这么白跑了。这一步比"至少有一个键变成旗标"更严：
+        # 先判监督模式，再让 factor_to_flags/arm_runs 判实现是否存在。
+        _road_only = bool(getattr(args, "allow_road_only", False))
+        _fact_act = factor_activity(factor, line_supervision=not _road_only)
+        if not _fact_act["active"] and not args.plan_only:
+            _note = "factor_not_applied: " + _fact_act["why"]
+            _log_give_up(log, args.run_id, cand_id, "factor_not_applied",
+                         _note, phase="needs_review")
+            print(f"[rounds] 第 {rnd + 1} 轮拒绝训练：{_note}")
+            print("  无效因子会让候选臂与基线臂在**实际监督**上完全相同，"
+                  "跑出来的只是白跑一轮（无收益也不构成平台期证据）。")
+            return 3
+        if not _fact_act["active"]:
+            print(f"[plan] 第 {rnd + 1} 轮因子被判 inactive：{_fact_act['why']}"
+                  "（真实运行时这一轮会被拒绝）")
         extra, skipped = factor_to_flags(factor)
         cand_runs, data_note = arm_runs(args.runs, factor)
         # 因子未生效就拒绝训练：候选臂与基线臂输入相同，跑不出证据
@@ -1882,7 +2101,9 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 # 任务主指标也逐 seed 收（方案 G05）：判定要求主指标有可信改善，
                 # 只送 IoU 等于让任何候选都晋不了级。
                 _idb = identity_metrics(out / "checkpoint_last.pt",
-                                        args.eval_runs)
+                                        args.eval_runs,
+                                        frames_by_dir=_report.get(
+                                            "dev_frames_by_dir"))
                 champ_task[str(seed)] = {
                     name: task_metric_value(name, m, _idb)
                     for name in TASK_METRICS}
@@ -1946,7 +2167,8 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
         hard_measured: dict = {}
         hard_by_seed: dict = {}          # 每个 seed 自己的硬门度量
         scene_by_seed: dict = {}         # 每个 seed 的分场景度量
-        scene_ident_by_seed: dict = {}   # 分场景候选口径（只上报）
+        scene_ident_by_seed: dict = {}   # 分场景**整数计数**（判定用，下限按 R）
+        scene_ratios_by_seed: dict = {}  # 分场景比率（只上报，不参与判定）
         for seed in args.seeds:
             out = exp_dir(args.run_id) / f"round{rnd}" / f"seed{seed}"
             _cmd = train_cmd(args, cand_runs, out, seed, extra)
@@ -1967,7 +2189,14 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 metrics[_key] if metrics.get(_key) is not None
                 else metrics.get("line_iou") or 0.0)
             _idc = identity_metrics(out / "checkpoint_last.pt",
-                                    args.eval_runs)
+                                    args.eval_runs,
+                                    frames_by_dir=_report.get(
+                                        "dev_frames_by_dir"))
+            if _idc.get("eval_run_errors"):
+                print(f"[rounds] 第 {rnd + 1} 轮 seed {seed}："
+                      f"{_idc['n_eval_run_errors']} 个评价 run 没测到"
+                      f"（判定记 UNKNOWN，不当 0 候选）："
+                      f"{_idc['eval_run_errors'][:2]}")
             cand_task[str(seed)] = {
                 name: task_metric_value(name, metrics, _idc)
                 for name in TASK_METRICS}
@@ -1986,6 +2215,12 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 # "点进具体帧"：判定文件带上该 seed 最差的几帧（路径+IoU+真值像素），
                 # 人可以从一次失败判定直接看到是哪张图、差在哪
                 worst_by_seed[str(seed)] = metrics["mask_compare"]["worst"]
+            # 候选口径（覆盖率/左右角色）也进池化硬门：v4 起它们是硬门输入
+            hard_measured.setdefault("candidate_reference_coverage",
+                                     []).append(
+                _idc.get("candidate_reference_coverage"))
+            hard_measured.setdefault("left_right_role_agreement", []).append(
+                _idc.get("left_right_role_agreement"))
             hard_measured.setdefault("line_recall", []).append(
                 metrics.get("line_recall"))
             hard_measured.setdefault("line_precision", []).append(
@@ -2034,9 +2269,19 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 scene_by_seed[str(seed)] = {
                     str(g): _seed_hard(gm, None, gm.get("inference_ms_p95"))
                     for g, gm in _pg.items()}
+            # 逐场景**整数计数**（判定用）与**比率**（只上报）必须分开取：
+            # 旧实现把 `_idc["per_group"]`（键是比率名）当计数读
+            # （键 P_frames/C/R/M/L/A），于是每个场景都被读成 P_frames=0，
+            # 真实有线场景被判 not_applicable，R<30 的下限在 rounds 路径
+            # 永不触发（独立复核实测：P=3,C=100,R=62,M=9 的输入判定全 0）。
+            if _idc.get("counts_by_group"):
                 scene_ident_by_seed[str(seed)] = {
-                    str(g): dict(iv or {})
-                    for g, iv in ((_idc.get("per_group") or {}).items())}
+                    str(g): dict(cv or {})
+                    for g, cv in _idc["counts_by_group"].items()}
+            if _idc.get("ratios_by_group"):
+                scene_ratios_by_seed[str(seed)] = {
+                    str(g): dict(rv or {})
+                    for g, rv in _idc["ratios_by_group"].items()}
         # 按 **seed** 配对：顺序/数量不一致说明对照不完整，拒绝而不是截断
         missing = [str(s) for s in args.seeds if str(s) not in champ_by_seed]
         if missing:
@@ -2062,6 +2307,8 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
             # （记 None 而不是 0，避免"没测"被读成"很差"或被硬门当违反）
             hard = {"line_recall": None, "line_precision": None,
                     "candidate_identity_rate": None,
+                    "candidate_reference_coverage": None,
+                    "left_right_role_agreement": None,
                     "offroad_false_ratio": None,
                     "inference_ms_p95": _mean_or_none(
                         hard_measured.get("inference_ms_p95")),
@@ -2070,6 +2317,10 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
         else:
             hard = {"line_recall": _mean_or_none(
                         hard_measured.get("line_recall")),
+                    "candidate_reference_coverage": _mean_or_none(
+                        hard_measured.get("candidate_reference_coverage")),
+                    "left_right_role_agreement": _mean_or_none(
+                        hard_measured.get("left_right_role_agreement")),
                     "line_precision": _mean_or_none(
                         hard_measured.get("line_precision")),
                     "offroad_false_ratio": _mean_or_none(
@@ -2115,6 +2366,9 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
             print(f"[rounds] 来源资格：{_r}")
         # 分场景：跨 seed 汇总**每个场景自己的最差**——同一场景在不同 seed 的
         # 表现不能被平均掉（方案 §10.2：关键场景不允许被总体均值抵消）。
+        # road-only：标线/身份整通道屏蔽，逐 seed 与分场景只查可测口径
+        _pf = ("inference_ms_p95",) if road_only else None
+        _sf = (("inference_ms_p95",) if road_only else SCENE_HARD_FIELDS)
         per_scene: dict = {}
         for _ss in scene_by_seed.values():
             for _g, _sv in _ss.items():
@@ -2124,10 +2378,29 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                         continue
                     if cur is None or float(_v) < float(cur):
                         per_scene[_g][_k] = _v
-        _scene = scene_report(per_scene, t)
+        _scene = scene_report(per_scene, t, fields=_sf)
+        # 逐场景**样本量下限（按 R）**与适用性（方案 v2 §S3.2/§3.4）：
+        # 下限对象是身份率的实际分母，不能用总候选数冒充；无标线场景
+        # not_applicable（既不通过也不算缺测）。
+        _scene_counts: dict = {}
+        for _ss in scene_ident_by_seed.values():
+            for _g, _cv in (_ss or {}).items():
+                _acc = _scene_counts.setdefault(_g, {})
+                for _k in ("P_frames", "C", "R", "M", "L", "A",
+                           "C_outside_P"):
+                    _acc[_k] = int(_acc.get(_k, 0)) + int(
+                        (_cv or {}).get(_k, 0) or 0)
+        _sc = scene_count_violations(_scene_counts, t)
+        if _sc["low_sample"]:
+            print(f"[rounds] 逐场景样本不足 {len(_sc['low_sample'])} 条"
+                  f"（下限按身份率分母 R={t.per_scene_min_candidates} 计）")
+        for _m in _sc["missing"]:
+            print(f"[rounds] 场景 UNKNOWN：{_m}")
         # 分场景候选口径（匹配率/覆盖/左右角色）：**只上报不进硬门**——
         # 单场景候选数可能只有几个，逐场景身份门槛尚未标定（方案 §10.2）。
-        _scene_keys = sorted({g for d in scene_ident_by_seed.values()
+        # 取的是**比率**字典（`ratios_by_group`），不是判定用的整数计数：
+        # 两者键空间不同，混用会把比率读成 None（旧实现正是这样读错的）。
+        _scene_keys = sorted({g for d in scene_ratios_by_seed.values()
                               for g in d})
         _cand_fields = ("candidate_identity_rate",
                         "candidate_reference_coverage",
@@ -2136,14 +2409,23 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
         for _g in _scene_keys:
             scene_candidates[_g] = {
                 f: _mean_or_none([(d.get(_g) or {}).get(f)
-                                  for d in scene_ident_by_seed.values()])
+                                  for d in scene_ratios_by_seed.values()])
                 for f in _cand_fields}
         # 缺测与硬门：总体、逐 seed、分场景三路都要进来（方案 §10.2/A7）
+        # 缺测与违反**分两路**（方案 §10.3 的判定顺序）：池化的硬门输入里
+        # 没测到的项原来被 threshold_violations 写成"违反"，于是 road-only
+        # 实验（标线整通道屏蔽、指标本就未测）被判成 rejected，读起来像"候选
+        # 不合格"，实际是"没测"——代码注释本来就写着"记 None 避免被硬门当违反"，
+        # 这里把注释兑现：缺测走 missing_metrics -> needs_evidence。
+        _hs = hard_split(hard, t)
         _missing = missing_metrics_for(
             paired, coverage_gate_frozen=COVERAGE_GATE_FROZEN)
-        _missing += per_seed_missing(hard_by_seed, t) + _scene["missing"]
-        _violations = (threshold_violations(hard, t)
-                       + per_seed_gate_violations(hard_by_seed, t)
+        _missing += [f"{n}: UNKNOWN (hard gate needs a measurement)"
+                     for n in _hs["missing"]]
+        _missing += per_seed_missing(hard_by_seed, t, fields=_pf)
+        _missing += _scene["missing"] + _sc["missing"] + _sc["low_sample"]
+        _violations = (_hs["violations"]
+                       + per_seed_gate_violations(hard_by_seed, t, fields=_pf)
                        + _scene["violations"])
         if _scene["violations"]:
             print(f"[rounds] 逐场景硬门不通过：{len(_scene['violations'])} 条"
@@ -2196,8 +2478,36 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                      confirmation_issues=_conf_issues,
                      hard_gate_violations=_violations)
         dec = _block_research_promotion(dec, _research)
+        # 单因归因（方案 v2 §S5）：停止条件只统计"有意义的无收益"。资格失败/
+        # 缺标注/无效因子各自另有原因，不能当"模型没有提升空间"的证据。
+        # labels_ok 看**本轮判定依赖的通道**：road-only 按 road_iou 晋级，
+        # 公路标签可用即可；线通道模式由审计的 paint 门保证。
+        # 审计报告里的 ``coverage`` 本身就是 train split 的逐通道覆盖
+        # （`mf_tr.coverage()["train"]`），不要再 .get("train") 一层
+        _cov_tr = (_report or {}).get("coverage") or {}
+        _labels_ok = bool(int(_cov_tr.get(
+            "road_valid_frames" if road_only else "paint_valid_frames") or 0))
+        _outcome = classify_round_outcome(
+            decision=dec["decision"], factor_active=bool(_fact_act["active"]),
+            labels_ok=_labels_ok, eligibility_ok=not _research)
         blob = {"candidate_id": cand_id,
                 "research_only": bool(_research),
+                "factor_activity": _fact_act,
+                "round_outcome": _outcome,
+                # 本轮身份（看板第一面板）：commit/dirty、实际设备、数据入口四计数。
+                # 定义写死在这里，避免看板各算一套：
+                #   generated=清单全部记录（含被拒）；reviewed=评价集 paint 档有效帧；
+                #   trained=训练集 trainable 帧；evaluated=评价集记录数。
+                "git_commit": _git_commit(ROOT),
+                "git_dirty": _git_dirty_paths(),
+                "device": str(getattr(args, "device", "") or ""),
+                "data_counts": {
+                    "generated": int(_report.get("n_records_train") or 0)
+                                 + int(_report.get("n_records_dev") or 0),
+                    "reviewed": int(((_report.get("coverage_dev") or {})
+                                     .get("paint_valid_frames")) or 0),
+                    "trained": int(_cov_tr.get("trainable_frames") or 0),
+                    "evaluated": int(_report.get("n_records_dev") or 0)},
                 "paint_sources": paint_sources_from(args),
                 "paint_source_resolution": _src_res,
                 "thresholds": {"config_hash": t.config_hash,
@@ -2215,6 +2525,18 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 "hard_gate_violations": _violations,
                 "missing_metrics": _missing,
                 "hard_by_seed": hard_by_seed,
+                # v5 计数契约（方案 v2 §S3.7）：判定必须自带**整数计数**，
+                # 否则 replay 无法按新分母重判（legacy_replay_note 会明确说明）。
+                "counts": _idc.get("counts") or {},
+                "counts_by_group": _idc.get("counts_by_group") or {},
+                # 评价 run 的缺测（T11）：空列表才是"每个 run 都测到了"，
+                # 有内容时必须能在判定文件/看板上看到，不许当成 0 候选
+                "eval_run_errors": _idc.get("eval_run_errors") or [],
+                "scene_counts": _scene_counts,
+                # 逐场景适用性（measured/not_applicable/unknown）：只写
+                # scene_counts 的话，看板只能显示"无数据"，看不到
+                # "确认真无线"与"有线但 R=0（UNKNOWN）"的分别（独立复核指出）。
+                "scene_applicability": _sc["scenes"],
                 "per_scene": per_scene,
                 "scene_candidates": scene_candidates,
                 "final_confirmation": _conf,
@@ -2238,6 +2560,19 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                                               / "checkpoint_last.pt")
                              .get("n_train") or 0),
                             args.batch) * int(cand_epochs))
+                        for s in args.seeds}},
+                # 实际入训**样本数**（来自 checkpoint 的 train_args，不是配置声称）：
+                # 等步数对照的另一半证据，也是"四个计数"里"实际入训"的来源。
+                "n_train_frames_by_arm": {
+                    "baseline": {
+                        str(s): (_ckpt_train_args(
+                            exp_dir(args.run_id) / "baseline" / f"seed{s}"
+                            / "checkpoint_last.pt").get("n_train"))
+                        for s in args.seeds},
+                    "candidate": {
+                        str(s): (_ckpt_train_args(
+                            exp_dir(args.run_id) / f"round{rnd}" / f"seed{s}"
+                            / "checkpoint_last.pt").get("n_train"))
                         for s in args.seeds}},
                 "timing_suspect": timing_notes,
                 "timing_repeats": timing_repeats,
@@ -2320,7 +2655,8 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
               f"identity {hard['candidate_identity_rate']}）")
         history.append(RoundRecord(round_index=rnd, candidate_id=cand_id,
                                    decision=dec["decision"],
-                                   reasons=dec["reasons"]))
+                                   reasons=dec["reasons"],
+                                   outcome=_outcome))
         # 真实累计（方案 G08）：原来传 0，预算停止条件在 rounds 里永远不触发
         stop = should_stop(cfg, history,
                            gpu_minutes_today=machine_gpu_minutes_today(),
@@ -2391,6 +2727,9 @@ def main(argv=None) -> int:
     s.add_argument("--champion-steps", type=int, default=None)
     s.add_argument("--champion-epochs", type=int, default=3)
     s.add_argument("--max-proposals", type=int, default=3)
+    s.add_argument("--allow-road-only", action="store_true",
+                   help="road-only 配方：line 类整通道屏蔽，线损失键判 inactive，"
+                        "不产出这类提议（方案 v2 §S5/T14）")
     s.set_defaults(func=cmd_propose)
 
     s = sub.add_parser("evaluate",

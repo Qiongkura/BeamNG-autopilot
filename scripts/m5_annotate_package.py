@@ -44,20 +44,24 @@ from scripts.m5_annotate_manual import (  # noqa: E402
 DEFAULT_PREFILL = "logs/m5_seg/seg_model_v13b_ft_t13/best.pt"
 
 KEY_HELP = """\
-| 键 | 作用 |
-| --- | --- |
-| 鼠标左键拖 | 画笔，画当前类别 |
-| 右键 / `f` | 油漆桶（填连通区域：先画闭合轮廓，再点内部） |
-| `1` / `2` / `3` | 当前类别 = 标线 / 路面 / 背景（擦除） |
-| `4` / `5` / `6` | 标记"这里为什么画不了"：遮挡 / 模糊 / 无法判断 |
-| `b` / `p` | 在画笔与油漆桶之间切换 |
-| `u` | 撤销上一次笔画/填充/清空 |
-| `c` | 清空整帧标签 |
-| `z` | 2× / 1× 缩放 |
-| `a` / ← | 上一帧 |
-| `s` | 保存并进入下一帧 |
-| `q` | 退出（已保存的都在盘上） |
-| 拖动条 | 笔刷大小 1–40 |
+界面是中文，顶端有一条工具栏，**所有操作都能用鼠标点**（按钮上印着等价的键）：
+
+| 顶端按钮 | 等价的键 | 作用 |
+| --- | --- | --- |
+| 标线 / 路面 / 擦除 | `1` / `2` / `3` | 像素类别：标线 / 路面 / 背景（擦除） |
+| 沥青 / 碎石 / 路肩 | `7` / `8` / `9` | **路型**（单独一组，不和"路面"混）：逐像素记进 `road_type`（1/2/3）。沥青与纯土路算路面；**路肩不算路面**（写背景），按约束"有铺装时土肩不得算作道路" |
+| 遮挡 / 模糊 / 未知 | `4` / `5` / `6` | 标记"这里为什么画不了"：写 255(ignore) + 原因 |
+| 画笔 | `p` | 画笔：左键拖动，涂当前画笔 |
+| 油漆桶 | `f`（或右键） | 填连通区域：先画闭合轮廓，再点内部 |
+| 直线 | `l` | 拖动 A→B，或点两下（A 再 B）—— 画出来是**笔直**的 |
+| 曲线 | `v` | 平滑曲线：拖动 = 自由手绘（自动去抖 + 平滑）；或点若干控制点后按 `ENTER`，曲线穿过每个点 |
+| 撤回 | `u` | 画曲线时退掉最后一个控制点，否则退掉上一笔 |
+| 清空 / 缩放 / 上一帧 / 保存并下一帧 | `c` / `z` / `a`(或 ←) / `s` | 对应操作；`q` 退出 |
+| 拖动条 | — | 笔刷大小 1–40 |
+
+草稿（还没落笔的直线/曲线）按 `ESC` 放弃，或再点一次当前工具按钮；
+**草稿不会写进标签**，只有落笔才写。碎石与路肩在画面上有各自的颜色，
+不存在"画了看不见"。
 """
 
 
@@ -88,6 +92,11 @@ def build_package(*, collection: Path, frames: list, out: Path,
     """写任务包；返回 ``{view: {"frames": n, "identity_ok": n, ...}}``。"""
     collection = Path(collection)
     out = Path(out)
+    # meta 的位置有两种（实测都遇到过）：
+    #   * 采集级 ``<collection>/meta.json``（采集器写的，含全部视角）；
+    #   * **视角级** ``<collection>/<view>/meta.json``（agent 标注池就是这种：
+    #     每个视角目录各有一份，里面列着全部视角的帧）。
+    # 只找采集级会在视角级池子上直接 FileNotFoundError（实测踩到）。
     meta_src = collection / "meta.json"
     picks = pick_per_view(frames, per_view)
     per: dict = {}
@@ -100,8 +109,49 @@ def build_package(*, collection: Path, frames: list, out: Path,
             continue
         d = out / view
         d.mkdir(parents=True, exist_ok=True)
-        (d / "meta.json").write_text(meta_src.read_text(encoding="utf-8"),
-                                     encoding="utf-8")
+        _meta_here = meta_src if meta_src.is_file() else (collection / view
+                                                          / "meta.json")
+        if not _meta_here.is_file():
+            per.setdefault(view, {"frames": 0, "missing": []})
+            per[view]["missing"].append(
+                f"meta.json for {src} (tried {meta_src} and "
+                f"{collection / view / 'meta.json'})")
+            continue
+        meta_src = _meta_here
+        _blob = json.loads(meta_src.read_text(encoding="utf-8"))
+        # 视角级 meta 列着**全部视角**的帧：只保留本包真正带的那些，避免
+        # 包里的 meta 出现"并不存在的帧"（下游按 meta 记身份就会记错）。
+        _names = {Path(str(x["path"])).name for x in picks
+                  if str(x["view"]) == view}
+        if _blob.get("frames"):
+            # 必须按**视角+文件名**匹配：不同视角的同名帧（front_main/
+            # frame_00000.npz 与 rear/frame_00000.npz）文件名相同，只按文件名
+            # 过滤会把别的视角的帧一起留下（实测：4 帧的包留下 32 条记录）。
+            _want = {f"{view}/{n}" for n in _names}
+
+            def _keep(r) -> bool:
+                rp = str(r.get("path") or "")
+                if rp:
+                    return rp in _want
+                return (str(r.get("view") or "") == view
+                        and Path(rp).name in _names)
+            _cat = {Path(str(x.get("path") or "")).name: str(
+                x.get("category") or "") for x in picks
+                if str(x["view"]) == view}
+            _kept = []
+            for r in _blob["frames"]:
+                if not _keep(r):
+                    continue
+                # 类别是**复核用**的候选归类：写进包内 meta，监督器直接读，
+                # 不再靠工作表按源路径猜（包内是副本，按文件名会串味）。
+                _c = _cat.get(Path(str(r.get("path") or "")).name)
+                if _c:
+                    r = {**r, "category": _c}
+                _kept.append(r)
+            _blob["frames"] = _kept
+            _blob["views_in_package"] = [view]
+        (d / "meta.json").write_text(
+            json.dumps(_blob, ensure_ascii=False, indent=1), encoding="utf-8")
         with np.load(src) as z:
             payload = {"colour": np.asarray(z["colour"], dtype=np.uint8)}
             if "annotation_raw" in z.files:
@@ -109,15 +159,15 @@ def build_package(*, collection: Path, frames: list, out: Path,
                                                        dtype=np.uint8)
         # 身份：先用帧自己的 npz 字段，再用采集 meta 里按 basename 匹配的记录
         ident = {k: None for k in ("map_name", "source_id", "pos", "heading")}
-        for rec in (json.loads(meta_src.read_text(encoding="utf-8")).get("frames")
-                    or []):
+        _blob2 = json.loads((d / "meta.json").read_text(encoding="utf-8"))
+        for rec in (_blob2.get("frames") or []):
             if Path(str(rec.get("path") or "")).name == src.name:
                 ident.update({"map_name": rec.get("map_name"),
                               "source_id": rec.get("source_id"),
                               "pos": rec.get("pos"),
                               "heading": rec.get("heading")})
                 break
-        run_meta = json.loads(meta_src.read_text(encoding="utf-8"))
+        run_meta = _blob2
         ident["map_name"] = ident["map_name"] or run_meta.get("map_name")
         ident["source_id"] = ident["source_id"] or run_meta.get("source_id")
         np.savez_compressed(d / src.name, **payload,
@@ -128,6 +178,15 @@ def build_package(*, collection: Path, frames: list, out: Path,
         st["paint_px"] += int(f.get("line_pixels") or 0)
         if st["pos_first"] is None:
             st["pos_first"] = f.get("pos")
+    # 一帧都没拷到时给可读错误：原来会先写 README，而 out/<view> 没被创建 ->
+    # FileNotFoundError 栈（实测踩到：队列里的路径与 collection 拼不上时）
+    copied = sum(int(v.get("frames") or 0) for v in per.values())
+    if copied == 0:
+        print(f"[pkg] 一帧都没拷到：检查队列里的 path 与 --collection 能否拼上"
+              f"（collection={collection}，前几个缺失："
+              f"{[m for v in per.values() for m in (v.get('missing') or [])][:3]}）")
+        return per
+    out.mkdir(parents=True, exist_ok=True)
     _write_readme(out, collection=collection, per=per, prefill=prefill,
                   seed=seed, per_view=per_view)
     return per

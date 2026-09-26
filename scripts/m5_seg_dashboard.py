@@ -1656,6 +1656,11 @@ def _decisions_state(path: Path | None) -> dict:
             state["items"].append({"file": fp.name, "error":
                                    f"{type(exc).__name__}: {exc}"})
             continue
+        # v5 计数契约（方案 v2 §S3.7）：旧判定没有整数计数就**不能**按新分母重判，
+        # 页面对新字段只能写"旧协议未记录"（见 gates.legacy_replay_note）。
+        # 判定原样留在 item 里，七个 v5 面板直读它、不重算。
+        from beamng_autopilot.experiments.gates import legacy_replay_note
+        legacy_note = legacy_replay_note(blob) or ""
         pairs = blob.get("pairings") or {}
         hard = blob.get("hard_gate") or {}
         dec = blob.get("decision") or {}
@@ -1669,6 +1674,7 @@ def _decisions_state(path: Path | None) -> dict:
             "decision": dec.get("decision") or "",
             "reasons": list(dec.get("reasons") or []),
             "steps_by_arm": blob.get("steps_by_arm"),
+            "n_train_frames_by_arm": blob.get("n_train_frames_by_arm") or {},
             "max_train_frames": blob.get("max_train_frames"),
             "equal_steps": blob.get("equal_steps_requested"),
             "factor": blob.get("factor"),
@@ -1676,10 +1682,250 @@ def _decisions_state(path: Path | None) -> dict:
             "trivial_all_road": blob.get("road_iou_trivial_all_road"),
             "eval_checkpoint": blob.get("eval_checkpoint"),
             "epochs": blob.get("epochs"),
+            # 逐 seed / 逐场景的**原始测量**（方案 §10.2/A7：坏 seed 或坏场景
+            # 不能被池化均值藏掉，所以页面上要能直接看到）
+            "hard_by_seed": blob.get("hard_by_seed") or {},
+            "per_scene": blob.get("per_scene") or {},
+            "scene_candidates": blob.get("scene_candidates") or {},
+            "missing_metrics": list(blob.get("missing_metrics") or []),
+            # S4/T16 七面板直读：判定原样保留 + 旧协议标记（新计数缺失时
+            # 页面写"旧协议未记录"，绝不补 0）。
+            "blob": blob,
+            "legacy_note": legacy_note,
         })
     state["gpu_minutes"] = ledger
     state["readable"] = bool([i for i in state["items"] if not i.get("error")])
     return state
+
+
+#: 事件 (phase, status) -> 时间线阶段（方案 §11：采集 → 审计 → 标注 →
+#: 训练 → 评价 → 判定 → 下一轮）。
+STAGE_OF_EVENT = {
+    ("auditing", "collecting"): "采集",
+    ("auditing", "collect_ok"): "审计",
+    ("auditing", "collect_rejected"): "审计",
+    ("auditing", "collect_blocked"): "审计",
+    ("auditing", "collect_failed"): "审计",
+    ("auditing", "resource_blocked"): "资源门",
+    ("auditing", "resource_checked"): "资源门",
+    ("auditing", "stopped_before_start"): "停止",
+    ("auditing", "lease_blocked"): "资源门",
+    ("auditing", "no_data_configured"): "停止",
+    ("needs_review", "collect_rejected"): "标注/复核",
+    ("needs_review", "labels_missing"): "标注/复核",
+    ("training", "running"): "训练",
+    ("training", "train_error"): "训练",
+    ("evaluating", "running"): "评价",
+    ("evaluating", "evaluated"): "评价",
+    ("rejected", "decided"): "判定",
+    ("shadow_candidate", "decided"): "判定",
+    ("needs_evidence", "decided"): "判定",
+    ("paused", "paused"): "暂停",
+    ("failed", "failed"): "失败",
+}
+
+
+def _timeline_state(run_dir) -> dict:
+    """全流程时间线（方案 §11）：从既有产物重建，不新造数据库。
+
+    验收动作是「**从一个候选反查它来自哪次采集和哪份标签**」，所以除事件流外，
+    还要把 ``collect_*.json``（采集与身份审计）、``selection_collect_*.json``
+    （选样）、``review_queue_*.json``（复核队列）、
+    ``proposals_collect_*.json``（数据因子提议）与 ``decision_*.json``（判定）
+    串起来：候选 -> 数据目录 -> 采集记录 -> 标签来源。读不到就写"没有记录/
+    未测"，不猜、不补 0。
+    """
+    st = {"readable": False, "error": "", "candidates": [],
+          "n_collections": 0, "n_review_queues": 0, "n_selections": 0}
+    if run_dir is None:
+        st["error"] = "没有 run 目录"
+        return st
+    root = Path(run_dir)
+    if not root.is_dir():
+        st["error"] = f"{root} 不存在"
+        return st
+
+    def _loads(pattern):
+        out = []
+        for fp in sorted(root.glob(pattern)):
+            try:
+                out.append((fp, json.loads(fp.read_text(encoding="utf-8"))))
+            except Exception as exc:                       # noqa: BLE001
+                out.append((fp, {"_error": f"{type(exc).__name__}: {exc}"}))
+        return out
+
+    collects = _loads("collect_*.json")
+    selections = _loads("selection_collect_*.json")
+    queues = _loads("review_queue_*.json")
+    decisions = _loads("decision_*.json")
+    st["n_collections"] = len(collects)
+    st["n_selections"] = len(selections)
+    st["n_review_queues"] = len(queues)
+    if not any((collects, selections, queues, decisions)):
+        st["error"] = "run 目录里没有采集/选样/判定产物"
+        return st
+
+    coll_by_dir = {}
+    for fp, blob in collects:
+        if blob.get("_error"):
+            continue
+        d = str(blob.get("out_dir") or "")
+        if d:
+            coll_by_dir[d] = {"file": fp.name, "stamp": blob.get("stamp"),
+                              "map_name": blob.get("map_name"),
+                              "source_id": blob.get("source_id"),
+                              "frames_total": blob.get("frames_total"),
+                              "ok": blob.get("ok"),
+                              "group_spread": blob.get("group_spread"),
+                              "selection": blob.get("selection")}
+
+    def _norm(x) -> str:
+        return str(x).replace(chr(92), "/")
+
+    def _collection_of(run_paths):
+        """候选的数据目录 -> 它来自哪次采集（按目录前缀匹配，不模糊猜）。
+
+        同一采集的多个视角目录要合并成一行：否则一次四视角采集会在页面上
+        显示成"来自采集"四遍，看起来像四次采集。
+        """
+        hits: dict = {}
+        # 先按路径去重：同一个目录可能同时出现在 candidate_runs 与
+        # baseline_runs 里（基线臂=候选臂的起点），不该被数成两个目录。
+        for rp in sorted({str(x) for x in (run_paths or [])}):
+            rpn = _norm(rp)
+            for d, rec in coll_by_dir.items():
+                dn = _norm(d)
+                if rpn == dn or rpn.startswith(dn + "/"):
+                    key = (str(rec.get("stamp")), str(rec.get("source_id")))
+                    if key in hits:
+                        hits[key]["n_dirs"] += 1
+                        hits[key]["matched_runs"].append(str(rp))
+                    else:
+                        hits[key] = {**rec, "n_dirs": 1,
+                                     "matched_runs": [str(rp)]}
+                    break
+        return list(hits.values())
+
+    for fp, blob in decisions:
+        if blob.get("_error"):
+            continue
+        runs = list(blob.get("candidate_runs") or []) + \
+            list(blob.get("baseline_runs") or [])
+        res = blob.get("paint_source_resolution") or {}
+        st["candidates"].append({
+            "file": fp.name,
+            "candidate_id": blob.get("candidate_id"),
+            "factor": blob.get("factor"),
+            "data_runs": [str(r) for r in runs],
+            "collections": _collection_of(runs),
+            "label": {
+                "declared": blob.get("paint_sources"),
+                "research_only": blob.get("research_only"),
+                "why": res.get("reasons"),
+            },
+            "protocol_hash": (blob.get("protocol") or {}).get("hash"),
+            "decision": (blob.get("decision") or {}).get("decision"),
+            "reasons": list((blob.get("decision") or {}).get("reasons") or []),
+            "skipped_factors": blob.get("skipped_factors"),
+            "data_factor_note": blob.get("data_factor_note"),
+        })
+    st["readable"] = True
+    return st
+
+
+def _timeline_view(ctx: dict) -> str:
+    """全流程时间线 + 候选反查（方案 §11 的验收动作）。"""
+    tl = ctx.get("timeline") or {}
+    ev = ctx.get("events") or {}
+    out = ['<section id="timeline"><h2>全流程时间线</h2>',
+           '<p class="hint">采集 → 审计 → 标注/复核 → 训练 → 评价 → 判定 → '
+           '下一轮。时间来自事件流；ID 与帧数来自采集/选样/判定产物；'
+           '读不到就写"没有记录"，不补 0。</p>']
+    rows = ['<table><tr><th>时间</th><th>阶段</th><th>状态</th>'
+            "<th>候选/数据集</th><th>说明</th></tr>"]
+    n_rows = 0
+    for e in (ev.get("events") or []):
+        stage = STAGE_OF_EVENT.get((e.phase, e.status))
+        if not stage:
+            continue
+        rows.append(
+            f'<tr><td class="mono">{_esc(e.ts)}</td><td>{_esc(stage)}</td>'
+            f'<td class="mono">{_esc(e.phase)}/{_esc(e.status)}</td>'
+            f'<td class="mono">{_esc(e.candidate_id or "")}'
+            f'{(" · " + _esc(e.dataset_id)) if e.dataset_id else ""}</td>'
+            f'<td>{_esc(e.note or "")}</td></tr>')
+        n_rows += 1
+    if n_rows:
+        rows.append("</table>")
+        out.append("".join(rows))
+    else:
+        out.append("<p>" + _unknown("事件流里没有可识别的阶段事件"
+                                    "（采集/审计/训练/评价/判定/暂停）",
+                                    level=LEVEL_TRAIN) + "</p>")
+    out.append("<h3>候选反查：它来自哪次采集、哪份标签</h3>")
+    if not tl.get("readable"):
+        out.append("<p>" + _unknown(
+            f"反查不可用：{tl.get('error') or '没有产物'}", level=LEVEL_TRAIN)
+            + "</p></section>")
+        return "".join(out)
+    if not tl.get("candidates"):
+        out.append("<p>" + _unknown("还没有判定文件，无法反查候选",
+                                    level=LEVEL_TRAIN) + "</p></section>")
+        return "".join(out)
+    for c in tl["candidates"]:
+        out.append(f'<h4 class="mono">{_esc(c.get("candidate_id") or "?")}</h4>')
+        rows2 = ['<table><tr><th>项</th><th>内容</th></tr>']
+        rows2.append('<tr><td>因子</td><td class="mono">'
+                     + _esc(json.dumps(c.get("factor"), ensure_ascii=False))
+                     + "</td></tr>")
+        if c.get("collections"):
+            for col in c["collections"]:
+                sp = col.get("group_spread") or []
+                cov = ""
+                if sp:
+                    cov = (f' · 覆盖比 {_esc(sp[0].get("coverage_ratio"))}'
+                           f'（{_esc(sp[0].get("extent_m"))} m）')
+                rows2.append(
+                    f'<tr><td>来自采集</td><td class="mono">'
+                    f'{_esc(col.get("stamp"))} · {_esc(col.get("map_name"))}/'
+                    f'{_esc(col.get("source_id"))} · '
+                    f'{_esc(col.get("frames_total"))} 帧 · 身份审计'
+                    f'{"通过" if col.get("ok") else "未通过"} · '
+                    f'{_esc(col.get("n_dirs"))} 个目录{cov}</td></tr>')
+        else:
+            rows2.append('<tr><td>来自采集</td><td>'
+                         + _unknown("这些数据目录没有对应的采集记录"
+                                    "（可能是早期数据或手工目录）",
+                                    level=LEVEL_TRAIN) + "</td></tr>")
+        lab = c.get("label") or {}
+        lab_txt = _esc(json.dumps(lab.get("declared"), ensure_ascii=False))
+        if lab.get("research_only"):
+            lab_txt += ' <span class="badge">research_only：不晋级</span>'
+        rows2.append(f'<tr><td>标签来源</td><td class="mono">{lab_txt}</td></tr>')
+        rows2.append('<tr><td>协议哈希</td><td class="mono">'
+                     + _esc(c.get("protocol_hash") or "未记录") + "</td></tr>")
+        rows2.append(f'<tr><td>判定</td><td><b>{_esc(c.get("decision") or "未判定")}'
+                     "</b>"
+                     + ("".join(f"<div>{_esc(r)}</div>"
+                                for r in (c.get("reasons") or []))
+                        or '<div class="hint">没有理由记录</div>')
+                     + "</td></tr>")
+        if c.get("skipped_factors"):
+            rows2.append('<tr><td>未采用的因子</td><td class="mono">'
+                         + _esc(json.dumps(c["skipped_factors"],
+                                           ensure_ascii=False))
+                         + "</td></tr>")
+        if c.get("data_factor_note"):
+            rows2.append('<tr><td>下一轮输入</td><td>'
+                         + _esc(c["data_factor_note"]) + "</td></tr>")
+        rows2.append("</table>")
+        out.append("".join(rows2))
+    out.append(f'<p class="hint">产物计数：采集记录 {tl.get("n_collections")} · '
+               f'选样 {tl.get("n_selections")} · 复核队列 '
+               f'{tl.get("n_review_queues")} · 判定 '
+               f'{len(tl.get("candidates") or [])}</p>')
+    out.append("</section>")
+    return "".join(out)
 
 
 def _decisions_view(ctx: dict) -> str:
@@ -1743,11 +1989,92 @@ def _decisions_view(ctx: dict) -> str:
                     f"gt={_esc(str(f.get('gt_px')))})" for f in frames)
                 out.append(f"<li>seed {_esc(seed)}: {cells}</li>")
             out.append("</ul>")
+        _ntf = it.get("n_train_frames_by_arm") or {}
+        if _ntf:
+            out.append('<p class="hint">两臂**实际入训样本数**（来自 checkpoint 的 '
+                       "train_args；等步数对照的另一半证据）:</p>")
+            rows_n = ['<table><tr><th>seed</th><th>基线臂</th><th>候选臂</th></tr>']
+            _seeds = sorted(set(_ntf.get("baseline") or {})
+                            | set(_ntf.get("candidate") or {}),
+                            key=lambda x: str(x))
+            for sd in _seeds:
+                b = (_ntf.get("baseline") or {}).get(sd)
+                c = (_ntf.get("candidate") or {}).get(sd)
+                def _n(v):
+                    return (Evidence(name=sd, level=LEVEL_TRAIN,
+                                     value=(None if v is None else float(v)),
+                                     unit="count",
+                                     missing=("" if v is not None
+                                              else "checkpoint 里没有 n_train")
+                                     ).cell())
+                rows_n.append(f'<tr><td class="mono">seed {_esc(sd)}</td>'
+                              f"<td>{_n(b)}</td><td>{_n(c)}</td></tr>")
+            rows_n.append("</table>")
+            out.append("".join(rows_n))
+        _hbs = it.get("hard_by_seed") or {}
+        if _hbs:
+            out.append('<p class="hint">逐 seed 硬门输入（每个 seed 的 checkpoint '
+                       "必须**自己**满足门槛；某一行明显差就是那个 seed 不合格，"
+                       "池化均值会把它藏掉）:</p>")
+            _keys = ("candidate_identity_rate", "line_recall", "line_precision",
+                     "offroad_false_ratio", "inference_ms_p95")
+            rows_seed = ['<table><tr><th>seed</th>'
+                         + "".join(f"<th>{_esc(k)}</th>" for k in _keys)
+                         + "</tr>"]
+            for seed in sorted(_hbs, key=lambda x: str(x)):
+                cells = []
+                for k in _keys:
+                    v = (_hbs.get(seed) or {}).get(k)
+                    cells.append("<td>" + (Evidence(
+                        name=k, level=LEVEL_TRAIN, value=(None if v is None
+                                                          else float(v)),
+                        unit=("ms" if k == "inference_ms_p95" else "ratio"),
+                        missing=("" if v is not None else "该 seed 未测")
+                    ).cell()) + "</td>")
+                rows_seed.append(f'<tr><td class="mono">seed {_esc(seed)}</td>'
+                                 + "".join(cells) + "</tr>")
+            rows_seed.append("</table>")
+            out.append("".join(rows_seed))
+        _ps = it.get("per_scene") or {}
+        if _ps:
+            _sc = it.get("scene_candidates") or {}
+            out.append('<p class="hint">逐场景（跨 seed 取**最差**；场景用 '
+                       "map/source_id 分组，不能只报池化值）:</p>")
+            rows_sc = ['<table><tr><th>场景</th><th>line_recall</th>'
+                       "<th>line_precision</th><th>offroad_false_ratio</th>"
+                       "<th>inference_ms_p95</th><th>候选覆盖率</th>"
+                       "<th>左右角色</th></tr>"]
+            for g in sorted(_ps):
+                m = _ps.get(g) or {}
+                cand = _sc.get(g) or {}
+                def _cell(v, unit="ratio", miss="该场景未测"):
+                    return Evidence(name=g, level=LEVEL_TRAIN,
+                                    value=(None if v is None else float(v)),
+                                    unit=unit,
+                                    missing=("" if v is not None else miss)).cell()
+                rows_sc.append(
+                    f'<tr><td class="mono">{_esc(g)}</td>'
+                    f'<td>{_cell(m.get("line_recall"))}</td>'
+                    f'<td>{_cell(m.get("line_precision"))}</td>'
+                    f'<td>{_cell(m.get("offroad_false_ratio"))}</td>'
+                    f'<td>{_cell(m.get("inference_ms_p95"), "ms")}</td>'
+                    f'<td>{_cell(cand.get("candidate_reference_coverage"))}</td>'
+                    f'<td>{_cell(cand.get("left_right_role_agreement"))}</td>'
+                    "</tr>")
+            rows_sc.append("</table>")
+            out.append("".join(rows_sc))
+        if it.get("missing_metrics"):
+            out.append('<p class="hint">缺测清单（进 needs_evidence 的通道）: '
+                       + _esc("; ".join(map(str, it["missing_metrics"])))
+                       + "</p>")
         if it.get("hard_unknown"):
             out.append('<p class="hint">硬门未测（UNKNOWN）: '
                        f'{_esc(", ".join(it["hard_unknown"]))}'
                        "——这些项没有测量，既不算通过也不算违反。</p>")
-            ledger = st.get("gpu_minutes") or {}
+        # 账本与"有没有 UNKNOWN 硬门项"无关：原来它缩进在 if 里面，于是
+        # 硬门全部测到的判定文件一渲染就 UnboundLocalError（实测：真 run 的
+        # 判定文件 hard_unknown 为空，看板直接崩）。
+        ledger = st.get("gpu_minutes") or {}
         if ledger:
             days = ", ".join(f"{d}: {v.get('minutes')} min"
                              for d, v in sorted(ledger.items()))
@@ -1762,6 +2089,1486 @@ def _decisions_view(ctx: dict) -> str:
                            + ", ".join(f'<code>{_esc(str(p.relative_to(run_dir)))}</code>'
                                        for p in shots) + "</p>")
         out.append("</section>")
+    return "".join(out)
+
+
+# ---------------------------------------------------------------------------
+# 视图：方案 v2 §S4 / T16 七面板（直读判定 JSON，不重算指标）
+# ---------------------------------------------------------------------------
+#: T16 的七个面板（顺序固定；标题就是验收时检查的标签）。
+V5_PANELS = ("本轮身份", "数据入口", "学习过程", "比较结果", "无线诊断",
+             "错误定位", "资源与判定")
+
+#: 两种"没有数"必须分开写：新判定缺字段 = 无数据；v5 计数契约之前的旧判定
+#: = 旧协议未记录（方案 v2 §S3.7：缺新计数字段时说明"无法用新口径重判"，
+#: 不能给旧记录补 0）。
+NO_DATA = "无数据"
+LEGACY_RECORD = "旧协议未记录"
+
+#: 适用性状态 -> 人读标签（四种状态的取值来自 protocol.APPLICABILITY）。
+#: 标签里**保留协议原文取值**（measured/not_applicable/unknown/
+#: unverified_labels）：页面要让"不适用"与"未测"一眼分开，而不是把两者都
+#: 说成"没测到"——not_applicable 既不算通过也不算缺测（方案 v2 §3.4）。
+APPLICABILITY_LABELS = {
+    "measured": "measured（实测：有真值且有可判候选）",
+    "not_applicable": "not_applicable（不适用：确认真无线，不进入有线门，也不算通过）",
+    "unknown": "unknown（未测：有真值但没有可判分母，不是 0 分）",
+    "unverified_labels": "unverified_labels（标签未验证：仅诊断，不得当结论）",
+}
+
+
+def _src_note(*fields) -> str:
+    """可追溯：这一格读的是哪个 JSON 字段（T16 硬要求）。"""
+    text = " / ".join(str(f) for f in fields if str(f))
+    return f'<span class="hint">来源: {_esc(text)}</span>' if text else ""
+
+
+def _v5_no_data(reason: str, *, legacy: bool = False, source: str = "") -> str:
+    label = LEGACY_RECORD if legacy else NO_DATA
+    out = f'<span class="miss">{label}：{_esc(reason or "字段没有记录")}</span>'
+    if source:
+        out += " " + _src_note(source)
+    return out
+
+
+def _v5_num(value, *, unit: str = "", numerator=None, denominator=None,
+            level: str = LEVEL_TRAIN, legacy: bool = False, reason: str = "",
+            source: str = "", digits: int = 4) -> str:
+    """JSON 里真实存在的数值才渲染；None/缺失 -> 只写原因（0 就是实测 0）。"""
+    if value is None or (isinstance(value, float) and not math.isfinite(value)):
+        return _v5_no_data(reason, legacy=legacy, source=source)
+    out = Evidence(name="", level=level, value=float(value), unit=unit,
+                   numerator=numerator, denominator=denominator,
+                   digits=digits).cell()
+    if source:
+        out += " " + _src_note(source)
+    return out
+
+
+def _v5_pct(value, *, numerator=None, denominator=None, level: str = LEVEL_TRAIN,
+            legacy: bool = False, reason: str = "", source: str = "") -> str:
+    """比率单元格：带分子/分母；小于 1% 的比率多给有效位。
+
+    为什么不用 Evidence 的固定一位小数：``0.0003`` 会被印成 ``0.0%``，
+    等于把"测到了很小的假线率"说成"没测到"（与"不写假 0"同一条纪律）。
+    """
+    if value is None or (isinstance(value, float) and not math.isfinite(value)):
+        return _v5_no_data(reason, legacy=legacy, source=source)
+    v = float(value)
+    text = f"{v * 100:.2f}%" if abs(v) >= 0.01 else f"{v * 100:.4g}%"
+    out = f'<span class="mono">{text}</span>'
+    if numerator is not None and denominator is not None:
+        out += (f' <span class="hint">（{int(numerator)}/{int(denominator)}）'
+                "</span>")
+    out += _badge(level)
+    if source:
+        out += " " + _src_note(source)
+    return out
+
+
+def _v5_int(value, *, level: str = LEVEL_TRAIN, legacy: bool = False,
+            reason: str = "", source: str = "") -> str:
+    if value is None:
+        return _v5_no_data(reason, legacy=legacy, source=source)
+    out = f'<span class="mono">{int(value)}</span>{_badge(level)}'
+    if source:
+        out += " " + _src_note(source)
+    return out
+
+
+def _v5_pick(blob: dict, *keys):
+    """``blob`` 里第一个存在的字段 -> ``(value, key)``；都没有 -> ``(None, "")``。"""
+    if not isinstance(blob, dict):
+        return None, ""
+    for k in keys:
+        if k in blob:
+            return blob[k], k
+    return None, ""
+
+
+def _v5_row(label: str, value: str, source: str = "") -> str:
+    return (f'<tr><td>{_esc(label)}</td><td>{value}</td>'
+            f'<td class="mono">{_src_note(source) if source else ""}</td></tr>')
+
+
+def _v5_rows_table(rows: list, *, headers=("项", "值", "来源")) -> str:
+    head = "".join(f"<th>{_esc(h)}</th>" for h in headers)
+    body = "".join(rows)
+    return f"<table><tr>{head}</tr>{body}</table>"
+
+
+def _v5_kv_table(pairs: list) -> str:
+    """``[(label, value_html, source)]`` -> 三列表（来源列钉住可追溯性）。"""
+    if not pairs:
+        return ""
+    rows = "".join(_v5_row(str(a), b, c) for a, b, c in pairs)
+    return ('<table><tr><th>项</th><th>值</th><th>来源字段</th></tr>'
+            f"{rows}</table>")
+
+
+def _v5_rounds_dataset(ctx: dict) -> dict:
+    """运行目录里的 ``rounds_dataset.json``（数据准入门产物，只读）。
+
+    七个面板里"去重/冲突/已见组/空间 UNKNOWN"的权威来源是它（或判定文件里
+    同名字段）。读不到只记原因，不猜、不补 0。
+    """
+    root = _run_root(ctx)
+    if root is None:
+        return {"readable": False, "error": "没有 run 目录"}
+    path = root / "rounds_dataset.json"
+    if not path.is_file():
+        return {"readable": False, "error": f"{path.name} 不存在"}
+    blob, err = _load_json(path)
+    if err:
+        return {"readable": False, "error": err}
+    if not isinstance(blob, dict):
+        return {"readable": False, "error": "not a JSON object"}
+    return {"readable": True, "error": "", "path": str(path), "blob": blob}
+
+
+def _v5_frame_ref(frame, out_dir) -> str:
+    """原帧引用：能相对 HTML 打开才给链接，否则只给路径（不假装能点）。
+
+    与探针图同一条纪律：页面只引用**相对本文件真实存在**的文件。
+    """
+    raw = str(frame or "")
+    if not raw:
+        return _v5_no_data("该条目没有帧路径，无法追溯原帧")
+    p = Path(raw)
+    if not p.exists():
+        return (f'<span class="miss">missing: {_esc(raw)}</span>'
+                '<span class="hint">（文件不存在，无法点击定位；路径来自判定'
+                "文件，不在页面上造假链接）</span>")
+    try:
+        rel = os.path.relpath(p.resolve(), Path(out_dir).resolve())
+    except ValueError as exc:                          # Windows 跨盘符
+        return (f'<span class="mono">{_esc(raw)}</span>'
+                f'<span class="hint">（无法相对链接：{_esc(exc)}；按原路径可追溯）'
+                "</span>")
+    if rel.startswith(".."):
+        return (f'<span class="mono">{_esc(raw)}</span>'
+                '<span class="hint">（文件在页面目录之外：不做相对链接，'
+                "按原路径可追溯）</span>")
+    rel = rel.replace("\\", "/")
+    return (f'<a href="{_esc(rel)}">{_esc(raw)}</a>'
+            f'<span class="hint">（点击打开原帧: {_esc(rel)}）</span>')
+
+
+def _v5_model_rows(ctx: dict, blob: dict, fname: str) -> list:
+    """模型完整路径 + 哈希：优先判定文件，其次评估矩阵（都标来源）。"""
+    rows = []
+    models = blob.get("models")
+    if isinstance(models, dict):
+        for name in sorted(models, key=str)[:8]:
+            m = models[name] if isinstance(models[name], dict) else {}
+            rows.append((str(name), m))
+            rows[-1][1].setdefault("_src", f"{fname}: models.{name}")
+    elif isinstance(models, list):
+        for m in models[:8]:
+            if isinstance(m, dict):
+                rows.append((str(m.get("name") or m.get("tag") or "model"), m))
+                rows[-1][1].setdefault("_src", f"{fname}: models[]")
+    if not rows:
+        path, pkey = _v5_pick(blob, "model_path", "model_full_path")
+        sha, skey = _v5_pick(blob, "model_sha16", "sha16", "sha256_16")
+        if path is not None or sha is not None:
+            rows.append(("model", {"path": path, "sha16": sha,
+                                   "_src": f"{fname}: {pkey or skey}"}))
+    if not rows:
+        ev = ctx.get("eval") or {}
+        for split in sorted(ev.get("splits") or {}):
+            for name, entry in sorted((ev["splits"][split] or {}).items()):
+                if not isinstance(entry, dict):
+                    continue
+                p = entry.get("model") or entry.get("model_path")
+                s = (entry.get("sha256_16") or entry.get("model_sha16")
+                     or entry.get("sha16"))
+                if p is None and s is None:
+                    continue
+                rows.append((f"{split}/{name}",
+                             {"path": p, "sha16": s,
+                              "_src": f"eval matrix: {split}.{name}"
+                                      ".model/.sha256_16"}))
+                if len(rows) >= 8:
+                    break
+    return rows
+
+
+def _v5_identity_block(ctx: dict, it: dict) -> str:
+    """面板 1：本轮身份（commit/dirty、run、dataset、协议/阈值、模型、设备）。"""
+    blob = it.get("blob") or {}
+    fname = str(it.get("file") or "decision_*.json")
+    legacy = bool(it.get("legacy_note"))
+    ev = ctx.get("events") or {}
+    last = ev.get("last") if ev.get("readable") else None
+    mf = ctx.get("manifest") or {}
+    root = _run_root(ctx)
+    out = ["<h3>本轮身份</h3>"]
+    pairs = []
+    run_name = root.name if root is not None else "未指定"
+    cand = str(it.get("candidate_id") or "")
+    pairs.append(("运行 / 候选",
+                  f'<span class="mono">{_esc(run_name)}</span> · '
+                  + (f'<span class="mono">{_esc(cand)}</span>' if cand else
+                     _v5_no_data("判定文件没有 candidate_id"))
+                  + _badge(LEVEL_TRAIN),
+                  f"--run-dir / {fname}: candidate_id"))
+    # commit / dirty：判定文件优先，事件流兜底；"dirty 未记录"不等于干净
+    commit, ckey = _v5_pick(blob, "git_commit", "commit")
+    csrc = f"{fname}: {ckey}"
+    if commit is None and last is not None and last.git_commit:
+        commit, csrc = last.git_commit, "events.jsonl: git_commit"
+    dirty, dkey = _v5_pick(blob, "git_dirty", "git_dirty_paths", "dirty",
+                           "dirty_count")
+    dsrc = f"{fname}: {dkey}"
+    if dirty is None:
+        dirty_txt = _v5_no_data("判定文件与事件流都没有工作树状态："
+                                "不能声称 commit 对应可复现代码", source=dsrc)
+    elif isinstance(dirty, (list, tuple)):
+        dirty_txt = (f'<span class="mono">{len(dirty)}</span> 个未提交路径'
+                     + (f'<div class="hint mono">{_esc(", ".join(map(str, dirty[:6])))}'
+                        "</div>" if dirty else "")
+                     + _badge(LEVEL_TRAIN))
+    elif isinstance(dirty, bool):
+        dirty_txt = (f'<span class="mono">{"dirty" if dirty else "clean"}'
+                     f'</span>{_badge(LEVEL_TRAIN)}')
+    else:
+        dirty_txt = (f'<span class="mono">{_esc(dirty)}</span>'
+                     f'{_badge(LEVEL_TRAIN)}')
+    pairs.append(("commit", (f'<span class="mono">{_esc(commit)}</span>'
+                             f"{_badge(LEVEL_TRAIN)}") if commit else
+                 _v5_no_data("没有 git_commit 记录", source=csrc), csrc))
+    pairs.append(("工作树 / dirty", dirty_txt, dsrc))
+    ds, k = _v5_pick(blob, "dataset_id")
+    dsrc2 = f"{fname}: {k}"
+    if ds is None and mf.get("readable") and mf.get("dataset_id"):
+        ds, dsrc2 = mf["dataset_id"], "manifest: dataset_id"
+    if ds is None and last is not None and last.dataset_id:
+        ds, dsrc2 = last.dataset_id, "events.jsonl: dataset_id"
+    pairs.append(("数据集 dataset_id",
+                  f'<span class="mono">{_esc(str(ds)[:24])}</span>'
+                  f'{_badge(LEVEL_TRAIN)}' if ds else
+                  _v5_no_data("没有 dataset_id 记录", source=dsrc2), dsrc2))
+    proto = blob.get("protocol") if isinstance(blob.get("protocol"), dict) \
+        else None
+    if proto and proto.get("version"):
+        ptxt = (f'<span class="mono">{_esc(proto.get("version"))}</span>'
+                + (f' · hash <span class="mono">{_esc(proto.get("hash"))}</span>'
+                   if proto.get("hash") else ""))
+        pairs.append(("协议版本 / 哈希", ptxt, f"{fname}: protocol.version/hash"))
+    else:
+        pairs.append(("协议版本 / 哈希",
+                      _v5_no_data("判定文件没有协议快照版本（v5 之前的记录）",
+                                  legacy=True, source=f"{fname}: protocol"),
+                      f"{fname}: protocol"))
+    thr = blob.get("thresholds") if isinstance(blob.get("thresholds"), dict) \
+        else {}
+    thr_v = proto.get("thresholds") if proto else None
+    if thr or thr_v:
+        ttxt = (f'<span class="mono">{_esc(str(thr.get("config_hash") or ""))}'
+                "</span>")
+        if thr.get("source"):
+            ttxt += f' · <span class="hint">{_esc(str(thr.get("source")))}</span>'
+        if isinstance(thr_v, dict):
+            ttxt += (f'<div class="hint">协议里的门槛值: '
+                     f'{_esc(json.dumps(thr_v, ensure_ascii=False, sort_keys=True))}'
+                     "</div>")
+        pairs.append(("阈值版本 config_hash", ttxt,
+                      f"{fname}: thresholds.config_hash / protocol.thresholds"))
+    else:
+        pairs.append(("阈值版本 config_hash",
+                      _v5_no_data("判定文件没有阈值版本", legacy=legacy,
+                                  source=f"{fname}: thresholds"),
+                      f"{fname}: thresholds"))
+    mrows = _v5_model_rows(ctx, blob, fname)
+    if mrows:
+        for name, m in mrows[:6]:
+            path = m.get("path") or m.get("model") or m.get("checkpoint")
+            sha = (m.get("sha16") or m.get("model_sha16")
+                   or m.get("sha256_16"))
+            mtxt = (f'<span class="mono">{_esc(str(path or "路径未记录"))}</span>'
+                    + (f' · sha16 <span class="mono">{_esc(str(sha))}</span>'
+                       if sha else
+                       ' · ' + _v5_no_data("该条目没有权重哈希")))
+            pairs.append((f"模型 {name}", mtxt, str(m.get("_src") or fname)))
+    else:
+        pairs.append(("模型完整路径 / 哈希",
+                      _v5_no_data("判定文件与评估矩阵都没有模型路径/哈希",
+                                  source=f"{fname}: models / eval matrix"),
+                      f"{fname}: models / eval matrix"))
+    dev, dev_key = _v5_pick(blob, "device")
+    dev_src = f"{fname}: {dev_key}"
+    if dev is None:
+        env = blob.get("env") if isinstance(blob.get("env"), dict) else {}
+        if env.get("device"):
+            dev, dev_src = env["device"], f"{fname}: env.device"
+    if dev is None:
+        ta = (blob.get("train_args")
+              if isinstance(blob.get("train_args"), dict) else {})
+        if ta.get("device_name") or ta.get("device"):
+            dev = ta.get("device_name") or ta.get("device")
+            dev_src = f"{fname}: train_args.device"
+    if dev is None and root is not None:
+        for r in _ckpt_params(root, limit=4):
+            env = r.get("env") or {}
+            if env.get("device"):
+                dev = env["device"]
+                dev_src = f"checkpoint {r.get('arm')}/{r.get('seed')}: env.device"
+                break
+    pairs.append(("实际设备",
+                  f'<span class="mono">{_esc(str(dev))}</span>'
+                  f'{_badge(LEVEL_TRAIN)}' if dev is not None else
+                  _v5_no_data("判定/checkpoint 都没有实际运行设备记录",
+                              source=dev_src), dev_src))
+    out.append(_v5_kv_table(pairs))
+    if legacy:
+        out.append('<p class="hint">' + _esc(str(it.get("legacy_note"))) + "</p>")
+    return "".join(out)
+
+
+def _v5_data_block(ctx: dict, it: dict, rounds: dict) -> str:
+    """面板 2：数据入口（生成/复核/入训/评价、去重、冲突、rank、已见组、空间）。"""
+    blob = it.get("blob") or {}
+    fname = str(it.get("file") or "decision_*.json")
+    legacy = bool(it.get("legacy_note"))
+    mf = ctx.get("manifest") or {}
+    out = ["<h3>数据入口</h3>"]
+    rows = []
+    records = mf.get("records") if mf.get("readable") else None
+    dc = blob.get("data_counts") if isinstance(blob.get("data_counts"),
+                                               dict) else {}
+
+    def _four(label, value, src, reason="字段没有记录"):
+        if value is None:
+            cell = _v5_no_data(reason, legacy=legacy, source=src)
+        else:
+            cell = _v5_int(value, source=src)
+        rows.append(_v5_row(label, cell, src))
+
+    _four("生成帧（data_counts.generated）", dc.get("generated"),
+          f"{fname}: data_counts.generated", reason="判定文件没有四个数据计数"
+          "（v5 之前不记录）")
+    _four("复核帧（data_counts.reviewed）", dc.get("reviewed"),
+          f"{fname}: data_counts.reviewed", reason="判定文件没有四个数据计数"
+          "（v5 之前不记录）")
+    if not dc and records is not None:
+        n_verified = sum(
+            1 for r in records
+            if str(((r.get("quality") or {}).get("paint") or {})
+                   .get("rank") or "") == "verified")
+        rows.append(_v5_row(
+            "生成帧（manifest 记录）", _v5_int(len(records)),
+            "manifest: records"))
+        rows.append(_v5_row(
+            "复核帧（paint rank = verified）", _v5_int(n_verified),
+            "manifest: records[].quality.paint.rank"))
+        if not n_verified:
+            rows.append(_v5_row(
+                "复核提示",
+                '<span class="hint">0 个 verified 档帧：生成帧数不得当人工真值'
+                "数（本页按档位分开）</span>",
+                "manifest: records[].quality.paint.rank"))
+    else:
+        rows.append(_v5_row(
+            "生成帧（manifest 记录）",
+            _v5_no_data("没有 --manifest，无法统计清单记录") if records is None
+            else _v5_int(len(records)), "manifest: records"))
+    ntf = blob.get("n_train_frames_by_arm")
+    if isinstance(ntf, dict) and ntf:
+        parts = []
+        for arm in ("baseline", "candidate"):
+            per = ntf.get(arm) or {}
+            if isinstance(per, dict) and per:
+                parts.append(arm + " " + "、".join(
+                    f"seed {k}: {_v5_int(v)}" for k, v in sorted(
+                        per.items(), key=lambda kv: str(kv[0]))))
+        rows.append(_v5_row(
+            "入训帧（实测，来自 checkpoint train_args）",
+            "<br>".join(parts) if parts else _v5_no_data("两臂都没有记录"),
+            f"{fname}: n_train_frames_by_arm"))
+    else:
+        rows.append(_v5_row("入训帧（实测）",
+                            _v5_no_data("判定文件没有 n_train_frames_by_arm",
+                                        legacy=legacy),
+                            f"{fname}: n_train_frames_by_arm"))
+    ev = ctx.get("eval") or {}
+    if ev.get("readable"):
+        parts = []
+        for split in sorted(ev.get("splits") or {}):
+            for name, entry in sorted((ev["splits"][split] or {}).items()):
+                if isinstance(entry, dict) and entry.get("n_frames") is not None:
+                    parts.append(f"{split}/{name}: {int(entry['n_frames'])} 帧")
+                elif isinstance(entry, dict):
+                    parts.append(f"{split}/{name}: " + _v5_no_data(
+                        "评估矩阵条目没有 n_frames"))
+        rows.append(_v5_row("评价帧（评估矩阵实测）",
+                            "<br>".join(parts[:8]) if parts else
+                            _v5_no_data("评估矩阵没有 n_frames"),
+                            "eval matrix: <split>.<model>.n_frames"))
+    else:
+        rows.append(_v5_row("评价帧（评估矩阵实测）",
+                            _v5_no_data(ev.get("error") or "没有评估矩阵"),
+                            "eval matrix: <split>.<model>.n_frames"))
+    # 去重：判定字段优先；否则 manifest 的字节复制隔离；否则准入门产物
+    rows.append(_v5_row("去重（字节复制隔离）",
+                        _v5_dedupe_cell(blob, fname, mf, rounds, legacy),
+                        f"{fname}: dedupe / manifest: content_overlap / "
+                        "rounds_dataset.json: rejected[]"))
+    # 冲突：判定字段优先；否则组重叠（训练/开发同组）
+    rows.append(_v5_row("冲突（组重叠/标签冲突）",
+                        _v5_conflict_cell(blob, fname, mf, rounds, legacy),
+                        f"{fname}: conflicts / manifest: group_overlap / "
+                        "rounds_dataset.json: group_overlap"))
+    # 来源 rank（凡能进晋级参考的都要 verified；research_only 明确标出）
+    ranks = {}
+    if records is not None:
+        for r in records:
+            rank = str(((r.get("quality") or {}).get("paint") or {})
+                       .get("rank") or "absent")
+            ranks[rank] = ranks.get(rank, 0) + 1
+    ptxt = []
+    if ranks:
+        ptxt.append("、".join(f"{RANK_LABEL.get(k, k)}: {v}"
+                              for k, v in sorted(ranks.items())))
+    if blob.get("paint_sources") is not None:
+        ptxt.append("判定声明 paint_sources: "
+                    + _esc(json.dumps(blob.get("paint_sources"),
+                                      ensure_ascii=False)))
+    if blob.get("research_only"):
+        ptxt.append('<span class="badge">research_only：不晋级</span>')
+    rows.append(_v5_row("来源 rank / 资格",
+                        "<br>".join(ptxt) if ptxt else
+                        _v5_no_data("没有 manifest 档位，也没有 paint_sources",
+                                    legacy=legacy),
+                        "manifest: records[].quality.paint.rank / "
+                        f"{fname}: paint_sources, research_only"))
+    # 已见组：判定 lineage 字段优先；否则准入门产物的 train_groups
+    seen_txt, seen_src = _v5_seen_cell(blob, fname, rounds)
+    rows.append(_v5_row("已见组（训练侧组）", seen_txt, seen_src))
+    # 空间 UNKNOWN：没有位置的帧不能默认"隔离通过"
+    sp_txt, sp_src = _v5_spatial_cell(blob, fname, rounds)
+    rows.append(_v5_row("空间 UNKNOWN（没有位置的帧）", sp_txt, sp_src))
+    out.append(_v5_rows_table(rows))
+    return "".join(out)
+
+
+def _v5_dedupe_cell(blob: dict, fname: str, mf: dict, rounds: dict,
+                    legacy: bool) -> str:
+    node = blob.get("dedupe")
+    if isinstance(node, dict):
+        checked = node.get("checked")
+        removed = node.get("removed", node.get("n_removed"))
+        groups = node.get("groups", node.get("n_duplicate_groups"))
+        if removed is not None or groups is not None:
+            return (f'删除 {_v5_int(removed)} 帧 / 重复组 '
+                    f'{_v5_int(groups)}（来源 {_esc(fname)}: dedupe）'
+                    if removed is not None and groups is not None else
+                    f'删除 {_v5_int(removed)} 帧 / 重复组 '
+                    f'{_v5_int(groups)}')
+        if checked is False:
+            return ('<span class="unknown">未检查</span>'
+                    '<span class="hint">（判定文件写 checked:false，'
+                    "不是 0 个重复）</span>")
+    records = mf.get("records") if mf.get("readable") else None
+    if records:
+        n_dup = sum(1 for r in records
+                    if "byte-identical" in str(r.get("reject_reason") or ""))
+        note = ("0（清单里没有字节复制帧：这是查过的 0，不是未测）"
+                if n_dup == 0 else f"去重隔离 {n_dup} 帧（byte-identical）")
+        return f'<span class="mono">{_esc(note)}</span>'
+    rb = rounds.get("blob") if rounds.get("readable") else None
+    rej = rb.get("rejected") if isinstance(rb, dict) else None
+    if isinstance(rej, list):
+        n_dup = sum(1 for r in rej
+                    if "byte-identical" in str((r or {}).get("reason") or ""))
+        return (f'<span class="mono">去重隔离 {n_dup} 帧（byte-identical）'
+                f"</span><span class=\"hint\">（准入门 rejected 列表，"
+                f"共 {len(rej)} 条被拒）</span>")
+    return _v5_no_data("没有 dedupe 字段，也没有清单/准入门记录",
+                       legacy=legacy)
+
+
+def _v5_conflict_cell(blob: dict, fname: str, mf: dict, rounds: dict,
+                      legacy: bool) -> str:
+    node = blob.get("conflicts")
+    if isinstance(node, dict):
+        checked = node.get("checked")
+        n = node.get("n", node.get("count"))
+        if n is not None:
+            return f'<span class="mono">{_v5_int(n)}</span>'
+        if checked is False:
+            return ('<span class="unknown">未检查</span>'
+                    '<span class="hint">（判定文件写 checked:false）</span>')
+    elif isinstance(node, list):
+        return (f'<span class="mono">{len(node)}</span> 条'
+                + (f'<div class="hint mono">{_esc(str(node[:3]))}</div>'
+                   if node else
+                   '<span class="hint">（列表为空＝查过没有冲突）</span>'))
+    audit = (mf.get("audit") or {}) if mf.get("readable") else {}
+    go = audit.get("group_overlap") or {}
+    if go.get("checked") and go.get("n") is not None:
+        return (f'组重叠 <span class="mono">{_v5_int(go.get("n"))}</span> 组'
+                + (f'<div class="hint mono">{_esc(str(go.get("detail") or []))}'
+                   "</div>" if go.get("n") else ""))
+    rb = rounds.get("blob") if rounds.get("readable") else None
+    ov = rb.get("group_overlap") if isinstance(rb, dict) else None
+    if isinstance(ov, list):
+        return (f'组重叠 <span class="mono">{len(ov)}</span> 组'
+                + (f'<div class="hint mono">{_esc(", ".join(map(str, ov[:4])))}'
+                   "</div>" if ov else
+                   '<span class="hint">（空列表＝准入门查过没有组重叠）</span>'))
+    return _v5_no_data("没有 conflicts 字段，也没有组重叠审计", legacy=legacy)
+
+
+def _v5_seen_cell(blob: dict, fname: str, rounds: dict) -> tuple:
+    lin = blob.get("lineage")
+    if isinstance(lin, dict):
+        seen = lin.get("seen_groups") or lin.get("seen_in") or []
+        unknown = lin.get("unknown_models") or lin.get("lineage_unknown") or []
+        txt = ("、".join(map(str, seen)) if seen else
+               "没有命中已见组（" + str(lin.get("n_checked", "n 未记录"))
+               + " 项已查）")
+        if unknown:
+            txt += ('<div class="hint">lineage UNKNOWN（checkpoint 读不到 '
+                    "runs）: " + _esc("、".join(map(str, unknown))) + "</div>")
+        return txt, f"{fname}: lineage.seen_groups/unknown_models"
+    rb = rounds.get("blob") if rounds.get("readable") else None
+    tg = rb.get("train_groups") if isinstance(rb, dict) else None
+    if isinstance(tg, list):
+        return ("、".join(map(str, tg)) if tg else
+                "0 个训练组（准入门记录为空列表）",
+                "rounds_dataset.json: train_groups")
+    return (_v5_no_data("没有 lineage 字段，也没有准入门 train_groups",
+                        legacy=not bool(rounds.get("readable"))),
+            f"{fname}: lineage / rounds_dataset.json: train_groups")
+
+
+def _v5_spatial_cell(blob: dict, fname: str, rounds: dict) -> tuple:
+    from beamng_autopilot.experiments.protocol import SPATIAL_BUFFER_M
+    for node, src in ((blob.get("spatial"), f"{fname}: spatial"),
+                      ((rounds.get("blob") or {}).get("spatial")
+                       if rounds.get("readable") else None,
+                       "rounds_dataset.json: spatial")):
+        if not isinstance(node, dict):
+            continue
+        missing = node.get("n_missing_position")
+        if missing is None:
+            continue
+        txt = (f'<span class="mono">{int(missing)}</span> 帧没有位置'
+               + ("（0＝所有帧都有位置，距离判定完整）" if int(missing) == 0
+                  else '<span class="hint">（这些帧无法判空间距离，不是通过）'
+                       "</span>"))
+        if node.get("min_distance_m") is not None:
+            txt += (f' · 最小距离 <span class="mono">'
+                    f'{_esc(node.get("min_distance_m"))} m</span>(缓冲 '
+                    f'{_esc(node.get("buffer_m") or SPATIAL_BUFFER_M)} m)')
+        if node.get("n_pairs_checked") is not None:
+            txt += f' · 已查 {_esc(node.get("n_pairs_checked"))} 对'
+        if node.get("violations"):
+            txt += (f' · <span class="miss">违规 '
+                    f'{len(node.get("violations"))} 条</span>')
+        return txt, src
+    return (_v5_no_data("判定与准入门产物都没有空间隔离计数",
+                        legacy=not bool(rounds.get("readable"))),
+            f"{fname}: spatial / rounds_dataset.json: spatial")
+
+
+def _v5_learning_block(ctx: dict, it: dict) -> str:
+    """面板 3：学习过程（step/epoch、train/dev loss、样本步数、配方、checkpoint）。"""
+    blob = it.get("blob") or {}
+    fname = str(it.get("file") or "decision_*.json")
+    legacy = bool(it.get("legacy_note"))
+    ev = ctx.get("events") or {}
+    last = ev.get("last") if ev.get("readable") else None
+    t13 = ctx.get("t13") or {}
+    root = _run_root(ctx)
+    out = ["<h3>学习过程</h3>"]
+    pairs = []
+    ep, ekey = _v5_pick(blob, "candidate_epochs", "epochs")
+    if ep is None and last is not None:
+        ep, ekey = last.epoch, "events.jsonl: epoch"
+    pairs.append(("step / epoch",
+                  (f'<span class="mono">epoch {_esc(ep)}</span> · step '
+                   f'<span class="mono">{_esc(last.step if last else "未记录")}'
+                   "</span>") + _badge(LEVEL_TRAIN)
+                  if ep is not None else
+                  _v5_no_data("判定文件与事件流都没有 epoch/step 记录",
+                              source=f"{fname}: epochs"),
+                  f"{fname}: {ekey} / events.jsonl: epoch,step"))
+    dyn = ctx.get("dyn") or []
+    if dyn:
+        parts = []
+        for d in dyn[:4]:
+            if d.get("error"):
+                parts.append(f'{d.get("run")}: ' + _v5_no_data(str(d["error"])))
+                continue
+            parts.append(
+                f'{_esc(d.get("run"))}: 实测步数 '
+                f'<span class="mono">{_esc(d.get("n_steps"))}</span>'
+                f'/{_esc(d.get("total_steps") or "?")}'
+                + (f" · lr {_esc(d.get('lr_first'))}→{_esc(d.get('lr_last'))}"
+                   if d.get("lr_first") is not None else "")
+                + (f" · step_s p50 {_esc(d.get('step_s_p50'))}"
+                   if d.get("step_s_p50") is not None else ""))
+        pairs.append(("实际步数（逐 step 指标）", "<br>".join(parts),
+                      "metrics.jsonl: kind=train, total_steps(task)"))
+    else:
+        pairs.append(("实际步数（逐 step 指标）",
+                      _v5_no_data("没有 metrics.jsonl（逐 step 记录）"),
+                      "metrics.jsonl: kind=train"))
+    # train vs dev loss：只取 train_hist.json 里**记录过**的点，末值+epoch
+    series = [se for se in (t13.get("series") or [])
+              if se.metric == "train_loss" or str(se.metric).startswith("val")]
+    if series:
+        shown = []
+        for se in series[:8]:
+            got = [(x, v) for x, v in se.points if v is not None]
+            if not got:
+                shown.append(f'{_esc(se.name)} · {_esc(se.metric)}: '
+                             + _v5_no_data("该序列没有测到的点"))
+                continue
+            x, v = got[-1]
+            shown.append(
+                f'{_esc(se.name)} · {_esc(se.metric)} = '
+                + _v5_num(v, level=se.level,
+                          source=f"{se.source}: {se.metric}[epoch {int(x)}]"))
+        pairs.append(("train vs dev loss（记录末值）", "<br>".join(shown),
+                      "train_hist.json: train_loss / val_*"))
+    else:
+        pairs.append(("train vs dev loss（记录末值）",
+                      _v5_no_data("没有训练历史（train_hist.json）"),
+                      "train_hist.json: train_loss / val_*"))
+    ntf = blob.get("n_train_frames_by_arm")
+    steps = blob.get("steps_by_arm")
+    if isinstance(ntf, dict) or isinstance(steps, dict):
+        parts = []
+        for arm in ("baseline", "candidate"):
+            n_per = (ntf or {}).get(arm) or {}
+            s_per = (steps or {}).get(arm) or {}
+            if not isinstance(n_per, dict) and not isinstance(s_per, dict):
+                continue
+            seeds_ = sorted({*n_per, *s_per}, key=lambda x: str(x))
+            cells = []
+            for sd in seeds_:
+                nv, sv = n_per.get(sd), s_per.get(sd)
+                cells.append(
+                    f"seed {sd}: 样本 "
+                    + (_v5_int(nv) if nv is not None else
+                       _v5_no_data("该 seed 没有 n_train"))
+                    + " · 步数 "
+                    + (_v5_int(sv) if sv is not None else
+                       _v5_no_data("该 seed 没有步数记录")))
+            parts.append(f"{arm}: " + ("；".join(cells) if cells else
+                                       _v5_no_data("没有该臂记录")))
+        pairs.append(("实际样本与步数（两臂）", "<br>".join(parts),
+                      f"{fname}: n_train_frames_by_arm / steps_by_arm"))
+    else:
+        pairs.append(("实际样本与步数（两臂）",
+                      _v5_no_data("判定文件没有 n_train_frames_by_arm / "
+                                  "steps_by_arm", legacy=legacy),
+                      f"{fname}: n_train_frames_by_arm / steps_by_arm"))
+    # 配方激活情况：分"生效/未生效/未采用"三态，命令行列了不等于生效
+    act = []
+    if "factor" in blob:
+        act.append("因子: " + _esc(json.dumps(blob.get("factor"),
+                                              ensure_ascii=False)))
+    flags = blob.get("applied_flags")
+    if isinstance(flags, list):
+        act.append("生效标记: " + (_esc("、".join(map(str, flags)))
+                                 if flags else "无（applied_flags 为空）"))
+    elif flags is not None:
+        act.append("生效标记: " + _esc(str(flags)))
+    if blob.get("skipped_factors") is not None:
+        act.append("未采用: " + _esc(json.dumps(blob.get("skipped_factors"),
+                                                ensure_ascii=False)))
+    if blob.get("data_factor_note") is not None:
+        act.append("下轮输入: " + _esc(json.dumps(
+            blob.get("data_factor_note"), ensure_ascii=False)))
+    pairs.append(("配方激活情况",
+                  "<br>".join(act) if act else
+                  _v5_no_data("判定文件没有 factor/applied_flags",
+                              legacy=legacy,
+                              source=f"{fname}: factor, applied_flags"),
+                  f"{fname}: factor / applied_flags / skipped_factors / "
+                  "data_factor_note"))
+    # checkpoint 变化：只做文件系统证据（不改权重、不重算）
+    ck_txt = []
+    if root is not None:
+        cands = (sorted(root.glob("*/seed*/checkpoint_last.pt"))
+                 + sorted(root.glob("seed*/checkpoint_last.pt"))
+                 + sorted(root.glob("checkpoint_last.pt")))
+        for ck in cands[:8]:
+            try:
+                stt = ck.stat()
+            except OSError as exc:
+                ck_txt.append(f'{_esc(ck.name)}: '
+                              + _v5_no_data(f"stat 失败 {exc}"))
+                continue
+            mtime = time.strftime("%Y-%m-%d %H:%M:%S",
+                                  time.localtime(stt.st_mtime))
+            ck_txt.append(
+                f'<span class="mono">{_esc(str(ck.relative_to(root)))}</span>'
+                f' · {stt.st_size} B · mtime {_esc(mtime)}')
+        if not cands:
+            ck_txt.append(_v5_no_data("运行目录里没有 checkpoint_last.pt"))
+    else:
+        ck_txt.append(_v5_no_data("没有 run 目录，无法列出 checkpoint"))
+    ck_txt.append("评测口径: checkpoint = "
+                  + _esc(str(blob.get("eval_checkpoint") or "未记录"))
+                  + "（判定文件 eval_checkpoint）")
+    pairs.append(("checkpoint 变化", "<br>".join(ck_txt),
+                  f"文件系统: <run>/*/seed*/checkpoint_last.pt / "
+                  f"{fname}: eval_checkpoint"))
+    out.append(_v5_kv_table(pairs))
+    return "".join(out)
+
+
+def _v5_compare_block(ctx: dict, it: dict) -> str:
+    """面板 4：比较结果（同 seed 两臂、micro/macro/最差场景、C/R/M/L/A）。"""
+    from beamng_autopilot.experiments import candidate_metrics as cm
+    blob = it.get("blob") or {}
+    fname = str(it.get("file") or "decision_*.json")
+    legacy = bool(it.get("legacy_note"))
+    out = ["<h3>比较结果</h3>"]
+    # ---- 同 seed 两臂：champ_by_seed/cand_by_seed 直读；否则 pairings ----
+    champ_by = blob.get("champ_by_seed") if isinstance(
+        blob.get("champ_by_seed"), dict) else {}
+    cand_by = blob.get("cand_by_seed") if isinstance(
+        blob.get("cand_by_seed"), dict) else {}
+    shown = False
+    # 形状一：{seed: 标量}（单主指标，road-only 的判定就是这样写的）
+    seeds = sorted(set(champ_by) | set(cand_by), key=lambda x: str(x))
+    if seeds and all(isinstance(champ_by.get(s, cand_by.get(s)), (int, float))
+                     or champ_by.get(s) is None or cand_by.get(s) is None
+                     for s in seeds):
+        metric = str(blob.get("metric") or "主指标")
+        rows = []
+        for s in seeds:
+            bv, cv = champ_by.get(s), cand_by.get(s)
+            delta = (float(cv) - float(bv)
+                     if isinstance(bv, (int, float))
+                     and isinstance(cv, (int, float)) else None)
+            rows.append(
+                f'<tr><td class="mono">seed {_esc(s)}</td>'
+                f'<td>{_v5_num(bv, level=LEVEL_DEV, reason="该 seed 未记录", source=f"{fname}: champ_by_seed.{s}")}</td>'
+                f'<td>{_v5_num(cv, level=LEVEL_DEV, reason="该 seed 未记录", source=f"{fname}: cand_by_seed.{s}")}</td>'
+                f'<td>{_v5_num(delta, level=LEVEL_DEV, reason="缺一侧，无法算差值", source=f"{fname}: cand-champ")}</td></tr>')
+        out.append(f'<h4>同 seed 两臂 · {_esc(metric)}</h4>')
+        out.append('<table><tr><th>seed</th><th>champion</th><th>candidate'
+                   "</th><th>Δ（candidate−champion）</th></tr>"
+                   + "".join(rows) + "</table>")
+        shown = True
+    # 形状二：{seed: {指标: 值}}
+    if not shown:
+        for seed in sorted(champ_by, key=lambda x: str(x)):
+            c = champ_by.get(seed) or {}
+            d = cand_by.get(seed) or {}
+            if not isinstance(c, dict) or not isinstance(d, dict):
+                continue
+            keys = sorted({k for k in (*c, *d)
+                           if isinstance(c.get(k, d.get(k)), (int, float))
+                           or isinstance(d.get(k, c.get(k)), (int, float))})
+            if not keys:
+                continue
+            rows = []
+            for k in keys[:12]:
+                bv, cv = c.get(k), d.get(k)
+                delta = (float(cv) - float(bv)
+                         if isinstance(bv, (int, float))
+                         and isinstance(cv, (int, float)) else None)
+                rows.append(
+                    f'<tr><td class="mono">{_esc(k)}</td>'
+                    f'<td>{_v5_num(bv, level=LEVEL_DEV, reason="该 seed 未记录", source=f"{fname}: champ_by_seed.{seed}.{k}")}</td>'
+                    f'<td>{_v5_num(cv, level=LEVEL_DEV, reason="该 seed 未记录", source=f"{fname}: cand_by_seed.{seed}.{k}")}</td>'
+                    f'<td>{_v5_num(delta, level=LEVEL_DEV, reason="缺一侧无法算差值", source=f"{fname}: cand-champ")}</td></tr>')
+            out.append(f'<h4>同 seed 两臂 · seed {_esc(seed)}</h4>')
+            out.append('<table><tr><th>指标</th><th>champion</th>'
+                       "<th>candidate</th><th>Δ（candidate−champion）</th>"
+                       "</tr>" + "".join(rows) + "</table>")
+            shown = True
+    if not shown:
+        pairs = blob.get("pairings") if isinstance(blob.get("pairings"),
+                                                   dict) else {}
+        if pairs:
+            rows = []
+            for name in sorted(pairs):
+                sp = pairs[name] if isinstance(pairs[name], dict) else {}
+                rows.append(
+                    f'<tr><td>{_esc(name)}</td>'
+                    f'<td class="mono">{_esc(_fmt_list(sp.get("champion")))}</td>'
+                    f'<td class="mono">{_esc(_fmt_list(sp.get("candidate")))}</td>'
+                    f'<td class="mono">{_esc(_fmt_num(sp.get("mean_delta")))}</td>'
+                    f'<td>{_esc(str(sp.get("verdict") or "未测"))}</td></tr>')
+            out.append('<table><tr><th>指标</th><th>champion 每 seed</th>'
+                       "<th>candidate 每 seed</th><th>mean Δ</th><th>verdict"
+                       "</th></tr>" + "".join(rows) + "</table>")
+            out.append('<p class="hint">来源: ' + _esc(fname)
+                       + ": pairings.<metric>.champion/candidate/mean_delta"
+                       "</p>")
+        else:
+            out.append("<p>" + _v5_no_data(
+                "判定文件没有 champ_by_seed/cand_by_seed，也没有 pairings",
+                legacy=legacy, source=f"{fname}: pairings") + "</p>")
+    # ---- C/R/M/L/A 计数（micro 整数总计 + 分母；比率只在有记录时印） ----
+    counts = blob.get("counts")
+    if isinstance(counts, dict) and any(counts.get(k) is not None
+                                        for k in cm.COUNTERS):
+        from beamng_autopilot.experiments.protocol import CANDIDATE_COUNTING
+        meanings = CANDIDATE_COUNTING.get("counters") or {}
+        out.append("<h4>C/R/M/L/A 计数（micro 整数总计，先累加整数再算比率）"
+                   "</h4>")
+        rows = []
+        for k in cm.COUNTERS:
+            v = counts.get(k)
+            meaning = meanings.get(k, "")
+            rows.append(
+                f'<tr><td class="mono">{_esc(k)}</td>'
+                f'<td>{_v5_int(v, reason="该计数未记录", source=f"{fname}: counts.{k}")}</td>'
+                f'<td class="hint">{_esc(meaning)}</td></tr>')
+        out.append('<table><tr><th>计数</th><th>值</th><th>含义</th></tr>'
+                   + "".join(rows) + "</table>")
+        ratios = blob.get("ratios") if isinstance(blob.get("ratios"), dict) \
+            else None
+        if ratios is None:
+            ratios = cm.ratios(counts)   # 计数契约的唯一实现（不是第二套口径）
+            rsrc = f"{fname}: counts（按 candidate_metrics.ratios 口径）"
+        else:
+            rsrc = f"{fname}: ratios"
+        rrows = []
+        for name, (num, den) in cm.RATIO_SPECS.items():
+            n = ratios.get(f"{name}_numerator", counts.get(num))
+            dd = ratios.get(f"{name}_denominator", counts.get(den))
+            v = ratios.get(name)
+            if v is None:
+                cell = _v5_no_data(
+                    str(ratios.get(f"{name}_missing") or
+                        (f"分母 {den}=0：没有可判的样本，不是 0 分")),
+                    source=rsrc)
+            else:
+                cell = _v5_pct(v, numerator=n, denominator=dd,
+                               level=LEVEL_DEV, source=rsrc)
+            rrows.append(f'<tr><td>{_esc(name)}</td><td>{cell}</td>'
+                         f'<td class="hint">{_esc(num)}/{_esc(den)}</td></tr>')
+        out.append('<table><tr><th>比率</th><th>值（分子/分母）</th>'
+                   "<th>定义</th></tr>" + "".join(rrows) + "</table>")
+        out.append('<p class="hint">micro = 场景计数的整数汇总（本轮主口径）；'
+                   "每场景一个单位的 macro 只能与单位一起读"
+                   "（candidate_metrics.micro_macro）。</p>")
+    else:
+        out.append("<p>" + _v5_no_data(
+            "判定文件没有 v5 整数计数 counts（旧协议记录不能按新分母重判，"
+            "也不补 0）", legacy=legacy, source=f"{fname}: counts") + "</p>")
+    # ---- micro/macro：判定字段优先；否则用计数契约的聚合函数 ----
+    micro, macro = blob.get("micro"), blob.get("macro")
+    if isinstance(micro, dict) or isinstance(macro, dict):
+        mm = {"micro": micro or {}, "macro": macro or {}}
+        mm_src = f"{fname}: micro / macro"
+    elif isinstance(blob.get("scene_counts"), dict) and blob.get("scene_counts"):
+        mm = cm.micro_macro(blob["scene_counts"])
+        mm_src = f"{fname}: scene_counts（candidate_metrics.micro_macro）"
+    else:
+        mm = None
+        mm_src = f"{fname}: scene_counts"
+    if mm is None:
+        out.append("<p>" + _v5_no_data("判定文件没有 micro/macro 或 scene_counts",
+                                       legacy=legacy, source=mm_src) + "</p>")
+    else:
+        rows = []
+        for name, (num, den) in cm.RATIO_SPECS.items():
+            mv = (mm.get("micro") or {}).get(name)
+            rows.append(
+                f'<tr><td>micro {_esc(name)}</td>'
+                + "<td>" + (_v5_pct(mv, level=LEVEL_DEV,
+                                    numerator=(mm.get("micro") or {}).get(
+                                        f"{name}_numerator"),
+                                    denominator=(mm.get("micro") or {}).get(
+                                        f"{name}_denominator"),
+                                    reason="micro 分母为 0，无法给比率",
+                                    source=mm_src)
+                           if mv is not None else
+                           _v5_no_data("micro 没有该比率（分母为 0 或未记录）",
+                                       source=mm_src)) + "</td></tr>")
+            ma = (mm.get("macro") or {}).get(name)
+            units = (mm.get("macro") or {}).get(f"{name}_units")
+            rows.append(
+                f'<tr><td>macro {_esc(name)}<span class="hint">（每场景一个'
+                "单位）</span></td>"
+                + "<td>" + (_v5_pct(ma, level=LEVEL_DEV,
+                                    reason="没有可平均的场景",
+                                    source=mm_src)
+                            + (f' <span class="hint">n_units='
+                               f"{_esc(units)}</span>"
+                               if units is not None else "")
+                            if ma is not None else
+                            _v5_no_data("macro 没有该比率（没有任何场景有分母）",
+                                        source=mm_src)) + "</td></tr>")
+        out.append(_v5_rows_table(rows, headers=("聚合", "值")))
+        out.append(f'<p class="hint">{_esc(str(mm.get("macro_note") or ""))}'
+                   f' {_src_note(mm_src)}</p>')
+    # ---- 最差场景：坏场景不能被池化均值藏掉 ----
+    worst = blob.get("worst_scene")
+    if isinstance(worst, dict) and (worst.get("scene") or worst.get("name")):
+        out.append("<h4>最差场景（判定文件记录）</h4>")
+        out.append(f'<p><span class="mono">{_esc(worst.get("scene") or worst.get("name"))}'
+                   f'</span> · ' + _esc(json.dumps(worst, ensure_ascii=False))
+                   + f' {_src_note(f"{fname}: worst_scene")}</p>')
+    else:
+        per_scene = blob.get("per_scene") if isinstance(blob.get("per_scene"),
+                                                       dict) else {}
+        got = [(g, (m or {}).get("line_recall")) for g, m in per_scene.items()
+               if isinstance(m, dict) and m.get("line_recall") is not None]
+        if got:
+            g, v = min(got, key=lambda kv: float(kv[1]))
+            out.append("<h4>最差场景（按已记录的 line_recall 取最小）</h4>")
+            out.append(
+                '<p><span class="mono">' + _esc(str(g)) + "</span> · "
+                + _v5_pct(v, level=LEVEL_DEV,
+                          source=f"{fname}: per_scene.{g}.line_recall")
+                + '<span class="hint">（规则：只在有 line_recall 记录的场景里'
+                  "取最小；未测/不适用场景不参与，也不会被当成 0。若某场景"
+                  "其实未测但旧记录写了 0，那属于旧记录问题，本页不替它改写）"
+                  "</span></p>")
+        else:
+            out.append("<p>" + _v5_no_data(
+                "没有 worst_scene，也没有任何场景记录了 line_recall",
+                legacy=legacy, source=f"{fname}: per_scene") + "</p>")
+    # ---- 逐场景适用性：UNKNOWN 与 not_applicable 必须分开 ----
+    app = blob.get("applicability")
+    if not isinstance(app, dict):
+        app = blob.get("scene_applicability")
+    scene_counts = blob.get("scene_counts") if isinstance(
+        blob.get("scene_counts"), dict) else {}
+    merged = {}
+    if isinstance(app, dict):
+        merged.update(app)
+    for g, c in scene_counts.items():
+        if isinstance(c, dict) and (c.get("applicability") or c.get("status")):
+            merged.setdefault(g, c.get("applicability") or c.get("status"))
+    if merged or scene_counts:
+        out.append("<h4>逐场景适用性（未测与不适用分开显示）</h4>")
+        rows = []
+        for g in sorted(set(merged) | set(scene_counts), key=str):
+            st = merged.get(g)
+            why = ""
+            if isinstance(st, dict):
+                why = str(st.get("why") or st.get("reason") or "")
+                st = st.get("status") or st.get("applicability")
+            st = str(st or "")
+            if not st:
+                cell = _v5_no_data("该场景没有适用性记录（不是实测通过）",
+                                   source=f"{fname}: applicability.{g}")
+            else:
+                label = APPLICABILITY_LABELS.get(st, st)
+                cls = {"measured": "ok", "unknown": "miss",
+                       "not_applicable": "hint",
+                       "unverified_labels": "unknown"}.get(st, "")
+                cell = (f'<span class="{cls}">{_esc(label)}</span>'
+                        + (f'<div class="hint">{_esc(why)}</div>' if why
+                           else ""))
+            cc = scene_counts.get(g) if isinstance(scene_counts.get(g),
+                                                   dict) else {}
+            counts_txt = "、".join(
+                f"{k}={_esc(cc.get(k))}" for k in cm.COUNTERS
+                if cc.get(k) is not None) or _v5_no_data("该场景没有计数")
+            rows.append(f'<tr><td class="mono">{_esc(g)}</td><td>{cell}</td>'
+                        f'<td class="mono">{counts_txt}</td></tr>')
+        out.append('<table><tr><th>场景</th><th>适用性</th>'
+                   "<th>计数（C/R/M/L/A…）</th></tr>" + "".join(rows)
+                   + "</table>")
+        out.append(_src_note(f"{fname}: applicability / scene_counts",
+                             "protocol.APPLICABILITY 定义 未测≠不适用≠通过"))
+    # ---- 逐场景候选口径：判定文件记录值（None -> 未测，不补 0） ----
+    sc = blob.get("scene_candidates")
+    if isinstance(sc, dict) and sc:
+        out.append("<h4>逐场景候选口径（判定文件记录值）</h4>")
+        rows = []
+        for g in sorted(sc, key=str):
+            m = sc[g] if isinstance(sc[g], dict) else {}
+
+            def _cell(key: str) -> str:
+                if m.get(key) is None:
+                    return _v5_no_data(
+                        "该场景该指标未记录（UNKNOWN），不是 0",
+                        source=f"{fname}: scene_candidates.{g}.{key}")
+                return _v5_pct(
+                    m.get(key), level=LEVEL_DEV,
+                    numerator=m.get(f"{key}_numerator"),
+                    denominator=m.get(f"{key}_denominator"),
+                    source=f"{fname}: scene_candidates.{g}.{key}")
+
+            rows.append(
+                f'<tr><td class="mono">{_esc(g)}</td>'
+                f'<td>{_cell("candidate_reference_coverage")}</td>'
+                f'<td>{_cell("candidate_identity_rate")}</td>'
+                f'<td>{_cell("left_right_role_agreement")}</td>'
+                f'<td>{_v5_int(m.get("n_candidates"), reason="该场景没有候选数", source=f"{fname}: scene_candidates.{g}.n_candidates")}</td></tr>')
+        out.append('<table><tr><th>场景</th><th>候选覆盖率 R/C</th>'
+                   "<th>身份率 M/R</th><th>左右角色 A/L</th><th>候选数 C</th>"
+                   "</tr>" + "".join(rows) + "</table>")
+        out.append(_src_note(f"{fname}: scene_candidates.*"))
+    return "".join(out)
+
+
+def _v5_negative_block(ctx: dict, it: dict) -> str:
+    """面板 5：无线诊断（合格/排除帧、严格假线率；诊断，不直接晋级）。"""
+    from beamng_autopilot.experiments.protocol import NEGATIVE_DIAGNOSTIC
+    blob = it.get("blob") or {}
+    fname = str(it.get("file") or "decision_*.json")
+    legacy = bool(it.get("legacy_note"))
+    out = ["<h3>无线诊断</h3>",
+           '<p class="hint">严格假线帧率/像素占比是 <b>诊断，不直接晋级</b>：'
+           + _esc(str(NEGATIVE_DIAGNOSTIC.get("gate") or "no threshold")) +
+           "；与 offroad_false_ratio 的分母不同（"
+           + _esc(str(NEGATIVE_DIAGNOSTIC.get("not_comparable_with") or ""))
+           + "）。</p>"]
+    entries = []
+    nl = blob.get("negative_line")
+    if isinstance(nl, dict):
+        entries.append((f"{fname}: negative_line", nl))
+    ev = ctx.get("eval") or {}
+    for split in sorted(ev.get("splits") or {}):
+        for name, entry in sorted((ev["splits"][split] or {}).items()):
+            n2 = (entry or {}).get("negative_line") if isinstance(entry, dict) \
+                else None
+            if isinstance(n2, dict):
+                entries.append((f"eval matrix: {split}.{name}.negative_line",
+                                n2))
+    if not entries:
+        out.append("<p>" + _v5_no_data(
+            "判定文件没有 negative_line 字段，评估矩阵也没有",
+            legacy=legacy, source=f"{fname}: negative_line") + "</p>")
+        return "".join(out)
+    rows = []
+    for src, n in entries[:8]:
+        status = str(n.get("status") or "")
+        elig = n.get("eligible_frames")
+        excluded = n.get("excluded_frames")
+        # negative_scenes.negative_line_summary 不直接给 excluded_frames：
+        # 被排除帧 = frames - eligible_frames（= 正例 + 含未知像素 + 空帧）。
+        # 缺任一计数就写无数据，**不补 0**（"一个被排除帧都没有"必须是算出来的）。
+        if excluded is None and isinstance(n.get("frames"), (int, float)) \
+                and isinstance(elig, (int, float)):
+            excluded = int(n["frames"]) - int(elig)
+        exc_parts = []
+        for k, label in (("unverified_frames", "档位不可信"),
+                         ("positive_frames", "正例（有线真值）"),
+                         ("unknown_frames", "含未知像素"),
+                         ("empty_frames", "空帧")):
+            if n.get(k) is not None:
+                exc_parts.append(f"{label} {int(n[k])}")
+        rows.append(
+            f'<tr><td class="mono">{_esc(src)}</td>'
+            f'<td>{"实测" if status == "measured" else _esc(status or "未标状态")}</td>'
+            + "<td>" + (_v5_int(elig, reason="没有 eligible_frames",
+                                source=src)
+                        if elig is not None else
+                        _v5_no_data("没有合格帧计数", source=src)) + "</td>"
+            + "<td>" + (
+                (f'<span class="mono">{int(excluded)}</span>'
+                 + (f'<div class="hint">{_esc("、".join(exc_parts))}</div>'
+                    if exc_parts else ""))
+                if excluded is not None else
+                (_v5_no_data("没有排除帧计数", source=src))) + "</td>"
+            + "<td>" + _v5_pct(
+                n.get("false_positive_frame_rate"), numerator=n.get(
+                    "false_positive_frames"), denominator=elig,
+                level=LEVEL_DEV,
+                reason=str(n.get("missing_reason") or
+                           "没有合格负例帧，帧率为 UNKNOWN"),
+                source=src) + "</td>"
+            + "<td>" + _v5_pct(
+                n.get("false_positive_pixel_fraction"),
+                numerator=n.get("false_positive_px"),
+                denominator=n.get("eligible_px"), level=LEVEL_DEV,
+                reason=str(n.get("missing_reason") or
+                           "没有合格负例像素，像素占比为 UNKNOWN"),
+                source=src) + "</td></tr>")
+        if n.get("excluded_reason"):
+            rows.append(f'<tr><td class="hint" colspan="6">'
+                        f'{_esc(str(n.get("excluded_reason")))}</td></tr>')
+    out.append('<table><tr><th>来源</th><th>状态</th><th>合格帧</th>'
+               "<th>被排除帧</th><th>严格假线帧率<br><span style=\""
+               'font-weight:400;font-size:11px;color:#6b7280">'
+               "有 ≥1 假线像素的帧 / 合格帧</span></th>"
+               "<th>假线像素占比<br><span style=\"font-weight:400;"
+               'font-size:11px;color:#6b7280">'
+               "假线像素 / 合格帧总像素</span></th></tr>"
+               + "".join(rows) + "</table>")
+    out.append('<p class="hint">诊断口径来自 protocol.NEGATIVE_DIAGNOSTIC'
+               "（本轮不设阈值；没有独立标定前不得当晋级门）。</p>")
+    return "".join(out)
+
+
+def _v5_error_block(ctx: dict, it: dict) -> str:
+    """面板 6：错误定位（同帧真值/生产/候选叠图、掩码/候选/投影/角色、原帧）。"""
+    blob = it.get("blob") or {}
+    fname = str(it.get("file") or "decision_*.json")
+    legacy = bool(it.get("legacy_note"))
+    out = ["<h3>错误定位</h3>",
+           '<p class="hint">本页**不自己画叠图**：只有判定/评估产物给出帧路径与'
+           "叠图路径时才显示，并能点回原帧（相对本 HTML 真实存在的文件）。"
+           "掩码/候选/投影/角色只渲染记录里有的字段。</p>"]
+    out_dir = Path(str(ctx.get("out_path") or ".")).parent
+    rows = []
+    entries = []
+    worst = blob.get("worst_frames_by_seed")
+    if isinstance(worst, dict):
+        for seed in sorted(worst, key=lambda x: str(x)):
+            for f in (worst.get(seed) or [])[:5]:
+                if isinstance(f, dict):
+                    entries.append((f"seed {seed}",
+                                    f"{fname}: worst_frames_by_seed.{seed}[]",
+                                    f))
+    mc = blob.get("mask_compare")
+    if isinstance(mc, dict):
+        for f in (mc.get("worst") or [])[:5]:
+            if isinstance(f, dict):
+                entries.append(("mask_compare",
+                                f"{fname}: mask_compare.worst[]", f))
+    ev = ctx.get("eval") or {}
+    for split in sorted(ev.get("splits") or {}):
+        for name, entry in sorted((ev["splits"][split] or {}).items()):
+            mc2 = (entry or {}).get("mask_compare") if isinstance(entry, dict) \
+                else None
+            if isinstance(mc2, dict):
+                for f in (mc2.get("worst") or [])[:3]:
+                    if isinstance(f, dict):
+                        entries.append(
+                            (f"eval {split}/{name}",
+                             f"eval matrix: {split}.{name}.mask_compare.worst[]",
+                             f))
+    for scope, src, f in entries[:12]:
+        frame = f.get("frame") or f.get("path")
+        iou = f.get("iou", f.get("road_iou"))
+        iou_cell = _v5_num(iou, unit="", level=LEVEL_DEV, digits=4,
+                           reason="该帧没有 IoU 记录", source=src + ".iou")
+        rows.append(
+            f'<tr><td class="mono">{_esc(scope)}</td>'
+            f'<td>{_v5_frame_ref(frame, out_dir)}</td>'
+            f'<td>{iou_cell}</td>'
+            f'<td>'
+            + _v5_int(f.get("gt_px"), reason="没有真值像素记录",
+                      source=src + ".gt_px") + "</td>"
+            + "<td>" + _v5_field(f, ("mask", "mask_px", "truth_mask"),
+                                 src, "掩码") + "</td>"
+            + "<td>" + _v5_field(f, ("candidate", "candidates", "candidate_n"),
+                                 src, "候选") + "</td>"
+            + "<td>" + _v5_field(f, ("projection", "projected", "match"),
+                                 src, "投影") + "</td>"
+            + "<td>" + _v5_field(f, ("role", "roles", "side"), src, "角色")
+            + "</td></tr>")
+    if rows:
+        out.append('<table><tr><th>范围</th><th>原帧（点击追溯）</th>'
+                   "<th>IoU</th><th>真值像素</th><th>掩码</th><th>候选</th>"
+                   "<th>投影</th><th>角色</th></tr>" + "".join(rows)
+                   + "</table>")
+        if blob.get("overlays"):
+            ol = blob["overlays"] if isinstance(blob["overlays"], dict) else {}
+            items = []
+            for frame, kinds in list(ol.items())[:6]:
+                if not isinstance(kinds, dict):
+                    continue
+                links = []
+                for kind in ("truth", "production", "candidate"):
+                    if kinds.get(kind):
+                        links.append(f"{_esc(kind)}: "
+                                     + _v5_frame_ref(kinds[kind], out_dir))
+                items.append(f'<li><span class="mono">{_esc(frame)}</span>: '
+                             + " · ".join(links) + "</li>")
+            out.append("<h4>同帧真值/生产/候选叠图</h4><ul class=\"reasons\">"
+                       + "".join(items) + "</ul>"
+                       + _src_note(f"{fname}: overlays"))
+        else:
+            out.append("<p>" + _v5_no_data(
+                "判定文件没有 overlays（同帧真值/生产/候选叠图路径）",
+                legacy=legacy, source=f"{fname}: overlays") + "</p>")
+    else:
+        out.append("<p>" + _v5_no_data(
+            "判定/评估产物都没有 worst_frames_by_seed 或 mask_compare 记录",
+            legacy=legacy,
+            source=f"{fname}: worst_frames_by_seed / mask_compare") + "</p>")
+    # 运行目录里的复核图（文件系统证据，不伪造）
+    root = _run_root(ctx)
+    if root is not None:
+        shots = sorted(root.glob("review_overlays/*.png"))[:6]
+        if shots:
+            out.append('<p class="hint">运行目录复核图: '
+                       + "、".join(_v5_frame_ref(p, out_dir) for p in shots)
+                       + f' {_src_note("文件系统: review_overlays/*.png")}</p>')
+    return "".join(out)
+
+
+def _v5_field(node: dict, keys: tuple, src: str, label: str) -> str:
+    """错误定位行里的可选字段：记录里有才渲染，没有就写无数据（不编）。"""
+    for k in keys:
+        if k in node and node.get(k) is not None:
+            return (f'<span class="mono">{_esc(node.get(k))}</span>'
+                    + _src_note(f"{src}.{k}"))
+    return _v5_no_data(f"记录里没有{label}字段")
+
+
+def _v5_resources_block(ctx: dict, it: dict) -> str:
+    """面板 7：资源与判定（GPU/CPU/内存/磁盘、阶段耗时、暂停原因、硬门/研究）。"""
+    blob = it.get("blob") or {}
+    fname = str(it.get("file") or "decision_*.json")
+    # 计时重复/计时可信度是 v5 之后才落盘的字段：旧判定写"旧协议未记录"。
+    legacy = bool(it.get("legacy_note"))
+    ev = ctx.get("events") or {}
+    out = ["<h3>资源与判定</h3>"]
+    pairs = []
+    res = blob.get("resources") if isinstance(blob.get("resources"), dict) \
+        else None
+    if res:
+        txt = " · ".join(
+            f'{_esc(k)}: <span class="mono">{_esc(v)}</span>'
+            for k, v in sorted(res.items()) if v is not None)
+        pairs.append(("GPU/CPU/内存/磁盘", txt or _v5_no_data("resources 为空"),
+                      f"{fname}: resources"))
+    else:
+        found = []
+        for e in (ev.get("events") or []):
+            for name, rec in (e.metrics or {}).items():
+                if any(k in str(name) for k in ("gpu", "vram", "mem", "disk",
+                                                "cpu")):
+                    found.append((f"epoch {e.epoch} · {name}",
+                                  _metric_evidence(rec, str(name),
+                                                   LEVEL_TRAIN)))
+        if found:
+            pairs.append(("GPU/CPU/内存/磁盘（事件流指标）",
+                          "<br>".join(f"{_esc(a)}: {b.cell()}"
+                                      for a, b in found[:12]),
+                          "events.jsonl: metrics.*"))
+        else:
+            pairs.append(("GPU/CPU/内存/磁盘",
+                          _v5_no_data("判定文件没有 resources，事件流也没有"
+                                      "资源指标"),
+                          f"{fname}: resources / events.jsonl: metrics"))
+    # 阶段耗时
+    sd = blob.get("stage_durations")
+    if isinstance(sd, dict) and sd:
+        txt = " · ".join(f'{_esc(k)}: <span class="mono">{_esc(v)}</span> s'
+                         for k, v in sorted(sd.items()))
+        pairs.append(("阶段耗时", txt, f"{fname}: stage_durations"))
+    else:
+        # 训练步骤轴与硬件时间轴分开：这里只给事件流各阶段的墙钟跨度
+        by_phase = {}
+        for e in (ev.get("events") or []):
+            t = _ts_epoch(e.ts)
+            if t is None:
+                continue
+            slot = by_phase.setdefault(e.phase, [t, t])
+            slot[0], slot[1] = min(slot[0], t), max(slot[1], t)
+        if by_phase:
+            txt = " · ".join(
+                f'{_esc(k)}: <span class="mono">{max(0.0, v[1] - v[0]):.1f}'
+                "</span> s" for k, v in sorted(by_phase.items()))
+            pairs.append(("阶段耗时（事件 ts 跨度，派生）", txt,
+                          "events.jsonl: ts 各阶段 min→max"))
+        else:
+            pairs.append(("阶段耗时",
+                          _v5_no_data("判定文件没有 stage_durations，"
+                                      "事件流也没有可解析 ts"),
+                          f"{fname}: stage_durations"))
+    # 计时重复与可信度（方案 §S4 资源与判定）：重复测量两次是"这个 p95 值不值
+    # 得引用"的证据；timing_suspect 非空时本轮 p95 已被记 UNKNOWN，页面必须跟着
+    # 说"不可引用"，不能只显示一个漂亮的毫秒数。
+    reps = blob.get("timing_repeats")
+    if isinstance(reps, list) and reps:
+        parts = []
+        for r in reps[:8]:
+            if not isinstance(r, dict):
+                continue
+            parts.append(
+                f'seed {_esc(r.get("seed"))}: p50 '
+                f'{_esc(_fmt_list(r.get("p50")))} · p95 '
+                f'{_esc(_fmt_list(r.get("p95")))}'
+                + (f' · 采用 <span class="mono">{_esc(r.get("used"))}</span> ms'
+                   if r.get("used") is not None else
+                   ' · ' + _v5_no_data("该 seed 没有采用值")))
+        pairs.append(("计时重复（p50/p95 各测两次）", "<br>".join(parts),
+                      f"{fname}: timing_repeats"))
+    else:
+        pairs.append(("计时重复（p50/p95 各测两次）",
+                      _v5_no_data("判定文件没有 timing_repeats"
+                                  "（不确定的计时不能当结论）", legacy=legacy,
+                                  source=f"{fname}: timing_repeats"),
+                      f"{fname}: timing_repeats"))
+    suspect = blob.get("timing_suspect")
+    if isinstance(suspect, list) and suspect:
+        pairs.append((
+            "计时可信度",
+            '<span class="miss">本轮计时不可引用：inference_ms_p95 已记 '
+            f'UNKNOWN（{len(suspect)} 条原因）</span><br>'
+            + "<br>".join(_esc(x) for x in suspect[:6]),
+            f"{fname}: timing_suspect"))
+    elif isinstance(suspect, list):
+        pairs.append(("计时可信度",
+                      '<span class="ok">timing_suspect 为空：'
+                      "计时前提满足（没有游戏在跑）</span>",
+                      f"{fname}: timing_suspect"))
+    else:
+        pairs.append(("计时可信度",
+                      _v5_no_data("判定文件没有 timing_suspect 字段",
+                                  legacy=legacy, source=f"{fname}: timing_suspect"),
+                      f"{fname}: timing_suspect"))
+    # 暂停/失败原因
+    stop = []
+    if ev.get("readable"):
+        for e in (ev.get("events") or []):
+            if e.phase in ("paused", "failed") or e.status in ("failed",
+                                                               "paused"):
+                stop.append(f'{_esc(e.ts)} {_esc(e.phase)}/{_esc(e.status)}: '
+                            f'{_esc(e.note or "未写原因")}')
+    elif blob.get("pause_reasons") or blob.get("failure_reasons"):
+        stop.append(_esc(json.dumps(
+            blob.get("pause_reasons") or blob.get("failure_reasons"),
+            ensure_ascii=False)))
+    if stop:
+        pairs.append(("暂停/失败原因", "<br>".join(stop),
+                      "events.jsonl: phase/status/note"))
+    elif ev.get("readable"):
+        pairs.append(("暂停/失败原因",
+                      '<span class="ok">事件流里没有 paused/failed 事件'
+                      "（这是查过的 0）</span>",
+                      "events.jsonl: phase/status"))
+    else:
+        pairs.append(("暂停/失败原因",
+                      _v5_no_data("没有事件流，暂停/失败原因未记录"),
+                      "events.jsonl: phase/status/note"))
+    out.append(_v5_kv_table(pairs))
+    # 硬门 vs 研究结论：两条通道分开显示
+    out.append("<h4>硬门（晋级门，缺测不算通过）</h4>")
+    hg = blob.get("hard_gate") if isinstance(blob.get("hard_gate"), dict) \
+        else {}
+    viol = blob.get("hard_gate_violations") or []
+    hrows = []
+    for k in sorted(hg):
+        v = hg.get(k)
+        if v is None:
+            cell = _v5_no_data("硬门输入未测（UNKNOWN），既不算通过也不算违反",
+                               source=f"{fname}: hard_gate.{k}")
+        elif isinstance(v, (int, float)) and not isinstance(v, bool):
+            cell = _v5_num(v, unit=("ms" if "ms" in str(k) else "ratio"),
+                           level=LEVEL_DEV, reason="硬门输入未测（UNKNOWN）",
+                           source=f"{fname}: hard_gate.{k}")
+        else:
+            # note 这类说明文字原样显示（不是指标，不能当数）
+            cell = (f'<span class="mono">{_esc(v)}</span>'
+                    + _src_note(f"{fname}: hard_gate.{k}"))
+        hrows.append(f'<tr><td class="mono">{_esc(k)}</td><td>{cell}</td></tr>')
+    for v in viol:
+        hrows.append('<tr><td class="miss">违反</td><td class="miss">'
+                     f'{_esc(v)}</td></tr>')
+    miss = [m for m in (blob.get("missing_metrics") or [])
+            if "UNKNOWN" in str(m)]
+    for m in miss:
+        hrows.append(f'<tr><td class="unknown">缺测</td>'
+                     f'<td class="unknown">{_esc(m)}</td></tr>')
+    if hrows:
+        out.append('<table><tr><th>硬门项</th><th>值 / 结论</th></tr>'
+                   + "".join(hrows) + "</table>")
+    else:
+        out.append("<p>" + _v5_no_data("判定文件没有 hard_gate 记录") + "</p>")
+    # 逐 seed 硬门输入：坏 seed 不能被跨 seed 均值藏掉（方案 §10.2）
+    hbs = blob.get("hard_by_seed")
+    if isinstance(hbs, dict) and hbs:
+        from beamng_autopilot.experiments.protocol import METRIC_DEFINITIONS
+        keys = sorted({k for sd in hbs.values() if isinstance(sd, dict)
+                       for k in sd})
+        rows = []
+        for sd in sorted(hbs, key=str):
+            entry = hbs[sd] if isinstance(hbs[sd], dict) else {}
+            cells = []
+            for k in keys[:8]:
+                unit = str((METRIC_DEFINITIONS.get(k) or {}).get("unit") or "")
+                if entry.get(k) is None:
+                    cells.append("<td>" + _v5_no_data(
+                        "该 seed 未测（不是 0）",
+                        source=f"{fname}: hard_by_seed.{sd}.{k}") + "</td>")
+                elif unit == "ratio":
+                    cells.append("<td>" + _v5_pct(
+                        entry.get(k), level=LEVEL_DEV,
+                        source=f"{fname}: hard_by_seed.{sd}.{k}") + "</td>")
+                else:
+                    cells.append("<td>" + _v5_num(
+                        entry.get(k), unit=("ms" if unit == "ms" else ""),
+                        level=LEVEL_DEV,
+                        source=f"{fname}: hard_by_seed.{sd}.{k}") + "</td>")
+            rows.append(f'<tr><td class="mono">seed {_esc(sd)}</td>'
+                        + "".join(cells) + "</tr>")
+        out.append('<h5>逐 seed 硬门输入（每个 seed 自己过门）</h5>'
+                   '<table><tr><th>seed</th>'
+                   + "".join(f"<th>{_esc(k)}</th>" for k in keys[:8])
+                   + "</tr>" + "".join(rows) + "</table>")
+        out.append(_src_note(f"{fname}: hard_by_seed.<seed>.<metric>"))
+    out.append("<h4>研究结论（不直接晋级）</h4>")
+    dec = blob.get("decision") if isinstance(blob.get("decision"), dict) else {}
+    rrows = []
+    rrows.append(f'<tr><td>判定</td><td><span class="pill '
+                 f'{_esc(str(dec.get("decision") or ""))}">'
+                 f'{_esc(str(dec.get("decision") or "未写"))}</span></td></tr>')
+    for r in (dec.get("reasons") or []):
+        rrows.append(f'<tr><td>理由</td><td>{_esc(r)}</td></tr>')
+    if blob.get("research_only") is not None:
+        rrows.append(f'<tr><td>research_only</td><td>'
+                     f'{_esc(str(blob.get("research_only")))}</td></tr>')
+    if blob.get("r2_confirmed") is not None:
+        rrows.append(f'<tr><td>最终集 R2 确认</td><td>'
+                     f'{_esc(str(blob.get("r2_confirmed")))}'
+                     '<span class="hint">（研究结论不等于 R2 已确认）</span>'
+                     "</td></tr>")
+    out.append('<table><tr><th>项</th><th>内容</th></tr>' + "".join(rrows)
+               + "</table>")
+    out.append(_src_note(f"{fname}: hard_gate, hard_gate_violations, "
+                         "missing_metrics, decision, research_only, "
+                         "r2_confirmed"))
+    return "".join(out)
+
+
+def _v5_view(ctx: dict) -> str:
+    """方案 v2 §S4 / T16：七个面板（只读判定 JSON 与既有产物）。
+
+    纪律：不重算指标、不另建驾驶控制协议；每个值都标来源字段；缺字段写
+    「无数据」，v5 计数契约之前的旧判定写「旧协议未记录」，绝不补 0；
+    坏 seed/坏场景、UNKNOWN 与 not_applicable 都必须看得见。
+    """
+    out = ['<section id="v5"><h2>方案 v2 判定看板（T16 七面板）</h2>',
+           '<p class="hint">七个面板直读判定与既有只读产物（decision_*.json、'
+           "评估矩阵、准入门产物、事件流、checkpoint 元数据）：本页不重算指标、"
+           "不另建驾驶控制协议。缺字段写「无数据」，v5 计数契约之前的记录写"
+           "「旧协议未记录」，不补 0。</p>"]
+    st = ctx.get("decisions") or {}
+    items = [i for i in (st.get("items") or []) if not i.get("error")]
+    if not st.get("readable") or not items:
+        reason = st.get("error") or "没有 decision_*.json"
+        out.append("<p>" + _v5_no_data(f"判定文件不可读：{reason}") + "</p>")
+        for panel in V5_PANELS:
+            out.append(f'<h3>{_esc(panel)}</h3><p>'
+                       + _v5_no_data("没有判定文件，本面板不展示任何数字")
+                       + "</p>")
+        out.append("</section>")
+        return "".join(out)
+    rounds = _v5_rounds_dataset(ctx)
+    for it in items:
+        out.append('<p class="mono">判定文件: '
+                   f'<b>{_esc(str(it.get("file") or ""))}</b> · 候选 '
+                   f'{_esc(str(it.get("candidate_id") or "未写"))}'
+                   + (f' · <span class="miss">{LEGACY_RECORD}</span>'
+                      '<span class="hint">：本文件没有 v5 整数计数，'
+                      "新口径字段无法重判</span>" if it.get("legacy_note")
+                      else "")
+                   + "</p>")
+        if rounds.get("readable"):
+            out.append(f'<p class="hint">数据准入门产物: '
+                       f'{_esc(str(rounds.get("path")))}</p>')
+        out.append(_v5_identity_block(ctx, it))
+        out.append(_v5_data_block(ctx, it, rounds))
+        out.append(_v5_learning_block(ctx, it))
+        out.append(_v5_compare_block(ctx, it))
+        out.append(_v5_negative_block(ctx, it))
+        out.append(_v5_error_block(ctx, it))
+        out.append(_v5_resources_block(ctx, it))
+    out.append("</section>")
     return "".join(out)
 
 
@@ -2149,8 +3956,9 @@ def _cards_view(ctx: dict) -> str:
             f'<div class="hint">missing data：{_esc(str(t13.get("error") or "无"))}'
             "。缺训练历史时不画任何数。</div>"))
     # 表类卡片：复用既有分区的表格（它们本身就是 table 结构）
-    for sec in (_decisions_view(ctx), _dl_params_view(ctx), _data_view(ctx),
-                _resources_view(ctx), _final_view(ctx), _paths_view(ctx)):
+    for sec in (_decisions_view(ctx), _v5_view(ctx), _dl_params_view(ctx),
+                _data_view(ctx), _resources_view(ctx), _final_view(ctx),
+                _paths_view(ctx)):
         cards.append(_card_wide_from_section(sec))
     return "<main>" + "".join(cards) + "</main>"
 
@@ -3486,6 +5294,7 @@ def build_context(args: argparse.Namespace) -> dict:
         "tasks": _task_state(
             Path(args.tasks) if getattr(args, "tasks", None) else None),
         "guard": _guard_state(run_dir),
+        "timeline": _timeline_state(run_dir),
     }
     return ctx
 
@@ -3503,6 +5312,8 @@ def render_html(ctx: dict) -> str:
         _tasks_view(ctx),
         _compare_view(ctx),
         _decisions_view(ctx),
+        _v5_view(ctx),
+        _timeline_view(ctx),
         _final_view(ctx),
         _data_view(ctx),
         _resources_view(ctx),

@@ -15,23 +15,53 @@ file in hand.  Identity is *carried* from the recording, never invented: a
 missing field stays empty and is listed in ``identity_missing`` so the
 audit rejects the frame instead of silently trusting it.
 
-Tools:
-    pen (left-drag)         paint with the active class
-    bucket (right-click/f)  flood-fill the connected same-label region
-                            with the active class - draw a closed
-                            outline, then click inside it
-Controls:
-    1 / 2 / 3   class = line / road / background(erase)
-    b           toggle pen / bucket
-    f           switch directly to bucket
-    p           switch directly to pen
-    u           undo (last stroke / fill / clear)
-    c           clear the whole label
-    trackbar    brush size 1-40
-    z           zoom 2x / 1x
+Tools, all of them clickable in the toolbar at the top of the window:
+    pen         left-drag to paint with the active brush
+    bucket      click a region to flood-fill it with the active brush
+                (draw a closed outline, then click inside it)
+    straight    drag A->B, or click A then B: a straight line, every painted
+                pixel within the brush radius of the ideal segment
+    curve       drag = freehand, resampled + de-jittered + Catmull-Rom, so
+                the stroke comes out smooth; or click control points and
+                press ENTER - the curve passes through every clicked point
+    undo        pops the last control point while a curve is being drawn,
+                otherwise the last stroke / fill / clear
+    clear / zoom / prev / save+next   the other one-click actions
+
+Brushes (toolbar buttons too):
+    line / road / erase          the pixel classes (0/1/2 in the label)
+    asphalt / gravel / shoulder  the ROAD TYPE, in its own group, recorded in a
+        separate ``road_type`` array (1/2/3) because the label contract
+        (0/1/2/255) cannot express a material.  The pixel class follows
+        AGENTS.md's driving constraints rather than "painted means road":
+        asphalt and a genuine gravel route are road(1); **shoulder is
+        background(0)** - with pavement present the soil shoulder must not
+        count as road - and it is tinted in the display so a shoulder stroke
+        is never invisible.
+    occluded / blurred / undecidable  write 255(IGNORE) plus the reason in
+        the ``unknown_kind`` array
+
+The interface is in Chinese (PIL renders Microsoft YaHei); with no CJK font
+installed it falls back to the English button names - the letters change, the
+functions do not.
+
+Controls (keyboard kept from the old flow; the buttons show their keys):
+    1 / 2 / 3   brush = line / road / background(erase)
+    7 / 8 / 9   brush = asphalt / gravel / shoulder (road type)
+    4 / 5 / 6   brush = occluded / blurred / undecidable
+    p / f / b   pen / bucket / toggle between them
+    l / v       straight line / smooth curve
+    u           undo (draft-aware)      c clear      z zoom 2x / 1x
     a / Left    previous frame (back)
-    s           save + next frame
-    q           quit
+    s           save + next frame       q quit
+    ENTER       finish the curve being drawn
+    ESC         abandon the draft (draft never touches the label)
+    trackbar    brush size 1-40
+
+Interaction lives in ``beamng_autopilot.labeling.annotate_session`` and the
+toolbar/geometry in ``beamng_autopilot.labeling.annotate_tools`` (both are
+unit-tested without a GUI); this script keeps the CLI, frame loading, the
+identity recording and the export contract.
 
     .venv\\Scripts\\python.exe scripts\\m5_annotate_manual.py \\
         --frames-dir logs/m5_seg/manual_capture
@@ -56,6 +86,12 @@ import numpy as np
 
 from beamng_autopilot import config
 from beamng_autopilot.labeling import curve_schema as cs
+from beamng_autopilot.labeling.annotate_session import AnnotateSession
+# 左右侧统计与路型计数都只有一份实现：状态行、导出核查、审计共用同一个口径
+# （两个实现迟早会出现"HUD 说有 R=0、导出说右侧漏标"这种自相矛盾）。
+from beamng_autopilot.labeling.annotate_tools import (
+    road_type_counts, side_line_counts,
+)
 
 # The pixel classes live in the schema (T10), so the annotator and every
 # metric agree on what 0/1/2/255 mean: 255 is IGNORE, never background.
@@ -76,16 +112,6 @@ BRUSH_NAME = {**CLASS_NAME, **UNKNOWN_KINDS}
 def unknown_kind_for_key(ch: str) -> int | None:
     """键盘 4/5/6 → 遮挡/模糊/无法判断（其它键返回 None）。"""
     return UNKNOWN_KEY_TO_KIND.get(str(ch))
-
-
-def side_line_counts(label, centre_col: int | None = None) -> dict:
-    """按图像左右半分列 line 像素数（左右两侧都标了没有，一眼可查）。"""
-    arr = np.asarray(label)
-    h, w = arr.shape[:2]
-    c = int(w // 2) if centre_col is None else int(centre_col)
-    left = int((arr[:, :c] == CLS_LINE).sum())
-    right = int((arr[:, c:] == CLS_LINE).sum())
-    return {"left": left, "right": right, "centre_col": c}
 
 
 def side_coverage_note(human_label, engine_label) -> dict:
@@ -332,17 +358,35 @@ def identity_npz_extras(ident: dict) -> dict:
 
 
 def export_frame(path: Path, rgb: np.ndarray, label: np.ndarray,
-                 ident: dict, unknown_kind=None) -> None:
+                 ident: dict, unknown_kind=None, road_type=None) -> None:
     """Save one labelled frame *with* its identity.
 
     ``unknown_kind``（可选）逐像素记录"为什么这里是 255"：1=遮挡 2=模糊
-    3=无法判断。只有非零时才写，保持既有消费者不变。
+    3=无法判断。``road_type``（可选）逐像素记录路面材质：1=沥青 2=碎石
+    3=路肩——方案要求"两种道路类型分别标记，不能混成 road 一类就结束"，而
+    label 的 0/1/2/255 契约表达不了材质，所以另存一列。两者都**只在非零时
+    才写**，既有消费者不变。
     """
     extras = {}
     if unknown_kind is not None and int(np.asarray(unknown_kind).sum()) > 0:
         extras["unknown_kind"] = np.asarray(unknown_kind, dtype=np.uint8)
+    if road_type is not None and int(np.asarray(road_type).sum()) > 0:
+        extras["road_type"] = np.asarray(road_type, dtype=np.uint8)
     np.savez_compressed(str(path), colour=rgb, label=label,
                         **identity_npz_extras(ident), **extras)
+
+
+def _sidecar_seed_from_inputs(frames_dir: Path, out_dir: Path) -> tuple[dict, str]:
+    """种子优先级：**输入目录的 meta** > 输出目录树。
+
+    输入目录的 meta 是采集/打包时写的完整 meta（含 `cameras` 内外参、width/height/
+    classes/palette_source）。只在输出目录找会丢掉这些键，而身份探针的投影依赖
+    `cameras`——丢了就测不出候选身份/覆盖率（实测踩到）。
+    """
+    m, tag = _read_dir_meta(Path(frames_dir))
+    if m:
+        return m, f"input:{tag}"
+    return _sidecar_seed(out_dir)
 
 
 def _sidecar_seed(out_dir: Path) -> tuple[dict, str]:
@@ -364,7 +408,17 @@ def _sidecar_seed(out_dir: Path) -> tuple[dict, str]:
     return {}, "unavailable"
 
 
+def _default_reviewer() -> str:
+    """复核人缺省值：当前系统用户名（拿不到就写空，不编名字）。"""
+    try:
+        import getpass
+        return getpass.getuser()
+    except Exception:                                      # noqa: BLE001
+        return ""
+
+
 def write_sidecar(out_dir: Path, records: list, *, identity: dict,
+                  annotation_reviewer: str = "",
                   seed: tuple | None = None) -> Path:
     """Write/merge ``<out_dir>/meta.json``: run identity + per-frame identity.
 
@@ -390,6 +444,7 @@ def write_sidecar(out_dir: Path, records: list, *, identity: dict,
     side["label_source"] = "human_revision"
     side["annotation"] = {
         "tool": "m5_annotate_manual.py",
+        "reviewer": str(annotation_reviewer or ""),
         "annotated_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         "identity_source": identity.get("identity_source", "unavailable"),
         "identity_missing": list(identity.get("identity_missing") or []),
@@ -480,6 +535,9 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--grab", type=int, default=0,
                     help="capture N fresh frames from the live game first")
     ap.add_argument("--out", type=str, default=None)
+    ap.add_argument("--reviewer", type=str, default=None,
+                    help="复核人标识（缺省取 BEAMNG_REVIEWER，其次当前用户）："
+                         "验收要能查'这帧是谁复核的'")
     ap.add_argument("--prefill-model", type=str, default=None,
                     help="用分割模型预填 road/line，人工只需修正误检/漏检")
     ap.add_argument("--review-incomplete", action="store_true",
@@ -545,6 +603,9 @@ def main() -> int:
             print("[annotate] no incomplete frames found")
             return 0
 
+    reviewer = (args.reviewer or os.environ.get("BEAMNG_REVIEWER")
+                or _default_reviewer())
+    print(f"[annotate] 复核人 -> {reviewer}（写进 meta.json 的 annotation.reviewer）")
     prefill = None
     if args.prefill_model:
         try:
@@ -558,7 +619,7 @@ def main() -> int:
     out_dir = (Path(args.out) if args.out
                else config.LOGS_DIR / "m5_seg" / f"manual_{stamp}")
     out_dir.mkdir(parents=True, exist_ok=True)
-    sidecar_seed = _sidecar_seed(out_dir)
+    sidecar_seed = _sidecar_seed_from_inputs(args.frames_dir, out_dir)
     print(f"[annotate] {len(frames)} frames | output -> {out_dir}")
     _ident_txt = (f"{run_identity.get('map_name') or 'UNKNOWN'}/"
                   f"{run_identity.get('source_id') or 'UNKNOWN'}")
@@ -573,74 +634,53 @@ def main() -> int:
               f"{run_identity.get('identity_source')} "
               f"(meta: {run_identity.get('meta_source', meta_source)})")
 
-    cls = CLS_LINE
-    unknown_kind = 0                 # 0=普通画笔；1/2/3=遮挡/模糊/无法判断
-    tool = "pen"                     # pen | bucket
-    zoom = 2
-    fi = 0
+    # 工具 / 类别 / 撤回栈现在由 AnnotateSession 持有；脚本这边只留导出需要的
+    # 帧号计数与逐帧记录。
     save_i = [0]
-    undo_stack: list = []
     saved_records: list = []
 
     def _initial_label(frame, source_idx=None):
+        """这一帧的起始 ``(label, unknown_kind)``：续标优先，其次 prefill。
+
+        与 label 同形的 unknown_kind 数组跟 label 一起进会话缓存/撤销；续标
+        时从零开始（来源 npz 里的旧原因不重放，避免上一轮的标记粘住）。
+        """
+        blank = np.zeros(frame.shape[:2], dtype=np.uint8)
         if source_idx in resume_labels:
             cached = resume_labels[source_idx]
             if cached.shape == frame.shape[:2]:
-                return cached.copy()
+                return cached.copy(), blank.copy()
         if prefill is None:
-            return np.zeros(frame.shape[:2], dtype=np.uint8)
+            return blank.copy(), blank.copy()
         try:
             road, line = prefill.predict(frame)
             lab = np.zeros(frame.shape[:2], dtype=np.uint8)
             lab[np.asarray(road, dtype=bool)] = CLS_ROAD
             lab[np.asarray(line, dtype=bool)] = CLS_LINE
-            return lab
+            return lab, blank.copy()
         except Exception as exc:
             print(f"[annotate] prefill frame failed: {exc}")
-            return np.zeros(frame.shape[:2], dtype=np.uint8)
+            return blank.copy(), blank.copy()
 
-    rgb, fidx = frames[0]
-    label = _initial_label(rgb, fidx)
-    # 与 label 同形的"为什么这里是 255"数组（1/2/3），随 label 一起缓存/撤销
-    unk = np.zeros(label.shape, dtype=np.uint8)
-    # Keep the current label in memory by SOURCE frame.  Going back must
-    # restore the work (including unsaved fixes), and saving a revisited
-    # frame must overwrite its existing output instead of creating a
-    # duplicate training sample.
-    label_cache: dict[int, tuple] = {0: (label.copy(), unk.copy())}
+    # 会话（工具选择 / 笔画几何 / 撤回 / 画布）在库里，脚本只留 CLI、身份与
+    # 导出：下面两个回调告诉它"这一帧从什么 label 开始""保存一帧要写什么"。
+    # 逐帧缓存与复标覆盖由会话负责（回上一帧不能丢未保存的修改，复标帧要覆盖
+    # 它自己的输出而不是多出一份训练样本）。
     saved_paths: dict[int, tuple[Path, Path]] = {
         fi0: resume_paths_by_source[src_idx]
         for fi0, (_rgb0, src_idx) in enumerate(frames)
         if src_idx in resume_paths_by_source}
-    painting = False
-    last_pt = None
 
-    def _cache_current() -> None:
-        label_cache[fi] = (label.copy(), unk.copy())
-
-    def _load_frame(target: int) -> None:
-        nonlocal fi, rgb, fidx, label, unk
-        _cache_current()
-        fi = int(target)
-        rgb, fidx = frames[fi]
-        cached = label_cache.get(fi)
-        if cached is not None:
-            label, unk = cached[0].copy(), cached[1].copy()
-        else:
-            label = _initial_label(rgb, fidx)
-            unk = np.zeros(label.shape, dtype=np.uint8)
-        undo_stack.clear()
-
-    def _save_current() -> None:
-        _cache_current()
+    def _on_save(fi, rgb, src_idx, label, unk, road_type, ident):
+        """保存一帧：导出 npz + 预览图 + 逐帧记录（复标帧覆盖自己的输出）。"""
         if fi not in saved_paths:
             save_i[0] += 1
             saved_paths[fi] = (
                 out_dir / f"frame_{save_i[0]:05d}.npz",
                 out_dir / f"preview_{save_i[0]:05d}.png")
         fp, prev = saved_paths[fi]
-        ident = idents[fi] if fi < len(idents) else {}
-        export_frame(fp, rgb, label, ident, unknown_kind=unk)
+        export_frame(fp, rgb, label, ident, unknown_kind=unk,
+                     road_type=road_type)
         engine = (engine_labels[fi]
                   if fi < len(engine_labels) and engine_labels[fi] is not None
                   else None)
@@ -659,7 +699,17 @@ def main() -> int:
             "identity_source": ident.get("identity_source", "unavailable"),
             "identity_missing": list(ident.get("identity_missing") or []),
             "unknown_px": unknown_counts(unk),
+            # 路型逐帧计数：方案要求"两种道路类型分别标记"，所以这里能查
+            # "这一帧标了多少沥青/碎石/路肩像素"，而不是只有 road 一个数
+            "road_type_px": road_type_counts(road_type),
             "side_coverage": cov,
+            # 验收要查"对**哪些类别**做了复核"：直接记这一帧各类别的像素数
+            "classes_painted": {
+                "line": int((np.asarray(label) == CLS_LINE).sum()),
+                "road": int((np.asarray(label) == CLS_ROAD).sum()),
+                "background": int((np.asarray(label) == 0).sum()),
+                "unknown": int((np.asarray(label) == 255).sum()),
+            },
             "saved_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
         })
         ov = rgb.copy()
@@ -668,146 +718,36 @@ def main() -> int:
                                  ).astype(np.uint8)
         ov[label == CLS_LINE] = (0, 255, 0)
         cv2.imwrite(str(prev), cv2.cvtColor(ov, cv2.COLOR_RGB2BGR))
-        print(f"[saved] {fp.name} (src#{fidx}, ident="
+        print(f"[saved] {fp.name} (src#{src_idx}, ident="
               f"{ident.get('map_name') or 'UNKNOWN'}/"
               f"{ident.get('source_id') or 'UNKNOWN'})")
-
-    def _push_undo():
-        undo_stack.append((label.copy(), unk.copy()))
-        if len(undo_stack) > 25:
-            undo_stack.pop(0)
-
-    def _render():
-        ov = rgb.copy()
-        m_road = label == CLS_ROAD
-        m_line = label == CLS_LINE
-        ov[m_road] = (ov[m_road] * 0.6
-                      + np.array([255, 120, 0]) * 0.4).astype(np.uint8)
-        ov[m_line] = (0, 255, 0)
-        if unk.any():                     # 遮挡/模糊/无法判断：洋红
-            ov[unk > 0] = (255, 0, 255)
-        big = cv2.resize(ov, (ov.shape[1] * zoom, ov.shape[0] * zoom),
-                         interpolation=cv2.INTER_NEAREST)
-        _brush = UNKNOWN_KINDS.get(int(unknown_kind)) or CLASS_NAME[cls]
-        _sides = side_line_counts(label)
-        tool_txt = (f"tool={tool} class={_brush} undo={len(undo_stack)} "
-                    f"L={_sides['left']} R={_sides['right']}")
-        idn = idents[fi] if fi < len(idents) else {}
-        ident_txt = (f"{idn.get('map_name') or 'UNKNOWN'}/"
-                     f"{idn.get('source_id') or 'UNKNOWN'}")
-        for txt, row in (
-                (f"[{fi + 1}/{len(frames)}] src#{fidx} {ident_txt} "
-                 f"{tool_txt}", 20),
-                ("1/2/3 class  4=遮挡 5=模糊 6=无法判断  b=tool  f=fill  "
-                 "p=pen  a/Left=back  u=undo  c=clear  z=zoom  s=save+next  "
-                 "q=quit", 40)):
-            cv2.putText(big, txt, (8, row), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5, (0, 0, 0), 3)
-            cv2.putText(big, txt, (8, row), cv2.FONT_HERSHEY_SIMPLEX,
-                        0.5, (255, 255, 255), 1)
-        cv2.imshow(WIN, big)
-
-    def _paint(x, y):
-        r, c = int(y / zoom), int(x / zoom)
-        h, w = label.shape
-        rr, cc = min(max(r, 0), h - 1), min(max(c, 0), w - 1)
-        if unknown_kind:
-            # "不能判断"：label 记 255(ignore)，原因写进 unk
-            cv2.circle(label, (cc, rr), brush, 255, -1)
-            cv2.circle(unk, (cc, rr), brush, int(unknown_kind), -1)
-        else:
-            cv2.circle(label, (cc, rr), brush, cls, -1)
-            cv2.circle(unk, (cc, rr), brush, 0, -1)
-
-    def _bucket(x, y):
-        r, c = int(y / zoom), int(x / zoom)
-        h, w = label.shape
-        if not (0 <= r < h and 0 <= c < w):
-            return
-        old = int(label[r, c])
-        want = 255 if unknown_kind else cls
-        if old == want:
-            return
-        m = (label == old).astype(np.uint8)
-        ff = np.zeros((h + 2, w + 2), np.uint8)
-        cv2.floodFill(m, ff, (c, r), 0, loDiff=0, upDiff=0, flags=4)
-        region = (m == 0) & (label == old)
-        label[region] = want
-        unk[region] = int(unknown_kind) if unknown_kind else 0
-
-    def _mouse(event, x, y, flags, param):
-        nonlocal painting, last_pt
-        if event == cv2.EVENT_LBUTTONDOWN:
-            _push_undo()
-            if tool == "bucket":
-                _bucket(x, y)
-            else:
-                painting = True
-                last_pt = (x, y)
-                _paint(x, y)
-        elif event == cv2.EVENT_MOUSEMOVE and painting:
-            if last_pt is not None:
-                cv2.line(label,
-                         (int(last_pt[0] / zoom), int(last_pt[1] / zoom)),
-                         (int(x / zoom), int(y / zoom)), cls,
-                         thickness=max(1, brush * 2))
-            last_pt = (x, y)
-            _paint(x, y)
-        elif event == cv2.EVENT_LBUTTONUP:
-            painting = False
-            last_pt = None
-        elif event == cv2.EVENT_RBUTTONDOWN:
-            _push_undo()
-            _bucket(x, y)
 
     def _brush_cb(v):
         pass
 
+    session = AnnotateSession(
+        frames, idents, label_for=_initial_label, on_save=_on_save,
+        zoom=2, brush=6, cls=CLS_LINE, tool="pen", window_title=WIN)
     cv2.namedWindow(WIN)
-    cv2.setMouseCallback(WIN, _mouse)
+    cv2.setMouseCallback(
+        WIN, lambda event, x, y, flags, _param: session.on_mouse(event, x, y,
+                                                                flags))
     cv2.createTrackbar("brush", WIN, 6, 40, _brush_cb)
-    _render()
     while True:
-        brush = max(1, cv2.getTrackbarPos("brush", WIN))
-        key = cv2.waitKey(20) & 0xFF
-        if key == ord("q"):
+        session.set_brush(max(1, cv2.getTrackbarPos("brush", WIN)))
+        # waitKey 的原始值直接交给会话：方向键是大码，先 & 0xFF 就再也认不出来
+        action = session.on_key(cv2.waitKey(20))
+        cv2.imshow(WIN, session.canvas())
+        if action == "finish":
+            print("[annotate] all frames done")
             break
-        elif key == ord("1"):
-            cls, unknown_kind = CLS_LINE, 0
-        elif key == ord("2"):
-            cls, unknown_kind = CLS_ROAD, 0
-        elif key == ord("3"):
-            cls, unknown_kind = CLS_BG, 0
-        elif key in (ord("4"), ord("5"), ord("6")):
-            unknown_kind = int(unknown_kind_for_key(chr(key)) or 0)
-        elif key == ord("b"):
-            tool = "bucket" if tool == "pen" else "pen"
-        elif key == ord("f"):
-            tool = "bucket"
-        elif key == ord("p"):
-            tool = "pen"
-        elif key == ord("u") and undo_stack:
-            label[:], unk[:] = undo_stack.pop()
-        elif key == ord("c"):
-            _push_undo()
-            label[:] = 0
-            unk[:] = 0
-        elif key == ord("z"):
-            zoom = 1 if zoom == 2 else 2
-        elif key in (ord("a"), 81):       # 81 = left arrow
-            if fi > 0:
-                _load_frame(fi - 1)
-        elif key == ord("s"):
-            _save_current()
-            if fi >= len(frames) - 1:
-                print("[annotate] all frames done")
-                break
-            _load_frame(fi + 1)
-        _render()
+        if action == "quit":
+            break
     cv2.destroyAllWindows()
     if saved_records:
         side_fp = write_sidecar(out_dir, saved_records, identity=run_identity,
-                                seed=sidecar_seed)
+                                seed=sidecar_seed,
+                                annotation_reviewer=reviewer)
         print(f"[annotate] sidecar -> {side_fp.name} "
               f"(map={run_identity.get('map_name') or 'UNKNOWN'} "
               f"source={run_identity.get('source_id') or 'UNKNOWN'}, "
