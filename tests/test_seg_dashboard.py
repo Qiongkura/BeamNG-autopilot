@@ -943,3 +943,161 @@ def test_generated_frames_are_not_shown_as_human_truth(tmp_path):
           "quality": {"paint": {"rank": "verified"}}}],
         {"eval": {"readable": False}})
     assert "过度声明" not in html2, html2
+
+
+def test_a_candidate_can_be_traced_back_to_its_collection_and_labels(tmp_path):
+    """§11 验收动作：**从一个候选反查它来自哪次采集和哪份标签**。
+
+    造一份真实的产物组合：一次采集记录（带身份审计与覆盖范围）、一个数据因子
+    提议、一份判定（候选数据目录指到那次采集的视角目录）。页面必须显示
+    采集 stamp / map/source / 帧数 / 覆盖比、标签来源与 research_only 标记、
+    协议哈希、判定与理由；对不上采集记录时写"没有记录"，不编。
+    """
+    run = tmp_path / "run"
+    run.mkdir()
+    coll = tmp_path / "collect_x"
+    (run / "collect_20260925_235858.json").write_text(json.dumps({
+        "out_dir": str(coll), "stamp": "20260925_235858",
+        "map_name": "italy", "source_id": "ring_20260925_235904",
+        "frames_total": 116, "ok": True,
+        "group_spread": [{"group": "italy/ring_20260925_235904",
+                          "extent_m": 56.44, "coverage_ratio": 0.973}],
+    }), encoding="utf-8")
+    (run / "proposals_collect_20260925_235858.json").write_text(json.dumps({
+        "proposals": [{"candidate_id": "collect-20260925_235858",
+                       "family": "data_composition",
+                       "factor": {"add_runs": [str(coll / "front_main")]}}],
+    }), encoding="utf-8")
+    (run / "selection_collect_20260925_235858.json").write_text(
+        json.dumps({"n_items": 6, "n_review_only": 6}), encoding="utf-8")
+    (run / "review_queue_collect_20260925_235858.json").write_text(
+        json.dumps({"frames": []}), encoding="utf-8")
+    (run / "decision_cand-r0.json").write_text(json.dumps({
+        "candidate_id": "cand-r0",
+        "factor": {"add_runs": [str(coll / "front_main")]},
+        "candidate_runs": [str(coll / "front_main")],
+        "baseline_runs": [str(coll / "front_main")],
+        "paint_sources": {str(coll / "front_main"): "agent_revision"},
+        "research_only": True,
+        "paint_source_resolution": {"research_only": True,
+                                    "reasons": ["rank agent: research only"]},
+        "protocol": {"hash": "ed85bf8f904b3c78"},
+        "decision": {"decision": "rejected",
+                     "reasons": ["line_recall: 0.31 < 0.7"]},
+        "skipped_factors": {"epochs": "already tried"},
+        "data_factor_note": "下一轮：换成复核过的漆线真值再比",
+    }), encoding="utf-8")
+    tl = dash._timeline_state(run)
+    assert tl["readable"] and tl["n_collections"] == 1, tl
+    assert tl["n_selections"] == 1 and tl["n_review_queues"] == 1, tl
+    c = tl["candidates"][0]
+    assert c["candidate_id"] == "cand-r0"
+    assert c["collections"] and c["collections"][0]["source_id"] == \
+        "ring_20260925_235904", c["collections"]
+    # 同一采集的多个视角目录合并成一行：否则一次四视角采集在页面上看起来像四次采集
+    assert c["collections"][0]["n_dirs"] == 1, c["collections"]
+    html = dash._timeline_view({"timeline": tl, "events": {"events": []}})
+    assert "ring_20260925_235904" in html and "116 帧" in html, html
+    assert "0.973" in html, "覆盖比要出现在反查里"
+    assert "agent_revision" in html and "research_only" in html, html
+    assert "ed85bf8f904b3c78" in html, "协议哈希要能查"
+    assert "line_recall: 0.31 &lt; 0.7" in html or "line_recall: 0.31" in html
+    assert "下一轮" in html and "未采用的因子" in html, html
+
+
+def test_the_timeline_orders_stages_and_shows_pause_reasons(tmp_path):
+    """时间线要按事件给出阶段与**暂停原因**，没有可识别事件时写未测。"""
+    from beamng_autopilot.experiments.events import Event
+    evs = [
+        Event(run_id="r", candidate_id="c0", dataset_id="", config_hash="x",
+              seed=42, phase="auditing", status="collecting", seq=1,
+              note="启动采集"),
+        Event(run_id="r", candidate_id="c0", dataset_id="", config_hash="x",
+              seed=42, phase="auditing", status="resource_blocked", seq=2,
+              note="user is using the machine: paused by configuration"),
+        Event(run_id="r", candidate_id="c0", dataset_id="", config_hash="x",
+              seed=42, phase="training", status="running", seq=3, note=""),
+    ]
+    html = dash._timeline_view({"timeline": {"readable": False,
+                                             "error": "没有产物"},
+                                "events": {"events": evs}})
+    for stage in ("采集", "资源门", "训练"):
+        assert stage in html, (stage, html)
+    assert "paused by configuration" in html, "暂停原因必须显示"
+    assert "反查不可用" in html, html
+    empty = dash._timeline_view({"timeline": {"readable": True, "candidates": []},
+                                 "events": {"events": []}})
+    assert "没有可识别的阶段事件" in empty and "无法反查候选" in empty, empty
+
+
+def test_the_decision_view_renders_when_every_hard_gate_input_was_measured():
+    """回归：hard_unknown 为空时看板不能崩（账本与它无关）。
+
+    实测踩到：`ledger = st.get("gpu_minutes")` 缩进在 `if hard_unknown:` 里，
+    而真 run 的判定文件硬门全部测到（hard_unknown=[]）-> 渲染直接
+    UnboundLocalError，整页打不开（方案 A9 要求从采集到判定可追溯，
+    页面打不开就等于不可追溯）。
+    """
+    import json
+    import tempfile
+    from pathlib import Path as _P
+
+    with tempfile.TemporaryDirectory() as td:
+        root = _P(td)
+        (root / "decision_c.json").write_text(json.dumps({
+            "candidate_id": "c", "pairings": {}, "hard_gate": {},
+            "decision": {"decision": "rejected", "reasons": ["x"]}}),
+            encoding="utf-8")
+        (root / "gpu_minutes.json").write_text(
+            json.dumps({"2026-09-25": {"minutes": 12.5}}), encoding="utf-8")
+        st = dash._decisions_state(root)
+        assert st["readable"] and st["gpu_minutes"], st
+        html = dash._decisions_view({"decisions": st})
+        assert "12.5 min" in html, html
+
+
+def test_the_decisions_view_shows_per_seed_and_per_scene(tmp_path):
+    """A9/§10.2：单坏 seed 与坏场景必须**看得见**（均值不能把它们藏掉）。
+
+    判定文件里已经落盘 hard_by_seed / per_scene / scene_candidates，但看板原来
+    只渲染池化值——于是"某个 seed 塌了"在页面上完全看不出来。
+    """
+    import json
+    import tempfile
+    from pathlib import Path as _P
+
+    with tempfile.TemporaryDirectory() as td:
+        root = _P(td)
+        (root / "decision_c.json").write_text(json.dumps({
+            "candidate_id": "c", "pairings": {}, "hard_gate": {},
+            "decision": {"decision": "rejected", "reasons": ["x"]},
+            "hard_by_seed": {
+                "42": {"candidate_identity_rate": 0.8, "line_recall": 0.9,
+                       "line_precision": 0.6, "offroad_false_ratio": 0.02,
+                       "inference_ms_p95": 18.0},
+                "43": {"candidate_identity_rate": 0.1, "line_recall": 0.2,
+                       "line_precision": None, "offroad_false_ratio": 0.9,
+                       "inference_ms_p95": 19.0}},
+            "per_scene": {
+                "italy/ring_a": {"line_recall": 0.9, "line_precision": 0.6,
+                                 "offroad_false_ratio": 0.01,
+                                 "inference_ms_p95": 17.0},
+                "italy/ring_b": {"line_recall": 0.2, "line_precision": 0.1,
+                                 "offroad_false_ratio": 0.8,
+                                 "inference_ms_p95": None}},
+            "scene_candidates": {
+                "italy/ring_b": {"candidate_reference_coverage": 0.26,
+                                 "left_right_role_agreement": 0.33}},
+            "missing_metrics": ["line_recall: UNKNOWN (hard gate needs a "
+                                "measurement)"],
+        }), encoding="utf-8")
+        st = dash._decisions_state(root)
+        html = dash._decisions_view({"decisions": st})
+        # 逐 seed：两行都在，坏 seed 的读数原样显示
+        assert "seed 42" in html and "seed 43" in html, html
+        assert "90.0%" in html and "20.0%" in html, html
+        # 逐场景：两个场景都在，坏场景的 80% 与未测的 p95 都能看到
+        assert "italy/ring_a" in html and "italy/ring_b" in html, html
+        assert "80.0%" in html, html
+        assert "未测" in html, "缺测场景的 p95 要显示未测，不能写 0"
+        assert "缺测清单" in html, html

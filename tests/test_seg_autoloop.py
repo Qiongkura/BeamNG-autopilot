@@ -164,6 +164,8 @@ class TestProposeAndEliminate:
         hard = tmp_path / "hard.json"
         hard.write_text(json.dumps({"line_recall": 0.8, "line_precision": 0.5,
                                     "candidate_identity_rate": 0.7,
+                                    "candidate_reference_coverage": 0.92,
+                                    "left_right_role_agreement": 0.75,
                                     "offroad_false_ratio": 0.01,
                                     "inference_ms_p95": 20.0}), encoding="utf-8")
         r = _run(None, ["evaluate", "--run-id", "loop_iou", "--candidate-id",
@@ -177,6 +179,8 @@ class TestProposeAndEliminate:
         hard = tmp_path / "hard.json"
         hard.write_text(json.dumps({"line_recall": 0.8, "line_precision": 0.5,
                                     "candidate_identity_rate": 0.7,
+                                    "candidate_reference_coverage": 0.92,
+                                    "left_right_role_agreement": 0.75,
                                     "offroad_false_ratio": 0.01,
                                     "inference_ms_p95": 20.0}), encoding="utf-8")
         r = _run(None, ["evaluate", "--run-id", "loop5", "--candidate-id",
@@ -195,6 +199,8 @@ class TestProposeAndEliminate:
         hard = tmp_path / "hard.json"
         hard.write_text(json.dumps({"line_recall": 0.8, "line_precision": 0.5,
                                     "candidate_identity_rate": 0.7,
+                                    "candidate_reference_coverage": 0.92,
+                                    "left_right_role_agreement": 0.75,
                                     "offroad_false_ratio": 0.01,
                                     "inference_ms_p95": 20.0}), encoding="utf-8")
         r = _run(None, ["evaluate", "--run-id", "loop6", "--candidate-id",
@@ -210,6 +216,8 @@ class TestProposeAndEliminate:
         hard = tmp_path / "hard.json"
         hard.write_text(json.dumps({"line_recall": 0.8, "line_precision": 0.5,
                                     "candidate_identity_rate": 0.7,
+                                    "candidate_reference_coverage": 0.92,
+                                    "left_right_role_agreement": 0.75,
                                     "offroad_false_ratio": 0.01,
                                     "inference_ms_p95": 20.0}), encoding="utf-8")
         _run(None, ["evaluate", "--run-id", "loop7", "--candidate-id", "c1",
@@ -262,9 +270,18 @@ class TestNonInferiority:
     """次要指标只要**非劣**；主指标才要求可信改善（方案 §5）。"""
 
     def _hard(self, tmp_path):
+        """硬门输入夹具。
+
+        协议 v4（2026-09-26）起 `candidate_reference_coverage` 与
+        `left_right_role_agreement` 是**已标定的硬门输入**（门槛 0.80 / 0.70，
+        见 docs/CANDIDATE_GATE_CALIBRATION_20260926.md），所以夹具必须给出实测值：
+        缺这两项会走缺测通道（needs_evidence），测试就不再是在测原意了。
+        """
         p = tmp_path / "hard.json"
         p.write_text(json.dumps({"line_recall": 0.8, "line_precision": 0.5,
                                  "candidate_identity_rate": 0.7,
+                                 "candidate_reference_coverage": 0.92,
+                                 "left_right_role_agreement": 0.75,
                                  "offroad_false_ratio": 0.01,
                                  "inference_ms_p95": 20.0}), encoding="utf-8")
         return p

@@ -332,6 +332,16 @@ def test_a_round_decision_replays_byte_for_byte(tmp_path):
         "thresholds": {"config_hash": t.config_hash,
                        "source": "code defaults"},
         "pairings": compared, "hard_gate_violations": [],
+        # v5 计数契约：判定必须自带整数计数，否则 replay 只能报
+        # "早于计数契约、不能按新分母重判"（见 gates.legacy_replay_note）
+        "counts": {"P_frames": 3, "C": 10, "C_outside_P": 0, "R": 8,
+                   "M": 6, "L": 6, "A": 5},
+        "counts_by_group": {"italy/ring_x": {"P_frames": 3, "C": 10,
+                                             "C_outside_P": 0, "R": 8,
+                                             "M": 6, "L": 6, "A": 5}},
+        "scene_counts": {"italy/ring_x": {"P_frames": 3, "C": 10,
+                                          "C_outside_P": 0, "R": 8,
+                                          "M": 6, "L": 6, "A": 5}},
         "decision": dec}, ensure_ascii=False), encoding="utf-8")
     r = subprocess.run([sys.executable,
                         str(ROOT / "scripts" / "m5_seg_autoloop.py"),
@@ -856,6 +866,84 @@ def test_a_final_confirmation_that_does_not_match_is_rejected(tmp_path):
     assert blob["decision"]["decision"] == "rejected", blob["decision"]
 
 
+def test_a_masked_channel_is_missing_evidence_not_a_violation():
+    """road-only：标线整通道屏蔽 -> 标线指标"未测" -> needs_evidence。
+
+    实测踩到（E2 那轮）：池化硬门把 None 写成 "UNKNOWN (hard gate needs a
+    measurement)" 塞进**违反**通道，判定成 rejected——读起来像"候选不合格"，
+    实际是"这个通道没测"（代码注释本来就写着记 None 是为了不被当违反）。
+    同时逐 seed / 分场景在屏蔽模式下只查可测口径，否则模型"没画线"的近零读数
+    会被当成逐 seed 违反。
+    """
+    loop = _load()
+    t = loop.Thresholds()
+    hard = {"line_recall": None, "line_precision": None,
+            "offroad_false_ratio": None, "candidate_identity_rate": None,
+            "inference_ms_p95": 18.0}
+    sp = loop.hard_split(hard, t)
+    assert sp["violations"] == [] and len(sp["missing"]) == 4, sp
+    per_seed = {"42": {"line_recall": 0.002, "inference_ms_p95": 18.0}}
+    masked = ("inference_ms_p95",)
+    assert loop.per_seed_gate_violations(per_seed, t, fields=masked) == []
+    assert loop.per_seed_missing(per_seed, t, fields=masked) == []
+    # 不限制字段时，屏蔽通道的近零读数会被当违反（这就是 road-only 下的假 rejected）
+    assert loop.per_seed_gate_violations(per_seed, t), "反例不成立"
+    dec = loop.decide(
+        pairings={"road_iou": loop.paired_compare("road_iou", [0.90] * 5,
+                                                  [0.88] * 5)},
+        thresholds=t,
+        missing_metrics=[f"{n}: UNKNOWN (hard gate needs a measurement)"
+                         for n in sp["missing"]],
+        hard_gate_violations=sp["violations"])
+    assert dec["decision"] == "needs_evidence", dec
+    assert any("UNKNOWN" in r for r in dec["reasons"]), dec["reasons"]
+
+
+def test_the_evaluation_reference_credentials_decide_eligibility(tmp_path):
+    """A1 反例：**漏传** --paint-source 时，agent 评价真值仍不能晋级。
+
+    实测踩到（E2 那轮）：资格原来只遍历 `--paint-source`，于是不带这个参数时
+    wide/plain 的 agent 起草评价真值被当成可晋级参考，判定写 research_only=False。
+    现在评价侧直接读 eval 目录自己的凭证（self -> parent）。
+    """
+    loop = _load()
+    dev = _agent_dir(tmp_path, "coll_eval_cred")   # annotation.json: agent_revision
+
+    class A:
+        paint_source = None
+        eval_runs = [str(dev)]
+
+    res = loop.resolve_paint_sources(A())
+    assert res["research_only"] is True, res
+    assert any("evaluation reference" in r for r in res["reasons"]), res
+    entry = res["runs"][str(dev)]
+    assert entry["rank"] == "agent" and entry["can_promote"] is False, entry
+    assert entry.get("role") == "evaluation_reference", entry
+
+    # 人工修订的凭证 -> 可当评价参考（不误伤）
+    dev2 = _frames(tmp_path, "coll_eval_human")
+    (dev2 / "annotation.json").write_text(json.dumps({
+        "label_source": "human_revision", "generator": "test",
+        "frames": [{"path": f"coll_eval_human/front_main/frame_{i:05d}.npz"}
+                   for i in range(3)]}, ensure_ascii=False), encoding="utf-8")
+
+    class B:
+        paint_source = None
+        eval_runs = [str(dev2)]
+
+    res2 = loop.resolve_paint_sources(B())
+    assert res2["research_only"] is False, res2
+    assert res2["runs"][str(dev2)]["rank"] == "verified", res2["runs"]
+
+    # 没有任何凭证的目录：保守判为不可晋级（缺证据不是通过）
+    class C:
+        paint_source = None
+        eval_runs = [str(tmp_path / "no_such_dir")]
+
+    res3 = loop.resolve_paint_sources(C())
+    assert res3["research_only"] is True, res3
+
+
 def test_evaluate_also_downgrades_a_research_source(tmp_path):
     """直接调 evaluate 也不能旁路：同一条资格规则（G03）。"""
     loop = _load()
@@ -870,14 +958,16 @@ def test_evaluate_also_downgrades_a_research_source(tmp_path):
               "--candidate-id", "cand", "--pairings", str(pairings),
               "--hard-gate", str(gate),
               "--paint-source", f"{a}=agent_revision"],
-             tmp_path, expect=1)   # 不可晋级的判定 rc=1
+             tmp_path, expect=3)   # 空硬门=证据缺失 -> needs_evidence（v4/§10.3）
     d = tmp_path / "logs" / "experiments" / "rw_ev"
     blob = json.loads(sorted(d.glob("decision_*.json"))[0].read_text(
         encoding="utf-8"))
     assert blob["research_only"] is True, blob.get("decision")
     # 同时作为 G05 的反例：**只有 line_iou 改善**（任务主指标缺失）不能进入影子
-    # 候选，判定必须是 rejected（而不是被研究臂降级成的 needs_evidence）。
-    assert blob["decision"]["decision"] == "rejected", blob["decision"]
+    # 候选，判定只能是 needs_evidence（缺测，不是被研究臂降级）。
+    assert blob["decision"]["decision"] == "needs_evidence", blob["decision"]
+    assert any("UNKNOWN (hard gate needs a measurement)" in x
+               for x in blob["decision"]["reasons"]), blob["decision"]["reasons"]
     reasons = " ".join(blob["decision"]["reasons"])
     assert "line_iou" in reasons, blob["decision"]["reasons"]
 
@@ -1124,21 +1214,26 @@ def test_identity_metrics_report_coverage_and_roles(tmp_path):
 
                             "n_candidates": 100,
 
-                            "n_candidates_with_reference": 62}}
+                            "n_candidates_with_reference": 62,
+                            "counts": {"P_frames": 3, "C": 100,
+                                       "C_outside_P": 0, "R": 62, "M": 9,
+                                       "L": 8, "A": 4}}}
 
 
 
     got = loop.identity_metrics(Path("ck.pt"), [str(d)], probe_fn=fake)
 
-    assert got["candidate_identity_rate"] == 0.15, got
+    # v5 计数契约：身份率 = M/R（不是旧的 match_rate=0.15）
+    assert got["candidate_identity_rate"] == round(9 / 62, 4), got
+    assert got["candidate_identity_rate_legacy_match_rate"] == 0.15, got
 
     assert got["candidate_identity_rate_with_reference"] == 0.28
 
-    assert got["candidate_reference_coverage"] == 0.62, got
+    assert got["candidate_reference_coverage"] == round(62 / 100, 4), got
 
-    assert got["left_right_role_agreement"] == 0.42
+    assert got["left_right_role_agreement"] == round(4 / 8, 4)
 
-    assert got["n_candidates"] == 100.0
+    assert got["n_candidates"] == 100.0   # = 计数 C（整数求和，不是目录均值）
 
     # 测不到（没有 meta / 没有帧）就是 None，不写 0
 
@@ -1152,7 +1247,19 @@ def test_identity_metrics_report_coverage_and_roles(tmp_path):
 
     # 覆盖率门槛尚未标定：阻止相应晋级（方案 §10.2）
 
-    assert loop.COVERAGE_GATE_FROZEN is False
+    # 覆盖率门槛**已标定并冻结**（协议 v4，2026-09-26，门槛 0.80；标定证据见
+    # docs/CANDIDATE_GATE_CALIBRATION_20260926.md）
+    assert loop.COVERAGE_GATE_FROZEN is True
+
+    # T11：探针没给 counts（旧产物/异常）时新口径一律 None——缺测可见，
+    # 不能默认 0 后继续报"成功"
+    def no_counts(run, meta, *, view, model_path):
+        return {"summary": {"match_rate": 0.9, "n_candidates": 10,
+                            "n_candidates_with_reference": 9}}
+    got3 = loop.identity_metrics(Path("ck.pt"), [str(d)], probe_fn=no_counts)
+    assert got3["candidate_reference_coverage"] is None, got3
+    assert got3["candidate_identity_rate"] is None, got3
+    assert got3["counts"]["C"] == 0, got3
 
     # 逐场景明细必须真的有：调用方读 per_group 时静默拿到空字典，会看起来像
 

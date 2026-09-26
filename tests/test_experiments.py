@@ -907,3 +907,88 @@ def test_an_unfrozen_gate_blocks_promotion_even_when_it_is_measured(tmp_path):
     # 没测到的口径任何时候都算缺测
     none_cov = {"candidate_reference_coverage": {"metric": "x", "n": 0}}
     assert gates.missing_metrics_for(none_cov, coverage_gate_frozen=True) ==         ["candidate_reference_coverage"]
+
+
+def test_per_seed_checks_can_be_restricted_to_measurable_fields():
+    """整通道被屏蔽的实验里，逐 seed 检查只查可测口径（方案 §10.3）。
+
+    实测踩到（E2）：road-only 下模型不产出标线，逐 seed 的 line_recall 是
+    近零"读数"，被当成逐 seed 硬门违反 -> 判定 rejected，读起来像"候选不合格"，
+    实际是"这个通道没测"。
+    """
+    t = gates.Thresholds()
+    per_seed = {"42": {"line_recall": 0.002, "inference_ms_p95": 18.0},
+                "43": {"line_recall": 0.0, "inference_ms_p95": 55.0}}
+    masked = ("inference_ms_p95",)
+    # 屏蔽模式下：标线读数不参与，只有真正的耗时越界算违反
+    v = gates.per_seed_gate_violations(per_seed, t, fields=masked)
+    assert len(v) == 1 and "43" in v[0] and "inference_ms_p95" in v[0], v
+    assert gates.per_seed_missing(per_seed, t, fields=masked) == []
+    # 不限制字段时，标线读数会被当违反（就是那个假 rejected）
+    assert len(gates.per_seed_gate_violations(per_seed, t)) == 3
+    # 缺测与违反仍然分开：字段里的 None 进 missing，不进 violations
+    assert gates.per_seed_missing({"42": {"inference_ms_p95": None}}, t,
+                                  fields=masked) == [
+        "seed 42: inference_ms_p95: UNKNOWN (hard gate needs a measurement)"]
+
+
+def test_a_reviewer_road_type_map_makes_the_pavement_channel_judgeable():
+    """路型列（标注器另存）让"铺装/土肩"从"不可分"变成可判（方案 §6.3）。
+
+    实测背景：label 的 0/1/2/255 契约表达不了材质，所以 pavement 通道一直判
+    "pavement vs shoulder is not separable..."；标注器现在把材质另存一列
+    （1=沥青 2=碎石 3=路肩，路肩按背景处理），审计据此可判，并把各材质像素数
+    记进覆盖表（否则"有路型图的帧"在汇总里看不见）。
+    """
+    import numpy as np
+    from beamng_autopilot.experiments.labels import audit_label
+
+    lab = np.zeros((20, 30), np.uint8)
+    lab[5:15, :] = 1                     # road
+    lab[10, :6] = 2                      # line
+    rt = np.zeros((20, 30), np.uint8)
+    rt[5:10, :] = 1                      # asphalt
+    rt[10:13, :] = 2                     # gravel
+    rt[13:15, :] = 3                     # shoulder
+    a = audit_label(lab, paint_source="human_revision", road_type=rt)
+    assert a.pavement.valid is True, a.pavement
+    assert a.road_type_px == {"asphalt": 150, "gravel": 90, "shoulder": 60}, \
+        a.road_type_px
+    assert "shoulder is background" in a.pavement.reason, a.pavement.reason
+    # 没有路型列的帧保持原判据（不假装可分）
+    b = audit_label(lab, paint_source="human_revision")
+    assert b.pavement.valid is False and b.road_type_px == {}, b.pavement
+    assert "not separable" in b.pavement.reason, b.pavement.reason
+    # 形状不匹配的路型列不参与（不猜）
+    c = audit_label(lab, paint_source="human_revision",
+                    road_type=np.zeros((3, 3), np.uint8))
+    assert c.pavement.valid is False, c.pavement
+
+
+def test_the_calibrated_candidate_gates_only_bite_when_declared():
+    """v4 候选门（覆盖率 0.80 / 左右角色 0.70）：显式给值才启用，None 跳过。
+
+    标定证据：docs/CANDIDATE_GATE_CALIBRATION_20260926.md（136 帧权威真值，
+    有参考场景实测覆盖率 0.89–0.92、角色一致 0.74）。旧阈值文件没有这两个键
+    （None）时必须保持原语义——否则历史判定会被新门重新判死。
+    """
+    base = {"candidate_identity_rate": 0.7, "line_recall": 0.8,
+            "line_precision": 0.5, "offroad_false_ratio": 0.01,
+            "inference_ms_p95": 20.0}
+    old = gates.Thresholds()          # 未声明新门
+    sp = gates.hard_split({**base, "candidate_reference_coverage": 0.10,
+                           "left_right_role_agreement": 0.10}, old)
+    assert sp["violations"] == [] and sp["missing"] == [], sp
+    t = gates.Thresholds(candidate_reference_coverage_min=0.80,
+                         left_right_role_agreement_min=0.70)
+    sp2 = gates.hard_split({**base, "candidate_reference_coverage": 0.45,
+                            "left_right_role_agreement": 0.74}, t)
+    assert len(sp2["violations"]) == 1 and "candidate_reference_coverage" in         sp2["violations"][0], sp2
+    sp3 = gates.hard_split({**base, "candidate_reference_coverage": 0.92}, t)
+    assert sp3["violations"] == [] and sp3["missing"] == [
+        "left_right_role_agreement"], sp3
+    # 无标线场景没有参考：覆盖率天然为 0 —— 标定时**不**按全部场景算，
+    # 该口径写进协议的 coverage_denominator
+    from beamng_autopilot.experiments.protocol import CANDIDATE_GATES
+    assert "HAVE a line reference" in CANDIDATE_GATES["coverage_denominator"]
+    assert CANDIDATE_GATES["candidate_reference_coverage_min"] == 0.80

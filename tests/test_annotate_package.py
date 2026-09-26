@@ -149,3 +149,133 @@ def test_a_queue_pointing_at_a_missing_collection_fails_loudly(tmp_path):
                  encoding="utf-8")
     assert pkg.main(["--review-queue", str(q),
                      "--out", str(tmp_path / "p")]) == 2
+
+
+def test_a_view_level_meta_is_used_and_filtered_to_the_package(tmp_path):
+    """视角级 meta（agent 标注池那种）也要能打包，且只留包内帧。
+
+    实测踩到：agent 标注池每个**视角目录**各有一份 meta（里面列着全部视角的帧），
+    采集目录下没有 meta.json -> 打包直接 FileNotFoundError。回退到视角级 meta
+    后还必须**按视角+文件名过滤**：不同视角的同名帧文件名相同，只按文件名过滤
+    会把别的视角的帧一起留下（实测 4 帧的包留下 32 条记录）。
+    """
+    pkg = _load()
+    coll = _collection(tmp_path, views=("front_main", "pillar_left"), n=3)
+    # 把 meta 挪到视角目录（每个视角一份，列出全部视角的帧）
+    blob = json.loads((coll / "meta.json").read_text(encoding="utf-8"))
+    for v in ("front_main", "pillar_left"):
+        (coll / v / "meta.json").write_text(
+            json.dumps(blob, ensure_ascii=False), encoding="utf-8")
+    (coll / "meta.json").unlink()
+    frames = [f for f in blob["frames"] if f["view"] == "front_main"][:2]
+    q = tmp_path / "q_view_meta.json"
+    q.write_text(json.dumps({"why": "t", "frames": frames}),
+                 encoding="utf-8")
+    out = tmp_path / "pkg_view_meta"
+    rc = pkg.main(["--review-queue", str(q), "--collection", str(coll),
+                   "--out", str(out)])
+    assert rc == 0, rc
+    meta = json.loads((out / "front_main" / "meta.json").read_text(
+        encoding="utf-8"))
+    assert meta["map_name"] == "italy" and meta["source_id"] == "ring_test", meta
+    # 只留包内帧（2 帧），且不含别的视角
+    assert len(meta["frames"]) == 2, meta["frames"]
+    assert {r["view"] for r in meta["frames"]} == {"front_main"}, meta["frames"]
+    assert len(list((out / "front_main").glob("frame_*.npz"))) == 2
+    # 采集级 meta 仍然优先（老路径不变）
+    coll2 = _collection(tmp_path / "second", views=("front_main",), n=2)
+    q2 = tmp_path / "q2.json"
+    q2.write_text(json.dumps({"why": "t", "frames": json.loads(
+        (coll2 / "meta.json").read_text(encoding="utf-8"))["frames"]}),
+        encoding="utf-8")
+    out2 = tmp_path / "pkg_coll_meta"
+    assert pkg.main(["--review-queue", str(q2), "--collection", str(coll2),
+                     "--out", str(out2)]) == 0
+    assert (out2 / "front_main" / "meta.json").is_file()
+
+
+def test_the_annotation_sidecar_records_who_reviewed_and_which_classes(tmp_path):
+    """验收要求「能查询任意帧是**谁**、何时、对哪些类别和区域做了复核」。
+
+    实测缺口：sidecar 有 tool/annotated_at/unknown_px，但没有复核人，也没有
+    "这一帧标了哪些类别"——于是"谁复核的"只能靠记忆。现在写
+    ``annotation.reviewer`` 与逐帧 ``classes_painted``。
+    """
+    import importlib.util
+    import sys
+    from pathlib import Path as _P
+
+    import numpy as np
+
+    root = _P(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_annotate_manual_t", root / "scripts" / "m5_annotate_manual.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["m5_annotate_manual_t"] = mod
+    spec.loader.exec_module(mod)
+
+    out = tmp_path / "annotated" / "front_main"
+    out.mkdir(parents=True)
+    label = np.zeros((6, 8), np.uint8)
+    label[1, :] = 2                     # line
+    label[2:5, :] = 1                   # road
+    label[5, :3] = 255                  # unknown
+    np.savez_compressed(out / "frame_00000.npz",
+                        colour=np.zeros((6, 8, 3), np.uint8), label=label)
+    rec = {"path": "frame_00000.npz", "view": "front_main", "exposure": 0,
+           "pos": [1.0, 2.0, 0.0], "heading": 0.0,
+           "classes_painted": {"line": int((label == 2).sum()),
+                               "road": int((label == 1).sum()),
+                               "background": int((label == 0).sum()),
+                               "unknown": int((label == 255).sum())}}
+    fp = mod.write_sidecar(out, [rec],
+                           identity={"map_name": "italy", "source_id": "ring_x"},
+                           annotation_reviewer="tester")
+    import json
+    blob = json.loads(fp.read_text(encoding="utf-8"))
+    assert blob["label_source"] == "human_revision", blob["label_source"]
+    assert blob["annotation"]["reviewer"] == "tester", blob["annotation"]
+    assert blob["annotation"]["annotated_at"], blob["annotation"]
+    got = blob["frames"][0]["classes_painted"]
+    assert got == {"line": 8, "road": 24, "background": 13, "unknown": 3}, got
+    # 复核人缺省不编名字（拿不到就空）
+    assert mod._default_reviewer() is not None
+
+
+def test_the_sidecar_seed_keeps_the_input_meta(tmp_path):
+    """标注输出的 meta 要以**输入目录**的 meta 为种子（否则丢 cameras）。
+
+    实测踩到：`--out` 与 `--frames-dir` 不同（逐采集打包正是这样）时，种子只看
+    输出目录 -> 空 -> 写出的 meta 只剩 map/source/annotation/frames，**丢了
+    `cameras`（内外参）**。身份探针的投影依赖它，于是 136 帧权威真值集上
+    "候选身份/覆盖率"根本测不出来（R2 要的正是这些指标）。
+    """
+    import importlib.util
+    import sys
+    from pathlib import Path as _P
+
+    root = _P(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_annotate_manual_seed", root / "scripts" / "m5_annotate_manual.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["m5_annotate_manual_seed"] = mod
+    spec.loader.exec_module(mod)
+
+    inp = tmp_path / "in" / "front_main"
+    inp.mkdir(parents=True)
+    (inp.parent / "meta.json").write_text(json.dumps({
+        "map_name": "italy", "source_id": "ring_x", "width": 536,
+        "cameras": {"front_main": {"fov": 70}},
+        "frames": [{"path": "front_main/frame_00000.npz"}]}), encoding="utf-8")
+    out = tmp_path / "out" / "front_main"
+    seed = mod._sidecar_seed_from_inputs(inp, out)
+    assert seed[0].get("cameras"), seed
+    assert seed[1].startswith("input:"), seed
+    out.mkdir(parents=True)
+    fp = mod.write_sidecar(out, [{"path": "frame_00000.npz"}],
+                           identity={"map_name": "italy", "source_id": "ring_x"},
+                           seed=seed)
+    blob = json.loads(fp.read_text(encoding="utf-8"))
+    assert blob.get("cameras"), blob.keys()
+    assert blob.get("width") == 536, blob
+    assert blob["label_source"] == "human_revision", blob

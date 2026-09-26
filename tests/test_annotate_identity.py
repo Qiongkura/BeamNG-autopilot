@@ -306,3 +306,34 @@ def test_side_coverage_lists_both_sides_and_warns_on_a_gap():
     note2 = ann.side_coverage_note(human2, np.zeros((6, 10), np.uint8))
     assert len(note2["warnings"]) == 2
     assert all("引擎为 0" in w for w in note2["warnings"])
+
+
+def test_road_type_is_exported_per_pixel_and_only_when_used():
+    """路型要能分别标出来（方案：两种道路类型分别标记，不能混成 road 一类），
+    并且只在非零时才写进 npz——没有路型的帧不带这个键，既有消费者不变。
+
+    与 ``unknown_kind`` 同一套设计：label 的 0/1/2/255 契约表达不了材质，
+    所以另存一列而不是改契约。
+    """
+    import numpy as np
+    import tempfile
+    rt = np.zeros((4, 4), np.uint8)
+    rt[1, :3] = 3                                   # 路肩
+    rt[2, :2] = 2                                   # 碎石
+    with tempfile.TemporaryDirectory() as td:
+        fp = Path(td) / "rt.npz"
+        ann.export_frame(fp, np.zeros((4, 4, 3), np.uint8),
+                         np.zeros((4, 4), np.uint8), {}, road_type=rt)
+        with np.load(fp) as z:
+            assert "road_type" in z.files
+            assert int((z["road_type"] == 3).sum()) == 3
+            assert int((z["road_type"] == 2).sum()) == 2
+        fp2 = Path(td) / "no_rt.npz"
+        ann.export_frame(fp2, np.zeros((4, 4, 3), np.uint8),
+                         np.zeros((4, 4), np.uint8), {})
+        with np.load(fp2) as z:
+            assert "road_type" not in z.files
+
+    # 计数口径与界面状态行共用同一份实现
+    from beamng_autopilot.labeling.annotate_tools import road_type_counts
+    assert road_type_counts(rt) == {"asphalt": 0, "gravel": 2, "shoulder": 3}
