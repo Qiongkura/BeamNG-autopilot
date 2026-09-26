@@ -36,15 +36,63 @@ if str(SCRIPTS) not in sys.path:
 from beamng_autopilot.experiments.manifest import dir_group  # noqa: E402
 
 
+def audited_inventory(pack_dir: Path) -> dict:
+    """**唯一**评价清单：内容去重 + 拒绝理由 + 逐帧标签哈希（方案 v2 §3.1）。
+
+    标定与评价都消费这一份，禁止各自 glob（实测：两棵树重叠 -> 159 输入里
+    只有 136 张唯一图、22 个重复内容组）。返回
+    ``{records, rejected, by_scene, by_dir, raw_inputs}``；``records`` 里每条带
+    ``path/group/view/label_sha16``。
+    """
+    from beamng_autopilot.experiments.manifest import DatasetManifest
+    dirs = []
+    raw = 0
+    for tree in ("reviewed", "reviewed_full"):
+        for d in sorted((pack_dir / tree).glob("*/front_main")):
+            n = len(list(d.glob("frame_*.npz")))
+            if n:
+                dirs.append(d)
+                raw += n
+    mf = DatasetManifest.build(dirs, root=Path("."))
+    records = [{"path": r.path, "group": r.group, "view": r.view,
+                "label_sha16": r.label_sha16, "run": r.run}
+               for r in mf.records if not r.reject_reason]
+    rejected = [{"path": r.path, "run": r.run, "reason": r.reject_reason}
+                for r in mf.records if r.reject_reason]
+    by_scene: dict = {}
+    by_dir: dict = {}
+    for r in records:
+        by_scene.setdefault(r["group"], []).append(r["path"])
+        by_dir.setdefault(str(Path(r["path"]).parent), []).append(r["path"])
+    # 同一内容多份拷贝（重复别名）：同一标签哈希出现在多个目录
+    aliases: dict = {}
+    for r in records:
+        aliases.setdefault(r["label_sha16"], []).append(r["path"])
+    dup_aliases = {k: v for k, v in aliases.items() if len(v) > 1}
+    return {"records": records, "rejected": rejected, "by_scene": by_scene,
+            "by_dir": by_dir, "raw_inputs": raw,
+            "n_unique": len(records), "n_rejected": len(rejected),
+            "content_alias_groups": len(dup_aliases),
+            "content_aliases": {k: v for k, v in list(dup_aliases.items())[:10]},
+            "dirs": [str(d) for d in dirs]}
+
+
 def _reviewed_dirs(pack_dir: Path) -> dict:
-    """复核目录 -> 场景键（两棵树按目录去重：reviewed 与 reviewed_full 可能重叠）。"""
+    """兼容旧调用：场景 -> 目录列表（**仅供展示**；测量请用 audited_inventory）。"""
     out: dict = {}
     for tree in ("reviewed", "reviewed_full"):
         for d in sorted((pack_dir / tree).glob("*/front_main")):
             if not list(d.glob("frame_*.npz")):
                 continue
-            g = dir_group(d)
-            out.setdefault(g, []).append(d)
+            out.setdefault(dir_group(d), []).append(d)
+    return out
+
+
+def _group_by_dir(paths: list) -> dict:
+    """按所在目录分组（探针需要"目录 + 该目录的帧清单"，meta 才对得上）。"""
+    out: dict = {}
+    for p in paths:
+        out.setdefault(str(Path(p).parent), []).append(p)
     return out
 
 
@@ -62,58 +110,83 @@ def main(argv=None) -> int:
 
     import m5_marking_identity_probe as probe_mod
     pack_dir = Path(args.pack_dir)
-    by_scene = _reviewed_dirs(pack_dir)
-    print(f"[calib] 场景 {len(by_scene)} 个，"
-          f"帧 {sum(len(list(d.glob('frame_*.npz'))) for ds in by_scene.values() for d in ds)}")
+    inv = audited_inventory(pack_dir)
+    by_scene = inv["by_scene"]
+    print(f"[calib] 审计清单：原始输入 {inv['raw_inputs']} 帧 -> 唯一 "
+          f"{inv['n_unique']} 帧，拒绝 {inv['n_rejected']}，重复别名组 "
+          f"{inv['content_alias_groups']}；场景 {len(by_scene)} 个")
+    for r in inv["rejected"][:3]:
+        print(f"[calib]   拒绝：{Path(r['path']).name} @ {r['run']} - {r['reason'][:80]}")
 
     models = []
     for spec in args.model:
         name, _, path = spec.partition("=")
         models.append((name.strip(), Path(path.strip())))
 
-    out = {"pack_dir": str(pack_dir), "models": {}, "per_scene_frames": {
-        g: sum(len(list(d.glob("frame_*.npz"))) for d in ds)
-        for g, ds in sorted(by_scene.items())}}
+    out = {"pack_dir": str(pack_dir), "models": {},
+           "inventory": {k: inv[k] for k in
+                         ("raw_inputs", "n_unique", "n_rejected",
+                          "content_alias_groups")},
+           "rejected": inv["rejected"],
+           "content_aliases": inv["content_aliases"],
+           "per_scene_frames": {g: len(ps)
+                                for g, ps in sorted(by_scene.items())}}
     for name, path in models:
         if not path.exists():
             print(f"[calib] 缺权重 {path}")
             continue
         per_scene = {}
-        for g, dirs in sorted(by_scene.items()):
+        for g, paths in sorted(by_scene.items()):
             # 分母口径（探针 summary）：role_agreement_rate = roles_agreeing /
             # **candidates_matched**（已匹配候选数），不是帧数——实测读错键会
             # 把角色一致率当成 None。
             agg = {"n_candidates": 0, "n_with_reference": 0,
                    "matched": 0, "role_agree": 0, "role_total": 0,
                    "off_road": 0, "frames": 0,
-                   "frames_with_line_ref": 0}
-            for d in dirs:
+                   "frames_with_line_ref": 0, "frames_skipped": 0,
+                   "n_errors": 0, "incomplete_runs": []}
+            # 按目录分组、只喂**该目录已接受的帧**（显式清单，不再 glob）
+            for d_str, dir_paths in sorted(
+                    _group_by_dir(paths).items()):
+                d = Path(d_str)
                 meta_p = d / "meta.json"
                 meta = (json.loads(meta_p.read_text(encoding="utf-8"))
                         if meta_p.is_file() else None)
                 res = probe_mod.probe(d, meta, view=d.name,
                                       model_path=str(path),
+                                      frames=dir_paths,
                                       limit=args.limit)
                 s = res.get("summary") or {}
                 if not s:
                     print(f"[calib]   {g} / {d.name}: 无 summary（{res.get('reason')}）")
                     continue
-                agg["frames"] += int(s.get("n_frames") or 0)
-                agg["n_candidates"] += int(s.get("n_candidates") or 0)
-                agg["n_with_reference"] += int(
-                    s.get("n_candidates_with_reference") or 0)
-                agg["matched"] += int(s.get("candidates_matched") or 0)
-                agg["role_agree"] += int(s.get("roles_agreeing") or 0)
-                agg["role_total"] += int(s.get("candidates_matched") or 0)
+                # 按探针**实际** schema 读：frames/frames_processed（不是 n_frames），
+                # 计数以 counts 的整数为准（先加总再算比率）
+                _c = s.get("counts") or {}
+                agg["frames"] += int(s.get("frames_processed")
+                                     or s.get("frames") or 0)
+                agg["n_candidates"] += int(_c.get("C", 0))
+                agg["n_with_reference"] += int(_c.get("R", 0))
+                agg["matched"] += int(_c.get("M", 0))
+                agg["role_agree"] += int(_c.get("A", 0))
+                agg["role_total"] += int(_c.get("L", 0))
+                # 有帧被跳过 -> 计数不完整：标出来，不把它当完整样本
+                _sk = int(s.get("frames_skipped") or 0)
+                agg["frames_skipped"] += _sk
+                agg["n_errors"] += int(s.get("n_errors") or 0)
+                if _sk or int(s.get("n_errors") or 0):
+                    agg["incomplete_runs"].append(str(d))
                 agg["off_road"] += int(s.get("candidates_off_road") or 0)
                 # 有标线参考的帧数：无标线场景（人确认无线）没有参考，
                 # 覆盖率在那里天然为 0——门槛标定必须把它们分开算。
                 agg["frames_with_line_ref"] += int(
-                    s.get("frames_with_engine_line") or 0)
+                    s.get("frames_with_engine_line")
+                    or _c.get("P_frames") or 0)
             n_cand = agg["n_candidates"]
             n_ref = agg["n_with_reference"]
             per_scene[g] = {
                 **agg,
+                "counts_complete": not agg["incomplete_runs"],
                 "has_line_reference": bool(agg["frames_with_line_ref"]),
                 "off_road_frac": (None if not n_cand
                                   else round(agg["off_road"] / n_cand, 4)),
@@ -159,6 +232,12 @@ def main(argv=None) -> int:
             },
         }
         p = out["models"][name]["pooled"]
+        _inc = sorted({r for v in per_scene.values()
+                       for r in v["incomplete_runs"]})
+        if _inc:
+            print(f"[calib] 注意：{len(_inc)} 个目录计数不完整（有帧被跳过/报错）："
+                  f"{[Path(x).name for x in _inc][:3]}")
+        out["models"][name]["incomplete_runs"] = _inc
         ro = out["models"][name]["reference_scenes_only"]
         print(f"[calib] {name}: 全部场景 候选 {p['n_candidates']} 有参考 "
               f"{p['n_with_reference']} 覆盖 {p['candidate_reference_coverage']} "

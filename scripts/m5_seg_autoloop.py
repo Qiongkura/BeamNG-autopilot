@@ -46,8 +46,9 @@ from beamng_autopilot.experiments.final_set import (  # noqa: E402
 )
 from beamng_autopilot.experiments.gates import (  # noqa: E402
     HARD_CHECKS, SCENE_HARD_FIELDS, Thresholds, decide, hard_split,
-    missing_metrics_for, paired_compare, per_seed_gate_violations,
-    per_seed_missing, scene_report, threshold_violations,
+    legacy_replay_note, missing_metrics_for, paired_compare,
+    per_seed_gate_violations, per_seed_missing, scene_count_violations,
+    scene_report, threshold_violations,
 )
 from beamng_autopilot.experiments.manifest import (  # noqa: E402
     DatasetManifest, dir_group,
@@ -340,6 +341,7 @@ def cmd_replay(args) -> int:
         print("[autoloop] 没有可重放的判定（先跑 evaluate）")
         return 2
     same, diff = 0, []
+    legacy: list = []         # 早于 v5 计数契约的判定（不能按新分母重判）
     proto: list = []          # 每个判定文件的协议快照自查结果
     tampered: list = []       # 快照内容与记录哈希不符（被改过/截断）
     for p in decs:
@@ -359,6 +361,11 @@ def cmd_replay(args) -> int:
         t = thresholds(
             Path(blob["thresholds"]["source"])
             if Path(blob["thresholds"]["source"]).exists() else None)
+        # v5：早于计数契约的判定**不能**按新分母重判，也不许补 0——显式说明。
+        _note = legacy_replay_note(blob)
+        if _note:
+            legacy.append({"file": p.name, "note": _note})
+            continue
         compared = {name: spec for name, spec in blob["pairings"].items()}
         # 缺测清单**优先用判定文件里落盘的那份**：它可能含逐 seed/分场景缺测
         # 以及"新硬门未标定"这类不由 pairings 推导出来的条目；旧判定文件
@@ -391,7 +398,10 @@ def cmd_replay(args) -> int:
             continue
         print(f"  {pr['file']}: 按**旧协议** {pr['recorded']} 留档（当前 "
               f"{pr['current']}）——结论有效，但不能与当前口径混比")
+    for lg in legacy:
+        print(f"  {lg['file']}: {lg['note']}")
     print(f"[autoloop] 重放 {len(decs)} 个判定：相同 {same}，不同 {len(diff)}"
+          + (f"，早于 v5 计数契约 {len(legacy)}" if legacy else "")
           + (f"，协议不一致 {len(tampered)}" if tampered else ""))
     for d in diff:
         print(f"  {d['file']}: 决策或理由不一致 -> 判定不可复现")
@@ -1191,6 +1201,12 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
         _sys.path.insert(0, _sd)
     import m5_marking_identity_probe as ip
     probe_fn = probe_fn or ip.probe
+    # 新口径：**累加整数计数**，最后算一次比率（方案 v2 §3.3）。
+    # 旧实现把各目录的比率取平均、并用"全部候选"当分母，确定性输入会算出
+    # 覆盖率 0.40（应 0.80）——所以这里只加 counts。
+    from beamng_autopilot.experiments import candidate_metrics as _cm
+    counts_acc = _cm.empty()
+    counts_by_group: dict = {}
     acc: dict = {k: [] for k in IDENTITY_FIELDS}
     gacc: dict = {}          # 逐场景（map/source_id 组）明细
     for r in eval_runs:
@@ -1208,6 +1224,12 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
         # 探针把 match_rate_with_reference 的字段**内联在 summary 里**
         # （`**match_rate_with_reference(rows)`），所以这里直接读 summary。
         summary = res.get("summary") or {}
+        # 整数计数（新口径的唯一来源）
+        _c = summary.get("counts") or {}
+        if _c:
+            _cm.accumulate(counts_acc, _c)
+            _cm.accumulate(counts_by_group.setdefault(dir_group(r), _cm.empty()),
+                           _c)
         n_cand = summary.get("n_candidates")
         n_ref = summary.get("n_candidates_with_reference")
         vals = {
@@ -1228,6 +1250,25 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
                     float(v))
     out = {k: (round(sum(v) / len(v), 4) if v else None)
            for k, v in acc.items()}
+    # 旧原始匹配率**显式改名**（S2：旧指标不得继续被硬门消费）
+    if out.get("candidate_identity_rate") is not None:
+        out["candidate_identity_rate_legacy_match_rate"] = out[
+            "candidate_identity_rate"]
+    # 新口径：计数汇总 -> 比率；同时给出整数（n_candidates=C、
+    # n_candidates_with_reference=R、candidates_matched=M、role_compared=L）
+    _r = _cm.ratios(counts_acc)
+    out.update({
+        "candidate_reference_coverage": _r["candidate_reference_coverage"],
+        "candidate_identity_rate": _r["candidate_identity_rate"],
+        "left_right_role_agreement": _r["left_right_role_agreement"],
+        "counts": dict(counts_acc),
+        "counts_by_group": {g: dict(v) for g, v in counts_by_group.items()},
+        "ratios_by_group": {g: _cm.ratios(v) for g, v in counts_by_group.items()},
+        "n_candidates": float(counts_acc.get("C", 0)),
+        "n_candidates_with_reference": float(counts_acc.get("R", 0)),
+        "candidates_matched": float(counts_acc.get("M", 0)),
+        "role_compared": float(counts_acc.get("L", 0)),
+    })
     # 逐场景明细（方案 §10.2：分场景候选口径只上报，不进硬门）。没有它，
     # 调用方读 `per_group` 会**静默拿到空字典**——看起来像"没有候选"，
     # 实际是没接线（实测踩到）。
@@ -2190,6 +2231,23 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                     if cur is None or float(_v) < float(cur):
                         per_scene[_g][_k] = _v
         _scene = scene_report(per_scene, t, fields=_sf)
+        # 逐场景**样本量下限（按 R）**与适用性（方案 v2 §S3.2/§3.4）：
+        # 下限对象是身份率的实际分母，不能用总候选数冒充；无标线场景
+        # not_applicable（既不通过也不算缺测）。
+        _scene_counts: dict = {}
+        for _ss in scene_ident_by_seed.values():
+            for _g, _cv in (_ss or {}).items():
+                _acc = _scene_counts.setdefault(_g, {})
+                for _k in ("P_frames", "C", "R", "M", "L", "A",
+                           "C_outside_P"):
+                    _acc[_k] = int(_acc.get(_k, 0)) + int(
+                        (_cv or {}).get(_k, 0) or 0)
+        _sc = scene_count_violations(_scene_counts, t)
+        if _sc["low_sample"]:
+            print(f"[rounds] 逐场景样本不足 {len(_sc['low_sample'])} 条"
+                  f"（下限按身份率分母 R={t.per_scene_min_candidates} 计）")
+        for _m in _sc["missing"]:
+            print(f"[rounds] 场景 UNKNOWN：{_m}")
         # 分场景候选口径（匹配率/覆盖/左右角色）：**只上报不进硬门**——
         # 单场景候选数可能只有几个，逐场景身份门槛尚未标定（方案 §10.2）。
         _scene_keys = sorted({g for d in scene_ident_by_seed.values()
@@ -2215,7 +2273,7 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
         _missing += [f"{n}: UNKNOWN (hard gate needs a measurement)"
                      for n in _hs["missing"]]
         _missing += per_seed_missing(hard_by_seed, t, fields=_pf)
-        _missing += _scene["missing"]
+        _missing += _scene["missing"] + _sc["missing"] + _sc["low_sample"]
         _violations = (_hs["violations"]
                        + per_seed_gate_violations(hard_by_seed, t, fields=_pf)
                        + _scene["violations"])
@@ -2289,6 +2347,11 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 "hard_gate_violations": _violations,
                 "missing_metrics": _missing,
                 "hard_by_seed": hard_by_seed,
+                # v5 计数契约（方案 v2 §S3.7）：判定必须自带**整数计数**，
+                # 否则 replay 无法按新分母重判（legacy_replay_note 会明确说明）。
+                "counts": _idc.get("counts") or {},
+                "counts_by_group": _idc.get("counts_by_group") or {},
+                "scene_counts": _scene_counts,
                 "per_scene": per_scene,
                 "scene_candidates": scene_candidates,
                 "final_confirmation": _conf,

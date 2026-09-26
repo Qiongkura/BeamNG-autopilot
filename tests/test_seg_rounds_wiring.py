@@ -332,6 +332,16 @@ def test_a_round_decision_replays_byte_for_byte(tmp_path):
         "thresholds": {"config_hash": t.config_hash,
                        "source": "code defaults"},
         "pairings": compared, "hard_gate_violations": [],
+        # v5 计数契约：判定必须自带整数计数，否则 replay 只能报
+        # "早于计数契约、不能按新分母重判"（见 gates.legacy_replay_note）
+        "counts": {"P_frames": 3, "C": 10, "C_outside_P": 0, "R": 8,
+                   "M": 6, "L": 6, "A": 5},
+        "counts_by_group": {"italy/ring_x": {"P_frames": 3, "C": 10,
+                                             "C_outside_P": 0, "R": 8,
+                                             "M": 6, "L": 6, "A": 5}},
+        "scene_counts": {"italy/ring_x": {"P_frames": 3, "C": 10,
+                                          "C_outside_P": 0, "R": 8,
+                                          "M": 6, "L": 6, "A": 5}},
         "decision": dec}, ensure_ascii=False), encoding="utf-8")
     r = subprocess.run([sys.executable,
                         str(ROOT / "scripts" / "m5_seg_autoloop.py"),
@@ -1204,21 +1214,26 @@ def test_identity_metrics_report_coverage_and_roles(tmp_path):
 
                             "n_candidates": 100,
 
-                            "n_candidates_with_reference": 62}}
+                            "n_candidates_with_reference": 62,
+                            "counts": {"P_frames": 3, "C": 100,
+                                       "C_outside_P": 0, "R": 62, "M": 9,
+                                       "L": 8, "A": 4}}}
 
 
 
     got = loop.identity_metrics(Path("ck.pt"), [str(d)], probe_fn=fake)
 
-    assert got["candidate_identity_rate"] == 0.15, got
+    # v5 计数契约：身份率 = M/R（不是旧的 match_rate=0.15）
+    assert got["candidate_identity_rate"] == round(9 / 62, 4), got
+    assert got["candidate_identity_rate_legacy_match_rate"] == 0.15, got
 
     assert got["candidate_identity_rate_with_reference"] == 0.28
 
-    assert got["candidate_reference_coverage"] == 0.62, got
+    assert got["candidate_reference_coverage"] == round(62 / 100, 4), got
 
-    assert got["left_right_role_agreement"] == 0.42
+    assert got["left_right_role_agreement"] == round(4 / 8, 4)
 
-    assert got["n_candidates"] == 100.0
+    assert got["n_candidates"] == 100.0   # = 计数 C（整数求和，不是目录均值）
 
     # 测不到（没有 meta / 没有帧）就是 None，不写 0
 
@@ -1235,6 +1250,16 @@ def test_identity_metrics_report_coverage_and_roles(tmp_path):
     # 覆盖率门槛**已标定并冻结**（协议 v4，2026-09-26，门槛 0.80；标定证据见
     # docs/CANDIDATE_GATE_CALIBRATION_20260926.md）
     assert loop.COVERAGE_GATE_FROZEN is True
+
+    # T11：探针没给 counts（旧产物/异常）时新口径一律 None——缺测可见，
+    # 不能默认 0 后继续报"成功"
+    def no_counts(run, meta, *, view, model_path):
+        return {"summary": {"match_rate": 0.9, "n_candidates": 10,
+                            "n_candidates_with_reference": 9}}
+    got3 = loop.identity_metrics(Path("ck.pt"), [str(d)], probe_fn=no_counts)
+    assert got3["candidate_reference_coverage"] is None, got3
+    assert got3["candidate_identity_rate"] is None, got3
+    assert got3["counts"]["C"] == 0, got3
 
     # 逐场景明细必须真的有：调用方读 per_group 时静默拿到空字典，会看起来像
 
