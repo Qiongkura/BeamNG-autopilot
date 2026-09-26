@@ -963,3 +963,32 @@ def test_a_reviewer_road_type_map_makes_the_pavement_channel_judgeable():
     c = audit_label(lab, paint_source="human_revision",
                     road_type=np.zeros((3, 3), np.uint8))
     assert c.pavement.valid is False, c.pavement
+
+
+def test_the_calibrated_candidate_gates_only_bite_when_declared():
+    """v4 候选门（覆盖率 0.80 / 左右角色 0.70）：显式给值才启用，None 跳过。
+
+    标定证据：docs/CANDIDATE_GATE_CALIBRATION_20260926.md（136 帧权威真值，
+    有参考场景实测覆盖率 0.89–0.92、角色一致 0.74）。旧阈值文件没有这两个键
+    （None）时必须保持原语义——否则历史判定会被新门重新判死。
+    """
+    base = {"candidate_identity_rate": 0.7, "line_recall": 0.8,
+            "line_precision": 0.5, "offroad_false_ratio": 0.01,
+            "inference_ms_p95": 20.0}
+    old = gates.Thresholds()          # 未声明新门
+    sp = gates.hard_split({**base, "candidate_reference_coverage": 0.10,
+                           "left_right_role_agreement": 0.10}, old)
+    assert sp["violations"] == [] and sp["missing"] == [], sp
+    t = gates.Thresholds(candidate_reference_coverage_min=0.80,
+                         left_right_role_agreement_min=0.70)
+    sp2 = gates.hard_split({**base, "candidate_reference_coverage": 0.45,
+                            "left_right_role_agreement": 0.74}, t)
+    assert len(sp2["violations"]) == 1 and "candidate_reference_coverage" in         sp2["violations"][0], sp2
+    sp3 = gates.hard_split({**base, "candidate_reference_coverage": 0.92}, t)
+    assert sp3["violations"] == [] and sp3["missing"] == [
+        "left_right_role_agreement"], sp3
+    # 无标线场景没有参考：覆盖率天然为 0 —— 标定时**不**按全部场景算，
+    # 该口径写进协议的 coverage_denominator
+    from beamng_autopilot.experiments.protocol import CANDIDATE_GATES
+    assert "HAVE a line reference" in CANDIDATE_GATES["coverage_denominator"]
+    assert CANDIDATE_GATES["candidate_reference_coverage_min"] == 0.80

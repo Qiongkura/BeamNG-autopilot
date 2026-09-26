@@ -21,7 +21,7 @@ import json
 from .labels import PAINT_SOURCE_RANK
 
 #: 协议版本：定义/覆盖/资格任一处改动都要递增，并写进判定文件
-PROTOCOL_VERSION = "t14-protocol-v3"
+PROTOCOL_VERSION = "t14-protocol-v4"
 
 # ---------------------------------------------------------------------------
 # 指标字典：name -> 定义
@@ -248,10 +248,24 @@ AGGREGATION: dict = {
     "reported_alongside": ["mean", "macro average", "worst scene", "each seed"],
 }
 
-#: 可测候选覆盖率（G09 新硬门的门槛）**尚未标定**：测到了也不许当通过，
-#: 标定后写进协议并把这个开关翻成 True（方案 §10.2：新硬门未完成基线标定前
-#: 阻止相应晋级，不能为让当前候选过门而调低阈值）。
-COVERAGE_GATE_FROZEN = False
+#: 可测候选覆盖率门槛：**2026-09-26 已标定并冻结**（见
+#: `docs/CANDIDATE_GATE_CALIBRATION_20260926.md`）。标定集为 136 帧权威人工真值：
+#: 有标线参考场景上实测 0.890–0.916，门取 0.80（要求驱动：至少 4/5 的候选要有
+#: 参考可判）；无标线场景没有参考、覆盖率天然为 0，**不计入该门**。
+COVERAGE_GATE_FROZEN = True
+
+#: 候选口径门槛（v4 标定值；进 `protocol_blob()` 哈希）。
+CANDIDATE_GATES = {
+    "candidate_reference_coverage_min": 0.80,
+    "left_right_role_agreement_min": 0.70,
+    "per_scene_min_candidates": 30,
+    "identity_rate_min": 0.60,
+    "coverage_denominator": ("candidates produced on frames that HAVE a line "
+                             "reference; scenes with no line truth are negative "
+                             "scenes judged by the negative-line metric instead"),
+    "calibrated_on": "2026-09-26, 136-frame authoritative human-truth set",
+    "evidence": "docs/CANDIDATE_GATE_CALIBRATION_20260926.md",
+}
 
 
 def protocol_blob(*, thresholds: dict | None = None) -> dict:
@@ -266,6 +280,7 @@ def protocol_blob(*, thresholds: dict | None = None) -> dict:
         "research_only_ranks": list(RESEARCH_ONLY_RANKS),
         "statistics": STATISTICS,
         "aggregation": AGGREGATION,
+        "candidate_gates": CANDIDATE_GATES,
         "coverage_gate_frozen": bool(COVERAGE_GATE_FROZEN),
         "spatial_buffer_m": SPATIAL_BUFFER_M,
         "spatial_buffer_note": SPATIAL_BUFFER_NOTE,
@@ -278,8 +293,8 @@ def protocol_blob(*, thresholds: dict | None = None) -> dict:
 SNAPSHOT_FIELDS = ("version", "metrics", "coverage_requirements",
                    "min_eval_groups", "primary_eval_view", "source_eligibility",
                    "research_only_ranks", "statistics", "aggregation",
-                   "coverage_gate_frozen", "spatial_buffer_m",
-                   "spatial_buffer_note", "thresholds")
+                   "candidate_gates", "coverage_gate_frozen",
+                   "spatial_buffer_m", "spatial_buffer_note", "thresholds")
 
 
 def snapshot_hash(snap: dict) -> str:

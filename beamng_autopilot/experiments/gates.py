@@ -42,6 +42,15 @@ class Thresholds:
     noninferior_margin: float = 0.05
     #: 成对 seed 结论所需的最小 seed 数与差值/不确定度规则
     min_seeds: int = 3
+    #: --- 候选口径门槛（2026-09-26 标定，见 docs/CANDIDATE_GATE_CALIBRATION_20260926.md）
+    #: **None = 该门未声明**（旧阈值文件没有这些键 -> 哈希不变、不启用新门）。
+    #: 覆盖率只在"有标线参考的帧/场景"上算：无标线场景没有参考，覆盖率天然为 0，
+    #: 按全部场景算会让任何模型永久失败（标定实测 0.89–0.92，门 0.80）。
+    candidate_reference_coverage_min: float | None = None
+    #: 左右角色一致率：角色混淆超过 30% 时左右身份不足以支撑横向参考（实测 0.74）。
+    left_right_role_agreement_min: float | None = None
+    #: 逐场景判身份的样本量下限：低于 30 条候选时 p=0.5 的 95% 区间宽约 ±0.18。
+    per_scene_min_candidates: int | None = None
     #: --- 续训等价性容差（GPU）-----------------------------------------
     #: CUDA 上没有 `nll_loss2d` 的确定性实现（本项目交叉熵就用它），所以
     #: "中断续训 = 未中断"在 GPU 上只能按容差判。实测（3 seed、AMP、CUDA、
@@ -58,8 +67,10 @@ class Thresholds:
 
     @property
     def config_hash(self) -> str:
+        # None 值**不进哈希**：新加的门槛字段在旧阈值文件里没有键，保持 None ->
+        # 旧文件的 config_hash 不变（冻结校验照过）；显式给值就进哈希（改值即新配置）。
         blob = json.dumps({k: v for k, v in asdict(self).items()
-                           if k not in ("frozen_at", "source")},
+                           if k not in ("frozen_at", "source") and v is not None},
                           sort_keys=True)
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
@@ -263,8 +274,13 @@ def decide(*, pairings: dict, thresholds: Thresholds,
         return {"decision": "rejected",
                 "reasons": list(hard_gate_violations) + also}
     if missing_metrics:
-        return {"decision": "needs_evidence", "reasons": [
-            f"{m}: not measured" for m in missing_metrics]}
+        # 缺测时也把成对比较的结论一起给出（与硬门分支同一条理由）：只写"缺测"
+        # 会让读者看不到主指标到底有没有改善（方案点名的可读性要求）。
+        _also = [f"{name}: {p['verdict']} (mean {p.get('mean_delta')})"
+                 for name, p in (pairings or {}).items() if p.get("verdict")]
+        return {"decision": "needs_evidence",
+                "reasons": [f"{m}: not measured" for m in missing_metrics]
+                + _also}
 
     # 只按**有测量**的配对算 seed 数：没测到的口径（n=0）走
     # missing_metrics 去 needs_evidence，不能把整个判定一起拉成“样本不足”
@@ -354,14 +370,18 @@ def _noninferior_margin(p: dict, thresholds: Thresholds) -> float:
     return abs(mean) * float(thresholds.noninferior_margin)
 
 
-#: 硬门检查表：``(指标, 门槛, 越小越好)``。逐 seed、分场景与总体共用同一张表
+#: 硬门检查表：``(指标, 门槛字段, 越小越好)``。逐 seed、分场景与总体共用同一张表
 #: ——换口径只改这里一处，避免三个地方各写一份"什么算过门"。
+#: 后两项（覆盖率、左右角色）的门槛字段默认 None = **未声明**，只在阈值文件显式
+#: 给值时才启用（旧阈值文件因此保持原语义；见 Thresholds 的注释）。
 HARD_CHECKS = (
     ("candidate_identity_rate", "candidate_identity_rate_min", False),
     ("line_recall", "line_recall_min", False),
     ("line_precision", "line_precision_min", False),
     ("offroad_false_ratio", "offroad_false_ratio_max", True),
     ("inference_ms_p95", "inference_ms_p95_max", True),
+    ("candidate_reference_coverage", "candidate_reference_coverage_min", False),
+    ("left_right_role_agreement", "left_right_role_agreement_min", False),
 )
 
 
@@ -389,6 +409,8 @@ def hard_split(measured: dict, thresholds: Thresholds,
         if wanted is not None and name not in wanted:
             continue
         limit = getattr(thresholds, limit_attr)
+        if limit is None:
+            continue          # 该门未声明（旧阈值文件）：不检查、也不算缺测
         v = (measured or {}).get(name)
         if v is None:
             missing.append(name)
