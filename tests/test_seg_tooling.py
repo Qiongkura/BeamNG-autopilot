@@ -257,6 +257,54 @@ class TestEvalMatrixMath:
         assert name == "best"
         assert Path(path).name == "best.pt" and Path(path).parent.name == "y"
 
+    @pytest.mark.parametrize("device", ["cpu", "cuda"])
+    def test_negative_scene_wiring_and_explicit_device(self, tmp_path,
+                                                      monkeypatch, device):
+        """轻量接线：按组与总体计数一致；设备不得被自动选择覆盖。"""
+        tool = self._tool()
+        selected = []
+
+        class FakeSegmenter:
+            last_timing_ms = {"total": 1.0}
+
+            def __init__(self, *, model_path, device):
+                selected.append(device)
+                self.device = device
+
+            def predict_with_probs(self, colour):
+                line = colour[..., 0] > 0
+                return np.ones_like(line), line, None
+
+        monkeypatch.setattr(tool, "Segmenter", FakeSegmenter)
+        ckpt = tmp_path / "stub.pt"
+        ckpt.write_bytes(b"test checkpoint identity only")
+        # 帧元组带**档位**（第 4 项）：负例资格要求 verified（方案 v2 §3.5/T10）
+        clean = ("clean", np.zeros((2, 2, 3)), np.ones((2, 2)), "verified")
+        false = ("false", np.ones((2, 2, 3)), np.zeros((2, 2)), "verified")
+        unknown = ("unknown", np.ones((2, 2, 3)), np.full((2, 2), 255),
+                   "verified")
+        groups = {"clean": [clean], "false": [false], "unknown": [unknown]}
+        out = tool.evaluate_model_per_group(ckpt, groups, device=device)
+        pooled = tool.evaluate_model(ckpt, [clean, false, unknown], device=device)
+        assert selected == [device, device]
+        assert out["device"] == pooled["device"] == device
+        assert out["negative_line"] == pooled["negative_line"]
+        assert out["negative_line"]["false_positive_frame_rate"] == .5
+        assert out["negative_line"]["unknown_frames"] == 1
+        good = out["per_group"]["clean"]
+        assert good["line_iou"] is None  # 不通过把 IoU 改成 1 来掩盖零分母
+        assert good["negative_line"]["false_positive_frame_rate"] == 0
+        assert out["per_group"]["false"]["negative_line"]["false_positive_frame_rate"] == 1
+        # T10：档位不是 verified 的目录**不进**合格负例分母（排除量可见）
+        agent = ("agent", np.ones((2, 2, 3)), np.zeros((2, 2)), "agent")
+        out2 = tool.evaluate_model_per_group(ckpt, {"agent": [agent]},
+                                             device=device)
+        nl = out2["negative_line"]
+        assert nl["eligible_frames"] == 0, nl
+        assert nl["unverified_frames"] == 1, nl
+        assert nl["false_positive_frame_rate"] is None, nl
+        assert out["per_group"]["unknown"]["negative_line"]["status"] == "no_eligible_frames"
+
 
 class TestCheckpointDiff:
     """T14 阶段 B：逐位比较两个 checkpoint（续训 ≈ 未中断 的验收工具）。"""
