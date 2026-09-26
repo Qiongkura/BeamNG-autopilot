@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 from pathlib import Path
 
 import numpy as np
@@ -429,3 +430,73 @@ class TestE0Baseline:
         # 缺测不参与（不能把"没测"当成最差或最好）
         seeds[0]["eval"]["per_scene"]["b"]["line_precision"] = None
         assert "line_precision" not in tool.worst_scene_table(seeds)
+
+
+class TestEvalMatrixPerScene:
+    """评估矩阵 CLI 要**分场景**报（方案 §10.2/A7：均值不能替场景过门）。"""
+
+    def _tool(self):
+        import importlib.util
+        import sys
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location(
+            "m5_seg_eval_matrix_ps", root / "scripts" / "m5_seg_eval_matrix.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["m5_seg_eval_matrix_ps"] = mod
+        spec.loader.exec_module(mod)
+        return mod
+
+    def _scene(self, tmp_path, name: str, source: str, n: int = 2):
+        import numpy as np
+        d = tmp_path / name / "front_main"
+        d.mkdir(parents=True)
+        frames = []
+        for i in range(n):
+            colour = np.full((24, 32, 3), 40 + i * 7, np.uint8)
+            label = np.zeros((24, 32), np.uint8)
+            label[8:18, :] = 1
+            label[12, :8] = 2
+            np.savez(d / f"frame_{i:05d}.npz", colour=colour, label=label)
+            frames.append({"path": f"front_main/frame_{i:05d}.npz",
+                           "view": "front_main", "exposure": i,
+                           "pos": [0.0, 0.0, 0.0], "heading": 0.0})
+        (d.parent / "meta.json").write_text(json.dumps(
+            {"map_name": "italy", "source_id": source, "frames": frames}),
+            encoding="utf-8")
+        return d
+
+    def test_frames_are_grouped_by_identity_not_directory_name(self, tmp_path):
+        tool = self._tool()
+        a = self._scene(tmp_path, "coll_a", "ring_a")
+        b = self._scene(tmp_path, "coll_b", "ring_b")
+        got = tool.frames_by_group([a, b])
+        assert sorted(got) == ["italy/ring_a", "italy/ring_b"], got
+        assert all(len(v) == 2 for v in got.values()), got
+        # 同组的多目录合并（同一次采集的不同视角目录）
+        c = self._scene(tmp_path, "coll_a2", "ring_a", n=1)
+        got2 = tool.frames_by_group([a, c])
+        assert sorted(got2) == ["italy/ring_a"], got2
+        assert len(got2["italy/ring_a"]) == 3, got2
+
+    def test_the_cli_json_carries_per_group_metrics(self, tmp_path, monkeypatch):
+        import json as _json
+        import torch
+        from beamng_autopilot.vision.segmentation import SegUNet
+        tool = self._tool()
+        ckpt = tmp_path / "ck.pt"
+        torch.save({"state_dict": SegUNet(width=1.0).state_dict(),
+                    "train_args": {"arch_args": {"width": 1.0}}}, ckpt)
+        a = self._scene(tmp_path, "coll_a", "ring_a")
+        b = self._scene(tmp_path, "coll_b", "ring_b")
+        out_json = tmp_path / "m.json"
+        rc = tool.main(["--model", f"m={ckpt}", "--runs", str(a), str(b),
+                        "--device", "cpu", "--json", str(out_json)])
+        assert rc == 0, rc
+        blob = _json.loads(out_json.read_text(encoding="utf-8"))
+        assert blob["frozen_groups"] == ["italy/ring_a", "italy/ring_b"], blob
+        got = blob["frozen"]["m"]["per_group"]
+        assert sorted(got) == ["italy/ring_a", "italy/ring_b"], got
+        assert all(v.get("n_frames") == 2 for v in got.values()), got
+        # 总体仍在（形状不变，老调用方不受影响）
+        assert "line_iou" in blob["frozen"]["m"], blob["frozen"]["m"]

@@ -185,6 +185,19 @@ def totals_to_metrics(acc: dict, *, n_frames: int, ms: list) -> dict:
     return out
 
 
+def frames_by_group(dirs: list) -> dict:
+    """按 ``map/source_id`` 分组装载帧（同组多目录合并）。
+
+    身份读目录的 meta（先本目录、再父目录），**不从目录名猜**；没有身份的目录
+    退到 ``dir/<完整路径>``（`dir_group` 的规则），绝不按目录名合并。
+    """
+    from beamng_autopilot.experiments.manifest import dir_group
+    out: dict = {}
+    for d in dirs:
+        out.setdefault(dir_group(d), []).extend(load_frames([d]))
+    return out
+
+
 def load_frames(dirs: list) -> list:
     """读 npz 帧：``[(repo 相对路径, colour, label)]``，按文件名排序。"""
     frames = []
@@ -302,13 +315,18 @@ def main(argv=None) -> int:
         except Exception:                    # noqa: BLE001
             device = "cpu"
 
-    frozen = load_frames(args.runs)
-    dev = load_frames(args.dev_runs) if args.dev_runs else []
-    print(f"[eval-matrix] frozen {len(frozen)} frames, dev {len(dev)} frames, "
-          f"device={device}", flush=True)
+    frozen_groups = frames_by_group(args.runs)
+    dev_groups = frames_by_group(args.dev_runs) if args.dev_runs else {}
+    frozen = [f for g in frozen_groups.values() for f in g]
+    dev = [f for g in dev_groups.values() for f in g]
+    print(f"[eval-matrix] frozen {len(frozen)} frames / "
+          f"{len(frozen_groups)} 场景, dev {len(dev)} frames / "
+          f"{len(dev_groups)} 场景, device={device}", flush=True)
     out = {"frozen": {}, "dev": {},
            "frozen_runs": [str(r) for r in args.runs],
-           "dev_runs": [str(r) for r in args.dev_runs]}
+           "dev_runs": [str(r) for r in args.dev_runs],
+           "frozen_groups": sorted(frozen_groups),
+           "dev_groups": sorted(dev_groups)}
     for spec in args.model:
         name, path = parse_model_arg(spec)
         if not path.exists():
@@ -316,9 +334,13 @@ def main(argv=None) -> int:
             out["frozen"][name] = {"error": f"missing checkpoint: {path}"}
             continue
         try:
-            out["frozen"][name] = evaluate_model(path, frozen, device=device)
-            if dev:
-                out["dev"][name] = evaluate_model(path, dev, device=device)
+            # 分场景评估（总体形状不变，另有 per_group）：坏场景不能被池化均值
+            # 抵消，所以 CLI 也按组算（方案 §10.2/A7）。
+            out["frozen"][name] = evaluate_model_per_group(
+                path, frozen_groups, device=device)
+            if dev_groups:
+                out["dev"][name] = evaluate_model_per_group(
+                    path, dev_groups, device=device)
         except Exception as exc:             # noqa: BLE001
             out["frozen"][name] = {"error": f"{type(exc).__name__}: {exc}"}
         f = out["frozen"][name]
@@ -329,6 +351,13 @@ def main(argv=None) -> int:
               f"offroadFP={f.get('offroad_false_line_px')} "
               f"p50={f.get('inference_ms_p50')}ms p95={f.get('inference_ms_p95')}"
               f"ms | dev IoU={d.get('line_iou')}", flush=True)
+        # 逐场景一行：池化值漂亮但某个场景塌掉时，这一行能直接看见
+        for g, m in sorted((f.get("per_group") or {}).items()):
+            print(f"[eval-matrix]   {name} @ {g}: "
+                  f"IoU={m.get('line_iou')} R={m.get('line_recall')} "
+                  f"P={m.get('line_precision')} "
+                  f"offroad={m.get('offroad_false_frac_of_pred')} "
+                  f"n={m.get('n_frames')}", flush=True)
     if args.json:
         Path(args.json).parent.mkdir(parents=True, exist_ok=True)
         Path(args.json).write_text(
