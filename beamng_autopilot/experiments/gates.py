@@ -42,6 +42,15 @@ class Thresholds:
     noninferior_margin: float = 0.05
     #: 成对 seed 结论所需的最小 seed 数与差值/不确定度规则
     min_seeds: int = 3
+    #: --- 候选口径门槛（2026-09-26 标定，见 docs/CANDIDATE_GATE_CALIBRATION_20260926.md）
+    #: **None = 该门未声明**（旧阈值文件没有这些键 -> 哈希不变、不启用新门）。
+    #: 覆盖率只在"有标线参考的帧/场景"上算：无标线场景没有参考，覆盖率天然为 0，
+    #: 按全部场景算会让任何模型永久失败（标定实测 0.89–0.92，门 0.80）。
+    candidate_reference_coverage_min: float | None = None
+    #: 左右角色一致率：角色混淆超过 30% 时左右身份不足以支撑横向参考（实测 0.74）。
+    left_right_role_agreement_min: float | None = None
+    #: 逐场景判身份的样本量下限：低于 30 条候选时 p=0.5 的 95% 区间宽约 ±0.18。
+    per_scene_min_candidates: int | None = None
     #: --- 续训等价性容差（GPU）-----------------------------------------
     #: CUDA 上没有 `nll_loss2d` 的确定性实现（本项目交叉熵就用它），所以
     #: "中断续训 = 未中断"在 GPU 上只能按容差判。实测（3 seed、AMP、CUDA、
@@ -58,8 +67,10 @@ class Thresholds:
 
     @property
     def config_hash(self) -> str:
+        # None 值**不进哈希**：新加的门槛字段在旧阈值文件里没有键，保持 None ->
+        # 旧文件的 config_hash 不变（冻结校验照过）；显式给值就进哈希（改值即新配置）。
         blob = json.dumps({k: v for k, v in asdict(self).items()
-                           if k not in ("frozen_at", "source")},
+                           if k not in ("frozen_at", "source") and v is not None},
                           sort_keys=True)
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
@@ -74,14 +85,20 @@ class Thresholds:
                 "basis": ("measured on CUDA+AMP, 3 seeds, "
                           "scripts/m5_seg_resume_tolerance.py")}
 
-    def save(self, path, *, force: bool = False):
+    def save(self, path, *, force: bool = False, note: str | None = None):
+        """写盘（并校验/写入 ``config_hash``）。
+
+        ``note``：只是文件头的**说明文字**（不进哈希），用来写清这一版的口径；
+        缺省仍是"改任何值 = 新 config_hash"这句。
+        """
         import pathlib
         p = pathlib.Path(path)
         blob = {"schema": 1, "thresholds": asdict(self),
                 "config_hash": self.config_hash,
                 "primary_order": list(PRIMARY_ORDER),
                 "auxiliary": list(AUXILIARY),
-                "note": "frozen: changing any value creates a NEW config_hash"}
+                "note": ("frozen: changing any value creates a NEW config_hash"
+                         if note is None else str(note))}
         if p.exists() and not force:
             old = json.loads(p.read_text(encoding="utf-8"))
             if old.get("config_hash") != self.config_hash:
@@ -263,8 +280,13 @@ def decide(*, pairings: dict, thresholds: Thresholds,
         return {"decision": "rejected",
                 "reasons": list(hard_gate_violations) + also}
     if missing_metrics:
-        return {"decision": "needs_evidence", "reasons": [
-            f"{m}: not measured" for m in missing_metrics]}
+        # 缺测时也把成对比较的结论一起给出（与硬门分支同一条理由）：只写"缺测"
+        # 会让读者看不到主指标到底有没有改善（方案点名的可读性要求）。
+        _also = [f"{name}: {p['verdict']} (mean {p.get('mean_delta')})"
+                 for name, p in (pairings or {}).items() if p.get("verdict")]
+        return {"decision": "needs_evidence",
+                "reasons": [f"{m}: not measured" for m in missing_metrics]
+                + _also}
 
     # 只按**有测量**的配对算 seed 数：没测到的口径（n=0）走
     # missing_metrics 去 needs_evidence，不能把整个判定一起拉成“样本不足”
@@ -354,14 +376,18 @@ def _noninferior_margin(p: dict, thresholds: Thresholds) -> float:
     return abs(mean) * float(thresholds.noninferior_margin)
 
 
-#: 硬门检查表：``(指标, 门槛, 越小越好)``。逐 seed、分场景与总体共用同一张表
+#: 硬门检查表：``(指标, 门槛字段, 越小越好)``。逐 seed、分场景与总体共用同一张表
 #: ——换口径只改这里一处，避免三个地方各写一份"什么算过门"。
+#: 后两项（覆盖率、左右角色）的门槛字段默认 None = **未声明**，只在阈值文件显式
+#: 给值时才启用（旧阈值文件因此保持原语义；见 Thresholds 的注释）。
 HARD_CHECKS = (
     ("candidate_identity_rate", "candidate_identity_rate_min", False),
     ("line_recall", "line_recall_min", False),
     ("line_precision", "line_precision_min", False),
     ("offroad_false_ratio", "offroad_false_ratio_max", True),
     ("inference_ms_p95", "inference_ms_p95_max", True),
+    ("candidate_reference_coverage", "candidate_reference_coverage_min", False),
+    ("left_right_role_agreement", "left_right_role_agreement_min", False),
 )
 
 
@@ -389,6 +415,8 @@ def hard_split(measured: dict, thresholds: Thresholds,
         if wanted is not None and name not in wanted:
             continue
         limit = getattr(thresholds, limit_attr)
+        if limit is None:
+            continue          # 该门未声明（旧阈值文件）：不检查、也不算缺测
         v = (measured or {}).get(name)
         if v is None:
             missing.append(name)
@@ -400,8 +428,12 @@ def hard_split(measured: dict, thresholds: Thresholds,
     return {"violations": violations, "missing": missing}
 
 
-def per_seed_gate_violations(per_seed: dict, thresholds: Thresholds) -> list:
+def per_seed_gate_violations(per_seed: dict, thresholds: Thresholds,
+                            *, fields=None) -> list:
     """逐 seed 硬门：**每个 seed 的 checkpoint 自己**必须满足门槛（方案 §10.2）。
+
+    ``fields``：只查这些指标（整通道被屏蔽的实验用，例如 road-only 下
+    标线指标是"未测"而不是"很差"）。
 
     为什么不能只看跨 seed 均值：4 个 seed 的 ``line_recall`` 都 0.9、第 5 个
     0.3，均值 0.78 照样过 0.70——真正要部署的是具体 checkpoint，均值会把这个
@@ -410,16 +442,19 @@ def per_seed_gate_violations(per_seed: dict, thresholds: Thresholds) -> list:
     """
     out: list[str] = []
     for seed in sorted(per_seed, key=str):
-        for r in hard_split(per_seed[seed] or {}, thresholds)["violations"]:
+        for r in hard_split(per_seed[seed] or {}, thresholds,
+                            fields=fields)["violations"]:
             out.append(f"seed {seed}: {r}")
     return out
 
 
-def per_seed_missing(per_seed: dict, thresholds: Thresholds) -> list:
+def per_seed_missing(per_seed: dict, thresholds: Thresholds,
+                     *, fields=None) -> list:
     """逐 seed 缺测项（进 ``missing_metrics`` → ``needs_evidence``）。"""
     out: list[str] = []
     for seed in sorted(per_seed, key=str):
-        for name in hard_split(per_seed[seed] or {}, thresholds)["missing"]:
+        for name in hard_split(per_seed[seed] or {}, thresholds,
+                               fields=fields)["missing"]:
             out.append(f"seed {seed}: {name}: UNKNOWN (hard gate needs a "
                        f"measurement)")
     return out
@@ -442,6 +477,56 @@ def scene_report(per_scene: dict, thresholds: Thresholds, *, fields=None) -> dic
     return {"violations": violations, "missing": missing}
 
 
+def scene_count_violations(per_scene_counts: dict,
+                           thresholds: Thresholds) -> dict:
+    """逐场景样本量/适用性检查（方案 v2 §S3.2、§3.4）。
+
+    ``per_scene_counts``：``{场景: {P_frames,C,R,M,L,A,...}}``（整数计数，来自
+    `candidate_metrics`）。返回 ``{"missing": [...], "low_sample": [...],
+    "scenes": {...}}``：
+
+    * 场景有标线真值但 **R=0**（没有候选有可用参考）-> ``missing``（UNKNOWN，
+      不是 0 分）；**R < 下限** -> ``low_sample``（样本不足，不宣称结论）；
+    * 下限对象是 **R**（身份率的实际分母），不是总候选 C——"C=100、R=1" 仍然不足；
+    * 没有标线真值的场景（P_frames=0）-> ``not_applicable``：它不进入有线覆盖门，
+      由负例/边界任务评价，**既不算通过也不算缺测**；
+    * 角色分母 L=0 且 R>0 -> ``missing``（角色率 UNKNOWN）。
+
+    每个场景条目还带 ``applicability``：``measured``（有真值且 R>0）、
+    ``unknown``（有真值但 R=0）、``not_applicable``（确认真无线）。第四档
+    ``unverified_labels`` 由标签档位派发，这里看不到档位，所以不由本函数给出
+    （见 ``candidate_metrics.APPLICABILITY``）。
+    """
+    from . import candidate_metrics as cm
+    floor = getattr(thresholds, "per_scene_min_candidates", None)
+    rep = cm.scene_report(per_scene_counts, min_candidates=floor)
+    # **无标线真值的场景不进缺测通道**（方案 v2 §3.4）："确认真无线且参考完整 ->
+    # 覆盖率/recall 不适用"，把它记成缺测会永久挡住所有实验。它们只标
+    # not_applicable，由负例/边界任务评价。
+    _no_truth = {g for g, c in (per_scene_counts or {}).items()
+                 if int((c or {}).get("P_frames", 0)) == 0}
+    _keep = lambda m: not any(str(m).startswith(f"scene {g}:")
+                              for g in _no_truth)
+    out = {"missing": [m for m in rep["missing"] if _keep(m)],
+           "low_sample": [m for m in rep["low_sample"] if _keep(m)],
+           "scenes": rep["scenes"]}
+    # 适用性取值与协议同一套词（measured/not_applicable/unknown）：无标线场景
+    # 不是通过、不是缺测；有线真值但 R=0 是 UNKNOWN（没有分母可判，不是 0 分）。
+    for g, c in (per_scene_counts or {}).items():
+        entry = out["scenes"].setdefault(g, {})
+        if g in _no_truth:
+            entry["applicability"] = "not_applicable"
+            entry["why"] = ("no line truth in this scene: the coverage/identity "
+                            "gates do not apply")
+        elif int((c or {}).get("R", 0)) == 0:
+            entry["applicability"] = "unknown"
+            entry["why"] = ("line truth exists but no candidate has a usable "
+                            "reference (R=0): identity is UNKNOWN, not 0")
+        else:
+            entry["applicability"] = "measured"
+    return out
+
+
 def missing_metrics_for(pairings: dict, *,
                         coverage_gate_frozen: bool = True) -> list:
     """判定要用的缺测清单（在线判定与 replay 共用，保证逐字可复现）。
@@ -458,6 +543,89 @@ def missing_metrics_for(pairings: dict, *,
         out.append("candidate_reference_coverage: gate not calibrated "
                    "(unfrozen)")
     return out
+
+
+#: 旧判定（v5 计数契约之前落盘的）**不能**按新分母重判时给出的说明
+#: （方案 v2 §S3.7）。一句话说清三件事：缺的是计数、重判会造分母、动作是重测。
+LEGACY_REPLAY_NOTE = (
+    "this decision predates the v5 counting contract (no counts/"
+    "counts_by_group and no per-seed counters in hard_by_seed): it cannot be "
+    "re-judged under the new denominators (coverage=R/C, identity=M/R, "
+    "role=A/L) - re-measure, do not backfill zeros")
+
+
+def _v5_counter_keys() -> tuple:
+    """v5 整数计数键（与 ``candidate_metrics.COUNTERS`` 同一份定义，不另抄一份）。"""
+    from . import candidate_metrics as cm
+    return cm.COUNTERS
+
+
+def _is_count_blob(node) -> bool:
+    """``node`` 是否**带着实测的** v5 整数计数（至少一个计数字段非 None）。
+
+    ``{}``、缺字段或全 ``None`` 都不算：那说明**没测到**，重放只能得到
+    UNKNOWN——把"没测"当"测到 0"正是 §S3.7 禁止的补零。``0`` 本身是合法读数
+    （如 ``P_frames=0`` 确认过没有标线帧），非 None 即算。
+    """
+    if not isinstance(node, dict):
+        return False
+    return any(node.get(k) is not None for k in _v5_counter_keys())
+
+
+def _has_v5_counts(node) -> bool:
+    """``node`` 是计数，或是"分组/场景 -> 计数"的映射（``counts_by_group`` 形状）。"""
+    if _is_count_blob(node):
+        return True
+    return (isinstance(node, dict)
+            and any(_is_count_blob(v) for v in node.values()))
+
+
+def _v5_counts_evidence(blob) -> str | None:
+    """blob 里 v5 计数的**位置**；None = 没有（= 旧记录）。
+
+    认这些位置（与 ``scripts/m5_seg_autoloop.py`` 的落盘形状一致）：
+    ``counts`` / ``counts_by_group`` / ``scene_counts``（逐场景整数累加器）、
+    ``hard_by_seed[seed]``（逐 seed 新口径）；再加一层兜底：任何顶层映射里嵌着
+    非空的 ``counts``/``counts_by_group`` 也算（例如以后把计数挂进 pairings）。
+    只认**整数计数键**，不认比率键——旧 blob 也有比率，比率当不了重判的输入。
+    """
+    if not isinstance(blob, dict):
+        return None
+    for key in ("counts", "counts_by_group", "scene_counts"):
+        if key in blob and _has_v5_counts(blob[key]):
+            return key
+    hbs = blob.get("hard_by_seed")
+    if isinstance(hbs, dict):
+        for seed in sorted(hbs, key=str):
+            entry = hbs[seed]
+            if _has_v5_counts(entry):
+                return f"hard_by_seed[{seed}]"
+            if isinstance(entry, dict) and _has_v5_counts(entry.get("counts")):
+                return f"hard_by_seed[{seed}].counts"
+    for key in sorted(blob, key=str):
+        node = blob[key]
+        if not isinstance(node, dict):
+            continue
+        for sub in ("counts", "counts_by_group", "scene_counts"):
+            if sub in node and _has_v5_counts(node[sub]):
+                return f"{key}.{sub}"
+    return None
+
+
+def legacy_replay_note(blob) -> str | None:
+    """旧判定能否按 v5 计数口径重放；不能就返回说明（方案 v2 §S3.7）。
+
+    * 返回 ``None``：blob 带 v5 整数计数（``counts``/``counts_by_group``/
+      ``scene_counts``，或 ``hard_by_seed`` 里的逐 seed 计数）-> replay 可以
+      照同一分母重算，不会出现两套口径；
+    * 返回 :data:`LEGACY_REPLAY_NOTE`：没有这些计数 -> **不许**给旧记录补默认
+      计数（补 0 会让"没测到"变成"测到 0 分"），正确动作是重测。
+
+    纯函数：只读 ``blob``，不写入、不修改（调用方可以直接拿判定文件来问）。
+    """
+    if _v5_counts_evidence(blob) is not None:
+        return None
+    return LEGACY_REPLAY_NOTE
 
 
 def threshold_violations(measured: dict, thresholds: Thresholds) -> list:

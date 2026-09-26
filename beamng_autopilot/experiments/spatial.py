@@ -163,11 +163,23 @@ def group_spread(records, *, expect_step_m: float | None = None) -> list:
         xs = [p[0] for p in pts]
         ys = [p[1] for p in pts]
         extent = math.hypot(max(xs) - min(xs), max(ys) - min(ys))
-        steps = sorted(math.hypot(pts[i + 1][0] - pts[i][0],
-                                  pts[i + 1][1] - pts[i][1])
-                       for i in range(len(pts) - 1))
+        # 路径要按**曝光**排，不能按文件名排：同一次采集的多视角共享曝光，
+        # 位置相同，按文件名排会在视角之间来回跳（实测：116 帧 4 视角、实际
+        # 沿路走 56 m，按文件名算出的"覆盖比"只有 0.245，纯属分母被视角帧数
+        # 灌大）。一个曝光取一个代表点（同曝光的各视角位置相同）。
+        by_exp: dict = {}
+        for k in ks:
+            e = k["exposure"]
+            by_exp.setdefault(e if e is not None else k["path"], _xy(k["pos"]))
+        seq = [by_exp[e] for e in sorted(
+            by_exp, key=lambda v: (isinstance(v, str), v))]
+        seq = [p for p in seq if p is not None]
+        steps = sorted(math.hypot(seq[i + 1][0] - seq[i][0],
+                                  seq[i + 1][1] - seq[i][1])
+                       for i in range(len(seq) - 1))
         med = steps[len(steps) // 2] if steps else None
         row = {"group": g, "n_positioned": len(pts),
+               "n_exposures": len(seq),
                "extent_m": round(extent, 2),
                "median_step_m": None if med is None else round(med, 3),
                "min_step_m": round(steps[0], 3) if steps else None,
@@ -180,7 +192,13 @@ def group_spread(records, *, expect_step_m: float | None = None) -> list:
             # 步长、间距正常（step_ratio≈1），但跨度只有 13.9 m —— 路径在小范围
             # 折返：帧不重复，**场景覆盖小**。两件事必须分开报（间距正常不等于
             # 覆盖够，覆盖够也不等于帧不重复）。
-            span = max(1e-9, (len(pts) - 1) * float(expect_step_m))
-            row["coverage_ratio"] = round(extent / span, 3)
+            # 只有一个曝光时"路径"不存在，覆盖比不可判（写 None，不能拿
+            # 1e-9 当分母编出一个天文数字）
+            row["coverage_ratio"] = (
+                None if len(seq) < 2
+                else round(extent / ((len(seq) - 1) * float(expect_step_m)), 3))
+            if len(seq) < 2:
+                row["note"] = ("single exposure in this group: path length and "
+                               "coverage cannot be judged")
         out.append(row)
     return out

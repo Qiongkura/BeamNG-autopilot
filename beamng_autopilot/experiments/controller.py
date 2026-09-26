@@ -665,6 +665,11 @@ class RoundRecord:
     reasons: list = field(default_factory=list)
     ts: str = field(default_factory=_utc)
     gain: float | None = None
+    #: 单因归因（``proposer.classify_round_outcome`` 写入判定文件后带回来）。
+    #: 只有 ``"meaningful_no_gain"`` 才算"有意义的无收益"；资格失败、缺标注、
+    #: 无效因子各自另有原因，不得当成"模型没有提升空间"的证据（方案 v2 §S5）。
+    #: 空串 = 旧记录/未归因，停止条件回退旧口径，兼容历史日志。
+    outcome: str = ""
 
 
 def should_stop(cfg: LoopConfig, history: list[RoundRecord], *,
@@ -678,6 +683,13 @@ def should_stop(cfg: LoopConfig, history: list[RoundRecord], *,
     reasons: list[str] = []
     streak = 0
     for r in reversed(history):
+        if r.outcome:
+            # 有归因就按归因数：无效因子/缺标注/资格失败的"没收益"不是
+            # 平台期证据，不该把预算推向停止（方案 v2 §S5）。
+            if r.outcome == "meaningful_no_gain":
+                streak += 1
+                continue
+            break
         if r.decision in ("rejected", "needs_evidence") and not r.gain:
             streak += 1
         else:

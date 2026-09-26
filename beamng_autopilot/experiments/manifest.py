@@ -9,6 +9,12 @@
    验证（方案点名："不能把'共享组 6'写成组隔离"）。这里按**整个采集组**
    分配 train / dev / final，任一组跨集合即报错；同一路段的相邻帧、同次
    曝光的多视角、字节复制都不允许跨集合。
+3. **显式的重复/冲突归属**（方案 v2 §3.1）：按图像内容哈希分组，组内再比
+   标签哈希与几何身份（图像尺寸、相机内外参摘要、位姿存在性）：完全一致
+   ⇒ 只留**一个**评价样本、全部来源路径记为别名；标签不同 ⇒ 记标签冲突
+   并隔离（只有"恰好一侧有 verified 凭证"时才保留该侧并记继承）；几何身份
+   不同 ⇒ 记身份冲突并隔离。生存者按 ``(run, path)`` 排序选取——**绝不**
+   依赖目录传入顺序。
 
 ``final``（最终集）只有一次确认的机会：``freeze_final`` 之后
 ``assert_final_unused`` 会拒绝把它用于搜索。
@@ -25,10 +31,12 @@ from pathlib import Path
 
 import numpy as np
 
+from beamng_autopilot.experiments.credentials import read_dir_credentials
 from beamng_autopilot.experiments.labels import (
     audit_label,
     audit_summary,
 )
+from beamng_autopilot.experiments.protocol import effective_source
 
 SCHEMA = 1
 
@@ -63,10 +71,24 @@ class FrameRecord:
     quality: dict
     split: str = "none"
     reject_reason: str = ""
+    # 机器可读的拒绝代码（``reject_reason`` 是给人看的说明）：
+    # "no_map_identity" / "alias_duplicate" / "label_conflict" /
+    # "label_conflict_superseded" / "identity_conflict"
+    reject_code: str = ""
     # 逐帧位姿（来自采集 meta）：空间隔离要用它判断"同地点重采"。
     # 缺失就是 None —— 空间判定不猜（方案 W2：不能只靠字节重复）。
     pos: tuple | None = None
     heading: float | None = None
+    # ---- 几何身份（方案 v2 §3.1）----------------------------------------
+    # 同 RGB 但尺寸/相机/位姿不一致的帧：不能合并成一个样本，也不能当两个
+    # 独立样本。尺寸取 RGB 实际像素；相机摘要元数据缺失时为空串（不猜）。
+    image_hw: str = ""            # "高x宽"
+    camera_sha16: str = ""        # 相机内外参摘要（meta.cameras[view] 等）
+    pose_state: str = "unknown"   # pos+heading / pos / heading / unknown
+    geometry_key: str = ""        # sha16(image_hw, camera_sha16, pose_state)
+    # (a) 完全一致的分组里，同一样本的全部来源路径（含本记录自己的路径）；
+    # 无别名时为空列表。生存者是谁见 ``aliases[content_sha16]["kept"]``。
+    aliases: list[str] = field(default_factory=list)
 
     @property
     def trainable(self) -> bool:
@@ -83,6 +105,13 @@ class DatasetManifest:
     notes: list[str] = field(default_factory=list)
     final_frozen: bool = False
     schema: int = SCHEMA
+    # 内容冲突（同图像、标签/几何不一致）逐对记录，可定位、可报告；
+    # 结构见 ``_resolve_content_groups`` 的 docstring。顺序与目录传入顺序无关。
+    conflicts: list = field(default_factory=list)
+    # content_sha16 -> {"content_sha16", "n", "kept", "paths", "groups",
+    #                   "splits", "n_accepted"}：同图像同标签同几何的分组，
+    # 只留一个评价样本，全部来源路径保留为别名。
+    aliases: dict = field(default_factory=dict)
 
     # ---- construction --------------------------------------------------
     @classmethod
@@ -97,6 +126,7 @@ class DatasetManifest:
         指定整组归属；其余组进 train。
         """
         paint_sources = paint_sources or {}
+        _missing_cred: list = []
         dev_groups = list(dev_groups or [])
         final_groups = list(final_groups or [])
         records: list[FrameRecord] = []
@@ -126,8 +156,34 @@ class DatasetManifest:
                     f"(meta lacks map_name_source) - a legacy collector may "
                     f"have written its argument as the map name; confirm with "
                     f"independent evidence before a decision")
-            src = paint_sources.get(rd.name) or paint_sources.get(str(rd)) \
-                or "engine_annotation"
+            # 资格以**目录自己的凭证**为准（方案 §6.1 / A1）：sidecar
+            # （annotation.json / meta.json 的 label_source）优先于调用方的声明，
+            # 调用方**不能**用字符串把来源抬高质量。原来这里 `or
+            # "engine_annotation"` 从不读凭证——人工复核过的帧会被判成
+            # unreliable / valid=False（实测踩到）。
+            _declared = (paint_sources.get(rd.name)
+                         or paint_sources.get(str(rd)) or "")
+            _cred = read_dir_credentials(rd)
+            _cred_src = None if _cred is None else str(
+                _cred.get("label_source") or "")
+            # 没有凭证也没有声明时，保持**旧默认**（引擎标注 = unreliable）：
+            # 这些帧确实带引擎 label，只是不能当门槛真值；写成 absent 会把
+            # "有引擎标注但不可信"误报成"来源不明"。
+            src, _src_notes = effective_source(
+                _declared or "engine_annotation", _cred_src)
+            if _cred is None:
+                _missing_cred.append(str(rd))
+            for _n in _src_notes:
+                notes.append(f"{rd}: {_n}")
+            if _cred is not None and _cred.get("readable") is False:
+                notes.append(f"{rd}: credential file is not parseable "
+                             f"({_cred.get('path')}) - treated as absent")
+            elif _cred is not None and not _cred_src:
+                notes.append(
+                    f"{rd}: credential file {_cred.get('path')} declares no "
+                    f"label_source ({_cred.get('why')}) - the declared value "
+                    f"or the engine default is used, which is not a verified "
+                    f"source")
             for f in files:
                 z = np.load(f)
                 colour = np.asarray(z["colour"], np.uint8) \
@@ -138,8 +194,12 @@ class DatasetManifest:
                     notes.append(f"{f}: missing colour/label - RGB/annotation "
                                  f"alignment is a gate, not a warning")
                     continue
+                # 路型列（标注器另存）：有它 pavement 通道才可判（方案 §6.3
+                # "两种道路类型分别标记"）。老帧没有这一列 -> 保持"不可分"。
+                _rt = (np.asarray(z["road_type"], np.uint8)
+                       if "road_type" in z.files else None)
                 audit = audit_label(label, paint_source=src,
-                                    road_min_px=min_road_px)
+                                    road_min_px=min_road_px, road_type=_rt)
                 rec = FrameRecord(
                     path=str(Path(f).resolve()), run=rd.name, view=view,
                     group=_group_of(map_name, source_id, rd),
@@ -148,7 +208,8 @@ class DatasetManifest:
                     content_sha16=content_sha16(colour),
                     label_sha16=audit.label_sha256_16,
                     road_px=audit.road.pixels, line_px=audit.paint.pixels,
-                    quality=audit.as_dict())
+                    quality=audit.as_dict(),
+                    image_hw=_image_hw(colour))
                 records.append(rec)
             # identities come from the collection's own frame list
             for rec, frame in _zip_frames(records, files, meta):
@@ -162,19 +223,49 @@ class DatasetManifest:
                         float(v) for v in _p[:2]))
                     _h = frame.get("heading")
                     rec.heading = (None if _h is None else float(_h))
+                    rec.camera_sha16 = _camera_fingerprint(meta, view, frame)
+                elif rec is not None:
+                    # 有 meta 但没有逐帧记录：相机摘要只取 meta 级（不猜）
+                    rec.camera_sha16 = _camera_fingerprint(meta, view, None)
+        # 几何身份在 pos/heading 到位之后才算（方案 v2 §3.1：位姿是否缺失
+        # 本身就是身份的一部分）
+        for rec in records:
+            rec.pose_state = _pose_state(rec.pos, rec.heading)
+            rec.geometry_key = _geometry_key(rec)
         # map identity must be real: a collection that cannot name its map is
         # not admissible (the T13 round found a collector hardcoding "italy")
         for rec in records:
             if not rec.map_name:
                 rec.reject_reason = ("no map identity in the recording: the "
                                      "group would be a directory name only")
-        _reject_content_duplicates(records)
+                rec.reject_code = "no_map_identity"
+        conflicts, aliases = _resolve_content_groups(records)
         groups = _assign_splits(records, dev_groups=dev_groups,
                                final_groups=final_groups, notes=notes)
-        did = _dataset_id(records, groups)
+        _attach_alias_split_info(aliases, records)
+        if conflicts:
+            notes.append(
+                f"{len(conflicts)} content conflict pair(s) recorded: identical "
+                f"image bytes with a different label or geometry - the "
+                f"affected copies are isolated, never merged (see "
+                f"manifest.conflicts for both paths and reasons)")
+        if aliases:
+            notes.append(
+                f"{len(aliases)} alias group(s): the same image+label+geometry "
+                f"is counted once, every source path is kept in "
+                f"manifest.aliases")
+        if _missing_cred:
+            notes.append(
+                f"{len(_missing_cred)} dir(s) have no credential sidecar "
+                f"(annotation.json/meta.json label_source): their paint source "
+                f"falls back to the declared value or engine_annotation - "
+                f"not a verified source. dirs: {_missing_cred[:4]}")
+        did = _dataset_id(records, groups, conflicts=conflicts,
+                          aliases=aliases)
         mf = cls(dataset_id=did,
                  created=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-                 records=records, groups=groups, notes=notes)
+                 records=records, groups=groups, notes=notes,
+                 conflicts=conflicts, aliases=aliases)
         return mf
 
     # ---- io ------------------------------------------------------------
@@ -192,6 +283,7 @@ class DatasetManifest:
         blob = {"schema": self.schema, "dataset_id": self.dataset_id,
                 "created": self.created, "groups": self.groups,
                 "notes": self.notes, "final_frozen": self.final_frozen,
+                "conflicts": self.conflicts, "aliases": self.aliases,
                 "records": [asdict(r) for r in self.records]}
         p.write_text(json.dumps(blob, indent=1, ensure_ascii=False),
                      encoding="utf-8")
@@ -204,7 +296,9 @@ class DatasetManifest:
                    records=[FrameRecord(**r) for r in blob.get("records", [])],
                    groups=blob.get("groups", {}), notes=blob.get("notes", []),
                    final_frozen=bool(blob.get("final_frozen")),
-                   schema=int(blob.get("schema", SCHEMA)))
+                   schema=int(blob.get("schema", SCHEMA)),
+                   conflicts=list(blob.get("conflicts") or []),
+                   aliases=dict(blob.get("aliases") or {}))
 
     # ---- queries -------------------------------------------------------
     def by_split(self, split: str) -> list[FrameRecord]:
@@ -254,6 +348,25 @@ class DatasetManifest:
                                  "checked": any(
                                      r.exposure is not None
                                      for r in self.records)},
+            # 同图像、标签/几何不一致的冲突：可定位、可计数（方案 v2 §3.1/T02）
+            "conflicts": {
+                "n": len(self.conflicts),
+                "n_isolated_copies": sum(
+                    1 for r in self.records
+                    if r.reject_code in ("label_conflict",
+                                         "identity_conflict",
+                                         "label_conflict_superseded")),
+                "checked": True,
+                "detail": list(self.conflicts)[:8],
+            },
+            # 同图像同标签同几何的分组：一个评价样本 + 全部来源别名
+            "alias_groups": {
+                "n": len(self.aliases),
+                "n_extra_paths": sum(max(0, int(a.get("n", 0)) - 1)
+                                     for a in self.aliases.values()),
+                "checked": True,
+                "detail": list(self.aliases.values())[:8],
+            },
             "faces_known_to_contain": self.faces_known_to_contain(),
         }
 
@@ -347,19 +460,295 @@ def dir_group(d: str | Path) -> str:
     return f"dir/{key}"
 
 
-def _reject_content_duplicates(records: list[FrameRecord]) -> None:
-    """字节复制：同内容只保留第一条，其余标隔离（方案点名的泄漏类型）。"""
-    seen: dict[str, FrameRecord] = {}
+def _image_hw(colour: np.ndarray) -> str:
+    c = np.asarray(colour)
+    if c.ndim >= 2:
+        return f"{int(c.shape[0])}x{int(c.shape[1])}"
+    return f"{int(c.size)}"
+
+
+def _pose_state(pos, heading) -> str:
+    """位姿存在性：缺失不猜，缺失本身就是几何身份的一部分（方案 v2 §3.1）。"""
+    if pos is not None and heading is not None:
+        return "pos+heading"
+    if pos is not None:
+        return "pos"
+    if heading is not None:
+        return "heading"
+    return "unknown"
+
+
+#: 逐帧 meta 里可能出现的相机参数键（boundary 采集器与人工标注器都用这一组）
+_CAMERA_FRAME_KEYS = ("cam_offset", "cam_fwd", "cam_up", "cam_fov",
+                      "cam_w", "cam_h", "width", "height")
+
+
+def _canon(obj):
+    """把相机参数变成可哈希的规范 JSON 值（numpy 标量 -> Python，浮点定精度）。"""
+    if isinstance(obj, dict):
+        return {str(k): _canon(v) for k, v in
+                sorted(obj.items(), key=lambda kv: str(kv[0]))}
+    if isinstance(obj, (list, tuple)):
+        return [_canon(v) for v in obj]
+    if isinstance(obj, np.ndarray):
+        return _canon(obj.tolist())
+    if isinstance(obj, (np.floating, float)):
+        return round(float(obj), 6)
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if isinstance(obj, (np.bool_, bool)):
+        return bool(obj)
+    if obj is None or isinstance(obj, (str, int)):
+        return obj
+    return str(obj)
+
+
+def _camera_fingerprint(meta, view: str, frame_meta=None) -> str:
+    """相机内/外参摘要（sha16）。元数据没有任何相机信息时返回 ``""``——不猜。
+
+    来源按"同一目录的 meta 对同一 view 的声明"取：``meta['cameras'][view]``、
+    meta 级 width/height、以及逐帧 meta 的 cam_* 键。**不**从目录名或图像
+    尺寸反推相机。
+    """
+    blob: dict = {}
+    if isinstance(meta, dict):
+        cams = meta.get("cameras")
+        if isinstance(cams, dict) and isinstance(cams.get(view), dict):
+            blob["cameras"] = {view: cams[view]}
+        for k in ("width", "height"):
+            if meta.get(k) is not None:
+                blob[k] = meta[k]
+    if isinstance(frame_meta, dict):
+        for k in _CAMERA_FRAME_KEYS:
+            if k in frame_meta:
+                blob[f"frame.{k}"] = frame_meta[k]
+    if not blob:
+        return ""
+    try:
+        payload = json.dumps(_canon(blob), sort_keys=True, ensure_ascii=False,
+                             separators=(",", ":"))
+    except (TypeError, ValueError):                    # pragma: no cover
+        return ""
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
+
+
+def _geometry_key(rec: FrameRecord) -> str:
+    """几何身份键：尺寸 + 相机摘要 + 位姿存在性一起哈希（同键才算同一个样本）。"""
+    return _sha(f"hw={rec.image_hw}", f"cam={rec.camera_sha16}",
+                f"pose={rec.pose_state}")[:16]
+
+
+#: 漆线来源 rank 的强度阶梯（取值与 labels.PAINT_SOURCE_RANK 对应）：
+#: 只有 ``verified`` 是"已确认"的修订/凭证继承，能在标签冲突中胜出；
+#: agent/pseudo 都只是可测的研究来源（protocol.SOURCE_ELIGIBILITY）。
+_RANK_TIER = {"verified": 3, "agent": 2, "pseudo": 1, "unreliable": 0}
+
+
+def _paint_rank(rec: FrameRecord) -> str:
+    return str((rec.quality.get("paint") or {}).get("rank") or "absent")
+
+
+def _tier(rank: str) -> int:
+    return _RANK_TIER.get(str(rank), -1)          # 未知/absent 一律最低
+
+
+def _rel(p: str | Path) -> str:
+    """报告用路径：能相对仓库根就相对，否则原样（不猜、不丢信息）。"""
+    try:
+        return str(Path(p).resolve().relative_to(ROOT_DIR))
+    except (ValueError, OSError):
+        return str(p)
+
+
+def _alias_reason(sha: str, kept: FrameRecord) -> str:
+    return (f"byte-identical content sha16={sha}: an evaluation sample of this "
+            f"image is kept at {_rel(kept.path)}; this copy is an alias, not a "
+            f"second sample (the survivor is chosen by sorted (run, path), "
+            f"never by directory order)")
+
+
+def _superseded_reason(sha: str, kept: FrameRecord) -> str:
+    return (f"content conflict sha16={sha}: superseded by the verified "
+            f"revision kept at {_rel(kept.path)}; this copy is isolated, not "
+            f"silently merged")
+
+
+def _conflict_reason(kind: str, sha: str, labels: list, geoms: list) -> str:
+    """冲突的**机器可读**拒绝理由：两侧的标签/几何摘要都在字符串里。"""
+    bits = []
+    if "label" in kind:
+        bits.append("label " + ", ".join(labels) + " differ")
+    if "identity" in kind:
+        bits.append("geometry " + "; ".join(geoms) + " differ")
+    lead = f"content conflict sha16={sha}: " + " and ".join(bits)
+    if "identity" in kind:
+        return (lead + "; identical pixels with a different identity are "
+                "neither one sample nor two independent samples -> every "
+                "copy is isolated")
+    return (lead + "; no confirmed revision lineage -> every copy is "
+            "isolated (directory order must not pick a winner)")
+
+
+def _geom_desc(rec: FrameRecord) -> str:
+    return (f"{rec.image_hw or 'hw-unknown'}/"
+            f"cam:{rec.camera_sha16 or 'unknown'}/{rec.pose_state}")
+
+
+def _verified_winner(sigs: dict) -> tuple | None:
+    """标签冲突里唯一可胜出的签名：**恰好一侧**的漆线 rank 是 verified。
+
+    "已确认的修订继承"= 该侧目录自己的凭证把来源定为 ``human_revision`` /
+    ``engine_verified``（``protocol.effective_source`` 只在凭证支持时才给
+    verified；调用方声明抬不上去）。两侧都 verified ⇒ 两个权威版本互相矛盾，
+    不选，全隔离。
+    """
+    tiers = {sig: max(_tier(_paint_rank(r)) for r in vs)
+             for sig, vs in sigs.items()}
+    winners = [sig for sig, t in tiers.items() if t == 3]
+    if len(winners) != 1:
+        return None
+    return winners[0]
+
+
+def _resolve_content_groups(records: list[FrameRecord]) -> tuple:
+    """按**图像内容**分组，把重复/冲突变成显式归属（方案 v2 §3.1）。
+
+    规则（写死，与 ``runs`` 的传入顺序无关）：
+
+    (a) 同内容 + 同标签 + 同几何（尺寸 / 相机摘要 / 位姿存在性）⇒ 只计
+        **一个**评价样本；生存者按 ``(run, path)`` 排序取最小（不是目录
+        顺序），其余副本标 ``alias_duplicate`` 隔离，但全部来源路径记进
+        ``aliases[content_sha16]["paths"]`` 和生存者的 ``aliases`` 字段。
+    (b) 同内容、标签不同 ⇒ 标签冲突。只有**恰好一侧**的漆线来源 rank 是
+        ``verified``（来自目录自己的凭证）且其他各侧严格低于它时，才保留
+        该侧并记 ``inheritance``（"有明确修订继承关系时按已确认版本选择"）；
+        否则每一份都隔离（``label_conflict``）——绝不按路径排序或"后读到"
+        静默选一个。
+    (c) 同内容、几何身份不同 ⇒ 身份冲突（``identity_conflict``），每一份
+        都隔离：相同像素不是独立样本，几何不同也不能强行合并成一个样本。
+        身份冲突**不**适用 (b) 的继承规则（几何不同就无法确认是同一视图）。
+
+    返回 ``(conflicts, aliases)``：
+
+    * ``conflicts``：逐对（每条两个签名各取一个代表）的 ``dict``，含
+      ``group_key``(内容 sha16)、``kind``(label/identity/label+identity)、
+      ``path_a/path_b``(绝对路径)、``label_sha16_a/b``、``geometry_key_a/b``
+      与各自 ``image_hw/camera_sha16/pose_state``、两侧 ``source_rank``、
+      ``why``、``resolution``("isolated"/"kept_verified")、``kept``、
+      ``superseded``；
+    * ``aliases``：``content_sha16 -> {content_sha16, n, kept, paths}``，
+      ``paths`` 是**全部**来源路径（含生存者，按 (run, path) 排序）；只在
+      同一样本确有多个来源（(a) 或 (b) 胜出侧自己有多份）时记录，
+      单来源样本不出现在这里（``FrameRecord.aliases`` 同理保持空）。
+
+    两个结构都只依赖帧集合本身（内容/标签/几何/rank/路径），不依赖传入
+    顺序，因此 ``dataset_id`` 可复现、不会"换个目录顺序换一个标签赢家"。
+    """
+    by_content: dict[str, list[FrameRecord]] = {}
     for r in records:
-        if r.reject_reason:
+        if not r.reject_reason:
+            by_content.setdefault(r.content_sha16, []).append(r)
+    conflicts: list[dict] = []
+    aliases: dict[str, dict] = {}
+    for sha in sorted(by_content):
+        members = sorted(by_content[sha], key=lambda r: (r.run, r.path))
+        if len(members) < 2:
             continue
-        first = seen.get(r.content_sha16)
-        if first is None:
-            seen[r.content_sha16] = r
+        labels = sorted({r.label_sha16 for r in members})
+        geoms = sorted({r.geometry_key for r in members})
+        geoms_desc = sorted({_geom_desc(r) for r in members})
+        if len(labels) == 1 and len(geoms) == 1:
+            # (a) 完全一致：一个样本 + 全部别名
+            kept = members[0]
+            kept.aliases = [r.path for r in members]
+            aliases[sha] = {"content_sha16": sha, "n": len(members),
+                            "kept": kept.path,
+                            "paths": [r.path for r in members]}
+            for r in members[1:]:
+                r.reject_reason = _alias_reason(sha, kept)
+                r.reject_code = "alias_duplicate"
             continue
-        r.reject_reason = (f"byte-identical to {Path(first.path).name} in "
-                           f"{first.run}: a copied sample inflates whichever "
-                           f"side it lands on")
+        kind = "+".join([k for k, on in (("label", len(labels) > 1),
+                                         ("identity", len(geoms) > 1)) if on])
+        sigs: dict[tuple, list[FrameRecord]] = {}
+        for r in members:
+            sigs.setdefault((r.label_sha16, r.geometry_key), []).append(r)
+        reps = {sig: vs[0] for sig, vs in sigs.items()}   # vs 已按 (run,path) 排序
+        winner = _verified_winner(sigs) if "identity" not in kind else None
+        ordered = sorted(reps)
+        for i in range(len(ordered)):
+            for j in range(i + 1, len(ordered)):
+                sig_a, sig_b = ordered[i], ordered[j]
+                a, b = reps[sig_a], reps[sig_b]
+                kept_sig = None
+                if winner is not None and winner in (sig_a, sig_b):
+                    kept_sig = winner
+                kept_rec = reps[kept_sig] if kept_sig is not None else None
+                other = reps[sig_b if kept_sig == sig_a else sig_a] \
+                    if kept_rec is not None else None
+                if kept_rec is not None:
+                    why = ("label differs; exactly one side has a confirmed "
+                           "(verified) revision lineage, so that side is kept "
+                           "and the other copy is isolated")
+                    resolution, kept_path = "kept_verified", kept_rec.path
+                    superseded = other.path
+                else:
+                    why = _conflict_reason(kind, sha, labels, geoms_desc)
+                    resolution, kept_path, superseded = "isolated", None, None
+                conflicts.append({
+                    "group_key": sha, "kind": kind,
+                    "path_a": a.path, "path_b": b.path,
+                    "run_a": a.run, "run_b": b.run,
+                    "label_sha16_a": a.label_sha16,
+                    "label_sha16_b": b.label_sha16,
+                    "geometry_key_a": a.geometry_key,
+                    "geometry_key_b": b.geometry_key,
+                    "image_hw_a": a.image_hw, "image_hw_b": b.image_hw,
+                    "camera_sha16_a": a.camera_sha16,
+                    "camera_sha16_b": b.camera_sha16,
+                    "pose_state_a": a.pose_state, "pose_state_b": b.pose_state,
+                    "source_rank_a": _paint_rank(a),
+                    "source_rank_b": _paint_rank(b),
+                    "why": why, "resolution": resolution,
+                    "kept": kept_path, "superseded": superseded,
+                })
+        if winner is None:
+            reason = _conflict_reason(kind, sha, labels, geoms_desc)
+            code = ("identity_conflict" if "identity" in kind
+                    else "label_conflict")
+            for r in members:
+                r.reject_reason = reason
+                r.reject_code = code
+            continue
+        # (b) 唯一 verified 侧胜出：该侧只留一个样本，其余签名全隔离
+        kept = reps[winner]
+        win_members = sigs[winner]
+        if len(win_members) > 1:            # 该侧自己也有多份来源 -> 记别名
+            kept.aliases = [r.path for r in win_members]
+            aliases[sha] = {"content_sha16": sha, "n": len(win_members),
+                            "kept": kept.path,
+                            "paths": [r.path for r in win_members]}
+        for r in win_members:
+            if r is not kept:
+                r.reject_reason = _alias_reason(sha, kept)
+                r.reject_code = "alias_duplicate"
+        for sig, vs in sigs.items():
+            if sig == winner:
+                continue
+            for r in vs:
+                r.reject_reason = _superseded_reason(sha, kept)
+                r.reject_code = "label_conflict_superseded"
+    return conflicts, aliases
+
+
+def _attach_alias_split_info(aliases: dict, records: list) -> None:
+    """别名组补充分组/划分信息（要在 ``_assign_splits`` 之后调用）。"""
+    by_path = {r.path: r for r in records}
+    for info in aliases.values():
+        members = [by_path[p] for p in info.get("paths", []) if p in by_path]
+        info["groups"] = sorted({m.group for m in members})
+        info["splits"] = sorted({m.split for m in members})
+        info["n_accepted"] = sum(1 for m in members if not m.reject_reason)
 
 
 def _assign_splits(records: list[FrameRecord], *, dev_groups, final_groups,
@@ -392,7 +781,15 @@ def _assign_splits(records: list[FrameRecord], *, dev_groups, final_groups,
     return groups
 
 
-def _dataset_id(records: list[FrameRecord], groups: dict) -> str:
+def _dataset_id(records: list[FrameRecord], groups: dict, *,
+                conflicts: list | None = None,
+                aliases: dict | None = None) -> str:
+    """数据版本哈希。贡献**只依赖帧集合本身**，与 runs 的传入顺序无关。
+
+    除逐帧记录与划分外，冲突/别名的归属也进哈希（用仓库相对路径，避免机器
+    路径差异）：目录顺序换了若真能改变接受集或谁胜出，``dataset_id`` 必然
+    可见地不同——不会出现"同一个 dataset_id 两种标签赢家"。
+    """
     parts = []
     for r in sorted(records, key=lambda x: (x.run, x.path)):
         parts.append("|".join([
@@ -401,6 +798,22 @@ def _dataset_id(records: list[FrameRecord], groups: dict) -> str:
             str(r.quality.get("paint", {}).get("valid")), r.split,
             r.group, r.reject_reason[:40]]))
     parts.append(json.dumps(groups, sort_keys=True))
+    for c in sorted(conflicts or (),
+                    key=lambda c: (str(c.get("group_key", "")),
+                                   _rel(str(c.get("path_a", ""))),
+                                   _rel(str(c.get("path_b", ""))))):
+        parts.append("conflict|" + "|".join(
+            [str(c.get("kind", "")), str(c.get("group_key", "")),
+             _rel(str(c.get("path_a", ""))), _rel(str(c.get("path_b", "")))]
+            + [str(c.get(k, "")) for k in
+               ("label_sha16_a", "label_sha16_b",
+                "geometry_key_a", "geometry_key_b",
+                "resolution", "kept")]))
+    for sha, info in sorted((aliases or {}).items()):
+        parts.append("alias|" + sha + "|" + "|".join(
+            _rel(p) for p in (info.get("paths") or [])))
+        parts.append("alias-kept|" + sha + "|"
+                     + _rel(str(info.get("kept") or "")))
     return _sha(*parts)
 
 
@@ -421,7 +834,9 @@ def _audit_from_dict(q: dict):
         line_masked_px=q.get("line_masked_px", 0),
         frame_unknown_frac=q.get("frame_unknown_frac", 0.0),
         label_sha256_16=q.get("label_sha256_16", ""),
-        notes=q.get("notes", []))
+        notes=q.get("notes", []),
+        # 路型计数要回到重建的审计对象（覆盖表按它统计"有路型图的帧"）
+        road_type_px=dict(q.get("road_type_px") or {}))
 
 
 def _count(items) -> dict:
