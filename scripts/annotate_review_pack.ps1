@@ -84,6 +84,21 @@ try {
         foreach ($d in $all) { Write-Host ("  " + $d.Name) }
         exit 4
     }
+    # 包目录存在不等于包里有帧：重建时删了没重打就会这样（实测踩到，逐个包报
+    # "Cannot find path .../front_main"、"0 帧"，看不出真正原因）。
+    $empty = @($pkgs | Where-Object {
+        @(Get-ChildItem -Path (Join-Path $_.FullName $View) -Filter 'frame_*.npz' `
+            -ErrorAction SilentlyContinue).Count -eq 0 })
+    if ($empty.Count -gt 0) {
+        $build = if ($Full) { 'build_packages_full.ps1' } else { 'build_packages.ps1' }
+        Write-Host ("[annotate] 有 {0} 个包是空的（缺 {1}/frame_*.npz）：" -f `
+            $empty.Count, $View) -ForegroundColor Red
+        foreach ($d in $empty) { Write-Host ("  " + $d.Name) }
+        Write-Host ("[annotate] 先把包打出来再标注：" -f $build) -ForegroundColor Yellow
+        Write-Host ("  pwsh -NoProfile -ExecutionPolicy Bypass -File " +
+                    (Join-Path $packRoot $build))
+        exit 5
+    }
 
     Write-Host ("[annotate] 共 {0} 个包；输出 -> {1}" -f $pkgs.Count, $OutRoot)
     Write-Host "[annotate] 键位：1=line 2=road 3=背景/擦除 · b 画笔/填充 · u 撤销 · c 清空 · a 上一帧 · s 保存并下一帧 · q 退出"
