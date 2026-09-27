@@ -148,7 +148,11 @@ def _v5_decision(frame: Path, overlays: dict) -> dict:
         "hard_gate_violations": ["scene italy/ring_b: line_recall 0.12 < 0.7"],
         "missing_metrics": ["line_precision: UNKNOWN (hard gate needs a "
                             "measurement)"],
+        # 两臂形状（`rounds` 真实写法：negative_line = {baseline, candidate}）：
+        # 复核者实测踩到——看板只认扁平形状时，真实判定里的实测负例诊断被渲染成
+        # "无数据"。夹具用真实形状，扁平形状由下面的 legacy/矩阵回退路径覆盖。
         "negative_line": {
+          "baseline": {
             "frames": 43, "eligible_frames": 40, "clean_frames": 38,
             "false_positive_frames": 2, "false_positive_px": 120,
             "eligible_px": 400000, "positive_frames": 0, "unknown_frames": 0,
@@ -160,6 +164,17 @@ def _v5_decision(frame: Path, overlays: dict) -> dict:
             "excluded_reason": ("3 frame(s) excluded: label rank is not "
                                 "verified, so an all-zero label does not "
                                 "confirm 'no line'")},
+          "candidate": {
+            "frames": 43, "eligible_frames": 40, "clean_frames": 39,
+            "false_positive_frames": 1, "false_positive_px": 60,
+            "eligible_px": 400000, "positive_frames": 0, "unknown_frames": 0,
+            "empty_frames": 0, "unverified_frames": 3,
+            "unverified_pred_line_px": 9, "status": "measured",
+            "false_positive_frame_rate": 0.025,
+            "false_positive_pixel_fraction": 0.00015,
+            "excluded_frames": 3,
+            "excluded_reason": ("3 frame(s) excluded: label rank is not "
+                                "verified")}},
         "decision": {"decision": "rejected",
                      "reasons": ["scene italy/ring_b: line_recall 0.12 < 0.7",
                                  "no primary metric shows a credible "
@@ -337,6 +352,7 @@ def test_v5_panels_render_and_every_value_names_its_source(tmp_path):
     for needle in ("epoch 12", "train_loss", "val_line_iou", "add_runs",
                    "qualification_failure", "因子是否真生效: 否",
                    "line_tversky_weight",
+                   "negative_line.candidate", "negative_line.baseline",
                    "checkpoint_last.pt", "120.0"):
         assert needle in text, needle
     assert "来源: decision_v5.json: train_hist" not in text  # 来源写的是文件名+指标

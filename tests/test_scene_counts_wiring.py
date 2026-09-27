@@ -342,3 +342,26 @@ def test_dev_frames_by_dir_keys_are_directories_not_frame_files(tmp_path):
         assert rel_key in by_dir, (rel_key, list(by_dir))
     finally:
         os.chdir(old)
+
+
+def test_a_probe_refusal_is_recorded_not_silently_zero(tmp_path, monkeypatch):
+    """T09/T11 残留：探针的**结构化 refusal**（无 summary）必须逐条可见。
+
+    复核者实测：整 run 缺相机时探针返回 refusal（不抛异常、也没有 summary），
+    旧写法让它静默变成"零计数"，与"实测 0"分不清。
+    """
+    loop = _load()
+    d = _frames(tmp_path, "coll_ref", source_id="ring_ref")
+
+    def probe(run, meta, *, view=None, model_path=None, frames=None):
+        return {"reason": "no camera for view front_main (refused)",
+                "frames_total": 2, "frames_processed": 0}
+
+    import m5_marking_identity_probe as ip
+    monkeypatch.setattr(ip, "probe", probe)
+    out = loop.identity_metrics(Path("model.pt"), [d])
+    assert out["n_eval_run_errors"] == 1, out["eval_run_errors"]
+    assert "refused" in out["eval_run_errors"][0]["why"]
+    assert out["counts"]["P_frames"] == 0
+    assert out["counts_by_group"] == {}, \
+        "refusal 不该产出任何分组计数（零计数 = 没测，不是实测 0）"

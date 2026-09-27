@@ -3137,7 +3137,15 @@ def _v5_negative_block(ctx: dict, it: dict) -> str:
     entries = []
     nl = blob.get("negative_line")
     if isinstance(nl, dict):
-        entries.append((f"{fname}: negative_line", nl))
+        # 两种形状都要吃：两臂形状 {baseline:{...}, candidate:{...}}（E1/E2 判定
+        # 文件）逐臂一行；扁平形状（评估矩阵/旧写法）一行。实测踩到：只认扁平
+        # 时真实 E1 判定里的实测负例诊断被渲染成"无数据"（复核者发现）。
+        _arms = {k: v for k, v in nl.items() if isinstance(v, dict)}
+        if _arms:
+            for _arm, _sub in sorted(_arms.items()):
+                entries.append((f"{fname}: negative_line.{_arm}", _sub))
+        else:
+            entries.append((f"{fname}: negative_line", nl))
     ev = ctx.get("eval") or {}
     for split in sorted(ev.get("splits") or {}):
         for name, entry in sorted((ev["splits"][split] or {}).items()):

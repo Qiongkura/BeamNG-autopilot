@@ -1300,6 +1300,15 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
         # 探针把 match_rate_with_reference 的字段**内联在 summary 里**
         # （`**match_rate_with_reference(rows)`），所以这里直接读 summary。
         summary = res.get("summary") or {}
+        if not summary:
+            # 探针的**结构化 refusal**（缺相机整 run 不可测、缺 label 数组、
+            # 全帧失败…）：不抛异常但也没有 summary。旧写法会让它静默变成
+            # "零计数"，与"实测 0"分不清（复核者 T09/T11 发现）。逐条记下原因。
+            run_errors.append({
+                "run": str(run),
+                "why": ("probe refused: "
+                        + str(res.get("reason") or "no summary returned"))})
+            continue
         # 整数计数（新口径的唯一来源）
         _c = summary.get("counts") or {}
         if _c:
