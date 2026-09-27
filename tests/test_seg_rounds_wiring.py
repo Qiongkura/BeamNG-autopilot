@@ -1271,3 +1271,53 @@ def test_identity_metrics_report_coverage_and_roles(tmp_path):
 
     assert got2["per_group"] == {}
 
+
+
+def test_replay_detects_a_decision_whose_ratios_do_not_match_its_counts(tmp_path):
+    """T12②（复核者发现）：比率必须能由**同一份 counts** 重算出来。
+
+    只存 counts、不存"由它派生的比率"时，手改过的比率查不出来——replay 重跑的是
+    存档 pairings，比率字段本身没有自洽检查。现在判定文件带 `counts_ratios`
+    （micro 口径，由 counts 派生），replay 从 counts 重算并与它比对：不一致就是
+    "同一计数出现两套结果"，必须报出来（rc=1）。
+    """
+    loop = _load()
+    env = dict(os.environ)
+    env["BEAMNG_LOGS_DIR"] = str(tmp_path / "logs")
+    d = tmp_path / "logs" / "experiments" / "rw_ratio"
+    d.mkdir(parents=True, exist_ok=True)
+    t = loop.Thresholds()
+    counts = {"P_frames": 3, "C": 10, "C_outside_P": 0, "R": 8, "M": 6,
+              "L": 6, "A": 5}
+    from beamng_autopilot.experiments import candidate_metrics as cm
+    good = cm.ratios(counts)
+    compared = {"line_iou": loop.paired_compare(
+        "line_iou", [0.10, 0.11, 0.12], [0.10, 0.11, 0.12])}
+    dec = loop.decide(pairings=compared, thresholds=t, missing_metrics=[],
+                      hard_gate_violations=[])
+    base = {"candidate_id": "ratio-r0",
+            "thresholds": {"config_hash": t.config_hash,
+                           "source": "code defaults"},
+            "pairings": compared, "hard_gate_violations": [],
+            "counts": counts, "counts_ratios": good,
+            "decision": dec}
+    (d / "decision_ratio-r0.json").write_text(
+        json.dumps(base, ensure_ascii=False), encoding="utf-8")
+    r = subprocess.run([sys.executable,
+                        str(ROOT / "scripts" / "m5_seg_autoloop.py"),
+                        "replay", "--run-id", "rw_ratio"],
+                       capture_output=True, text=True, env=env, timeout=600)
+    assert r.returncode == 0, r.stdout[-600:]
+    assert "计数↔比率不一致" not in r.stdout
+    # 手改比率（保持 counts 不变）：replay 必须抓出来
+    bad = dict(base)
+    bad["counts_ratios"] = dict(good, candidate_identity_rate=0.9)
+    (d / "decision_ratio-r0.json").write_text(
+        json.dumps(bad, ensure_ascii=False), encoding="utf-8")
+    r2 = subprocess.run([sys.executable,
+                         str(ROOT / "scripts" / "m5_seg_autoloop.py"),
+                         "replay", "--run-id", "rw_ratio"],
+                        capture_output=True, text=True, env=env, timeout=600)
+    assert r2.returncode == 1, r2.stdout[-600:]
+    assert "计数与比率不一致" in r2.stdout, r2.stdout[-600:]
+    assert "计数↔比率不一致 1" in r2.stdout

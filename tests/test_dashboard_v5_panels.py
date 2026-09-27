@@ -69,6 +69,18 @@ def _v5_decision(frame: Path, overlays: dict) -> dict:
         # S5 单因归因与因子生效判定（方案 v2 §S5）：看板必须显示，否则
         # "无效因子/缺标注/资格失败"会被读成"模型没有提升空间"
         "round_outcome": "qualification_failure",
+        "eval_run_errors": [{"run": "logs/m5_seg/dev/front_main",
+                             "why": "probe refused: no camera"}],
+        "probe_frame_accounting": {"frames_processed": 12, "frames_skipped": 1,
+                                   "frames_unknown": 2, "frames_no_line_mask": 0,
+                                   "n_runs_measured": 2},
+        "negative_line_by_seed": {
+            "baseline": {"42": {"eligible_frames": 40,
+                                "false_positive_frame_rate": 0.05},
+                         "43": {"eligible_frames": 0,
+                                "false_positive_frame_rate": None}},
+            "candidate": {"42": {"eligible_frames": 40,
+                                 "false_positive_frame_rate": 0.025}}},
         "factor_activity": {"active": False,
                             "inactive_keys": ["line_tversky_weight"],
                             "why": "line_supervision=False（road-only）"},
@@ -251,7 +263,11 @@ def _write_run(tmp_path: Path, *, name: str = "run_v5",
     }), encoding="utf-8")
     dec = _v5_decision(frame, overlays)
     if not negative_line:
+        # "完全没有负例记录"要连逐 seed 那份一起去掉：只去掉池化字段的话，
+        # 页面会显示逐 seed 的真实比率（那是记录，不是假比率），而这条测试
+        # 想验的是"一条记录都没有时不许出现任何比率"
         dec.pop("negative_line")
+        dec.pop("negative_line_by_seed", None)
     (run / "decision_v5.json").write_text(
         json.dumps(dec, ensure_ascii=False), encoding="utf-8")
     # 数据准入门产物：去重/冲突/已见组/空间 UNKNOWN
@@ -353,6 +369,8 @@ def test_v5_panels_render_and_every_value_names_its_source(tmp_path):
                    "qualification_failure", "因子是否真生效: 否",
                    "line_tversky_weight",
                    "negative_line.candidate", "negative_line.baseline",
+                   "评价 run 缺测", "探针帧数账", "seed 43",
+                   "UNKNOWN（没有合格负例）",
                    "checkpoint_last.pt", "120.0"):
         assert needle in text, needle
     assert "来源: decision_v5.json: train_hist" not in text  # 来源写的是文件名+指标

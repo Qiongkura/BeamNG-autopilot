@@ -71,6 +71,8 @@ from beamng_autopilot.experiments.labels import (  # noqa: E402
 from beamng_autopilot.experiments.negative_scenes import (  # noqa: E402
     negative_training_eligibility,
 )
+# 计数契约的唯一实现（先加总整数再算比率）：模块级别名，供判定/重放共用
+from beamng_autopilot.experiments import candidate_metrics as _cm  # noqa: E402
 from beamng_autopilot.experiments.protocol import (  # noqa: E402
     COVERAGE_GATE_FROZEN, effective_source, eligibility, protocol_blob,
     snapshot_hash, sources_can_promote, verify_snapshot,
@@ -362,6 +364,7 @@ def cmd_replay(args) -> int:
     legacy: list = []         # 早于 v5 计数契约的判定（不能按新分母重判）
     proto: list = []          # 每个判定文件的协议快照自查结果
     tampered: list = []       # 快照内容与记录哈希不符（被改过/截断）
+    mismatch: list = []       # counts 与 counts_ratios 不是同一批数（T12②）
     for p in decs:
         blob = json.loads(p.read_text(encoding="utf-8"))
         # 协议快照自查（方案 §10.3）：内容与记录的哈希是否自洽、是否就是
@@ -387,6 +390,24 @@ def cmd_replay(args) -> int:
         if _note:
             legacy.append({"file": p.name, "note": _note})
             continue
+        # 计数↔比率一致性自查（T12②）：从 counts 重算池化比率，与存档的
+        # counts_ratios 比对。不一致 = 判定文件里的比率不是由这份计数派生的
+        # （手改/拼接）——"同计数不出现两套结果"必须能被查出来。
+        _cc = blob.get("counts") or {}
+        _stored_r = blob.get("counts_ratios")
+        if _cc and isinstance(_stored_r, dict):
+            _re = _cm.ratios(_cc)
+            _bad = {k: {"stored": _stored_r.get(k), "recomputed": _re.get(k)}
+                    for k in ("candidate_reference_coverage",
+                              "candidate_identity_rate",
+                              "left_right_role_agreement")
+                    if (_stored_r.get(k) is None) != (_re.get(k) is None)
+                    or (_stored_r.get(k) is not None
+                        and abs(float(_stored_r[k]) - float(_re[k])) > 1e-3)}
+            if _bad:
+                mismatch.append({"file": p.name, "fields": _bad})
+                print(f"  {p.name}: 计数与比率不一致（不是由这份 counts 派生）："
+                      f"{_bad}")
         compared = {name: spec for name, spec in blob["pairings"].items()}
         # 缺测清单**优先用判定文件里落盘的那份**：它可能含逐 seed/分场景缺测
         # 以及"新硬门未标定"这类不由 pairings 推导出来的条目；旧判定文件
@@ -423,10 +444,13 @@ def cmd_replay(args) -> int:
         print(f"  {lg['file']}: {lg['note']}")
     print(f"[autoloop] 重放 {len(decs)} 个判定：相同 {same}，不同 {len(diff)}"
           + (f"，早于 v5 计数契约 {len(legacy)}" if legacy else "")
-          + (f"，协议不一致 {len(tampered)}" if tampered else ""))
+          + (f"，协议不一致 {len(tampered)}" if tampered else "")
+          + (f"，计数↔比率不一致 {len(mismatch)}" if mismatch else ""))
     for d in diff:
         print(f"  {d['file']}: 决策或理由不一致 -> 判定不可复现")
-    return 0 if not diff and not tampered else 1
+    for m in mismatch:
+        print(f"  {m['file']}: counts 与 counts_ratios 不是同一批数（判定文件被改过？）")
+    return 0 if not diff and not tampered and not mismatch else 1
 
 
 # ---------------------------------------------------------------------------
@@ -1274,6 +1298,12 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
     acc: dict = {k: [] for k in IDENTITY_FIELDS}
     gacc: dict = {}          # 逐场景（map/source_id 组）明细
     run_errors: list = []    # 被跳过的评价 run（T11：缺测必须可见，不静默丢）
+    # 探针的**帧数账**（T11③：标定侧有、rounds/evaluate 链此前没有）：逐帧
+    # 处理/跳过/缺证据/无掩码的计数必须随判定落盘，否则"这个 run 到底测了几帧"
+    # 只能靠猜。
+    frame_acct = {"frames_processed": 0, "frames_skipped": 0,
+                  "frames_unknown": 0, "frames_no_line_mask": 0,
+                  "n_runs_measured": 0}
     for r in eval_runs:
         run = Path(r)
         meta = run / "meta.json"
@@ -1325,6 +1355,10 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
                 "why": ("probe refused: "
                         + str(res.get("reason") or "no summary returned"))})
             continue
+        frame_acct["n_runs_measured"] += 1
+        for _k in ("frames_processed", "frames_skipped", "frames_unknown",
+                   "frames_no_line_mask"):
+            frame_acct[_k] += int(summary.get(_k) or 0)
         # 整数计数（新口径的唯一来源）
         _c = summary.get("counts") or {}
         if _c:
@@ -1379,6 +1413,8 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
     # 缺测的 run 逐条可见（T11）：空列表 = 每个 run 都测到了
     out["eval_run_errors"] = run_errors
     out["n_eval_run_errors"] = len(run_errors)
+    # 帧数账（T11③）：与标定侧同一组键，判定文件里也要能看到
+    out["probe_frame_accounting"] = frame_acct
     return out
 
 
@@ -2624,10 +2660,16 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 # v5 计数契约（方案 v2 §S3.7）：判定必须自带**整数计数**，
                 # 否则 replay 无法按新分母重判（legacy_replay_note 会明确说明）。
                 "counts": _idc.get("counts") or {},
+                # 由 counts **派生**的池化比率（micro 口径）：replay 用它自查
+                # "计数与比率是不是同一批数"——只存 counts 的话，手改过的比率
+                # 查不出来（复核者 T12②）。它与 hard_gate 的逐 seed 均值不是
+                # 同一口径（micro vs macro），不能混比。
+                "counts_ratios": _cm.ratios(_idc.get("counts") or {}),
                 "counts_by_group": _idc.get("counts_by_group") or {},
                 # 评价 run 的缺测（T11）：空列表才是"每个 run 都测到了"，
                 # 有内容时必须能在判定文件/看板上看到，不许当成 0 候选
                 "eval_run_errors": _idc.get("eval_run_errors") or [],
+                "probe_frame_accounting": _idc.get("probe_frame_accounting") or {},
                 "scene_counts": _scene_counts,
                 # 逐场景适用性（measured/not_applicable/unknown）：只写
                 # scene_counts 的话，看板只能显示"无数据"，看不到

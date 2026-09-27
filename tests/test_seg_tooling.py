@@ -548,3 +548,27 @@ class TestEvalMatrixPerScene:
         assert all(v.get("n_frames") == 2 for v in got.values()), got
         # 总体仍在（形状不变，老调用方不受影响）
         assert "line_iou" in blob["frozen"]["m"], blob["frozen"]["m"]
+
+
+class TestEmptyPredictionIsMeasuredZeroNotUnknown:
+    """T09②：真值有线、预测为空 -> recall 实测 0；precision 无分母 -> null。
+
+    复核者指出这条行为正确但**没有专项测试钉住**（可被改坏而不报警）。
+    """
+
+    def test_truth_with_empty_prediction_gives_recall_zero(self):
+        import importlib.util
+        import sys as _sys
+        spec = importlib.util.spec_from_file_location(
+            "m5_seg_eval_matrix_math",
+            _TRAIN_PATH.parent / "m5_seg_eval_matrix.py")
+        em = importlib.util.module_from_spec(spec)
+        _sys.modules["m5_seg_eval_matrix_math"] = em
+        spec.loader.exec_module(em)
+        # 真值 5 px 标线、预测 0 px（空预测）
+        acc = {"tp_px": 0, "fp_px": 0, "fn_px": 5, "gt_line_px": 5,
+               "pred_line_px": 0, "pred_line_known_px": 0}
+        m = em.totals_to_metrics(acc, n_frames=1, ms=[])
+        assert m["line_recall"] == 0.0, "有线真值 + 空预测 = 实测 0，不是 UNKNOWN"
+        assert m["line_precision"] is None, "没有预测就没有 precision 的分母"
+        assert m["line_iou"] == 0.0

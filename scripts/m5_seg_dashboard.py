@@ -2788,6 +2788,18 @@ def _v5_learning_block(ctx: dict, it: dict) -> str:
     # 必须显示——无效因子/缺标注/资格失败各自另有原因，不能读成"没有提升空间"
     if blob.get("round_outcome") is not None:
         act.append("单因归因: " + _esc(str(blob.get("round_outcome"))))
+    _errs = blob.get("eval_run_errors")
+    if _errs:
+        act.append("评价 run 缺测: " + _esc(f"{len(_errs)} 个没测到")
+                   + "（判定记 UNKNOWN，不当 0 候选）："
+                   + _esc(str((_errs[0] or {}).get("why") or "")[:120]))
+    _acct = blob.get("probe_frame_accounting")
+    if isinstance(_acct, dict) and _acct:
+        act.append("探针帧数账: " + _esc(
+            f"处理 {_acct.get('frames_processed')} / 跳过 {_acct.get('frames_skipped')}"
+            f" / 缺证据 {_acct.get('frames_unknown')}"
+            f" / 无掩码 {_acct.get('frames_no_line_mask')}"
+            f"（测到 {_acct.get('n_runs_measured')} 个 run）"))
     fa = blob.get("factor_activity")
     if isinstance(fa, dict):
         act.append("因子是否真生效: "
@@ -3134,6 +3146,23 @@ def _v5_negative_block(ctx: dict, it: dict) -> str:
            "；与 offroad_false_ratio 的分母不同（"
            + _esc(str(NEGATIVE_DIAGNOSTIC.get("not_comparable_with") or ""))
            + "）。</p>"]
+    # 逐 seed 的负例诊断（复核者 T16②：看板原来不读它）：合格负例的假线帧率
+    # 逐 seed 必须可见——一个坏 seed 不能被池化值吞掉（方案 §10.2 同一纪律）。
+    _per_seed_nl = blob.get("negative_line_by_seed")
+    if isinstance(_per_seed_nl, dict):
+        for _arm, _seeds in sorted(_per_seed_nl.items()):
+            if not isinstance(_seeds, dict):
+                continue
+            for _s, _v in sorted(_seeds.items()):
+                _r = (_v or {}).get("false_positive_frame_rate")
+                _n = (_v or {}).get("eligible_frames")
+                out.append(f'<p class="mono">{_esc(str(_arm))} seed {_esc(str(_s))}: '
+                           f'合格负例 {_esc(str(_n))} 帧，假线帧率 '
+                           + ("UNKNOWN（没有合格负例）" if _r is None
+                              else _esc(f"{100 * float(_r):.2f}%"))
+                           + f' <span class="src">来源: {_esc(fname)}: '
+                             f'negative_line_by_seed.{_esc(str(_arm))}.{_esc(str(_s))}'
+                             f'</span></p>')
     entries = []
     nl = blob.get("negative_line")
     if isinstance(nl, dict):
