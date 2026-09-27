@@ -197,3 +197,37 @@ def test_confirmation_record_records_what_was_measured(tmp_path):
     assert rec["seal_digest"] and rec["protocol_hash"] == "ph-1"
     assert rec["results"]["overall"]["line_recall"] == 0.5
     assert rec["notes"] == ["identity probe not run"]
+
+
+def test_the_confirmation_record_carries_the_same_counting_contract() -> None:
+    """T12：最终确认与标定/循环/评价用**同一套计数契约**。
+
+    复核者指出确认记录只留了比率；比率之外还必须留 v5 的整数计数与负例诊断，
+    否则 R2 证据里看不到同一套分母（"没测"与"测到 0"分不清）。
+    """
+    from beamng_autopilot.experiments.final_set import confirmation_results
+
+    metrics = {
+        "line_recall": 0.71, "line_precision": 0.4, "line_iou": 0.2,
+        "road_iou": 0.9, "n_frames": 40, "offroad_false_frac_of_pred": 0.02,
+        "inference_ms_p95": 18.0, "device": "cuda",
+        "counts": {"P_frames": 3, "C": 10, "R": 8, "M": 4, "L": 4, "A": 3,
+                   "C_outside_P": 1},
+        "negative_line": {"status": "measured", "eligible_frames": 12,
+                          "false_positive_frame_rate": 0.0},
+        "per_group": {"italy/ring_a": {
+            "line_recall": 0.7, "n_frames": 20,
+            "counts": {"P_frames": 2, "C": 5, "R": 5, "M": 2, "L": 2, "A": 2,
+                       "C_outside_P": 0},
+            "negative_line": {"status": "no_eligible_frames"}}},
+    }
+    res = confirmation_results(metrics, model_path="m.pt", model_sha16="deadbeef")
+    assert res["overall"]["counts"]["R"] == 8
+    assert res["overall"]["negative_line"]["status"] == "measured"
+    assert res["overall"]["line_recall"] == 0.71
+    assert res["per_group"]["italy/ring_a"]["counts"]["C"] == 5
+    assert "same implementation" in res["counts_contract"]
+    # 矩阵没给 counts 时不能凭空造：字段不出现（读的人据此知道"没留"）
+    bare = confirmation_results({"line_recall": 0.5}, model_path="m.pt",
+                                model_sha16="x")
+    assert "counts" not in bare["overall"]

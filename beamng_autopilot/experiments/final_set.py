@@ -130,6 +130,41 @@ def confirmation_record(*, seal_dir, protocol_hash: str, candidate_id: str,
     }
 
 
+#: 最终确认记录里保留的逐场景/总体口径（与 `m5_final_set.py` 一致）
+CONFIRMATION_KEEP = ("line_recall", "line_precision", "offroad_false_frac_of_pred",
+                     "line_iou", "road_iou", "n_frames", "inference_ms_p95")
+
+
+def confirmation_results(metrics: dict, *, model_path: str,
+                         model_sha16: str) -> dict:
+    """从评估矩阵输出挑出**最终确认记录**要留的字段（方案 §7/T12）。
+
+    要点：确认与标定/循环/评价用**同一套计数契约**，所以除了比率，还要把
+    v5 的**整数计数**（``counts``）与负例诊断（``negative_line``）一起留档——
+    否则 R2 的证据里看不到同一套分母，读的人分不清"没测"与"测到 0"。
+    逐场景同样保留（含 ``applicability`` 若矩阵给了）。
+    """
+    keep = CONFIRMATION_KEEP
+
+    def _pick(m: dict) -> dict:
+        out = {k: (m or {}).get(k) for k in keep}
+        for k in ("counts", "negative_line", "device"):
+            if (m or {}).get(k) is not None:
+                out[k] = m[k]
+        return out
+
+    per_group = {g: _pick(m) for g, m in ((metrics or {}).get("per_group") or {}).items()}
+    return {
+        "per_group": per_group,
+        "overall": _pick(metrics or {}),
+        "model": str(model_path),
+        "model_sha16": str(model_sha16),
+        # 同一套计数契约的证据：确认记录里也带整数计数与负例诊断
+        "counts_contract": ("v5 integer counters included (same implementation as "
+                            "calibration/rounds/evaluate: candidate_metrics)"),
+    }
+
+
 def confirmation_check(rec: dict | None, *, protocol_hash: str,
                        candidate_id: str, model_sha16: str | None = None,
                        seal_digest: str | None = None) -> dict:
