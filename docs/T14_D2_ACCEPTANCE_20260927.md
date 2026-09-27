@@ -66,8 +66,15 @@
   不进 `eval_run_errors`；不完整计数无告警）、T12①③（`evaluate` 的计数来源、
   逐 seed 原始计数落盘）、T13（`SNAPSHOT_FIELDS` 增长误杀 54 个合法旧判定，
   现按"当时字段集"重算并标注规则）。
-  仍未闭合的（如实记录）：`evaluate` 入口本身不产生 v5 计数（无 runs/模型，
-  已写 `counts_provenance` 说明）；replay 用存档 pairings 重跑 `decide()`、
-  不从 `counts` 重算比率。
+  二次复核的 4 个 partial 里**点名子项已全部闭合**：
+  * T09② 空预测的 recall=0 有专项测试钉住；
+  * T11③ 探针帧数账（处理/跳过/缺证据/无掩码）随判定落盘；
+  * T12② 判定文件带 `counts_ratios`（由 counts 派生），replay 从 counts 重算并与
+    它比对——**手改过的比率会被抓出来**（rc=1，"计数↔比率不一致"）；
+  * T16② 看板显示 `eval_run_errors` 与逐 seed 假线帧率（没有合格负例的 seed 显示
+    UNKNOWN 而不是 0）。
+  结构性说明（不是缺口，是入口定位）：`evaluate` 只消费外部 pairings/hard-gate
+  文件、本身不测量，已写 `counts_provenance` 说明；replay 重跑 `decide()` 复现
+  决策，计数一致性由上面的自检覆盖。
 * 本轮的两处自查缺陷（唯一清单键不匹配 → 身份率静默 UNKNOWN；白名单三处漂移 →
   全量回归失败）都记录了证据与修复，失败产物保留在 `logs/experiments/`。
