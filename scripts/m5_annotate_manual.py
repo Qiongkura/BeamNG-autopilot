@@ -738,9 +738,15 @@ def main() -> int:
         frames, idents, label_for=_initial_label, on_save=_on_save,
         zoom=2, brush=6, cls=CLS_LINE, tool="pen", window_title=WIN)
     cv2.namedWindow(WIN)
-    cv2.setMouseCallback(
-        WIN, lambda event, x, y, flags, _param: session.on_mouse(event, x, y,
-                                                                flags))
+    # 回调里**绝不能让异常穿出去**：cv2 的回调抛异常会直接结束进程，留下
+    # 点不动也关不掉的僵尸窗口（实测踩到）。捕获、打印、继续。
+    def _safe_mouse(event, x, y, flags, _param=None):
+        try:
+            session.on_mouse(event, x, y, flags)
+        except Exception as exc:                          # noqa: BLE001
+            print(f"[annotate] mouse event ignored: {type(exc).__name__}: {exc}",
+                  flush=True)
+    cv2.setMouseCallback(WIN, _safe_mouse)
     cv2.createTrackbar("brush", WIN, 6, 40, _brush_cb)
     while True:
         try:
@@ -752,7 +758,13 @@ def main() -> int:
             # 标注继续。
             cv2.createTrackbar("brush", WIN, int(session.brush), 40, _brush_cb)
         # waitKey 的原始值直接交给会话：方向键是大码，先 & 0xFF 就再也认不出来
-        action = session.on_key(cv2.waitKey(20))
+        try:
+            action = session.on_key(cv2.waitKey(20))
+        except Exception as exc:                          # noqa: BLE001
+            # 键盘回调同样不许炸进程（炸了就丢未保存的帧 + 僵尸窗口）
+            print(f"[annotate] key ignored: {type(exc).__name__}: {exc}",
+                  flush=True)
+            action = None
         cv2.imshow(WIN, session.canvas())
         if action == "finish":
             print("[annotate] all frames done")

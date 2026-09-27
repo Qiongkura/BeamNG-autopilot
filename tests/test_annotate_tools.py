@@ -733,3 +733,23 @@ def test_every_button_has_a_name_in_both_languages():
         assert it.ascii.strip(), it.id
     assert at.button_text(at.ITEM_BY_ID["cls_road"]) == "路面(2)"
     assert at.button_text(at.ITEM_BY_ID["cls_road"], variant="ascii") == "Road(2)"
+
+
+def test_mouse_move_over_the_toolbar_does_not_raise():
+    """实测回归：`hit.item.id` 写错 -> 第一次鼠标移动就 AttributeError。
+
+    异常穿出 OpenCV 回调会直接杀掉标注进程，留下点不动也关不掉的僵尸窗口
+    （用户第一次点击就撞上）。这里钉住：工具栏上的鼠标移动必须只更新 hover、
+    不抛异常。
+    """
+    sess = _mk(1)
+    for item_id in ("pen", "curve", "clear"):
+        b = sess.layout().button(item_id)
+        if b is None:
+            continue
+        x, y = b.center
+        assert sess.on_mouse(cv2.EVENT_MOUSEMOVE, x, y) in (True, False)
+        assert sess._hover_id == item_id, (item_id, sess._hover_id)
+    # 画面区域（不在工具栏上）移动：hover 应清空，且不抛
+    sess.on_mouse(cv2.EVENT_MOUSEMOVE, 5, sess.canvas().shape[0] - 5)
+    assert sess._hover_id is None

@@ -407,7 +407,11 @@ class AnnotateSession:
         hit = self.layout().hit(x, y)
         if event == cv2.EVENT_MOUSEMOVE:
             changed = False
-            hover = hit.item.id if hit is not None else None
+            # `Layout.hit()` 返回的就是 Item 本身（见 annotate_tools.hit 的
+            # 签名）——原来写 `hit.item.id`，**第一次鼠标移动就 AttributeError**，
+            # 异常穿出 OpenCV 回调把进程杀掉，留下点不动也关不掉的僵尸窗口
+            # （实测：用户第一次点击就撞上）。
+            hover = hit.id if hit is not None else None
             if hover != self._hover_id:
                 self._hover_id = hover
                 changed = True

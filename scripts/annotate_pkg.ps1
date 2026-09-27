@@ -29,6 +29,12 @@ $ErrorActionPreference = 'Continue'
 
 $py = Join-Path $Repo '.venv\Scripts\python.exe'
 if (-not (Test-Path $py)) { Write-Error "python venv not found: $py"; exit 2 }
+# 子进程**不缓冲**输出：实测踩到——标注器被强关（点窗口的 X / 被杀）时，Python 的
+# 缓冲 stdout 会连同"为什么崩"一起丢掉，日志里只剩一句退出码，无法定位。
+$env:PYTHONUNBUFFERED = '1'
+# 窗口被强关时 OpenCV 可能直接结束进程（不会走我们的收尾）——所以每跑完一个视角
+# 都重新检查一次进程/窗口状态，并明确告诉用户"关窗口请用 q，不要点 X"。
+$env:PYTHONIOENCODING = 'utf-8'
 $pkgRoot = Join-Path $Repo $Package
 if (-not (Test-Path $pkgRoot)) { Write-Error "package not found: $pkgRoot"; exit 3 }
 
@@ -70,7 +76,9 @@ foreach ($v in $found) {
     }
     Write-Host ("[annotate] {0}/{1} 打开 {2}（关掉窗口后自动进下一个）" -f $i, $found.Count, $v) -ForegroundColor Cyan
     Push-Location $Repo
-    try { & $py @argv } finally { Pop-Location }
+    Write-Host ("[annotate] 提示：画完/退出请按 q（点窗口右上角的 X 可能直接杀掉进程、" -f $null) -ForegroundColor DarkGray
+    Write-Host ("[annotate]       留下关不掉的空窗口）。画线用鼠标拖动；工具栏按钮也能点。" -f $null) -ForegroundColor DarkGray
+    try { & $py -u @argv } finally { Pop-Location }
     if ($LASTEXITCODE -ne 0) {
         Write-Host ("[annotate] {0} 退出码 {1}：停下来，别继续标下一个（先查这个视角）" -f $v, $LASTEXITCODE) -ForegroundColor Red
         exit 5
