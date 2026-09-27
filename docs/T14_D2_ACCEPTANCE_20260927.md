@@ -45,7 +45,15 @@
 
 ## 4. 复核与独立性
 
-* 本轮独立复核（第二个复核者、与实现者不同）见 `T14_T01_T16_REVIEW_V2_20260927.md`；
-  第一次复核见 `T14_T01_T16_REVIEW_20260926.md`。
+* 本轮独立复核（第二个复核者、与实现者、与第一次复核者都不同）见
+  `T14_T01_T16_REVIEW_V2_20260927.md`：**12 covered / 4 partial / 0 missing**
+  （第一次为 8/8/0）。它点名的缺口已在本轮修复并有测试：T16（看板只认扁平
+  `negative_line`，真实两臂判定被渲染成"无数据"）、T09/T11（探针结构化 refusal
+  不进 `eval_run_errors`；不完整计数无告警）、T12①③（`evaluate` 的计数来源、
+  逐 seed 原始计数落盘）、T13（`SNAPSHOT_FIELDS` 增长误杀 54 个合法旧判定，
+  现按"当时字段集"重算并标注规则）。
+  仍未闭合的（如实记录）：`evaluate` 入口本身不产生 v5 计数（无 runs/模型，
+  已写 `counts_provenance` 说明）；replay 用存档 pairings 重跑 `decide()`、
+  不从 `counts` 重算比率。
 * 本轮的两处自查缺陷（唯一清单键不匹配 → 身份率静默 UNKNOWN；白名单三处漂移 →
   全量回归失败）都记录了证据与修复，失败产物保留在 `logs/experiments/`。
