@@ -1518,7 +1518,8 @@ def _safe(fn, code: str, frame_id, rejections: list, stats: dict):
 
 
 def verify_batch(batch, *, expected=None,
-                 line_evidence: str = "annotation") -> dict:
+                 line_evidence: str = "annotation",
+                 occlusion_margin_m: float = OCCLUSION_MARGIN_M) -> dict:
     """批次校验汇总（契约见模块 docstring）。
 
     返回 ``{ok, rejections, channels, stats}``：
@@ -1527,6 +1528,12 @@ def verify_batch(batch, *, expected=None,
     * ``channels`` 来自 `channel_eligibility`（逐通道独立，不合格不替别人背书）；
     * ``stats`` 给证据计数（投影 checked/mismatch、遮挡 unknown_px、黑图数、
       逐帧 sha 等）——没有证据的通道在报告里必须是 unknown，不是通过。
+
+    ``occlusion_margin_m``：遮挡审计的余量（米），透传给 `occlusion_audit`。
+    默认 0.5 m 是给**高精度深度**的；uint8 量化 + 标定残差 ~0.6 m 的通道上，
+    0.5 m 低于噪声底会产生成片假 `OCCLUSION_INSERT`（实测：导出批次因此全部
+    写不出 engine_verified）。调用方按通道实测精度给（如 3× 默认）并**记录**
+    这个值，读的人才知道遮挡判据有多紧。
 
     ``line_evidence``：线点的证据源，透传给 `verify_projection`
     （``"annotation"`` = label 类别；``"appearance"`` = 经深度校验的 RGB 外观，
@@ -1663,7 +1670,8 @@ def verify_batch(batch, *, expected=None,
             if audit["flipped"]:
                 _add(CAMERA_FLIP, fid, audit["why"])
         # 6. 遮挡
-        occ = _safe(lambda f=frame: occlusion_audit(f), OCCLUSION_INSERT, fid,
+        occ = _safe(lambda f=frame: occlusion_audit(
+            f, margin_m=float(occlusion_margin_m)), OCCLUSION_INSERT, fid,
                     rejections, stats)
         if occ is not None:
             occ_occluded += occ["occluded_px"]
@@ -1706,7 +1714,7 @@ def verify_batch(batch, *, expected=None,
                        "ignored": proj_ignored, "occluded": proj_occluded,
                        "skipped": proj_skipped, "radius_px": PROJECTION_RADIUS_PX},
         "occlusion": {"occluded_px": occ_occluded, "unknown_px": occ_unknown,
-                      "margin_m": OCCLUSION_MARGIN_M},
+                      "margin_m": float(occlusion_margin_m)},
         "line_evidence": str(line_evidence),
         "line_distance_px": {
             "n": sum(int((v or {}).get("line_distance", {}).get("n") or 0)
