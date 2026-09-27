@@ -625,7 +625,30 @@ def legacy_replay_note(blob) -> str | None:
     """
     if _v5_counts_evidence(blob) is not None:
         return None
+    prov = (blob or {}).get("counts_provenance")
+    if prov:
+        # 设计上就不带计数的入口（例如 `evaluate` 只消费外部 pairings/hard-gate
+        # 文件）：说清"不是旧记录，而是这里没有测量"，别让它被读成"早于 v5"
+        return (f"this decision carries no counters by design ({prov}); it was not "
+                "measured through the counting contract - re-measure via "
+                "rounds/calibration, do not backfill zeros")
     return LEGACY_REPLAY_NOTE
+
+
+def counts_completeness_note(blob) -> str | None:
+    """计数是否**完整**：有评价 run 没测到（``eval_run_errors`` 非空）时给出告警。
+
+    与 :func:`legacy_replay_note` 分开是有意的（复核者 T11② 发现"全 0 的 counts
+    也会被当成实测证据"）：重放比较用的是存档 pairings，**能不能重放**与
+    "计数完不完整"是两件事。这里只做**可见性**：不完整就写出来，让读者不会把
+    "实测 0"与"没测到"混在一起；不改变任何门的通过/拒绝。
+    """
+    errs = (blob or {}).get("eval_run_errors")
+    if not errs:
+        return None
+    return (f"{len(errs)} evaluation run(s) were never measured (see "
+            "eval_run_errors): the v5 counters are INCOMPLETE - a re-judge would "
+            "mix measured with unmeasured runs")
 
 
 def threshold_violations(measured: dict, thresholds: Thresholds) -> list:

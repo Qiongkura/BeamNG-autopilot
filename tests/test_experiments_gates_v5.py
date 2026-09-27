@@ -270,3 +270,41 @@ def test_the_v4_thresholds_file_restates_v3_numbers_under_the_v5_wording():
                    "no threshold"):
         assert needle in text, (needle, text)
     assert "v5" in b["source"] and "v5" in v4["note"], text
+
+
+def test_an_incomplete_counter_blob_gets_a_visible_note_but_still_replays() -> None:
+    """T11②（复核者发现）：全 0 的 counts 不能静默当"实测证据"。
+
+    计数不完整（有评价 run 没测到）必须**可见**；但"能不能重放"是另一件事
+    （重放用存档 pairings），两者不能混成一个门——否则会误伤可重放的记录。
+    """
+    from beamng_autopilot.experiments.gates import (
+        LEGACY_REPLAY_NOTE, counts_completeness_note, legacy_replay_note)
+
+    blob = {"counts": {"P_frames": 0, "C": 0, "R": 0, "M": 0, "L": 0, "A": 0,
+                       "C_outside_P": 0},
+            "eval_run_errors": [{"run": "x", "why": "probe refused"}]}
+    note = counts_completeness_note(blob)
+    assert note and "INCOMPLETE" in note and "never measured" in note
+    assert legacy_replay_note(blob) is None, \
+        "有计数键就仍然可重放（不完整≠不可重放），不完整由上面那条单独说"
+    # 完整时没有告警
+    assert counts_completeness_note({"counts": blob["counts"]}) is None
+    # 真·旧记录（无计数键、无 provenance）仍然判"早于 v5"
+    assert legacy_replay_note({"decision": {}}) == LEGACY_REPLAY_NOTE
+
+
+def test_a_decision_without_counters_by_design_says_so() -> None:
+    """`evaluate` 只消费外部 pairings/hard-gate 文件，设计上不带计数。
+
+    复核者 T12①：这种判定原来被 `legacy_replay_note` 读成"早于 v5 计数契约"，
+    读起来像"历史遗留"，实际是"这个入口本来就不测量"。写清 provenance 后按
+    事实说明，并且**不允许**补 0。
+    """
+    from beamng_autopilot.experiments.gates import legacy_replay_note
+
+    note = legacy_replay_note({
+        "decision": {"decision": "needs_evidence"},
+        "counts_provenance": "evaluate consumes external pairings/hard-gate files"})
+    assert note and "by design" in note and "do not backfill zeros" in note
+    assert "predates" not in note
