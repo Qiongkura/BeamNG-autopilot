@@ -121,3 +121,45 @@ def test_a_mixed_pack_is_flagged_not_hidden(tmp_path):
     assert rep["ok"] is True
     assert rep["kind"] == "mixed"
     assert any("按用途分别使用" in n for n in rep["notes"]), rep["notes"]
+
+
+def test_a_frame_whose_content_does_not_match_its_name_is_refused(tmp_path):
+    """实测回归：保存名先自增 -> 整批错位 +1，标注会贴到错的帧上。
+
+    导出帧自带 `identity_json.identity_provenance`，写明它来自哪个源文件——
+    与自己的文件名不符就必须拒绝（这次是靠人工看出来的，应该自动抓到）。
+    """
+    mod = _load()
+    d = tmp_path / "mis" / "front_main"
+    d.mkdir(parents=True)
+    frames = []
+    for i in range(3):
+        lab = np.zeros((12, 16), np.uint8)
+        # 故意错位：frame_00001 里装 frame_00000 的身份
+        src = f"npz:frame_{max(0, i - 1):05d}.npz"
+        np.savez(d / f"frame_{i:05d}.npz", colour=np.full((12, 16, 3), 20 + i,
+                                                          np.uint8), label=lab,
+                 exposure=i, identity_json=json.dumps(
+                     {"identity_provenance": {"pos": src}}))
+        frames.append({"path": f"front_main/frame_{i:05d}.npz", "view": "front_main",
+                       "exposure": i, "pos": [1.0, 2.0, 3.0],
+                       "classes_painted": {"line": 0, "road": 10}})
+    (d / "meta.json").write_text(json.dumps({
+        "map_name": "italy", "source_id": "ring_mis",
+        "label_source": "human_revision",
+        "annotation": {"reviewer": "owner", "identity_missing": []},
+        "frames": frames}), encoding="utf-8")
+    rep = mod.check_dir(d)
+    assert rep["ok"] is False
+    assert any("内容与文件名对不上" in r for r in rep["reasons"]), rep["reasons"]
+
+
+def test_an_extra_frame_that_is_not_part_of_the_batch_is_refused(tmp_path):
+    """越界名/多余文件（同一 bug 的另一半）也必须拒绝。"""
+    mod = _load()
+    d = _annotated(tmp_path, "extra", line_px=0)
+    np.savez(d / "frame_00099.npz", colour=np.full((12, 16, 3), 9, np.uint8),
+             label=np.zeros((12, 16), np.uint8))
+    rep = mod.check_dir(d)
+    assert rep["ok"] is False
+    assert any("不属于本批的帧" in r for r in rep["reasons"]), rep["reasons"]

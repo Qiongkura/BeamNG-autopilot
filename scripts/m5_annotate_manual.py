@@ -674,10 +674,19 @@ def main() -> int:
     def _on_save(fi, rgb, src_idx, label, unk, road_type, ident):
         """保存一帧：导出 npz + 预览图 + 逐帧记录（复标帧覆盖自己的输出）。"""
         if fi not in saved_paths:
-            save_i[0] += 1
+            # 输出名**跟随源帧名**：包里的帧是按队列逐帧点名的（frame_00000…），
+            # 先自增再命名会让整批错位 +1（实测踩到：15 帧标注后目录里多出一个
+            # 未标注的原帧、还多出一个越界名，就绪核对因此拒绝——而名字错了，
+            # 后续按名取帧/写侧车都会跟着错）。
+            src_name = Path(str(ident.get("source_path") or "")).name
+            if not src_name.endswith(".npz"):
+                # 拿不到源名（例如从 episode 标注）才退回序号命名
+                save_i[0] += 1
+                src_name = f"frame_{save_i[0]:05d}.npz"
             saved_paths[fi] = (
-                out_dir / f"frame_{save_i[0]:05d}.npz",
-                out_dir / f"preview_{save_i[0]:05d}.png")
+                out_dir / src_name,
+                out_dir / ("preview_" + src_name.split("frame_", 1)[-1]
+                           .replace(".npz", ".png")))
         fp, prev = saved_paths[fi]
         export_frame(fp, rgb, label, ident, unknown_kind=unk,
                      road_type=road_type)
@@ -734,7 +743,14 @@ def main() -> int:
                                                                 flags))
     cv2.createTrackbar("brush", WIN, 6, 40, _brush_cb)
     while True:
-        session.set_brush(max(1, cv2.getTrackbarPos("brush", WIN)))
+        try:
+            session.set_brush(max(1, cv2.getTrackbarPos("brush", WIN)))
+        except cv2.error:
+            # 窗口被重建（实测：某些按键路径会重建窗口，轨迹条随之消失）时，
+            # getTrackbarPos 会断言失败——原来那会把整个会话炸掉、丢掉未保存的
+            # 帧（实测 pillar_right 就这样崩了）。这里按会话当前画笔重建轨迹条，
+            # 标注继续。
+            cv2.createTrackbar("brush", WIN, int(session.brush), 40, _brush_cb)
         # waitKey 的原始值直接交给会话：方向键是大码，先 & 0xFF 就再也认不出来
         action = session.on_key(cv2.waitKey(20))
         cv2.imshow(WIN, session.canvas())

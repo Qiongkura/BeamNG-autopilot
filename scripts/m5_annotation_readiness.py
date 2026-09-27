@@ -69,6 +69,12 @@ def check_dir(d: Path) -> dict:
         out["reasons"].append("目录里没有 frame_*.npz")
         return out
     unlabeled, line_px = [], []
+    # 帧名 ↔ 帧内身份**对齐检查**（实测踩到：保存名先自增 -> 整批错位 +1，
+    # 目录里同时多出未标注原帧与越界名）。导出帧自带 identity_provenance，
+    # 它写明这一帧来自哪个源文件——与自己的文件名不符就是错位。
+    misaligned: list = []
+    expected_names = {Path(str(fr.get("path") or "")).name
+                      for fr in (meta.get("frames") or []) if fr.get("path")}
     by_name = {str(fr.get("path", "")).split("/")[-1]: fr
                for fr in (meta.get("frames") or [])}
     for f in frames:
@@ -82,6 +88,42 @@ def check_dir(d: Path) -> dict:
             continue
         cp = (by_name.get(f.name) or {}).get("classes_painted") or {}
         line_px.append(int(cp.get("line", int((z["label"] == 2).sum()))))
+        _prov = ""
+        if "identity_json" in z.files:
+            try:
+                _ij = json.loads(str(z["identity_json"].item()
+                                     if getattr(z["identity_json"], "size", 1) == 1
+                                     else z["identity_json"]))
+                _prov = str((_ij.get("identity_provenance") or {}).get("pos")
+                            or (_ij.get("identity_provenance") or {}).get("exposure")
+                            or "")
+            except Exception:                          # noqa: BLE001
+                _prov = ""
+        if _prov.startswith("npz:"):
+            _src = Path(_prov.split("npz:", 1)[1]).name
+            if _src and _src != f.name:
+                misaligned.append((f.name, _src))
+        elif "exposure" in z.files:
+            _exp_meta = (by_name.get(f.name) or {}).get("exposure")
+            if _exp_meta is not None:
+                try:
+                    if int(z["exposure"]) != int(_exp_meta):
+                        misaligned.append((f.name, f"exposure={int(z['exposure'])}"
+                                                   f" vs meta {int(_exp_meta)}"))
+                except Exception:                      # noqa: BLE001
+                    pass
+    if misaligned:
+        out["misaligned_frames"] = misaligned[:5]
+        out["reasons"].append(
+            f"{len(misaligned)} 帧的**内容与文件名对不上**（例如 "
+            f"{misaligned[0][0]} 实际来自 {misaligned[0][1]}）：标注会贴到错的帧上，"
+            "必须重标或按源名改正后再用")
+    if expected_names:
+        _extra = sorted({f.name for f in frames} - expected_names)
+        if _extra:
+            out["reasons"].append(
+                f"目录里有不属于本批的帧（多余文件）：{_extra[:3]}——"
+                "通常说明保存命名与源帧名不一致")
     out["unlabeled_frames"] = len(unlabeled)
     if unlabeled:
         out["reasons"].append(
