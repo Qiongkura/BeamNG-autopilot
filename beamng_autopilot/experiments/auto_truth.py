@@ -312,8 +312,185 @@ def _line_truth_points(frame) -> list[dict]:
     return [p for p in _truth_points(frame) if int(p.get("class", 0)) == 2]
 
 
+# ── 0. 漆线外观判据（贴花不被 annotation 标注时的替代证据）────────────────────
+#: 白线判据 = **中性白**（亮度高、色度低）**或暖白**（亮度高、r-b 够大）。
+#: 阈值依据（实测 2026-09-27，受控场景 + italy 渲染）：
+#: * 渲染出来的白线像素中位 RGB ≈ (195,174,143)——**暖白**（r-b≈52、chroma≈50），
+#:   第一版"chroma≤30"把它全判成不是线（like=1/32，实测踩到）；
+#: * 沥青路面中位 (164,163,163)（中性灰、max≈164）——所以亮度门必须 ≥185；
+#: * 蓝线材质 (125,137,146) 不该被白/黄判据命中（蓝线是另一类标线，
+#:   外观证据只覆盖白/黄，报告里要写明）。
+#: 黄线按**黄度**（r-b）判：淡黄 (238,230,120) r-b=118 该过，
+#: 土肩 (150,120,86) r-b=64 必须不过（材质混合场景里土肩就是干扰项）。
+#: 这是**受控场景**的证据阈值：换场景/光照/材质要重新标定并写进报告。
+LINE_WHITE_MIN = 185
+LINE_WHITE_CHROMA = 30
+LINE_WARM_WHITE_RB = 25
+LINE_YELLOW_RG_MIN = 135
+LINE_YELLOW_B_MAX = 130
+LINE_YELLOW_RB_MIN = 90
+
+
+def line_appearance(rgb, u, v, *, radius_px: int = 2) -> dict:
+    """投影点邻域是否呈现漆线外观：``{line_like, white, yellow, max, min, chroma}``。
+
+    方案 §4.2：当实例/annotation 输出区分不了贴花时，用**经深度遮挡校验的
+    投影 + 渲染外观**作为证据。这里只做外观部分；可见性由调用方用深度判。
+    """
+    a = np.asarray(rgb)
+    out = {"line_like": False, "white": False, "yellow": False,
+           "max": None, "min": None, "chroma": None}
+    if a.ndim != 3 or a.shape[2] < 3 or a.size == 0:
+        return out
+    h, w = a.shape[:2]
+    x, y = int(round(float(u))), int(round(float(v)))
+    if not (0 <= x < w and 0 <= y < h):
+        return out
+    win = a[max(0, y - radius_px):y + radius_px + 1,
+            max(0, x - radius_px):x + radius_px + 1, :3].astype(np.int16)
+    mx = win.max(axis=2)
+    mn = win.min(axis=2)
+    r, g, b = win[:, :, 0], win[:, :, 1], win[:, :, 2]
+    neutral_white = (mx >= LINE_WHITE_MIN) & ((mx - mn) <= LINE_WHITE_CHROMA)
+    warm_white = (mx >= LINE_WHITE_MIN) & ((r - b) >= LINE_WARM_WHITE_RB)
+    white = neutral_white | warm_white
+    yellow = (r >= LINE_YELLOW_RG_MIN) & (g >= LINE_YELLOW_RG_MIN) & \
+        (b <= LINE_YELLOW_B_MAX) & (np.abs(r - g) <= 45) & \
+        ((r - b) >= LINE_YELLOW_RB_MIN)
+    out.update(white=bool(white.any()), yellow=bool(yellow.any()),
+               line_like=bool(white.any() or yellow.any()),
+               max=int(mx.max()), min=int(mn.min()),
+               chroma=int((mx - mn).max()))
+    return out
+
+
+def appearance_line_check(frame, *,
+                          radius_px: int = PROJECTION_RADIUS_PX) -> dict:
+    """逐线真值点做"可见 + 外观像线"检查（生成侧真值的替代证据）。
+
+    与 `verify_projection` 同一套跳过规则（画面外 / ignore / 被遮挡），差别只在
+    判据：不看 label 类别，而看 **RGB 邻域是否呈现漆线外观**。
+    返回 ``{checked, line_like, not_line_like, ignored, occluded, skipped,
+    unknown_depth, details, status}``；``checked>0`` 才算有证据（UNKNOWN≠PASS）。
+    """
+    camera = frame.get("camera")
+    rgb = frame.get("rgb")
+    pts = _line_truth_points(frame)
+    out = {"checked": 0, "line_like": 0, "not_line_like": 0, "ignored": 0,
+           "occluded": 0, "skipped": 0, "unknown_depth": 0, "details": [],
+           "status": "unknown", "why": ""}
+    if not pts:
+        out["why"] = "frame declares no line truth points"
+        return out
+    if camera is None or rgb is None:
+        out["why"] = "frame has neither camera nor rgb"
+        return out
+    lab = np.asarray(frame.get("label")) if frame.get("label") is not None else None
+    depth = _axis_depth(frame)
+    h, w = np.asarray(rgb).shape[:2]
+    if depth is not None and (lab is None or depth.shape != lab.shape):
+        depth = None
+    for i, p in enumerate(pts):
+        try:
+            u, v = project_point(p.get("world"), camera)
+            d_pt = _point_depth(p.get("world"), camera)
+        except (TypeError, ValueError):
+            out["skipped"] += 1
+            continue
+        if not (math.isfinite(u) and math.isfinite(v)):
+            out["skipped"] += 1
+            continue
+        x, y = int(round(u)), int(round(v))
+        if not (0 <= x < w and 0 <= y < h):
+            out["skipped"] += 1
+            continue
+        if lab is not None and int(lab[y, x]) == IGNORE:
+            out["ignored"] += 1
+            continue
+        if depth is not None:
+            nearer = _nearer_surface(depth, x, y, d_pt)
+            if nearer is None:
+                out["unknown_depth"] += 1
+            elif nearer:
+                out["occluded"] += 1
+                continue
+        ap = line_appearance(rgb, u, v, radius_px=radius_px)
+        out["checked"] += 1
+        if ap["line_like"]:
+            out["line_like"] += 1
+        else:
+            out["not_line_like"] += 1
+            if len(out["details"]) < 5:
+                out["details"].append({"i": i, "u": round(u, 2),
+                                       "v": round(v, 2), "role": p.get("role"),
+                                       "rgb": ap})
+    out["status"] = "measured" if out["checked"] else "unknown"
+    if not out["checked"]:
+        out["why"] = ("no line truth point could be checked (all skipped/"
+                      "occluded/ignored)")
+    return out
+
+
 # ── 1. 投影校验 ─────────────────────────────────────────────────────────────
-def verify_projection(frame, *, radius_px: int = PROJECTION_RADIUS_PX) -> dict:
+def line_distance_stats(frame) -> dict:
+    """线真值点到**最近线类像素**的距离统计（像素）。
+
+    为什么需要它：`verify_projection` 的 2 px 半径是在合成渲染上标定的；真实
+    渲染有线宽、抗锯齿、贴花亚像素与异步帧，二值判定会把"差 2.5 px 的同一
+    条线"记成失配。这里给**度量**而不是开关：mean/p95/max 距离 + 2 px 内占比
+    ——报告里写清楚"几何对到几像素"，不偷偷放宽判定半径。
+
+    返回 ``{n, mean_px, p95_px, max_px, within_radius_frac, radius_px,
+    line_px, status}``；没有线像素或没有线真值点 -> ``status="unknown"``。
+    """
+    camera = frame.get("camera")
+    label = frame.get("label")
+    pts = _line_truth_points(frame)
+    out = {"n": 0, "mean_px": None, "p95_px": None, "max_px": None,
+           "within_radius_frac": None, "radius_px": PROJECTION_RADIUS_PX,
+           "line_px": 0, "status": "unknown", "why": ""}
+    if not pts:
+        out["why"] = "frame declares no line truth points"
+        return out
+    if camera is None or label is None:
+        out["why"] = "frame has neither camera nor label"
+        return out
+    lab = np.asarray(label)
+    if lab.ndim != 2 or lab.size == 0:
+        out["why"] = "label must be a nonempty 2-D array"
+        return out
+    line_px = np.argwhere(lab == 2)
+    out["line_px"] = int(len(line_px))
+    if not len(line_px):
+        out["why"] = "no line-class pixel in this frame"
+        return out
+    h, w = lab.shape
+    dists: list[float] = []
+    for p in pts:
+        try:
+            u, v = project_point(p.get("world"), camera)
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(u) and math.isfinite(v)):
+            continue
+        x, y = int(round(u)), int(round(v))
+        if not (0 <= x < w and 0 <= y < h):
+            continue
+        dists.append(float(np.hypot(line_px[:, 0] - v, line_px[:, 1] - u).min()))
+    if not dists:
+        out["why"] = "no line truth point projects into the frame"
+        return out
+    arr = np.asarray(dists, dtype=float)
+    out.update(n=int(arr.size), mean_px=round(float(arr.mean()), 3),
+               p95_px=round(float(np.percentile(arr, 95)), 3),
+               max_px=round(float(arr.max()), 3),
+               within_radius_frac=round(float((arr <= out["radius_px"]).mean()), 4),
+               status="measured")
+    return out
+
+
+def verify_projection(frame, *, radius_px: int = PROJECTION_RADIUS_PX,
+                      line_evidence: str = "annotation") -> dict:
     """逐真值点核对投影位置半径内的像素类别（线点=2、路面点=1）。
 
     跳过规则（保守，只跳"本来就看不清"的点，绝不放过矛盾）：
@@ -321,6 +498,11 @@ def verify_projection(frame, *, radius_px: int = PROJECTION_RADIUS_PX) -> dict:
     * 投影在画面外/相机后方 → ``skipped``；
     * 命中像素是 ignore(255)：标签明确说"这一块不判"，不算 mismatch；
     * 该像素的实测深度明显近于真值点深度 → 点被遮挡，不算 mismatch。
+
+    ``line_evidence``：线点（class 2）用什么证据判"这一像素确实是那条线"。
+    ``"annotation"``（默认）查 label 类别；``"appearance"`` 查 **RGB 外观**
+    （`line_appearance`）——方案 §4.2：贴花链不被实例/语义标注区分时，用
+    "经深度遮挡校验的投影 + 渲染外观"作替代证据。路面点始终用 label 类别。
 
     ``ok`` 要求 ``checked>0``：没有可核对的点 = ``status="unknown"``，
     调用方不得当通过（UNKNOWN≠PASS）。
@@ -378,6 +560,20 @@ def verify_projection(frame, *, radius_px: int = PROJECTION_RADIUS_PX) -> dict:
         x0, x1 = max(0, x - int(radius_px)), min(w, x + int(radius_px) + 1)
         y0, y1 = max(0, y - int(radius_px)), min(h, y + int(radius_px) + 1)
         window = lab[y0:y1, x0:x1]
+        if cls == 2 and line_evidence == "appearance":
+            ap = line_appearance(frame.get("rgb"), u, v, radius_px=radius_px)
+            out["checked"] += 1
+            if ap["line_like"]:
+                residuals.append(0.0)          # 外观命中即位置命中（像素级证据）
+            else:
+                out["mismatches"] += 1
+                if len(details) < 5:
+                    details.append({"i": i, "class": cls, "u": round(u, 2),
+                                    "v": round(v, 2), "evidence": "appearance",
+                                    "label_window": sorted(
+                                        int(t) for t in np.unique(window)),
+                                    "rgb": ap, "role": p.get("role")})
+            continue
         ys, xs = np.nonzero(window == cls)
         out["checked"] += 1
         if len(ys):
@@ -1106,7 +1302,8 @@ def _safe(fn, code: str, frame_id, rejections: list, stats: dict):
         return None
 
 
-def verify_batch(batch, *, expected=None) -> dict:
+def verify_batch(batch, *, expected=None,
+                 line_evidence: str = "annotation") -> dict:
     """批次校验汇总（契约见模块 docstring）。
 
     返回 ``{ok, rejections, channels, stats}``：
@@ -1115,6 +1312,10 @@ def verify_batch(batch, *, expected=None) -> dict:
     * ``channels`` 来自 `channel_eligibility`（逐通道独立，不合格不替别人背书）；
     * ``stats`` 给证据计数（投影 checked/mismatch、遮挡 unknown_px、黑图数、
       逐帧 sha 等）——没有证据的通道在报告里必须是 unknown，不是通过。
+
+    ``line_evidence``：线点的证据源，透传给 `verify_projection`
+    （``"annotation"`` = label 类别；``"appearance"`` = 经深度校验的 RGB 外观，
+    贴花不被标注时用）。报告里记 ``stats["line_evidence"]``，读的人要能分辨。
 
     ``expected`` 可选：``{"channels": {...}}`` 或直接 ``{"LINE": "measured"}``。
     与实测资格不符 → ``ok=False`` 且记 ``stats["expected_mismatches"]``（不编造
@@ -1144,6 +1345,7 @@ def verify_batch(batch, *, expected=None) -> dict:
 
     prev_ts = None
     proj_checked = proj_mismatch = proj_ignored = proj_occluded = proj_skipped = 0
+    app_checked = app_like = app_not_like = app_occluded = 0
     black_frames = 0
     occ_occluded = occ_unknown = 0
     area_road = area_line = area_ignore = area_total = 0
@@ -1194,8 +1396,9 @@ def verify_batch(batch, *, expected=None) -> dict:
                           fid, rejections, stats) or []:
             _add(code, fid, "label_sha/values inconsistent with the label content")
         # 1. 投影
-        rep = _safe(lambda f=frame: verify_projection(f), PROJECTION_MISMATCH,
-                    fid, rejections, stats)
+        rep = _safe(lambda f=frame: verify_projection(
+            f, line_evidence=line_evidence), PROJECTION_MISMATCH,
+            fid, rejections, stats)
         if rep is not None:
             proj_checked += rep["checked"]
             proj_mismatch += rep["mismatches"]
@@ -1214,6 +1417,29 @@ def verify_batch(batch, *, expected=None) -> dict:
                 _add(PROJECTION_MISMATCH, fid,
                      f"{rep['mismatches']}/{rep['checked']} truth points have no "
                      f"declared class within {PROJECTION_RADIUS_PX} px")
+        # 1b. 线点的外观+可见性证据（贴花不被标注时的替代证据；只上报）
+        try:
+            dstat = line_distance_stats(frame)
+        except Exception:                                    # noqa: BLE001
+            dstat = None
+        if dstat is not None:
+            frame_info.setdefault(i, {})["line_distance"] = dstat
+        try:
+            ap = appearance_line_check(frame)
+        except Exception as exc:                              # noqa: BLE001
+            ap = None
+            stats.setdefault("errors", []).append(
+                {"frame_id": fid, "code": "appearance_check",
+                 "error": f"{type(exc).__name__}: {exc}"})
+        if ap is not None:
+            app_checked += ap["checked"]
+            app_like += ap["line_like"]
+            app_not_like += ap["not_line_like"]
+            app_occluded += ap["occluded"]
+            frame_info.setdefault(i, {})["appearance"] = {
+                "checked": ap["checked"], "line_like": ap["line_like"],
+                "not_line_like": ap["not_line_like"],
+                "occluded": ap["occluded"], "status": ap["status"]}
         # 7. 翻转
         audit = _safe(lambda f=frame: flip_audit(f), CAMERA_FLIP, fid,
                       rejections, stats)
@@ -1266,6 +1492,24 @@ def verify_batch(batch, *, expected=None) -> dict:
                        "skipped": proj_skipped, "radius_px": PROJECTION_RADIUS_PX},
         "occlusion": {"occluded_px": occ_occluded, "unknown_px": occ_unknown,
                       "margin_m": OCCLUSION_MARGIN_M},
+        "line_evidence": str(line_evidence),
+        "line_distance_px": {
+            "n": sum(int((v or {}).get("line_distance", {}).get("n") or 0)
+                     for v in frame_info.values()),
+            "mean_of_frames": round(float(np.mean([
+                v["line_distance"]["mean_px"] for v in frame_info.values()
+                if (v or {}).get("line_distance", {}).get("mean_px")
+                is not None] or [float("nan")])), 3),
+            "per_frame": [v.get("line_distance") for v in frame_info.values()]},
+        "appearance": {"checked": app_checked, "line_like": app_like,
+                       "not_line_like": app_not_like,
+                       "occluded": app_occluded,
+                       "status": "measured" if app_checked else "unknown",
+                       "thresholds": {"white_min": LINE_WHITE_MIN,
+                                      "white_chroma": LINE_WHITE_CHROMA,
+                                      "warm_white_rb": LINE_WARM_WHITE_RB,
+                                      "yellow_rg_min": LINE_YELLOW_RG_MIN,
+                                      "yellow_b_max": LINE_YELLOW_B_MAX}},
         "scene": dict(scene),
         "generator": dict(batch.get("generator") or {}),
         "asset": dict(batch.get("asset") or {}),
