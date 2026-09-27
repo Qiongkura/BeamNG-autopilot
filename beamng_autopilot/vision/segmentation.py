@@ -145,13 +145,33 @@ LINE_ROAD_ELONGATED_FRAC = 0.25
 LINE_ROAD_MIN_MASK_FRAC = 0.005
 
 
-def filter_line_shape(line: np.ndarray) -> np.ndarray:
+def filter_line_shape(line: np.ndarray, *, min_area: int | None = None,
+                      min_long: int | None = None,
+                      min_ratio: float | None = None) -> np.ndarray:
     """Stage 4: keep line components that look like paint, not specks.
 
     A real painted line (including a dashed fragment) is a long thin
     stroke; texture / shadow specks are small blobs.  A component is kept
     when it is big enough (``_LINE_MIN_AREA_PX``) or clearly elongated.
+
+    ``min_area`` / ``min_long`` / ``min_ratio`` 与 ``BEAMNG_LINE_SHAPE`` 只用于
+    **单因子测量**（默认 None = 生产常量，行为不变）：
+    ``BEAMNG_LINE_SHAPE=off`` 整条形状过滤关掉（消融），
+    ``BEAMNG_LINE_SHAPE_AREA`` / ``_LONG`` / ``_RATIO`` 覆盖三个判据。
+    实测记录见 `docs/T14_CANDIDATE_FAILURE_ATTRIBUTION_20260926.md` §7。
     """
+    _mode = os.environ.get("BEAMNG_LINE_SHAPE", "on").lower()
+    if _mode in ("0", "off"):
+        return np.asarray(line, dtype=bool)
+    if min_area is None and os.environ.get("BEAMNG_LINE_SHAPE_AREA"):
+        min_area = int(float(os.environ["BEAMNG_LINE_SHAPE_AREA"]))
+    if min_long is None and os.environ.get("BEAMNG_LINE_SHAPE_LONG"):
+        min_long = int(float(os.environ["BEAMNG_LINE_SHAPE_LONG"]))
+    if min_ratio is None and os.environ.get("BEAMNG_LINE_SHAPE_RATIO"):
+        min_ratio = float(os.environ["BEAMNG_LINE_SHAPE_RATIO"])
+    min_area = _LINE_MIN_AREA_PX if min_area is None else int(min_area)
+    min_long = 20 if min_long is None else int(min_long)
+    min_ratio = 2.5 if min_ratio is None else float(min_ratio)
     line = np.asarray(line, dtype=bool)
     if not line.any():
         return line
@@ -168,9 +188,9 @@ def filter_line_shape(line: np.ndarray) -> np.ndarray:
     ch = stats[:, 3].astype(np.int64)
     long_side = np.maximum(cw, ch)
     short_side = np.minimum(cw, ch)
-    keep_ids = (area >= _LINE_MIN_AREA_PX) | (
-        (long_side >= 20) & (short_side >= 2)
-        & (long_side >= 2.5 * short_side))
+    keep_ids = (area >= min_area) | (
+        (long_side >= min_long) & (short_side >= 2)
+        & (long_side >= min_ratio * short_side))
     keep_ids[0] = False                    # 0 号是背景，永远不保留
     return keep_ids[labels]
 
