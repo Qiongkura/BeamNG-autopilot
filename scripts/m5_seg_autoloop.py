@@ -47,10 +47,10 @@ from beamng_autopilot.experiments.final_set import (  # noqa: E402
 )
 from beamng_autopilot.experiments.gates import (
     counts_completeness_note,  # noqa: E402
-    HARD_CHECKS, SCENE_HARD_FIELDS, Thresholds, decide, hard_split,
-    legacy_replay_note, missing_metrics_for, paired_compare,
-    per_seed_gate_violations, per_seed_missing, scene_count_violations,
-    scene_report, threshold_violations,
+    HARD_CHECKS, LINE_CHANNEL_FIELDS, SCENE_HARD_FIELDS, Thresholds, decide,
+    hard_split, legacy_replay_note, missing_metrics_for, paired_compare,
+    per_seed_gate_violations, per_seed_missing, proven_line_free,
+    scene_count_violations, scene_report, threshold_violations,
 )
 from beamng_autopilot.experiments.manifest import (  # noqa: E402
     DatasetManifest, dir_group,
@@ -66,10 +66,11 @@ from beamng_autopilot.experiments.credentials import (  # noqa: E402
     read_dir_credentials,
 )
 from beamng_autopilot.experiments.labels import (  # noqa: E402
-    PAINT_SOURCE_RANK,
+    resolve_paint_rank,
 )
 from beamng_autopilot.experiments.negative_scenes import (  # noqa: E402
-    negative_training_eligibility,
+    COUNTER_VERSION as NEGATIVE_COUNTER_VERSION,  # noqa: E402
+    merge_counts, negative_training_eligibility,
 )
 # 计数契约的唯一实现（先加总整数再算比率）：模块级别名，供判定/重放共用
 from beamng_autopilot.experiments import candidate_metrics as _cm  # noqa: E402
@@ -1589,6 +1590,13 @@ def train_cmd(args, runs, out: Path, seed: int, extra: list) -> list:
     # 这是**两臂共享的配方**，不是因子差异。
     _srcs = sorted(set(paint_sources_from(args).values()))
     paint_flags = (["--paint-source", _srcs[0]] if len(_srcs) == 1 else [])
+    # 步预算（T16 §3.1）：两臂同 N，等步数由**预算**保证而不是截数据。
+    # 预算模式下不许再传 --max-train-frames（训练器直接报错，语义矛盾）。
+    _ts = int(getattr(args, "total_steps", 0) or 0)
+    budget_flags = ["--total-steps", str(_ts)] if _ts > 0 else []
+    # 初始化（T16 §3.3）：两臂共享同一初始权重（因子差异不能混进 init）。
+    _init = getattr(args, "init", None)
+    init_flags = ["--init", str(_init)] if _init else []
     return [sys.executable, str(script),
             "--runs", *[str(r) for r in runs],
             "--split", args.split, "--val-frac", "0.2",
@@ -1596,7 +1604,8 @@ def train_cmd(args, runs, out: Path, seed: int, extra: list) -> list:
             "--lr", str(args.lr), "--seed", str(seed),
             "--device", args.device, "--save-every-epoch",
             "--metrics-run", metrics_run,
-            "--out", str(out), *road_only, *paint_flags, *extra]
+            "--out", str(out), *road_only, *paint_flags, *budget_flags,
+            *init_flags, *extra]
 
 
 def steps_per_epoch(n_train: int, batch: int) -> int:
@@ -1629,6 +1638,71 @@ def _ckpt_train_args(path: Path) -> dict:
         return dict(ck.get("train_args") or {})
     except Exception:                                     # noqa: BLE001
         return {}
+
+
+def sampling_label(args, equal_cap: int) -> str:
+    """本轮采样协议标签（T16 §4 新旧口径分界）。
+
+    ``quota_full_pool``：给了 ``--total-steps``，全池配额轮换、等步数靠预算；
+    ``legacy_cap``：旧协议，靠 ``--max-train-frames`` 截帧凑等步数；
+    ``legacy_epoch``：旧协议，纯 epoch 停止。判定与 champion.json 都用它，
+    读者才能分清"这批结果是在哪种采样下得到的"。
+    """
+    if int(getattr(args, "total_steps", 0) or 0) > 0:
+        return "quota_full_pool"
+    return "legacy_cap" if int(equal_cap or 0) else "legacy_epoch"
+
+
+def line_free_scenes_from(scene_counts: dict, scene_rank: dict) -> dict:
+    """已证明无线的场景 -> ``{场景: {basis, why}}``（T16 §3.5 接线）。
+
+    输入：场景级整数计数（要 ``P_frames``）与场景标签档位（来自凭证，经
+    ``resolve_paint_rank`` 解析）。判据在 ``gates.proven_line_free``（纯函数）：
+    ``P_frames==0`` **且** 档位 verified 才算证明；档位不明/非 verified 返回
+    空 —— 那种情况保持 UNKNOWN（needs_evidence），不冒充"确认无线"。
+    """
+    out: dict = {}
+    for g, cv in (scene_counts or {}).items():
+        pf = proven_line_free(
+            p_frames=int((cv or {}).get("P_frames", 0) or 0),
+            label_rank=(scene_rank or {}).get(g, ""))
+        if pf.get("proven"):
+            out[str(g)] = {"basis": pf["basis"], "why": pf["why"]}
+    return out
+
+
+def _train_meta(out_dir: Path) -> dict:
+    """逐 seed 的预算/采样/init 证据（T16 §3 契约）。
+
+    判定必须能回答三个问题：**实际训了多少 optimizer step**（steps_done，
+    权威计数，不用 epochs 估算）、**看过多少唯一样本**（sampler_report，
+    只来自真实进过损失的采样）、**初始权重是谁**（init 块）。旧 run 没有这些
+    字段 -> 记 None/空字典，不猜（判定里显示为 legacy 缺字段）。
+    """
+    out_dir = Path(out_dir)
+    ta = _ckpt_train_args(out_dir / "checkpoint_last.pt")
+    hist: dict = {}
+    hp = out_dir / "train_hist.json"
+    if hp.exists():
+        try:
+            hist = json.loads(hp.read_text(encoding="utf-8"))
+        except Exception:                                 # noqa: BLE001
+            hist = {}
+    init = ta.get("init") if isinstance(ta.get("init"), dict) else None
+    if init is None:
+        init = hist.get("init") if isinstance(hist.get("init"), dict) else {}
+    return {
+        "steps_done": ta.get("steps_done", hist.get("steps_done")),
+        "total_steps": ta.get("total_steps", hist.get("total_steps")),
+        "stopped_by": ta.get("stopped_by", hist.get("stopped_by")),
+        "sampling": ta.get("sampling"),
+        "sampler": ta.get("sampler"),
+        "sampler_report": hist.get("sampler_report"),
+        "sampler_state_digest": ta.get("sampler_state_digest"),
+        "init": ({k: init.get(k) for k in (
+            "init_from", "init_sha16", "init_source", "init_arch",
+            "provenance_complete", "parent_history")} if init else {}),
+    }
 
 
 #: p95 与同 seed p50 的比值超过它，就认为这次计时被机器负载污染
@@ -1797,6 +1871,11 @@ def sum_negative_summaries(per_seed: dict) -> dict:
 
     与候选计数同一契约（方案 v2 §3.3）：先把各 seed 的帧数/像素数相加，再算
     假线帧率与像素占比；缺计数的 seed 不参与（不按 0 相加）。
+
+    用 ``negative_scenes.merge_counts`` 而不是逐个 int 求和：v2 的
+    ``false_positive_max_cc_px`` 是**取最大**的伴随计数，求和会把"最大连通域"
+    变成"各 seed 最大连通域之和"（T16 §7 要求最大连通域可解释）。汇总里
+    同时报 ``counter_version``，旧产物（v1 无新键）照旧可读。
     """
     rows = [v for v in (per_seed or {}).values() if v]
     if not rows:
@@ -1805,8 +1884,19 @@ def sum_negative_summaries(per_seed: dict) -> dict:
             "false_positive_frames", "false_positive_px", "eligible_px",
             "positive_frames", "unknown_frames", "empty_frames",
             "unverified_frames", "unverified_pred_line_px")
-    out = {k: sum(int((r or {}).get(k) or 0) for r in rows) for k in keys}
+    # v2 新键只有在该 seed 的记录里存在时才计入（旧 run 不按 0 参与，
+    # 否则"没测到"会被记成"最大连通域 0"）。
+    v2_keys = ("false_positive_max_cc_px",
+               "control_region_false_candidates",
+               "false_positive_control_region_frames")
+    acc: dict = {}
+    for r in rows:
+        acc = merge_counts(acc, {k: int((r or {}).get(k) or 0)
+                                 for k in keys})
+    out = {k: int(acc.get(k, 0)) for k in keys}
+    has_v2 = any(any(k in (r or {}) for k in v2_keys) for r in rows)
     out["n_seeds"] = len(rows)
+    out["counter_version"] = (NEGATIVE_COUNTER_VERSION if has_v2 else 1)
     out["status"] = ("measured" if out["eligible_frames"]
                      else "no_eligible_frames")
     out["false_positive_frame_rate"] = (
@@ -1817,6 +1907,19 @@ def sum_negative_summaries(per_seed: dict) -> dict:
         else out["false_positive_px"] / out["eligible_px"])
     out["excluded_frames"] = (out["unverified_frames"] + out["unknown_frames"]
                               + out["empty_frames"])
+    if has_v2:
+        acc2: dict = {}
+        for r in rows:
+            acc2 = merge_counts(acc2, {k: int((r or {}).get(k) or 0)
+                                       for k in v2_keys})
+        out["false_positive_max_cc_px_max"] = int(
+            acc2.get("false_positive_max_cc_px", 0))
+        out["false_positive_control_region_frames"] = int(
+            acc2.get("false_positive_control_region_frames", 0))
+        out["control_region_false_candidates"] = int(
+            acc2.get("control_region_false_candidates", 0))
+    else:
+        out["extra_counters"] = "absent"
     return out
 
 
@@ -1868,7 +1971,10 @@ def resolve_paint_sources(args) -> dict:
 
     * 读该目录自己的凭证（``annotation.json`` / ``meta.json``）；
     * ``effective_source(declared, credential)`` —— 凭证优先，命令行不能抬高质量；
-    * rank 不能晋级的（agent / pseudo / 未知）→ 整轮记 ``research_only``。
+    * rank 由 ``resolve_paint_rank(eff, credential=cred)`` 解析：``engine_verified``
+      **必须**有真值验证器凭证（T16 §4.3 反伪造），否则降 ``absent``；
+    * rank 不能晋级的（agent / pseudo / 未知 / 无凭证的 engine_verified）
+      → 整轮记 ``research_only``。
 
     返回 ``{runs, research_only, reasons, notes, missing_credentials}``；
     调用方把整份结论写进判定文件，**replay 才能重放同一结论**。
@@ -1883,8 +1989,11 @@ def resolve_paint_sources(args) -> dict:
         cred = read_dir_credentials(run)
         cred_src = None if cred is None else str(cred.get("label_source") or "")
         eff, notes = effective_source(declared, cred_src)
-        rank = PAINT_SOURCE_RANK.get(eff, "absent")
-        ok, why = sources_can_promote([eff])
+        _pr = resolve_paint_rank(eff, credential=cred)
+        rank = _pr["rank"]
+        # 晋级检查按**已解析的档位**（不是来源名）：否则无凭证的
+        # engine_verified 会绕过反伪造检查（名字在表里仍是 verified）。
+        ok, why = sources_can_promote([rank])
         if cred is None:
             out["missing_credentials"].append(run)
         if not ok:
@@ -1892,12 +2001,13 @@ def resolve_paint_sources(args) -> dict:
             out["reasons"].append(
                 f"{run}: effective source {eff!r} (rank {rank}) cannot be used "
                 f"as a promotion reference")
-        for n in notes:
+        for n in list(notes) + list(_pr["notes"]):
             out["notes"].append(f"{run}: {n}")
         out["runs"][run] = {"declared": declared, "credential": cred_src,
                             "credential_path": (cred or {}).get("path"),
                             "credential_frames": (cred or {}).get("frames"),
                             "effective": eff, "rank": rank,
+                            "rank_proof": _pr["proof"],
                             "eligibility": eligibility(rank),
                             "can_promote": bool(ok), "notes": notes}
     # 评价侧的资格**必须读 eval 目录自己的凭证**（方案 §6.1 / A1：agent 评价
@@ -1909,8 +2019,9 @@ def resolve_paint_sources(args) -> dict:
         cred = read_dir_credentials(run)
         cred_src = None if cred is None else str(cred.get("label_source") or "")
         eff, notes = effective_source("", cred_src)
-        rank = PAINT_SOURCE_RANK.get(eff, "absent")
-        ok, why = sources_can_promote([eff])
+        _pr = resolve_paint_rank(eff, credential=cred)
+        rank = _pr["rank"]
+        ok, why = sources_can_promote([rank])
         if cred is None:
             out["missing_credentials"].append(key)
         if not ok:
@@ -1918,13 +2029,14 @@ def resolve_paint_sources(args) -> dict:
             out["reasons"].append(
                 f"{key}: evaluation reference source {eff!r} (rank {rank}) "
                 f"cannot be used as a promotion reference")
-        for n in notes:
+        for n in list(notes) + list(_pr["notes"]):
             out["notes"].append(f"{key}: {n}")
         out["runs"].setdefault(key, {
             "declared": "", "credential": cred_src,
             "credential_path": (cred or {}).get("path"),
             "credential_frames": (cred or {}).get("frames"),
             "effective": eff, "rank": rank,
+            "rank_proof": _pr["proof"],
             "eligibility": eligibility(rank),
             "can_promote": bool(ok), "notes": notes,
             "role": "evaluation_reference"})
@@ -2194,6 +2306,18 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                   "（真实运行时这一轮会被拒绝）")
         extra, skipped = factor_to_flags(factor)
         cand_runs, data_note = arm_runs(args.runs, factor)
+        # 预算模式（quota 采样器）与 run_weights 互斥：训练器会硬报错，但那时
+        # 一轮训练已经启动、报错信息埋在 train_error 里。这里提前拒绝并说明
+        # 该用什么替代（配额轮换已经按 run 均衡曝光；要改权重得先让采样器支持）。
+        if int(getattr(args, "total_steps", 0) or 0) > 0 and "--run-weights" in extra:
+            _note = ("sampler_conflict: --total-steps（quota 全池采样）与 "
+                     "run_weights 因子不能同时用——配额轮换已按 run 均衡曝光；"
+                     "要么去掉 run_weights，要么退回 legacy 采样（不给 "
+                     "--total-steps）")
+            _log_give_up(log, args.run_id, cand_id, "sampler_conflict",
+                         _note, phase="needs_review")
+            print(f"[rounds] 第 {rnd + 1} 轮拒绝训练：{_note}")
+            return 3
         # 因子未生效就拒绝训练：候选臂与基线臂输入相同，跑不出证据
         if not extra and not data_note["applied"]:
             note = ("factor_not_applied: " + "; ".join(
@@ -2229,6 +2353,7 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
             continue
         # ---- 基线臂：第 0 轮训练一次并落盘，跨轮沿用 ----------------
         base_steps: dict = {}
+        base_meta: dict = {}      # 逐 seed 预算/采样/init 证据（T16 §3）
         champ_task: dict = {}     # 逐 seed 任务主指标（G05）：{seed: {metric: value}}
         base_n_train: int = 0
         equal_cap: int = 0
@@ -2270,14 +2395,27 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 plateau_base_by_seed[str(seed)] = plateau_from_hist(
                     out / "train_hist.json")
                 ta_b = _ckpt_train_args(out / "checkpoint_last.pt")
+                base_meta[str(seed)] = _train_meta(out)
                 if ta_b.get("n_train"):
                     base_n_train = max(base_n_train, int(ta_b["n_train"]))
-                    base_steps[str(seed)] = steps_per_epoch(
-                        ta_b["n_train"], ta_b.get("batch") or args.batch)                         * int(ta_b.get("epochs") or args.epochs)
+                    # 实际步数以训练器落盘的 steps_done 为准（T16 §3.1：
+                    # 预算模式的权威计数是 optimizer.step() 数）；旧 checkpoint
+                    # 没有该字段才退回 epochs×steps_per_epoch 的估算。
+                    if ta_b.get("steps_done") is not None:
+                        base_steps[str(seed)] = int(ta_b["steps_done"])
+                    else:
+                        base_steps[str(seed)] = steps_per_epoch(
+                            ta_b["n_train"], ta_b.get("batch") or args.batch)                         * int(ta_b.get("epochs") or args.epochs)
             # 等步数对照（精确版）：两臂 **epochs 不变**，把帧多的一臂按
             # run 配额截到与基线相同的训练帧数 —— 步数因此逐位相等，
             # 不需要用"最接近的整数轮"去凑（那会留下 +33% 的残余差）。
-            if args.equal_steps and base_steps and base_n_train:
+            # 预算模式（--total-steps）下**不截帧**：两臂同预算，等步数由
+            # optimizer step 保证，截数据只会白白丢掉新增样本（T16 §3.1）。
+            if int(getattr(args, "total_steps", 0) or 0) > 0:
+                if args.equal_steps:
+                    print("[rounds] --total-steps 生效：等步数由预算保证，"
+                          "--equal-steps 的截帧不再使用（候选保留全池）")
+            elif args.equal_steps and base_steps and base_n_train:
                 n_cand = count_frames(cand_runs)
                 n_val_c = max(1, int(n_cand * 0.2))
                 n_train_c = max(1, n_cand - n_val_c)
@@ -2296,7 +2434,13 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 "candidate_epochs": int(cand_epochs),
                 "base_n_train": int(base_n_train),
                 "max_train_frames": int(equal_cap),
-                "equal_steps": bool(args.equal_steps)},
+                "equal_steps": bool(args.equal_steps),
+                # T16 预算/init 契约：判定要能区分"等步数靠预算"与
+                # "等步数靠截帧"，以及两臂共享的初始权重是谁。
+                "step_budget": int(getattr(args, "total_steps", 0) or 0),
+                "sampling": sampling_label(args, equal_cap),
+                "init_from": (str(getattr(args, "init", None))
+                              if getattr(args, "init", None) else None)},
                 indent=1, ensure_ascii=False), encoding="utf-8")
         elif champ_file.exists():
             champ_by_seed = json.loads(champ_file.read_text(
@@ -2305,6 +2449,12 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 encoding="utf-8")).get("steps_by_seed") or {}
             equal_cap = int(json.loads(champ_file.read_text(
                 encoding="utf-8")).get("max_train_frames") or 0)
+            # 基线臂的预算/采样/init 证据在跨轮复用时也要能读出来（否则第 1+
+            # 轮的判定只剩候选侧可追溯，"两臂起始身份"就断了一半）。
+            for seed in args.seeds:
+                _bdir = exp_dir(args.run_id) / "baseline" / f"seed{seed}"
+                if (_bdir / "checkpoint_last.pt").exists():
+                    base_meta[str(seed)] = _train_meta(_bdir)
         else:
             print("[rounds] 没有基线记录（champion.json 缺失）：拒绝用本轮"
                   "候选自己的值当对照")
@@ -2315,6 +2465,7 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
         # ---- 候选臂 ------------------------------------------------
         cand_by_seed: dict = {}
         cand_neg: dict = {}      # 逐 seed 负例诊断（E1 主指标）
+        cand_meta: dict = {}     # 逐 seed 预算/采样/init 证据（T16 §3）
         cand_task: dict = {}      # 逐 seed 任务主指标（G05）
         timing_repeats: list = []
         plateau_by_seed: dict = {}
@@ -2331,8 +2482,9 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
         for seed in args.seeds:
             out = exp_dir(args.run_id) / f"round{rnd}" / f"seed{seed}"
             _cmd = train_cmd(args, cand_runs, out, seed, extra)
-            if equal_cap:
-                # 只加这一个量：epochs/其它开关与基线臂逐字相同
+            if equal_cap and int(getattr(args, "total_steps", 0) or 0) <= 0:
+                # 只加这一个量：epochs/其它开关与基线臂逐字相同。
+                # 预算模式下不加（训练器会直接拒绝预算+截帧的组合）。
                 _cmd += ["--max-train-frames", str(int(equal_cap))]
             run = _train_once(_cmd, args.timeout_s)
             if run.returncode != 0:
@@ -2348,6 +2500,7 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 metrics[_key] if metrics.get(_key) is not None
                 else metrics.get("line_iou") or 0.0)
             cand_neg[str(seed)] = metrics.get("negative_line") or {}
+            cand_meta[str(seed)] = _train_meta(out)
             _idc = identity_metrics(out / "checkpoint_last.pt",
                                     args.eval_runs,
                                     frames_by_dir=_report.get(
@@ -2538,7 +2691,23 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                         continue
                     if cur is None or float(_v) < float(cur):
                         per_scene[_g][_k] = _v
-        _scene = scene_report(per_scene, t, fields=_sf)
+        # 场景标签档位（读评价目录自己的凭证，经 resolve_paint_rank 解析）：
+        # 后面与 P_frames 一起判"已证明无线"（T16 §3.5）。档位不明或非
+        # verified 一律**不证明**（保持 UNKNOWN -> needs_evidence）。
+        _scene_rank: dict = {}
+        for _r in list(args.eval_runs or []):
+            try:
+                _g = dir_group(_r)
+            except Exception:                             # noqa: BLE001
+                continue
+            _cred = read_dir_credentials(_r)
+            _rk = resolve_paint_rank(
+                str((_cred or {}).get("label_source") or ""),
+                credential=_cred)["rank"]
+            if _g in _scene_rank and _scene_rank[_g] != _rk:
+                _scene_rank[_g] = ""      # 同场景内档位不一致 -> 不证明
+            else:
+                _scene_rank[_g] = _rk
         # 逐场景**样本量下限（按 R）**与适用性（方案 v2 §S3.2/§3.4）：
         # 下限对象是身份率的实际分母，不能用总候选数冒充；无标线场景
         # not_applicable（既不通过也不算缺测）。
@@ -2551,6 +2720,16 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                     _acc[_k] = int(_acc.get(_k, 0)) + int(
                         (_cv or {}).get(_k, 0) or 0)
         _sc = scene_count_violations(_scene_counts, t)
+        # 已证明无线的场景（T16 §3.5 / §1.3-5 修复）：线通道指标记 N/A，
+        # 不再当"缺测"。证据 = 场景级 P_frames==0 + 该场景标签档位
+        # （_scene_rank，来自评价目录凭证）。**不是放宽门**：有线场景的
+        # 召回门原样保留；无线场景转由负例指标约束（负例诊断在判定里）。
+        _line_free = line_free_scenes_from(_scene_counts, _scene_rank)
+        if _line_free:
+            print(f"[rounds] 已证明无线的场景 {len(_line_free)} 个：线通道"
+                  f"记 N/A（{', '.join(sorted(_line_free))}）")
+        _scene = scene_report(per_scene, t, fields=_sf,
+                              line_free_scenes=(_line_free or None))
         if _sc["low_sample"]:
             print(f"[rounds] 逐场景样本不足 {len(_sc['low_sample'])} 条"
                   f"（下限按身份率分母 R={t.per_scene_min_candidates} 计）")
@@ -2587,6 +2766,10 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
         _violations = (_hs["violations"]
                        + per_seed_gate_violations(hard_by_seed, t, fields=_pf)
                        + _scene["violations"])
+        for _na in (_scene.get("not_applicable") or []):
+            print(f"[rounds] 场景 N/A（已证明无线）：{_na.get('scene')} "
+                  f"{_na.get('field')}（依据 {_na.get('basis')}）——"
+                  f"不进缺测，转由负例指标约束")
         if _scene["violations"]:
             print(f"[rounds] 逐场景硬门不通过：{len(_scene['violations'])} 条"
                   f"（整体均值可能仍然是好的——这就是要分场景的原因）")
@@ -2703,6 +2886,17 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 # scene_counts 的话，看板只能显示"无数据"，看不到
                 # "确认真无线"与"有线但 R=0（UNKNOWN）"的分别（独立复核指出）。
                 "scene_applicability": _sc["scenes"],
+                # T16 适用性修复的证据：哪些场景按"已证明无线"把线通道
+                # 记 N/A（含依据档位），replay 才能重放出同一结论。
+                "scene_not_applicable": _scene.get("not_applicable") or [],
+                "line_free_scenes": {g: dict(v) for g, v in _line_free.items()},
+                # T16 §3 预算/采样/init 契约：判定必须能回答"实际训了多少
+                # optimizer step、看过多少唯一样本、初始权重是谁"。
+                "step_budget": int(getattr(args, "total_steps", 0) or 0),
+                "sampling": sampling_label(args, equal_cap),
+                "init_from": (str(getattr(args, "init", None))
+                              if getattr(args, "init", None) else None),
+                "train_meta": {"baseline": base_meta, "candidate": cand_meta},
                 "per_scene": per_scene,
                 "scene_candidates": scene_candidates,
                 "final_confirmation": _conf,
@@ -2964,6 +3158,14 @@ def main(argv=None) -> int:
     s.add_argument("--proposals", default=None, help="propose 产出的 JSON")
     s.add_argument("--seeds", nargs="+", type=int, default=[42, 43, 44])
     s.add_argument("--epochs", type=int, default=3)
+    s.add_argument("--total-steps", type=int, default=0,
+                   help="优化步预算（T16 §3.1）：两臂同 N，停止条件按实际 "
+                        "optimizer step；给了它就不再截帧（等步数由预算保证），"
+                        "0 = 旧 epoch 协议")
+    s.add_argument("--init", default=None, metavar="CHECKPOINT",
+                   help="初始权重（T16 §3.3）：两臂共享同一 --init；不传 = "
+                        "随机初始化（也显式记录）。--init 是权重初始化，"
+                        "与 --resume 恢复同一任务不是一回事")
     s.add_argument("--batch", type=int, default=4)
     s.add_argument("--lr", type=float, default=1e-3)
     s.add_argument("--split", default="tail")
