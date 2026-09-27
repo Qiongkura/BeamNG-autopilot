@@ -37,30 +37,54 @@ SCRIPTS = ROOT / "scripts"
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-#: 训练侧的既有配方（与研究臂 E2/E1 完全一致：同样的 town 组、同样的步数预算）
-TOWN = "logs/m5_seg/line_truth_agent_full_20260925/town/front_main"
-DEV = ["logs/m5_seg/line_truth_agent_full_20260925/wide/front_main",
-       "logs/m5_seg/line_truth_agent_full_20260925/plain/front_main"]
+#: 训练基座：**优先用人工 verified 正例**（这样两臂标签都可晋级）；只有在没有正例
+#: 时才退回 agent 弱标签的 town 组（那时整轮会被判 research_only，如实标注）。
+#: 为什么重要：`resolve_paint_sources` 只要看到任一非 verified 来源就把整轮记
+#: research_only——基座选错，加多少 verified 数据都晋不了级。
+TOWN_FALLBACK = "logs/m5_seg/line_truth_agent_full_20260925/town/front_main"
+#: 评价集：人工复核包（136 帧、human_revision）——verified 参考才允许晋级判定；
+#: 其中的两组无标线场景（dirt/plain2，50 帧）正好给 E1 做假线诊断。
+PACK = "logs/experiments/review_pack_20260926/reviewed_full"
+DEV = [f"{PACK}/{n}/front_main" for n in (
+    "pkg_collect_t14_collect_dirt_20260926_20260926_123625",
+    "pkg_collect_t14_collect_plain2_20260926_20260926_123944",
+    "pkg_diverse_curve_20260924", "pkg_diverse_plain_20260924",
+    "pkg_plain", "pkg_t13_corner", "pkg_t13_junction2", "pkg_town")]
 
 
 def _norm(p: str) -> str:
     return str(p).replace("\\", "/")
 
 
-def build(out_dir: Path, *, negative_dirs: list, positive_dirs: list) -> dict:
-    """生成两份配置 + 提议；返回 ``{configs, proposals, commands, notes}``。"""
+def build(out_dir: Path, *, negative_dirs: list, positive_dirs: list,
+          base_dir: str | None = None) -> dict:
+    """生成两份配置 + 提议；返回 ``{configs, proposals, commands, notes}``。
+
+    ``base_dir``：训练基座（"固定配方"那一臂）。默认取**第一个 verified 正例目录**
+    ——这样两臂的训练标签都是 human_revision，判定可晋级；没有正例时退回 town 弱标签
+    并在 notes 里写明"这一轮只能记 research_only"。
+    """
     out_dir.mkdir(parents=True, exist_ok=True)
     neg = [_norm(d) for d in negative_dirs]
     pos = [_norm(d) for d in positive_dirs]
+    base = _norm(base_dir) if base_dir else (pos[0] if pos else TOWN_FALLBACK)
+    extra_pos = [d for d in pos if d != base]
     notes: list = []
+    if base == _norm(TOWN_FALLBACK):
+        notes.append("训练基座是 agent 弱标签（没有 verified 正例）：整轮会被判 "
+                     "research_only，不可晋级")
+    else:
+        notes.append(f"训练基座 = {base}（human_revision）→ 两臂标签可晋级")
     configs: dict = {}
     proposals: dict = {}
     commands: dict = {}
 
-    paint_sources = [f"{TOWN}=agent_revision"] + [f"{d}=human_revision"
-                                                  for d in neg + pos]
+    paint_sources = [f"{base}=human_revision"] + [f"{d}=human_revision"
+                                                   for d in neg + pos]
+    # 评价集现在是**人工复核包**（human_revision）——参考资格必须是 verified，
+    # 否则判定又被记 research_only（这里写错就等于把可晋级的实验降级）
     for d in DEV:
-        paint_sources.append(f"{d}=agent_revision")
+        paint_sources.append(f"{d}=human_revision")
 
     if neg:
         cfg = {
@@ -74,7 +98,7 @@ def build(out_dir: Path, *, negative_dirs: list, positive_dirs: list) -> dict:
             "min_free_vram_mb": 2048.0, "min_free_disk_gb": 10.0,
             "max_candidates": 3, "max_rounds_without_gain": 2,
             "seeds": [42, 43, 44], "dry_run": False, "python": "",
-            "runs": [TOWN] + neg, "baseline_runs": [TOWN], "eval_runs": DEV,
+            "runs": [base] + neg, "baseline_runs": [base], "eval_runs": DEV,
             "proposals": str(out_dir / "proposal_e1_promotable.json"),
             "rounds": 1, "epochs": 24, "batch": 4, "lr": 0.001,
             "allow_road_only": False, "equal_steps": True,
@@ -113,7 +137,11 @@ def build(out_dir: Path, *, negative_dirs: list, positive_dirs: list) -> dict:
             "min_free_vram_mb": 2048.0, "min_free_disk_gb": 10.0,
             "max_candidates": 3, "max_rounds_without_gain": 2,
             "seeds": [42, 43, 44], "dry_run": False, "python": "",
-            "runs": [TOWN] + pos, "baseline_runs": [TOWN], "eval_runs": DEV,
+            # 候选臂的视角由**因子**（add_runs）加进来：`runs` 必须只放基座，
+            # 否则因子加的是"已在列表里"的目录 -> 被 factor_not_applied 正确拒训
+            # （实测踩到：线通道那轮就是这么被拦下的）
+            "runs": [base], "baseline_runs": [base],
+            "eval_runs": DEV,
             "proposals": str(out_dir / "proposal_line_promotable.json"),
             "rounds": 1, "epochs": 24, "batch": 4, "lr": 0.001,
             "allow_road_only": False, "equal_steps": True,
@@ -122,7 +150,7 @@ def build(out_dir: Path, *, negative_dirs: list, positive_dirs: list) -> dict:
         prop = {"_note": "线通道因子：把 verified 正例组加进训练输入（数据组成）。",
                 "proposals": [{"candidate_id": "line-add-verified",
                                "family": "scene_mix",
-                               "factor": {"add_runs": pos}}]}
+                               "factor": {"add_runs": extra_pos}}]}
         configs["line"] = out_dir / "loop_config_line_promotable.json"
         proposals["line"] = out_dir / "proposal_line_promotable.json"
         configs["line"].write_text(json.dumps(cfg, indent=1, ensure_ascii=False),
@@ -150,6 +178,8 @@ def main(argv=None) -> int:
     ap.add_argument("--positive-dir", action="append", default=[],
                     help="标注完成的**正例**视角目录（可多次）")
     ap.add_argument("--out-dir", required=True)
+    ap.add_argument("--base-dir", default=None,
+                    help="训练基座（固定配方那一臂）；默认取第一个 verified 正例目录")
     ap.add_argument("--execute", action="store_true",
                     help="生成后直接执行 E1（默认只打印命令）")
     args = ap.parse_args(argv)
@@ -180,7 +210,8 @@ def main(argv=None) -> int:
         print("[after] 有 --negative-dir 判成非纯负例（含线帧）：请按实际用途决定，"
               "脚本不替你改口径")
         return 3
-    plan = build(Path(args.out_dir), negative_dirs=neg, positive_dirs=pos)
+    plan = build(Path(args.out_dir), negative_dirs=neg, positive_dirs=pos,
+                 base_dir=args.base_dir)
     for n in plan["notes"]:
         print(f"[after] 提示：{n}")
     for k, c in plan["configs"].items():

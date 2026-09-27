@@ -65,9 +65,10 @@ def test_annotated_packs_generate_both_configs(tmp_path):
     mod = _load()
     neg = _pack(tmp_path, "neg", line_px=0)
     pos = _pack(tmp_path, "pos", line_px=4)
+    pos2 = _pack(tmp_path, "pos2", line_px=4)   # 第二个正例视角：线通道要"加其余视角"
     out = tmp_path / "out"
     rc = mod.main(["--negative-dir", str(neg), "--positive-dir", str(pos),
-                   "--out-dir", str(out)])
+                   "--positive-dir", str(pos2), "--out-dir", str(out)])
     assert rc == 0
     e1 = json.loads((out / "loop_config_e1_promotable.json").read_text(
         encoding="utf-8"))
@@ -79,9 +80,18 @@ def test_annotated_packs_generate_both_configs(tmp_path):
     assert prop["proposals"][0]["factor"]["run_weights"] == {"0": 0.8, "1": 0.2}
     assert e1["equal_steps"] is True and "research_arm" not in e1
     assert any("neg/front_main=human_revision" in s for s in e1["paint_sources"])
-    assert e1["baseline_runs"] == [mod.TOWN], "对照臂是固定配方（只含 town）"
-    # 线通道：把正例组加进训练输入
-    assert any("pos/front_main" in r for r in line["runs"])
+    # 基座 = **verified 正例**（这样两臂标签都是 human_revision -> 判定可晋级）；
+    # 若基座退回 agent 弱标签的 town，整轮会被判 research_only
+    assert e1["baseline_runs"] == [str(pos).replace("\\", "/")], e1["baseline_runs"]
+    assert all("human_revision" in s for s in e1["paint_sources"]), e1["paint_sources"]
+    # 线通道：把**其余**正例组加进训练输入（基座那一个不重复加）
+    assert line["baseline_runs"] == [str(pos).replace("\\", "/")]
+    # `runs` 只放基座：其余视角由因子（add_runs）加进来，否则会被 factor_not_applied
+    # 正确拒训（实测踩到）
+    assert line["runs"] == [str(pos).replace("\\", "/")], line["runs"]
+    assert json.loads((out / "proposal_line_promotable.json").read_text(
+        encoding="utf-8"))["proposals"][0]["factor"]["add_runs"] == [
+        str(pos2).replace("\\", "/")], "只加其余视角（基座不重复加）"
     assert json.loads((out / "proposal_line_promotable.json").read_text(
         encoding="utf-8"))["proposals"][0]["factor"]["add_runs"]
 

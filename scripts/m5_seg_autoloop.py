@@ -2066,7 +2066,13 @@ def _rounds_audit(args, train_runs, log) -> tuple:
         return report, 3
     _line_sup = bool(_ps)
     if _line_sup:
-        print(f"[rounds] 研究臂：训练开启 line 通道（来源 {_ps}，弱监督：可学不可判）；"
+        # 措辞要跟**实际资格**一致：来源全是 verified 时判定是可晋级的，
+        # 一律说"弱监督/记 research_only"会与判定文件自相矛盾（实测踩到）。
+        _src_res_early = resolve_paint_sources(args)
+        _caveat = ("弱监督：可学不可判）；判定记 research_only，不允许晋级"
+                   if _src_res_early["research_only"]
+                   else "来源全部 verified）；判定**可晋级**")
+        print(f"[rounds] 训练开启 line 通道（来源 {_ps}，{_caveat}"
               f"判定记 research_only，不允许晋级")
     if not paint_ok and not getattr(args, "allow_road_only", False) \
             and not _line_sup:
