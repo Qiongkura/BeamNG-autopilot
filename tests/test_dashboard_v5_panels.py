@@ -66,6 +66,12 @@ def _v5_decision(frame: Path, overlays: dict) -> dict:
         "steps_by_arm": {"baseline": {"42": 15}, "candidate": {"42": 18}},
         "factor": {"add_runs": ["logs/m5_seg/x"]},
         "applied_flags": ["add_runs"],
+        # S5 单因归因与因子生效判定（方案 v2 §S5）：看板必须显示，否则
+        # "无效因子/缺标注/资格失败"会被读成"模型没有提升空间"
+        "round_outcome": "qualification_failure",
+        "factor_activity": {"active": False,
+                            "inactive_keys": ["line_tversky_weight"],
+                            "why": "line_supervision=False（road-only）"},
         "skipped_factors": {},
         "data_factor_note": {"applied": ["add_runs"], "not_applied": []},
         "eval_checkpoint": "checkpoint_last.pt",
@@ -329,6 +335,8 @@ def test_v5_panels_render_and_every_value_names_its_source(tmp_path):
         assert needle in text, needle
     # 面板 3：学习过程
     for needle in ("epoch 12", "train_loss", "val_line_iou", "add_runs",
+                   "qualification_failure", "因子是否真生效: 否",
+                   "line_tversky_weight",
                    "checkpoint_last.pt", "120.0"):
         assert needle in text, needle
     assert "来源: decision_v5.json: train_hist" not in text  # 来源写的是文件名+指标

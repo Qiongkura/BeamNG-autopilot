@@ -2784,13 +2784,26 @@ def _v5_learning_block(ctx: dict, it: dict) -> str:
     if blob.get("data_factor_note") is not None:
         act.append("下轮输入: " + _esc(json.dumps(
             blob.get("data_factor_note"), ensure_ascii=False)))
+    # 单因归因（方案 v2 §S5）：停止条件只数"有意义的无收益"，所以这一格
+    # 必须显示——无效因子/缺标注/资格失败各自另有原因，不能读成"没有提升空间"
+    if blob.get("round_outcome") is not None:
+        act.append("单因归因: " + _esc(str(blob.get("round_outcome"))))
+    fa = blob.get("factor_activity")
+    if isinstance(fa, dict):
+        act.append("因子是否真生效: "
+                   + _esc("是" if fa.get("active") else "否")
+                   + ("；原因: " + _esc(str(fa.get("why") or ""))
+                      if not fa.get("active") else "")
+                   + ("；inactive 键: "
+                      + _esc("、".join(map(str, fa.get("inactive_keys") or [])))
+                      if fa.get("inactive_keys") else ""))
     pairs.append(("配方激活情况",
                   "<br>".join(act) if act else
                   _v5_no_data("判定文件没有 factor/applied_flags",
                               legacy=legacy,
                               source=f"{fname}: factor, applied_flags"),
                   f"{fname}: factor / applied_flags / skipped_factors / "
-                  "data_factor_note"))
+                  "data_factor_note / round_outcome / factor_activity"))
     # checkpoint 变化：只做文件系统证据（不改权重、不重算）
     ck_txt = []
     if root is not None:
