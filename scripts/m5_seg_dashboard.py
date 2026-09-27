@@ -3523,8 +3523,13 @@ def _v5_resources_block(ctx: dict, it: dict) -> str:
     hbs = blob.get("hard_by_seed")
     if isinstance(hbs, dict) and hbs:
         from beamng_autopilot.experiments.protocol import METRIC_DEFINITIONS
+        # 只把**标量**指标放进数值表：`hard_by_seed[*].counts` 是 v5 整数计数
+        # 字典（T12③），对它调 float() 会让整页渲染 TypeError——独立复核实测
+        # 踩到：看板夹具当时没有 counts 所以测试抓不到，而此后每一轮真实
+        # rounds 的判定都会让页面渲染失败。计数单独成行渲染（见下面的块）。
         keys = sorted({k for sd in hbs.values() if isinstance(sd, dict)
-                       for k in sd})
+                       for k, v in sd.items()
+                       if not isinstance(v, (dict, list))})
         rows = []
         for sd in sorted(hbs, key=str):
             entry = hbs[sd] if isinstance(hbs[sd], dict) else {}
@@ -3551,6 +3556,17 @@ def _v5_resources_block(ctx: dict, it: dict) -> str:
                    + "".join(f"<th>{_esc(k)}</th>" for k in keys[:8])
                    + "</tr>" + "".join(rows) + "</table>")
         out.append(_src_note(f"{fname}: hard_by_seed.<seed>.<metric>"))
+        # 逐 seed 的 v5 整数计数（T12③）：键空间与比率表不同，单独成行——
+        # 混进数值表就是上面那个 TypeError 的来源
+        for sd in sorted(hbs, key=str):
+            _sc = (hbs[sd] if isinstance(hbs[sd], dict) else {}) or {}
+            _cnt = _sc.get("counts")
+            if isinstance(_cnt, dict) and _cnt:
+                out.append(
+                    f'<p class="mono">seed {_esc(sd)} 计数: '
+                    + _esc("、".join(f"{k}={v}" for k, v in sorted(_cnt.items())))
+                    + f' <span class="src">来源: {_esc(fname)}: '
+                      f'hard_by_seed.{_esc(sd)}.counts</span></p>')
     out.append("<h4>研究结论（不直接晋级）</h4>")
     dec = blob.get("decision") if isinstance(blob.get("decision"), dict) else {}
     rrows = []

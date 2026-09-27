@@ -133,8 +133,12 @@ def _v5_decision(frame: Path, overlays: dict) -> dict:
                              "inference_ms_p95": 19.0},
             "italy/ring_negative": {"line_recall": None},
         },
+        # 真实形状：逐 seed 硬门输入里带 v5 整数计数（T12③）。夹具必须带它，
+        # 否则"字典型计数让整页渲染崩溃"这类回归抓不到（复核者实测踩到）。
         "hard_by_seed": {
-            "42": {"candidate_identity_rate": 0.75, "line_recall": 0.90,
+            "42": {
+                "counts": {"P_frames": 3, "C": 10, "R": 8, "M": 6, "L": 6,
+                           "A": 5, "C_outside_P": 0},"candidate_identity_rate": 0.75, "line_recall": 0.90,
                    "line_precision": 0.85, "offroad_false_ratio": 0.02,
                    "inference_ms_p95": 18.0},
             "43": {"candidate_identity_rate": 0.10, "line_recall": 0.20,
@@ -371,6 +375,9 @@ def test_v5_panels_render_and_every_value_names_its_source(tmp_path):
                    "negative_line.candidate", "negative_line.baseline",
                    "评价 run 缺测", "探针帧数账", "seed 43",
                    "UNKNOWN（没有合格负例）",
+                   # T12③：逐 seed 整数计数必须渲染（字典型值不能进数值表，
+                   # 否则整页 float(dict) 崩溃——复核者实测踩到过）
+                   "seed 42 计数: A=5",
                    "checkpoint_last.pt", "120.0"):
         assert needle in text, needle
     assert "来源: decision_v5.json: train_hist" not in text  # 来源写的是文件名+指标

@@ -382,3 +382,30 @@ def test_each_seed_carries_its_raw_integer_counts(tmp_path, monkeypatch):
     assert entry["counts"] == fake_ident["counts"], entry
     # 场景（ident=None）不带 counts：它没有自己的候选计数
     assert "counts" not in loop._seed_hard({"line_recall": 0.6}, None, 12.0)
+
+
+def test_a_summary_without_counts_is_recorded_not_silently_zero(
+        tmp_path, monkeypatch):
+    """复核者 #2：有 summary 但**没有 counts**（旧探针 schema）也要记账。
+
+    否则这一 run 的"全 0"与"实测 0"分不清，且 counts_completeness_note 不会触发。
+    """
+    loop = _load()
+    d = _frames(tmp_path, "coll_old", source_id="ring_old")
+
+    def probe(run, meta, *, view=None, model_path=None, frames=None):
+        # 旧 schema：有 summary、有帧数，但没有 counts 字典
+        return {"summary": {"frames_processed": 2, "frames_skipped": 0,
+                            "frames_unknown": 0, "frames_no_line_mask": 0}}
+
+    import m5_marking_identity_probe as ip
+    monkeypatch.setattr(ip, "probe", probe)
+    out = loop.identity_metrics(Path("model.pt"), [d])
+    assert out["n_eval_run_errors"] == 1, out["eval_run_errors"]
+    assert "no counts" in out["eval_run_errors"][0]["why"]
+    assert out["counts"]["P_frames"] == 0
+    # 帧数账仍然记下真实处理量（帧是真处理过的，缺的是计数）
+    assert out["probe_frame_accounting"]["frames_processed"] == 2
+    # 判定文件层面：不完整必须可见（gates 的 completeness note 会触发）
+    from beamng_autopilot.experiments.gates import counts_completeness_note
+    assert counts_completeness_note(out) is not None

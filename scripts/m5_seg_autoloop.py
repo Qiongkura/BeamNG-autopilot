@@ -365,6 +365,8 @@ def cmd_replay(args) -> int:
     proto: list = []          # 每个判定文件的协议快照自查结果
     tampered: list = []       # 快照内容与记录哈希不符（被改过/截断）
     mismatch: list = []       # counts 与 counts_ratios 不是同一批数（T12②）
+    no_selfcheck: list = []   # 早于 counts_ratios 字段的 v5 判定（无法自洽检查）
+    design_no_counters: list = []   # 设计上不测量计数的入口（evaluate）
     for p in decs:
         blob = json.loads(p.read_text(encoding="utf-8"))
         # 协议快照自查（方案 §10.3）：内容与记录的哈希是否自洽、是否就是
@@ -388,13 +390,22 @@ def cmd_replay(args) -> int:
         if _incomplete:
             print(f"  {p.name}: 计数不完整——{_incomplete}")
         if _note:
-            legacy.append({"file": p.name, "note": _note})
+            # "设计上不测量"（evaluate 写了 counts_provenance）与"早于 v5 计数
+            # 契约"是两件事，汇总行不能混成一类（复核者 #4）
+            if "by design" in _note:
+                design_no_counters.append({"file": p.name, "note": _note})
+            else:
+                legacy.append({"file": p.name, "note": _note})
             continue
         # 计数↔比率一致性自查（T12②）：从 counts 重算池化比率，与存档的
         # counts_ratios 比对。不一致 = 判定文件里的比率不是由这份计数派生的
         # （手改/拼接）——"同计数不出现两套结果"必须能被查出来。
         _cc = blob.get("counts") or {}
         _stored_r = blob.get("counts_ratios")
+        if _cc and not isinstance(_stored_r, dict):
+            no_selfcheck.append(p.name)
+            print(f"  {p.name}: 没有 counts_ratios（早于该字段的 v5 产物）："
+                  f"本次无法做计数↔比率自洽检查")
         if _cc and isinstance(_stored_r, dict):
             _re = _cm.ratios(_cc)
             _bad = {k: {"stored": _stored_r.get(k), "recomputed": _re.get(k)}
@@ -444,6 +455,10 @@ def cmd_replay(args) -> int:
         print(f"  {lg['file']}: {lg['note']}")
     print(f"[autoloop] 重放 {len(decs)} 个判定：相同 {same}，不同 {len(diff)}"
           + (f"，早于 v5 计数契约 {len(legacy)}" if legacy else "")
+          + (f"，该入口设计上不测量计数 {len(design_no_counters)}"
+             if design_no_counters else "")
+          + (f"，无计数自洽检查（早于 counts_ratios） {len(no_selfcheck)}"
+             if no_selfcheck else "")
           + (f"，协议不一致 {len(tampered)}" if tampered else "")
           + (f"，计数↔比率不一致 {len(mismatch)}" if mismatch else ""))
     for d in diff:
@@ -1361,6 +1376,13 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
             frame_acct[_k] += int(summary.get(_k) or 0)
         # 整数计数（新口径的唯一来源）
         _c = summary.get("counts") or {}
+        if not _c:
+            # 有 summary 但**没有 counts**（旧探针 schema）：这一 run 贡献不了
+            # 计数，必须记账——否则它的"全 0"会与"实测 0"混在一起（复核者 #2）
+            run_errors.append({
+                "run": str(run),
+                "why": ("probe summary has no counts (old schema?): this run "
+                        "contributes no measured counters")})
         if _c:
             _cm.accumulate(counts_acc, _c)
             _cm.accumulate(counts_by_group.setdefault(dir_group(r), _cm.empty()),
