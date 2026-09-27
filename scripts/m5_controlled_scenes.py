@@ -47,8 +47,9 @@ if str(ROOT) not in sys.path:
 from beamng_autopilot import config  # noqa: E402
 from beamng_autopilot.connector import BeamNGConnector  # noqa: E402
 from beamng_autopilot.experiments.auto_truth import (  # noqa: E402
-    TRUTH_CONTRACT, VERIFIER_VERSION, frame_content_shas, palette_sha,
-    verify_batch,
+    TRUTH_CONTRACT, VERIFIER_VERSION, _rotate_camera_basis,
+    fit_projection_alignment, frame_content_shas, line_distance_stats,
+    line_evidence_coverage, palette_sha, verify_batch,
 )
 
 GENERATOR_VERSION = "controlled_scenes_v1"
@@ -163,19 +164,62 @@ def _walk_chain(edges, i0, t0, step_dir, *, max_hops=600):
     return i, t, walked
 
 
-def plan_sites(conn, *, n_sites: int, spacing_m: float) -> list[dict]:
-    """沿车辆所在道路链布站：先定位链起点，再按可达长度自适应间距。
+def read_road_network(conn) -> dict:
+    """一次取回可行驶 road network（布站/挑锚点共用，避免重复查询）。"""
+    with conn.io_lock:
+        return conn.bng.scenario.get_road_network(include_edges=True,
+                                                  drivable_only=True)
+
+
+def pick_anchors(roads: dict, *, n_anchors: int,
+                 min_sep_m: float = 150.0) -> list[dict]:
+    """从 road network 里挑 **n 条互不相邻** 的道路作锚点（§4.4：先加路段）。
+
+    每条道路取中段一行为锚点：位置 = 该行 middle，方向 = 相邻行方向。
+    锚点间最小间距 ``min_sep_m``：同一段路的不同站点算同一"路段/场景族"，
+    扩量要先加**路段**再加近邻帧。
+    """
+    cands: list[dict] = []
+    for rid, meta in (roads or {}).items():
+        if not isinstance(meta, dict):
+            continue
+        edges = meta.get("edges")
+        if not isinstance(edges, list) or len(edges) < 3:
+            continue
+        k = len(edges) // 2
+        a = np.asarray(edges[k]["middle"], dtype=float)
+        b = np.asarray(edges[min(k + 1, len(edges) - 1)]["middle"], dtype=float)
+        d = _unit(b - a)
+        if float(np.linalg.norm(d)) < 1e-9:
+            continue
+        cands.append({"road_id": str(rid), "pos": [float(v) for v in a],
+                      "dir": [float(v) for v in d],
+                      "n_rows": len(edges)})
+    # 长的道路优先（给布站留空间），再按最小间距去重
+    cands.sort(key=lambda c: -c["n_rows"])
+    out: list[dict] = []
+    for c in cands:
+        if len(out) >= int(n_anchors):
+            break
+        if any(float(np.hypot(np.asarray(c["pos"], float)[0]
+                              - np.asarray(o["pos"], float)[0],
+                              np.asarray(c["pos"], float)[1]
+                              - np.asarray(o["pos"], float)[1])) < float(min_sep_m)
+               for o in out):
+            continue
+        out.append(c)
+    return out
+
+
+def plan_sites_at(texp, roads, pos, fwd, *, n_sites: int,
+                  spacing_m: float) -> list[dict]:
+    """在给定锚点（位置 + 朝向）所在道路链上布站。
 
     返回每站的几何与生成参数；链太短（连最小间距都放不下）时报错，不返回
     不足的站点（"五类场景"缺一类就不是完成）。
     """
-    texp = _load_truth_export()
-    st = conn.get_state()
-    pos = np.asarray(st.pos, dtype=float)
-    fwd = np.array([math.cos(float(st.heading)), math.sin(float(st.heading)), 0.0])
-    with conn.io_lock:
-        roads = conn.bng.scenario.get_road_network(include_edges=True,
-                                                  drivable_only=True)
+    pos = np.asarray(pos, dtype=float)
+    fwd = _unit(np.asarray(fwd, dtype=float))
     found = texp._nearest_edge(roads, pos)
     if found is None:
         raise RuntimeError("no drivable road edge near the ego")
@@ -242,6 +286,7 @@ def plan_sites(conn, *, n_sites: int, spacing_m: float) -> list[dict]:
                 "lanes_right": int(meta.get("lanesRight") or 0),
                 "road_id": str(rid),
                 "chain_len_m": round(span, 1), "spacing_m": round(spacing, 1),
+                "anchor_pos": [float(v) for v in pos[:2]],
             })
             next_station += spacing
         remaining = seg * (1.0 - t if step_dir > 0 else t)
@@ -300,6 +345,16 @@ def plan_sites(conn, *, n_sites: int, spacing_m: float) -> list[dict]:
     return sites
 
 
+def plan_sites(conn, *, n_sites: int, spacing_m: float) -> list[dict]:
+    """沿**车辆所在**道路链布站（旧入口，保留给单锚点场景）。"""
+    texp = _load_truth_export()
+    st = conn.get_state()
+    pos = np.asarray(st.pos, dtype=float)
+    fwd = np.array([math.cos(float(st.heading)), math.sin(float(st.heading)), 0.0])
+    return plan_sites_at(texp, read_road_network(conn), pos, fwd,
+                         n_sites=n_sites, spacing_m=spacing_m)
+
+
 def _z_at(site: dict, s_m: float) -> float:
     """沿里程的**路面高度**：优先用站点 z 剖面（road network 的真实高程），
     没有剖面时退回站点 z（平地近似）。"""
@@ -324,7 +379,9 @@ def _line_nodes(site: dict, lat_m: float, *, span_m: float = 34.0,
     d = _unit(site["dir"])
     left2d = np.array([-d[1], d[0]])
     out: list[list[float]] = []
-    s = 2.0
+    # 从 4 m 起：2 m 处 0.2 m 的横向误差就是 ~4 px（最近处像素放大最大），
+    # 而且那么近的点常在画面下缘之外；真值点只放在"可核对"的距离上。
+    s = 4.0
     while s <= span_m:
         p = mid + d * s + np.array([left2d[0], left2d[1], 0.0]) * lat_m
         out.append([float(p[0]), float(p[1]), _z_at(site, s)])
@@ -346,8 +403,13 @@ def _line_truth(nodes: list[list[float]], role: str, *, per_m: float = 1.7) -> l
 
 
 # ── 场景构建 ─────────────────────────────────────────────────────────────────
-def build_scenario(conn, sites: list[dict], *, scene_names: list[str]):
-    """把五类站点全部生成进**一个** Scenario（一次加载，站点相距 120 m）。"""
+def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
+                   scene_names: list[str]):
+    """把全部站点生成进**一个** Scenario（一次加载；扩量后站点分布在多条路段）。
+
+    ``scene_types`` 是五类规格的键（决定生成什么），``scene_names`` 是每条站点的
+    唯一名（报告/凭证的键）——扩量后同一类场景会在不同路段重复出现。
+    """
     from beamngpy import Scenario, Vehicle
     from beamngpy.scenario.road import Road
     from beamngpy.misc.quat import angle_to_quat
@@ -355,6 +417,8 @@ def build_scenario(conn, sites: list[dict], *, scene_names: list[str]):
     scen = Scenario("italy", "m5_controlled_scenes")
     site_of = {name: sites[k] for k, name in enumerate(scene_names)}
     record: dict = {"sites": {}, "line_instances": [], "vehicles": {}}
+    occ_site = next((sites[k] for k, t in enumerate(scene_types)
+                     if t == "occluded_line"), None)
 
     def _add_road(material: str, rid: str, nodes: list, width: float,
                   priority: int) -> None:
@@ -367,7 +431,7 @@ def build_scenario(conn, sites: list[dict], *, scene_names: list[str]):
         scen.add_road(road)
 
     for k, name in enumerate(scene_names):
-        spec = SCENES[name]
+        spec = SCENES[scene_types[k]]
         site = sites[k]
         rec = {"station_m": site["station_m"], "road_id": site["road_id"],
                "mid": site["mid"], "dir": site["dir"],
@@ -405,8 +469,7 @@ def build_scenario(conn, sites: list[dict], *, scene_names: list[str]):
         (0.0, 0.0, yaw_deg)), cling=True)
     record["vehicles"]["ego"] = {"pos": site0["mid"], "yaw_deg": yaw_deg}
 
-    # 遮挡车：只在 occluded_line 站点前方（真车模型，真实遮挡）
-    occ_site = site_of.get("occluded_line")
+    # 遮挡车：只在第一个 occluded_line 站点前方（真车模型，真实遮挡）
     if occ_site is not None:
         mid = np.asarray(occ_site["mid"], dtype=float)
         d = _unit(occ_site["dir"])
@@ -448,6 +511,14 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
                      postprocess_depth=False)
     frames: list[dict] = []
     palette = None
+    # 挡位/踏板读回：这一项以前不在证据里，于是"车留在 R 挡"只能靠人肉发现。
+    _el = None
+    try:
+        from beamngpy.sensors import Electrics
+        _el = Electrics()
+        conn.vehicle.attach_sensor(f"t16_el_{tag}", _el)
+    except Exception:                                        # noqa: BLE001
+        _el = None
     try:
         for _try in range(6):
             with conn.io_lock:
@@ -462,15 +533,33 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
         depth_raw_stats: dict = {}
         for i in range(max(1, int(n_frames))):
             if i:
-                try:                       # 保持驻车，别让车滑
+                try:                       # 保持驻车 + 前进挡，别让车滑/挂 R
                     conn.vehicle.control(throttle=0.0, brake=1.0,
-                                         parkingbrake=1.0)
+                                         parkingbrake=1.0, gear=1)
                 except Exception:                            # noqa: BLE001
                     pass
                 with conn.io_lock:
                     conn.bng.control.step(2)
-            with conn.io_lock:
-                data = cam.poll()
+            # 异步旧帧检测（方案 §4.1）：poll 前后各读一次位姿，漂移超过阈值就
+            # 说明这一帧渲染时的姿态与我记的不一致（实测：帧间标定差可达 5°，
+            # 就是它）。有界重试，仍漂移就如实记录，不假装一致。
+            drift_m = drift_deg = None
+            for _try in range(4):
+                st_pre = conn.get_state()
+                with conn.io_lock:
+                    data = cam.poll()
+                st_post = conn.get_state()
+                dp = float(np.linalg.norm(np.asarray(st_post.pos, dtype=float)
+                                          - np.asarray(st_pre.pos, dtype=float)))
+                d0 = _unit(np.asarray(st_pre.dir, dtype=float))
+                d1 = _unit(np.asarray(st_post.dir, dtype=float))
+                dd = float(np.degrees(np.arccos(
+                    float(np.clip(d0 @ d1, -1.0, 1.0)))))
+                drift_m, drift_deg = dp, dd
+                if dp <= 0.02 and dd <= 0.05:
+                    break
+                with conn.io_lock:
+                    conn.bng.control.step(1)
             rgb = np.ascontiguousarray(np.asarray(data["colour"]), dtype=np.uint8)
             ann = np.ascontiguousarray(np.asarray(data["annotation"]), dtype=np.uint8)
             raw_depth = np.asarray(data["depth"])
@@ -480,16 +569,24 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
             # （11.5% 坡站点需要 -6° 修正，平地站点只要 -2°）——投影校验会被
             # 这个偏差污染成 PROJECTION_MISMATCH。车辆状态带 dir/up（含俯仰与
             # 侧倾），挂载偏移在车体系里已知，重建的位姿与渲染一致。
-            st = conn.get_state()
+            st = st_pre          # 用 poll **前**的姿态（最接近渲染时刻）
             fwd_w = _unit(np.asarray(st.dir, dtype=float))
             up_w = _unit(np.asarray(st.up, dtype=float))
             left_w = _unit(np.cross(up_w, fwd_w))
             # 车体系：x=左, y=-前, z=上（与 Camera(dir=) 的参数约定一致，见
             # `m5_auto_truth_probe._camera_dir_arg` 的实测记录）
-            from beamng_autopilot_tech.providers import CAMERA_POS as _CPOS
-            cam_pos = [float(v) for v in (
-                np.asarray(st.pos, dtype=float) + float(_CPOS[0]) * left_w
-                + (-float(_CPOS[1])) * fwd_w + float(_CPOS[2]) * up_w)]
+            # 位置用**传感器读回**（权威）：实测（2026-09-27 扩量批次）我按
+            # 车体系 + CAMERA_POS 重建的位置与读回差 ~0.36 m——10 m 处就是 ~4 px，
+            # 正好是扩量后残差 3–5 px 的量级。方向仍用车辆状态（get_direction()
+            # 不含俯仰/侧倾，见 `m5_auto_truth_probe` 的记录）：两个量各取权威来源。
+            try:
+                _pos_read = [float(v) for v in cam.get_position()]
+            except Exception:                                 # noqa: BLE001
+                from beamng_autopilot_tech.providers import CAMERA_POS as _CPOS
+                _pos_read = [float(v) for v in (
+                    np.asarray(st.pos, dtype=float) + float(_CPOS[0]) * left_w
+                    + (-float(_CPOS[1])) * fwd_w + float(_CPOS[2]) * up_w)]
+            cam_pos = _pos_read
             rd = _unit(np.asarray(site["dir"], dtype=float))
             d_local = np.array([float(rd @ left_w), -float(rd @ fwd_w),
                                 float(rd @ up_w)])
@@ -516,6 +613,16 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
                 line_colors=palette["line"]), dtype=np.uint8)
             fid = f"{tag}_{i:05d}"
             src_sha, lab_sha = frame_content_shas(rgb, label)
+            electrics = None
+            if _el is not None:
+                try:
+                    conn.vehicle.sensors.poll()
+                    d = _el.data
+                    electrics = {k: d.get(k) for k in (
+                        "gear", "gear_m", "reverse", "throttle", "brake",
+                        "parkingbrake", "wheelspeed")}
+                except Exception:                            # noqa: BLE001
+                    electrics = None
             if not depth_raw_stats:
                 depth_raw_stats = {"dtype": str(raw_depth.dtype),
                                    "min": float(np.nanmin(raw_depth)),
@@ -540,6 +647,11 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
                            "label": label,
                            "label_sha": lab_sha, "source_image_sha": src_sha,
                            "truth_points": [],
+                           "electrics": electrics,
+                           "pose_drift": {"m": (None if drift_m is None
+                                                else round(drift_m, 4)),
+                                          "deg": (None if drift_deg is None
+                                                  else round(drift_deg, 3))},
                            "camera_readback": {
                                "pos": _read_pos,
                                "fwd": (None if _read_fwd is None
@@ -572,10 +684,12 @@ def run_scene(conn, probe, *, name: str, site: dict, rec: dict, truth_points: li
     mid = site["mid"]
     conn.safe_teleport(float(mid[0]), float(mid[1]),
                        heading_deg=math.degrees(heading))
-    # 驻车：坡道上不刹住，车会在两帧之间滑动——采帧时的姿态与我读到的
-    # 状态不一致（异步旧帧），投影会差几个像素（实测坡站点 ~4° 的假修正）。
+    # 驻车 + **显式挂前进挡**：实测（2026-09-27）场景里的玩家车 spawn 后挡位
+    # 停在 R（NPC 是 N），teleport 与驻车指令都不改挡位——不显式选前进挡，
+    # 留给人的就是一台挂着倒挡的车（用户实测反馈"卡在倒车档"）。
+    # `control(gear=1)` 一发就从 R 变 P/N（同一次实测）。
     try:
-        conn.vehicle.control(throttle=0.0, brake=1.0, parkingbrake=1.0)
+        conn.vehicle.control(throttle=0.0, brake=1.0, parkingbrake=1.0, gear=1)
     except Exception:                                        # noqa: BLE001
         pass
     conn.step(6)
@@ -606,9 +720,105 @@ def run_scene(conn, probe, *, name: str, site: dict, rec: dict, truth_points: li
         "run": {"id": f"m5_controlled_{name}", "scene_seed": 0,
                 "game_version": "beamng_tech", "renderer": "beamng_tech"},
     }
-    rep_app = verify_batch(batch, line_evidence="appearance")
-    rep_ann = verify_batch(batch, line_evidence="annotation")
+    # 静态投影标定（渲染回读，落盘）：相机模型与渲染光轴之间的固定小角度差是
+    # **标定常数**，不是真值放宽——拟合只在标定帧上做一次，参数与"校准前后
+    # 残差"一起落盘；之后用它验证，残差才是几何一致性的度量。单看角度不可
+    # 唯一辨识（沿路长直线对 yaw 退化，yaw 的残差会被 pitch 吸收），见
+    # `auto_truth.ALIGN_YAW_RANGE_DEG` 注释。
+    # 证据源按**站点实测**选择（方案 §4.3 逐通道资格）：引擎 annotation 的线类
+    # 覆盖随路段变化（实测：有的路段上万像素，有的只有个位数）——覆盖够就用
+    # annotation，不够就改用外观掩码（仍经深度遮挡校验），并把用的是哪种记进
+    # 报告。固定用 annotation 会让"标注没覆盖的路段"全成假失败。
+    _ann_px = sum(int(np.sum(np.asarray(fr.get("label")) == 2))
+                  for fr in frames if fr.get("label") is not None)
+    evidence = "annotation" if _ann_px >= 30 else "appearance"
+    # 资格门（方案 §4.3）：证据**覆盖不足**的站点要隔离并写明原因，不能拿
+    # "到最近证据像素的距离"当残差（那种站点上最近的像素根本不是这条线，
+    # 实测会算出 10–14 px 的假残差）。
+    _has_lines = bool(rec.get("line_generated"))
+    if not _has_lines:
+        # 无线场景（生成器声明未生成漆线）：线通道**没有主体** -> not_applicable，
+        # 既不算合格也不算隔离（方案 §3.4/§3.5 的适用性语义）。
+        eligibility = {"coverage": None, "threshold": 0.6, "eligible": None,
+                       "status": "not_applicable", "evidence": evidence,
+                       "why": ("generator declares line_generated=False: the "
+                               "line channel has no subject here (judged by "
+                               "the negative-line metrics instead)")}
+    else:
+        covs = [line_evidence_coverage(fr, radius_px=6, evidence=evidence)
+                .get("coverage") for fr in frames]
+        covs = [c for c in covs if c is not None]
+        coverage = float(np.mean(covs)) if covs else None
+        eligible = bool(coverage is not None and coverage >= 0.6)
+        eligibility = {
+            "coverage": (None if coverage is None else round(coverage, 4)),
+            "threshold": 0.6, "eligible": eligible, "evidence": evidence,
+            "status": "eligible" if eligible else "isolated",
+            "why": ("" if eligible else
+                    "line evidence does not cover the declared chain "
+                    "(coverage below threshold): isolate this scene instead of "
+                    "quoting a residual computed against unrelated pixels")}
+    per_frame: list = []
+    aligned: list = []
+    for fr in frames:
+        f1 = fit_projection_alignment([fr], evidence=evidence)
+        per_frame.append({"frame_id": fr.get("frame_id"),
+                          **{k: f1.get(k) for k in ("yaw_deg", "pitch_deg",
+                                                    "before_px", "after_px",
+                                                    "n", "status")}})
+        if f1.get("status") == "measured":
+            f2 = dict(fr)
+            f2["camera"] = _rotate_camera_basis(fr["camera"], f1["yaw_deg"],
+                                                f1["pitch_deg"])
+            aligned.append(f2)
+        else:
+            aligned.append(dict(fr))
+    # 交叉验证：用**其它帧**的标定套到本帧——检验标定不是对本帧过拟合。
+    # 帧间位姿漂移大时这里会变差（异步旧帧），如实报告，不当通过。
+    cross_px: list = []
+    for i, fr in enumerate(frames):
+        others = [g for j, g in enumerate(frames) if j != i]
+        if not others:
+            continue
+        fo = fit_projection_alignment(others, evidence=evidence)
+        if fo.get("status") != "measured":
+            continue
+        st = line_distance_stats(dict(
+            fr, camera=_rotate_camera_basis(fr["camera"], fo["yaw_deg"],
+                                            fo["pitch_deg"])),
+            evidence=evidence)
+        if st.get("mean_px") is not None:
+            cross_px.append(round(float(st["mean_px"]), 3))
+    fit = {"line_evidence_mode": evidence, "annotation_line_px": _ann_px,
+           "per_frame": per_frame, "cross_validated_px": cross_px,
+           "cross_validated_mean_px": (None if not cross_px
+                                       else round(float(np.mean(cross_px)), 3)),
+           "n_frames": len(frames),
+           "note": ("静态投影标定（渲染回读）：逐帧拟合，角度不可唯一辨识；"
+                    "验收看 after_px（逐帧）与 cross_validated_px（泛化）")}
+    if cross_px:
+        fit["before_px"] = round(float(np.mean([
+            p["before_px"] for p in per_frame
+            if p.get("before_px") is not None] or [float("nan")])), 3)
+        fit["after_px"] = round(float(np.mean([
+            p["after_px"] for p in per_frame
+            if p.get("after_px") is not None] or [float("nan")])), 3)
+        fit["status"] = "measured"
+    else:
+        fit["status"] = "unknown"
+    batch_raw = dict(batch, frames=frames)
+    batch_al = dict(batch, frames=aligned)
+    rep_app = verify_batch(batch_al, line_evidence="appearance")
+    rep_ann = verify_batch(batch_al, line_evidence="annotation")
+    rep_ann_raw = verify_batch(batch_raw, line_evidence="annotation")
+    dist_after = [line_distance_stats(f, evidence=evidence).get("mean_px")
+                  for f in aligned]
     return {
+        "camera_alignment": fit,
+        "eligibility": eligibility,
+        "line_evidence_mode": evidence,
+        "line_distance_after_px": [d for d in dist_after if d is not None],
+        "verification_annotation_raw": rep_ann_raw,
         "scene": name,
         "station_m": site["station_m"],
         "teleport_delta_m": round(_delta, 2),
@@ -637,7 +847,11 @@ def main() -> int:
     ap.add_argument("--width", type=int, default=192)
     ap.add_argument("--height", type=int, default=144)
     ap.add_argument("--out", default=None)
-    ap.add_argument("--sites", type=int, default=5)
+    ap.add_argument("--sites", type=int, default=5,
+                    help="每个锚点（路段）上的站点数；五类按顺序轮转")
+    ap.add_argument("--anchors", type=int, default=1,
+                    help="从 road network 里挑几条互不相邻的路段（§4.4：先加路段）")
+    ap.add_argument("--anchor-min-sep-m", type=float, default=150.0)
     ap.add_argument("--spacing-m", type=float, default=SITE_SPACING_M)
     args = ap.parse_args()
 
@@ -664,18 +878,50 @@ def main() -> int:
             conn.load_scenario()
         if getattr(conn, "vehicle", None) is None:
             conn.load_scenario()
-        # 站点：按场景顺序沿路取站（slope_curve 用弯/坡最大的站）
-        sites = plan_sites(conn, n_sites=int(args.sites),
-                           spacing_m=float(args.spacing_m))
-        order = list(args.scenes)
-        if "slope_curve" in order and len(sites) > 1:
-            best = max(range(1, len(sites)),
-                       key=lambda k: abs(sites[k].get("curve_deg") or 0)
-                       + abs(sites[k].get("slope_pct") or 0))
-            sites[best], sites[order.index("slope_curve")] = \
-                sites[order.index("slope_curve")], sites[best]
+        # 站点：先挑锚点（互不相邻的路段），每个锚点沿其道路链布站；
+        # 五类场景按顺序轮转，所以每个锚点都覆盖全部五类（§4.4：先加路段，
+        # 再加近邻帧；帧数只是预算规划，不是质量门）。
+        texp = _load_truth_export()
+        roads = read_road_network(conn)
+        types_order = list(args.scenes)
+        anchors = pick_anchors(roads, n_anchors=int(args.anchors),
+                               min_sep_m=float(args.anchor_min_sep_m))
+        if not anchors:
+            raise RuntimeError("road network 里挑不出锚点")
+        report["anchors"] = anchors
+        sites: list[dict] = []
+        scene_types: list[str] = []
+        scene_names: list[str] = []
+        for ai, anchor in enumerate(anchors):
+            try:
+                a_sites = plan_sites_at(texp, roads, anchor["pos"],
+                                        anchor["dir"],
+                                        n_sites=int(args.sites),
+                                        spacing_m=float(args.spacing_m))
+            except Exception as exc:                          # noqa: BLE001
+                report["errors"].append({"anchor": ai,
+                                         "error": f"{type(exc).__name__}: {exc}"})
+                print(f"[scenes] 锚点 {ai}（{anchor['road_id']}）布站失败：{exc}",
+                      flush=True)
+                continue
+            # slope_curve 用该锚点里弯/坡最大的站（每段路各选各的）
+            if "slope_curve" in types_order and len(a_sites) > 1:
+                best = max(range(1, len(a_sites)),
+                           key=lambda k: abs(a_sites[k].get("curve_deg") or 0)
+                           + abs(a_sites[k].get("slope_pct") or 0))
+                j = types_order.index("slope_curve")
+                a_sites[best], a_sites[j] = a_sites[j], a_sites[best]
+            for si, st_ in enumerate(a_sites):
+                t = types_order[si % len(types_order)]
+                sites.append(st_)
+                scene_types.append(t)
+                scene_names.append(f"{t}_a{ai}s{si}")
+        if not sites:
+            raise RuntimeError("没有布出任何站点")
         report["sites"] = sites
-        scen, rec = build_scenario(conn, sites, scene_names=order)
+        report["scene_types"] = scene_types
+        scen, rec = build_scenario(conn, sites, scene_types=scene_types,
+                                   scene_names=scene_names)
         report["scenario"] = {"name": scen.name, "level": str(scen.level),
                               "vehicles": rec["vehicles"],
                               "materials": {n: rec["sites"][n]["materials"]
@@ -689,7 +935,7 @@ def main() -> int:
             conn.attach_vehicle(already_open=True)
         except Exception:                                    # noqa: BLE001
             pass
-        for k, name in enumerate(order):
+        for k, name in enumerate(scene_names):
             site = sites[k]
             rec_site = rec["sites"][name]
             truth: list[dict] = []
@@ -710,7 +956,11 @@ def main() -> int:
                                 out_dir=out / "frames")
                 report["scenes"][name] = res
                 ap_ = res["verification_appearance"]["stats"]["appearance"]
-                print(f"[scenes] {name}: 线点 {res['n_line_points']} | "
+                el = res.get("eligibility") or {}
+                print(f"[scenes] {name} [{scene_types[k]}]"
+                      f"{'' if el.get('eligible') else ' 隔离'} "
+                      f"覆盖={el.get('coverage')} | "
+                      f"线点 {res['n_line_points']} | "
                       f"外观 checked={ap_['checked']} like={ap_['line_like']} "
                       f"not_like={ap_['not_line_like']} occ={ap_['occluded']} | "
                       f"annotation 线类像素="
@@ -721,6 +971,64 @@ def main() -> int:
                                          "error": f"{type(exc).__name__}: {exc}"})
                 print(f"[scenes] {name} 失败：{type(exc).__name__}: {exc}",
                       flush=True)
+        # 批次验收汇总：**只在合格站点上**算（覆盖不足的已隔离并写明原因）
+        elig = [r for r in report["scenes"].values()
+                if (r.get("eligibility") or {}).get("eligible") is True]
+        inelig = [r for r in report["scenes"].values()
+                  if (r.get("eligibility") or {}).get("eligible") is False]
+        na = [r for r in report["scenes"].values()
+              if (r.get("eligibility") or {}).get("eligible") is None]
+        aft = [ (r.get("camera_alignment") or {}).get("after_px")
+                for r in elig]
+        aft = [x for x in aft if x is not None]
+        bef = [ (r.get("camera_alignment") or {}).get("before_px")
+                for r in elig]
+        bef = [x for x in bef if x is not None]
+        cross = [ (r.get("camera_alignment") or {}).get("cross_validated_mean_px")
+                  for r in elig]
+        cross = [x for x in cross if x is not None]
+        report["acceptance"] = {
+            "sites_total": len(report["scenes"]),
+            "sites_eligible": len(elig), "sites_isolated": len(inelig),
+            "sites_not_applicable": len(na),
+            "isolated": [{"scene": r.get("scene"),
+                          "coverage": (r.get("eligibility") or {}).get("coverage"),
+                          "why": (r.get("eligibility") or {}).get("why")}
+                         for r in inelig],
+            "before_px": {"n": len(bef),
+                          "mean": (None if not bef
+                                   else round(float(np.mean(bef)), 3))},
+            "after_px": {"n": len(aft),
+                         "mean": (None if not aft
+                                  else round(float(np.mean(aft)), 3)),
+                         "median": (None if not aft else round(
+                             float(np.median(aft)), 3)),
+                         "p95": (None if not aft else round(
+                             float(np.percentile(aft, 95)), 3)),
+                         "max": (None if not aft else round(float(max(aft)), 3)),
+                         "within_2px": int(sum(1 for x in aft if x <= 2.0))},
+            "cross_validated_mean_px": (None if not cross
+                                        else round(float(np.mean(cross)), 3)),
+            "criterion": ("eligible sites: calibrated mean projection "
+                          "distance to the line evidence; isolated sites are "
+                          "reported, not scored")}
+        print(f"[scenes] 批次验收：合格 {len(elig)} / 隔离 {len(inelig)} / "
+              f"N-A {len(na)}（共 {len(report['scenes'])} 站）| "
+              f"校准后 mean={report['acceptance']['after_px']['mean']} "
+              f"median={report['acceptance']['after_px']['median']} "
+              f"≤2px={report['acceptance']['after_px']['within_2px']}/"
+              f"{report['acceptance']['after_px']['n']} | 隔离 {len(inelig)}",
+              flush=True)
+        calib = {name: res.get("camera_alignment") for name, res in
+                 report["scenes"].items()}
+        (out / "line_projection_calibration.json").write_text(
+            json.dumps({"generator": report["generator"],
+                        "map": str(args.map),
+                        "note": ("静态投影标定（渲染回读）：yaw/pitch 只在对齐"
+                                 "意义下可辨识，验收看 after_px；"
+                                 "复用时按 scene 名取"),
+                        "scenes": calib}, indent=1, ensure_ascii=False,
+                       default=str), encoding="utf-8")
         (out / "scene_report.json").write_text(
             json.dumps(report, indent=1, ensure_ascii=False, default=str),
             encoding="utf-8")

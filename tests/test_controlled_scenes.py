@@ -135,3 +135,47 @@ def test_plan_sites_raises_when_the_chain_is_too_short():
         assert "站点" in str(exc)
     else:                                                  # pragma: no cover
         raise AssertionError("道路链太短时必须报错，不能返回不足的站点")
+
+
+def test_pick_anchors_respects_min_separation_and_prefers_long_roads():
+    """锚点 = 互不相邻的路段（§4.4：扩量先加路段）。"""
+    m = _load()
+    roads = {}
+    for k in range(6):
+        n = 12 if k % 2 == 0 else 4          # 长路优先
+        rows = [{"middle": [k * 400.0 + i * 10.0, 0.0, 1.0],
+                 "left": [k * 400.0 + i * 10.0, 4.0],
+                 "right": [k * 400.0 + i * 10.0, -4.0]} for i in range(n)]
+        roads[f"r{k}"] = {"edges": rows, "lanesLeft": 1, "lanesRight": 1}
+    a = m.pick_anchors(roads, n_anchors=3, min_sep_m=150.0)
+    assert len(a) == 3
+    xs = [c["pos"][0] for c in a]
+    assert all(abs(xs[i + 1] - xs[i]) >= 150.0 for i in range(len(xs) - 1)), xs
+    # 长路（12 行）优先
+    assert all(c["n_rows"] == 12 for c in a), a
+    tight = m.pick_anchors(roads, n_anchors=6, min_sep_m=500.0)
+    assert len(tight) == 3, tight             # 500 m 间距下只剩 3 条
+
+
+def test_plan_sites_at_uses_the_given_anchor_and_records_it():
+    m = _load()
+    texp = m._load_truth_export()
+    roads = _road(n_rows=40, step=10.0)
+    sites = m.plan_sites_at(texp, roads, [0.0, 0.0, 1.0], [1.0, 0.0, 0.0],
+                            n_sites=4, spacing_m=60.0)
+    assert len(sites) == 4
+    assert all(abs(s["anchor_pos"][0] - 0.0) < 1e-6 for s in sites)
+    xs = [s["mid"][0] for s in sites]
+    assert xs == sorted(xs) and len(set(xs)) == 4
+
+
+def test_the_generator_selects_drive_gear_explicitly():
+    """挡位接线（实测：玩家车 spawn 后停在 R，teleport/驻车指令都不改挡位）。
+
+    这是源码级接线检查：漏了 `gear=1` 的后果只有在游戏里由人发现（用户实测
+    反馈"卡在倒车档"），所以用测试卡住。
+    """
+    src = (ROOT / "scripts" / "m5_controlled_scenes.py").read_text(
+        encoding="utf-8")
+    assert src.count("gear=1") >= 2, "run_scene 与采帧循环都要显式挂前进挡"
+    assert '"electrics"' in src and "reverse" in src, "挡位/踏板要进证据"
