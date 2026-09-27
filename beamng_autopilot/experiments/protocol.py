@@ -370,22 +370,55 @@ def snapshot_hash(snap: dict) -> str:
     ).hexdigest()[:16]
 
 
+def snapshot_hash_legacy(snap: dict) -> str:
+    """旧记录的哈希口径：只对**当时记录下来的字段**重算（不按当前字段表）。
+
+    为什么需要：`SNAPSHOT_FIELDS` 随协议版本增长（v5 加了 candidate_counting /
+    applicability / negative_diagnostic）。若一律按当前字段表重算，旧判定会被
+    误判成"被编辑或截断"——实测：54 个合法旧判定 replay 返回 rc=1（方案 §S3.7
+    要求旧判定按其嵌入协议重放，这条不能错杀）。
+
+    代价：这个口径对"**删掉**某个字段"不设防（删掉的键不再参与哈希）。所以它
+    只作为 :func:`verify_snapshot` 的**第二规则**，并在结果里显式标注用了哪条。
+    """
+    view = {k: v for k, v in snap.items() if k != "hash"}
+    return hashlib.sha256(
+        json.dumps(view, sort_keys=True, ensure_ascii=False).encode()
+    ).hexdigest()[:16]
+
+
 def verify_snapshot(snap: dict) -> dict:
-    """校验一份记录下来的协议快照：内容自洽 + 与当前口径是否一致。"""
+    """校验一份记录下来的协议快照：内容自洽 + 与当前口径是否一致。
+
+    两条哈希规则：① 当前字段表（严格，新记录必须过这条）；② 旧记录按"当时
+    记录下来的字段"（`snapshot_hash_legacy`）——只有 ① 不匹配而 ② 匹配时才
+    算通过，并标注 `hash_rule` 与说明，绝不静默放行。
+    """
     got = snapshot_hash(snap)
+    legacy_got = snapshot_hash_legacy(snap)
     recorded = snap.get("hash")
     cur = protocol_hash(thresholds=snap.get("thresholds") or None)
-    reasons = []
+    reasons: list = []
+    notes: list = []
+    rule = "current_fields"
     if recorded is None:
         reasons.append("snapshot has no hash: cannot tell which protocol it was "
                        "written under")
     elif str(recorded) != got:
-        reasons.append(f"snapshot content does not match its recorded hash "
-                       f"({got}) - the decision file was edited or truncated")
+        if str(recorded) == legacy_got:
+            rule = "fields_present_at_record_time"
+            notes.append(
+                "recorded under an older protocol field set: the hash matches "
+                "the fields present at record time, so this file is intact but "
+                "cannot be re-judged under the new denominators")
+        else:
+            reasons.append(f"snapshot content does not match its recorded hash "
+                           f"({got}) - the decision file was edited or truncated")
     return {"ok": not reasons, "recorded_hash": recorded,
-            "recomputed_hash": got, "current_hash": cur,
+            "recomputed_hash": got, "legacy_recomputed_hash": legacy_got,
+            "hash_rule": rule, "current_hash": cur,
             "matches_current_protocol": bool(recorded == cur),
-            "reasons": reasons}
+            "reasons": reasons, "notes": notes}
 
 
 def protocol_hash(*, thresholds: dict | None = None) -> str:

@@ -69,3 +69,51 @@ def test_only_verified_sources_can_promote():
                                     "can_promote": False}
     assert eligibility("no-such-rank") == SOURCE_ELIGIBILITY["absent"]
     assert set(RESEARCH_ONLY_RANKS) == {"agent", "pseudo"}
+
+
+def test_a_snapshot_recorded_under_an_older_field_set_still_verifies() -> None:
+    """T13：`SNAPSHOT_FIELDS` 增长不能把合法旧判定误判成"被篡改"。
+
+    实测（2026-09-27 复核）：v5 给 SNAPSHOT_FIELDS 加了三个字段后，54 个合法
+    pre-v5 判定的快照按新字段表重算必然不匹配 -> replay 返回 rc=1。修法：加一条
+    "按当时记录下来的字段"重算的规则，只有严格规则不中而它中时才算通过，并
+    显式标注用了哪条（不静默放行）。
+    """
+    from beamng_autopilot.experiments.protocol import (
+        protocol_blob, snapshot_hash, snapshot_hash_legacy, verify_snapshot)
+
+    # 旧记录：拿当前快照删掉三个 v5 新增字段，并用"当时字段"口径记哈希
+    snap = dict(protocol_blob())
+    for k in ("candidate_counting", "applicability", "negative_diagnostic"):
+        snap.pop(k, None)
+    snap["hash"] = snapshot_hash_legacy(snap)
+    ver = verify_snapshot(snap)
+    assert ver["ok"] is True, ver["reasons"]
+    assert ver["hash_rule"] == "fields_present_at_record_time"
+    assert ver["notes"], "必须写明这是旧字段集（不能与当前口径混比）"
+    assert ver["matches_current_protocol"] is False
+
+
+def test_an_edited_snapshot_is_still_rejected_by_both_rules() -> None:
+    """两条规则都不该放过被改过的快照（不能为了兼容旧记录而放松自查）。"""
+    from beamng_autopilot.experiments.protocol import (
+        protocol_blob, snapshot_hash, verify_snapshot)
+
+    snap = dict(protocol_blob())
+    snap["hash"] = snapshot_hash(snap)              # 先按原样记哈希
+    snap["version"] = "t14-protocol-v0-forged"      # 再改内容、留旧哈希
+    ver = verify_snapshot(snap)
+    assert ver["ok"] is False and ver["reasons"]
+    assert "edited or truncated" in ver["reasons"][0]
+
+
+def test_a_current_snapshot_verifies_under_the_strict_rule() -> None:
+    from beamng_autopilot.experiments.protocol import (
+        protocol_blob, snapshot_hash, verify_snapshot)
+
+    snap = dict(protocol_blob())
+    snap["hash"] = snapshot_hash(snap)
+    ver = verify_snapshot(snap)
+    assert ver["ok"] is True
+    assert ver["hash_rule"] == "current_fields"
+    assert ver["matches_current_protocol"] is True
