@@ -45,7 +45,8 @@ from beamng_autopilot.experiments.checkpoint import git_commit as _git_commit
 from beamng_autopilot.experiments.final_set import (  # noqa: E402
     confirmation_check,
 )
-from beamng_autopilot.experiments.gates import (  # noqa: E402
+from beamng_autopilot.experiments.gates import (
+    counts_completeness_note,  # noqa: E402
     HARD_CHECKS, SCENE_HARD_FIELDS, Thresholds, decide, hard_split,
     legacy_replay_note, missing_metrics_for, paired_compare,
     per_seed_gate_violations, per_seed_missing, scene_count_violations,
@@ -297,6 +298,13 @@ def cmd_evaluate(args) -> int:
         "source": str(Path(args.thresholds) if args.thresholds
                       else newest_thresholds_file() or "code defaults")},
         "protocol": _protocol_snapshot(t),
+        # 计数来源说明（复核者 T12①）：`evaluate` 只消费外部 pairings/hard-gate
+        # 文件，本身没有 runs/模型 -> 设计上不产生 v5 计数。写明这一点，replay
+        # 就不会把它读成"早于 v5 的历史遗留"（那是另一回事）。
+        "counts_provenance": ("not measured here: evaluate consumes external "
+                              "pairings/hard-gate files (no runs/model in this "
+                              "entry point); use rounds/calibration to measure "
+                              "the counting contract"),
         "pairings": compared, "hard_gate_violations": violations,
         "decision": decision}
     # 事件先落、判定后落：反过来一旦状态机拒绝迁移，就会出现"有判定文件
@@ -373,6 +381,9 @@ def cmd_replay(args) -> int:
             if Path(blob["thresholds"]["source"]).exists() else None)
         # v5：早于计数契约的判定**不能**按新分母重判，也不许补 0——显式说明。
         _note = legacy_replay_note(blob)
+        _incomplete = counts_completeness_note(blob)
+        if _incomplete:
+            print(f"  {p.name}: 计数不完整——{_incomplete}")
         if _note:
             legacy.append({"file": p.name, "note": _note})
             continue
@@ -1124,7 +1135,7 @@ def _seed_hard(metrics: dict, ident: dict | None, p95: float | None) -> dict:
     （= UNKNOWN，不当通过）。
     """
     ident = ident or {}
-    return {
+    out = {
         "candidate_identity_rate": ident.get("candidate_identity_rate"),
         # v4 新增的两道候选门：必须逐 seed 可测（否则记缺测阻止晋级）
         "candidate_reference_coverage": ident.get("candidate_reference_coverage"),
@@ -1134,6 +1145,11 @@ def _seed_hard(metrics: dict, ident: dict | None, p95: float | None) -> dict:
         "offroad_false_ratio": (metrics or {}).get("offroad_false_frac_of_pred"),
         "inference_ms_p95": p95,
     }
+    # 逐 seed 的**原始整数计数**也要落盘（方案 §8.1"逐 seed 原始计数"；
+    # 复核者 T12③：此前 hard_by_seed 只有比率，重判拿不到该 seed 的分母）
+    if ident.get("counts"):
+        out["counts"] = dict(ident["counts"])
+    return out
 
 
 def task_metric_value(name: str, metrics: dict, identity: float | None):

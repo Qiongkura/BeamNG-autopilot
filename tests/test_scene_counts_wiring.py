@@ -365,3 +365,20 @@ def test_a_probe_refusal_is_recorded_not_silently_zero(tmp_path, monkeypatch):
     assert out["counts"]["P_frames"] == 0
     assert out["counts_by_group"] == {}, \
         "refusal 不该产出任何分组计数（零计数 = 没测，不是实测 0）"
+
+
+def test_each_seed_carries_its_raw_integer_counts(tmp_path, monkeypatch):
+    """T12③（复核者发现）：`hard_by_seed` 原来只有比率，逐 seed 原始计数没落盘。
+
+    方案 §8.1 要求"逐 seed 原始计数"——重判某个 seed 时需要它自己的分母。
+    """
+    loop = _load()
+    fake_ident = {"candidate_identity_rate": 0.5,
+                  "candidate_reference_coverage": 0.8,
+                  "left_right_role_agreement": 0.7,
+                  "counts": {"P_frames": 3, "C": 10, "R": 8, "M": 4,
+                             "L": 4, "A": 3, "C_outside_P": 1}}
+    entry = loop._seed_hard({"line_recall": 0.6}, fake_ident, 12.0)
+    assert entry["counts"] == fake_ident["counts"], entry
+    # 场景（ident=None）不带 counts：它没有自己的候选计数
+    assert "counts" not in loop._seed_hard({"line_recall": 0.6}, None, 12.0)
