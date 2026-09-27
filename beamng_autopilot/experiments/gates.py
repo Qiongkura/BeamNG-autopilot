@@ -399,6 +399,100 @@ HARD_CHECKS = (
 SCENE_HARD_FIELDS = ("line_recall", "line_precision", "offroad_false_ratio",
                      "inference_ms_p95")
 
+#: **线通道**硬门字段：只有这些字段在"已证明无线"的场景里可以记 not_applicable
+#: （T16 §3.5 适用性契约）。直接从 :data:`SCENE_HARD_FIELDS` 的实际成员派生，
+#: 不另抄一份名单：``line_iou`` 不在分场景硬门里，就不在这里做豁免；以后往
+#: 硬门表里加线通道字段，这里自动跟上。
+LINE_CHANNEL_FIELDS = tuple(f for f in ("line_recall", "line_precision",
+                                        "line_iou")
+                            if f in SCENE_HARD_FIELDS)
+
+
+def _negative_counter(negative, name: str):
+    """从负例计数 dict 取一个键（兼容带/不带 ``negative_line_`` 前缀）。
+
+    缺键/非数值 -> ``None``（= 没测到），调用方必须与 0 区分：0 是"测到 0"，
+    ``None`` 是"没有这个计数"。
+    """
+    if not isinstance(negative, dict):
+        return None
+    for key in (name, f"negative_line_{name}"):
+        if negative.get(key) is not None:
+            try:
+                return int(negative[key])
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def proven_line_free(*, p_frames: int, label_rank: str,
+                     negative: dict | None = None) -> dict:
+    """**已证明无线**的纯函数判据（T16 §4.3/§3.5；P0 适用性接线用）。
+
+    返回 ``{"proven": bool, "basis": str, "why": str}``；``basis`` 是给判定
+    文件与 replay 读的**证据标签**（N/A 是豁免，必须能说清凭什么）：
+
+    * 严格档 ``basis="negative_eligible_counters"``：``p_frames == 0``、
+      ``label_rank == "verified"``，且负例计数完整（``eligible_frames > 0``、
+      ``positive_frames == 0``、``unknown_frames == 0``）——有 verified 的合格
+      负例帧佐证"这些帧上没有线"；
+    * 弱一档 ``basis="rank_verified_zero_line_pixels"``：``p_frames == 0``、
+      ``label_rank == "verified"``，但**没有**负例计数（老产物）。只是"已核验
+      标签里没有线像素"，缺负例分母佐证，判定里必须显示 basis 供读者分辨；
+    * 非 verified 档 ``basis="unverified_labels"`` -> ``proven=False``：标签
+      不可信时全零**不构成**无线证明，保持 UNKNOWN（走到 ``needs_evidence``）；
+    * 有线真值 ``p_frames > 0`` -> ``proven=False``（不给 N/A，正常进线通道门）。
+
+    **为什么 ``p_frames == 0`` 单独不构成证明**：它也可能是"没有标注/没测"，
+    而不是"确实没有漆线"——把缺真值当"确认无线"会让模型永远不画线的输出
+    变成"负例全过"。必须再有"档位 verified"（人工修订或凭证支持的
+    engine_verified）以及可选的合格负例计数才允许记 N/A。
+
+    保守细节：调用方给了 negative 但不完整（eligible=0 / 有 positive / 有
+    unknown / 缺键）时**不退回弱档**——已有证据不支持无线，就不能靠档位放行。
+    """
+    try:
+        p = int(p_frames)
+    except (TypeError, ValueError):
+        return {"proven": False, "basis": "unknown_p_frame_count",
+                "why": ("p_frames is not an integer count: whether this scene "
+                        "has line truth is unknown, so the line channel stays "
+                        "UNKNOWN (no N/A by missing evidence)")}
+    if p > 0:
+        return {"proven": False, "basis": "has_line_truth",
+                "why": (f"p_frames={p} > 0: this scene has line truth, so the "
+                        "line-channel gates apply normally (no N/A)")}
+    rank = str(label_rank or "")
+    if rank != "verified":
+        return {"proven": False, "basis": "unverified_labels",
+                "why": (f"label rank {rank or 'absent'!r} is not verified: "
+                        "all-zero labels do not prove 'no line' (unlabelled is "
+                        "not the same as confirmed line-free) - keep UNKNOWN")}
+    if negative:
+        eligible = _negative_counter(negative, "eligible_frames")
+        positive = _negative_counter(negative, "positive_frames")
+        unknown = _negative_counter(negative, "unknown_frames")
+        if (eligible is not None and positive is not None
+                and unknown is not None and eligible > 0 and positive == 0
+                and unknown == 0):
+            return {"proven": True, "basis": "negative_eligible_counters",
+                    "why": (f"{eligible} verified negative frame(s) with "
+                            "positive_frames=0 and unknown_frames=0: the scene "
+                            "is a proven line-free negative")}
+        return {"proven": False, "basis": "negative_counters_not_eligible",
+                "why": ("negative counters were supplied but do not prove a "
+                        "line-free scene: "
+                        f"eligible_frames={eligible}, "
+                        f"positive_frames={positive}, "
+                        f"unknown_frames={unknown} (need eligible_frames>0, "
+                        "positive_frames==0, unknown_frames==0); the rank alone "
+                        "is not promoted here")}
+    return {"proven": True, "basis": "rank_verified_zero_line_pixels",
+            "why": ("rank verified and p_frames=0, but no negative counters "
+                    "were supplied: weaker evidence (zero line pixels in "
+                    "verified labels) - no eligible-negative denominator backs "
+                    "it")}
+
 
 def hard_split(measured: dict, thresholds: Thresholds,
                *, fields=None) -> dict:
@@ -460,21 +554,77 @@ def per_seed_missing(per_seed: dict, thresholds: Thresholds,
     return out
 
 
-def scene_report(per_scene: dict, thresholds: Thresholds, *, fields=None) -> dict:
+def scene_report(per_scene: dict, thresholds: Thresholds, *, fields=None,
+                 line_free_scenes: dict | None = None) -> dict:
     """分场景硬门：坏场景不能被合并均值抵消，缺测场景记 UNKNOWN（§10.2/A7）。
 
     ``per_scene``：``{场景/组键: 该场景自己的硬门度量}``。返回
     ``{"violations": [...], "missing": [...]}``，两者分别进判定的硬门与缺测通道。
     ``fields`` 缺省用 :data:`SCENE_HARD_FIELDS`（像素层 + 该场景耗时）。
+
+    ``line_free_scenes``（可选，**默认 None = 与旧行为逐字一致**）：
+    ``{场景: {"basis": ..., "why": ...}}``，由调用方用
+    :func:`proven_line_free` 逐场景判定后构造（``basis`` 必填，缺失直接报错——
+    N/A 是豁免，不允许无证据放行）。对这些场景，**线通道字段**里**缺测**的那
+    些从 ``missing`` 移到 ``out["not_applicable"]``（带场景名、字段名、basis、
+    why），并保证 ``out["scenes"][g]["applicability"] == "not_applicable"``。
+    这类场景的线通道本来就没有真值/分母（实测自相矛盾：
+    ``scene_applicability=not_applicable`` 却在 ``missing`` 里索要 line_recall）。
+
+    保守边界（不放宽任何门）：
+
+    * 只动 ``missing``，**已测到的值照常进出 violations**——无线场景里模型
+      画了假线（line_precision=0）仍会撞精度门，不因 N/A 豁免；
+    * 有线场景、以及没有进该集合的场景，一个字节都不变；
+    * 未证明无线（rank 非 verified、negative 计数不合格）的场景不会由本函数
+      推断 N/A，调用方也就不会把它放进集合 -> 仍然 UNKNOWN -> needs_evidence。
     """
     wanted = SCENE_HARD_FIELDS if fields is None else tuple(fields)
-    violations, missing = [], []
+    line_free = None
+    if line_free_scenes is not None:
+        line_free = {}
+        for g, info in line_free_scenes.items():
+            g = str(g)
+            if not isinstance(info, dict) or not str(info.get("basis") or "").strip():
+                raise ValueError(
+                    f"line_free_scenes[{g!r}] must be a dict with a non-empty "
+                    "'basis' (the proof tag from proven_line_free): refusing "
+                    "to move a scene's line metrics to not_applicable without "
+                    "recorded evidence")
+            line_free[g] = {"basis": str(info.get("basis")),
+                            "why": str(info.get("why") or "")}
+    violations, missing, not_applicable = [], [], []
     for name in sorted(per_scene, key=str):
+        g = str(name)
         sp = hard_split(per_scene[name] or {}, thresholds, fields=wanted)
-        violations += [f"scene {name}: {r}" for r in sp["violations"]]
-        missing += [f"scene {name}: {m}: UNKNOWN (hard gate needs a "
-                    f"measurement)" for m in sp["missing"]]
-    return {"violations": violations, "missing": missing}
+        v_list = [f"scene {g}: {r}" for r in sp["violations"]]
+        m_list = [f"scene {g}: {m}: UNKNOWN (hard gate needs a measurement)"
+                  for m in sp["missing"]]
+        if line_free is not None and g in line_free:
+            info = line_free[g]
+            moved = [f for f in LINE_CHANNEL_FIELDS if f in wanted]
+            # 只搬**缺测**的线通道字段：已测到的读数（哪怕是坏值）留在违反通道里，
+            # N/A 不等于把坏读数洗白。
+            m_list = [x for x in m_list
+                      if not any(x.startswith(f"scene {g}: {f}:")
+                                 for f in moved)]
+            for f in moved:
+                if (per_scene[name] or {}).get(f) is None:
+                    not_applicable.append({
+                        "scene": g, "field": f,
+                        "basis": info["basis"], "why": info["why"],
+                        "measured": None})
+        violations += v_list
+        missing += m_list
+    out = {"violations": violations, "missing": missing}
+    if line_free is not None:
+        # 过滤依据写进返回结构：主 agent 原样落盘进判定 blob，replay 读回同一
+        # 集合与 basis，就能重放出同一份 N/A/missing 划分。
+        out["not_applicable"] = not_applicable
+        out["scenes"] = {g: {"applicability": "not_applicable",
+                             "basis": info["basis"], "why": info["why"]}
+                         for g, info in sorted(line_free.items())}
+    return out
 
 
 def scene_count_violations(per_scene_counts: dict,
@@ -651,9 +801,25 @@ def counts_completeness_note(blob) -> str | None:
             "mix measured with unmeasured runs")
 
 
-def threshold_violations(measured: dict, thresholds: Thresholds) -> list:
-    """硬门槛检查：返回违反项（空列表 = 全过）。缺测不算通过。"""
-    sp = hard_split(measured, thresholds)
+def threshold_violations(measured: dict, thresholds: Thresholds, *,
+                         drop_fields=None) -> list:
+    """硬门槛检查：返回违反项（空列表 = 全过）。缺测不算通过。
+
+    ``drop_fields``（可选，**默认 None = 与旧行为逐字一致**）：给**池化**路径的
+    显式豁免，由调用方（主 agent）决定并写进判定 blob；列出的指标从**违反与
+    缺测两个通道**一起移除。只在"该字段的池化值确实整体无意义"时使用，例如
+    全部评价场景都无标线真值时 line_recall 本来就没有分母。
+
+    为什么这里**不**接受 :func:`scene_report` 那套 ``line_free_scenes`` 自动
+    过滤：池化指标把有线与无线场景混在一起，按"存在无线场景"整体丢掉线通道
+    会取消有线场景的召回门（0.70 不动）。分场景的 N/A 只在
+    :func:`scene_report` 里有意义；池化要豁免就显式点名字段。
+    """
+    fields = None
+    if drop_fields:
+        dropped = {str(f) for f in drop_fields}
+        fields = tuple(n for n, _attr, _lower in HARD_CHECKS if n not in dropped)
+    sp = hard_split(measured, thresholds, fields=fields)
     return sp["violations"] + [
         f"{n}: UNKNOWN (hard gate needs a measurement)" for n in sp["missing"]]
 

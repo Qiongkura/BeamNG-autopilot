@@ -32,7 +32,11 @@ IGNORE = 255
 #: ``m5_inject_yellow_labels.py`` 的 HSV 注入属于伪标签）。
 PAINT_SOURCE_RANK = {
     "human_revision": "verified",     # 人工逐帧修订
-    "engine_verified": "verified",    # 单独验证过的模拟器真值
+    #: 单独验证过的模拟器真值——**声明档位**。注意：这个字典只是"这个字符串
+    #: 声称什么"，engine_verified 是否真的算 verified 必须经
+    #: :func:`resolve_paint_rank` 用凭证里的真值证明判定（T16 §4.3 反伪造）；
+    #: 人工修订（human_revision）有逐帧复核记录，按原语义保持 verified。
+    "engine_verified": "verified",
     # 引擎标注的漆线类：**存在但不完整**。2026-09-25 更正：此前写的
     # "漆线被画成 ASPHALT / line 类为空"在这批采集上不成立——逐帧目视 + 像素统计
     # （6 个采集 × 8 帧）：引擎线像素覆盖了 RGB 漆线候选的 ~0.61（precision ~0.68）。
@@ -50,6 +54,89 @@ PAINT_SOURCE_RANK = {
     "pseudo": "pseudo",               # HSV 注入等，不得当真值
     "none": "absent",
 }
+
+#: engine_verified 凭证要求的真值契约版本（T16 Order0 §3.4）。
+TRUTH_CONTRACT_V1 = "v1"
+
+
+def engine_verified_proof(credential: dict | None) -> dict:
+    """凭证是否**支持** engine_verified（P1 反伪造；T16 §4.3 / Order0 §3.4）。
+
+    返回 ``{"proven": bool, "basis": str, "why": str}``。成立条件（任一）：
+    ``credential["truth_verified"] is True``（真值验证器的派生结论），或
+    ``credential["truth_provenance"]`` 满足 ``truth_contract == "v1"`` 且
+    ``report.verified is True`` 且 ``report.verifier_version`` 非空。
+
+    **为什么不能只看 sidecar 字符串**：``label_source`` 是声明，谁都能写；
+    "引擎采集过"不等于"这批标签被独立验证过"（方案 §4.3：不得仅改 sidecar
+    字符串把旧不完整标签提升为 engine_verified）。缺键/None 一律按**不成立**
+    处理——这里只读 ``read_dir_credentials`` 返回 dict 里的键，不 import 凭证
+    模块，避免模块间顺序耦合。
+    """
+    if not isinstance(credential, dict):
+        return {"proven": False, "basis": "no_credentials",
+                "why": ("no readable credential was supplied: engine_verified "
+                        "is only a declared string here")}
+    if credential.get("truth_verified") is True:
+        return {"proven": True, "basis": "truth_verified_flag",
+                "why": ("the credential carries truth_verified=True (the "
+                        "verifier's conclusion was recorded)")}
+    prov = credential.get("truth_provenance")
+    if isinstance(prov, dict):
+        report = prov.get("report") if isinstance(prov.get("report"), dict) else {}
+        contract = str(credential.get("truth_contract")
+                       or prov.get("truth_contract") or "")
+        verifier = str(report.get("verifier_version") or "").strip()
+        if (contract == TRUTH_CONTRACT_V1 and report.get("verified") is True
+                and verifier):
+            return {"proven": True,
+                    "basis": "truth_contract_v1_report_verified",
+                    "why": (f"truth_provenance report says verified=True under "
+                            f"truth_contract={TRUTH_CONTRACT_V1!r} "
+                            f"(verifier_version={verifier!r})")}
+        return {"proven": False, "basis": "provenance_incomplete",
+                "why": ("truth_provenance is present but is not a verified v1 "
+                        f"report: truth_contract={contract!r}, "
+                        f"report.verified={report.get('verified')!r}, "
+                        f"verifier_version={verifier!r}")}
+    return {"proven": False, "basis": "no_truth_provenance",
+            "why": ("the credential declares engine_verified but carries no "
+                    "truth_provenance/truth_verified keys")}
+
+
+def resolve_paint_rank(label_source: str, *,
+                       credential: dict | None = None) -> dict:
+    """按凭证解析漆线来源**档位**（P1）：返回 ``{rank, declared_rank, notes,
+    proof}``。
+
+    * 非 ``engine_verified``：与 ``PAINT_SOURCE_RANK`` 直接查表**逐字相同**
+      （human_revision / agent / pseudo / engine_annotation 语义不变）；
+    * ``engine_verified``：凭证证明成立 -> ``"verified"``；否则 -> ``"absent"``
+      （不得仅凭 sidecar 字符串升格），notes 里写明
+      "engine_verified declared but no verifier proof (truth_provenance
+      missing/unverified): treated as absent" 与证据标签。
+
+    调用链（主 agent 接线）：``read_dir_credentials`` 读目录凭证 -> 本函数把
+    ``label_source + credential`` 解析成最终档位；``audit_label`` 已接上它。
+    """
+    src = str(label_source or "")
+    declared = PAINT_SOURCE_RANK.get(src, "absent")
+    if src != "engine_verified":
+        return {"rank": declared, "declared_rank": declared, "notes": [],
+                "proof": {"proven": False, "basis": "not_engine_verified",
+                          "why": (f"{src or '(empty)'!r} does not require "
+                                  "verifier proof")}}
+    proof = engine_verified_proof(credential)
+    if proof["proven"]:
+        return {"rank": "verified", "declared_rank": declared,
+                "notes": [f"engine_verified supported by credential "
+                          f"({proof['basis']})"],
+                "proof": proof}
+    note = ("engine_verified declared but no verifier proof (truth_provenance "
+            "missing/unverified): treated as absent")
+    return {"rank": "absent", "declared_rank": declared,
+            "notes": [f"{note} [{proof['basis']}: {proof['why']}]"],
+            "proof": proof}
 
 
 @dataclass
@@ -126,12 +213,19 @@ ROAD_TYPE_NAMES = {1: "asphalt", 2: "gravel", 3: "shoulder"}
 
 def audit_label(label, *, paint_source: str = "engine_annotation",
                 palette_ok: bool = True, road_min_px: int = 200,
-                has_rgb: bool = True, road_type=None) -> LabelAudit:
+                has_rgb: bool = True, road_type=None,
+                credential: dict | None = None) -> LabelAudit:
     """逐帧判三个通道的可用性。
 
     ``paint_source`` 来自采集元数据的 ``label_source`` 或人工修订记录；
     ``engine_annotation``（本图默认）被判为 **unreliable**：可见漆线可能
     完全没有标注，此时 ``paint_valid=False`` 并把 line 通道屏蔽。
+
+    ``credential``（可选，默认 None = 旧调用逐字不变）：``read_dir_credentials``
+    读回的目录凭证。只有它带了真值证明（``truth_verified`` /
+    ``truth_contract=="v1"`` + ``report.verified``）时，``engine_verified``
+    才算 verified；否则档位降 ``absent`` 且整通道屏蔽（反伪造，方案 §4.3）。
+    人工/agent/pseudo 档位不受影响。
     """
     lab = np.asarray(label)
     if lab.ndim != 2:
@@ -147,10 +241,17 @@ def audit_label(label, *, paint_source: str = "engine_annotation",
     if not palette_ok:
         notes.append("palette quality flagged by the collector audit")
 
-    rank = PAINT_SOURCE_RANK.get(str(paint_source), "absent")
+    resolved = resolve_paint_rank(paint_source, credential=credential)
+    rank = resolved["rank"]
+    notes.extend(resolved["notes"])
     if rank == "verified":
         paint = ClassQuality(True, f"paint truth from {paint_source}",
                              line_px, rank=rank)
+    elif rank == "absent" and str(paint_source or "") == "engine_verified":
+        # 反伪造：声明 engine_verified 但凭证不成立 -> 连弱监督都不给
+        # （`absent` 在 protocol.SOURCE_ELIGIBILITY 里全 False）。
+        paint = ClassQuality(False, resolved["notes"][0], line_px,
+                             usable=False, rank=rank)
     elif rank == "pseudo":
         # 弱监督：可以学（usable=True），但不能当门槛真值（valid=False）
         paint = ClassQuality(
