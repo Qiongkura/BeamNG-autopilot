@@ -18,12 +18,26 @@ r"""M5 路面/标线分割训练：轻量 UNet（beamng_autopilot.vision.segment
 验证/评估指标口径：IoU 用全局累加 inter/union 计算（iou_from_accum），
 未出现的类别不虚高为 1.0、不计入 mIoU。
 
+--total-steps N（T16 §3.1 步预算）：主停止条件变成"实际 optimizer step 数"，
+epoch 数由 ceil(N / ceil(n_train/batch)) 反推、CosineAnnealingLR 按步调度；
+数据侧配 --sampler quota（全池按 run/视角配额轮换，见
+beamng_autopilot.vision.sampling），train_hist.json 记 steps_done/total_steps/
+stopped_by/sampler_report，checkpoint 记完整 sampler_state 供逐位恢复。
+不给 --total-steps 时**完全保持旧的 epoch 协议**（逐位一致）。
+
+--init CKPT（T16 §3.3）：只加载权重（优化器从头），并记录父 checkpoint 的内容
+hash、来源档位（random/champion/production）、父训练历史与谱系完整性；父的
+width 与本次 --width 不一致直接报错，不做静默部分加载。
+
 用法:
     .venv\Scripts\python.exe scripts\m5_train_seg.py --runs logs\m5_seg\run_*
         --epochs 40 --out logs\m5_seg\seg_model
     中断后续训（每轮结束自动落盘 checkpoint_last.pt）:
     .venv\Scripts\python.exe scripts\m5_train_seg.py --runs logs\m5_seg\run_*
         --epochs 40 --out logs\m5_seg\seg_model --resume logs\m5_seg\seg_model\checkpoint_last.pt
+    步预算 + 全池采样（新协议）:
+    .venv\Scripts\python.exe scripts\m5_train_seg.py --runs logs\m5_seg\run_*
+        --total-steps 72 --batch 4 --out logs\m5_seg\seg_model
 """
 
 from __future__ import annotations
@@ -47,10 +61,13 @@ from beamng_autopilot import config
 from beamng_autopilot.vision.segmentation import (
     SegUNet, N_CLASSES, CLASS_NAMES, iou_from_accum,
 )
-from beamng_autopilot.experiments.checkpoint import checkpoint_extras
+from beamng_autopilot.experiments.checkpoint import checkpoint_extras, file_sha16
 from beamng_autopilot.vision.dataset_split import (
     FrameRef, coverage_digest, cross_view_leak, frame_refs_from_meta,
     leak_check, select_weak_lines, split_audit, split_by_group,
+)
+from beamng_autopilot.vision.sampling import (
+    QuotaSampler, frame_identity, plan_epochs,
 )
 
 
@@ -444,6 +461,294 @@ def balanced_indices(run_bounds: list[tuple[int, int]],
     return out
 
 
+# --- T16 步预算 / 采样 / init 谱系（冻结契约 §3.1-§3.3）---------------------
+# 能做成纯逻辑的一律放模块层：测试可以脱离训练循环直接钉住这些语义，
+# 看板/autoloop 也能复用同一口径而不是各自再写一套。
+
+def validate_arg_combos(args) -> str:
+    """校验参数组合并返回**实际生效**的采样器名（非法组合直接报错退出）。
+
+    拒绝的组合都有"为什么不"的具体理由，不能静默取一个：
+
+    * ``--max-train-frames`` + ``--total-steps``：截帧把池固定成子集，与
+      "从全池按配额轮换"矛盾（等步数应由步预算保证，不再靠丢样本）；
+    * ``--init`` + ``--resume``：前者是"只加载权重当初始化"，后者是"恢复同一
+      训练任务"，语义互斥（契约 §3.3）。
+    """
+    max_frames = int(getattr(args, "max_train_frames", 0) or 0)
+    budget = int(getattr(args, "total_steps", 0) or 0)
+    if budget < 0:
+        raise SystemExit("--total-steps 必须 >= 0（0 = 关闭步预算/历史 epoch 协议）")
+    if max_frames and budget:
+        raise SystemExit(
+            "--max-train-frames 与 --total-steps 不能同时给出：截帧把训练池固定"
+            "成子集，与全池配额轮换的语义矛盾。等步数请用 --total-steps 保证；"
+            "要复现历史协议就不要给 --total-steps")
+    if getattr(args, "init", None) and getattr(args, "resume", None):
+        raise SystemExit(
+            "--init（只加载权重的初始化，优化器从头）与 --resume（恢复同一训练"
+            "任务）不能同时给出；请二选一")
+    sampler = str(getattr(args, "sampler", "auto") or "auto")
+    if sampler == "auto":
+        sampler = "quota" if budget > 0 else "legacy"
+    if sampler == "quota":
+        if max_frames:
+            raise SystemExit(
+                "--sampler quota（全池轮换）与 --max-train-frames（固定截帧）"
+                "语义矛盾，不能同时给出")
+        if getattr(args, "balance_runs", False):
+            raise SystemExit(
+                "--sampler quota 自带按 run 配额轮换，不能再叠加 --balance-runs"
+                "（两套采样规则叠加会互相覆盖，结果无法解释）")
+        if str(getattr(args, "run_weights", "") or "").strip():
+            raise SystemExit(
+                "--sampler quota 自带按 run 配额轮换，不能再叠加 --run-weights"
+                "（加权采样是另一套数据因子协议）")
+    return sampler
+
+
+def run_view_map(per_run: dict) -> dict:
+    """每个 run 的视角（来自 meta 的帧级 ``view``）。
+
+    环采集合按 ``<collection>/<view>`` 分目录，所以一个 run 目录就是一个视角；
+    多视角混在一个目录或没有 meta 时记 ``None``——**不猜**（猜错会让
+    ``exposures_by_view`` 变成假统计）。
+    """
+    out: dict = {}
+    for name, rec in per_run.items():
+        meta = rec.get("meta") if isinstance(rec, dict) else None
+        views = set()
+        if isinstance(meta, dict):
+            for f in (meta.get("frames") or []):
+                v = str((f or {}).get("view") or "").strip()
+                if v:
+                    views.add(v)
+        out[name] = sorted(views)[0] if len(views) == 1 else None
+    return out
+
+
+def build_sampler_pool(all_frames: list, per_run: dict,
+                       train_frames: list) -> list[dict]:
+    """划分后的训练帧 -> 全池采样器池（T16 §3.2）。
+
+    run 归属按**内容身份**反查 ``per_run`` 里各 run 的帧区间，而不是按训练帧的
+    下标区间：``--split by-map-scene`` 会按组重排/抽取训练帧（下标区间早就不
+    对应 per_run 的顺序，``--balance-runs`` 也踩过这个坑），内容反查在 tail /
+    per-run / by-map-scene 三种划分下都成立，``--weak-line-oversample`` 追加的
+    副本也自然继承来源。同一内容出现在多个 run 时取**先出现的**（确定性；重复
+    内容本该算同一帧，不该各占一份配额）。
+
+    ``has_line`` 看标签里的 line 类（2）像素，是"这一帧自己有没有线标注"，
+    不是模型预测；``hash`` 与 manifest 的内容哈希同一命名空间。
+    """
+    owner: dict[str, str] = {}
+    for name, rec in per_run.items():
+        if not isinstance(rec, dict):
+            continue
+        start = max(0, int(rec.get("start", 0)))
+        end = max(start, int(rec.get("end", start)))
+        for i in range(start, min(end, len(all_frames))):
+            owner.setdefault(frame_identity(all_frames[i]), str(name))
+    view_of = run_view_map(per_run)
+    pool: list[dict] = []
+    for frame in train_frames:
+        if isinstance(frame, dict):
+            label = frame.get("label")
+        elif isinstance(frame, (tuple, list)) and len(frame) > 1:
+            label = frame[1]
+        else:
+            label = None
+        has_line = (False if label is None
+                    else bool(int(np.count_nonzero(
+                        np.asarray(label) == 2)) > 0))
+        sha = frame_identity(frame)              # 一帧只哈希一次（大图不便宜）
+        run = owner.get(sha, "")
+        pool.append({"frame": frame, "run": run,
+                     "view": view_of.get(run),
+                     "hash": sha,
+                     "has_line": has_line})
+    return pool
+
+
+def random_init_block() -> dict:
+    """未给 ``--init`` 时的显式记录（T16 §3.3）。
+
+    随机初始化**本身就是完整谱系的根**，所以 ``provenance_complete=True``；
+    把它显式写出来（而不是缺字段）才能让下游区分"确认是随机根"和"没有记录"。
+    """
+    return {"init_from": None, "init_sha16": None, "init_source": "random",
+            "init_arch": None, "parent_history": None,
+            "provenance_complete": True}
+
+
+def _read_ckpt_dict(path) -> dict:
+    """读一个 checkpoint 字典（只读文件；读不了返回 {}）。"""
+    try:
+        blob = torch.load(str(path), map_location="cpu", weights_only=False)
+    except Exception:                                    # noqa: BLE001
+        return {}
+    return blob if isinstance(blob, dict) else {}
+
+
+def _opt_int(ta: dict, key: str):
+    """取整数字段；**缺字段返回 None**（不编造 0——0 和"没记录"不是一回事）。"""
+    v = ta.get(key)
+    if v is None:
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _role_from_run_id(run_id) -> str | None:
+    """run_id 里的角色字样：``champion`` / ``production``（冻结文档给的判据）。
+
+    两个字样同时出现时按冻结文档列出的顺序取 ``champion``（先声明的更具体）。
+    """
+    text = str(run_id or "").lower()
+    for key in ("champion", "production"):
+        if key in text:
+            return key
+    return None
+
+
+def walk_init_chain(path, ckpt, *, depth_limit: int = 16):
+    """沿 ``--init`` 的父链向上走，返回 ``(完整, run_id 链, 角色, 说明)``。
+
+    "谱系完整"的判据（契约 §3.3，逐环检查，缺一不算）：
+
+    * 每一环的 ``train_args`` 都必须**显式**记录 ``init_from``/``init_sha16``/
+      ``init_source`` 三个字段——缺字段（旧 checkpoint）就是 False，不因为
+      "看起来像从头训练的"就补齐；
+    * 非根环节要能读到父文件、且父文件自身没记 ``provenance_complete=False``；
+    * 链的根必须 ``init_from`` 为空**且** ``init_source == "random"``（随机初始化
+      本身是完整谱系的根，但必须是显式记录的 random）。
+    """
+    chain_run_ids: list[str] = []
+    role: str | None = None
+    cur_ckpt = ckpt if isinstance(ckpt, dict) else {}
+    seen = {str(Path(path).resolve()) if Path(path).exists()
+            else str(Path(path))}
+    for _depth in range(int(depth_limit)):
+        ta = cur_ckpt.get("train_args")
+        ta = ta if isinstance(ta, dict) else {}
+        if not ("init_from" in ta and "init_sha16" in ta
+                and "init_source" in ta):
+            return (False, chain_run_ids, role,
+                    "父链有一环的 train_args 缺 init_from/init_sha16/"
+                    "init_source 记录（旧 checkpoint，不能当完整谱系）")
+        rid = cur_ckpt.get("run_id") or ta.get("run_id") or ""
+        if str(rid).strip():
+            chain_run_ids.append(str(rid))
+        if role is None:
+            role = _role_from_run_id(rid)
+        init_from = str(ta.get("init_from") or "").strip()
+        if not init_from:
+            if str(ta.get("init_source") or "") != "random":
+                return (False, chain_run_ids, role,
+                        f"根记录的 init_source={ta.get('init_source')!r} "
+                        f"不是显式 random")
+            return True, chain_run_ids, role, "根为显式 random"
+        if not str(ta.get("init_sha16") or "").strip():
+            return False, chain_run_ids, role, "非根环节缺 init_sha16"
+        if ta.get("provenance_complete") is False:
+            return (False, chain_run_ids, role,
+                    "链上一环自己记录了 provenance_complete=False")
+        parent_path = Path(init_from)
+        key = (str(parent_path.resolve()) if parent_path.exists()
+               else str(parent_path))
+        if key in seen:
+            return False, chain_run_ids, role, "init_from 成环"
+        seen.add(key)
+        nxt = _read_ckpt_dict(parent_path) if parent_path.exists() else {}
+        if not nxt:
+            return (False, chain_run_ids, role,
+                    f"父链文件读不到: {init_from}")
+        cur_ckpt = nxt
+    return (False, chain_run_ids, role,
+            f"父链长度超过 {depth_limit}（疑似成环或异常深）")
+
+
+def classify_init_source(path, ckpt, *, depth_limit: int = 16):
+    """``--init`` 父 checkpoint 的来源档位 + 谱系完整性。
+
+    来源判定按冻结契约：父 run_id 有 champion/production 字样 → 该档；父链上
+    某一环有 → 该档；父的 ``init_source`` 自己记了 champion/production → 继承；
+    父没有 ``init_from``（随机根）→ ``random``。**缺记录时按 random 记并让
+    ``provenance_complete=False`` 把不确定性显式带出去**——判定侧不得把 False
+    当完整谱系，也不要求这个三值枚举里存在 "unknown"。
+    """
+    ta = ckpt.get("train_args") if isinstance(ckpt, dict) else None
+    ta = ta if isinstance(ta, dict) else {}
+    # 冻结契约的第一判据：**父自己的 run_id** 有 champion/production 字样。
+    # 先单独判它，因为旧 checkpoint 可能没有完整的 init_* 记录（链走不动），
+    # 但 run_id 仍在——"来源档位"与"谱系完整性"是两个独立的问题。
+    parent_role = _role_from_run_id(ckpt.get("run_id") or ta.get("run_id"))
+    complete, chain, role, why = walk_init_chain(path, ckpt,
+                                                 depth_limit=depth_limit)
+    source = parent_role or role
+    if source is None:
+        recorded = str(ta.get("init_source") or "")
+        if recorded in ("champion", "production"):
+            source = recorded
+    if source is None:
+        source = "random"
+    return source, bool(complete), list(chain), str(why)
+
+
+def init_provenance(path, ckpt, *, width: float) -> dict:
+    """``--init CKPT`` 的谱系记录（写进 train_hist 顶层 init 块与 checkpoint）。
+
+    架构不一致（父记录 width 与本次 ``--width`` 不同）**直接报错**：容量对照
+    跑出来的 checkpoint 按默认宽度加载会 size mismatch，静默部分加载只会把
+    "换了容量"混进"换了初始化"的结论里。父没记 width 时不阻断（由
+    ``load_state_dict(strict=True)`` 兜底），但会在 stderr 说明。
+    """
+    p = Path(path)
+    if not isinstance(ckpt, dict) or "state_dict" not in ckpt:
+        raise SystemExit(f"--init 的 checkpoint 缺少 state_dict: {p}")
+    ta = ckpt.get("train_args")
+    ta = ta if isinstance(ta, dict) else {}
+    arch = ta.get("arch_args")
+    arch = arch if isinstance(arch, dict) else {}
+    parent_width = arch.get("width")
+    if parent_width is None:
+        print(f"[train] 注意：--init 的父 checkpoint 没有 arch_args.width，"
+              f"架构一致性改由 load_state_dict(strict=True) 兜底", flush=True)
+    elif abs(float(parent_width) - float(width)) > 1e-9:
+        raise SystemExit(
+            f"--init 架构不一致：父 checkpoint width={parent_width}，本次 "
+            f"--width={width}。拒绝静默部分加载；容量对照请显式给匹配的 --width")
+    source, complete, chain, why = classify_init_source(p, ckpt)
+    run_id = ckpt.get("run_id") or ta.get("run_id")
+    dataset_id = ckpt.get("dataset_id")
+    print(f"[train] init 谱系：init_source={source} "
+          f"provenance_complete={complete}（{why}）", flush=True)
+    if chain:
+        print(f"[train] init 父链 run_id: {chain[:6]}", flush=True)
+    return {
+        "init_from": str(p),
+        "init_sha16": file_sha16(p),
+        "init_source": source,
+        "init_arch": (None if parent_width is None else float(parent_width)),
+        "parent_history": {
+            "run_id": (str(run_id) if str(run_id or "").strip() else None),
+            "steps_done": _opt_int(ta, "steps_done"),
+            "total_steps": _opt_int(ta, "total_steps"),
+            "dataset_id": (str(dataset_id)
+                           if str(dataset_id or "").strip() else None),
+        },
+        "provenance_complete": bool(complete),
+    }
+
+
+def _write_train_hist(out_dir, hist: dict) -> None:
+    """把 train_hist.json 立刻落盘（quota 模式每轮调用，训练中途可查）。"""
+    (Path(out_dir) / "train_hist.json").write_text(
+        json.dumps(hist, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
 def _augment(frame, rng: np.random.Generator,
             line_morph: bool = False):
     """在线数据增强（colour/label 同步变换），提升路段泛化。
@@ -565,7 +870,16 @@ def main() -> None:
                          "用于困难样本/场景配比这类数据因子")
     ap.add_argument("--max-train-frames", type=int, default=0,
                     help="把训练帧按各 run 配额截到 N 帧（等步数对照用；0=不截）。"
-                         "验证集不受影响")
+                         "验证集不受影响。历史协议：与 --total-steps 互斥")
+    ap.add_argument("--total-steps", type=int, default=0, metavar="N",
+                    help="优化步预算（T16 §3.1）：实际 optimizer.step() 达到 N "
+                         "即停。给定时 epochs 由 ceil(N/ceil(n_train/batch)) 反推、"
+                         "LR 按步调度；0=关闭，走旧 epoch 协议（逐位不变）")
+    ap.add_argument("--sampler", choices=("auto", "legacy", "quota"),
+                    default="auto",
+                    help="训练采样：auto=有 --total-steps 用 quota 否则 legacy；"
+                         "quota=全池按 run/视角配额轮换（T16 §3.2，可恢复）；"
+                         "legacy=按 epoch 整体洗牌（历史行为）")
     ap.add_argument("--ignore-line-class", action="store_true",
                     help="缺可信标线真值的帧：把 line 类从 softmax 分母里去掉"
                          "（既无正样本也无负样本），只训练路面/背景通道；"
@@ -667,6 +981,10 @@ def main() -> None:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+
+    # 生效采样器 + 互斥组合校验（--max-train-frames/--total-steps、
+    # --init/--resume）。放在最前面：拒绝的组合不该先花几分钟加载数据再报错。
+    sampler_name = validate_arg_combos(args)
 
     if args.deterministic:
         # 必须在 CUDA 初始化之前设：否则 cuBLAS 仍会用非确定性 GEMM
@@ -848,6 +1166,8 @@ def main() -> None:
                   f"时间尾切分（这是 temporal-tail 开发验证，不是 episode/组"
                   f"隔离；要组隔离请用 holdout_groups）-> "
                   f"{_leak['leaked_groups'][:6]}", flush=True)
+    # 弱线增补（--weak-line-oversample）追加的重复帧：按内容身份自然继承来源
+    # （见 build_sampler_pool），这里不再单独记录位置
     if args.weak_line_oversample > 0 and train_frames:
         _refs = [FrameRef(index=i, run="", t=float(i),
                           line_frac=float((lb == 2).mean()))
@@ -893,15 +1213,79 @@ def main() -> None:
                                    line_weight=args.line_weight)
     print(f"[train] 类别权重: {weights.tolist()}", flush=True)
 
+    # --- 步预算 / 续训前置（T16 §3.1）------------------------------------
+    # scheduler 的 T_max 与 epoch 上界都依赖"预算"与恢复出来的 steps_done，
+    # 所以必须在建 scheduler 之前定下来。旧 checkpoint 读起来仍然兼容：
+    # 没有 total_steps 记录的 checkpoint 只能按 epoch 续训（见下面的拒绝）。
+    resume_ckpt = None
+    if args.resume:
+        resume_ckpt = torch.load(args.resume, map_location=device,
+                                 weights_only=False)
+    budget = int(args.total_steps or 0)
+    steps_done = 0
+    steps_in_epoch = 0
+    if resume_ckpt is not None:
+        _ta_ck = resume_ckpt.get("train_args")
+        _ta_ck = _ta_ck if isinstance(_ta_ck, dict) else {}
+        _ck_total = int(_ta_ck.get("total_steps") or 0)
+        steps_done = int(_ta_ck.get("steps_done") or 0)
+        steps_in_epoch = int(_ta_ck.get("steps_in_epoch") or 0)
+        if budget > 0 and _ck_total and _ck_total != budget:
+            raise SystemExit(
+                f"--resume 的 checkpoint 记录 total_steps={_ck_total}，与本次 "
+                f"--total-steps={budget} 不一致：这是换配方，不是续训")
+        if budget > 0 and not _ck_total:
+            raise SystemExit(
+                "--resume 的 checkpoint 没有 total_steps 记录（旧 epoch 协议）"
+                "：它的 LR 计划按 epoch 调度，续到步预算会改变计划；"
+                "请用同口径的 --epochs 续训")
+        if budget <= 0 and _ck_total:
+            budget = _ck_total
+            print(f"[train] 采用 checkpoint 记录的 total_steps={budget} 续训"
+                  f"（--resume 恢复同一训练任务）", flush=True)
+        _ck_sampler = str(_ta_ck.get("sampler") or "")
+        if _ck_sampler == "quota" and args.sampler != "legacy":
+            sampler_name = "quota"                # 恢复同一采样协议
+        elif _ck_sampler == "quota":
+            print("[train] 警告：该 checkpoint 是 quota 采样训练的，"
+                  "--sampler legacy 无法复现原采样序列（不声称逐位一致）",
+                  flush=True)
+    budget_mode = budget > 0
+    plan = None
+    if budget_mode:
+        plan = plan_epochs(budget, len(train_frames), args.batch)
+        epochs_eff = int(plan["epochs"])
+        if int(args.epochs) != epochs_eff:
+            print(f"[train] 步预算是主停止条件：--epochs={args.epochs} 与 "
+                  f"ceil({budget}/{plan['steps_per_epoch']})={epochs_eff} "
+                  f"不一致，按步预算取 epochs={epochs_eff}（LR 计划 T_max={budget}）",
+                  flush=True)
+        print(f"[train] 步预算 total_steps={budget}：steps_per_epoch="
+              f"ceil({len(train_frames)}/{args.batch})="
+              f"{plan['steps_per_epoch']} -> 循环上界 epochs={epochs_eff}",
+              flush=True)
+    else:
+        epochs_eff = int(args.epochs)
+
+    # --- init v1 谱系（T16 §3.3）：只加载权重（优化器从头）-----------------
+    # 没给 --init 时也是显式记录：随机初始化本身就是完整谱系的根。
+    init_block = random_init_block()
     model = SegUNet(width=float(args.width)).to(device)
     if args.init:
+        # 先做架构/谱系核对再加载：不一致就不该有任何权重被读进来
         init_ckpt = torch.load(args.init, map_location=device,
                                weights_only=False)
+        init_block = init_provenance(args.init, init_ckpt,
+                                     width=float(args.width))
         model.load_state_dict(init_ckpt["state_dict"])
-        print(f"[train] 初始化模型权重: {args.init}（优化器从头开始）",
+        print(f"[train] 初始化模型权重: {args.init}（优化器从头开始；"
+              f"init_source={init_block['init_source']}, "
+              f"provenance_complete={init_block['provenance_complete']}）",
               flush=True)
     opt = torch.optim.Adam(model.parameters(), lr=args.lr)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, args.epochs)
+    # 预算模式按**步**调度（T_max=N），legacy 仍按 epoch 调度（T_max=epochs）
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, budget if budget_mode else args.epochs)
     # 加权 CE 之外对 line 通道再加两个区域项：Tversky(FN>FP, 细线召回)
     # + soft-clDice(连通性, 治断线帧)。权重 0 即回退历史纯 CE 行为。
     from beamng_autopilot.vision.seg_losses import LineSegLoss
@@ -976,7 +1360,19 @@ def main() -> None:
                  if args.balance_runs else "（总帧数不变）"), flush=True)
 
     def run_epoch(fr, train: bool, ep: int = 0, balance_runs: bool = False,
-                  run_bounds: list[tuple[int, int]] | None = None):
+                  run_bounds: list[tuple[int, int]] | None = None, *,
+                  sampler: QuotaSampler | None = None, step_base: int = 0,
+                  skip_steps: int = 0, max_steps: int | None = None):
+        """跑一轮训练或验证；返回 ``(loss, acc, ious, present, steps)``。
+
+        ``steps`` = 这一轮**实际**执行的 ``optimizer.step()`` 次数（验证轮 0）
+        ——步预算的停止条件依据它，而不是"跑了几轮"。
+
+        采样顺序：给 ``sampler``（quota 模式）时逐批由采样器决定；否则保持历史
+        行为（整轮 ``rng.permutation`` / balance_runs / run_weights）。``skip_steps``
+        用于预算停在轮中间之后的续训：跳过该轮前 N 个 batch（quota 模式不需要，
+        采样器的 cursor 已经指向正确位置）。
+        """
         model.train(train)
         total_loss, correct, n_pix = 0.0, 0, 0
         inter = np.zeros(N_CLASSES)
@@ -984,7 +1380,11 @@ def main() -> None:
         # 每轮独立随机种子：旧写法 seed 只看 len(fr) 恒定不变，导致
         # 每轮增强/洗牌序列完全一致，等于数据没有随机化。
         rng = np.random.default_rng(args.seed + ep * 1000003 + len(fr))
-        if train and balance_runs and run_bounds:
+        use_sampler = bool(train and sampler is not None)
+        order = None
+        if use_sampler:
+            order = None                        # 顺序逐批由采样器给出
+        elif train and balance_runs and run_bounds:
             order = balanced_indices(run_bounds, rng)
         elif train and run_weights and run_bounds:
             order, _w_note = weighted_run_indices(run_bounds, run_weights, rng)
@@ -995,11 +1395,41 @@ def main() -> None:
             order = rng.permutation(len(fr))
         else:
             order = np.arange(len(fr))
-        for i in range(0, len(order), args.batch):
+        if use_sampler:
+            # 一轮 = 池的一次配额轮换：批数 = ceil(池/batch)（与
+            # plan_epochs.steps_per_epoch 同一口径）
+            n_batches = max(1, -(-len(fr) // max(1, args.batch)))
+        else:
+            n_batches = (0 if len(order) == 0
+                         else -(-len(order) // max(1, args.batch)))
+        steps = 0
+        n_seen = 0
+        skipped = 0
+        for bi in range(n_batches):
+            if use_sampler:
+                idx = sampler.next_batch()
+            else:
+                if train and skipped < int(skip_steps or 0):
+                    skipped += 1
+                    continue
+                idx = [int(j) for j in
+                       order[bi * args.batch:(bi + 1) * args.batch]]
+            if not idx:
+                continue
             _t_step0 = time.perf_counter()
-            batch = [fr[int(j)] for j in order[i:i + args.batch]]
+            batch = [fr[int(j)] for j in idx]
+            n_seen += len(batch)
             if train:
-                batch = [_augment(f, rng, line_morph=args.line_morph)
+                if budget_mode:
+                    # 预算模式：每个优化步一条独立增广随机流（种子含全局步号，
+                    # step_base+steps）。这样"停在轮中间再恢复"时，后续每一步
+                    # 的增广与不中断逐位一致；legacy 模式沿用整轮一条流（历史
+                    # 行为不动）。
+                    _arng = np.random.default_rng(
+                        [int(args.seed), 0x5EED, int(step_base) + steps])
+                else:
+                    _arng = rng
+                batch = [_augment(f, _arng, line_morph=args.line_morph)
                          for f in batch]
             xs = torch.stack([to_tensor(f, device)[0] for f in batch])
             ys = torch.stack([to_tensor(f, device)[1] for f in batch])
@@ -1045,12 +1475,16 @@ def main() -> None:
                     mon["pending_grad_norm"] = _gn
                 scaler.step(opt)
                 scaler.update()
-                monitor_step(i, ep, loss_v=float(loss.item()),
+                monitor_step(bi * args.batch, ep, loss_v=float(loss.item()),
                              acc_v=(float(((logits.argmax(dim=1) == ys_eval)
                                            & (ys_eval != 255)).sum())
                                     / max(1, int((ys_eval != 255).sum()))),
                              lr_v=float(sched.get_last_lr()[-1]),
                              step_s=time.perf_counter() - _t_step0)
+                if budget_mode:
+                    # 新协议按**步**调度：每个 optimizer.step() 之后走一步
+                    # （legacy 仍是每轮结束在循环里 sched.step()）
+                    sched.step()
             _loss_v = float(loss.item())
             if not math.isfinite(_loss_v):
                 # 方案 §4 要求 NaN 立即失败：继续跑只会把非有限权重写进
@@ -1070,10 +1504,17 @@ def main() -> None:
                 t = (ys_eval == c) & valid
                 inter[c] += int((p & t).sum())
                 union[c] += int((p | t).sum())
+            if train:
+                steps += 1
+                if max_steps is not None and steps >= int(max_steps):
+                    break                        # 步预算到点：本轮的剩余帧不再走
         ious = iou_from_accum(inter, union)
         present = union > 0
-        return (total_loss / max(1, len(fr)),
-                correct / max(1, n_pix), ious, present)
+        # 旧路径的分母是 len(fr)（逐位不变）；被步预算截短的一轮按实际看过
+        # 的帧数算，否则 loss 看起来像"突然掉了一半"
+        denom = len(fr) if max_steps is None else max(1, n_seen)
+        return (total_loss / max(1, denom),
+                correct / max(1, n_pix), ious, present, int(steps))
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1081,13 +1522,13 @@ def main() -> None:
     best_miou = -1.0
     hist = {"epoch": [], "train_loss": [], "val_miou": [], "val_acc": []}
     if args.resume:
-        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        ckpt = resume_ckpt                       # 前面已按预算语义读过一次
         model.load_state_dict(ckpt["state_dict"])
         opt.load_state_dict(ckpt["optimizer"])
         sched.load_state_dict(ckpt["scheduler"])
         if "scaler" in ckpt and ckpt.get("scaler") is not None and use_amp:
             scaler.load_state_dict(ckpt["scaler"])
-        start_ep = int(ckpt.get("next_epoch", args.epochs))
+        start_ep = int(ckpt.get("next_epoch", epochs_eff))
         best_miou = float(ckpt.get("best_miou", -1.0))
         hist = ckpt.get("hist", hist)
         # T14：随机状态与数据版本必须一起恢复，否则"续训"与"未中断"不等价
@@ -1103,7 +1544,37 @@ def main() -> None:
             print(f"[train] 随机状态与数据版本已恢复（dataset_id="
                   f"{ckpt.get('dataset_id')}, rng_ok={_ok}）", flush=True)
         print(f"[train] 从 {args.resume} 续训, 从 epoch {start_ep} 继续 "
-              f"(共 {args.epochs})", flush=True)
+              f"(共 {epochs_eff}；steps_done={steps_done}"
+              + (f", 本轮已做 {steps_in_epoch} 步" if steps_in_epoch else "")
+              + ")", flush=True)
+    if budget_mode and steps_done >= budget:
+        print(f"[train] checkpoint 的 steps_done={steps_done} 已达步预算 "
+              f"{budget}：不再执行优化步（只做收尾/落盘）", flush=True)
+
+    # --- 全池配额采样器（T16 §3.2）---------------------------------------
+    # quota 模式：每个 batch 的下标由 QuotaSampler 给出（替代整轮洗牌），
+    # 池 = 划分后（含弱线增补）的全部训练帧；checkpoint 里存完整状态供逐位恢复。
+    sampler: QuotaSampler | None = None
+    if sampler_name == "quota":
+        _pool = build_sampler_pool(frames, per_run, train_frames)
+        _st = (resume_ckpt or {}).get("sampler_state")
+        if _st:
+            try:
+                sampler = QuotaSampler.from_state(_st, _pool, batch=args.batch)
+            except ValueError as exc:
+                # 池/批大小变了就不是同一次采样任务：明确报错，不静默重排
+                raise SystemExit(f"采样器状态无法恢复（{exc}）；"
+                                 f"数据或 batch 变过就不能声称逐位续训")
+            print(f"[train] 采样器状态已恢复：round={sampler.round} "
+                  f"cursor={sampler.cursor} digest={sampler.state_digest()}",
+                  flush=True)
+        else:
+            sampler = QuotaSampler(_pool, batch=args.batch, seed=args.seed,
+                                   run_key=args.dataset_id or "adhoc")
+        _rep = sampler.report()
+        print(f"[train] quota 采样：池 {_rep['pool_size']} 个槽位 / "
+              f"{_rep['unique_available']} 个不同帧, {len(sampler.runs)} 个 run; "
+              f"steps_per_epoch={sampler.steps_per_epoch}", flush=True)
 
     # 任务指标校验（opt-in）：本栈上 val_mIoU 与配对任务**反相关**
     # （`scripts/m5_seg_task_eval.py`、docs/lateral_reference_diag_20260911.md
@@ -1136,15 +1607,22 @@ def main() -> None:
         mon["store"] = _mstore
         mon["steps_per_epoch"] = max(1, int(math.ceil(
             len(train_frames) / max(1, args.batch))))
-        _total_steps = mon["steps_per_epoch"] * int(args.epochs)
+        # 预算模式的总步数是 N（不是 每轮步数 x 轮数）；两种模式都要给看板一个
+        # 可比的分母
+        _total_steps = (int(budget) if budget_mode
+                        else mon["steps_per_epoch"] * int(args.epochs))
+        mon["total_steps"] = _total_steps
         _name = args.task_name or args.metrics_run
         _mstore.append(task_record(
             args.metrics_run, _name, "running", total_steps=_total_steps,
-            current_step=mon["steps_per_epoch"] * int(start_ep),
+            current_step=(int(steps_done) if budget_mode
+                          else mon["steps_per_epoch"] * int(start_ep)),
             epoch=start_ep, started_at=time.time(),
             extra={"batch": args.batch, "lr": args.lr, "seed": args.seed,
-                   "epochs": args.epochs, "resume_from": bool(args.resume),
+                   "epochs": epochs_eff, "resume_from": bool(args.resume),
                    "steps_per_epoch": mon["steps_per_epoch"],
+                   "total_steps": _total_steps, "sampler": sampler_name,
+                   "init_source": init_block["init_source"],
                    "n_train": len(train_frames), "n_val": len(val_frames)}))
         mon["sampler"] = SystemSampler(
             _mstore, interval_s=args.monitor_interval,
@@ -1155,13 +1633,60 @@ def main() -> None:
         print(f"[train] 指标 -> {_mstore.path}（逐 step；硬件每 "
               f"{args.monitor_interval:g}s 采样）", flush=True)
 
-    for ep in range(start_ep, args.epochs):
+    # 恢复的 checkpoint 已经跑满预算时，循环一次都不进——停止原因要按事实写，
+    # 不能因为没进循环就落成默认的 epochs
+    stopped_by = ("step_budget"
+                  if (budget_mode and steps_done >= budget) else "epochs")
+
+    def t16_train_args() -> dict:
+        """步预算/采样/init 谱系字段（T16 §3.1-§3.3）。
+
+        集中一处生成：checkpoint_last/best/epoch 快照与 train_hist 用同一口径，
+        避免"checkpoint 说 5 步、曲线说 6 步"这类对不上账的记录。
+        """
+        if int(args.max_train_frames or 0) > 0:
+            sampling = "legacy_cap"          # 历史协议：固定截帧凑等步数
+        elif sampler is not None:
+            sampling = "quota_full_pool"     # 新协议：全池配额轮换
+        else:
+            sampling = "legacy_epoch"
+        return {
+            "total_steps": int(budget),
+            "steps_done": int(steps_done),
+            "steps_in_epoch": int(steps_in_epoch),
+            "stopped_by": str(stopped_by),
+            "sampler": str(sampler_name),
+            "sampling": sampling,
+            "sampler_state_digest": (sampler.state_digest()
+                                     if sampler is not None else None),
+            **init_block,
+        }
+
+    # 一轮的批数（与 plan_epochs 同口径）：用来判断预算是不是停在轮中间
+    spe_ref = (int(plan["steps_per_epoch"]) if plan else
+               max(1, -(-len(train_frames) // max(1, args.batch))))
+    for ep in range(start_ep, epochs_eff):
         t0 = time.time()
-        tr_loss, tr_acc, _, _ = run_epoch(
+        # 从轮中间续训时跳过已经做过的批次（quota 模式由采样器 cursor 负责，
+        # 这里的 skip 只对 legacy 顺序生效）
+        _skip = int(steps_in_epoch) if ep == start_ep else 0
+        tr_loss, tr_acc, _, _, ep_steps = run_epoch(
             train_frames, train=True, ep=ep,
-            balance_runs=args.balance_runs, run_bounds=train_bounds)
-        sched.step()
-        va_loss, va_acc, va_ious, va_present = run_epoch(
+            balance_runs=args.balance_runs, run_bounds=train_bounds,
+            sampler=sampler, step_base=int(steps_done), skip_steps=_skip,
+            max_steps=((int(budget) - int(steps_done))
+                       if budget_mode else None))
+        steps_done += int(ep_steps)
+        if budget_mode:
+            # 预算到点后记下"这一轮做到第几步"：恰好做完一整轮就归零，
+            # 停在轮中间就留给续训（不能从轮首重跑）
+            steps_in_epoch = (0 if (ep_steps >= spe_ref or steps_done < budget)
+                              else int(ep_steps))
+        else:
+            sched.step()          # legacy：按 epoch 调度（历史行为，不变）
+        _budget_hit = bool(budget_mode and steps_done >= budget)
+        stopped_by = "step_budget" if _budget_hit else "epochs"
+        va_loss, va_acc, va_ious, va_present, _ = run_epoch(
             val_frames, train=False, ep=ep)
         m_iou = (float(va_ious[va_present].mean())
                  if va_present.any() else 0.0)
@@ -1186,6 +1711,9 @@ def main() -> None:
         if mon["store"] is not None:
             mon["store"].append({
                 "kind": "epoch", "epoch": ep, "step": mon["step"],
+                "steps_done": int(steps_done),
+                "total_steps": (int(budget) if budget_mode else None),
+                "stopped_by": str(stopped_by),
                 "run_id": args.metrics_run,
                 "train_loss": float(tr_loss), "train_acc": float(tr_acc),
                 "val_loss": float(va_loss), "val_acc": float(va_acc),
@@ -1200,7 +1728,19 @@ def main() -> None:
         print(f"[train] ep {ep:02d}  loss={tr_loss:.4f} "
               f"val_acc={va_acc:.3f} val_mIoU={m_iou:.4f} "
               f"val_lineIoU={'n/a' if line_iou_ep is None else round(line_iou_ep, 4)} "
-              f"({time.time() - t0:.0f}s)", flush=True)
+              + (f"steps={steps_done}/{budget} " if budget_mode else "")
+              + f"({time.time() - t0:.0f}s)", flush=True)
+        if sampler is not None:
+            # 每轮把采样报告写进 train_hist.json：训练中途也能看到 unique_seen
+            # （不是等跑完才第一次出现），且它是**真实进过 batch** 的计数
+            hist["steps_done"] = int(steps_done)
+            hist["total_steps"] = int(budget)
+            hist["stopped_by"] = str(stopped_by)
+            hist["sampler"] = sampler_name
+            hist["sampler_report"] = sampler.report()
+            hist["sampler_state_digest"] = sampler.state_digest()
+            hist["init"] = dict(init_block)
+            _write_train_hist(out_dir, hist)
         if args.stop_after is not None and (ep + 1) >= int(args.stop_after):
             print(f"[train] --stop-after={args.stop_after}：在 epoch {ep} 后"
                   f"落盘并退出（模拟中断；--epochs 未变，LR 计划一致）",
@@ -1245,8 +1785,11 @@ def main() -> None:
                 "next_epoch": ep + 1, "epoch": ep,
                 "best_miou": best_miou, "hist": hist,
                 "dataset_id": args.dataset_id or "unversioned",
+                "sampler_state": (sampler.state() if sampler is not None
+                                  else None),
                 "train_args": {"epochs": args.epochs, "batch": args.batch,
-                               "lr": args.lr, "seed": args.seed},
+                               "lr": args.lr, "seed": args.seed,
+                               **t16_train_args()},
             }, out_dir / f"epoch_{ep:02d}.pt")
         ckpt = {
             "state_dict": model.state_dict(),
@@ -1257,6 +1800,9 @@ def main() -> None:
             "best_miou": best_miou,
             "best_task": best_task,
             "hist": hist,
+            # 完整采样器状态（JSON 安全的纯 int/list/dict）：--resume 靠它把
+            # next_batch() 序列恢复到与不中断逐位一致（digest 在 train_args 里）
+            "sampler_state": (sampler.state() if sampler is not None else None),
             "train_args": {
                 "line_weight": args.line_weight,
                 "line_tversky_weight": args.line_tversky_weight,
@@ -1291,7 +1837,9 @@ def main() -> None:
                     "name": type(sched).__name__,
                     "T_max": int(getattr(sched, "T_max", 0) or 0),
                     "eta_min": float(getattr(sched, "eta_min", 0.0) or 0.0),
-                    "step_per": "epoch",
+                    # 预算模式按步调度（T_max=N），legacy 按 epoch——复现口径
+                    # 必须自描述，不能只看 epochs 猜
+                    "step_per": ("step" if budget_mode else "epoch"),
                 },
                 "optimizer": {
                     "name": type(opt).__name__,
@@ -1308,6 +1856,9 @@ def main() -> None:
                                 else "cpu"),
                 "steps_per_epoch": max(1, -(-len(train_frames)
                                             // max(1, args.batch))),
+                # T16 §3.1-§3.3：步预算/采样器/init 谱系（autoloop 与判定据此
+                # 读"实际跑了多少步、从哪来、看没看过新数据"）
+                **t16_train_args(),
             },
             # T14：恢复所需的随机状态/数据版本/git/环境，缺一项就不能声称
             # "中断续训 = 未中断"。旧 checkpoint 读起来仍然兼容。
@@ -1371,7 +1922,29 @@ def main() -> None:
             }, out_dir / "best_task.pt")
             print(f"[train] 保存最优任务成对率={t_paired:.1%} -> "
                   f"{out_dir / 'best_task.pt'}", flush=True)
+        if _budget_hit:
+            # 步预算是主停止条件：本轮（可能只做了一半）的权重/优化器/采样器
+            # 状态都已按上面同一份 payload 落盘，可以从这里退出
+            print(f"[train] 步预算到达：steps_done={steps_done}/{budget}，"
+                  f"在 epoch {ep} 落盘退出（stopped_by=step_budget）",
+                  flush=True)
+            break
 
+    # 顶层口径（train_hist.json）：步数、停止原因、采样报告、init 谱系。
+    # 不给 --total-steps 时也写——legacy 也必须有可读的"实际步数/停止原因"，
+    # 只是值描述旧协议（total_steps=0、stopped_by=epochs、sampler_report=None，
+    # 因为 legacy 不逐帧记账，用池大小冒充 unique_seen 是明令禁止的）。
+    hist["steps_done"] = int(steps_done)
+    hist["total_steps"] = int(budget)
+    hist["stopped_by"] = str(stopped_by)
+    hist["sampler"] = str(sampler_name)
+    if sampler is not None:
+        hist["sampler_report"] = sampler.report()
+        hist["sampler_state_digest"] = sampler.state_digest()
+    else:
+        hist.setdefault("sampler_report", None)
+        hist.setdefault("sampler_state_digest", None)
+    hist["init"] = dict(init_block)
     (out_dir / "train_hist.json").write_text(
         json.dumps(hist, ensure_ascii=False, indent=1), encoding="utf-8")
     try:
@@ -1417,7 +1990,8 @@ def main() -> None:
                            "line_only_runs": list(args.line_only_runs),
                            "thin_line_labels": int(args.thin_line_labels or 0),
                            "train_only_runs": list(args.train_only_runs),
-                           "n_train": len(train_frames), "n_val": 0},
+                           "n_train": len(train_frames), "n_val": 0,
+                           **t16_train_args()},
         }, out_dir / "best.pt")
         print(f"[train] 无验证集，best.pt 使用最终 epoch 权重 -> "
               f"{out_dir / 'best.pt'}", flush=True)
@@ -1425,15 +1999,21 @@ def main() -> None:
         mon["sampler"].stop()
         mon["store"].append(task_record(
             args.metrics_run, args.task_name or args.metrics_run, "completed",
-            total_steps=mon["steps_per_epoch"] * int(args.epochs),
-            current_step=mon["step"], epoch=int(args.epochs),
+            total_steps=mon.get("total_steps")
+            or (mon["steps_per_epoch"] * int(args.epochs)),
+            current_step=mon["step"], epoch=int(epochs_eff),
             started_at=(mon["store"].task() or {}).get("started_at"),
             extra={"best_val_miou": round(float(best_miou), 4),
-                   "best_pt": str(out_dir / "best.pt")}))
+                   "best_pt": str(out_dir / "best.pt"),
+                   "steps_done": int(steps_done),
+                   "stopped_by": str(stopped_by),
+                   "sampler": str(sampler_name)}))
         print(f"[train] 指标收尾：{mon['step']} 个优化步已记录 -> "
               f"{mon['store'].path}", flush=True)
     print(f"[train] 完成: 最优验证 mIoU={best_miou:.4f} "
-          f"-> {out_dir / 'best.pt'}", flush=True)
+          f"steps_done={steps_done}"
+          + (f"/{budget}" if budget_mode else "")
+          + f" stopped_by={stopped_by} -> {out_dir / 'best.pt'}", flush=True)
 
 
 if __name__ == "__main__":
