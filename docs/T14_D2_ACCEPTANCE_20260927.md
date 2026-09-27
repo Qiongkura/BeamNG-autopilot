@@ -57,6 +57,25 @@
 8. **状态**：**D1 通过；D2 通过（学习循环可解释）；R2/R3 未开始**。
    下一步输入：标注两个包 → 合格版 E1 + 可晋级线通道训练（身份门唯一已知出路）。
 
+## 3.1 新字段的真实产物端到端验证（2026-09-27）
+
+复核者指出"仓库里没有修复后的真实判定（新字段命中 0 个文件）"——本轮用**真 dev 目录 +
+桩训练器**跑了一轮真实 `rounds`（`logs/experiments/t14_dash_e2e2_20260927`，无 GPU 训练），
+判定文件带**实测值**：
+
+* `counts` = P_frames 55 / C 159 / R 66 / M 16 / L 16 / A 13（真 wide+plain 上探针实测）；
+* `counts_ratios` = 覆盖 0.4151（66/159）、身份 0.2424（16/66）、角色 0.8125（13/16）
+  ——**带分子分母**，可被 replay 从 counts 重算比对（T12②）；
+* `hard_by_seed["42"].counts`（逐 seed 原始计数，T12③）；
+* `probe_frame_accounting` = 处理 55 / 跳过 0 / 缺证据 0 / 无掩码 0（测到 2 个 run，T11③）；
+* `eval_run_errors` 空、`round_outcome` = qualification_failure、`factor_activity.active` = True；
+* `negative_line` 两臂都是 `no_eligible_frames`（wide/plain 是**有线**场景，没有合格负例
+  → 比率 null 而不是 0）。
+
+**看板端到端**：`render --run-dir … --view full` rc=0，页面出现"seed 42 计数:"、
+"探针帧数账"、"qualification_failure"、计数表（含 `C_outside_P`）、带分母的比率、
+适用性表，且**无外部资源**（`http://` 不出现）。
+
 ## 4. 复核与独立性
 
 * 本轮独立复核（第二个复核者、与实现者、与第一次复核者都不同）见
