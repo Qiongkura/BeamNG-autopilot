@@ -34,7 +34,8 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from beamng_autopilot.experiments.checkpoint import file_sha16  # noqa: E402
-from beamng_autopilot.experiments.final_set import (  # noqa: E402
+from beamng_autopilot.experiments.final_set import (
+    confirmation_results,  # noqa: E402
     access, confirmation_record, consumption, read_seal, seal, verify_seal,
 )
 from beamng_autopilot.experiments.protocol import protocol_hash  # noqa: E402
@@ -134,16 +135,11 @@ def _cmd_confirm(args) -> int:
         by.setdefault(dir_group(r), []).extend(em.load_frames([Path(r)]))
     metrics = em.evaluate_model_per_group(Path(args.model), by,
                                           device=args.device)
-    keep = ("line_recall", "line_precision", "offroad_false_frac_of_pred",
-            "line_iou", "road_iou", "n_frames", "inference_ms_p95")
-    per_group = {g: {k: m.get(k) for k in keep}
-                 for g, m in (metrics.get("per_group") or {}).items()}
-    results = {
-        "per_group": per_group,
-        "overall": {k: metrics.get(k) for k in keep},
-        "model": str(args.model),
-        "model_sha16": file_sha16(Path(args.model)),
-    }
+    # 记录用**同一套计数契约**：比率之外还留 v5 整数计数与负例诊断
+    # （`confirmation_results` 是库函数，可单测；此前只留了比率）
+    results = confirmation_results(metrics, model_path=str(args.model),
+                                   model_sha16=file_sha16(Path(args.model)))
+    per_group = results["per_group"]
     rec = confirmation_record(
         seal_dir=args.out, protocol_hash=ph,
         candidate_id=args.candidate_id, caller=args.caller,
