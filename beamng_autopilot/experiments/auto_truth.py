@@ -432,7 +432,221 @@ def appearance_line_check(frame, *,
 
 
 # ── 1. 投影校验 ─────────────────────────────────────────────────────────────
-def line_distance_stats(frame) -> dict:
+#: 静态投影标定的搜索范围（度）。实测相机模型与渲染光轴的差主要在**俯仰**
+#: （坡道上 2–6°）；方位（yaw）对"沿路的长直线"是**退化**的——直线沿光轴延伸时
+#: 最近像素距离对 yaw 不敏感（合成测试实测：注入 yaw=+2.5° 时最优解跑到 -1.25°
+#: 而残差照样降到 0.37 px）。所以 yaw 只在小范围里吸收残差，报告里要说明
+#: "标定的 yaw 不唯一"。
+ALIGN_YAW_RANGE_DEG = (-1.5, 1.5)
+ALIGN_PITCH_RANGE_DEG = (-8.0, 8.0)
+
+
+def _rotate_camera_basis(camera, yaw_deg: float, pitch_deg: float) -> dict:
+    """相机 basis 绕"右轴/上轴"小角度旋转后的新 camera dict（不动物理位置）。
+
+    两种 pose 形态都支持：``basis``（采集侧世界系基）与 ``rot``（合成场景的
+    欧拉/四元数）。实测踩到——只处理 ``basis`` 时合成批次（用 ``rot``）根本没被
+    旋转，标定测试测到的是"没注入误差"的假象。输出统一写成 ``basis`` 并删掉
+    ``rot``（`camera_basis` 里 basis 优先）。
+    """
+    cam = dict(camera or {})
+    pose = dict(cam.get("pose") or {})
+    try:
+        _pos, right, fwd, up = camera_basis(cam)
+    except (TypeError, ValueError):
+        return cam
+    ry, rp = math.radians(float(yaw_deg)), math.radians(float(pitch_deg))
+    f = fwd * math.cos(ry) + right * math.sin(ry)
+    f = f * math.cos(rp) - up * math.sin(rp)
+    f = f / max(1e-12, float(np.linalg.norm(f)))
+    up_w = np.array([0.0, 0.0, 1.0])
+    r = np.cross(f, up_w)
+    r = r / max(1e-12, float(np.linalg.norm(r)))
+    u = np.cross(r, f)
+    pose.pop("rot", None)
+    pose["basis"] = {"fwd": [float(v) for v in f],
+                     "right": [float(v) for v in r],
+                     "up": [float(v) for v in u]}
+    cam["pose"] = pose
+    return cam
+
+
+def _mean_line_distance(frames: list, *, yaw_deg: float,
+                        pitch_deg: float,
+                        evidence: str = "annotation") -> tuple:
+    """在给定角度修正下，所有帧的线真值点到最近线像素的平均距离（像素）。"""
+    total, n = 0.0, 0
+    for frame in frames:
+        cam = _rotate_camera_basis(frame.get("camera"), yaw_deg, pitch_deg)
+        f2 = dict(frame)
+        f2["camera"] = cam
+        st = line_distance_stats(f2, evidence=evidence)
+        if st.get("mean_px") is None:
+            continue
+        total += float(st["mean_px"]) * int(st["n"])
+        n += int(st["n"])
+    return (None if not n else total / n), n
+
+
+def fit_projection_alignment(frames, *, coarse_step: float = 1.0,
+                             fine_step: float = 0.1,
+                             yaw_range=ALIGN_YAW_RANGE_DEG,
+                             pitch_range=ALIGN_PITCH_RANGE_DEG,
+                             evidence: str = "annotation") -> dict:
+    """用**渲染回读**做静态投影标定：拟合 (yaw, pitch) 相机模型修正。
+
+    为什么需要它：相机模型（传感器位姿 + 针孔）与渲染光轴之间可能有固定小角度
+    差（实测：坡道上 2–6°、平地 1–2°，见 `docs/T16_ORDER2_SCENES_20260927.md`）。
+    这属于**渲染/标定常数**，不是真值放宽：本函数在标定帧上把投影对齐到渲染线
+    像素，把结果（角度 + 校准前后残差 + 样本数）**落盘**，之后用它做验证；
+    校准后残差才是几何一致性的度量（2 个参数拟合 100+ 个观测，残差降不下去
+    就说明几何真的不一致）。
+
+    返回 ``{yaw_deg, pitch_deg, before_px, after_px, n, n_frames, status, why}``；
+    没有线像素/真值点 -> ``status="unknown"``（不猜）。
+
+    **可辨识性**：俯仰可辨识（长直线的像素位置随俯仰整体平移）；方位对沿路的
+    长直线退化（见 `ALIGN_YAW_RANGE_DEG` 注释），所以 yaw 只在小范围内吸收
+    残差，读报告时不要把 yaw 当作实测的安装角。
+    """
+    usable = [f for f in (frames or []) if isinstance(f, Mapping)
+              and _line_truth_points(f)
+              and int(line_distance_stats(f, evidence=evidence).get("line_px")
+                      or 0) > 0]
+    out = {"yaw_deg": 0.0, "pitch_deg": 0.0, "before_px": None, "after_px": None,
+           "n": 0, "n_frames": len(usable), "status": "unknown", "why": "",
+           "evidence": str(evidence)}
+    if not usable:
+        out["why"] = ("no frame carries both line truth points and line-class "
+                      "pixels: nothing to align against")
+        return out
+    before, n0 = _mean_line_distance(usable, yaw_deg=0.0, pitch_deg=0.0,
+                                     evidence=evidence)
+    out["before_px"], out["n"] = (None if before is None else round(before, 3)), n0
+    best = (None, 0.0, 0.0)
+    yaws = np.arange(yaw_range[0], yaw_range[1] + 1e-9, float(coarse_step))
+    pitches = np.arange(pitch_range[0], pitch_range[1] + 1e-9, float(coarse_step))
+    for dy in yaws:
+        for dp in pitches:
+            m, _n = _mean_line_distance(usable, yaw_deg=float(dy),
+                                        pitch_deg=float(dp), evidence=evidence)
+            if m is not None and (best[0] is None or m < best[0]):
+                best = (m, float(dy), float(dp))
+    if best[0] is None:
+        out["why"] = "alignment search found no usable projection"
+        return out
+    # 细搜索：在上一步最优点附近
+    fy = np.arange(best[1] - coarse_step, best[1] + coarse_step + 1e-9, fine_step)
+    fp = np.arange(best[2] - coarse_step, best[2] + coarse_step + 1e-9, fine_step)
+    for dy in fy:
+        for dp in fp:
+            if not (yaw_range[0] <= dy <= yaw_range[1]
+                    and pitch_range[0] <= dp <= pitch_range[1]):
+                continue
+            m, _n = _mean_line_distance(usable, yaw_deg=float(dy),
+                                        pitch_deg=float(dp), evidence=evidence)
+            if m is not None and m < best[0]:
+                best = (m, float(dy), float(dp))
+    out.update(yaw_deg=round(best[1], 3), pitch_deg=round(best[2], 3),
+               after_px=round(float(best[0]), 3), status="measured")
+    return out
+
+
+def line_evidence_coverage(frame, *, radius_px: int = 6,
+                           evidence: str = "annotation") -> dict:
+    """线真值点被**证据像素**覆盖的比例（资格判据，方案 §4.3）。
+
+    为什么要它：实测（2026-09-27，12 锚点扩量批次）有站点线类像素只有 25 个、
+    甚至 0 个——那种站点上"到最近线像素的距离"会算出 10–14 px 的**假残差**
+    （最近的那个像素根本不是这条线）。证据覆盖不足的站点应当**隔离**并记明
+    原因，而不是拿假残差当结论。
+
+    定义：``coverage = (# 在画面内且 radius_px 内有证据像素的线真值点) /
+    (# 在画面内的线真值点)``（不做任何角度标定，避免自证）。
+    返回 ``{n_in_frame, n_covered, coverage, radius_px, evidence, status, why}``。
+    """
+    camera = frame.get("camera")
+    pts = _line_truth_points(frame)
+    out = {"n_in_frame": 0, "n_covered": 0, "coverage": None,
+           "radius_px": int(radius_px), "evidence": str(evidence),
+           "status": "unknown", "why": ""}
+    if not pts:
+        out["why"] = "frame declares no line truth points"
+        return out
+    if camera is None:
+        out["why"] = "frame has no camera"
+        return out
+    mask, mode_used, why_mask = line_evidence_mask(frame, mode=evidence)
+    out["evidence"] = mode_used
+    if mask is None:
+        out["why"] = f"line evidence mask unavailable: {why_mask}"
+        return out
+    h, w = mask.shape[:2]
+    px = np.argwhere(mask)
+    if not len(px):
+        out.update(status="not_covered", coverage=0.0,
+                   why=f"no line pixel under evidence={mode_used!r}")
+        return out
+    n_in = n_cov = 0
+    for p in pts:
+        try:
+            u, v = project_point(p.get("world"), camera)
+        except (TypeError, ValueError):
+            continue
+        if not (math.isfinite(u) and math.isfinite(v)):
+            continue
+        x, y = int(round(u)), int(round(v))
+        if not (0 <= x < w and 0 <= y < h):
+            continue
+        n_in += 1
+        if float(np.hypot(px[:, 0] - v, px[:, 1] - u).min()) <= float(radius_px):
+            n_cov += 1
+    out.update(n_in_frame=n_in, n_covered=n_cov,
+               coverage=(round(n_cov / n_in, 4) if n_in else None),
+               status=("measured" if n_in else "unknown"))
+    if not n_in:
+        out["why"] = "no line truth point projects into the frame"
+    return out
+
+
+def line_evidence_mask(frame, *, mode: str = "annotation"):
+    """漆线像素掩码：``mode="annotation"`` 取 label==2；``"appearance"`` 取
+    外观判据（白/暖白/黄）命中的像素。
+
+    为什么要有两种：实测（2026-09-27，12 锚点扩量批次）**引擎 annotation 的线类
+    覆盖随路段变化**——有的路段线类像素上万，有的只有个位数甚至 0（生成的贴花
+    明明可见）。方案 §4.3 要求"逐通道赋资格"，所以证据源要按站点实测选择：
+    覆盖够就用 annotation，不够就用外观（仍经深度遮挡校验），并把用的是哪一种
+    记进报告。返回 ``(mask, mode_used, why)``；不可用返回 ``(None, mode, why)``。
+    """
+    label = frame.get("label")
+    rgb = frame.get("rgb")
+    if mode == "annotation":
+        if label is None:
+            return None, mode, "no label in frame"
+        lab = np.asarray(label)
+        if lab.ndim != 2 or lab.size == 0:
+            return None, mode, "label must be a nonempty 2-D array"
+        return (lab == 2), mode, ""
+    if rgb is None:
+        return None, mode, "no rgb in frame"
+    a = np.asarray(rgb)
+    if a.ndim != 3 or a.shape[2] < 3 or a.size == 0:
+        return None, mode, "rgb must be a nonempty HxWx3 image"
+    win = a[:, :, :3].astype(np.int16)
+    mx = win.max(axis=2)
+    mn = win.min(axis=2)
+    r, g, b = win[:, :, 0], win[:, :, 1], win[:, :, 2]
+    white = ((mx >= LINE_WHITE_MIN)
+             & (((mx - mn) <= LINE_WHITE_CHROMA)
+                | ((r - b) >= LINE_WARM_WHITE_RB)))
+    yellow = ((r >= LINE_YELLOW_RG_MIN) & (g >= LINE_YELLOW_RG_MIN)
+              & (b <= LINE_YELLOW_B_MAX) & (np.abs(r - g) <= 45)
+              & ((r - b) >= LINE_YELLOW_RB_MIN))
+    return (white | yellow), mode, ""
+
+
+def line_distance_stats(frame, *, evidence: str = "annotation") -> dict:
     """线真值点到**最近线类像素**的距离统计（像素）。
 
     为什么需要它：`verify_projection` 的 2 px 半径是在合成渲染上标定的；真实
@@ -444,27 +658,28 @@ def line_distance_stats(frame) -> dict:
     line_px, status}``；没有线像素或没有线真值点 -> ``status="unknown"``。
     """
     camera = frame.get("camera")
-    label = frame.get("label")
     pts = _line_truth_points(frame)
     out = {"n": 0, "mean_px": None, "p95_px": None, "max_px": None,
            "within_radius_frac": None, "radius_px": PROJECTION_RADIUS_PX,
-           "line_px": 0, "status": "unknown", "why": ""}
+           "line_px": 0, "status": "unknown", "why": "",
+           "evidence": str(evidence)}
     if not pts:
         out["why"] = "frame declares no line truth points"
         return out
-    if camera is None or label is None:
-        out["why"] = "frame has neither camera nor label"
+    if camera is None:
+        out["why"] = "frame has no camera"
         return out
-    lab = np.asarray(label)
-    if lab.ndim != 2 or lab.size == 0:
-        out["why"] = "label must be a nonempty 2-D array"
+    mask, mode_used, why_mask = line_evidence_mask(frame, mode=evidence)
+    out["evidence"] = mode_used
+    if mask is None:
+        out["why"] = f"line evidence mask unavailable: {why_mask}"
         return out
-    line_px = np.argwhere(lab == 2)
+    h, w = mask.shape[:2]
+    line_px = np.argwhere(mask)
     out["line_px"] = int(len(line_px))
     if not len(line_px):
-        out["why"] = "no line-class pixel in this frame"
+        out["why"] = (f"no line pixel under evidence={mode_used!r} in this frame")
         return out
-    h, w = lab.shape
     dists: list[float] = []
     for p in pts:
         try:
