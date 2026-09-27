@@ -538,6 +538,21 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
                                          parkingbrake=1.0, gear=1)
                 except Exception:                            # noqa: BLE001
                     pass
+                # 逐帧沿站点方向前进 step_m（默认 0 = 原地多帧）：静止多帧是
+                # **重复画面**（方案 §4.4 明确"先加路段再加近邻帧"），
+                # 采序列才是不同的视角/位置。
+                _step_m = float(getattr(args, "step_m", 0.0) or 0.0)
+                if _step_m > 0.0:
+                    _d = _unit(np.asarray(site["dir"], dtype=float))
+                    _p = np.asarray(st.pos, dtype=float) + _d * _step_m
+                    try:
+                        conn.safe_teleport(float(_p[0]), float(_p[1]),
+                                           heading_deg=math.degrees(
+                                               math.atan2(_d[1], _d[0])))
+                        conn.vehicle.control(throttle=0.0, brake=1.0,
+                                             parkingbrake=1.0, gear=1)
+                    except Exception:                        # noqa: BLE001
+                        pass
                 with conn.io_lock:
                     conn.bng.control.step(2)
             # 异步旧帧检测（方案 §4.1）：poll 前后各读一次位姿，漂移超过阈值就
@@ -843,7 +858,10 @@ def main() -> int:
     ap.add_argument("--map", default="italy")
     ap.add_argument("--scenes", nargs="*", default=list(SCENES),
                     help="要跑的场景（默认全部五类）")
-    ap.add_argument("--frames", type=int, default=2)
+    ap.add_argument("--frames", type=int, default=2,
+                    help="每站帧数；配 --step-m 采**序列**（不同位置），否则是原地多帧")
+    ap.add_argument("--step-m", type=float, default=0.0,
+                    help="逐帧沿站点方向前进的米数（0 = 原地）")
     ap.add_argument("--width", type=int, default=192)
     ap.add_argument("--height", type=int, default=144)
     ap.add_argument("--out", default=None)

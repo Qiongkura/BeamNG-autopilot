@@ -179,3 +179,15 @@ def test_the_generator_selects_drive_gear_explicitly():
         encoding="utf-8")
     assert src.count("gear=1") >= 2, "run_scene 与采帧循环都要显式挂前进挡"
     assert '"electrics"' in src and "reverse" in src, "挡位/踏板要进证据"
+
+
+def test_sequence_capture_is_wired():
+    """`--step-m`：逐帧沿线前进采**序列**（静止多帧是重复画面）。
+
+    源码级接线检查：漏了它，多帧站点会产出近似重复的样本（方案 §4.4 要求
+    "先加路段、再加近邻帧"），而这一点在产物里不容易看出来。
+    """
+    src = (ROOT / "scripts" / "m5_controlled_scenes.py").read_text(
+        encoding="utf-8")
+    assert "--step-m" in src and "step_m" in src
+    assert "safe_teleport" in src, "序列帧要按站点方向前移（teleport）"
