@@ -198,8 +198,14 @@ class DatasetManifest:
                 # "两种道路类型分别标记"）。老帧没有这一列 -> 保持"不可分"。
                 _rt = (np.asarray(z["road_type"], np.uint8)
                        if "road_type" in z.files else None)
+                # 凭证要**传进去**：`engine_verified` 只有在凭证支持时才算
+                # verified（反伪造）。不传的话 rank 降 absent ->
+                # paint_valid_frames=0——实测踩到：自动真值导出的站点
+                # （label_source=engine_verified + truth_provenance v1）在清单里
+                # 被算成 0 个可用漆线帧，等于"接进采集链"没打通。
                 audit = audit_label(label, paint_source=src,
-                                    road_min_px=min_road_px, road_type=_rt)
+                                    road_min_px=min_road_px, road_type=_rt,
+                                    credential=_cred)
                 rec = FrameRecord(
                     path=str(Path(f).resolve()), run=rd.name, view=view,
                     group=_group_of(map_name, source_id, rd),
