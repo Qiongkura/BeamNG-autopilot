@@ -223,3 +223,29 @@ def test_no_undefined_args_reference_in_helpers():
         assert not uses or "args" in params or "args" in assigned, (
             f"{fn.name}() 引用了 args，但它既没有这个参数也没在函数内赋值"
             "（会在运行时 NameError）")
+
+
+def test_assign_scene_types_rotates_and_does_not_index_over():
+    """站点数 < 类型数时只轮转（实测踩到 --sites 3 时交换越界 IndexError）。"""
+    m = _load()
+    order = ["known_line", "known_no_line", "occluded_line", "slope_curve",
+             "material_mix"]
+    # 3 个站点：只有前 3 类，不越界
+    sites3 = [{"curve_deg": 0.0, "slope_pct": 0.1},
+              {"curve_deg": 2.0, "slope_pct": 9.0},
+              {"curve_deg": 1.0, "slope_pct": 2.0}]
+    types = m.assign_scene_types(sites3, order)
+    assert types == order[:3], types
+    # 5 个站点：slope_curve 换到弯/坡最大的那个站（交换站点，类型按位置）
+    sites5 = [{"curve_deg": 0.0, "slope_pct": 0.0},
+              {"curve_deg": 1.0, "slope_pct": 1.0},
+              {"curve_deg": 1.0, "slope_pct": 1.0},
+              {"curve_deg": 5.0, "slope_pct": 12.0},
+              {"curve_deg": 1.0, "slope_pct": 1.0}]
+    types5 = m.assign_scene_types(sites5, order)
+    assert types5 == order, types5
+    # 最弯/最陡的站现在在 slope_curve 的位置（index 3）
+    assert sites5[3]["slope_pct"] == 12.0
+    # 1 个站点：仍不崩
+    assert m.assign_scene_types([{"curve_deg": 0.0, "slope_pct": 0.0}],
+                                order) == [order[0]]

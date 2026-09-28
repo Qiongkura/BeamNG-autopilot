@@ -403,6 +403,24 @@ def _line_truth(nodes: list[list[float]], role: str, *, per_m: float = 1.7) -> l
 
 
 # ── 场景构建 ─────────────────────────────────────────────────────────────────
+def assign_scene_types(a_sites: list, types_order: list) -> list[str]:
+    """给一个锚点的站点分配场景类型：按顺序轮转；slope_curve 换到弯/坡最大的站。
+
+    **站点数少于类型数时不越界**（实测踩到：``--sites 3`` 时
+    ``types_order.index("slope_curve") == 2`` 恰好等于长度，交换时 IndexError）。
+    交换的是**站点**（类型按位置走），所以返回的 types 与 a_sites 一一对应。
+    """
+    types = [types_order[i % len(types_order)] for i in range(len(a_sites))]
+    if "slope_curve" in types and len(a_sites) > 1:
+        j = types.index("slope_curve")
+        best = max(range(len(a_sites)),
+                   key=lambda k: (abs(a_sites[k].get("curve_deg") or 0)
+                                  + abs(a_sites[k].get("slope_pct") or 0)))
+        if best != j:
+            a_sites[j], a_sites[best] = a_sites[best], a_sites[j]
+    return types
+
+
 def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
                    scene_names: list[str]):
     """把全部站点生成进**一个** Scenario（一次加载；扩量后站点分布在多条路段）。
@@ -925,18 +943,12 @@ def main() -> int:
                 print(f"[scenes] 锚点 {ai}（{anchor['road_id']}）布站失败：{exc}",
                       flush=True)
                 continue
-            # slope_curve 用该锚点里弯/坡最大的站（每段路各选各的）
-            if "slope_curve" in types_order and len(a_sites) > 1:
-                best = max(range(1, len(a_sites)),
-                           key=lambda k: abs(a_sites[k].get("curve_deg") or 0)
-                           + abs(a_sites[k].get("slope_pct") or 0))
-                j = types_order.index("slope_curve")
-                a_sites[best], a_sites[j] = a_sites[j], a_sites[best]
+            # 场景类型分配（五类轮转；slope_curve 用该锚点弯/坡最大的站）
+            a_types = assign_scene_types(a_sites, types_order)
             for si, st_ in enumerate(a_sites):
-                t = types_order[si % len(types_order)]
                 sites.append(st_)
-                scene_types.append(t)
-                scene_names.append(f"{t}_a{ai}s{si}")
+                scene_types.append(a_types[si])
+                scene_names.append(f"{a_types[si]}_a{ai}s{si}")
         if not sites:
             raise RuntimeError("没有布出任何站点")
         report["sites"] = sites
