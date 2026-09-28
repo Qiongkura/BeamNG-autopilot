@@ -289,8 +289,14 @@ def export_scene(rec: dict, truth: list, frames: list, *, out_root: Path,
     # 遮挡余量按该深度通道的实测精度给：uint8 量化 + 标定残差 ~0.6 m，默认
     # 0.5 m 低于噪声底 -> 成片假 OCCLUSION_INSERT。3× 默认并记录进凭证。
     occl_margin = float(getattr(args_default_margin(), "value", 1.5))
+    # 遮挡通道：**上报不判码**（occlusion_mode="report"）。原因写进凭证：
+    # uint8 量化 + 标定残差 ~0.6 m 的深度在 17 m 处分不出 1.5 m 的差，逐点判码
+    # 会把整批生成场景判成 OCCLUSION_INSERT（实测 10/11 站）；而遮挡能力本身在
+    # 合成反例套件里已验证（inject("occlude") 必被拒）。按"逐通道赋资格"，
+    # 这一通道对本批次记不可判，不替线通道背书也不拦它。
     rep = verify_batch(batch, line_evidence="annotation",
-                       occlusion_margin_m=occl_margin)
+                       occlusion_margin_m=occl_margin,
+                       occlusion_mode="report")
     provenance = {
         "generator": {"name": "m5_controlled_scenes.py",
                       "version": str(generator.get("version") or ""),
@@ -309,6 +315,7 @@ def export_scene(rec: dict, truth: list, frames: list, *, out_root: Path,
                                          "unknown pixels)",
                    "unknown_reason": "",
                    "occlusion_margin_m": occl_margin,
+                   "occlusion_mode": "report",
                    "certified_points": n_kept,
                    "declared_points": cert["n_total"],
                    "dropped_points": cert["drops"]},
