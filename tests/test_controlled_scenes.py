@@ -249,3 +249,20 @@ def test_assign_scene_types_rotates_and_does_not_index_over():
     # 1 个站点：仍不崩
     assert m.assign_scene_types([{"curve_deg": 0.0, "slope_pct": 0.0}],
                                 order) == [order[0]]
+
+
+def test_measured_line_convention_matches_the_dev_set():
+    """实测线位约定（开发集人工标签反投影，2026-09-28）：近线在自车右侧
+    （-0.4 m，role right）、远线在左侧（+2.1 m，role left）。
+
+    上一轮用对称 ±1.8 m 生成，身份率 +0.028 但角色一致率掉到 0.609——
+    约定不一致是主嫌疑，所以把这个约定钉在测试里。
+    """
+    m = _load()
+    assert m.LINE_LATERAL_M["near"] < 0 < m.LINE_LATERAL_M["far"]
+    assert abs(m.LINE_LATERAL_M["near"]) < abs(m.LINE_LATERAL_M["far"])
+    # 约定开关存在（symmetric = 旧行为，默认不变）
+    src = (ROOT / "scripts" / "m5_controlled_scenes.py").read_text(
+        encoding="utf-8")
+    assert "--line-convention" in src and "measured" in src
+    assert m.LINE_CONVENTION in ("symmetric", "measured")

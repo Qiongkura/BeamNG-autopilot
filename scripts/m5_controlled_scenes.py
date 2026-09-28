@@ -72,6 +72,16 @@ LINE_WIDTH_M = 0.15
 #: 不用地图路面的外缘：外缘常被边缘贴花覆盖（annotation 里是背景/非路面），
 #: 真值点会落在铺装之外（实测 3.65 m 处 label=0）。车道内部才是可控的。
 LAT_LANE_HALF = 1.8
+#: **实测的开发集线位约定**（2026-09-28，`scripts/m5_lane_geometry_measure.py`
+#: 在 8 个 reviewed 开发目录上反投影人工标签）：池化 261k 线像素，
+#: 质量集中在**自车右侧 −0.2…−0.7 m**（自车基本骑在线上——采集器沿 roadnet
+#: 中线行驶），另一条线在 +1.5…+3 m；地面高度 ±0.5 m 的假设误差只让中位移
+#: ~0.13 m，结论稳。上一轮自动真值用对称 ±1.8 m 生成，身份率 +0.028 但
+#: **角色一致率掉到 0.609**——约定不一致是主嫌疑。生成按实测约定：
+#: ``LINE_LATERAL_M`` 给"近线/远线"两个位置（车体系左为正，近线在右侧 = role
+#: right），`--line-convention measured|symmetric` 切换以便做单因子对照。
+LINE_LATERAL_M = {"near": -0.4, "far": +2.1}
+LINE_CONVENTION = "symmetric"   # 由 --line-convention 覆盖
 #: 横向符号约定（与 `_line_nodes` 的 left2d 一致）：**正 = 车体左**。
 #: 实测踩到：写成 -1 让"左线"跑到右侧，翻转审计按 role 投票直接报 CAMERA_FLIP。
 GRAVEL_WIDTH_M = 2.6
@@ -460,7 +470,12 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
                "materials": {}, "lines": [], "gravel": None}
         # 车道边界（真值几何：铺装边界 = 路面边缘；线在车道分界上）
         for kind, sign, role in spec["lines"]:
-            lat = sign * LAT_LANE_HALF
+            if LINE_CONVENTION == "measured":
+                # 实测约定：近线在自车右侧（role right）、远线在左侧（role left）
+                lat = (LINE_LATERAL_M["near"] if role == "right"
+                       else LINE_LATERAL_M["far"])
+            else:
+                lat = sign * LAT_LANE_HALF
             nodes = _line_nodes(site, lat)
             rid = f"m5_line_{name}_{role}"
             _add_road(_MAT[kind], rid, nodes, LINE_WIDTH_M, 30 + k)
@@ -492,8 +507,10 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
         mid = np.asarray(occ_site["mid"], dtype=float)
         d = _unit(occ_site["dir"])
         left2d = np.array([-d[1], d[0]])
+        _occ_lat = (LINE_LATERAL_M["near"] if LINE_CONVENTION == "measured"
+                    else LAT_LANE_HALF)
         pos = mid + d * OCCLUDER_AHEAD_M + np.array(
-            [left2d[0], left2d[1], 0.0]) * LAT_LANE_HALF   # 正=左，压在左线上
+            [left2d[0], left2d[1], 0.0]) * _occ_lat   # 正=左；压在该侧线上
         yaw = -math.degrees(math.atan2(d[1], d[0])) - 90.0
         blocker = Vehicle("blocker", model=OCCLUDER_MODEL, color="Blue")
         scen.add_vehicle(blocker, pos=(float(pos[0]), float(pos[1]),
@@ -883,6 +900,11 @@ def main() -> int:
                     help="每站帧数；配 --step-m 采**序列**（不同位置），否则是原地多帧")
     ap.add_argument("--step-m", type=float, default=0.0,
                     help="逐帧沿站点方向前进的米数（0 = 原地）")
+    ap.add_argument("--line-convention", choices=("symmetric", "measured"),
+                    default="symmetric",
+                    help="线位约定：symmetric=±LAT_LANE_HALF（旧）；"
+                         "measured=开发集实测（近线 -0.4 / 远线 +2.1 m，"
+                         "见 LINE_LATERAL_M 注释）")
     ap.add_argument("--width", type=int, default=192)
     ap.add_argument("--height", type=int, default=144)
     ap.add_argument("--out", default=None)
@@ -894,6 +916,12 @@ def main() -> int:
     ap.add_argument("--spacing-m", type=float, default=SITE_SPACING_M)
     args = ap.parse_args()
 
+    global LINE_CONVENTION
+    LINE_CONVENTION = str(args.line_convention)
+    print(f"[scenes] 线位约定 = {LINE_CONVENTION}"
+          + (f"（近线 {LINE_LATERAL_M['near']:+.1f} / 远线 "
+             f"{LINE_LATERAL_M['far']:+.1f} m）"
+             if LINE_CONVENTION == "measured" else ""), flush=True)
     probe = _load_probe()
     out = Path(args.out) if args.out else (
         config.LOGS_DIR / "experiments"
