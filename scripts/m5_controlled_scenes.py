@@ -489,7 +489,8 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
 
 def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
                  height: int, out_dir: Path, tag: str,
-                 frame_truth: list | None = None) -> tuple:
+                 frame_truth: list | None = None,
+                 step_m: float = 0.0) -> tuple:
     """在一个站点采帧（相机按站点方向对齐），返回 ``(frames, palette, meta)``。"""
     from beamngpy.sensors import Camera
     from beamng_autopilot_tech.providers import CAMERA_FOV_DEG, CAMERA_POS
@@ -541,7 +542,7 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
                 # 逐帧沿站点方向前进 step_m（默认 0 = 原地多帧）：静止多帧是
                 # **重复画面**（方案 §4.4 明确"先加路段再加近邻帧"），
                 # 采序列才是不同的视角/位置。
-                _step_m = float(getattr(args, "step_m", 0.0) or 0.0)
+                _step_m = float(step_m or 0.0)
                 if _step_m > 0.0:
                     _d = _unit(np.asarray(site["dir"], dtype=float))
                     _p = np.asarray(st.pos, dtype=float) + _d * _step_m
@@ -692,7 +693,8 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
 
 
 def run_scene(conn, probe, *, name: str, site: dict, rec: dict, truth_points: list,
-              n_frames: int, width: int, height: int, out_dir: Path) -> dict:
+              n_frames: int, width: int, height: int, out_dir: Path,
+              step_m: float = 0.0) -> dict:
     """一个站点的完整流程：teleport → 采帧 → 两种证据校验 → 记录。"""
     # 站点对齐的朝向（与生成时的 ego 朝向同一约定）
     heading = math.atan2(site["dir"][1], site["dir"][0])
@@ -713,7 +715,8 @@ def run_scene(conn, probe, *, name: str, site: dict, rec: dict, truth_points: li
                             np.asarray(_st.pos, dtype=float)[1] - float(mid[1])))
     frames, palette, cam_meta = capture_site(
         conn, probe, site=site, n_frames=n_frames, width=width, height=height,
-        out_dir=out_dir, tag=name, frame_truth=truth_points)
+        out_dir=out_dir, tag=name, frame_truth=truth_points,
+        step_m=float(step_m or 0.0))
     for fr in frames:
         fr["truth_points"] = [dict(p) for p in truth_points]
     batch = {
@@ -971,7 +974,8 @@ def main() -> int:
                 res = run_scene(conn, probe, name=name, site=site, rec=rec_site,
                                 truth_points=truth, n_frames=int(args.frames),
                                 width=int(args.width), height=int(args.height),
-                                out_dir=out / "frames")
+                                out_dir=out / "frames",
+                                step_m=float(args.step_m or 0.0))
                 report["scenes"][name] = res
                 ap_ = res["verification_appearance"]["stats"]["appearance"]
                 el = res.get("eligibility") or {}

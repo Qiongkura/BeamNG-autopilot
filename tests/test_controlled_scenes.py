@@ -191,3 +191,35 @@ def test_sequence_capture_is_wired():
         encoding="utf-8")
     assert "--step-m" in src and "step_m" in src
     assert "safe_teleport" in src, "序列帧要按站点方向前移（teleport）"
+
+
+def test_no_undefined_args_reference_in_helpers():
+    """辅助函数里不许引用 `args`——只有 main/cmd_* 有它。
+
+    实测踩到（2026-09-28）：`capture_site` 里写了
+    ``getattr(args, "step_m", 0.0)``，而该函数没有 `args` 参数，于是
+    大批次 125 个站点全部 `NameError: name 'args' is not defined`、0 帧落盘；
+    更糟的是它只在 ``--step-m > 0`` 时才触发，小批次（默认 0）完全看不出来。
+    用 AST 静态卡住：任何引用 `args` 的函数必须有同名参数。
+    """
+    import ast
+    src = (ROOT / "scripts" / "m5_controlled_scenes.py").read_text(
+        encoding="utf-8")
+    tree = ast.parse(src)
+    for fn in ast.walk(tree):
+        if not isinstance(fn, ast.FunctionDef):
+            continue
+        params = {a.arg for a in fn.args.args}
+        params |= {a.arg for a in fn.args.kwonlyargs}
+        if fn.args.vararg:
+            params.add(fn.args.vararg.arg)
+        if fn.args.kwarg:
+            params.add(fn.args.kwarg.arg)
+        # 函数内自己赋值也算合法（main 里就是 args = ap.parse_args()）
+        assigned = {t.id for n in ast.walk(fn) if isinstance(n, ast.Assign)
+                    for t in n.targets if isinstance(t, ast.Name)}
+        uses = any(isinstance(n, ast.Name) and n.id == "args"
+                   for n in ast.walk(fn))
+        assert not uses or "args" in params or "args" in assigned, (
+            f"{fn.name}() 引用了 args，但它既没有这个参数也没在函数内赋值"
+            "（会在运行时 NameError）")
