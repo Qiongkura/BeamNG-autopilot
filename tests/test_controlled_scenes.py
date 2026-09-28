@@ -266,3 +266,22 @@ def test_measured_line_convention_matches_the_dev_set():
         encoding="utf-8")
     assert "--line-convention" in src and "measured" in src
     assert m.LINE_CONVENTION in ("symmetric", "measured")
+
+
+def test_measured_role_targets_cover_the_reference_vocabulary():
+    """measured 约定要覆盖开发集的**参考角色词表**（实测 174 个实例：
+    straddled 13.8% / near_right 28.7% / near_left 32.2% / far_left 12.1% /
+    far_right 13.2%）。对称 ±1.8 m 只覆盖 near_left+near_right，缺 straddled
+    与 far_*——这是上一轮角色一致率 0.609 的机械解释。
+    """
+    m = _load()
+    roles = [r for r, _lat in m.LINE_ROLE_TARGETS]
+    assert "straddled" in roles, "必须能生成 straddled（自车骑线）"
+    assert any(r.startswith("far_") for r in roles), "必须能生成同侧第二条线"
+    assert "near_left" in roles and "near_right" in roles
+    # straddled 的位置必须在探针的 STRADDLE_M(0.5) 内（否则判不成 straddled）
+    lat = dict(m.LINE_ROLE_TARGETS)["straddled"]
+    assert abs(lat) <= 0.5, lat
+    # 每个位置都在一条合理车道范围内（生成时还会按铺装宽度夹紧）
+    for _r, lat0 in m.LINE_ROLE_TARGETS:
+        assert abs(lat0) <= 6.0, (_r, lat0)

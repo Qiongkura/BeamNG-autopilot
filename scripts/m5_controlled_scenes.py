@@ -81,6 +81,19 @@ LAT_LANE_HALF = 1.8
 #: ``LINE_LATERAL_M`` 给"近线/远线"两个位置（车体系左为正，近线在右侧 = role
 #: right），`--line-convention measured|symmetric` 切换以便做单因子对照。
 LINE_LATERAL_M = {"near": -0.4, "far": +2.1}
+#: 实测的**参考角色词表**（2026-09-28，8 个开发目录 174 个参考线实例，用探针
+#: 自己的 `engine_lines`+`assign_roles` 在人工标签上统计）：
+#: ``straddled 13.8% / near_right 28.7% / near_left 32.2% / far_left 12.1% /
+#: far_right 13.2%``。对称 ±1.8 m 只覆盖 near_left+near_right（≈61%），
+#: 缺 straddled（|lat|≤0.5，探针 `STRADDLE_M`）与 far_*（同侧第二条线）
+#: ——上一轮角色一致率 0.609 的机械解释。
+#: `measured` 约定按词表放线（位置 = 车体系左为正，夹在铺装内）：
+LINE_ROLE_TARGETS = (
+    ("straddled", -0.4),    # 自车骑线（|lat|<=0.5 判 straddled）
+    ("near_left", +2.1),    # 左侧最近线
+    ("far_left", +4.2),     # 左侧第二条（同侧 far_）
+    ("near_right", -2.6),   # 右侧最近线
+)
 LINE_CONVENTION = "symmetric"   # 由 --line-convention 覆盖
 #: 横向符号约定（与 `_line_nodes` 的 left2d 一致）：**正 = 车体左**。
 #: 实测踩到：写成 -1 让"左线"跑到右侧，翻转审计按 role 投票直接报 CAMERA_FLIP。
@@ -469,11 +482,28 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
                "line_texture_embedded": False,
                "materials": {}, "lines": [], "gravel": None}
         # 车道边界（真值几何：铺装边界 = 路面边缘；线在车道分界上）
-        for kind, sign, role in spec["lines"]:
+        _specs = spec["lines"]
+        if LINE_CONVENTION == "measured":
+            # 按参考词表放线：位置来自 LINE_ROLE_TARGETS，夹在铺装内
+            # （|lat| > half-0.3 的线会落在铺装外、annotation 不覆盖 ->
+            # 资格门必失败），并去掉彼此 <1 m 的重复线。
+            half_ok = float(site["half_width_m"]) - 0.3
+            _specs = []
+            used: list = []
+            for role_name, lat0 in LINE_ROLE_TARGETS:
+                lat = max(-half_ok, min(half_ok, float(lat0)))
+                if any(abs(lat - u) < 1.0 for u in used):
+                    continue
+                used.append(lat)
+                kind = ("yellow" if role_name.endswith("_left")
+                        else "white")
+                _specs.append((kind, 1 if lat >= 0 else -1, role_name))
+        for kind, sign, role in _specs:
             if LINE_CONVENTION == "measured":
-                # 实测约定：近线在自车右侧（role right）、远线在左侧（role left）
-                lat = (LINE_LATERAL_M["near"] if role == "right"
-                       else LINE_LATERAL_M["far"])
+                lat = next(lat0 for rn, lat0 in LINE_ROLE_TARGETS
+                           if rn == role)
+                lat = max(-(float(site["half_width_m"]) - 0.3),
+                          min(float(site["half_width_m"]) - 0.3, float(lat)))
             else:
                 lat = sign * LAT_LANE_HALF
             nodes = _line_nodes(site, lat)
@@ -508,7 +538,7 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
         d = _unit(occ_site["dir"])
         left2d = np.array([-d[1], d[0]])
         _occ_lat = (LINE_LATERAL_M["near"] if LINE_CONVENTION == "measured"
-                    else LAT_LANE_HALF)
+                    else LAT_LANE_HALF)   # measured: 压在 straddled 线上
         pos = mid + d * OCCLUDER_AHEAD_M + np.array(
             [left2d[0], left2d[1], 0.0]) * _occ_lat   # 正=左；压在该侧线上
         yaw = -math.degrees(math.atan2(d[1], d[0])) - 90.0
