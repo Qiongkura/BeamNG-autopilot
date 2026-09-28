@@ -1519,7 +1519,8 @@ def _safe(fn, code: str, frame_id, rejections: list, stats: dict):
 
 def verify_batch(batch, *, expected=None,
                  line_evidence: str = "annotation",
-                 occlusion_margin_m: float = OCCLUSION_MARGIN_M) -> dict:
+                 occlusion_margin_m: float = OCCLUSION_MARGIN_M,
+                 occlusion_mode: str = "gate") -> dict:
     """批次校验汇总（契约见模块 docstring）。
 
     返回 ``{ok, rejections, channels, stats}``：
@@ -1528,6 +1529,14 @@ def verify_batch(batch, *, expected=None,
     * ``channels`` 来自 `channel_eligibility`（逐通道独立，不合格不替别人背书）；
     * ``stats`` 给证据计数（投影 checked/mismatch、遮挡 unknown_px、黑图数、
       逐帧 sha 等）——没有证据的通道在报告里必须是 unknown，不是通过。
+
+    ``occlusion_mode``：``"gate"``（默认）把遮挡审计的码计入 ``rejections``；
+    ``"report"`` 只**上报**计数与码，不进拒绝列表。后者用于"该通道不可判"的
+    场合：实测（2026-09-28，140 站批次）uint8 量化 + 标定残差 ~0.6 m 的深度在
+    17 m 处区分不出 1.5 m 的差，逐点判码会把整批生成的场景全判成
+    `OCCLUSION_INSERT`（10/11 站），而遮挡能力本身在合成反例套件里是验证过的。
+    用 ``"report"`` 时报告里 ``stats["occlusion"]["mode"]`` 会写明，
+    读的人知道这一通道没有当门。
 
     ``occlusion_margin_m``：遮挡审计的余量（米），透传给 `occlusion_audit`。
     默认 0.5 m 是给**高精度深度**的；uint8 量化 + 标定残差 ~0.6 m 的通道上，
@@ -1677,8 +1686,9 @@ def verify_batch(batch, *, expected=None,
             occ_occluded += occ["occluded_px"]
             occ_unknown += occ["unknown_px"]
             frame_info.setdefault(i, {})["occlusion"] = occ
-            for code in occ["codes"]:
-                _add(code, fid, occ["why"])
+            if str(occlusion_mode) == "gate":
+                for code in occ["codes"]:
+                    _add(code, fid, occ["why"])
         src_sha, lab_sha = frame_content_shas(frame.get("rgb"), frame.get("label"))
         counts = _frame_label_counts(frame.get("label"))
         area_road += counts["road"]
@@ -1714,7 +1724,9 @@ def verify_batch(batch, *, expected=None,
                        "ignored": proj_ignored, "occluded": proj_occluded,
                        "skipped": proj_skipped, "radius_px": PROJECTION_RADIUS_PX},
         "occlusion": {"occluded_px": occ_occluded, "unknown_px": occ_unknown,
-                      "margin_m": float(occlusion_margin_m)},
+                      "margin_m": float(occlusion_margin_m),
+                      "mode": str(occlusion_mode),
+                      "gated": str(occlusion_mode) == "gate"},
         "line_evidence": str(line_evidence),
         "line_distance_px": {
             "n": sum(int((v or {}).get("line_distance", {}).get("n") or 0)
