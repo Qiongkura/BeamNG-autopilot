@@ -47,8 +47,9 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from beamng_autopilot.experiments.auto_truth import (  # noqa: E402
-    TRUTH_CONTRACT, VERIFIER_VERSION, _rotate_camera_basis, frame_content_shas,
-    line_evidence_coverage, palette_sha, verify_batch, write_truth_credentials,
+    TRUTH_CONTRACT, VERIFIER_VERSION, _rotate_camera_basis,
+    appearance_line_check, frame_content_shas, line_evidence_coverage,
+    palette_sha, verify_batch, write_truth_credentials,
 )
 from beamng_autopilot_tech.annotations import annotation_palette  # noqa: E402
 
@@ -135,13 +136,38 @@ def evaluate_scene(batch: Path, name: str, rec: dict, *, min_coverage: float,
     lines = ((rec.get("generated") or {}).get("lines") or [])
     truth = [p for inst in lines for p in (inst.get("truth_points") or [])]
     out["n_line_points"] = len(truth)
-    if not truth:
-        out["reasons"].append("no line truth points (line-free scene: not a "
-                              "line-truth source)")
-        return out
     frames = load_scene_frames(batch, name)
     if not frames:
         out["reasons"].append("no dumped frames for this scene")
+        return out
+    if not truth:
+        # 无线场景按**合格负例**评估（方案 §4.2：无线负例来自"确定未生成漆线
+        # 且无内嵌漆线纹理"的场景）。证据 = 生成器声明 line_generated=False
+        # + 帧内 annotation 线类像素为 0 + 外观也找不到线状像素。
+        gen = rec.get("generated") or {}
+        if gen.get("line_generated") is not False:
+            out["reasons"].append("no line truth points and the generator did "
+                                  "not declare this scene line-free")
+            return out
+        ann_px = 0
+        app_like = 0
+        for fr in frames:
+            ann_px += int(np.sum(np.asarray(fr["label"]) == 2))
+            ap = appearance_line_check({"rgb": fr["rgb"], "label": fr["label"],
+                                        "truth_points": []})
+            app_like += int(ap.get("line_like") or 0)
+        out.update(line_free=True, line_px_in_frames=ann_px,
+                   appearance_like_px=app_like)
+        if ann_px != 0:
+            out["reasons"].append(
+                f"declared line-free but {ann_px} line-class pixels present: "
+                "cannot be a confirmed negative")
+        elif app_like != 0:
+            out["reasons"].append(
+                f"declared line-free but {app_like} appearance line-like "
+                "pixels found: not a confirmed negative")
+        out["eligible"] = not out["reasons"]
+        out["frames"] = frames
         return out
     covs = []
     for fr in frames:
@@ -336,6 +362,90 @@ def export_scene(rec: dict, truth: list, frames: list, *, out_root: Path,
             "truth_contract": TRUTH_CONTRACT}
 
 
+def export_line_free_package(frames: list, *, out_root: Path, scene: str,
+                             anchor: int, map_name: str, generator: dict,
+                             evidence: dict,
+                             camera_name: str = "front_main") -> dict:
+    """写一个**已确认无线**的负例包（生成器声明 + 帧内零线像素 + 外观无）。
+
+    负例包同样带凭证（`engine_verified`），凭证里写明 `line_generated=False`
+    与判定依据——训练侧就能合法把这些帧当"确实没有线"的负例（§4.2/§6.2），
+    而不是"没标注"。
+    """
+    d = out_root / f"m5auto_a{anchor}_{scene}"
+    view = d / camera_name
+    view.mkdir(parents=True, exist_ok=True)
+    frame_records = []
+    label_shas = []
+    src_shas = []
+    for i, fr in enumerate(frames):
+        np.savez_compressed(view / f"frame_{i:05d}.npz", colour=fr["rgb"],
+                            label=fr["label"], annotation_raw=fr["annotation"])
+        src_sha, lab_sha = frame_content_shas(fr["rgb"], fr["label"])
+        label_shas.append(lab_sha)
+        src_shas.append(src_sha)
+        frame_records.append({"i": i, "view": camera_name, "exposure": i,
+                              "t_wall": 1000.0 + i,
+                              "path": f"{camera_name}/frame_{i:05d}.npz"})
+    (d / "meta.json").write_text(json.dumps({
+        "map_name": map_name, "source_id": f"m5auto_a{anchor}",
+        "map_name_source": "m5_controlled_scenes.py (generated scenario)",
+        "generated_by": EXPORTER_VERSION, "truth_kind": "line_free",
+        "frames": frame_records}, indent=1, ensure_ascii=False), encoding="utf-8")
+    batch = {"frames": [{"frame_id": f"{scene}_{i:05d}", "timestamp": 1000.0 + i,
+                         "channel_ids": {"rgb": f"{scene}_{i:05d}",
+                                         "annotation": f"{scene}_{i:05d}",
+                                         "depth": f"{scene}_{i:05d}"},
+                         "camera": fr["camera"], "rgb": fr["rgb"],
+                         "annotation": fr["annotation"], "depth": fr["depth"],
+                         "label": fr["label"], "label_sha": sh,
+                         "source_image_sha": sa, "truth_points": []}
+                        for i, (fr, sh, sa) in enumerate(
+                            zip(frames, label_shas, src_shas))],
+             "scene": {"map": map_name, "segment": f"m5auto_a{anchor}_{scene}",
+                       "run_id": f"m5_controlled_{scene}", "scene_seed": 0,
+                       "game_version": "beamng_tech", "renderer": "beamng_tech",
+                       "line_generated": False, "line_texture_embedded": False,
+                       "roles_defined": False, "road_defined": True,
+                       "label_source": "engine_annotation"},
+             "palette": palette_from_frames(frames),
+             "generator": {"name": "m5_controlled_scenes.py",
+                           "version": str(generator.get("version") or ""),
+                           "sha": str(generator.get("script_sha16") or "")},
+             "asset": {"map": map_name},
+             "run": {"id": f"m5_controlled_{scene}", "scene_seed": 0}}
+    rep = verify_batch(batch, line_evidence="annotation",
+                       occlusion_mode="report")
+    provenance = {
+        "generator": {"name": "m5_controlled_scenes.py",
+                      "version": str(generator.get("version") or ""),
+                      "sha": str(generator.get("script_sha16") or "")},
+        "asset": {"map": map_name, "segment": f"m5auto_a{anchor}_{scene}"},
+        "run": {"id": f"m5_controlled_{scene}", "scene_seed": 0,
+                "game_version": "beamng_tech", "renderer": "beamng_tech"},
+        "camera": {"name": camera_name,
+                   "frame_ids": [f"m5_controlled_{scene}:{i}"
+                                 for i in range(len(frames))]},
+        "labels": {"source_image_sha": _sha16_bytes(
+                       "|".join(sorted(src_shas)).encode()),
+                   "label_sha": _labels_digest(label_shas),
+                   "channel_valid_area": "full frame",
+                   "unknown_reason": "",
+                   "truth_kind": "line_free",
+                   "line_free_evidence": evidence},
+        "report": {"test_report_sha": _sha16_bytes(json.dumps(
+                       rep.get("rejections"), sort_keys=True).encode()),
+                   "verifier_version": VERIFIER_VERSION,
+                   "verified": bool(rep.get("ok"))}}
+    cred = write_truth_credentials(d, batch_report=rep, provenance=provenance)
+    return {"dir": str(view), "n_frames": len(frames),
+            "label_source": cred.get("label_source"),
+            "verified": bool((cred.get("truth_provenance") or {})
+                             .get("report", {}).get("verified")),
+            "rejections": sorted({r.get("code") for r in
+                                  (rep.get("rejections") or [])})}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__,
@@ -367,6 +477,25 @@ def main() -> int:
             continue
         lines = ((rec.get("generated") or {}).get("lines") or [])
         truth = [p for inst in lines for p in (inst.get("truth_points") or [])]
+        if ev.get("line_free") and not truth:
+            try:
+                res = export_line_free_package(
+                    ev["frames"], out_root=out_root, scene=name, anchor=anchor,
+                    map_name=str(args.map),
+                    generator=report.get("generator") or {},
+                    evidence={"line_px": ev.get("line_px_in_frames"),
+                              "appearance_like_px": ev.get("appearance_like_px")})
+                exported.append({"scene": name,
+                                 "type": (types[k] if k < len(types) else ""),
+                                 "line_free": True, **res})
+                print(f"[export] {name}: {res['n_frames']} 帧（负例）-> "
+                      f"{res['label_source'] or '(无来源声明)'} "
+                      f"verified={res['verified']}", flush=True)
+            except Exception as exc:                          # noqa: BLE001
+                isolated.append({"scene": name,
+                                 "reasons": [f"export failed: "
+                                             f"{type(exc).__name__}: {exc}"]})
+            continue
         anchor = int(name.rsplit("_a", 1)[1].split("s")[0]) if "_a" in name else 0
         try:
             res = export_scene(rec, truth, ev["frames"], out_root=out_root,
