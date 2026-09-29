@@ -285,3 +285,14 @@ def test_measured_role_targets_cover_the_reference_vocabulary():
     # 每个位置都在一条合理车道范围内（生成时还会按铺装宽度夹紧）
     for _r, lat0 in m.LINE_ROLE_TARGETS:
         assert abs(lat0) <= 6.0, (_r, lat0)
+
+
+def test_measured_convention_keeps_the_line_free_control_empty():
+    """measured 模式**不得**给 known_no_line 加线（它是无线对照）。
+
+    实测踩到：词表展开写成了无条件覆盖，于是无线对照场景也画了 4 条线
+    （线点 90、线类像素 5385）——控制组被破坏，负例包也就无从谈起。
+    """
+    src = (ROOT / "scripts" / "m5_controlled_scenes.py").read_text(
+        encoding="utf-8")
+    assert 'if LINE_CONVENTION == "measured" and spec["lines"]:' in src,         "词表展开必须只对有线场景生效"

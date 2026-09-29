@@ -169,22 +169,36 @@ def evaluate_scene(batch: Path, name: str, rec: dict, *, min_coverage: float,
         out["eligible"] = not out["reasons"]
         out["frames"] = frames
         return out
-    covs = []
-    for fr in frames:
-        c = line_evidence_coverage(
-            {"camera": fr["camera"], "label": fr["label"], "rgb": fr["rgb"],
-             "truth_points": truth}, radius_px=6, evidence="annotation")
-        if c.get("coverage") is not None:
-            covs.append(float(c["coverage"]))
-    coverage = float(np.mean(covs)) if covs else None
-    out["coverage"] = None if coverage is None else round(coverage, 4)
-    if coverage is None:
-        out["reasons"].append("annotation coverage could not be measured")
-    elif coverage < float(min_coverage):
+    # **逐线实例**覆盖：多线场景里某条线（例如远处的 far_left）没被 annotation
+    # 覆盖，不该把整个站点判死——按实例算覆盖，达标实例进真值、其余由逐点认证
+    # 剔除并记录（方案 §4.3：逐通道/逐实例赋资格，不确定的 ignore）。
+    by_role: dict = {}
+    for inst in lines:
+        by_role.setdefault(str(inst.get("role") or "?"), []).extend(
+            inst.get("truth_points") or [])
+    inst_cov: dict = {}
+    for role, pts in by_role.items():
+        covs = []
+        for fr in frames:
+            c = line_evidence_coverage(
+                {"camera": fr["camera"], "label": fr["label"],
+                 "rgb": fr["rgb"], "truth_points": pts},
+                radius_px=6, evidence="annotation")
+            if c.get("coverage") is not None:
+                covs.append(float(c["coverage"]))
+        inst_cov[role] = round(float(np.mean(covs)), 4) if covs else None
+    out["instance_coverage"] = inst_cov
+    ok_roles = [r for r, c in inst_cov.items()
+                if c is not None and c >= float(min_coverage)]
+    out["certified_roles"] = sorted(ok_roles)
+    out["coverage"] = (round(max((c for c in inst_cov.values()
+                                  if c is not None), default=0.0), 4)
+                       if inst_cov else None)
+    if not ok_roles:
         out["reasons"].append(
-            f"annotation line coverage {coverage:.2f} < {min_coverage}: the "
-            "engine label does not carry the line here, so it cannot be a "
-            "line-truth source (isolate; do not export as engine_verified)")
+            f"no line instance reaches annotation coverage {min_coverage} "
+            f"(per-instance: {inst_cov}): the engine label does not carry "
+            "these lines here, so the site cannot be a line-truth source")
     aft = [p.get("after_px") for p in
            ((rec.get("camera_alignment") or {}).get("per_frame") or [])]
     aft = [float(x) for x in aft if x is not None]
@@ -476,7 +490,10 @@ def main() -> int:
                              if kk != "frames"})
             continue
         lines = ((rec.get("generated") or {}).get("lines") or [])
-        truth = [p for inst in lines for p in (inst.get("truth_points") or [])]
+        _ok_roles = set(ev.get("certified_roles") or [])
+        truth = [p for inst in lines
+                 if str(inst.get("role") or "?") in _ok_roles
+                 for p in (inst.get("truth_points") or [])]
         if ev.get("line_free") and not truth:
             try:
                 res = export_line_free_package(
@@ -505,6 +522,8 @@ def main() -> int:
             exported.append({"scene": name,
                              "type": (types[k] if k < len(types) else ""),
                              "coverage": ev["coverage"],
+                             "instance_coverage": ev.get("instance_coverage"),
+                             "certified_roles": ev.get("certified_roles"),
                              "after_px": ev["after_px"], **res})
             print(f"[export] {name}: {res['n_frames']} 帧 -> "
                   f"{res['label_source'] or '(无来源声明)'} "

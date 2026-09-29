@@ -119,7 +119,21 @@ def test_scene_without_line_truth_is_isolated(tmp_path):
     ev = m.evaluate_scene(batch, "known_no_line", rep["scenes"]["known_no_line"],
                           min_coverage=0.6, max_after_px=2.0)
     assert ev["eligible"] is False
-    assert any("no line truth points" in r for r in ev["reasons"]), ev
+    # 判定顺序：先看有没有落盘帧，再看"无线声明"——两者都必须被隔离
+    assert any(("no dumped frames" in r) or ("line-free" in r)
+               or ("no line truth points" in r) for r in ev["reasons"]), ev
+    # 给了帧、但没有 line_generated=False 声明 -> 仍隔离（不得凭"没画线"当负例）
+    fr0 = _frames_from_synthetic(with_line=False)[0][0]
+    np.savez_compressed(batch / "frames" / "known_no_line_00000.npz",
+                        rgb=fr0["rgb"], annotation=fr0["annotation"],
+                        label=fr0["label"], depth_raw=fr0["depth"],
+                        camera_json=json.dumps(fr0["camera"]))
+    ev2 = m.evaluate_scene(batch, "known_no_line",
+                           rep["scenes"]["known_no_line"],
+                           min_coverage=0.6, max_after_px=2.0)
+    assert ev2["eligible"] is False
+    assert any("did not declare this scene line-free" in r
+               for r in ev2["reasons"]), ev2
 
 
 def test_low_coverage_and_bad_geometry_are_isolated(tmp_path):

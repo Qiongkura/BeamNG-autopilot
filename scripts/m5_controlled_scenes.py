@@ -483,7 +483,7 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
                "materials": {}, "lines": [], "gravel": None}
         # 车道边界（真值几何：铺装边界 = 路面边缘；线在车道分界上）
         _specs = spec["lines"]
-        if LINE_CONVENTION == "measured":
+        if LINE_CONVENTION == "measured" and spec["lines"]:
             # 按参考词表放线：位置来自 LINE_ROLE_TARGETS，夹在铺装内
             # （|lat| > half-0.3 的线会落在铺装外、annotation 不覆盖 ->
             # 资格门必失败），并去掉彼此 <1 m 的重复线。
