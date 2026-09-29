@@ -322,3 +322,21 @@ def test_mixed_density_cycle_matches_the_dev_set():
     assert abs(lat["near_left"]) <= 1.8 and abs(lat["near_right"]) <= 1.8,         "两侧线夹在已验证覆盖的 ±1.8 m 带内"
     src = (ROOT / "scripts" / "m5_controlled_scenes.py").read_text(encoding="utf-8")
     assert "MIXED_DENSITY_CYCLE[k % len(MIXED_DENSITY_CYCLE)]" in src
+
+
+def test_relative_convention_is_scale_invariant():
+    """relative 约定：线位 = frac × 半宽（宽路上与绝对 ±1.8 m 等价，窄路按比例收），
+    straddled 仍 |lat|<=0.45（保证判 straddled，STRADDLE_M=0.5）。
+
+    依据：候选比参考线系统外偏 1.0-1.3 m（far_*）、假线路外占比 0.67 —— 怀疑模型
+    学成"绝对 ±1.8 m"先验；相对比例让"线在铺装内的相对位置"可迁移。
+    """
+    m = _load()
+    assert set(m.LINE_RELATIVE_FRAC) == {"straddled", "near_left", "near_right"}
+    assert abs(m.LINE_RELATIVE_FRAC["straddled"]) <= 0.45 / 2.0  # 4m 半宽下 <=0.45
+    for half in (4.0, 3.0, 2.5):
+        lat = m.LINE_RELATIVE_FRAC["near_left"] * half
+        assert 0.6 <= lat <= half - 0.3 + 1e-9, (half, lat)
+    assert abs(m.LINE_RELATIVE_FRAC["near_left"] * 4.0 - 1.8) < 1e-9,         "宽路上应与已验证覆盖的 ±1.8 m 等价"
+    src = (ROOT / "scripts" / "m5_controlled_scenes.py").read_text(encoding="utf-8")
+    assert '"relative"' in src and "LINE_RELATIVE_FRAC" in src

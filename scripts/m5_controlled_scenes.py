@@ -90,6 +90,14 @@ LINE_LATERAL_M = {"near": -0.4, "far": +2.1}
 #: `measured` 约定按词表放线（位置 = 车体系左为正，夹在铺装内）：
 #: 角色横向位置（米，车体系左为正；夹在**已验证覆盖**的 ±1.8 m 带内）。
 LINE_ROLE_LATERAL_M = {"straddled": -0.4, "near_left": +1.8, "near_right": -1.8}
+#: **按铺装宽度的相对线位**（`--line-convention relative`）：线位 = frac × 半宽。
+#: 依据（2026-09-28 匹配几何扫描）：候选比参考线系统**外偏** 1.0–1.3 m
+#: （far_left +1.32 / far_right −1.05），而假线平均路外占比 0.67——怀疑模型学到
+#: 了"绝对 ±1.8 m"的先验，开发集窄路上就画到铺装外。相对比例让"线在铺装内的
+#: 相对位置"成为可迁移先验（宽路上与绝对 ±1.8 m 等价：0.45×4.0 = 1.8）。
+#: straddled 的比例压到 |lat| ≤ 0.45 m，保证仍判 straddled（STRADDLE_M=0.5）。
+LINE_RELATIVE_FRAC = {"straddled": -0.10, "near_left": +0.45,
+                      "near_right": -0.45}
 #: **混合密度循环**（按站点序号轮换）。两个实测约束一起满足：
 #: * **密度**：开发集人工标签是 **2.3 条/帧**（174 实例/76 帧）；单线批次
 #:   （密度 1.0）把模型教成"每帧一条线"，身份率崩到 0.206（2026-09-28 实测）；
@@ -497,7 +505,7 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
                "materials": {}, "lines": [], "gravel": None}
         # 车道边界（真值几何：铺装边界 = 路面边缘；线在车道分界上）
         _specs = spec["lines"]
-        if LINE_CONVENTION == "measured" and spec["lines"]:
+        if LINE_CONVENTION in ("measured", "relative") and spec["lines"]:
             # 按参考词表放线：位置来自 LINE_ROLE_TARGETS，夹在铺装内
             # （|lat| > half-0.3 的线会落在铺装外、annotation 不覆盖 ->
             # 资格门必失败），并去掉彼此 <1 m 的重复线。
@@ -507,7 +515,13 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
                        1 if float(LINE_ROLE_LATERAL_M[rn]) >= 0 else -1, rn)
                       for rn in _roles]
         for kind, sign, role in _specs:
-            if LINE_CONVENTION == "measured":
+            if LINE_CONVENTION == "relative":
+                half = float(site["half_width_m"])
+                lat = float(LINE_RELATIVE_FRAC.get(role, -0.10)) * half
+                lat = max(-(half - 0.3), min(half - 0.3, lat))
+                if role == "straddled":
+                    lat = max(-0.45, min(0.45, lat))
+            elif LINE_CONVENTION == "measured":
                 lat = float(LINE_ROLE_LATERAL_M.get(role, -0.4))
                 lat = max(-(float(site["half_width_m"]) - 0.3),
                           min(float(site["half_width_m"]) - 0.3, lat))
@@ -544,9 +558,13 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
         mid = np.asarray(occ_site["mid"], dtype=float)
         d = _unit(occ_site["dir"])
         left2d = np.array([-d[1], d[0]])
-        _occ_lat = (LINE_ROLE_LATERAL_M["straddled"]
-                    if LINE_CONVENTION == "measured"
-                    else LAT_LANE_HALF)   # measured: 压在 straddled 线上
+        if LINE_CONVENTION == "relative":
+            _occ_lat = float(LINE_RELATIVE_FRAC["straddled"]) * float(
+                occ_site["half_width_m"])
+        elif LINE_CONVENTION == "measured":
+            _occ_lat = LINE_ROLE_LATERAL_M["straddled"]
+        else:
+            _occ_lat = LAT_LANE_HALF
         pos = mid + d * OCCLUDER_AHEAD_M + np.array(
             [left2d[0], left2d[1], 0.0]) * _occ_lat   # 正=左；压在该侧线上
         yaw = -math.degrees(math.atan2(d[1], d[0])) - 90.0
@@ -938,11 +956,12 @@ def main() -> int:
                     help="每站帧数；配 --step-m 采**序列**（不同位置），否则是原地多帧")
     ap.add_argument("--step-m", type=float, default=0.0,
                     help="逐帧沿站点方向前进的米数（0 = 原地）")
-    ap.add_argument("--line-convention", choices=("symmetric", "measured"),
+    ap.add_argument("--line-convention",
+                    choices=("symmetric", "measured", "relative"),
                     default="symmetric",
                     help="线位约定：symmetric=±LAT_LANE_HALF（旧）；"
-                         "measured=开发集实测（近线 -0.4 / 远线 +2.1 m，"
-                         "见 LINE_LATERAL_M 注释）")
+                         "measured=开发集实测绝对线位；relative=按铺装半宽"
+                         "的相对线位（0.45×半宽，治绝对先验在窄路上外偏）")
     ap.add_argument("--width", type=int, default=192)
     ap.add_argument("--height", type=int, default=144)
     ap.add_argument("--out", default=None)
