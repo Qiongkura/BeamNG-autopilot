@@ -1597,6 +1597,11 @@ def train_cmd(args, runs, out: Path, seed: int, extra: list) -> list:
     # 初始化（T16 §3.3）：两臂共享同一初始权重（因子差异不能混进 init）。
     _init = getattr(args, "init", None)
     init_flags = ["--init", str(_init)] if _init else []
+    # 确定性内核（两臂共享的配方开关）：实测跨轮次的水平噪声主要来自 CUDA
+    # 非确定性（同一配置 0.359 vs 0.252）；训练器已说明 CUDA 上 nll_loss2d
+    # 无确定性实现（逐位比较只能在 CPU 上做），所以这里只是**降低**噪声并把
+    # 开关记进判定，残余方差仍要靠配对 seeds 与 autoloop 的 seed 数建议。
+    det_flags = ["--deterministic"] if getattr(args, "deterministic", False) else []
     return [sys.executable, str(script),
             "--runs", *[str(r) for r in runs],
             "--split", args.split, "--val-frac", "0.2",
@@ -1605,7 +1610,7 @@ def train_cmd(args, runs, out: Path, seed: int, extra: list) -> list:
             "--device", args.device, "--save-every-epoch",
             "--metrics-run", metrics_run,
             "--out", str(out), *road_only, *paint_flags, *budget_flags,
-            *init_flags, *extra]
+            *init_flags, *det_flags, *extra]
 
 
 def steps_per_epoch(n_train: int, batch: int) -> int:
@@ -2894,6 +2899,7 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 # optimizer step、看过多少唯一样本、初始权重是谁"。
                 "step_budget": int(getattr(args, "total_steps", 0) or 0),
                 "sampling": sampling_label(args, equal_cap),
+                "deterministic": bool(getattr(args, "deterministic", False)),
                 "init_from": (str(getattr(args, "init", None))
                               if getattr(args, "init", None) else None),
                 "train_meta": {"baseline": base_meta, "candidate": cand_meta},
@@ -3162,6 +3168,10 @@ def main(argv=None) -> int:
                    help="优化步预算（T16 §3.1）：两臂同 N，停止条件按实际 "
                         "optimizer step；给了它就不再截帧（等步数由预算保证），"
                         "0 = 旧 epoch 协议")
+    s.add_argument("--deterministic", action="store_true",
+                   help="两臂都开训练器确定性内核（cudnn.deterministic 等）；"
+                        "CUDA 上 nll_loss2d 无确定性实现，只能降低噪声，"
+                        "效果判定仍按配对 seeds")
     s.add_argument("--init", default=None, metavar="CHECKPOINT",
                    help="初始权重（T16 §3.3）：两臂共享同一 --init；不传 = "
                         "随机初始化（也显式记录）。--init 是权重初始化，"
