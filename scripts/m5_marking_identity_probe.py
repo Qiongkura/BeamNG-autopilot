@@ -71,6 +71,25 @@ LAT_MAX_M = 12.0
 #: Two lines are the same physical line when their lateral offsets differ
 #: by less than this (the plane model's own error is a separate matter).
 MATCH_M = 0.8
+#: 横向估计的**距离窗口**（米，前向）：太近的像素少、太远的像素地面投影横向误差
+#: 被放大——实测候选-参考的横向偏差 sd 1.19 m（> 0.8 m 容差，见
+#: docs/T16_LANE_CONVENTION_AND_ROLE_VOCAB_20260928.md §10）。窗口内取中位压 sd；
+#: 候选与参考**同一窗口**（公平），窗口内无像素时回退全簇并计数（可见）。
+LAT_WINDOW_M = (4.0, 12.0)
+#: 回退计数（窗口内没有像素的簇数）：报告里可见，不静默换口径
+_LAT_WINDOW_FALLBACK = {"candidates": 0, "engine": 0}
+
+
+def _windowed_median(pts, *, which: str) -> float:
+    """``pts``（Nx2：前向, 横向）在 ``LAT_WINDOW_M`` 内的横向中位；空则回退全簇。"""
+    if pts is None or len(pts) == 0:
+        return float("nan")
+    lo, hi = LAT_WINDOW_M
+    sel = (pts[:, 0] >= float(lo)) & (pts[:, 0] <= float(hi))
+    if not sel.any():
+        _LAT_WINDOW_FALLBACK[which] = _LAT_WINDOW_FALLBACK.get(which, 0) + 1
+        sel = np.ones(len(pts), dtype=bool)
+    return float(np.median(pts[sel, 1]))
 LINE_BIN_M = 2.0
 LINE_LAT_GAP_M = 0.5
 #: A straight line OBLIQUE to the ego axis drifts laterally by
@@ -245,7 +264,7 @@ def engine_lines(engine_mask, cam, *, stride: int = 3) -> list:
             continue
         sel = np.unique(np.asarray(ch["members"], dtype=int))
         fwd = pts[sel, 0]
-        lat = float(np.median(pts[sel, 1]))
+        lat = _windowed_median(pts[sel], which="engine")
         lines.append({"lat_m": round(lat, 3), "role": role_of(lat),
                       "fwd_span_m": [round(float(fwd.min()), 2),
                                      round(float(fwd.max()), 2)],
@@ -763,7 +782,7 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
                     m = np.zeros(label.shape, dtype=bool)
                     m[_vi, _ui] = True
                     cand_masks.append(m)
-                    lat = float(np.median(gp[:, 1]))
+                    lat = _windowed_median(gp, which="candidates")
                     prov = dict(getattr(mk, "meta", None) or {})
                     cands.append({"kind": mk.kind, "colour": mk.color,
                                   "lat_m": round(lat, 3),
@@ -978,6 +997,8 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
         # 哪个容差下测的"；默认值本身是协议常量，改它要重新标定+升版本
         "match_tolerance_m": float(match_tolerance_m if match_tolerance_m
                                    else MATCH_M),
+        "lat_window_m": list(LAT_WINDOW_M),
+        "lat_window_fallback": dict(_LAT_WINDOW_FALLBACK),
         "match_tolerance_default": not bool(match_tolerance_m),
         # ground-projected identity, vehicle frame
         "candidates_total": n_cand,
