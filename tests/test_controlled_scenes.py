@@ -300,3 +300,15 @@ def test_measured_convention_keeps_the_line_free_control_empty():
     src = (ROOT / "scripts" / "m5_controlled_scenes.py").read_text(
         encoding="utf-8")
     assert 'if LINE_CONVENTION == "measured" and spec["lines"]:' in src,         "词表展开必须只对有线场景生效"
+
+
+def test_measured_convention_is_one_line_per_site():
+    """每站**一条线**、角色按站点轮换（依据：单线站点覆盖 1.00，多线 0.46-0.59）。
+
+    词表覆盖放到批次级——这是"一个全局标定对不齐多条线"的直接对策。
+    """
+    src = (ROOT / "scripts" / "m5_controlled_scenes.py").read_text(
+        encoding="utf-8")
+    assert "LINE_ROLE_TARGETS[k % len(LINE_ROLE_TARGETS)]" in src,         "measured 模式必须每站只放一条线并按站点轮换角色"
+    m = _load()
+    assert len(m.LINE_ROLE_TARGETS) >= 3, "至少要覆盖 straddled + 两侧最近线"

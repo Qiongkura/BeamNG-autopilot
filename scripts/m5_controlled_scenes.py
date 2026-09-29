@@ -88,14 +88,20 @@ LINE_LATERAL_M = {"near": -0.4, "far": +2.1}
 #: 缺 straddled（|lat|≤0.5，探针 `STRADDLE_M`）与 far_*（同侧第二条线）
 #: ——上一轮角色一致率 0.609 的机械解释。
 #: `measured` 约定按词表放线（位置 = 车体系左为正，夹在铺装内）：
-#: 实测：4 条线（含 far_left +4.2 m）会让**单相机标定**对不齐所有线
-#: （逐线覆盖掉到 ~0.5，资格门全灭）且网格搜索代价 ×12（5 min/站）。
-#: 改成 3 条：straddled + 两侧最近线（覆盖词表 75%），横向跨度收到 ±2.6 m。
+#: **每站只放一条线，角色按站点轮换**。依据（2026-09-28 对称批次 140 站实测）：
+#: 单线站点（occluded_line 类）的 annotation 覆盖能到 **1.00**，而 3–4 线站点只有
+#: 0.46–0.59——一个全局 (yaw,pitch) 标定对不齐多条线，多线场景过不了覆盖门。
+#: 所以词表覆盖放到**批次级**：每站单线（标定精确、覆盖高），站点之间轮换角色，
+#: 整个批次覆盖 straddled / near_left / near_right。
 LINE_ROLE_TARGETS = (
     ("straddled", -0.4),    # 自车骑线（|lat|<=0.5 判 straddled）
-    ("near_left", +2.1),    # 左侧最近线
-    ("near_right", -2.6),   # 右侧最近线
+    ("near_left", +1.8),    # 左侧最近线（夹在已验证覆盖的 ±1.8 m 带内）
+    ("near_right", -1.8),   # 右侧最近线
 )
+#: 为什么是 ±1.8 m 而不是实测的 ±2.1/−2.6 m：实测那些位置在同一锚点上
+#: annotation 覆盖只有 0.54（对称 ±1.8 m 是 0.81）——**被标注的铺装带比 roadnet
+#: 的半宽窄**，靠外的线落在标注之外。覆盖门是硬门，所以位置夹回 ±1.8 m；
+#: 本批次的**新东西是 straddled**（自车骑线），这正是词表里此前完全缺失的角色。
 LINE_CONVENTION = "symmetric"   # 由 --line-convention 覆盖
 #: 横向符号约定（与 `_line_nodes` 的 left2d 一致）：**正 = 车体左**。
 #: 实测踩到：写成 -1 让"左线"跑到右侧，翻转审计按 role 投票直接报 CAMERA_FLIP。
@@ -489,17 +495,10 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
             # 按参考词表放线：位置来自 LINE_ROLE_TARGETS，夹在铺装内
             # （|lat| > half-0.3 的线会落在铺装外、annotation 不覆盖 ->
             # 资格门必失败），并去掉彼此 <1 m 的重复线。
-            half_ok = float(site["half_width_m"]) - 0.3
-            _specs = []
-            used: list = []
-            for role_name, lat0 in LINE_ROLE_TARGETS:
-                lat = max(-half_ok, min(half_ok, float(lat0)))
-                if any(abs(lat - u) < 1.0 for u in used):
-                    continue
-                used.append(lat)
-                kind = ("yellow" if role_name.endswith("_left")
-                        else "white")
-                _specs.append((kind, 1 if lat >= 0 else -1, role_name))
+            # 每站一条线，角色按**站点序号**轮换（词表在批次级覆盖）
+            role_name, lat0 = LINE_ROLE_TARGETS[k % len(LINE_ROLE_TARGETS)]
+            kind = "yellow" if role_name.endswith("_left") else "white"
+            _specs = [(kind, 1 if float(lat0) >= 0 else -1, role_name)]
         for kind, sign, role in _specs:
             if LINE_CONVENTION == "measured":
                 lat = next(lat0 for rn, lat0 in LINE_ROLE_TARGETS
