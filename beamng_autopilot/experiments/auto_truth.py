@@ -646,7 +646,8 @@ def line_evidence_mask(frame, *, mode: str = "annotation"):
     return (white | yellow), mode, ""
 
 
-def line_distance_stats(frame, *, evidence: str = "annotation") -> dict:
+def line_distance_stats(frame, *, evidence: str = "annotation",
+                        max_line_px: int = 1500) -> dict:
     """线真值点到**最近线类像素**的距离统计（像素）。
 
     为什么需要它：`verify_projection` 的 2 px 半径是在合成渲染上标定的；真实
@@ -677,6 +678,13 @@ def line_distance_stats(frame, *, evidence: str = "annotation") -> dict:
     h, w = mask.shape[:2]
     line_px = np.argwhere(mask)
     out["line_px"] = int(len(line_px))
+    # 确定性抽样：标定网格搜索的代价 ∝ 线像素数 × 真值点数，4 条线时实测
+    # 5 min/站（6000+ 像素 × ~3000 次网格）。抽到 max_line_px 以内（等距步长，
+    # 可复现）；最近邻距离只会略微高估，对**拟合**没有影响，报告里记 subsample。
+    if max_line_px and len(line_px) > int(max_line_px):
+        stride = int(np.ceil(len(line_px) / float(max_line_px)))
+        line_px = line_px[::stride]
+        out["line_px_subsampled"] = int(len(line_px))
     if not len(line_px):
         out["why"] = (f"no line pixel under evidence={mode_used!r} in this frame")
         return out

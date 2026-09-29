@@ -277,8 +277,12 @@ def test_measured_role_targets_cover_the_reference_vocabulary():
     m = _load()
     roles = [r for r, _lat in m.LINE_ROLE_TARGETS]
     assert "straddled" in roles, "必须能生成 straddled（自车骑线）"
-    assert any(r.startswith("far_") for r in roles), "必须能生成同侧第二条线"
     assert "near_left" in roles and "near_right" in roles
+    # far_* 是**有意不生成**的：实测 4 条线（含 far_left +4.2 m）让单相机标定
+    # 对不齐所有线（逐线覆盖 ~0.5 -> 资格门全灭）且网格搜索代价 ×12。
+    # 3 条线覆盖词表 75%（straddled+near_left+near_right），横向跨度 ±2.6 m。
+    assert not any(r.startswith("far_") for r in roles)
+    assert max(abs(lat) for _r, lat in m.LINE_ROLE_TARGETS) <= 3.0,         "横向跨度要收在标定能对齐的范围内"
     # straddled 的位置必须在探针的 STRADDLE_M(0.5) 内（否则判不成 straddled）
     lat = dict(m.LINE_ROLE_TARGETS)["straddled"]
     assert abs(lat) <= 0.5, lat

@@ -88,10 +88,12 @@ LINE_LATERAL_M = {"near": -0.4, "far": +2.1}
 #: 缺 straddled（|lat|≤0.5，探针 `STRADDLE_M`）与 far_*（同侧第二条线）
 #: ——上一轮角色一致率 0.609 的机械解释。
 #: `measured` 约定按词表放线（位置 = 车体系左为正，夹在铺装内）：
+#: 实测：4 条线（含 far_left +4.2 m）会让**单相机标定**对不齐所有线
+#: （逐线覆盖掉到 ~0.5，资格门全灭）且网格搜索代价 ×12（5 min/站）。
+#: 改成 3 条：straddled + 两侧最近线（覆盖词表 75%），横向跨度收到 ±2.6 m。
 LINE_ROLE_TARGETS = (
     ("straddled", -0.4),    # 自车骑线（|lat|<=0.5 判 straddled）
     ("near_left", +2.1),    # 左侧最近线
-    ("far_left", +4.2),     # 左侧第二条（同侧 far_）
     ("near_right", -2.6),   # 右侧最近线
 )
 LINE_CONVENTION = "symmetric"   # 由 --line-convention 覆盖
