@@ -112,6 +112,12 @@ MIXED_DENSITY_CYCLE = (
     ("straddled",),
     ("near_left", "near_right"),
 )
+#: **多档线位**（米，车体系左为正）：按站点序号轮换档位，覆盖更宽的线位先验。
+#: 依据（2026-09-29）：固定 ±1.8 m 的模型在开发集上候选-参考偏差 sd 1.19 m、
+#: far_* 候选系统外偏 1.0–1.3 m -> 线位先验太窄。多档（1.2/1.8/2.4）让模型见到
+#: 更宽的位置分布；每个档位仍夹在铺装内（|lat| <= half-0.3），窄路上自动收缩。
+#: straddled 档固定 -0.4 m（|lat|<=STRADDLE_M=0.5 保证角色可判）。
+LINE_TIER_M = (1.2, 1.8, 2.4)
 #: 为什么是 ±1.8 m 而不是实测的 ±2.1/−2.6 m：实测那些位置在同一锚点上
 #: annotation 覆盖只有 0.54（对称 ±1.8 m 是 0.81）——**被标注的铺装带比 roadnet
 #: 的半宽窄**，靠外的线落在标注之外。覆盖门是硬门，所以位置夹回 ±1.8 m；
@@ -505,17 +511,27 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
                "materials": {}, "lines": [], "gravel": None}
         # 车道边界（真值几何：铺装边界 = 路面边缘；线在车道分界上）
         _specs = spec["lines"]
-        if LINE_CONVENTION in ("measured", "relative") and spec["lines"]:
+        if LINE_CONVENTION in ("measured", "relative", "tiers") and spec["lines"]:
             # 按参考词表放线：位置来自 LINE_ROLE_TARGETS，夹在铺装内
             # （|lat| > half-0.3 的线会落在铺装外、annotation 不覆盖 ->
             # 资格门必失败），并去掉彼此 <1 m 的重复线。
-            # 混合密度：按站点序号取一组角色（多数站 2 条 ±1.8 m，少数 straddled）
+            # 混合密度：按站点序号取一组角色（多数站 2 条，少数 straddled）
             _roles = MIXED_DENSITY_CYCLE[k % len(MIXED_DENSITY_CYCLE)]
+            if LINE_CONVENTION == "tiers":
+                # 多档线位：档位也按站点轮换（角色不变），横向在下面按档位算
+                _tier = float(LINE_TIER_M[k % len(LINE_TIER_M)])
             _specs = [("yellow" if rn.endswith("_left") else "white",
                        1 if float(LINE_ROLE_LATERAL_M[rn]) >= 0 else -1, rn)
                       for rn in _roles]
         for kind, sign, role in _specs:
-            if LINE_CONVENTION == "relative":
+            if LINE_CONVENTION == "tiers":
+                half = float(site["half_width_m"])
+                if role == "straddled":
+                    lat = -0.4
+                else:
+                    lat = (_tier if role == "near_left" else -_tier)
+                lat = max(-(half - 0.3), min(half - 0.3, lat))
+            elif LINE_CONVENTION == "relative":
                 half = float(site["half_width_m"])
                 lat = float(LINE_RELATIVE_FRAC.get(role, -0.10)) * half
                 lat = max(-(half - 0.3), min(half - 0.3, lat))
@@ -558,9 +574,8 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
         mid = np.asarray(occ_site["mid"], dtype=float)
         d = _unit(occ_site["dir"])
         left2d = np.array([-d[1], d[0]])
-        if LINE_CONVENTION == "relative":
-            _occ_lat = float(LINE_RELATIVE_FRAC["straddled"]) * float(
-                occ_site["half_width_m"])
+        if LINE_CONVENTION in ("relative", "tiers"):
+            _occ_lat = -0.4
         elif LINE_CONVENTION == "measured":
             _occ_lat = LINE_ROLE_LATERAL_M["straddled"]
         else:
@@ -957,11 +972,12 @@ def main() -> int:
     ap.add_argument("--step-m", type=float, default=0.0,
                     help="逐帧沿站点方向前进的米数（0 = 原地）")
     ap.add_argument("--line-convention",
-                    choices=("symmetric", "measured", "relative"),
+                    choices=("symmetric", "measured", "relative", "tiers"),
                     default="symmetric",
                     help="线位约定：symmetric=±LAT_LANE_HALF（旧）；"
                          "measured=开发集实测绝对线位；relative=按铺装半宽"
-                         "的相对线位（0.45×半宽，治绝对先验在窄路上外偏）")
+                         "的相对线位；tiers=多档线位（1.2/1.8/2.4 m 轮换，"
+                         "覆盖更宽的线位先验）")
     ap.add_argument("--width", type=int, default=192)
     ap.add_argument("--height", type=int, default=144)
     ap.add_argument("--out", default=None)

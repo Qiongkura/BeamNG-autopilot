@@ -340,3 +340,15 @@ def test_relative_convention_is_scale_invariant():
     assert abs(m.LINE_RELATIVE_FRAC["near_left"] * 4.0 - 1.8) < 1e-9,         "宽路上应与已验证覆盖的 ±1.8 m 等价"
     src = (ROOT / "scripts" / "m5_controlled_scenes.py").read_text(encoding="utf-8")
     assert '"relative"' in src and "LINE_RELATIVE_FRAC" in src
+
+
+def test_tier_convention_covers_wider_lateral_prior():
+    """多档线位（1.2/1.8/2.4 m 轮换）：依据是固定 ±1.8 m 的候选-参考偏差 sd 1.19 m、
+    far_* 候选系统外偏 1.0-1.3 m（线位先验太窄）。档位要夹在铺装内、角色循环不变。
+    """
+    m = _load()
+    assert m.LINE_TIER_M == (1.2, 1.8, 2.4)
+    assert min(m.LINE_TIER_M) < 1.8 < max(m.LINE_TIER_M), "要跨过旧的 ±1.8 m"
+    src = (ROOT / "scripts" / "m5_controlled_scenes.py").read_text(encoding="utf-8")
+    assert '"tiers"' in src and "LINE_TIER_M[k % len(LINE_TIER_M)]" in src
+    assert 'if role == "straddled":' in src, "straddled 档要固定 -0.4（保角色可判）"
