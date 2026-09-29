@@ -561,6 +561,7 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
           line_road_keep_frac: float | None = None,
           line_road_elongated_frac: float | None = None,
           null_shift_m: float | None = None,
+          match_tolerance_m: float | None = None,
           overlay_dir: Path | None = None,
           overlay_limit: int | None = None,
           crop_limit: int | None = None) -> dict:
@@ -776,11 +777,17 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
                 eng_null = ([{**ln, "lat_m": ln["lat_m"] - null_shift}
                              for ln in eng_lines] if null_shift else [])
                 matched = agree = n_null = 0
+                # 匹配容差可配（默认仍是冻结的 MATCH_M=0.8 m）：只用于
+                # **诊断扫描**（容差-身份率曲线）；改默认值是协议变更，
+                # 必须先重新标定并升协议版本（方案 §7）。
+                _tol = float(match_tolerance_m if match_tolerance_m
+                             else MATCH_M)
                 by_role = {}
                 for c in cands:
                     by_role.setdefault(c["role"], 0)
                     by_role[c["role"]] += 1
-                    ln = match_candidate(c["lat_m"], eng_lines)
+                    ln = match_candidate(c["lat_m"], eng_lines,
+                                         tol_m=_tol)
                     c["engine_lat_m"] = None if ln is None else ln["lat_m"]
                     c["engine_role"] = None if ln is None else ln["role"]
                     c["matched"] = ln is not None
@@ -796,7 +803,8 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
                         if ln["role"] == c["role"]:
                             agree += 1
                     if (eng_null
-                            and match_candidate(c["lat_m"], eng_null)
+                            and match_candidate(c["lat_m"], eng_null,
+                                                tol_m=_tol)
                             is not None):
                         n_null += 1
                 stats["engine_lines"] = eng_lines
@@ -966,6 +974,11 @@ def probe(run_dir: Path, meta: dict | None = None, *, view: str = "front_main",
         # "这份数是在哪个后处理配置下测的"
         "line_road_keep_frac": line_road_keep_frac,
         "line_road_elongated_frac": line_road_elongated_frac,
+        # 匹配容差（米）+ 是不是冻结默认：诊断扫描必须能追溯"这份身份率是在
+        # 哪个容差下测的"；默认值本身是协议常量，改它要重新标定+升版本
+        "match_tolerance_m": float(match_tolerance_m if match_tolerance_m
+                                   else MATCH_M),
+        "match_tolerance_default": not bool(match_tolerance_m),
         # ground-projected identity, vehicle frame
         "candidates_total": n_cand,
         "candidates_matched": n_match,
@@ -1081,6 +1094,9 @@ def main(argv=None) -> int:
     ap.add_argument("--meta", default=None, help="collector meta.json")
     ap.add_argument("--view", default="front_main")
     ap.add_argument("--limit", type=int, default=None)
+    ap.add_argument("--match-tolerance-m", type=float, default=None,
+                    help="诊断覆盖匹配容差（米）。默认 None = 用冻结的 "
+                         "MATCH_M；改默认值是协议变更，需重新标定+升版本")
     ap.add_argument("--null-shift-m", type=float, default=None,
                     help="lateral shift applied to the engine lines as a "
                          "NULL control for the match rate")
@@ -1109,6 +1125,7 @@ def main(argv=None) -> int:
             meta = json.loads(mp.read_text(encoding="utf-8"))
     res = probe(Path(args.run), meta, view=args.view, limit=args.limit,
                 model_path=args.model, null_shift_m=args.null_shift_m,
+                match_tolerance_m=args.match_tolerance_m,
                 overlay_dir=(Path(args.overlay_out) if args.overlay_out
                              else None),
                 overlay_limit=args.overlay_limit,
@@ -1126,6 +1143,10 @@ def main(argv=None) -> int:
         print(f"[ident] WARNING {s['frames_skipped']} frame(s) skipped "
               f"({s['n_errors']} error(s)), e.g. {first.get('frame')}: "
               f"{first.get('error')}: {str(first.get('message'))[:120]}")
+    if s.get("match_tolerance_m") is not None:
+        print(f"[ident] 匹配容差 {s['match_tolerance_m']} m"
+              + ("（冻结默认）" if s.get("match_tolerance_default")
+                 else "（诊断覆盖）"))
     if s.get("match_rate_null") is not None:
         print(f"[ident] NULL control (lines shifted {s['null_shift_m']} m): "
               f"match {s['candidates_matched_null']}/{s['candidates_total']} "
