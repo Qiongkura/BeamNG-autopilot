@@ -21,7 +21,7 @@ import json
 from .labels import PAINT_SOURCE_RANK
 
 #: 协议版本：定义/覆盖/资格任一处改动都要递增，并写进判定文件
-PROTOCOL_VERSION = "t14-protocol-v5"
+PROTOCOL_VERSION = "t14-protocol-v6"
 
 # ---------------------------------------------------------------------------
 # 指标字典：name -> 定义
@@ -324,6 +324,21 @@ CANDIDATE_GATES = {
 }
 
 
+#: 候选/参考**横向估计器**的口径（v6 新增）：v5 及以前用"整簇像素中位"，
+#: v6 起用**距离窗口内中位**。依据（2026-09-28，同一 checkpoint 离线对照）：
+#: 全簇 0.387 / 远窗(8-30 m) 0.293 / **近窗(4-12 m) 0.435** —— 对齐信号在近场，
+#: 远场地面投影的横向误差是噪声。两侧同一窗口、匹配容差不变（0.8 m 不动）；
+#: 估计器变了就是口径变了，所以协议升 v6 并**重测基线**后再比较（方案 §7）。
+LAT_ESTIMATOR = {
+    "window_m": [4.0, 12.0],
+    "statistic": "median",
+    "fallback": "clusters with no pixel inside the window fall back to the "
+                "full cluster (counted in the probe summary)",
+    "note": "identity estimator; the match tolerance (MATCH_M=0.8 m) is a "
+            "separate frozen constant and was NOT changed",
+}
+
+
 def protocol_blob(*, thresholds: dict | None = None) -> dict:
     """协议快照：定义 + 覆盖 + 资格 + 统计 + 聚合 + 阈值版本（判定文件里存这份）。"""
     return {
@@ -338,6 +353,7 @@ def protocol_blob(*, thresholds: dict | None = None) -> dict:
         "aggregation": AGGREGATION,
         "candidate_gates": CANDIDATE_GATES,
         "candidate_counting": CANDIDATE_COUNTING,
+        "lat_estimator": LAT_ESTIMATOR,
         "applicability": APPLICABILITY,
         "negative_diagnostic": NEGATIVE_DIAGNOSTIC,
         "coverage_gate_frozen": bool(COVERAGE_GATE_FROZEN),
