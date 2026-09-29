@@ -275,14 +275,13 @@ def test_measured_role_targets_cover_the_reference_vocabulary():
     与 far_*——这是上一轮角色一致率 0.609 的机械解释。
     """
     m = _load()
-    roles = [r for r, _lat in m.LINE_ROLE_TARGETS]
+    roles = [r for spec in m.MIXED_DENSITY_CYCLE for r in spec]
     assert "straddled" in roles, "必须能生成 straddled（自车骑线）"
     assert "near_left" in roles and "near_right" in roles
     # far_* 是**有意不生成**的：实测 4 条线（含 far_left +4.2 m）让单相机标定
     # 对不齐所有线（逐线覆盖 ~0.5 -> 资格门全灭）且网格搜索代价 ×12。
-    # 3 条线覆盖词表 75%（straddled+near_left+near_right），横向跨度 ±2.6 m。
     assert not any(r.startswith("far_") for r in roles)
-    assert max(abs(lat) for _r, lat in m.LINE_ROLE_TARGETS) <= 3.0,         "横向跨度要收在标定能对齐的范围内"
+    assert max(abs(v) for v in m.LINE_ROLE_LATERAL_M.values()) <= 3.0,         "横向跨度要收在标定能对齐的范围内"
     # straddled 的位置必须在探针的 STRADDLE_M(0.5) 内（否则判不成 straddled）
     lat = dict(m.LINE_ROLE_TARGETS)["straddled"]
     assert abs(lat) <= 0.5, lat
@@ -302,13 +301,24 @@ def test_measured_convention_keeps_the_line_free_control_empty():
     assert 'if LINE_CONVENTION == "measured" and spec["lines"]:' in src,         "词表展开必须只对有线场景生效"
 
 
-def test_measured_convention_is_one_line_per_site():
-    """每站**一条线**、角色按站点轮换（依据：单线站点覆盖 1.00，多线 0.46-0.59）。
 
-    词表覆盖放到批次级——这是"一个全局标定对不齐多条线"的直接对策。
+
+def test_mixed_density_cycle_matches_the_dev_set():
+    """混合密度循环：平均 1.75 条/站（开发集 2.3）、含 straddled 站、每站 ≤2 条。
+
+    依据（2026-09-28 实测）：单线批次密度 1.0 -> 身份率崩到 0.206；对称 ±1.8 m
+    只覆盖词表 61%（缺 straddled）；3-4 线站点覆盖 0.46-0.59 过不了门。
     """
-    src = (ROOT / "scripts" / "m5_controlled_scenes.py").read_text(
-        encoding="utf-8")
-    assert "LINE_ROLE_TARGETS[k % len(LINE_ROLE_TARGETS)]" in src,         "measured 模式必须每站只放一条线并按站点轮换角色"
     m = _load()
-    assert len(m.LINE_ROLE_TARGETS) >= 3, "至少要覆盖 straddled + 两侧最近线"
+    cyc = m.MIXED_DENSITY_CYCLE
+    lens = [len(x) for x in cyc]
+    assert max(lens) <= 2, "每站最多 2 条线（多线过不了覆盖门）"
+    assert 1.5 <= sum(lens) / len(lens) <= 2.5, lens
+    roles = [r for spec in cyc for r in spec]
+    assert "straddled" in roles, "必须含 straddled 站（补词表缺失的 13.8%）"
+    assert "near_left" in roles and "near_right" in roles
+    lat = m.LINE_ROLE_LATERAL_M
+    assert abs(lat["straddled"]) <= 0.5, "straddled 位置要在 STRADDLE_M(0.5) 内"
+    assert abs(lat["near_left"]) <= 1.8 and abs(lat["near_right"]) <= 1.8,         "两侧线夹在已验证覆盖的 ±1.8 m 带内"
+    src = (ROOT / "scripts" / "m5_controlled_scenes.py").read_text(encoding="utf-8")
+    assert "MIXED_DENSITY_CYCLE[k % len(MIXED_DENSITY_CYCLE)]" in src

@@ -88,15 +88,21 @@ LINE_LATERAL_M = {"near": -0.4, "far": +2.1}
 #: 缺 straddled（|lat|≤0.5，探针 `STRADDLE_M`）与 far_*（同侧第二条线）
 #: ——上一轮角色一致率 0.609 的机械解释。
 #: `measured` 约定按词表放线（位置 = 车体系左为正，夹在铺装内）：
-#: **每站只放一条线，角色按站点轮换**。依据（2026-09-28 对称批次 140 站实测）：
-#: 单线站点（occluded_line 类）的 annotation 覆盖能到 **1.00**，而 3–4 线站点只有
-#: 0.46–0.59——一个全局 (yaw,pitch) 标定对不齐多条线，多线场景过不了覆盖门。
-#: 所以词表覆盖放到**批次级**：每站单线（标定精确、覆盖高），站点之间轮换角色，
-#: 整个批次覆盖 straddled / near_left / near_right。
-LINE_ROLE_TARGETS = (
-    ("straddled", -0.4),    # 自车骑线（|lat|<=0.5 判 straddled）
-    ("near_left", +1.8),    # 左侧最近线（夹在已验证覆盖的 ±1.8 m 带内）
-    ("near_right", -1.8),   # 右侧最近线
+#: 角色横向位置（米，车体系左为正；夹在**已验证覆盖**的 ±1.8 m 带内）。
+LINE_ROLE_LATERAL_M = {"straddled": -0.4, "near_left": +1.8, "near_right": -1.8}
+#: **混合密度循环**（按站点序号轮换）。两个实测约束一起满足：
+#: * **密度**：开发集人工标签是 **2.3 条/帧**（174 实例/76 帧）；单线批次
+#:   （密度 1.0）把模型教成"每帧一条线"，身份率崩到 0.206（2026-09-28 实测）；
+#: * **词表**：对称 ±1.8 m 只覆盖 near_left+near_right（61%），缺 straddled
+#:   （13.8%，|lat|<=STRADDLE_M=0.5）；
+#: * **覆盖**：单线站点覆盖 1.00、3–4 线站点 0.46–0.59（一个全局 yaw/pitch 标定
+#:   对不齐多条线）——所以每站最多 2 条线。
+#: 本循环平均密度 1.75 条/站，含 1/4 的 straddled 站，兼顾三者。
+MIXED_DENSITY_CYCLE = (
+    ("near_left", "near_right"),
+    ("near_left", "near_right"),
+    ("straddled",),
+    ("near_left", "near_right"),
 )
 #: 为什么是 ±1.8 m 而不是实测的 ±2.1/−2.6 m：实测那些位置在同一锚点上
 #: annotation 覆盖只有 0.54（对称 ±1.8 m 是 0.81）——**被标注的铺装带比 roadnet
@@ -495,16 +501,16 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
             # 按参考词表放线：位置来自 LINE_ROLE_TARGETS，夹在铺装内
             # （|lat| > half-0.3 的线会落在铺装外、annotation 不覆盖 ->
             # 资格门必失败），并去掉彼此 <1 m 的重复线。
-            # 每站一条线，角色按**站点序号**轮换（词表在批次级覆盖）
-            role_name, lat0 = LINE_ROLE_TARGETS[k % len(LINE_ROLE_TARGETS)]
-            kind = "yellow" if role_name.endswith("_left") else "white"
-            _specs = [(kind, 1 if float(lat0) >= 0 else -1, role_name)]
+            # 混合密度：按站点序号取一组角色（多数站 2 条 ±1.8 m，少数 straddled）
+            _roles = MIXED_DENSITY_CYCLE[k % len(MIXED_DENSITY_CYCLE)]
+            _specs = [("yellow" if rn.endswith("_left") else "white",
+                       1 if float(LINE_ROLE_LATERAL_M[rn]) >= 0 else -1, rn)
+                      for rn in _roles]
         for kind, sign, role in _specs:
             if LINE_CONVENTION == "measured":
-                lat = next(lat0 for rn, lat0 in LINE_ROLE_TARGETS
-                           if rn == role)
+                lat = float(LINE_ROLE_LATERAL_M.get(role, -0.4))
                 lat = max(-(float(site["half_width_m"]) - 0.3),
-                          min(float(site["half_width_m"]) - 0.3, float(lat)))
+                          min(float(site["half_width_m"]) - 0.3, lat))
             else:
                 lat = sign * LAT_LANE_HALF
             nodes = _line_nodes(site, lat)
@@ -538,7 +544,8 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
         mid = np.asarray(occ_site["mid"], dtype=float)
         d = _unit(occ_site["dir"])
         left2d = np.array([-d[1], d[0]])
-        _occ_lat = (LINE_LATERAL_M["near"] if LINE_CONVENTION == "measured"
+        _occ_lat = (LINE_ROLE_LATERAL_M["straddled"]
+                    if LINE_CONVENTION == "measured"
                     else LAT_LANE_HALF)   # measured: 压在 straddled 线上
         pos = mid + d * OCCLUDER_AHEAD_M + np.array(
             [left2d[0], left2d[1], 0.0]) * _occ_lat   # 正=左；压在该侧线上
