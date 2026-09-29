@@ -991,11 +991,18 @@ def main() -> None:
         os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
+        # CUDA 上必须 warn_only：nll_loss2d（cross_entropy）没有确定性实现，
+        # 严格模式会直接 RuntimeError（实测：基线臂训练失败，报
+        # "nll_loss2d_forward_out_cuda_template does not have a deterministic
+        # implementation"）。warn_only 让**其余算子**确定、损失核豁免并打警告；
+        # CPU 上保持严格（逐位比较只能在 CPU 做，见上面的参数说明）。
+        _warn_only = str(getattr(args, "device", "cuda")) == "cuda"
         try:
-            torch.use_deterministic_algorithms(True)
+            torch.use_deterministic_algorithms(True, warn_only=_warn_only)
             print("[train] 确定性模式已开（cudnn.deterministic + "
-                  "use_deterministic_algorithms + CUBLAS workspace）",
-                  flush=True)
+                  "use_deterministic_algorithms"
+                  + (" warn_only=CUDA 损失核豁免" if _warn_only else "")
+                  + " + CUBLAS workspace）", flush=True)
         except Exception as exc:             # noqa: BLE001
             print(f"[train] 确定性模式打开失败：{exc}", flush=True)
             raise
