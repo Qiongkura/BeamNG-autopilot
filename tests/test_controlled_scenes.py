@@ -283,11 +283,11 @@ def test_measured_role_targets_cover_the_reference_vocabulary():
     assert not any(r.startswith("far_") for r in roles)
     assert max(abs(v) for v in m.LINE_ROLE_LATERAL_M.values()) <= 3.0,         "横向跨度要收在标定能对齐的范围内"
     # straddled 的位置必须在探针的 STRADDLE_M(0.5) 内（否则判不成 straddled）
-    lat = dict(m.LINE_ROLE_TARGETS)["straddled"]
+    lat = float(m.LINE_ROLE_LATERAL_M["straddled"])
     assert abs(lat) <= 0.5, lat
     # 每个位置都在一条合理车道范围内（生成时还会按铺装宽度夹紧）
-    for _r, lat0 in m.LINE_ROLE_TARGETS:
-        assert abs(lat0) <= 6.0, (_r, lat0)
+    for _r, lat0 in m.LINE_ROLE_LATERAL_M.items():
+        assert abs(float(lat0)) <= 6.0, (_r, lat0)
 
 
 def test_measured_convention_keeps_the_line_free_control_empty():
@@ -298,7 +298,8 @@ def test_measured_convention_keeps_the_line_free_control_empty():
     """
     src = (ROOT / "scripts" / "m5_controlled_scenes.py").read_text(
         encoding="utf-8")
-    assert 'if LINE_CONVENTION == "measured" and spec["lines"]:' in src,         "词表展开必须只对有线场景生效"
+    # 词表展开只对**有线**场景生效（measured/relative/tiers 三套约定都带这条守卫）
+    assert 'in ("measured", "relative", "tiers") and spec["lines"]' in src,         "词表展开必须只对有线场景生效"
 
 
 
