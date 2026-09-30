@@ -593,20 +593,20 @@ def test_merge_close_candidates_same_side_only():
                            pixels=np.zeros((n, 2)), color="white",
                            kind="thin", confidence=0.5)
 
-    # 生产默认半径 0.5 m（实测选定，见 §19）：0.3 m 的两条并成一条
-    out, info = merge_close_candidates([mk(1.7), mk(2.0)], pos=(0.0, 0.0, 0.0),
+    # 生产默认半径 1.0 m（实测选定，§20：6/6 arm 过角色门）：0.8 m 的两条并成一条
+    out, info = merge_close_candidates([mk(1.7), mk(2.5)], pos=(0.0, 0.0, 0.0),
                                        heading=0.0)
     assert len(out) == 1 and info["merged"] == 1
     assert out[0].meta["merged_from"] == 2
     assert len(out[0].world) == 10          # 并集：信息只增不减
-    # 同侧 1.2 m：默认半径下**不合并**（真线近/远档可以只差 1.0–1.5 m）
+    # 同侧 1.2 m：超过默认半径 -> 不合并（真线近/远档可以只差 1.0–1.5 m）
     assert len(merge_close_candidates([mk(1.7), mk(2.9)], pos=(0.0, 0.0, 0.0),
                                       heading=0.0)[0]) == 2
-    # 显式放大半径（测量用）：1.2 m 会合并
-    big, info_big = merge_close_candidates([mk(1.7), mk(2.9)],
-                                           pos=(0.0, 0.0, 0.0), heading=0.0,
-                                           max_gap_m=1.5)
-    assert len(big) == 1 and info_big["merged"] == 1
+    # 小半径（测量用，§19 的 0.5 m 档）：0.8 m 也不合并
+    small, _ = merge_close_candidates([mk(1.7), mk(2.5)],
+                                      pos=(0.0, 0.0, 0.0), heading=0.0,
+                                      max_gap_m=0.5)
+    assert len(small) == 2
     # 同侧 2.5 m（真线间距量级）：不合并
     assert len(merge_close_candidates([mk(1.7), mk(4.2)], pos=(0.0, 0.0, 0.0),
                                       heading=0.0)[0]) == 2
