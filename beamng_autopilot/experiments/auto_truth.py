@@ -1808,7 +1808,13 @@ def _normalize_provenance(provenance, batch_report, frames, channels) -> dict:
     run = _block("run", ("id", "scene_seed", "game_version", "renderer"))
     camera = _block("camera", ("name", "calibration_sha", "frame_ids"))
     labels = _block("labels", ("source_image_sha", "label_sha",
-                               "channel_valid_area", "unknown_reason"))
+                               "channel_valid_area", "unknown_reason",
+                               # 负例的自证（2026-09-30）：`truth_kind="line_free"`
+                               # 与 `line_free_evidence`（零线像素 + 已声明的
+                               # 非漆结构 + 外观归因）以前被这里**丢掉**，于是
+                               # 负例凭证读不出"凭什么算合格负例"。白名单补上；
+                               # 正例不传这两键 -> 值为 null，无副作用。
+                               "truth_kind", "line_free_evidence"))
     report = _block("report", ("test_report_sha", "verifier_version", "verified"))
 
     if not generator.get("name"):

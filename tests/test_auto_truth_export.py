@@ -373,3 +373,33 @@ def test_structure_negative_still_rejects_line_class_pixels(tmp_path):
                           min_coverage=0.8, max_after_px=2.0)
     assert ev["eligible"] is False
     assert any("line-class pixels present" in r for r in ev["reasons"]), ev
+
+
+def test_negative_credential_carries_its_own_evidence(tmp_path):
+    """负例凭证必须能自证：`truth_kind` + `line_free_evidence` 不得被丢掉。
+
+    实测踩到（2026-09-30）：`_normalize_provenance` 的 labels 白名单里没有这两键，
+    导出侧写进去的"零线像素 + 已声明非漆结构 + 外观归因"在凭证里全部消失，
+    读凭证的人无法判断"凭什么算合格负例"（尤其结构负例：像线的外观来自
+    已声明结构，这条证据必须随凭证走）。
+    """
+    m = _load()
+    frames, _t = _frames_from_synthetic(with_line=False)
+    out = tmp_path / "out"
+    ev = {"line_px": 0, "appearance_like_px": 1234,
+          "structures": [{"id": "m5_wall_x_0", "kind": "wall_stone",
+                          "shape": "/levels/italy/.../italy_wall_stone_"
+                                   "bricktop.dae"}],
+          "structure_appearance": {"inside": 1000, "outside": 234,
+                                   "radius_px": 60, "n_structures": 1}}
+    m.export_line_free_package(frames, out_root=out, scene="known_no_line_a3s1",
+                               anchor=3, map_name="italy",
+                               generator={"version": "t"}, evidence=ev)
+    cred = json.loads((out / "m5auto_a3_known_no_line_a3s1" /
+                       "annotation.json").read_text(encoding="utf-8"))
+    lab = (cred.get("truth_provenance") or {}).get("labels") or {}
+    assert lab.get("truth_kind") == "line_free", lab
+    got = lab.get("line_free_evidence") or {}
+    assert got.get("line_px") == 0
+    assert got.get("structures") and got["structures"][0]["kind"] == "wall_stone"
+    assert (got.get("structure_appearance") or {}).get("inside") == 1000
