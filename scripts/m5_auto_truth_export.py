@@ -3,14 +3,27 @@
 输入：`m5_controlled_scenes.py` 的一次运行产物（`scene_report.json` +
 `scene_*.json` + `frames/*.npz`）。**不需要游戏**——复核与导出都在离线做。
 
-两道门槛，缺一不可（方案 §4.3"逐通道赋资格"）：
+四道门槛，缺一不可（方案 §4.3"逐通道赋资格"）：
 
-1. **annotation 线类覆盖** ≥ ``--min-coverage``（默认 0.6）：训练标签就是
+1. **annotation 线类覆盖** ≥ ``--min-coverage``（默认 0.8）：训练标签就是
    annotation，所以只认 annotation 的覆盖——外观再可见也不能当标签来源，
    否则等于教模型"这里有线的地方没有线"（扩量实测：部分路段 annotation 线类
-   像素只有个位数）。
-2. **几何一致性** 校准后 ``after_px`` ≤ ``--max-after-px``（默认 2.0）：逐帧
-   静态标定后的投影残差（标定参数在场景记录里）。
+   像素只有个位数）。**逐实例**判定，且要求**每个**线实例都达标：只过一个
+   实例时另一条的标签是断续的，同样在教模型"线可以断"。
+2. **几何一致性**：校准后逐帧 ``after_px`` 均值 ≤ ``--max-after-px``（默认
+   2.0）且**中位** ≤ ``--max-after-median-px``（默认 1.0）。中位门是必须的：
+   均值会被个别坏帧掩盖（多档批次里同一场景 0.9 px 与 50 px 并存）。
+3. **横向档位** |``lateral_m``| ≤ ``--max-line-lat-m``（默认 2.0）：多档批次
+   的 2.4 m 档落在 annotation 标注带之外（实测残差中位 2.125 px），只收
+   1.2/1.8 档。
+4. **漆面外观一致**：认证实例的真值点投影处，RGB 邻域必须像**漆**（亮的无彩
+   脊，或黄漆；阈值按开发集人工标签的线像素实测标定），合格点占比 ≥
+   ``--min-paint-agreement``（默认 0.9）。这条是 2026-09-29 找到的**标签中毒
+   机制**：被遮挡车/覆盖贴花挡住的线，引擎 annotation 仍把它标成线（annotation
+   通道不做深度测试），于是标签在 RGB 是车/泥土的地方写着"线"。实测已导出的包
+   里有 3/7 的漆面一致率只有 0.03–0.74（好包 1.00）；把它们混进训练后身份率从
+   0.4316 崩到 0.1728。门与新判据在实测站点上的判别力：好站 1.00，被车挡住的
+   线 0.00–0.32（`occluded_line_a1s2` 0.0、`slope_curve_a1s3` 右 0.32）。
 
 通过 -> 写一份训练可用的数据目录（与采集包同构）：
 
@@ -105,6 +118,118 @@ def _labels_digest(label_shas: list) -> str:
     return _sha16_bytes("|".join(sorted(str(s) for s in label_shas)).encode())
 
 
+def scene_anchor(name: str) -> int:
+    """站点名 -> 锚点号（场景族 = 锚点，划分 train/dev/final 按它分）。
+
+    **必须在分支之前算**：负例分支也要用它。实测踩到——旧代码把它写在负例
+    分支后面，于是首个负例 `UnboundLocalError: 'anchor'`，后面的负例又沿用
+    上一站的锚点，包名/meta 的 `source_id` 全是错的（`known_no_line_a5s1`
+    写成了 `m5auto_a2_...`）。
+    """
+    if "_a" not in name:
+        return 0
+    try:
+        return int(name.rsplit("_a", 1)[1].split("s")[0])
+    except (IndexError, ValueError):
+        return 0
+
+
+def calibrated_frames(frames: list, rec: dict) -> list:
+    """套上逐帧静态投影标定（标定是场景的渲染/相机常数，随批次落盘）。
+
+    不套的话投影残差会把复核判成不通过、写不出 engine_verified（实测踩到：
+    9 个站点全部 verified=False）。`evaluate_scene` 与 `export_scene` 共用，
+    免得两条路径的判定口径漂移。
+    """
+    pf = ((rec.get("camera_alignment") or {}).get("per_frame") or [])
+    out = []
+    for i, fr in enumerate(frames):
+        cam = fr["camera"]
+        if i < len(pf) and pf[i].get("status") == "measured":
+            cam = _rotate_camera_basis(cam, float(pf[i].get("yaw_deg") or 0.0),
+                                       float(pf[i].get("pitch_deg") or 0.0))
+        out.append(cam)
+    return out
+
+
+#: 漆面外观判据（**与材质声明无关**）。阈值按开发集人工标签实测标定
+#: （2026-09-29，`review_pack_20260926/reviewed_full` 的 12 个目录、26 万线像素）：
+#: 人工标注的线像素 max 通道 p10≈154 / p50≈205，色度（max-min）中位 ≈1——即
+#: "亮的、近无彩的脊"。原来的 185 绝对门会把 30% 的人工线像素判成非漆，
+#: 而实测 dim 站点（material_mix 的线只有 162 灰）本来就在开发集分布内。
+#: 黄漆另给一支（生成场景里有黄线材质）。
+#: **蓝漆不认证**：蓝漆与遮挡车（场景里是蓝车）在颜色上分不开，宁可保守隔离
+#: （蓝线只出现在 symmetric 约定的 material_mix，从未进过训练包）。
+PAINT_MIN_BRIGHT = 140
+PAINT_MAX_CHROMA = 60
+PAINT_YELLOW_RG_MIN = 120
+PAINT_YELLOW_B_MAX = 140
+PAINT_YELLOW_RB_MIN = 60
+PAINT_CRITERION = "achromatic_bright_or_yellow"
+
+
+def paint_like(rgb, u, v, *, radius_px: int = 2) -> bool | None:
+    """投影点邻域是否像**漆**（亮的无彩脊，或黄漆）；``None`` = 画面外。
+
+    画面外必须与"不是漆"分开：`line_appearance` 对越界返回 line_like=False，
+    拿它当"不是漆"会把画面外的点算成不合格（UNKNOWN≠FAIL 的同一个道理）。
+    """
+    a = np.asarray(rgb)
+    if a.ndim != 3 or a.shape[2] < 3 or a.size == 0:
+        return None
+    if not (np.isfinite(u) and np.isfinite(v)):
+        return None          # 相机背后的点投影出 NaN：先判有限再取整（实测踩到）
+    h, w = a.shape[:2]
+    x, y = int(round(float(u))), int(round(float(v)))
+    if not (0 <= x < w and 0 <= y < h):
+        return None
+    win = a[max(0, y - radius_px):y + radius_px + 1,
+            max(0, x - radius_px):x + radius_px + 1, :3].astype(np.int16)
+    mx = win.max(axis=2)
+    mn = win.min(axis=2)
+    r, g, b = win[:, :, 0], win[:, :, 1], win[:, :, 2]
+    achromatic_bright = ((mx >= PAINT_MIN_BRIGHT)
+                         & ((mx - mn) <= PAINT_MAX_CHROMA))
+    yellow = ((r >= PAINT_YELLOW_RG_MIN) & (g >= PAINT_YELLOW_RG_MIN)
+              & (b <= PAINT_YELLOW_B_MAX) & ((r - b) >= PAINT_YELLOW_RB_MIN)
+              & (np.abs(r - g) <= 45))
+    return bool((achromatic_bright | yellow).any())
+
+
+def paint_agreement(lines: list, frames: list, cal_frames: list, *,
+                    radius_px: int = 2) -> dict:
+    """逐线实例：真值点投影处的 RGB 像不像漆（判据见 ``PAINT_CRITERION``）。
+
+    只查 ``class == 2`` 的点（路面点 ``class == 1`` 落在沥青上，查它们等于
+    拿"路面不是漆"去否掉整个场景——实测合成批次因此从 1.00 掉到 0.586）。
+
+    返回 ``{role: {checked, like, ratio}}``；``checked == 0`` 的实例
+    ``ratio = None``（没有可查的点 -> UNKNOWN，不当通过）。
+    """
+    from beamng_autopilot.experiments.auto_truth import project_point
+    out: dict = {}
+    for inst in lines or []:
+        pts = [p for p in (inst.get("truth_points") or [])
+               if p.get("class") in (None, 2)]     # 只查线类点（class 1 是路面）
+        checked = like = 0
+        for fr, cam in zip(frames, cal_frames):
+            rgb = np.asarray(fr["rgb"])
+            for p in pts:
+                try:
+                    u, v = project_point(p.get("world"), cam)
+                except (TypeError, ValueError):
+                    continue
+                got = paint_like(rgb, u, v, radius_px=radius_px)
+                if got is None:
+                    continue
+                checked += 1
+                like += int(got)
+        out[str(inst.get("role") or "?")] = {
+            "checked": checked, "like": like,
+            "ratio": (round(like / checked, 4) if checked else None)}
+    return out
+
+
 def scene_frame_paths(batch: Path, name: str) -> list:
     return sorted((batch / "frames").glob(f"{name}_*.npz"))
 
@@ -126,10 +251,13 @@ def load_scene_frames(batch: Path, name: str) -> list:
 
 
 def evaluate_scene(batch: Path, name: str, rec: dict, *, min_coverage: float,
-                   max_after_px: float) -> dict:
-    """资格 + 几何两道门；返回 ``{eligible, reasons, coverage, after_px, frames}``。
+                   max_after_px: float, max_after_median_px: float | None = None,
+                   max_line_lat_m: float | None = None,
+                   min_paint_agreement: float | None = None) -> dict:
+    """资格 + 几何 + 档位 + 漆面四道门；返回判定与逐项证据。
 
-    只读产物，不写任何东西——先判定再决定要不要导出。
+    只读产物，不写任何东西——先判定再决定要不要导出。新增的三道门默认关闭
+    （``None``），调用方（``main`` 的 CLI 默认值）显式开启，老测试不受影响。
     """
     out: dict = {"scene": name, "eligible": False, "reasons": [],
                  "coverage": None, "after_px": None}
@@ -169,15 +297,30 @@ def evaluate_scene(batch: Path, name: str, rec: dict, *, min_coverage: float,
         out["eligible"] = not out["reasons"]
         out["frames"] = frames
         return out
-    # **逐线实例**覆盖：多线场景里某条线（例如远处的 far_left）没被 annotation
-    # 覆盖，不该把整个站点判死——按实例算覆盖，达标实例进真值、其余由逐点认证
-    # 剔除并记录（方案 §4.3：逐通道/逐实例赋资格，不确定的 ignore）。
-    by_role: dict = {}
+    # **横向档位门**：超出认证带的实例不进真值（多档批次的 2.4 m 档落在
+    # annotation 标注带外，实测残差中位 2.125 px，是崩溃那轮的坏标签来源）。
+    kept, excluded = [], []
     for inst in lines:
-        by_role.setdefault(str(inst.get("role") or "?"), []).extend(
-            inst.get("truth_points") or [])
+        lat = inst.get("lateral_m")
+        if (max_line_lat_m is not None and lat is not None
+                and abs(float(lat)) > float(max_line_lat_m)):
+            excluded.append({"role": inst.get("role"),
+                             "lateral_m": float(lat)})
+        else:
+            kept.append(inst)
+    out["excluded_instances"] = excluded
+    if not kept:
+        out["reasons"].append(
+            f"every line instance is outside the certified lateral band "
+            f"|lat| <= {max_line_lat_m} m (excluded: {excluded})")
+        out["frames"] = frames
+        return out
+    # **逐线实例**覆盖：按实例算覆盖（多线场景里某条线没被 annotation 覆盖，
+    # 不该靠另一条把它带过门）；**每个**实例都必须达标，否则标签是断续的。
     inst_cov: dict = {}
-    for role, pts in by_role.items():
+    for inst in kept:
+        role = str(inst.get("role") or "?")
+        pts = inst.get("truth_points") or []
         covs = []
         for fr in frames:
             c = line_evidence_coverage(
@@ -190,25 +333,54 @@ def evaluate_scene(batch: Path, name: str, rec: dict, *, min_coverage: float,
     out["instance_coverage"] = inst_cov
     ok_roles = [r for r, c in inst_cov.items()
                 if c is not None and c >= float(min_coverage)]
+    failed = [r for r, c in inst_cov.items()
+              if c is None or c < float(min_coverage)]
     out["certified_roles"] = sorted(ok_roles)
+    out["failed_roles"] = sorted(failed)
     out["coverage"] = (round(max((c for c in inst_cov.values()
                                   if c is not None), default=0.0), 4)
                        if inst_cov else None)
-    if not ok_roles:
+    if failed:
         out["reasons"].append(
-            f"no line instance reaches annotation coverage {min_coverage} "
-            f"(per-instance: {inst_cov}): the engine label does not carry "
-            "these lines here, so the site cannot be a line-truth source")
+            f"line instance(s) {sorted(failed)} below annotation coverage "
+            f"{min_coverage} (per-instance: {inst_cov}): the engine label does "
+            "not carry these lines here, so the site cannot be a line-truth "
+            "source")
     aft = [p.get("after_px") for p in
            ((rec.get("camera_alignment") or {}).get("per_frame") or [])]
     aft = [float(x) for x in aft if x is not None]
     out["after_px"] = round(float(np.mean(aft)), 3) if aft else None
+    out["after_px_median"] = round(float(np.median(aft)), 3) if aft else None
     if not aft:
         out["reasons"].append("no projection calibration record (after_px)")
     elif float(np.mean(aft)) > float(max_after_px):
         out["reasons"].append(
             f"calibrated projection residual {np.mean(aft):.2f} px > "
             f"{max_after_px}: geometry not verified")
+    elif (max_after_median_px is not None
+          and float(np.median(aft)) > float(max_after_median_px)):
+        out["reasons"].append(
+            f"calibrated projection residual median {np.median(aft):.2f} px > "
+            f"{max_after_median_px}: geometry not verified")
+    # **漆面外观门**（最后一道，也最贵）：认证实例的每个真值点投影处必须是
+    # 该实例颜色的漆。挡掉的是"标签在 RGB 是车/泥土的地方写线"的中毒包。
+    if min_paint_agreement is not None:
+        agree = paint_agreement(kept, frames, calibrated_frames(frames, rec))
+        out["paint_agreement"] = agree
+        checked = sum(int(v["checked"]) for v in agree.values())
+        like = sum(int(v["like"]) for v in agree.values())
+        out["paint_agreement_pooled"] = (round(like / checked, 4)
+                                         if checked else None)
+        if not checked:
+            out["reasons"].append(
+                "no line truth point is projectable into the frames: paint "
+                "appearance cannot be verified (UNKNOWN is not a pass)")
+        elif float(like / checked) < float(min_paint_agreement):
+            out["reasons"].append(
+                f"paint appearance agreement {like / checked:.3f} < "
+                f"{min_paint_agreement} over {checked} projected truth points "
+                f"(per-instance: {agree}): the label marks line where the RGB "
+                "does not show paint (annotation pass ignores occluders)")
     out["eligible"] = not out["reasons"]
     out["frames"] = frames
     return out
@@ -283,14 +455,7 @@ def export_scene(rec: dict, truth: list, frames: list, *, out_root: Path,
     # 出口复核前**套上逐帧静态投影标定**（标定是场景的渲染/相机常数，已在
     # 生成批次里落盘）：不套的话投影残差会把复核判成不通过，写不出
     # engine_verified——实测踩到（9 个站点全部 verified=False）。
-    pf = ((rec.get("camera_alignment") or {}).get("per_frame") or [])
-    cal_frames = []
-    for i, fr in enumerate(frames):
-        cam = fr["camera"]
-        if i < len(pf) and pf[i].get("status") == "measured":
-            cam = _rotate_camera_basis(cam, float(pf[i].get("yaw_deg") or 0.0),
-                                       float(pf[i].get("pitch_deg") or 0.0))
-        cal_frames.append(cam)
+    cal_frames = calibrated_frames(frames, rec)
     # 出口复核：用**annotation 证据**重跑 verify_batch（标签就是 annotation），
     # ok=True 才可能写 engine_verified（write_truth_credentials 里再做一次与）
     batch = {"frames": [{"frame_id": f"{scene}_{i:05d}",
@@ -467,8 +632,16 @@ def main() -> int:
     ap.add_argument("--batch", required=True,
                     help="m5_controlled_scenes.py 的一次运行目录")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--min-coverage", type=float, default=0.6)
+    ap.add_argument("--min-coverage", type=float, default=0.8,
+                    help="逐线实例的 annotation 线类覆盖门（每个实例都要过）")
     ap.add_argument("--max-after-px", type=float, default=2.0)
+    ap.add_argument("--max-after-median-px", type=float, default=1.0,
+                    help="逐帧投影残差**中位**门；<0 关闭")
+    ap.add_argument("--max-line-lat-m", type=float, default=2.0,
+                    help="只认证 |lateral_m| <= 该值的线实例（多档批次收 1.2/1.8 档）；"
+                         "<0 关闭")
+    ap.add_argument("--min-paint-agreement", type=float, default=0.9,
+                    help="真值点投影处 RGB 是该实例颜色的漆的占比门；<0 关闭")
     ap.add_argument("--map", default="italy")
     args = ap.parse_args()
 
@@ -479,20 +652,34 @@ def main() -> int:
     scenes = report.get("scenes") or {}
     types = report.get("scene_types") or []
     names = list(scenes)
+    gates = {
+        "min_coverage": float(args.min_coverage),
+        "max_after_px": float(args.max_after_px),
+        "max_after_median_px": (None if float(args.max_after_median_px) < 0
+                                else float(args.max_after_median_px)),
+        "max_line_lat_m": (None if float(args.max_line_lat_m) < 0
+                           else float(args.max_line_lat_m)),
+        "min_paint_agreement": (None if float(args.min_paint_agreement) < 0
+                                else float(args.min_paint_agreement)),
+    }
     exported, isolated = [], []
     for k, name in enumerate(names):
         rec = scenes[name]
-        ev = evaluate_scene(batch, name, rec,
-                            min_coverage=float(args.min_coverage),
-                            max_after_px=float(args.max_after_px))
+        # 锚点**在分支之前**算：负例包也要用它（旧代码写在负例分支后面，
+        # 首个负例直接 UnboundLocalError，后续负例沿用上一站锚点）
+        anchor = scene_anchor(name)
+        ev = evaluate_scene(batch, name, rec, **gates)
         if not ev["eligible"]:
             isolated.append({kk: vv for kk, vv in ev.items()
                              if kk != "frames"})
             continue
         lines = ((rec.get("generated") or {}).get("lines") or [])
         _ok_roles = set(ev.get("certified_roles") or [])
+        _excluded = {str(x.get("role") or "?")
+                     for x in (ev.get("excluded_instances") or [])}
         truth = [p for inst in lines
-                 if str(inst.get("role") or "?") in _ok_roles
+                 if (str(inst.get("role") or "?") in _ok_roles
+                     and str(inst.get("role") or "?") not in _excluded)
                  for p in (inst.get("truth_points") or [])]
         if ev.get("line_free") and not truth:
             try:
@@ -513,7 +700,6 @@ def main() -> int:
                                  "reasons": [f"export failed: "
                                              f"{type(exc).__name__}: {exc}"]})
             continue
-        anchor = int(name.rsplit("_a", 1)[1].split("s")[0]) if "_a" in name else 0
         try:
             res = export_scene(rec, truth, ev["frames"], out_root=out_root,
                                scene=name, anchor=anchor,
@@ -524,7 +710,11 @@ def main() -> int:
                              "coverage": ev["coverage"],
                              "instance_coverage": ev.get("instance_coverage"),
                              "certified_roles": ev.get("certified_roles"),
-                             "after_px": ev["after_px"], **res})
+                             "excluded_instances": ev.get("excluded_instances"),
+                             "after_px": ev["after_px"],
+                             "after_px_median": ev.get("after_px_median"),
+                             "paint_agreement_pooled": ev.get(
+                                 "paint_agreement_pooled"), **res})
             print(f"[export] {name}: {res['n_frames']} 帧 -> "
                   f"{res['label_source'] or '(无来源声明)'} "
                   f"verified={res['verified']}", flush=True)
@@ -532,8 +722,7 @@ def main() -> int:
             isolated.append({"scene": name,
                              "reasons": [f"export failed: {type(exc).__name__}: {exc}"]})
     blob = {"exporter": EXPORTER_VERSION, "batch": str(batch),
-            "map": str(args.map), "min_coverage": args.min_coverage,
-            "max_after_px": args.max_after_px,
+            "map": str(args.map), **gates,
             "scenes_total": len(names), "exported": exported,
             "isolated": isolated,
             "frames_exported": int(sum(e["n_frames"] for e in exported)),
