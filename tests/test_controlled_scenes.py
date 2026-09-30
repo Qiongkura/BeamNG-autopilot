@@ -376,3 +376,69 @@ def test_tier_convention_covers_wider_lateral_prior():
     src = (ROOT / "scripts" / "m5_controlled_scenes.py").read_text(encoding="utf-8")
     assert '"tiers"' in src and "LINE_TIER_M[k % len(LINE_TIER_M)]" in src
     assert 'if role == "straddled":' in src, "straddled 档要固定 -0.4（保角色可判）"
+
+
+def test_devdist_cycle_matches_measured_vocabulary_and_probe_roles():
+    """devdist 循环：实例配比贴近实测词表，且角色与**探针自己的**规则一致。
+
+    实测（174 实例，docs §2）：straddled 13.8% / near_left 32.2% / near_right
+    28.7% / far_left 12.1% / far_right 13.2%；横向主峰 −0.75…0.00（§1）。
+    探针 `assign_roles` 的规则是"同侧由近到远定 near_/far_"——生成侧声明的角色
+    必须满足它，否则生成词表与评价词表会漂移（角色一致率会被系统性扣分）。
+    """
+    m = _load()
+    cyc = m.LINE_DEVDIST_CYCLE
+    roles = [r for pair in cyc for r, _lat in pair]
+    from collections import Counter
+    c = Counter(roles)
+    n = len(roles)
+    assert n == 12, n
+    share = {k: v / n for k, v in c.items()}
+    measured = {"straddled": 0.138, "near_left": 0.322, "near_right": 0.287,
+                "far_left": 0.121, "far_right": 0.132}
+    for k, want in measured.items():
+        assert abs(share.get(k, 0.0) - want) <= 0.06, (k, share, measured)
+    assert set(share) == set(measured), share
+    # 密度：每站 2 条（开发集 2.3 条/帧）
+    assert all(len(p) == 2 for p in cyc)
+    # 主峰：straddled 的位置必须落在实测主峰 −0.75…0.00 且 |lat|<=STRADDLE_M
+    for pair in cyc:
+        for r, lat in pair:
+            if r == "straddled":
+                assert -0.75 <= lat <= 0.0 and abs(lat) <= 0.5, (r, lat)
+            if r.startswith("far_"):
+                assert abs(lat) >= 3.0, (r, lat)
+    # **用探针自己的 assign_roles 校验声明角色**
+    import importlib.util as _iu
+    spec = _iu.spec_from_file_location(
+        "m5_marking_identity_probe",
+        ROOT / "scripts" / "m5_marking_identity_probe.py")
+    ip = _iu.module_from_spec(spec)
+    sys.modules["m5_marking_identity_probe"] = ip
+    spec.loader.exec_module(ip)
+    for pair in cyc:
+        # straddled 由 role_of(|lat|<=STRADDLE_M) 决定，near_/far_ 由
+        # assign_roles（同侧由近到远）决定——两步都要对得上
+        got = ip.assign_roles([{"role": ip.role_of(float(lat)),
+                                "lat_m": float(lat)} for _r, lat in pair])
+        for (r, lat), g in zip(pair, got):
+            assert g["role"] == r, (pair, [x["role"] for x in got])
+
+
+def test_pick_anchors_filters_by_half_width():
+    """宽路过滤：devdist 的远线需要半宽够大的锚点；不够宽就不返回（不偷放）。"""
+    m = _load()
+    narrow = {"roadN": {"lanesLeft": 1, "lanesRight": 1, "edges": [
+        {"middle": [k * 10.0, 0.0, 1.0], "left": [k * 10.0, 2.5],
+         "right": [k * 10.0, -2.5]} for k in range(20)]}}
+    wide = {"roadW": {"lanesLeft": 2, "lanesRight": 2, "edges": [
+        {"middle": [500.0 + k * 10.0, 0.0, 1.0], "left": [500.0 + k * 10.0, 5.0],
+         "right": [500.0 + k * 10.0, -5.0]} for k in range(20)]}}
+    roads = {**narrow, **wide}
+    a0 = m.pick_anchors(roads, n_anchors=5, min_sep_m=50.0)
+    assert {a["road_id"] for a in a0} == {"roadN", "roadW"}
+    assert all(a["half_width_m"] is not None for a in a0)
+    a1 = m.pick_anchors(roads, n_anchors=5, min_sep_m=50.0,
+                        min_half_width_m=4.6)
+    assert [a["road_id"] for a in a1] == ["roadW"], a1
+    assert a1[0]["half_width_m"] >= 4.6

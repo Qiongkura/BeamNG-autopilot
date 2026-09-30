@@ -118,6 +118,32 @@ MIXED_DENSITY_CYCLE = (
 #: 更宽的位置分布；每个档位仍夹在铺装内（|lat| <= half-0.3），窄路上自动收缩。
 #: straddled 档固定 -0.4 m（|lat|<=STRADDLE_M=0.5 保证角色可判）。
 LINE_TIER_M = (1.2, 1.8, 2.4)
+#: **开发集线位分布驱动**（`--line-convention devdist`）：位置与角色配比按
+#: 开发集**人工标签**实测来放，修 §16.1/§16.4 的"线位差 1–8 m"匹配层损失。
+#:
+#: 实测依据：
+#: * 实例词表（174 实例，§2）：straddled 13.8% / near_left 32.2% /
+#:   near_right 28.7% / far_left 12.1% / far_right 13.2%；
+#: * 横向直方图（249k 近场线像素，§1）：主峰 **−0.75…0.00（41.8%）**，
+#:   近线 ±1.5…2.5，远线 ±3…6（左侧远端 +3…+6 有 17.3%）；
+#: * 密度 2.3 条/帧（174 实例/76 帧）。
+#:
+#: 6 步循环（每站 2 条 → 密度 2.0），角色必须与探针 `assign_roles` 的规则
+#: 一致（**同侧按由近到远**定 near_/far_）——所以 far_* 只能出现在"同侧两条"
+#: 的站上；`tests/test_controlled_scenes.py` 用探针自己的 `assign_roles`
+#: 逐站校验声明的角色，避免"生成侧词表"与"评价侧词表"漂移。
+LINE_DEVDIST_CYCLE = (
+    (("near_left", +1.8), ("near_right", -1.8)),
+    (("straddled", -0.4), ("near_left", +2.0)),
+    (("near_left", +1.7), ("far_left", +4.0)),
+    (("straddled", -0.3), ("near_right", -1.9)),
+    (("near_right", -1.7), ("far_right", -4.0)),
+    (("near_left", +2.2), ("far_left", +4.2)),
+)
+#: 远线（|lat| ≥ 3 m）需要**宽铺装**才放得下（生成时仍按 `|lat| <= half-0.3`
+#: 夹紧）：窄路上远线会被夹回近线带，等于没生成 far_* 质量。`--anchor-min-half-width`
+#: 让锚点挑选只取够宽的路段。
+LINE_FAR_MIN_HALF_M = 4.6
 #: 为什么是 ±1.8 m 而不是实测的 ±2.1/−2.6 m：实测那些位置在同一锚点上
 #: annotation 覆盖只有 0.54（对称 ±1.8 m 是 0.81）——**被标注的铺装带比 roadnet
 #: 的半宽窄**，靠外的线落在标注之外。覆盖门是硬门，所以位置夹回 ±1.8 m；
@@ -246,12 +272,18 @@ def read_road_network(conn) -> dict:
 
 
 def pick_anchors(roads: dict, *, n_anchors: int,
-                 min_sep_m: float = 150.0) -> list[dict]:
+                 min_sep_m: float = 150.0,
+                 min_half_width_m: float = 0.0) -> list[dict]:
     """从 road network 里挑 **n 条互不相邻** 的道路作锚点（§4.4：先加路段）。
 
     每条道路取中段一行为锚点：位置 = 该行 middle，方向 = 相邻行方向。
     锚点间最小间距 ``min_sep_m``：同一段路的不同站点算同一"路段/场景族"，
     扩量要先加**路段**再加近邻帧。
+
+    ``min_half_width_m > 0`` 时只取**铺装够宽**的路段（锚点行的 left/right
+    横向间距的一半 ≥ 该值）：`devdist` 约定的远线（|lat| ≥ 3 m）在窄路上会被
+    `|lat| <= half-0.3` 夹回近线带，等于没生成 far_* 质量。没有够宽的路段时
+    返回空表（调用方如实报"挑不出"，不偷偷放宽）。
     """
     cands: list[dict] = []
     for rid, meta in (roads or {}).items():
@@ -266,9 +298,25 @@ def pick_anchors(roads: dict, *, n_anchors: int,
         d = _unit(b - a)
         if float(np.linalg.norm(d)) < 1e-9:
             continue
+        half = None
+        try:                       # 锚点行的铺装半宽（与 plan_sites_at 同口径）
+            row = edges[k]
+            mid2 = np.asarray(row["middle"], dtype=float)[:2]
+            l2 = np.asarray(row["left"], dtype=float)[:2]
+            r2 = np.asarray(row["right"], dtype=float)[:2]
+            # 半宽 = 左右边界点间距的一半（不是"各自到中线的距离之差"——
+            # 实测踩到：左右对称时那个式子恒等于 0，宽路全被过滤掉）
+            half = 0.5 * float(np.linalg.norm(l2 - r2))
+        except Exception:                                    # noqa: BLE001
+            half = None
+        if (float(min_half_width_m) > 0.0
+                and (half is None or half < float(min_half_width_m))):
+            continue
         cands.append({"road_id": str(rid), "pos": [float(v) for v in a],
                       "dir": [float(v) for v in d],
-                      "n_rows": len(edges)})
+                      "n_rows": len(edges),
+                      "half_width_m": (None if half is None
+                                       else round(float(half), 3))})
     # 长的道路优先（给布站留空间），再按最小间距去重
     cands.sort(key=lambda c: -c["n_rows"])
     out: list[dict] = []
@@ -535,7 +583,16 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
                "materials": {}, "lines": [], "gravel": None}
         # 车道边界（真值几何：铺装边界 = 路面边缘；线在车道分界上）
         _specs = spec["lines"]
-        if LINE_CONVENTION in ("measured", "relative", "tiers") and spec["lines"]:
+        _devlat: dict | None = None      # devdist：按实测横向放线（见下）
+        if LINE_CONVENTION == "devdist" and spec["lines"]:
+            # **开发集线位分布驱动**：每站取循环里的 (role, lat) 对
+            # （角色与探针 assign_roles 同规则，测试用探针自己校验）。
+            _pair = LINE_DEVDIST_CYCLE[k % len(LINE_DEVDIST_CYCLE)]
+            _devlat = {rn: float(lat) for rn, lat in _pair}
+            _specs = [("yellow" if rn.endswith("_left") else "white",
+                       1 if float(lat) >= 0 else -1, rn)
+                      for rn, lat in _pair]
+        elif LINE_CONVENTION in ("measured", "relative", "tiers") and spec["lines"]:
             # 按参考词表放线：位置来自 LINE_ROLE_TARGETS，夹在铺装内
             # （|lat| > half-0.3 的线会落在铺装外、annotation 不覆盖 ->
             # 资格门必失败），并去掉彼此 <1 m 的重复线。
@@ -548,7 +605,16 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
                        1 if float(LINE_ROLE_LATERAL_M[rn]) >= 0 else -1, rn)
                       for rn in _roles]
         for kind, sign, role in _specs:
-            if LINE_CONVENTION == "tiers":
+            if LINE_CONVENTION == "devdist":
+                # 实测线位直接用；仍夹在铺装内（|lat| <= half-0.3），
+                # **夹紧量记进实例**（`lat_clamped_m`）——远线在窄路上被夹回
+                # 近线带时，报告里必须能看出来，否则"生成了 far_*"是假的。
+                half = float(site["half_width_m"])
+                lat = float((_devlat or {}).get(role, sign * LAT_LANE_HALF))
+                _clamped = max(-(half - 0.3), min(half - 0.3, lat))
+                _lat_clamp = round(_clamped - lat, 3)
+                lat = _clamped
+            elif LINE_CONVENTION == "tiers":
                 half = float(site["half_width_m"])
                 if role == "straddled":
                     lat = -0.4
@@ -574,6 +640,11 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
             inst = {"id": rid, "role": role, "material": _MAT[kind],
                     "width_m": LINE_WIDTH_M, "lateral_m": round(lat, 3),
                     "nodes": nodes, "truth_points": _line_truth(nodes, role)}
+            if LINE_CONVENTION == "devdist":
+                # 声明线位 vs 实际线位：窄路上远线被夹回近线带时必须可见
+                inst["declared_lateral_m"] = round(
+                    float((_devlat or {}).get(role, lat)), 3)
+                inst["lat_clamped_m"] = round(float(_lat_clamp), 3)
             rec["lines"].append(inst)
             record["line_instances"].append({"scene": name, **inst})
         if spec.get("gravel"):
@@ -1030,7 +1101,8 @@ def main() -> int:
     ap.add_argument("--step-m", type=float, default=0.0,
                     help="逐帧沿站点方向前进的米数（0 = 原地）")
     ap.add_argument("--line-convention",
-                    choices=("symmetric", "measured", "relative", "tiers"),
+                    choices=("symmetric", "measured", "relative", "tiers",
+                             "devdist"),
                     default="symmetric",
                     help="线位约定：symmetric=±LAT_LANE_HALF（旧）；"
                          "measured=开发集实测绝对线位；relative=按铺装半宽"
@@ -1044,6 +1116,9 @@ def main() -> int:
     ap.add_argument("--anchors", type=int, default=1,
                     help="从 road network 里挑几条互不相邻的路段（§4.4：先加路段）")
     ap.add_argument("--anchor-min-sep-m", type=float, default=150.0)
+    ap.add_argument("--anchor-min-half-width", type=float, default=0.0,
+                    help="只取铺装半宽 >= 该值的锚点（devdist 的远线需要宽路；"
+                         "0 = 不限）")
     ap.add_argument("--spacing-m", type=float, default=SITE_SPACING_M)
     args = ap.parse_args()
 
@@ -1083,7 +1158,9 @@ def main() -> int:
         roads = read_road_network(conn)
         types_order = list(args.scenes)
         anchors = pick_anchors(roads, n_anchors=int(args.anchors),
-                               min_sep_m=float(args.anchor_min_sep_m))
+                               min_sep_m=float(args.anchor_min_sep_m),
+                               min_half_width_m=float(
+                                   args.anchor_min_half_width))
         if not anchors:
             raise RuntimeError("road network 里挑不出锚点")
         report["anchors"] = anchors
