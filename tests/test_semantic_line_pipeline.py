@@ -572,3 +572,54 @@ class TestOptionalSurfaceGate:
                                                 surface_gate=True)
         assert len(kept) == 1 and not dropped, "路面未知时不得据此丢弃"
         assert mk.meta["surface_frac"] is None
+
+
+# ------------------------------------------------- 同侧近邻候选合并（路线 b）
+
+def test_merge_close_candidates_same_side_only():
+    """同侧 <1.5 m 合并成一条（并集），异侧/远距不动，可关。
+
+    实测依据（T16 §18.5 路线 b）：未匹配候选里 15–23% 与**同侧 1.5 m 内的已匹配
+    候选**成对出现（同一根线被切成两条），合并是**参考无关**的，离线账面身份率
+    +0.040…+0.065 且已匹配候选一条不丢。真线间距 ≥2.5 m（车道宽），
+    1.5 m 半径不会把两根真线并成一根。
+    """
+    import numpy as np
+    from beamng_autopilot.vision.segmentation import merge_close_candidates
+    from beamng_autopilot.vision.lanes import LaneMarking
+
+    def mk(lat, n=5):
+        return LaneMarking(world=np.array([[0.0, float(lat)]] * n),
+                           pixels=np.zeros((n, 2)), color="white",
+                           kind="thin", confidence=0.5)
+
+    # 生产默认半径 0.5 m（实测选定，见 §19）：0.3 m 的两条并成一条
+    out, info = merge_close_candidates([mk(1.7), mk(2.0)], pos=(0.0, 0.0, 0.0),
+                                       heading=0.0)
+    assert len(out) == 1 and info["merged"] == 1
+    assert out[0].meta["merged_from"] == 2
+    assert len(out[0].world) == 10          # 并集：信息只增不减
+    # 同侧 1.2 m：默认半径下**不合并**（真线近/远档可以只差 1.0–1.5 m）
+    assert len(merge_close_candidates([mk(1.7), mk(2.9)], pos=(0.0, 0.0, 0.0),
+                                      heading=0.0)[0]) == 2
+    # 显式放大半径（测量用）：1.2 m 会合并
+    big, info_big = merge_close_candidates([mk(1.7), mk(2.9)],
+                                           pos=(0.0, 0.0, 0.0), heading=0.0,
+                                           max_gap_m=1.5)
+    assert len(big) == 1 and info_big["merged"] == 1
+    # 同侧 2.5 m（真线间距量级）：不合并
+    assert len(merge_close_candidates([mk(1.7), mk(4.2)], pos=(0.0, 0.0, 0.0),
+                                      heading=0.0)[0]) == 2
+    # 异侧 1.2 m：不合并（横向符号不同）
+    assert len(merge_close_candidates([mk(1.7), mk(-1.7)], pos=(0.0, 0.0, 0.0),
+                                      heading=0.0)[0]) == 2
+    # 关掉：原样返回
+    off, info_off = merge_close_candidates([mk(1.7), mk(2.0)],
+                                           pos=(0.0, 0.0, 0.0), heading=0.0,
+                                           enable=False)
+    assert len(off) == 2 and info_off["enabled"] is False
+    # 缺 world 的候选（无法定位）：保留、不参与合并
+    bad = LaneMarking(world=np.zeros((0, 2)), pixels=np.zeros((3, 2)))
+    out2, _ = merge_close_candidates([mk(1.7), mk(2.0), bad],
+                                     pos=(0.0, 0.0, 0.0), heading=0.0)
+    assert len(out2) == 2

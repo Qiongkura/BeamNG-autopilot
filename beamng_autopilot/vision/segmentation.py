@@ -14,6 +14,7 @@ Output masks are consumed by the existing geometry pipeline:
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 import time
 
@@ -33,6 +34,11 @@ _INFER_W, _INFER_H = 536, 403  # 训练分辨率
 # 在 536x403 上至少 ~150 px；远距离细线也能到几十 px，但形态细长，
 # 由 max(cw, ch) >= 24 分支保留）。
 _LINE_MIN_AREA_PX = 150
+#: 同侧候选合并的最大横向间距（米）。**实测选定 0.5**（5 个 checkpoint 扫描
+#: 2026-09-30，T16 §19）：半径越大角色一致率越高（+0.07…+0.27）、身份率越低
+#: （−0.006…−0.034）；0.5 m 是"角色明显变好、身份代价最小"的一档。
+#: 依据见 ``merge_close_candidates`` 的 docstring。
+LINE_MERGE_MAX_GAP_M = 0.5
 # Soil / gravel colour window (OpenCV HSV): warm hue, saturated enough and
 # not in shadow.  Used only to keep the car on the PAVED surface - see
 # ``strip_soil_from_road``.
@@ -362,6 +368,105 @@ def default_model_path() -> Path | None:
             return by_map
     p = base / "best.pt"
     return p if p.is_file() else None
+
+
+def merge_close_candidates(markings, *, pos=None, heading=None,
+                           max_gap_m: float = LINE_MERGE_MAX_GAP_M,
+                           enable: bool | None = None,
+                           debug: dict | None = None) -> tuple:
+    """同侧、横向间距 < ``max_gap_m`` 的候选合并成一条（**参考无关**）。
+
+    为什么（2026-09-30 实测，T16 §18.5 路线 b）：未匹配候选里 **15–23% 与同侧
+    1.5 m 内的已匹配候选成对出现**（同一根线被切成两条、或线旁多出一条），
+    合并规则**不需要真值**（只看横向位置）。**5 个 checkpoint 的实测**（半径扫描，
+    T16 §19）：
+
+    | 半径 | 身份率变化 | 角色一致率变化 |
+    |---|---|---|
+    | 0.5 m（生产默认） | −0.006…−0.033 | **+0.07…+0.10** |
+    | 1.0 m | −0.011…−0.034 | **+0.14…+0.27** |
+
+    即：**合并是"角色杠杆"而不是"身份杠杆"**——离线"只删未匹配、保留已匹配"
+    的账（身份 +0.04）是**参考相关**的假设，提取器没有真值，做不到；实际合并会
+    把"两条各自匹配不同参考的近邻线"并成一条（M 与 R 同时减），所以身份率不升
+    反微降。角色一致率大幅上升是因为同侧多画一条正是 near_/far_ 判错的来源
+    （§18.5）。默认取 0.5 m：角色明显改善、身份代价最小。
+
+    为什么不是别的便宜路线（同一次测量里被否掉）：
+    * "候选必须落在**模型自己的路面掩码**上"（surface gate）会连 84% 的**已匹配**
+      候选一起丢——模型的路面掩码沿漆线有洞（`gate_line_candidates` 的注释里
+      就写了这件事），身份率数字变好是 M 崩掉的假象；
+    * 形状/长宽比门对 learned-backed 候选无效（它们无条件保留，占未匹配的 60%）。
+
+    合并取**并集**（world/pixels 拼接，保留点最多那条的颜色/类型/置信度），
+    所以信息只增不减；``meta["merged_from"]`` 记合并了几条。
+    返回 ``(markings, info)``。
+    """
+    from beamng_autopilot.vision.lanes import LaneMarking
+    if enable is None:
+        enable = os.environ.get("BEAMNG_LINE_MERGE", "1") != "0"
+    #: 单因子测量用（默认 = 生产常量）：合并半径可被环境变量覆盖，
+    #: 因为"半径多大会把两根真线并成一根"必须实测（见
+    #: ``docs/T16_..._20260928.md`` §19）。
+    if os.environ.get("BEAMNG_LINE_MERGE_GAP_M"):
+        max_gap_m = float(os.environ["BEAMNG_LINE_MERGE_GAP_M"])
+    ms = list(markings or [])
+    info = {"enabled": bool(enable), "in": len(ms), "out": len(ms),
+            "merged": 0, "groups": 0}
+    if not enable or len(ms) < 2 or pos is None or heading is None:
+        if debug is not None:
+            debug["line_candidate_merge"] = info
+        return ms, info
+    h = float(heading)
+    left = np.array([-math.sin(h), math.cos(h)])
+    pos2 = np.asarray(pos, dtype=float)[:2]
+
+    def _lat(mk):
+        w = np.asarray(getattr(mk, "world", None), dtype=float)
+        if w.ndim != 2 or len(w) == 0 or w.shape[1] < 2:
+            return None
+        return float((np.median(w[:, :2], axis=0) - pos2) @ left)
+
+    unknown = [mk for mk in ms if _lat(mk) is None]
+    known = sorted(((_lat(mk), mk) for mk in ms if _lat(mk) is not None),
+                   key=lambda x: x[0])
+    groups: list[list] = []
+    for lat, mk in known:
+        if groups and abs(lat - groups[-1][-1][0]) < float(max_gap_m):
+            groups[-1].append((lat, mk))
+        else:
+            groups.append([(lat, mk)])
+    out: list = list(unknown)
+    for g in groups:
+        if len(g) == 1:
+            out.append(g[0][1])
+            continue
+        info["merged"] += len(g) - 1
+        info["groups"] += 1
+        main = max((mk for _l, mk in g),
+                   key=lambda mk: len(np.asarray(getattr(mk, "pixels", ())))
+                   if getattr(mk, "pixels", None) is not None else 0)
+        worlds = [np.asarray(mk.world, dtype=float) for _l, mk in g
+                  if getattr(mk, "world", None) is not None]
+        pixs = [np.asarray(mk.pixels, dtype=float) for _l, mk in g
+                if getattr(mk, "pixels", None) is not None]
+        meta = dict(getattr(main, "meta", None) or {})
+        meta["merged_from"] = len(g)
+        meta["merged_lat_m"] = round(float(np.median([l for l, _m in g])), 3)
+        out.append(LaneMarking(
+            world=(np.concatenate(worlds, axis=0) if worlds
+                   else np.asarray(main.world, dtype=float)),
+            pixels=(np.concatenate(pixs, axis=0) if pixs
+                    else np.asarray(main.pixels, dtype=float)),
+            color=str(getattr(main, "color", "unknown")),
+            kind=str(getattr(main, "kind", "unknown")),
+            confidence=max(float(getattr(mk, "confidence", 0.0) or 0.0)
+                           for _l, mk in g),
+            meta=meta))
+    info["out"] = len(out)
+    if debug is not None:
+        debug["line_candidate_merge"] = info
+    return out, info
 
 
 def gate_line_candidates(markings, line_mask, road_mask,
@@ -719,7 +824,8 @@ class Segmenter:
         Both masks share the same ground-plane back-projection pipeline.
         """
         from beamng_autopilot.vision.lanes import (
-            _mask_to_markings, WHITE_SAT_MAX, recover_dashed_boundaries)
+            LaneMarking, _mask_to_markings, WHITE_SAT_MAX,
+            recover_dashed_boundaries)
 
         # An explicit (possibly empty) mask is authoritative: do not run
         # inference again or discard the head's temporal fusion.
@@ -829,7 +935,9 @@ class Segmenter:
             # 单因子测量；要改默认必须走协议新版本，不能为了分数临时删来源。
             _yellow_mode = os.environ.get("BEAMNG_LINE_YELLOW_ARM", "1").lower()
             if _yellow_mode in ("0", "off"):
-                return out
+                _m, _info = merge_close_candidates(
+                    out, pos=pos, heading=heading, debug=debug)
+                return _m
             for _ymk in _mask_to_markings(
                     cv_yellow.astype(np.uint8) * 255, "yellow",
                     cam_model, pos, heading, ground_z=ground_z,
@@ -864,7 +972,11 @@ class Segmenter:
                     if np.count_nonzero(_lm[_vy, _ux]) == 0:
                         continue                 # 学习掩码完全没覆盖 -> 不可信
                 out.append(_ymk)
-        return out
+        # 候选提取的最后一步：同侧近邻合并（参考无关，见
+        # ``merge_close_candidates`` 的实测依据）
+        _merged, _info = merge_close_candidates(
+            out, pos=pos, heading=heading, debug=debug)
+        return _merged
 
     def offroad_mask(self, frame_rgb: np.ndarray) -> np.ndarray:
         """True where the frame is NOT asphalt (feeds edge extraction)."""
