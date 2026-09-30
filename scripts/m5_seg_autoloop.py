@@ -2895,11 +2895,16 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 "hard_by_seed": hard_by_seed,
                 # v5 计数契约（方案 v2 §S3.7）：判定必须自带**整数计数**，
                 # 否则 replay 无法按新分母重判（legacy_replay_note 会明确说明）。
+                # **这是最后一个 seed 那一次评价的计数**（循环变量 `_idc` 出
+                # 循环后只剩末 seed）：它内部按候选池化（"micro 口径"），
+                # 但**不是**跨 seed 的池化，也不是逐 seed 均值。实测踩到：
+                # 把这里当"本臂的 micro 身份率"引用，会把某个 seed 的读数
+                # 当成整臂结论（0.4316 其实是 seed 44 的值，整臂均值 0.3979）。
                 "counts": _idc.get("counts") or {},
-                # 由 counts **派生**的池化比率（micro 口径）：replay 用它自查
-                # "计数与比率是不是同一批数"——只存 counts 的话，手改过的比率
-                # 查不出来（复核者 T12②）。它与 hard_gate 的逐 seed 均值不是
-                # 同一口径（micro vs macro），不能混比。
+                "counts_seed": str(args.seeds[-1]) if args.seeds else None,
+                # 由 counts **派生**的池化比率：replay 用它自查"计数与比率是不是
+                # 同一批数"——只存 counts 的话，手改过的比率查不出来（复核者
+                # T12②）。与 hard_gate 的逐 seed 均值不是同一口径，不能混比。
                 "counts_ratios": _cm.ratios(_idc.get("counts") or {}),
                 "counts_by_group": _idc.get("counts_by_group") or {},
                 # 评价 run 的缺测（T11）：空列表才是"每个 run 都测到了"，
