@@ -21,7 +21,15 @@ import json
 from .labels import PAINT_SOURCE_RANK
 
 #: 协议版本：定义/覆盖/资格任一处改动都要递增，并写进判定文件
-PROTOCOL_VERSION = "t14-protocol-v6"
+#:
+#: v7（2026-09-30）：**候选集口径**变了——候选提取新增"同侧近邻合并"
+#: （`vision.segmentation.merge_close_candidates`，生产默认半径 0.5 m）。
+#: 实测（5 个 checkpoint 半径扫描，T16 §19）：角色一致率 +0.07…+0.10、
+#: 身份率 −0.006…−0.033（半径 1.0 m 时角色 +0.14…+0.27、身份 −0.011…−0.034）。
+#: 候选集属于协议口径的一部分，所以必须递增版本、并**统一**应用到所有臂
+#: （旧判定里的 C/R/M 与 v7 不可混比）。开关：`BEAMNG_LINE_MERGE=0` 关，
+#: `BEAMNG_LINE_MERGE_GAP_M` 覆盖半径（仅测量用）。
+PROTOCOL_VERSION = "t14-protocol-v7"
 
 # ---------------------------------------------------------------------------
 # 指标字典：name -> 定义
