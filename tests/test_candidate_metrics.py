@@ -112,3 +112,28 @@ def test_accumulate_only_adds_integers_never_ratios():
     assert "candidate_identity_rate" not in acc, acc
     cm.accumulate(acc, {"C": 4, "R": 1})
     assert acc["C"] == 7 and acc["R"] == 3, acc
+
+
+def test_attribution_tool_scopes_candidates_to_p_frames():
+    """归因脚本的候选口径必须与协议一致：无线真值的帧记 `C_outside_P`。
+
+    实测踩到（2026-09-30）：两个 P_frames=0 的开发场景贡献了 477/531 个
+    "无参考候选"，于是"模型到处乱画"的结论是从**不判线**的帧里读出来的
+    （协议口径 C=385，脚本却报 1021）。修法是按帧适用性分流：不在 P 的帧
+    只累加 `candidates_outside_p` 并 `continue`，不进 C/R/M。
+
+    这里是源码级回归守卫（脚本要跑真模型才能端到端测）：分流语句与计数键
+    必须同时在，且 `continue` 必须在累加之后。
+    """
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "scripts"
+           / "m5_candidate_failure_attribution.py").read_text(encoding="utf-8")
+    assert "candidates_outside_p" in src, "必须单独记 C_outside_P"
+    assert src.count("candidates_outside_p") >= 4, \
+        "totals/agg/累加/打印 四处都要有（否则口径只改了一半）"
+    i = src.index('if not has_truth:')
+    j = src.index('candidates_outside_p', i)
+    k = src.index('continue', j)
+    assert i < j < k, "分流必须先累加 C_outside_P 再 continue"
+    # 比率口径要写明只含 P 帧
+    assert '"scope"' in src and "frames with line truth only" in src
