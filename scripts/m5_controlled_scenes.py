@@ -138,9 +138,32 @@ SCENES: dict[str, dict] = {
     "slope_curve": {"lines": [("white", +1, "left"), ("yellow", -1, "right")]},
     "material_mix": {"lines": [("white", +1, "left"), ("blue", -1, "right")],
                      "gravel": True},
+    # **结构负例**（T16 §16.1 的机制修复）：身份率的损失是模型在墙/护栏这类
+    # "像线的非漆结构"上多画线。这类场景**不生成漆线**（line_generated=False），
+    # 但在路侧放地图自带的静态物件（石墙 / 护栏）——它们在引擎 annotation 里是
+    # **非路面、非线**（GUARD_RAIL/BACKGROUND），外观却是亮的、细长的，正是
+    # "亮≠线"的对比样本。实机探针（2026-09-30）验证过：能加、能渲染、annotation
+    # 非线非路面。
+    "structure_negative": {"lines": [],
+                           "structures": ["wall_stone", "guardrail"]},
 }
 _MAT = {"white": MAT_LINE_WHITE, "yellow": MAT_LINE_YELLOW,
         "blue": MAT_LINE_BLUE}
+
+#: 结构负例用的地图自带静态物件：``shapeName`` 取自 levels/italy 的
+#: items.level.json（石墙 442 处、护栏 149 处），**不引入域外资产**。
+#: (shapeName, 横向符号(+左/-右), 距铺装边多少米)
+STRUCT_SHAPES: dict[str, tuple] = {
+    "wall_stone": ("/levels/italy/art/shapes/buildings/"
+                   "italy_wall_stone_bricktop.dae", +1.0, 0.9),
+    "guardrail": ("/levels/italy/art/shapes/buildings/"
+                  "italy_guardrails_railing.dae", -1.0, 0.9),
+    "jersey": ("art/shapes/objects/jerseybarrier_3m.dae", -1.0, 2.6),
+}
+#: 结构沿站点摆放：从 6 m 起、每 4 m 一个、共 7 个（覆盖 6–30 m，与线链同跨度）
+STRUCT_FIRST_M = 6.0
+STRUCT_STEP_M = 4.0
+STRUCT_COUNT = 7
 
 
 def _load_probe():
@@ -481,6 +504,7 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
     """
     from beamngpy import Scenario, Vehicle
     from beamngpy.scenario.road import Road
+    from beamngpy.scenario.scenario_object import ScenarioObject
     from beamngpy.misc.quat import angle_to_quat
 
     scen = Scenario("italy", "m5_controlled_scenes")
@@ -590,6 +614,40 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
         record["vehicles"]["blocker"] = {
             "pos": [float(pos[0]), float(pos[1]), float(mid[2])],
             "ahead_m": OCCLUDER_AHEAD_M, "model": OCCLUDER_MODEL}
+
+    # 结构负例：路侧放地图自带的静态物件（石墙 / 护栏）。**不是**漆线，
+    # annotation 里也不是线类——它们的作用是教"亮的细长结构 ≠ 线"。
+    # 每个物件都记进 record，导出侧据此把"像线的外观"归因到已声明结构上。
+    for k, name in enumerate(scene_names):
+        spec = SCENES[scene_types[k]]
+        site = sites[k]
+        for skind in spec.get("structures") or []:
+            if skind not in STRUCT_SHAPES:
+                raise KeyError(f"未登记的结构种类 {skind!r}："
+                               f"可选 {sorted(STRUCT_SHAPES)}")
+            shape, sign, off = STRUCT_SHAPES[skind]
+            mid = np.asarray(site["mid"], dtype=float)
+            d = _unit(site["dir"])
+            left2d = np.array([-d[1], d[0]])
+            lat = float(sign) * (float(site["half_width_m"]) + float(off))
+            yaw = -math.degrees(math.atan2(d[1], d[0])) - 90.0
+            rec_s = record["sites"][name]
+            rec_s["structures"] = []
+            for j in range(int(STRUCT_COUNT)):
+                s = STRUCT_FIRST_M + STRUCT_STEP_M * j
+                p = mid + d * s + np.array([left2d[0], left2d[1], 0.0]) * lat
+                z = _z_at(site, s)
+                oid = f"m5_{skind}_{name}_{j}"
+                scen.add_object(ScenarioObject(
+                    oid, oid, "TSStatic",
+                    pos=(float(p[0]), float(p[1]), float(z)),
+                    scale=(1.0, 1.0, 1.0),
+                    rot_quat=angle_to_quat((0.0, 0.0, yaw)),
+                    shapeName=shape))
+                rec_s["structures"].append({
+                    "id": oid, "kind": skind, "shape": shape,
+                    "lateral_m": round(lat, 3), "station_m": round(s, 2),
+                    "pos": [float(p[0]), float(p[1]), float(z)]})
     return scen, record
 
 

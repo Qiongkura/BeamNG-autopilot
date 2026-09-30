@@ -68,7 +68,8 @@ def _road(n_rows=60, step=10.0, width=4.0):
 def test_five_scene_classes_are_specified():
     m = _load()
     assert set(m.SCENES) == {"known_line", "known_no_line", "occluded_line",
-                             "slope_curve", "material_mix"}
+                             "slope_curve", "material_mix",
+                             "structure_negative"}
     assert m.SCENES["known_no_line"]["lines"] == []
     assert m.SCENES["occluded_line"].get("occluder") is True
     assert m.SCENES["material_mix"].get("gravel") is True
@@ -78,6 +79,28 @@ def test_five_scene_classes_are_specified():
         for kind, _sign, _role in spec["lines"]:
             assert kind in m._MAT
             assert "italy_road_markings" in m._MAT[kind]
+
+
+def test_structure_negative_is_line_free_with_map_props():
+    """结构负例：不生成漆线 + 放地图自带静态物件（石墙/护栏）。
+
+    机制（T16 §16.1）：身份率的损失是模型在"像线的非漆结构"上多画线。
+    这类场景必须**没有漆线**（否则不是负例），结构必须是**地图自己的资产**
+    （shapeName 取自 levels/italy，不引入域外外观），且摆放参数要落在路侧
+    而不是铺装上（压到铺装会挡住自车/真值）。
+    """
+    m = _load()
+    spec = m.SCENES["structure_negative"]
+    assert spec["lines"] == [], "结构负例不得生成漆线"
+    assert spec["structures"] == ["wall_stone", "guardrail"]
+    for kind in spec["structures"]:
+        shape, sign, off = m.STRUCT_SHAPES[kind]
+        assert "art/shapes" in shape or shape.endswith(".dae"), shape
+        assert abs(float(sign)) == 1.0 and float(off) > 0.0
+    # 跨度与线链一致（6–30 m），数量/步长自洽
+    assert m.STRUCT_FIRST_M == 6.0 and m.STRUCT_STEP_M == 4.0
+    assert m.STRUCT_COUNT == 7
+    assert (m.STRUCT_FIRST_M + m.STRUCT_STEP_M * (m.STRUCT_COUNT - 1)) <= 34.0
 
 
 def test_line_nodes_follow_the_site_direction_and_lateral_sign():
