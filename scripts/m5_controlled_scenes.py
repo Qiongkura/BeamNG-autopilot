@@ -144,6 +144,22 @@ LINE_DEVDIST_CYCLE = (
 #: 夹紧）：窄路上远线会被夹回近线带，等于没生成 far_* 质量。`--anchor-min-half-width`
 #: 让锚点挑选只取够宽的路段。
 LINE_FAR_MIN_HALF_M = 4.6
+#: **`pairfar`：同侧近+远成对扩量**（`--line-convention pairfar`）。依据
+#: （2026-09-30，T16 §21）：近/远档配比臂在 6 seed 下**确认改善**身份率 +0.0214、
+#: 精度 +0.1147、IoU +0.0828、路外假线 −32%——而该臂只有 **16 帧**成对数据。
+#: 本节把它扩量看剂量-效应：每个有线站点都放**同侧一对**（内=近、外=远，
+#: 满足探针 `assign_roles` 的"同侧由近到远"），两侧交替，6 步循环。
+LINE_PAIRFAR_CYCLE = (
+    (("near_left", +1.7), ("far_left", +4.0)),
+    (("near_right", -1.7), ("far_right", -4.0)),
+    (("near_left", +2.0), ("far_left", +4.2)),
+    (("near_right", -1.9), ("far_right", -4.2)),
+    (("near_left", +1.8), ("far_left", +3.8)),
+    (("near_right", -1.8), ("far_right", -3.8)),
+)
+#: 成对扩量要求半宽 ≥ 4.5 m（远线 |lat| 最大 4.2 + 0.3 夹紧余量——
+#: 测试用这条不变式校验常量，写 4.3 时当场被抓住）
+LINE_PAIRFAR_MIN_HALF_M = 4.5
 #: 为什么是 ±1.8 m 而不是实测的 ±2.1/−2.6 m：实测那些位置在同一锚点上
 #: annotation 覆盖只有 0.54（对称 ±1.8 m 是 0.81）——**被标注的铺装带比 roadnet
 #: 的半宽窄**，靠外的线落在标注之外。覆盖门是硬门，所以位置夹回 ±1.8 m；
@@ -583,11 +599,13 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
                "materials": {}, "lines": [], "gravel": None}
         # 车道边界（真值几何：铺装边界 = 路面边缘；线在车道分界上）
         _specs = spec["lines"]
-        _devlat: dict | None = None      # devdist：按实测横向放线（见下）
-        if LINE_CONVENTION == "devdist" and spec["lines"]:
-            # **开发集线位分布驱动**：每站取循环里的 (role, lat) 对
+        _devlat: dict | None = None      # devdist/pairfar：按声明横向放线（见下）
+        if LINE_CONVENTION in ("devdist", "pairfar") and spec["lines"]:
+            # **开发集线位分布驱动 / 同侧成对扩量**：每站取循环里的 (role, lat) 对
             # （角色与探针 assign_roles 同规则，测试用探针自己校验）。
-            _pair = LINE_DEVDIST_CYCLE[k % len(LINE_DEVDIST_CYCLE)]
+            _cyc = (LINE_PAIRFAR_CYCLE if LINE_CONVENTION == "pairfar"
+                    else LINE_DEVDIST_CYCLE)
+            _pair = _cyc[k % len(_cyc)]
             _devlat = {rn: float(lat) for rn, lat in _pair}
             _specs = [("yellow" if rn.endswith("_left") else "white",
                        1 if float(lat) >= 0 else -1, rn)
@@ -605,8 +623,8 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
                        1 if float(LINE_ROLE_LATERAL_M[rn]) >= 0 else -1, rn)
                       for rn in _roles]
         for kind, sign, role in _specs:
-            if LINE_CONVENTION == "devdist":
-                # 实测线位直接用；仍夹在铺装内（|lat| <= half-0.3），
+            if LINE_CONVENTION in ("devdist", "pairfar"):
+                # 声明线位直接用；仍夹在铺装内（|lat| <= half-0.3），
                 # **夹紧量记进实例**（`lat_clamped_m`）——远线在窄路上被夹回
                 # 近线带时，报告里必须能看出来，否则"生成了 far_*"是假的。
                 half = float(site["half_width_m"])
@@ -640,7 +658,7 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
             inst = {"id": rid, "role": role, "material": _MAT[kind],
                     "width_m": LINE_WIDTH_M, "lateral_m": round(lat, 3),
                     "nodes": nodes, "truth_points": _line_truth(nodes, role)}
-            if LINE_CONVENTION == "devdist":
+            if LINE_CONVENTION in ("devdist", "pairfar"):
                 # 声明线位 vs 实际线位：窄路上远线被夹回近线带时必须可见
                 inst["declared_lateral_m"] = round(
                     float((_devlat or {}).get(role, lat)), 3)
@@ -1102,7 +1120,7 @@ def main() -> int:
                     help="逐帧沿站点方向前进的米数（0 = 原地）")
     ap.add_argument("--line-convention",
                     choices=("symmetric", "measured", "relative", "tiers",
-                             "devdist"),
+                             "devdist", "pairfar"),
                     default="symmetric",
                     help="线位约定：symmetric=±LAT_LANE_HALF（旧）；"
                          "measured=开发集实测绝对线位；relative=按铺装半宽"

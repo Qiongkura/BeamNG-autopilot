@@ -442,3 +442,42 @@ def test_pick_anchors_filters_by_half_width():
                         min_half_width_m=4.6)
     assert [a["road_id"] for a in a1] == ["roadW"], a1
     assert a1[0]["half_width_m"] >= 4.6
+
+
+def test_pairfar_cycle_is_all_same_side_pairs():
+    """pairfar 扩量循环：每站都是**同侧近+远成对**，且角色与探针规则一致。
+
+    依据（T16 §21）：近/远档配比臂（只有 16 帧成对数据）在 6 seed 下确认改善
+    身份率 +0.0214、精度 +0.1147、IoU +0.0828、路外假线 −32%；扩量就是让每个
+    有线站点都放一对。角色必须满足 `assign_roles` 的"同侧由近到远"，
+    否则生成词表与评价词表漂移。
+    """
+    m = _load()
+    cyc = m.LINE_PAIRFAR_CYCLE
+    assert len(cyc) == 6 and all(len(p) == 2 for p in cyc)
+    sides = set()
+    for pair in cyc:
+        roles = [r for r, _lat in pair]
+        # 同一侧（角色后缀相同）、一近一远
+        assert roles[0].split("_", 1)[1] == roles[1].split("_", 1)[1], pair
+        assert {roles[0].split("_", 1)[0], roles[1].split("_", 1)[0]} == {
+            "near", "far"}, pair
+        lats = [abs(float(lat)) for _r, lat in pair]
+        assert lats[0] < lats[1], pair          # 内近外远
+        assert lats[1] >= 3.0, pair             # 远线档
+        sides.add(roles[0].split("_", 1)[1])
+    assert sides == {"left", "right"}           # 两侧都要有
+    assert m.LINE_PAIRFAR_MIN_HALF_M >= max(
+        abs(float(lat)) for _p in cyc for _r, lat in _p) + 0.3
+    # 用探针自己的 role_of + assign_roles 校验
+    import importlib.util as _iu
+    spec = _iu.spec_from_file_location(
+        "m5_marking_identity_probe",
+        ROOT / "scripts" / "m5_marking_identity_probe.py")
+    ip = _iu.module_from_spec(spec)
+    sys.modules["m5_marking_identity_probe"] = ip
+    spec.loader.exec_module(ip)
+    for pair in cyc:
+        got = ip.assign_roles([{"role": ip.role_of(float(lat)),
+                                "lat_m": float(lat)} for _r, lat in pair])
+        assert [g["role"] for g in got] == [r for r, _l in pair], pair
