@@ -137,3 +137,46 @@ def test_attribution_tool_scopes_candidates_to_p_frames():
     assert i < j < k, "分流必须先累加 C_outside_P 再 continue"
     # 比率口径要写明只含 P 帧
     assert '"scope"' in src and "frames with line truth only" in src
+
+
+def test_arm_gate_measure_summarizes_rows():
+    """臂级门表：只累加整数计数再算比率；缺测的掩码指标记 None 不记 0。
+
+    用途（T16 §20）：协议/提取器换版后**旧判定不可比**，要把已有 checkpoint
+    在同一口径下重测——本聚合函数是那个入口的纯逻辑部分。
+    """
+    import importlib.util
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_arm_gate_measure", root / "scripts" / "m5_arm_gate_measure.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["m5_arm_gate_measure"] = m
+    spec.loader.exec_module(m)
+    rows = [
+        {"counts": {"P_frames": 1, "C": 4, "R": 4, "M": 2, "L": 2, "A": 1,
+                    "C_outside_P": 3}, "recall": 0.5, "precision": 0.25,
+         "iou": 0.2, "candidates_off_road": 2, "n_candidates": 4,
+         "line_candidate_gate": {"line_candidate_merge": {"merged": 1,
+                                                          "groups": 1}}},
+        {"counts": {"P_frames": 1, "C": 6, "R": 5, "M": 3, "L": 3, "A": 2,
+                    "C_outside_P": 0}, "recall": 0.7, "precision": 0.5,
+         "iou": 0.4, "candidates_off_road": 1, "n_candidates": 6},
+        # 掩码指标缺测（None）：不进均值，样本数分开记
+        {"counts": {"P_frames": 0, "C": 0, "R": 0, "M": 0, "L": 0, "A": 0,
+                    "C_outside_P": 1}, "candidates_off_road": 0,
+         "n_candidates": 0},
+    ]
+    s = m.summarize_rows(rows)
+    assert s["C"] == 10 and s["R"] == 9 and s["M"] == 5 and s["A"] == 3
+    assert s["C_outside_P"] == 4
+    assert s["candidate_identity_rate"] == round(5 / 9, 4)
+    assert s["left_right_role_agreement"] == round(3 / 5, 4)
+    assert s["mask_recall_n"] == 2 and s["mask_recall_mean"] == 0.6
+    assert s["mask_precision_mean"] == 0.375
+    assert s["off_road_frac"] == round(3 / 10, 4)
+    assert s["merge_merged"] == 1 and s["merge_groups"] == 1
+    assert s["P_frames"] == 2 and s["frames"] == 3
+    # 全空：比率 None（不写 0）
+    e = m.summarize_rows([])
+    assert e["candidate_identity_rate"] is None and e["C"] == 0
