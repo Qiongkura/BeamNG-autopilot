@@ -1635,37 +1635,52 @@ def added_run_train_frames(added_runs: list, *, split: str, val_frac: float,
 
     与训练器 ``split_frames`` 同一口径（``tail``：全局尾部；``per-run``：
     每个 run 各取 ``max(1, int(k*val_frac))`` 帧做验证）。缺帧数的 run 记
-    ``None``（未知不当作通过）。
+    ``None``（未知不当作通过）。键与采样器同口径（``_run_key_like``）。
     """
     out: dict = {}
     for r in added_runs:
-        k = n_frames_by_run.get(str(r))
+        key = _run_key_like(r)
+        k = n_frames_by_run.get(key)
         if k is None:
-            k = n_frames_by_run.get(r)
+            k = n_frames_by_run.get(str(r))
         if k is None:
-            out[str(r)] = None
+            out[key] = None
             continue
         k = int(k)
         if str(split) == "per-run":
             n_val = max(1, int(k * float(val_frac))) if k > 0 else 0
-            out[str(r)] = max(0, k - n_val)
+            out[key] = max(0, k - n_val)
         else:
             # tail：全局尾部是 val，追加的 run 在末尾 -> 全部进 val
-            out[str(r)] = 0
+            out[key] = 0
     never = [r for r, n in out.items() if n is not None and int(n) <= 0]
     return {"train_frames_by_run": out, "never_trained": sorted(never),
             "split": str(split)}
 
 
+def _run_key_like(path) -> str:
+    """训练器 ``_run_key`` 的同一口径：相对 LOGS_DIR 的 posix 路径。
+
+    采样器的 ``exposures_by_run`` 用这个键（``experiments/...``），而命令行给的是
+    ``logs\\experiments\\...``——不归一化就会把"因子有 176 次曝光"读成 0
+    （实测踩到：修好划分后判定仍报 ``factor_never_sampled: True``）。
+    """
+    p = Path(path)
+    try:
+        return p.resolve().relative_to(Path(config.LOGS_DIR).resolve()).as_posix()
+    except Exception:                                        # noqa: BLE001
+        return p.as_posix()
+
+
 def _frames_by_run(run_id: str, runs: list) -> dict:
-    """逐 run 的帧数（只数 ``frame_*.npz``，不读内容）。"""
+    """逐 run 的帧数（只数 ``frame_*.npz``，不读内容）；键与采样器同口径。"""
     import glob as _glob
     out: dict = {}
     for r in runs:
         p = Path(r)
         if not p.is_dir():
             continue
-        out[str(r)] = len(_glob.glob(str(p / "frame_*.npz")))
+        out[_run_key_like(p)] = len(_glob.glob(str(p / "frame_*.npz")))
     return out
 
 
@@ -2729,9 +2744,10 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                          .get("sampler_report") or {})
                         .get("exposures_by_run") or {})
                 for _r in _added:
-                    _factor_exposures[str(_r)] = (
-                        _factor_exposures.get(str(_r), 0)
-                        + int(_ebr.get(str(_r)) or 0))
+                    _k = _run_key_like(_r)
+                    _factor_exposures[_k] = (
+                        _factor_exposures.get(_k, 0)
+                        + int(_ebr.get(_k) or 0))
         champ = [champ_by_seed[str(s)] for s in args.seeds]
         cand = [cand_by_seed[str(s)] for s in args.seeds]
         road_only = bool(getattr(args, "allow_road_only", False))
