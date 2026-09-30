@@ -233,3 +233,29 @@ def test_sum_negative_summaries_keeps_v1_rows_readable():
     assert out["extra_counters"] == "absent"
     assert "false_positive_max_cc_px_max" not in out
     assert out["false_positive_frame_rate"] == 0.0
+
+
+# ------------------------------------------------- 实测步数（预算模式权威计数）
+
+def test_ckpt_steps_done_prefers_recorded_steps(tmp_path):
+    """预算模式：实测步数必须来自 checkpoint 的 steps_done，不是 epochs 估算。
+
+    实测踩到（2026-09-30 严格门实验）：候选臂实跑 480 步、判定里
+    `steps_by_arm.candidate` 却写 72（= 3 epochs × 24 steps/epoch），
+    把一次有效的等预算对照读成"候选被欠训"。
+    """
+    import torch
+    loop = _load()
+    ck = tmp_path / "checkpoint_last.pt"
+    torch.save({"train_args": {"n_train": 94, "batch": 4, "epochs": 3,
+                               "steps_done": 480}}, str(ck))
+    assert loop.ckpt_steps_done(ck, batch=4, epochs=3) == 480
+    # 旧 checkpoint 没有 steps_done 才退回估算（94/4=24 -> 3×24=72）
+    torch.save({"train_args": {"n_train": 94, "batch": 4, "epochs": 3}},
+               str(ck))
+    assert loop.ckpt_steps_done(ck, batch=4, epochs=3) == 72
+    # 连 n_train 都没有（旧格式）：None，不猜
+    torch.save({"train_args": {}}, str(ck))
+    assert loop.ckpt_steps_done(ck, batch=4, epochs=3) is None
+    assert loop.ckpt_steps_done(tmp_path / "missing.pt", batch=4,
+                                epochs=3) is None

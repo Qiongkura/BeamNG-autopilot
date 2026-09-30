@@ -1618,6 +1618,26 @@ def steps_per_epoch(n_train: int, batch: int) -> int:
     return max(1, -(-int(n_train) // max(1, int(batch))))
 
 
+def ckpt_steps_done(ckpt, *, batch: int, epochs: int) -> int | None:
+    """checkpoint 里记录的**实测**优化步数；旧 checkpoint 才退回估算。
+
+    预算模式（``--total-steps``）下这是唯一权威计数（训练器写 ``steps_done``，
+    与 ``stopped_by=step_budget`` 配套）。**两臂都必须走这条路**：用
+    ``epochs × steps_per_epoch`` 去估，在预算模式下会写出与实际不符的数——
+    实测踩到（2026-09-30 严格门实验）：候选臂实跑 480 步、判定里
+    ``steps_by_arm.candidate`` 却写 72（= 3 epochs × 24），看上去像"候选臂
+    只训了 72 步"，足以把一次有效的等预算对照读成"候选被欠训"。
+    """
+    ta = _ckpt_train_args(Path(ckpt))
+    if not ta.get("n_train"):
+        return None
+    if ta.get("steps_done") is not None:
+        return int(ta["steps_done"])
+    return steps_per_epoch(int(ta["n_train"]),
+                           int(ta.get("batch") or batch)) * int(
+        ta.get("epochs") or epochs)
+
+
 def equal_steps_epochs(*, target_steps: int, n_train: int, batch: int) -> int:
     """把某一臂的 epoch 数定成"总步数最接近 target_steps"（至少 1 轮）。
 
@@ -2406,11 +2426,11 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                     # 实际步数以训练器落盘的 steps_done 为准（T16 §3.1：
                     # 预算模式的权威计数是 optimizer.step() 数）；旧 checkpoint
                     # 没有该字段才退回 epochs×steps_per_epoch 的估算。
-                    if ta_b.get("steps_done") is not None:
-                        base_steps[str(seed)] = int(ta_b["steps_done"])
-                    else:
-                        base_steps[str(seed)] = steps_per_epoch(
-                            ta_b["n_train"], ta_b.get("batch") or args.batch)                         * int(ta_b.get("epochs") or args.epochs)
+                    _bs = ckpt_steps_done(out / "checkpoint_last.pt",
+                                          batch=args.batch,
+                                          epochs=args.epochs)
+                    if _bs is not None:
+                        base_steps[str(seed)] = _bs
             # 等步数对照（精确版）：两臂 **epochs 不变**，把帧多的一臂按
             # run 配额截到与基线相同的训练帧数 —— 步数因此逐位相等，
             # 不需要用"最接近的整数轮"去凑（那会留下 +33% 的残余差）。
@@ -2922,16 +2942,16 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 "negative_line": {"baseline": sum_negative_summaries(base_neg),
                                   "candidate": sum_negative_summaries(cand_neg)},
                 "hard_gate": hard,
-                # 等步数对照的证据：两臂**实测**总步数（来自 checkpoint）
+                # 等步数对照的证据：两臂**实测**总步数（来自 checkpoint 的
+                # steps_done；两臂同一条路，不拿 epochs×steps_per_epoch 去估
+                # ——预算模式下那样估会写出与实际不符的数，实测踩到）
                 "steps_by_arm": {
                     "baseline": base_steps or None,
                     "candidate": {
-                        str(s): (steps_per_epoch(
-                            (_ckpt_train_args(exp_dir(args.run_id) / f"round{rnd}"
-                                              / f"seed{s}"
-                                              / "checkpoint_last.pt")
-                             .get("n_train") or 0),
-                            args.batch) * int(cand_epochs))
+                        str(s): ckpt_steps_done(
+                            exp_dir(args.run_id) / f"round{rnd}" / f"seed{s}"
+                            / "checkpoint_last.pt",
+                            batch=args.batch, epochs=int(cand_epochs))
                         for s in args.seeds}},
                 # 实际入训**样本数**（来自 checkpoint 的 train_args，不是配置声称）：
                 # 等步数对照的另一半证据，也是"四个计数"里"实际入训"的来源。
