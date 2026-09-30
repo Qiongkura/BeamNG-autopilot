@@ -61,7 +61,7 @@ if str(ROOT) not in sys.path:
 
 from beamng_autopilot.experiments.auto_truth import (  # noqa: E402
     TRUTH_CONTRACT, VERIFIER_VERSION, _rotate_camera_basis,
-    appearance_line_check, frame_content_shas, line_evidence_coverage,
+    frame_content_shas, line_evidence_coverage, line_evidence_mask,
     palette_sha, verify_batch, write_truth_credentials,
 )
 from beamng_autopilot_tech.annotations import annotation_palette  # noqa: E402
@@ -230,6 +230,56 @@ def paint_agreement(lines: list, frames: list, cal_frames: list, *,
     return out
 
 
+#: 结构足迹的投影半径（像素）：结构是 2–3 m 的实物，投影中心 ±该半径即其足迹。
+#: 取 60 是保守值（宁可把"结构附近"算进足迹，也不放过远处的真漆线——
+#: 后者由 outside 绝对量上限兜住）。
+STRUCT_FOOTPRINT_PX = 60
+
+
+def structure_appearance_split(frames: list, structures: list, *,
+                               radius_px: int = STRUCT_FOOTPRINT_PX) -> dict:
+    """把"像线的外观像素"分成落在**已声明结构投影足迹内/外**两份。
+
+    结构负例的认证靠这两条一起成立：annotation 线类像素 = 0（引擎自己说这里
+    不是漆线）+ 像线的外观能归因到已声明的非漆结构（石墙/护栏）上。只看前者
+    会把"护栏=线"教给模型；只看后者则等于拿外观当标签来源（方案 §4.2 禁止）。
+    """
+    from beamng_autopilot.experiments.auto_truth import project_point
+    inside = outside = 0
+    per_frame = []
+    for fr in frames:
+        mask, _mode, _why = line_evidence_mask(
+            {"rgb": fr["rgb"], "label": fr["label"]}, mode="appearance")
+        if mask is None:
+            continue
+        h, w = np.asarray(mask).shape
+        foot = np.zeros((h, w), dtype=bool)
+        for st in structures or []:
+            try:
+                u, v = project_point(st.get("pos"), fr["camera"])
+            except (TypeError, ValueError):
+                continue
+            if not (np.isfinite(u) and np.isfinite(v)):
+                continue
+            x, y = int(round(u)), int(round(v))
+            if not (-radius_px <= x < w + radius_px
+                    and -radius_px <= y < h + radius_px):
+                continue
+            x0, x1 = max(0, x - radius_px), min(w, x + radius_px + 1)
+            y0, y1 = max(0, y - radius_px), min(h, y + radius_px + 1)
+            foot[y0:y1, x0:x1] = True
+        n_in = int(np.sum(mask & foot))
+        n_out = int(np.sum(mask & ~foot))
+        inside += n_in
+        outside += n_out
+        per_frame.append({"path": str(fr.get("path") or ""),
+                          "inside": n_in, "outside": n_out})
+    return {"criterion": "appearance_line_like_px_attributed_to_declared_"
+                         "structures",
+            "radius_px": int(radius_px), "n_structures": len(structures or []),
+            "inside": inside, "outside": outside, "per_frame": per_frame}
+
+
 def scene_frame_paths(batch: Path, name: str) -> list:
     return sorted((batch / "frames").glob(f"{name}_*.npz"))
 
@@ -281,19 +331,31 @@ def evaluate_scene(batch: Path, name: str, rec: dict, *, min_coverage: float,
         app_like = 0
         for fr in frames:
             ann_px += int(np.sum(np.asarray(fr["label"]) == 2))
-            ap = appearance_line_check({"rgb": fr["rgb"], "label": fr["label"],
-                                        "truth_points": []})
-            app_like += int(ap.get("line_like") or 0)
+            _mask, _mode, _why = line_evidence_mask(
+                {"rgb": fr["rgb"], "label": fr["label"]}, mode="appearance")
+            app_like += int(_mask.sum()) if _mask is not None else 0
         out.update(line_free=True, line_px_in_frames=ann_px,
                    appearance_like_px=app_like)
+        # **外观判据不作负例门**（2026-09-30 实测）：`line_evidence_mask(
+        # mode="appearance")` 在**已验证的无线负例包**上就有 13k–68k px/8 帧
+        # （亮铺装、亮碎石都命中"白/暖白"），拿它当门会把整个负例通道杀光。
+        # 负例的权威证据是**引擎 annotation 的线类像素为 0**（引擎自己说这里
+        # 没有漆线）；外观数只上报、不判定。旧代码在这里调 `appearance_line_check`
+        # （需要真值点，无线场景恒返回 0）——那是个**恒不生效**的门，已去掉，
+        # 免得读代码的人以为外观被查过。
+        structs = gen.get("structures") or []
+        if structs:
+            # **结构负例**（T16 §16.1）：场景故意放了像线的非漆结构（石墙/护栏），
+            # 用来教"亮的细长结构 ≠ 线"。判据仍是 annotation 线类像素为 0；
+            # 额外上报"线状外观落在结构投影足迹内/外"的分解（证据，不判定）。
+            split = structure_appearance_split(frames, structs)
+            out.update(structure_appearance=split,
+                       structures=[{"id": s.get("id"), "kind": s.get("kind"),
+                                    "shape": s.get("shape")} for s in structs])
         if ann_px != 0:
             out["reasons"].append(
                 f"declared line-free but {ann_px} line-class pixels present: "
                 "cannot be a confirmed negative")
-        elif app_like != 0:
-            out["reasons"].append(
-                f"declared line-free but {app_like} appearance line-like "
-                "pixels found: not a confirmed negative")
         out["eligible"] = not out["reasons"]
         out["frames"] = frames
         return out
@@ -682,16 +744,26 @@ def main() -> int:
                      and str(inst.get("role") or "?") not in _excluded)
                  for p in (inst.get("truth_points") or [])]
         if ev.get("line_free") and not truth:
+            _structs = ((rec.get("generated") or {}).get("structures") or [])
             try:
                 res = export_line_free_package(
                     ev["frames"], out_root=out_root, scene=name, anchor=anchor,
                     map_name=str(args.map),
                     generator=report.get("generator") or {},
                     evidence={"line_px": ev.get("line_px_in_frames"),
-                              "appearance_like_px": ev.get("appearance_like_px")})
+                              "appearance_like_px": ev.get("appearance_like_px"),
+                              # 结构负例：把"像线的外观"的来源写进凭证
+                              "structures": [{"id": s.get("id"),
+                                              "kind": s.get("kind"),
+                                              "shape": s.get("shape")}
+                                             for s in _structs],
+                              "structure_appearance": ev.get(
+                                  "structure_appearance")})
                 exported.append({"scene": name,
                                  "type": (types[k] if k < len(types) else ""),
-                                 "line_free": True, **res})
+                                 "line_free": True,
+                                 "structures": len(_structs),
+                                 **res})
                 print(f"[export] {name}: {res['n_frames']} 帧（负例）-> "
                       f"{res['label_source'] or '(无来源声明)'} "
                       f"verified={res['verified']}", flush=True)

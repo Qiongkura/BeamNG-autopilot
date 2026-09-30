@@ -321,3 +321,55 @@ def test_paint_criterion_and_branches():
     # 相机背后的点：project_point 出 NaN，先判有限再取整（实测踩到 ValueError）
     assert m.paint_like(rgb, float("nan"), 4.0) is None
     assert m.paint_like(rgb, 4.0, float("nan")) is None
+
+
+def _struct_rec(frames: list, *, structures: list, after_px: float = 0.5):
+    return {"generated": {"lines": [], "line_generated": False,
+                          "structures": structures},
+            "camera_alignment": {"per_frame": [{"after_px": after_px}
+                                               for _ in frames]}}
+
+
+def test_structure_negative_is_gated_by_annotation_not_appearance(tmp_path):
+    """结构负例：门是 **annotation 线类像素为 0**；外观只上报、不判定。
+
+    机制（T16 §16.1）：模型在墙/护栏上多画线，所以要放"像线的非漆结构"。
+    为什么外观不能当门（2026-09-30 实测）：`line_evidence_mask(mode="appearance")`
+    在**已验证的无线负例包**上就有 13k–68k px/8 帧（亮铺装/亮碎石都命中"白"），
+    拿它当门会把负例通道杀光。旧代码的 `appearance_line_check`（需要真值点）
+    对无线场景恒返回 0——一个恒不生效的门，已去掉。
+    """
+    m = _load()
+    frames, _t = _frames_from_synthetic(with_line=False)
+    batch = tmp_path / "batch"
+    _dump_frames(batch, "s", frames)
+    structs = [{"id": "m5_wall_s_0", "kind": "wall_stone", "shape": "x.dae",
+                "pos": [0.0, 0.0, 0.0]}]
+    ev = m.evaluate_scene(batch, "s", _struct_rec(frames, structures=structs),
+                          min_coverage=0.8, max_after_px=2.0)
+    assert ev["eligible"] is True, ev
+    assert ev["line_px_in_frames"] == 0
+    # 结构被记进判定（导出侧据此写进凭证），外观分解是**证据**不是门
+    assert ev["structures"] and ev["structures"][0]["kind"] == "wall_stone"
+    assert ev["structure_appearance"]["n_structures"] == 1
+    assert "outside" in ev["structure_appearance"]
+    # 没声明结构的普通负例照样过（门只看 annotation），但判定里不该有结构键
+    ev2 = m.evaluate_scene(batch, "s", _struct_rec(frames, structures=[]),
+                           min_coverage=0.8, max_after_px=2.0)
+    assert ev2["eligible"] is True
+    assert not ev2.get("structures")
+    # 外观数**必须上报**（哪怕不判定）：否则读报告的人以为外观被查过
+    assert ev["appearance_like_px"] is not None
+
+def test_structure_negative_still_rejects_line_class_pixels(tmp_path):
+    """结构负例也不能有 annotation 线类像素（引擎说这是漆线就不是负例）。"""
+    m = _load()
+    frames, _t = _frames_from_synthetic(with_line=True)   # label 里有线类
+    batch = tmp_path / "batch"
+    _dump_frames(batch, "s", frames)
+    structs = [{"id": "x", "kind": "wall_stone", "shape": "x.dae",
+                "pos": [0.0, 0.0, 0.0]}]
+    ev = m.evaluate_scene(batch, "s", _struct_rec(frames, structures=structs),
+                          min_coverage=0.8, max_after_px=2.0)
+    assert ev["eligible"] is False
+    assert any("line-class pixels present" in r for r in ev["reasons"]), ev
