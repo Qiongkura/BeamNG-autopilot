@@ -1613,6 +1613,62 @@ def train_cmd(args, runs, out: Path, seed: int, extra: list) -> list:
             *init_flags, *det_flags, *extra]
 
 
+def effective_split(args_split: str, base_runs: list, cand_runs: list) -> str:
+    """数据臂的划分口径：候选比基线多 run 时**必须**用 ``per-run``。
+
+    为什么（2026-09-30 实测）：``--split tail`` 取"所有 run 拼接后的全局尾部"
+    当验证集，而 ``add_runs`` 把新数据**追加**在列表末尾——新数据正好落进验证集。
+    实测：候选臂追加 2 个负例包（16 帧）< 验证集 18 帧 → **因子 100% 变成验证
+    数据**，训练输入一个字节没变；判定里 ``exposures_by_run`` 的生成 run 曝光
+    为 0，而"因子已生效"的检查只看 ``--runs`` 变没变 → 白跑一轮还记成有效实验。
+    ``per-run`` 让每个 run 各取时间尾部 val_frac，追加的 run 必然有训练帧。
+    两臂共用同一口径（这是配方，不是因子差异）。
+    """
+    if len(cand_runs) > len(base_runs) and str(args_split) == "tail":
+        return "per-run"
+    return str(args_split)
+
+
+def added_run_train_frames(added_runs: list, *, split: str, val_frac: float,
+                           n_frames_by_run: dict) -> dict:
+    """追加的 run 在各划分下能拿到多少**训练**帧；0 帧 = 因子改不动输入。
+
+    与训练器 ``split_frames`` 同一口径（``tail``：全局尾部；``per-run``：
+    每个 run 各取 ``max(1, int(k*val_frac))`` 帧做验证）。缺帧数的 run 记
+    ``None``（未知不当作通过）。
+    """
+    out: dict = {}
+    for r in added_runs:
+        k = n_frames_by_run.get(str(r))
+        if k is None:
+            k = n_frames_by_run.get(r)
+        if k is None:
+            out[str(r)] = None
+            continue
+        k = int(k)
+        if str(split) == "per-run":
+            n_val = max(1, int(k * float(val_frac))) if k > 0 else 0
+            out[str(r)] = max(0, k - n_val)
+        else:
+            # tail：全局尾部是 val，追加的 run 在末尾 -> 全部进 val
+            out[str(r)] = 0
+    never = [r for r, n in out.items() if n is not None and int(n) <= 0]
+    return {"train_frames_by_run": out, "never_trained": sorted(never),
+            "split": str(split)}
+
+
+def _frames_by_run(run_id: str, runs: list) -> dict:
+    """逐 run 的帧数（只数 ``frame_*.npz``，不读内容）。"""
+    import glob as _glob
+    out: dict = {}
+    for r in runs:
+        p = Path(r)
+        if not p.is_dir():
+            continue
+        out[str(r)] = len(_glob.glob(str(p / "frame_*.npz")))
+    return out
+
+
 def steps_per_epoch(n_train: int, batch: int) -> int:
     """每个 epoch 的优化步数（与训练器一致：按批向上取整）。"""
     return max(1, -(-int(n_train) // max(1, int(batch))))
@@ -2331,6 +2387,37 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                   "（真实运行时这一轮会被拒绝）")
         extra, skipped = factor_to_flags(factor)
         cand_runs, data_note = arm_runs(args.runs, factor)
+        # **数据臂的划分口径**（2026-09-30 实测的静默白跑）：`--split tail`
+        # 取的是"所有 run 拼接后的全局尾部"当验证集，而 `add_runs` 把新数据
+        # **追加**在列表末尾——于是新数据正好落在验证集里。实测：2 个负例包
+        # 16 帧 < 18 帧验证集 -> **因子 100% 变成验证数据**，训练输入一个字节
+        # 都没变；而"因子已生效"的检查只看命令行的 --runs 变没变，于是历史上
+        # 所有 2 包负例臂（含 0.4316 那轮）都是白跑。数据臂一律改用 per-run
+        # 划分（每个 run 各取尾部 val_frac），两臂同口径。
+        _eff_split = effective_split(args.split, base_runs, cand_runs)
+        if _eff_split != args.split:
+            print(f"[rounds] 第 {rnd + 1} 轮划分改用 {_eff_split}："
+                  f"候选比基线多 {len(cand_runs) - len(base_runs)} 个 run，"
+                  f"tail 划分会把追加的 run 整段切进验证集")
+        args.split = _eff_split
+        _added = [r for r in cand_runs if r not in set(base_runs)]
+        _added_guard: dict | None = None
+        _factor_exposures: dict | None = None
+        if _added:
+            _guard = added_run_train_frames(_added, split=_eff_split,
+                                            val_frac=0.2,
+                                            n_frames_by_run=_frames_by_run(
+                                                args.run_id, cand_runs))
+            _added_guard = _guard
+            if _guard["never_trained"]:
+                _note = ("factor_not_sampled: 追加的 run 在 "
+                         f"{_eff_split} 划分下拿不到任何训练帧 "
+                         f"{_guard['never_trained']}（每个 run 需要 >=2 帧）"
+                         "——这样的因子改不动训练输入，拒绝训练")
+                _log_give_up(log, args.run_id, cand_id, "factor_not_sampled",
+                             _note, phase="needs_review")
+                print(f"[rounds] 第 {rnd + 1} 轮拒绝训练：{_note}")
+                return 3
         # 预算模式（quota 采样器）与 run_weights 互斥：训练器会硬报错，但那时
         # 一轮训练已经启动、报错信息埋在 train_error 里。这里提前拒绝并说明
         # 该用什么替代（配额轮换已经按 run 均衡曝光；要改权重得先让采样器支持）。
@@ -2632,6 +2719,19 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
         # 之后会在写盘那一行 UnboundLocalError，训练全跑完却拿不到判定）
         all_at_plateau = _both_at_plateau(plateau_by_seed,
                                          plateau_base_by_seed)
+        # 因子**实际曝光**（跨 seed 相加）：追加的 run 有没有真的进 batch。
+        # 判定里有了这个，"白跑一轮"（因子 0 曝光）就能一眼看出来，而不是靠
+        # 事后翻 train_meta。
+        if _added:
+            _factor_exposures = {}
+            for _s in args.seeds:
+                _ebr = (((cand_meta.get(str(_s)) or {})
+                         .get("sampler_report") or {})
+                        .get("exposures_by_run") or {})
+                for _r in _added:
+                    _factor_exposures[str(_r)] = (
+                        _factor_exposures.get(str(_r), 0)
+                        + int(_ebr.get(str(_r)) or 0))
         champ = [champ_by_seed[str(s)] for s in args.seeds]
         cand = [cand_by_seed[str(s)] for s in args.seeds]
         road_only = bool(getattr(args, "allow_road_only", False))
@@ -2927,6 +3027,16 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 "deterministic": bool(getattr(args, "deterministic", False)),
                 "init_from": (str(getattr(args, "init", None))
                               if getattr(args, "init", None) else None),
+                # **因子有没有真的进训练**（2026-09-30 实测的静默白跑）：
+                # 追加的 run 在 tail 划分下会整段变成验证数据，而"因子已生效"
+                # 只看 --runs 变没变。这里落盘划分口径 + 追加 run 的训练帧数 +
+                # 采样器对追加 run 的**实际曝光**，让"白跑"在判定里一眼可见。
+                "effective_split": str(args.split),
+                "added_runs_train_frames": _added_guard,
+                "factor_exposures_by_run": _factor_exposures,
+                "factor_never_sampled": bool(
+                    _factor_exposures is not None and _added
+                    and sum(int(v or 0) for v in _factor_exposures.values()) == 0),
                 "train_meta": {"baseline": base_meta, "candidate": cand_meta},
                 "per_scene": per_scene,
                 "scene_candidates": scene_candidates,

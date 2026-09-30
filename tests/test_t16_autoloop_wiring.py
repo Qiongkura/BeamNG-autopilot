@@ -259,3 +259,45 @@ def test_ckpt_steps_done_prefers_recorded_steps(tmp_path):
     assert loop.ckpt_steps_done(ck, batch=4, epochs=3) is None
     assert loop.ckpt_steps_done(tmp_path / "missing.pt", batch=4,
                                 epochs=3) is None
+
+
+# ------------------------------------------------- 因子必须真的进训练（划分口径）
+
+def test_effective_split_switches_to_per_run_for_data_arms():
+    """数据臂（候选比基线多 run）必须用 per-run 划分。
+
+    实测踩到（2026-09-30）：`--split tail` 取"所有 run 拼接后的全局尾部"当验证集，
+    而 `add_runs` 把新数据追加在末尾 -> 新数据正好落进验证集。2 个负例包 16 帧
+    < 18 帧验证集 -> **因子 100% 变成验证数据**，训练输入一个字节没变，而
+    "因子已生效"的检查只看 --runs 变没变（历史上所有 2 包负例臂都是白跑）。
+    """
+    loop = _load()
+    base = ["a", "b"]
+    assert loop.effective_split("tail", base, base) == "tail"      # 非数据臂不动
+    assert loop.effective_split("tail", base, base + ["c"]) == "per-run"
+    assert loop.effective_split("per-run", base, base + ["c"]) == "per-run"
+    assert loop.effective_split("by-map-scene", base,
+                                base + ["c"]) == "by-map-scene"
+
+
+def test_added_run_train_frames_flags_zero_train_runs():
+    """追加 run 拿不到训练帧 = 因子改不动输入，必须能被判出来。"""
+    loop = _load()
+    counts = {"gen/one": 16, "gen/tiny": 1, "gen/ok": 8}
+    added = list(counts)
+    # tail：追加的 run 在列表末尾 -> 全部进验证集（0 训练帧）
+    g = loop.added_run_train_frames(added, split="tail", val_frac=0.2,
+                                    n_frames_by_run=counts)
+    assert g["never_trained"] == sorted(added), g
+    # per-run：每个 run 各取尾部 20% 做验证（>=2 帧的 run 都有训练帧）
+    g2 = loop.added_run_train_frames(added, split="per-run", val_frac=0.2,
+                                     n_frames_by_run=counts)
+    assert g2["train_frames_by_run"]["gen/ok"] == 7, g2      # 8 -> val 1
+    assert g2["train_frames_by_run"]["gen/one"] == 13, g2    # 16 -> val 3
+    assert g2["train_frames_by_run"]["gen/tiny"] == 0, g2    # 1 帧全进 val
+    assert g2["never_trained"] == ["gen/tiny"], g2
+    # 帧数未知（目录不存在）不当作通过：记 None，不进 never_trained
+    g3 = loop.added_run_train_frames(["missing"], split="per-run", val_frac=0.2,
+                                     n_frames_by_run={})
+    assert g3["train_frames_by_run"]["missing"] is None
+    assert g3["never_trained"] == []
