@@ -322,7 +322,7 @@ def test_synthetic_line_dose_levels():
                    K(added[1]): {"n_frames": 8, "n_line_frames": 8},
                    K(base[0]): {"n_frames": 30, "n_line_frames": 15},
                    K(base[1]): {"n_frames": 30, "n_line_frames": 15}}
-    # 16/76 = 0.21 -> warn（正是 §21 那一档：+0.0214）
+    # 16/76 = 0.21 -> warn（§21 那一档的池占比是 0.149 = ok，这里构造 warn 区）
     d = loop.synthetic_line_dose(added_runs=added, base_runs=base,
                                  line_by_dir=line_by_dir,
                                  frames_by_run=frames)
@@ -334,7 +334,7 @@ def test_synthetic_line_dose_levels():
         line_by_dir={K(added[0]): {"n_line_frames": 4}},
         frames_by_run={K(base[0]): 30, K(base[1]): 30, K(added[0]): 8})
     assert d2["share"] == round(4 / 68, 4) and d2["level"] == "ok"
-    # 大剂量：48/108 = 0.44 -> over（§22 的崩溃档在 0.51）
+    # 大剂量：48/108 = 0.44 -> over（§22 的崩溃档 0.26/0.38）
     big = dict(frames)
     big.update({K(added[0]): 24, K(added[1]): 24})
     d3 = loop.synthetic_line_dose(
@@ -349,3 +349,10 @@ def test_synthetic_line_dose_levels():
     assert d4["synthetic_line_frames"] == 0
     assert d4["unknown_dirs"] == sorted([K(added[0]), K(added[1])])
     assert d4["level"] == "ok"
+    # 0.26（32 帧那档的实测占比）必须落在 over：那是**已实测的崩溃区**
+    d5 = loop.synthetic_line_dose(
+        added_runs=added, base_runs=base,
+        line_by_dir={K(added[0]): {"n_line_frames": 10},
+                     K(added[1]): {"n_line_frames": 10}},
+        frames_by_run=frames)
+    assert d5["share"] == round(20 / 76, 4) and d5["level"] == "over", d5

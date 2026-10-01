@@ -1672,13 +1672,16 @@ def _run_key_like(path) -> str:
         return p.as_posix()
 
 
-#: 合成**线**数据的安全剂量与硬上限（占候选训练帧的比例）。
-#: 依据（T16 §22.2/§22.3 实测，6 seed 配对）：16 帧（≈21% 训练帧）身份率 +0.0214
-#: （四项 candidate_better）；56 帧（≈51%）身份率 −0.1691（崩溃，量级与坏标签那轮
-#: 相同）。即"小剂量是正则化、大剂量是域偏移"。硬上限取 0.35 是保守插值：
-#: 超过它必须显式 `--allow-overdose`（会记进判定），避免误把崩溃读成"数据更多更好"。
-DOSE_SAFE_FRAC = 0.20
-DOSE_HARD_FRAC = 0.35
+#: 合成**线**数据的安全剂量与硬上限（占候选训练**池**帧的比例，与
+#: ``synthetic_line_dose`` 同一口径）。
+#: 三点实测（6 seed 配对，T16 §22.2；占比用本函数的真实数据算出）：
+#:   share 0.149（16 帧） -> 身份率 **+0.0214**（四项 candidate_better）
+#:   share 0.260（32 帧） -> **−0.1464**（崩溃）
+#:   share 0.381（56 帧） -> **−0.1691**（崩溃）
+#: 转折点在 0.149 与 0.260 之间，所以：≤0.15 安全；0.15–0.25 未知区（照跑但记
+#: warn）；>0.25 是**已实测的崩溃区**，必须显式 `--allow-overdose`（记进判定）。
+DOSE_SAFE_FRAC = 0.15
+DOSE_HARD_FRAC = 0.25
 
 
 def synthetic_line_dose(*, added_runs: list, line_by_dir: dict,
@@ -1687,7 +1690,8 @@ def synthetic_line_dose(*, added_runs: list, line_by_dir: dict,
 
     ``line_by_dir`` 用审计报告里的 ``train_line_by_dir``（键与 ``_run_key_like``
     同口径）；缺某目录的线帧计数时该目录按 **0** 计并记进 ``unknown_dirs``
-    （未知不虚增剂量，但必须可见）。
+    （未知不虚增剂量，但必须可见）。占比是**池**口径（划分前的候选训练帧），
+    与 §22 报告里的"训练帧占比"略差（per-run 划分按比例去掉验证帧，比例几乎不变）。
     返回 ``{share, synthetic_line_frames, candidate_frames, added_frames,
     unknown_dirs, level}``；``level`` ∈ {"ok","warn","over"}。
     """
