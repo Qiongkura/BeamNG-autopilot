@@ -1682,6 +1682,9 @@ def _run_key_like(path) -> str:
 #: warn）；>0.25 是**已实测的崩溃区**，必须显式 `--allow-overdose`（记进判定）。
 DOSE_SAFE_FRAC = 0.15
 DOSE_HARD_FRAC = 0.25
+#: 剂量只在**够大**的训练池上判：实测的崩溃是"合成数据主导训练量"的域偏移，
+#: 池子只有个位数帧时（冒烟/接线测试）占比没有意义——那类轮次只记录不拦。
+DOSE_MIN_FRAMES = 40
 
 
 def synthetic_line_dose(*, added_runs: list, line_by_dir: dict,
@@ -1732,7 +1735,8 @@ def synthetic_line_dose(*, added_runs: list, line_by_dir: dict,
         syn += n
     share = (syn / total) if total else None
     level = "ok"
-    if share is not None:
+    below_min = bool(total and total < DOSE_MIN_FRAMES)
+    if share is not None and not below_min:
         if share > DOSE_HARD_FRAC:
             level = "over"
         elif share > DOSE_SAFE_FRAC:
@@ -1741,7 +1745,8 @@ def synthetic_line_dose(*, added_runs: list, line_by_dir: dict,
             "synthetic_line_frames": int(syn), "candidate_frames": int(total),
             "added_frames": sum(_frames_of(r) for r in (added_runs or [])),
             "unknown_dirs": sorted(unknown), "level": level,
-            "safe_frac": DOSE_SAFE_FRAC, "hard_frac": DOSE_HARD_FRAC}
+            "safe_frac": DOSE_SAFE_FRAC, "hard_frac": DOSE_HARD_FRAC,
+            "below_min_frames": below_min, "min_frames": DOSE_MIN_FRAMES}
 
 
 def _frames_by_run(run_id: str, runs: list) -> dict:

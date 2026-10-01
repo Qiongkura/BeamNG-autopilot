@@ -370,14 +370,17 @@ def test_synthetic_line_dose_accepts_both_key_forms():
             "m5auto_a0_material_mix_a0s4/front_main")
     neg = ("logs/experiments/t16_autotruth_struct_strict_20260930/"
            "m5auto_a0_structure_negative_a0s5/front_main")
-    human = ["logs/experiments/annotate_pkg_e2_it3_20260927/front_fisheye"]
+    human = ["logs/experiments/annotate_pkg_e2_it3_20260927/front_fisheye",
+             "logs/experiments/annotate_pkg_e1_jv_20260927/front_main"]
     got = []
     for keyer in (loop._run_key_like, loop._canon_dir):
         line_by = {keyer(pair): {"n_frames": 8, "n_line_frames": 8},
                    keyer(neg): {"n_frames": 8, "n_line_frames": 0},
-                   keyer(human[0]): {"n_frames": 15, "n_line_frames": 8}}
+                   keyer(human[0]): {"n_frames": 30, "n_line_frames": 15},
+                   keyer(human[1]): {"n_frames": 30, "n_line_frames": 15}}
         frames = {keyer(pair): {"n_frames": 8}, keyer(neg): {"n_frames": 8},
-                  keyer(human[0]): {"n_frames": 15}}
+                  keyer(human[0]): {"n_frames": 30},
+                  keyer(human[1]): {"n_frames": 30}}
         d = loop.synthetic_line_dose(added_runs=[pair, neg], base_runs=human,
                                      line_by_dir=line_by,
                                      frames_by_run=frames)
@@ -385,5 +388,14 @@ def test_synthetic_line_dose_accepts_both_key_forms():
                     d["share"], d["level"], tuple(d["unknown_dirs"])))
     assert got[0] == got[1], got
     syn, tot, share, level, unknown = got[0]
-    assert (syn, tot) == (8, 31) and share == round(8 / 31, 4)
-    assert level == "over" and unknown == ()
+    # 8/76 = 0.105 -> ok（安全区）；键形式不影响结果
+    assert (syn, tot) == (8, 76) and share == round(8 / 76, 4)
+    assert level == "ok" and unknown == ()
+    # 池子太小（< DOSE_MIN_FRAMES）时只记录不拦：冒烟/接线轮次不该被剂量门挡
+    d_small = loop.synthetic_line_dose(
+        added_runs=[pair], base_runs=[human[0]],
+        line_by_dir={loop._run_key_like(pair): {"n_line_frames": 3}},
+        frames_by_run={loop._run_key_like(pair): 3,
+                       loop._run_key_like(human[0]): 3})
+    assert d_small["below_min_frames"] is True and d_small["level"] == "ok"
+    assert d_small["share"] == 0.5      # 占比照算，只是不拦
