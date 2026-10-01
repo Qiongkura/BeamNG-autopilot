@@ -180,3 +180,40 @@ def test_arm_gate_measure_summarizes_rows():
     # 全空：比率 None（不写 0）
     e = m.summarize_rows([])
     assert e["candidate_identity_rate"] is None and e["C"] == 0
+
+
+def test_dose_response_summarize_decision():
+    """剂量-效应表：从判定文件抽出剂量与配对差值；旧判定缺负例帧数时按 8 帧/包
+    估算并**标明 estimated**（估算值不得与实测值混着引用）。"""
+    import importlib.util
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_dose_response_table", root / "scripts" / "m5_dose_response_table.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["m5_dose_response_table"] = m
+    spec.loader.exec_module(m)
+    blob = {
+        "candidate_id": "x", "candidate_runs": ["b1", "g1", "n1", "n2"],
+        "baseline_runs": ["b1"], "all_at_plateau": False,
+        "round_outcome": "meaningful_no_gain",
+        "synthetic_line_dose": {"synthetic_line_frames": 8, "negative_frames": 16,
+                                "share": 0.1, "negative_frac": 0.2,
+                                "level": "ok"},
+        "pairings": {"candidate_identity_rate": {
+            "champion": [0.4, 0.5], "candidate": [0.45, 0.55],
+            "mean_delta": 0.05, "ci95_halfwidth": 0.01,
+            "verdict": "candidate_better"}},
+    }
+    r = m.summarize_decision(blob)
+    assert r["seeds"] == 2 and r["added_runs"] == 3
+    assert r["negative_x"] == 2.0 and r["dose_source"] == "measured"
+    assert r["candidate_identity_rate"]["mean_delta"] == 0.05
+    assert r["candidate_identity_rate"]["champion_mean"] == 0.45
+    assert r["candidate_identity_rate"]["candidate_mean"] == 0.5
+    # 旧判定：没有 synthetic_line_dose -> 负例帧数按 8 帧/包估，标明 estimated
+    old = {"candidate_id": "y", "candidate_runs": ["b1", "g1", "n1", "n2"],
+           "baseline_runs": ["b1"], "pairings": {}}
+    r2 = m.summarize_decision(old)
+    assert r2["negative_frames"] == 24 and r2["dose_source"] == "estimated"
+    assert r2["negative_x"] is None      # 线帧未知 -> 倍数未知，不猜
