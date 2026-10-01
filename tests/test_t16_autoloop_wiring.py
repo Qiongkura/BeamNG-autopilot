@@ -301,3 +301,51 @@ def test_added_run_train_frames_flags_zero_train_runs():
                                      n_frames_by_run={})
     assert g3["train_frames_by_run"]["missing"] is None
     assert g3["never_trained"] == []
+
+
+# ------------------------------------------------- 合成线数据的剂量纪律（§22.3）
+
+def test_synthetic_line_dose_levels():
+    """剂量纪律：合成**线**数据占候选训练帧的比例分三档（实测依据 §22.2/§22.3）。
+
+    16 帧（≈21%）身份率 +0.0214（四项 candidate_better）；56 帧（≈51%）−0.1691
+    崩溃。所以：≤0.20 照跑；0.20–0.35 记 warn；>0.35 必须显式 --allow-overdose。
+    """
+    loop = _load()
+    base = ["logs/experiments/human_a", "logs/experiments/human_b"]
+    added = ["logs/experiments/gen_a", "logs/experiments/gen_b"]
+    # 键用模块自己的归一化函数算（测试会话把 BEAMNG_LOGS_DIR 指到沙箱，
+    # 硬编码 "experiments/..." 会与运行期口径不一致）
+    K = loop._run_key_like
+    frames = {K(base[0]): 30, K(base[1]): 30, K(added[0]): 8, K(added[1]): 8}
+    line_by_dir = {K(added[0]): {"n_frames": 8, "n_line_frames": 8},
+                   K(added[1]): {"n_frames": 8, "n_line_frames": 8},
+                   K(base[0]): {"n_frames": 30, "n_line_frames": 15},
+                   K(base[1]): {"n_frames": 30, "n_line_frames": 15}}
+    # 16/76 = 0.21 -> warn（正是 §21 那一档：+0.0214）
+    d = loop.synthetic_line_dose(added_runs=added, base_runs=base,
+                                 line_by_dir=line_by_dir,
+                                 frames_by_run=frames)
+    assert d["synthetic_line_frames"] == 16 and d["candidate_frames"] == 76
+    assert d["share"] == round(16 / 76, 4) and d["level"] == "warn"
+    # 只用 4 帧：4/64 = 0.0625 -> ok
+    d2 = loop.synthetic_line_dose(
+        added_runs=added[:1], base_runs=base,
+        line_by_dir={K(added[0]): {"n_line_frames": 4}},
+        frames_by_run={K(base[0]): 30, K(base[1]): 30, K(added[0]): 8})
+    assert d2["share"] == round(4 / 68, 4) and d2["level"] == "ok"
+    # 大剂量：48/108 = 0.44 -> over（§22 的崩溃档在 0.51）
+    big = dict(frames)
+    big.update({K(added[0]): 24, K(added[1]): 24})
+    d3 = loop.synthetic_line_dose(
+        added_runs=added, base_runs=base,
+        line_by_dir={K(added[0]): {"n_line_frames": 24},
+                     K(added[1]): {"n_line_frames": 24}},
+        frames_by_run=big)
+    assert d3["level"] == "over", d3
+    # 缺线帧计数：记 unknown_dirs，且不虚增剂量
+    d4 = loop.synthetic_line_dose(added_runs=added, base_runs=base,
+                                  line_by_dir={}, frames_by_run=frames)
+    assert d4["synthetic_line_frames"] == 0
+    assert d4["unknown_dirs"] == sorted([K(added[0]), K(added[1])])
+    assert d4["level"] == "ok"

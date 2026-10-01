@@ -1672,6 +1672,52 @@ def _run_key_like(path) -> str:
         return p.as_posix()
 
 
+#: 合成**线**数据的安全剂量与硬上限（占候选训练帧的比例）。
+#: 依据（T16 §22.2/§22.3 实测，6 seed 配对）：16 帧（≈21% 训练帧）身份率 +0.0214
+#: （四项 candidate_better）；56 帧（≈51%）身份率 −0.1691（崩溃，量级与坏标签那轮
+#: 相同）。即"小剂量是正则化、大剂量是域偏移"。硬上限取 0.35 是保守插值：
+#: 超过它必须显式 `--allow-overdose`（会记进判定），避免误把崩溃读成"数据更多更好"。
+DOSE_SAFE_FRAC = 0.20
+DOSE_HARD_FRAC = 0.35
+
+
+def synthetic_line_dose(*, added_runs: list, line_by_dir: dict,
+                        frames_by_run: dict, base_runs: list) -> dict:
+    """合成**线**数据占候选训练帧的比例（剂量纪律，§22.3）。
+
+    ``line_by_dir`` 用审计报告里的 ``train_line_by_dir``（键与 ``_run_key_like``
+    同口径）；缺某目录的线帧计数时该目录按 **0** 计并记进 ``unknown_dirs``
+    （未知不虚增剂量，但必须可见）。
+    返回 ``{share, synthetic_line_frames, candidate_frames, added_frames,
+    unknown_dirs, level}``；``level`` ∈ {"ok","warn","over"}。
+    """
+    cand = [str(r) for r in (base_runs or [])] + [str(r) for r in
+                                                  (added_runs or [])]
+    total = sum(int(frames_by_run.get(_run_key_like(r)) or 0) for r in cand)
+    syn = 0
+    unknown: list = []
+    for r in (added_runs or []):
+        k = _run_key_like(r)
+        e = (line_by_dir or {}).get(k)
+        if not e:
+            unknown.append(k)
+            continue
+        syn += int(e.get("n_line_frames") or 0)
+    share = (syn / total) if total else None
+    level = "ok"
+    if share is not None:
+        if share > DOSE_HARD_FRAC:
+            level = "over"
+        elif share > DOSE_SAFE_FRAC:
+            level = "warn"
+    return {"share": (None if share is None else round(float(share), 4)),
+            "synthetic_line_frames": int(syn), "candidate_frames": int(total),
+            "added_frames": sum(int(frames_by_run.get(_run_key_like(r)) or 0)
+                                for r in (added_runs or [])),
+            "unknown_dirs": sorted(unknown), "level": level,
+            "safe_frac": DOSE_SAFE_FRAC, "hard_frac": DOSE_HARD_FRAC}
+
+
 def _frames_by_run(run_id: str, runs: list) -> dict:
     """逐 run 的帧数（只数 ``frame_*.npz``，不读内容）；键与采样器同口径。"""
     import glob as _glob
@@ -2212,6 +2258,10 @@ def _rounds_audit(args, train_runs, log) -> tuple:
               "group_overlap": overlap, "coverage": cov,
               # 数据入口四计数（看板"数据入口"面板）需要的原始量：生成=清单全部
               # 记录（含被拒），评价=开发集记录数，复核=开发集 paint 档位有效帧。
+              # 逐目录的"有标线真值的帧数"（审计时已算）：剂量纪律
+              # （§22.3：合成线数据占比）与负例资格都用这一份，不重复读盘
+              "train_line_by_dir": {k: dict(v) for k, v in
+                                    _neg_by_dir.items()},
               "n_records_train": len(mf_tr.records),
               "n_records_dev": len(mf_dev.records),
               "coverage_dev": mf_dev.coverage().get("dev", {}),
@@ -2430,6 +2480,30 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                          f"{_guard['never_trained']}（每个 run 需要 >=2 帧）"
                          "——这样的因子改不动训练输入，拒绝训练")
                 _log_give_up(log, args.run_id, cand_id, "factor_not_sampled",
+                             _note, phase="needs_review")
+                print(f"[rounds] 第 {rnd + 1} 轮拒绝训练：{_note}")
+                return 3
+        # **剂量纪律**（T16 §22.3 实测）：合成**线**数据在 ~20% 训练帧以内为正
+        # （16 帧 +0.0214），超过就崩（56 帧 / 51% → −0.1691）。这里把占比算出来：
+        # warn 档照跑但记进判定；over 档必须显式 --allow-overdose 才跑。
+        _dose: dict | None = None
+        if _added:
+            _dose = synthetic_line_dose(
+                added_runs=_added, base_runs=base_runs,
+                line_by_dir=(_report.get("train_line_by_dir") or {}),
+                frames_by_run=_frames_by_run(args.run_id, cand_runs))
+            print(f"[rounds] 第 {rnd + 1} 轮合成线数据剂量："
+                  f"{_dose['synthetic_line_frames']}/"
+                  f"{_dose['candidate_frames']} = {_dose['share']}"
+                  f"（安全 ≤{DOSE_SAFE_FRAC}，硬上限 {DOSE_HARD_FRAC}）"
+                  f" level={_dose['level']}")
+            if _dose["level"] == "over" and not bool(
+                    getattr(args, "allow_overdose", False)):
+                _note = ("dose_overdose: 合成线数据占候选训练帧 "
+                         f"{_dose['share']} > 硬上限 {DOSE_HARD_FRAC}"
+                         "（实测 51% 时身份率 −0.1691，§22.3）——"
+                         "要跑这种剂量必须显式 --allow-overdose（会记进判定）")
+                _log_give_up(log, args.run_id, cand_id, "dose_overdose",
                              _note, phase="needs_review")
                 print(f"[rounds] 第 {rnd + 1} 轮拒绝训练：{_note}")
                 return 3
@@ -3049,6 +3123,8 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 # 采样器对追加 run 的**实际曝光**，让"白跑"在判定里一眼可见。
                 "effective_split": str(args.split),
                 "added_runs_train_frames": _added_guard,
+                "synthetic_line_dose": _dose,
+                "allow_overdose": bool(getattr(args, "allow_overdose", False)),
                 "factor_exposures_by_run": _factor_exposures,
                 "factor_never_sampled": bool(
                     _factor_exposures is not None and _added
@@ -3267,6 +3343,9 @@ def main(argv=None) -> int:
     s.add_argument("--thresholds", default=None)
     s.add_argument("--paint-source", action="append", default=None,
                    metavar="RUN=SOURCE", help="与 rounds 同一口径：以凭证为准")
+    s.add_argument("--allow-overdose", action="store_true",
+                   help="允许合成线数据超过硬上限 0.35（实测 51%% 会崩，§22.3）；"
+                        "会记进判定")
     s.add_argument("--research-arm", action="store_true",
                    help="显式声明研究臂（来源资格不足时同样会降级）")
     s.add_argument("--production-mismatch", action="store_true")
