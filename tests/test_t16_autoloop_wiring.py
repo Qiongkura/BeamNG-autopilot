@@ -399,3 +399,26 @@ def test_synthetic_line_dose_accepts_both_key_forms():
                        loop._run_key_like(human[0]): 3})
     assert d_small["below_min_frames"] is True and d_small["level"] == "ok"
     assert d_small["share"] == 0.5      # 占比照算，只是不拦
+
+
+def test_synthetic_line_dose_reports_negative_dose():
+    """剂量里要能读出**负例剂量**（零线帧数与占比）——记录用，不是门。
+
+    结构负例通道不受线数据剂量上限约束（§22.3），但跨臂比较"负例加到几倍"
+    必须能从判定直接读（否则只能靠数目录，实测踩过）。
+    """
+    loop = _load()
+    K = loop._run_key_like
+    base = ["logs/experiments/human_a", "logs/experiments/human_b"]
+    pair = "logs/experiments/gen_pair"
+    neg = "logs/experiments/gen_neg"
+    frames = {K(base[0]): {"n_frames": 30}, K(base[1]): {"n_frames": 30},
+              K(pair): {"n_frames": 8}, K(neg): {"n_frames": 64}}
+    line_by = {K(pair): {"n_line_frames": 8},
+               K(neg): {"n_line_frames": 0}}
+    d = loop.synthetic_line_dose(added_runs=[pair, neg], base_runs=base,
+                                 line_by_dir=line_by, frames_by_run=frames)
+    assert d["synthetic_line_frames"] == 8 and d["negative_frames"] == 64
+    assert d["candidate_frames"] == 132
+    assert d["negative_frac"] == round(64 / 132, 4)
+    assert d["level"] == "ok"          # 线剂量 8/132 = 0.061 安全

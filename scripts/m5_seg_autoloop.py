@@ -1726,13 +1726,19 @@ def synthetic_line_dose(*, added_runs: list, line_by_dir: dict,
                                                   (added_runs or [])]
     total = sum(_frames_of(r) for r in cand)
     syn = 0
+    added_total = 0
     unknown: list = []
     for r in (added_runs or []):
         n = _line_frames_of(r)
+        added_total += _frames_of(r)
         if n is None:
             unknown.append(_run_key_like(r))
             continue
         syn += n
+    # 负例剂量（记录用，不是门）：追加 run 里**零线帧**的数量与占比。
+    # 结构负例通道不受线数据剂量上限约束（§22.3），但它的剂量必须可从判定
+    # 直接读出来，否则跨臂比较"负例加到几倍"只能靠数目录（实测踩过）。
+    neg = max(0, added_total - syn)
     share = (syn / total) if total else None
     level = "ok"
     below_min = bool(total and total < DOSE_MIN_FRAMES)
@@ -1746,7 +1752,10 @@ def synthetic_line_dose(*, added_runs: list, line_by_dir: dict,
             "added_frames": sum(_frames_of(r) for r in (added_runs or [])),
             "unknown_dirs": sorted(unknown), "level": level,
             "safe_frac": DOSE_SAFE_FRAC, "hard_frac": DOSE_HARD_FRAC,
-            "below_min_frames": below_min, "min_frames": DOSE_MIN_FRAMES}
+            "below_min_frames": below_min, "min_frames": DOSE_MIN_FRAMES,
+            # 负例（零线）剂量：记录用；>0 时给出占比便于跨臂比较
+            "negative_frames": int(neg),
+            "negative_frac": (round(neg / total, 4) if total else None)}
 
 
 def _frames_by_run(run_id: str, runs: list) -> dict:
