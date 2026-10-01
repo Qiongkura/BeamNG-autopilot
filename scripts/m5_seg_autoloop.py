@@ -1698,26 +1698,38 @@ def synthetic_line_dose(*, added_runs: list, line_by_dir: dict,
     # 键**两种形式都要认**：审计报告里的 `train_line_by_dir` 用 `_canon_dir`
     # （绝对 posix 小写），而这里/采样器用 `_run_key_like`（相对 LOGS_DIR）。
     # 实测踩到：只认一种时查不到 -> 剂量恒报 0（守卫形同虚设）。
+    # 取值也要两种形态都认：`frames_by_run` 是 int，`line_by_dir` 是 dict。
     def _lookup(d: dict, r):
         for k in (_run_key_like(r), _canon_dir(r), str(r)):
-            e = (d or {}).get(k)
-            if e:
-                return k, e
+            v = (d or {}).get(k)
+            if v is not None:
+                return k, v
         return None, None
+
+    def _frames_of(r) -> int:
+        _k, v = _lookup(frames_by_run, r)
+        if v is None:
+            return 0
+        return int(v.get("n_frames") or 0) if isinstance(v, dict) else int(v or 0)
+
+    def _line_frames_of(r):
+        _k, v = _lookup(line_by_dir, r)
+        if v is None:
+            return None
+        return (int(v.get("n_line_frames") or 0) if isinstance(v, dict)
+                else int(v or 0))
 
     cand = [str(r) for r in (base_runs or [])] + [str(r) for r in
                                                   (added_runs or [])]
-    total = sum(int((_lookup(frames_by_run, r)[1] or {}).get("n_frames")
-                    or (_lookup(frames_by_run, r)[1] or 0) or 0)
-                for r in cand)
+    total = sum(_frames_of(r) for r in cand)
     syn = 0
     unknown: list = []
     for r in (added_runs or []):
-        k, e = _lookup(line_by_dir, r)
-        if not e:
+        n = _line_frames_of(r)
+        if n is None:
             unknown.append(_run_key_like(r))
             continue
-        syn += int(e.get("n_line_frames") or 0)
+        syn += n
     share = (syn / total) if total else None
     level = "ok"
     if share is not None:
@@ -1727,10 +1739,7 @@ def synthetic_line_dose(*, added_runs: list, line_by_dir: dict,
             level = "warn"
     return {"share": (None if share is None else round(float(share), 4)),
             "synthetic_line_frames": int(syn), "candidate_frames": int(total),
-            "added_frames": sum(
-                int((_lookup(frames_by_run, r)[1] or {}).get("n_frames")
-                    or (_lookup(frames_by_run, r)[1] or 0) or 0)
-                for r in (added_runs or [])),
+            "added_frames": sum(_frames_of(r) for r in (added_runs or [])),
             "unknown_dirs": sorted(unknown), "level": level,
             "safe_frac": DOSE_SAFE_FRAC, "hard_frac": DOSE_HARD_FRAC}
 
