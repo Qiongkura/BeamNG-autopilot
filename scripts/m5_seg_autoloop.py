@@ -1695,16 +1695,27 @@ def synthetic_line_dose(*, added_runs: list, line_by_dir: dict,
     返回 ``{share, synthetic_line_frames, candidate_frames, added_frames,
     unknown_dirs, level}``；``level`` ∈ {"ok","warn","over"}。
     """
+    # 键**两种形式都要认**：审计报告里的 `train_line_by_dir` 用 `_canon_dir`
+    # （绝对 posix 小写），而这里/采样器用 `_run_key_like`（相对 LOGS_DIR）。
+    # 实测踩到：只认一种时查不到 -> 剂量恒报 0（守卫形同虚设）。
+    def _lookup(d: dict, r):
+        for k in (_run_key_like(r), _canon_dir(r), str(r)):
+            e = (d or {}).get(k)
+            if e:
+                return k, e
+        return None, None
+
     cand = [str(r) for r in (base_runs or [])] + [str(r) for r in
                                                   (added_runs or [])]
-    total = sum(int(frames_by_run.get(_run_key_like(r)) or 0) for r in cand)
+    total = sum(int((_lookup(frames_by_run, r)[1] or {}).get("n_frames")
+                    or (_lookup(frames_by_run, r)[1] or 0) or 0)
+                for r in cand)
     syn = 0
     unknown: list = []
     for r in (added_runs or []):
-        k = _run_key_like(r)
-        e = (line_by_dir or {}).get(k)
+        k, e = _lookup(line_by_dir, r)
         if not e:
-            unknown.append(k)
+            unknown.append(_run_key_like(r))
             continue
         syn += int(e.get("n_line_frames") or 0)
     share = (syn / total) if total else None
@@ -1716,8 +1727,10 @@ def synthetic_line_dose(*, added_runs: list, line_by_dir: dict,
             level = "warn"
     return {"share": (None if share is None else round(float(share), 4)),
             "synthetic_line_frames": int(syn), "candidate_frames": int(total),
-            "added_frames": sum(int(frames_by_run.get(_run_key_like(r)) or 0)
-                                for r in (added_runs or [])),
+            "added_frames": sum(
+                int((_lookup(frames_by_run, r)[1] or {}).get("n_frames")
+                    or (_lookup(frames_by_run, r)[1] or 0) or 0)
+                for r in (added_runs or [])),
             "unknown_dirs": sorted(unknown), "level": level,
             "safe_frac": DOSE_SAFE_FRAC, "hard_frac": DOSE_HARD_FRAC}
 

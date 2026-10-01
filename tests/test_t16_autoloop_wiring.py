@@ -356,3 +356,34 @@ def test_synthetic_line_dose_levels():
                      K(added[1]): {"n_line_frames": 10}},
         frames_by_run=frames)
     assert d5["share"] == round(20 / 76, 4) and d5["level"] == "over", d5
+
+
+def test_synthetic_line_dose_accepts_both_key_forms():
+    """剂量查表要认**两种键**：审计报告的 `train_line_by_dir` 用 `_canon_dir`
+    （绝对 posix 小写），采样器/命令行用 `_run_key_like`（相对 LOGS_DIR）。
+
+    实测踩到（2026-10-01）：只认一种时查不到 -> 剂量恒报 0，守卫形同虚设
+    （那一轮恰好是安全剂量才没出事）。两种键形式都必须给出同一结果。
+    """
+    loop = _load()
+    pair = ("logs/experiments/t16_autotruth_devdist_strict_20260930/"
+            "m5auto_a0_material_mix_a0s4/front_main")
+    neg = ("logs/experiments/t16_autotruth_struct_strict_20260930/"
+           "m5auto_a0_structure_negative_a0s5/front_main")
+    human = ["logs/experiments/annotate_pkg_e2_it3_20260927/front_fisheye"]
+    got = []
+    for keyer in (loop._run_key_like, loop._canon_dir):
+        line_by = {keyer(pair): {"n_frames": 8, "n_line_frames": 8},
+                   keyer(neg): {"n_frames": 8, "n_line_frames": 0},
+                   keyer(human[0]): {"n_frames": 15, "n_line_frames": 8}}
+        frames = {keyer(pair): {"n_frames": 8}, keyer(neg): {"n_frames": 8},
+                  keyer(human[0]): {"n_frames": 15}}
+        d = loop.synthetic_line_dose(added_runs=[pair, neg], base_runs=human,
+                                     line_by_dir=line_by,
+                                     frames_by_run=frames)
+        got.append((d["synthetic_line_frames"], d["candidate_frames"],
+                    d["share"], d["level"], tuple(d["unknown_dirs"])))
+    assert got[0] == got[1], got
+    syn, tot, share, level, unknown = got[0]
+    assert (syn, tot) == (8, 31) and share == round(8 / 31, 4)
+    assert level == "over" and unknown == ()
