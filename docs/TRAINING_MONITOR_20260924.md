@@ -67,8 +67,27 @@
 
 # 4) 排查"为什么图是空的"
 .venv\Scripts\python.exe scripts\m5_train_monitor.py probe      # 打印一次真实硬件采样
-.venv\Scripts\python.exe scripts\m5_train_monitor.py status --run-id <run_id>
+.venv\Scripts\python.exe scripts\m5_train_monitor.py status     # 不给 --run-id 取最新一轮
 ```
+
+### 跟随最新一轮（默认行为，开新训练不用重启）
+
+`serve` **不给 `--run-id` 就一直跟着最新一轮走**：只看
+`logs/experiments/*/metrics.jsonl` 里 mtime 最新的那个 run，出现更新的一轮时
+服务端自动切过去。所以监控窗口可以一直开着——它在下一轮训练开始时自己接上。
+
+切换是**整体清空重画**，不是把两轮的点接在一起：新轮次的 `seq` 从 0 重新开始，
+继续用旧 `since` 页面会永远拉不到数据（看着像卡死），所以 `/metrics` 每次都带回
+当前 `run_id`，页面发现 `run_id` 变了就丢掉上一轮的点、从 `since=0` 全量重拉，
+并在横幅里写一句"已跟随到新的一轮"。
+
+两条纪律：**只在真的更新时切**（`mtime` 相等或更旧都不切），所以正在写的那一轮
+不会被旧文件抢走；**没有可跟随的轮次时不编造**——页面显示"等待中"，控制台说明
+逐 step 指标只在训练带 `--metrics-run` 时才写。
+
+相关旋钮：`--follow-interval`（检查间隔，默认 2 s，下限 0.2 s）、`--root`（换一个
+实验目录来跟随）。给了 `--run-id` 就是**钉住**那一轮，不跟随。`snapshot` 与
+`status` 不给 `--run-id` 时也取最新一轮。
 
 配置项：`--monitor-interval`（硬件采样周期，默认 2 s）、`--task-name`（状态栏任务名）、
 `serve --port/--host/--poll-ms`（默认 8760 / 127.0.0.1 / 2000 ms）。
