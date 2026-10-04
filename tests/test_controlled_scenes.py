@@ -481,3 +481,24 @@ def test_pairfar_cycle_is_all_same_side_pairs():
         got = ip.assign_roles([{"role": ip.role_of(float(lat)),
                                 "lat_m": float(lat)} for _r, lat in pair])
         assert [g["role"] for g in got] == [r for r, _l in pair], pair
+
+
+def test_anchor_offset_skips_used_routes():
+    """`--anchor-offset` 跳过已用路段（R3 要用没进过训练/开发集的新路段）。
+
+    `pick_anchors` 是确定性的：不跳过就会把 devdist/pairfar 批次采过的同一批
+    宽路再采一遍（那批已进训练/开发集）。这里验证"取全部 -> 跳过 K -> 取 N"
+    的切片语义，以及越界时返回空表（调用方如实报错，不静默重采）。
+    """
+    m = _load()
+    roads = {}
+    for i in range(6):
+        x = 100.0 * i
+        roads[f"road{i}"] = {"lanesLeft": 1, "lanesRight": 1, "edges": [
+            {"middle": [x + k * 10.0, 0.0, 1.0], "left": [x + k * 10.0, 5.0],
+             "right": [x + k * 10.0, -5.0]} for k in range(20)]}
+    all_a = m.pick_anchors(roads, n_anchors=10_000, min_sep_m=50.0)
+    assert len(all_a) == 6
+    got = all_a[2:2 + 3]
+    assert [a["road_id"] for a in got] == [a["road_id"] for a in all_a[2:5]]
+    assert all_a[2:2 + 3] and not all_a[7:7 + 3]     # 越界 = 空表（调用方报错）

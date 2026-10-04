@@ -1137,6 +1137,9 @@ def main() -> int:
     ap.add_argument("--anchor-min-half-width", type=float, default=0.0,
                     help="只取铺装半宽 >= 该值的锚点（devdist 的远线需要宽路；"
                          "0 = 不限）")
+    ap.add_argument("--anchor-offset", type=int, default=0,
+                    help="跳过前 K 个合格锚点（R3 要用**没进过训练/开发集**的"
+                         "新路段；pick_anchors 是确定性的，不跳过就会重复采同一批）")
     ap.add_argument("--spacing-m", type=float, default=SITE_SPACING_M)
     args = ap.parse_args()
 
@@ -1175,10 +1178,19 @@ def main() -> int:
         texp = _load_truth_export()
         roads = read_road_network(conn)
         types_order = list(args.scenes)
-        anchors = pick_anchors(roads, n_anchors=int(args.anchors),
-                               min_sep_m=float(args.anchor_min_sep_m),
-                               min_half_width_m=float(
-                                   args.anchor_min_half_width))
+        _all_anchors = pick_anchors(
+            roads, n_anchors=10_000,
+            min_sep_m=float(args.anchor_min_sep_m),
+            min_half_width_m=float(args.anchor_min_half_width))
+        _off = max(0, int(args.anchor_offset))
+        anchors = _all_anchors[_off:_off + int(args.anchors)]
+        if _off or len(_all_anchors) > int(args.anchors):
+            print(f"[scenes] 锚点：合格 {len(_all_anchors)} 个，跳过前 {_off} 个，"
+                  f"本轮取 {len(anchors)} 个（offset 用于避开已进训练/开发集的"
+                  f"路段）", flush=True)
+        if not anchors:
+            raise RuntimeError(f"跳过 {_off} 个后没有锚点可用"
+                               f"（合格 {len(_all_anchors)} 个）")
         if not anchors:
             raise RuntimeError("road network 里挑不出锚点")
         report["anchors"] = anchors
