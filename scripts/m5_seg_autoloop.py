@@ -1310,6 +1310,11 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
     # 覆盖率 0.40（应 0.80）——所以这里只加 counts。
     from beamng_autopilot.experiments import candidate_metrics as _cm
     counts_acc = _cm.empty()
+    # 表面范围口径（§10.3 提案，**只报不判**）：把"标签说在背景上"的候选
+    # 从分母里去掉后的身份率/覆盖率/角色率。它**不参与任何硬门**——升为主口径
+    # 必须走 §10.3 签核（实测它会把臂排序反转）。
+    surf_acc = _cm.empty()
+    surf_extra = {"excluded_C": 0, "excluded_R": 0, "matched_lost": 0}
     counts_by_group: dict = {}
     acc: dict = {k: [] for k in IDENTITY_FIELDS}
     gacc: dict = {}          # 逐场景（map/source_id 组）明细
@@ -1388,6 +1393,12 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
             _cm.accumulate(counts_acc, _c)
             _cm.accumulate(counts_by_group.setdefault(dir_group(r), _cm.empty()),
                            _c)
+        _srows = res.get("rows") or []
+        if _srows:
+            _s = _cm.surface_scope(_srows)
+            _cm.accumulate(surf_acc, _s.get("counts") or {})
+            for _k2 in surf_extra:
+                surf_extra[_k2] += int(_s.get(_k2) or 0)
         n_cand = summary.get("n_candidates")
         n_ref = summary.get("n_candidates_with_reference")
         vals = {
@@ -1420,6 +1431,17 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
         "candidate_identity_rate": _r["candidate_identity_rate"],
         "left_right_role_agreement": _r["left_right_role_agreement"],
         "counts": dict(counts_acc),
+        # 表面范围口径（只报不判，§10.3 提案）：定义与代价（matched_lost）都在
+        # 这里，判定文件直接可读；硬门判定**不看**这一块。
+        "identity_surface_scope": {
+            **_cm.ratios(surf_acc), **surf_extra,
+            "scope": "candidates_on_labelled_surface",
+            "off_road_max": _cm.SURFACE_OFF_ROAD_MAX,
+            "reported_only": True,
+            "note": ("§10.3 proposal (docs/T16_PROTOCOL_V8_IDENTITY_SURFACE_"
+                     "PROPOSAL_20261004.md): reported only, never gating; "
+                     "promoting it to primary needs sign-off (it re-ranks "
+                     "arms)")},
         "counts_by_group": {g: dict(v) for g, v in counts_by_group.items()},
         "ratios_by_group": {g: _cm.ratios(v) for g, v in counts_by_group.items()},
         "n_candidates": float(counts_acc.get("C", 0)),
@@ -3143,6 +3165,9 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 # 同一批数"——只存 counts 的话，手改过的比率查不出来（复核者
                 # T12②）。与 hard_gate 的逐 seed 均值不是同一口径，不能混比。
                 "counts_ratios": _cm.ratios(_idc.get("counts") or {}),
+                # 表面范围口径（§10.3 提案，只报不判）：决策所需的数字随每次
+                # 判定落盘，避免"要决策时再补测"
+                "identity_surface_scope": _idc.get("identity_surface_scope"),
                 "counts_by_group": _idc.get("counts_by_group") or {},
                 # 评价 run 的缺测（T11）：空列表才是"每个 run 都测到了"，
                 # 有内容时必须能在判定文件/看板上看到，不许当成 0 候选
