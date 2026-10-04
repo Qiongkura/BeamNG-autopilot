@@ -11,6 +11,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import numpy as np
+
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from beamng_autopilot.experiments import candidate_metrics as cm  # noqa: E402
@@ -303,3 +305,35 @@ def test_surface_scope_counts_and_cost():
     # 空输入：比率 None（不写 0）
     e = surface_scope([])
     assert e["candidate_identity_rate"] is None and e["matched_lost"] == 0
+
+
+def test_frame_structure_density_is_label_only():
+    """R3 场景筛选判据：只读标签的"近场背景类结构密度"（纯函数，模型无关）。
+
+    干净路段（线之间只有路面）≈ 0；线外有墙/护栏/背景的帧明显更高；
+    全帧无线时 None（不猜、不写 0）。
+    """
+    import importlib.util
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_scene_structure_density",
+        root / "scripts" / "m5_scene_structure_density.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["m5_scene_structure_density"] = m
+    spec.loader.exec_module(m)
+    # 干净：两行近场（每行 6 列）在两条线之间全是路面（1）
+    clean = np.ones((4, 10), dtype=np.uint8) * 1
+    clean[2:, 2] = 2
+    clean[2:, 7] = 2
+    s = m.frame_structure_density(clean)
+    assert s["density"] == 0.0 and s["rows_with_line"] == 2
+    # 结构：线之间的路面被背景（0）替换
+    dirty = clean.copy()
+    dirty[2:, 4:6] = 0
+    d = m.frame_structure_density(dirty)
+    assert d["density"] is not None and d["density"] > 0.2
+    assert d["structure_px"] == 4          # 2 行 × 2 列
+    # 全帧无线：None（无线帧由负例通道管）
+    nol = np.ones((4, 10), dtype=np.uint8)
+    assert m.frame_structure_density(nol)["density"] is None
