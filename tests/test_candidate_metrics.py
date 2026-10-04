@@ -184,6 +184,90 @@ def test_arm_gate_measure_summarizes_rows():
     assert e["candidate_identity_rate"] is None and e["C"] == 0
 
 
+def test_arm_gate_measure_reports_per_scene_counts(tmp_path, monkeypatch):
+    """逐场景明细必须随臂输出：冻结口径的 per_scene_min_candidates=30 在 R 上，
+    池化均值会掩盖"某个场景样本不足"（R3 设计 §7 教训 1）。逐场景计数之和
+    必须等于池化计数（同一批行、两种聚合，不允许漏行）。
+    """
+    import importlib.util
+    from pathlib import Path as _P
+    root = _P(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_arm_gate_measure_ps", root / "scripts" / "m5_arm_gate_measure.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["m5_arm_gate_measure_ps"] = m
+    spec.loader.exec_module(m)
+    for name in ("pkg_a", "pkg_b"):
+        d = tmp_path / name / "front_main"
+        d.mkdir(parents=True)
+        (tmp_path / name / "meta.json").write_text("{}", encoding="utf-8")
+    rows_by_dir = {
+        "pkg_a": [{"counts": {"P_frames": 1, "C": 4, "R": 3, "M": 1, "L": 1,
+                              "A": 1, "C_outside_P": 0}}],
+        "pkg_b": [{"counts": {"P_frames": 1, "C": 2, "R": 2, "M": 2, "L": 2,
+                              "A": 1, "C_outside_P": 0}}]}
+
+    class FakeProbe:
+        @staticmethod
+        def probe(d, meta, view=None, model_path=None, device=None):
+            return {"rows": rows_by_dir[_P(d).parent.name]}
+
+    monkeypatch.setattr(m, "_probe", lambda: FakeProbe)
+    out = tmp_path / "gate.json"
+    ck = tmp_path / "ck.pt"
+    ck.write_bytes(b"x")
+    monkeypatch.setattr(sys, "argv", [
+        "m5_arm_gate_measure.py", "--arm", f"a={ck}",
+        "--dev-runs", str(tmp_path / "pkg_a" / "front_main"),
+        str(tmp_path / "pkg_b" / "front_main"), "--out", str(out)])
+    assert m.main() == 0
+    import json as _json
+    blob = _json.loads(out.read_text(encoding="utf-8"))
+    ps = blob["arms"]["a"]["per_scene"]
+    assert set(ps) == {"pkg_a/front_main", "pkg_b/front_main"}
+    assert ps["pkg_a/front_main"]["R"] == 3 and ps["pkg_b/front_main"]["R"] == 2
+    assert (ps["pkg_a/front_main"]["R"] + ps["pkg_b/front_main"]["R"]
+            == blob["arms"]["a"]["R"])
+
+
+def test_arm_gate_measure_decomposes_identity_by_role():
+    """身份率 ~0.5 时必须能分解到角色/认证实例：弥散噪声 vs 某条线系统性不匹配。
+
+    按模型自报角色（by_role）与按参考角色（by_reference_role，即认证实例）
+    两个视角都要有；R 为空时 identity=None（不写 0）。
+    """
+    import importlib.util
+    from pathlib import Path as _P
+    root = _P(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_arm_gate_measure_role", root / "scripts" / "m5_arm_gate_measure.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["m5_arm_gate_measure_role"] = m
+    spec.loader.exec_module(m)
+    rows = [{"counts": {"P_frames": 1, "C": 4, "R": 4, "M": 2, "L": 2, "A": 1,
+                        "C_outside_P": 0},
+             "candidates": [
+                 {"role": "near_left", "engine_role": "near_left",
+                  "reference_available": True, "matched": True},
+                 {"role": "near_left", "engine_role": "near_left",
+                  "reference_available": True, "matched": False},
+                 {"role": "near_right", "engine_role": "near_right",
+                  "reference_available": True, "matched": False},
+                 {"role": "near_right", "engine_role": "near_right",
+                  "reference_available": True, "matched": False},
+                 {"role": "far_left", "reference_available": False,
+                  "matched": False}]}]
+    s = m.summarize_rows(rows)
+    assert s["by_role"]["near_left"] == {"C": 2, "R": 2, "M": 1,
+                                         "identity": 0.5}
+    assert s["by_role"]["far_left"] == {"C": 1, "R": 0, "M": 0,
+                                        "identity": None}
+    # 匹配对上的角色混淆（model_role × engine_role）与逐实例被匹配数：
+    # 1 个 near_left 候选匹配到了 near_left 参考 -> 混淆 {near_left:{near_left:1}}
+    assert s["role_confusion"] == {"near_left": {"near_left": 1}}
+    assert s["reference_instances_matched"] == {"near_left": 1}
+
+
 def test_dose_response_summarize_decision():
     """剂量-效应表：从判定文件抽出剂量与配对差值；旧判定缺负例帧数时按 8 帧/包
     估算并**标明 estimated**（估算值不得与实测值混着引用）。"""
