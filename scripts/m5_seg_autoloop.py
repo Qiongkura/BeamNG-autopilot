@@ -1167,6 +1167,37 @@ def _protocol_snapshot(t: Thresholds) -> dict:
 LOWER_IS_BETTER = ("offroad_false_line_px", "inference_ms_p95")
 
 
+#: 身份率主口径的选择（§10.3 提案的**开关**，默认 v7 = 现行语义不动）：
+#: ``v7`` = 现口径（候选中心、含"横向擦边"匹配）；``surface`` = 表面口径
+#: （分母去掉"标签说在背景上"的候选）。**默认必须是 v7**：切到 surface 是
+#: 语义变更，需要方案层按 §10.3 签核（实测它会把臂排序反转，
+#: `docs/T16_PROTOCOL_V8_IDENTITY_SURFACE_PROPOSAL_20261004.md`）。
+IDENTITY_SCOPES = ("v7", "surface")
+
+
+def apply_identity_scope(ident: dict, scope: str) -> dict:
+    """按主口径选择改写身份/覆盖/角色三个门用值；v7 值另存 ``*_v7``（双报）。
+
+    纯函数（不改入参）：``scope="v7"`` 原样返回；``scope="surface"`` 时把三个
+    键换成 ``identity_surface_scope`` 里的值，并把 v7 值移到 ``*_v7``。
+    缺 surface 块（旧判定/探针拒测）时不猜：保持 v7 值并记 ``scope_fallback``。
+    """
+    out = dict(ident or {})
+    if str(scope) != "surface":
+        return out
+    surf = out.get("identity_surface_scope")
+    if not isinstance(surf, dict):
+        out["scope_fallback"] = "no identity_surface_scope block: v7 kept"
+        return out
+    for k in ("candidate_identity_rate", "candidate_reference_coverage",
+              "left_right_role_agreement"):
+        if surf.get(k) is not None:
+            out[k + "_v7"] = out.get(k)
+            out[k] = surf.get(k)
+    out["identity_scope"] = "surface"
+    return out
+
+
 def _seed_hard(metrics: dict, ident: dict | None, p95: float | None) -> dict:
     """一个 seed（或一个场景）自己的硬门输入（方案 §10.2：均值不能替它过门）。
 
@@ -2653,10 +2684,10 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 base_neg[str(seed)] = m.get("negative_line") or {}
                 # 任务主指标也逐 seed 收（方案 G05）：判定要求主指标有可信改善，
                 # 只送 IoU 等于让任何候选都晋不了级。
-                _idb = identity_metrics(out / "checkpoint_last.pt",
-                                        args.eval_runs,
-                                        frames_by_dir=_report.get(
-                                            "dev_frames_by_dir"))
+                _idb = apply_identity_scope(identity_metrics(
+                    out / "checkpoint_last.pt", args.eval_runs,
+                    frames_by_dir=_report.get("dev_frames_by_dir")),
+                    getattr(args, "identity_scope", "v7"))
                 champ_task[str(seed)] = {
                     name: task_metric_value(name, m, _idb)
                     for name in TASK_METRICS}
@@ -2771,10 +2802,10 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 else metrics.get("line_iou") or 0.0)
             cand_neg[str(seed)] = metrics.get("negative_line") or {}
             cand_meta[str(seed)] = _train_meta(out)
-            _idc = identity_metrics(out / "checkpoint_last.pt",
-                                    args.eval_runs,
-                                    frames_by_dir=_report.get(
-                                        "dev_frames_by_dir"))
+            _idc = apply_identity_scope(identity_metrics(
+                out / "checkpoint_last.pt", args.eval_runs,
+                frames_by_dir=_report.get("dev_frames_by_dir")),
+                getattr(args, "identity_scope", "v7"))
             if _idc.get("eval_run_errors"):
                 print(f"[rounds] 第 {rnd + 1} 轮 seed {seed}："
                       f"{_idc['n_eval_run_errors']} 个评价 run 没测到"
@@ -3168,6 +3199,9 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 # 表面范围口径（§10.3 提案，只报不判）：决策所需的数字随每次
                 # 判定落盘，避免"要决策时再补测"
                 "identity_surface_scope": _idc.get("identity_surface_scope"),
+                # 主口径（§10.3 开关）：默认 v7；切 surface 需方案层签核
+                "identity_scope": str(getattr(args, "identity_scope", "v7")),
+                "protocol_version": _protocol_snapshot(t).get("version"),
                 "counts_by_group": _idc.get("counts_by_group") or {},
                 # 评价 run 的缺测（T11）：空列表才是"每个 run 都测到了"，
                 # 有内容时必须能在判定文件/看板上看到，不许当成 0 候选
@@ -3455,6 +3489,9 @@ def main(argv=None) -> int:
                    metavar="RUN=SOURCE",
                    help="逐 run 指定漆线真值来源；`engine_annotation_partial` "
                         "= 弱监督研究臂（line 通道不屏蔽，但不允许晋级）")
+    s.add_argument("--identity-scope", choices=IDENTITY_SCOPES, default="v7",
+                   help="身份率主口径（§10.3 提案的开关；默认 v7 = 现行语义）。"
+                        "surface 需要方案层签核：它会把臂排序反转")
     s.add_argument("--research-arm", action="store_true",
                    help="明标研究臂：判定照算，但不允许晋级（真值不完整）")
     s.add_argument("--eval-runs", nargs="+", required=True,

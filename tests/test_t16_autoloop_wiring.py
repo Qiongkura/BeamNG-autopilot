@@ -450,3 +450,37 @@ def test_synthetic_line_dose_flags_negative_warn():
                        K(pair): {"n_frames": 16},
                        K(neg): {"n_frames": 64}})
     assert d2["negative_warn"] is False
+
+
+# ------------------------------------------- 身份率主口径开关（§10.3 提案）
+
+def test_apply_identity_scope_switches_and_keeps_v7():
+    """主口径开关：surface 时换三个门用值、v7 值另存 `*_v7`（双报）；缺块不猜。
+
+    默认必须是 v7（现行语义）；surface 是语义变更，需 §10.3 签核（会反转臂排序）。
+    """
+    loop = _load()
+    ident = {
+        "candidate_identity_rate": 0.44,
+        "candidate_reference_coverage": 0.95,
+        "left_right_role_agreement": 0.82,
+        "identity_surface_scope": {
+            "candidate_identity_rate": 0.77,
+            "candidate_reference_coverage": 0.96,
+            "left_right_role_agreement": 0.83},
+    }
+    v7 = loop.apply_identity_scope(ident, "v7")
+    assert v7["candidate_identity_rate"] == 0.44
+    assert "candidate_identity_rate_v7" not in v7
+    surf = loop.apply_identity_scope(ident, "surface")
+    assert surf["candidate_identity_rate"] == 0.77
+    assert surf["candidate_identity_rate_v7"] == 0.44
+    assert surf["candidate_reference_coverage_v7"] == 0.95
+    assert surf["identity_scope"] == "surface"
+    # 入参不被改写（纯函数）
+    assert ident["candidate_identity_rate"] == 0.44
+    # 缺 surface 块：保持 v7 并记 fallback（不猜、不静默切换）
+    fb = loop.apply_identity_scope(
+        {"candidate_identity_rate": 0.44}, "surface")
+    assert fb["candidate_identity_rate"] == 0.44
+    assert "no identity_surface_scope block" in fb["scope_fallback"]
