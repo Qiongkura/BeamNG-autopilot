@@ -36,11 +36,20 @@ def summarize_rows(rows: list) -> dict:
 
     只累加**整数计数**再算一次比率（与判定同口径）；掩码指标取逐帧均值并
     同时给出样本数（缺测不静默当 0）。
+
+    另外给一份**表面口径**（§10.3 变更提案的双口径对照）：把"像素主要落在
+    **人工标签的背景类**（``off_road_frac >= 0.5``）"的候选从分母里排除，
+    即只统计"标签自己说这是路面或漆线"的候选。判据用的是**标签自己的类**，
+    不是阈值旋钮；``matched`` 一条都不应被排除（匹配上的候选必然落在漆线上），
+    这个不变式在返回值里可见（``surface_scope.matched_lost``）。
     """
     from beamng_autopilot.experiments import candidate_metrics as cm
     acc = cm.empty()
     mask = {"recall": [], "precision": [], "iou": []}
     off_road = n_cand = frames = 0
+    # 表面口径（双口径对照）：候选是否"标签说在路面/漆线上"
+    surf = {"C": 0, "R": 0, "M": 0, "L": 0, "A": 0, "excluded_C": 0,
+            "excluded_R": 0, "matched_lost": 0}
     merges = merged = 0
     for r in rows or []:
         c = r.get("counts") or {}
@@ -51,6 +60,28 @@ def summarize_rows(rows: list) -> dict:
                 mask[k].append(float(r[k]))
         off_road += int(r.get("candidates_off_road") or 0)
         n_cand += int(r.get("n_candidates") or 0)
+        for c in (r.get("candidates") or []):
+            on_surface = float(c.get("off_road_frac") or 0.0) < 0.5
+            matched = bool(c.get("matched"))
+            if on_surface:
+                surf["C"] += 1
+                if c.get("reference_available"):
+                    surf["R"] += 1
+                if matched:
+                    surf["M"] += 1
+                    if c.get("role_agrees") is not None:
+                        surf["L"] += 1
+                        if c.get("role_agrees"):
+                            surf["A"] += 1
+            else:
+                surf["excluded_C"] += 1
+                if c.get("reference_available"):
+                    surf["excluded_R"] += 1
+                # **表面口径的召回代价**：现口径按"横向 ≤0.8 m"判匹配（不看像素），
+                # 所以会有"横向近、像素却在背景上"的匹配；表面口径把它们排除，
+                # 这个数就是代价（提案里必须与收益一起报，不能只报收益）。
+                if matched:
+                    surf["matched_lost"] += 1
         g = r.get("line_candidate_gate") or {}
         mg = (g.get("line_candidate_merge") or {}) if isinstance(g, dict) else {}
         merges += int(mg.get("groups") or 0)
@@ -64,7 +95,15 @@ def summarize_rows(rows: list) -> dict:
            "left_right_role_agreement": rt["left_right_role_agreement"],
            "candidates_off_road": off_road, "n_candidates": n_cand,
            "off_road_frac": (round(off_road / n_cand, 4) if n_cand else None),
-           "merge_groups": merges, "merge_merged": merged}
+           "merge_groups": merges, "merge_merged": merged,
+           "surface_scope": {
+               **surf,
+               "candidate_reference_coverage": (
+                   round(surf["R"] / surf["C"], 4) if surf["C"] else None),
+               "candidate_identity_rate": (
+                   round(surf["M"] / surf["R"], 4) if surf["R"] else None),
+               "left_right_role_agreement": (
+                   round(surf["A"] / surf["L"], 4) if surf["L"] else None)}}
     for k, v in mask.items():
         out[f"mask_{k}_mean"] = (round(sum(v) / len(v), 4) if v else None)
         out[f"mask_{k}_n"] = len(v)

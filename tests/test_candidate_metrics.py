@@ -217,3 +217,56 @@ def test_dose_response_summarize_decision():
     r2 = m.summarize_decision(old)
     assert r2["negative_frames"] == 24 and r2["dose_source"] == "estimated"
     assert r2["negative_x"] is None      # 线帧未知 -> 倍数未知，不猜
+
+
+def test_arm_gate_measure_surface_scope_dual():
+    """双口径对照（§10.3 提案）：表面口径只排除"标签说在背景上"的候选，
+    匹配上的候选一条都不该丢（matched_lost 必须为 0 才能说"无召回代价"）。"""
+    import importlib.util
+    from pathlib import Path
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_arm_gate_measure", root / "scripts" / "m5_arm_gate_measure.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["m5_arm_gate_measure"] = m
+    spec.loader.exec_module(m)
+    rows = [{
+        "counts": {"P_frames": 1, "C": 4, "R": 4, "M": 2, "L": 2, "A": 1,
+                   "C_outside_P": 0},
+        "n_candidates": 4, "candidates_off_road": 2,
+        "candidates": [
+            {"matched": True, "reference_available": True,
+             "off_road_frac": 0.0, "role_agrees": True},
+            {"matched": True, "reference_available": True,
+             "off_road_frac": 0.0, "role_agrees": False},
+            # 未匹配但落在标签的背景类上（"线状结构"）-> 表面口径排除
+            {"matched": False, "reference_available": True,
+             "off_road_frac": 1.0, "role_agrees": None},
+            {"matched": False, "reference_available": True,
+             "off_road_frac": 0.7, "role_agrees": None},
+        ],
+    }]
+    s = m.summarize_rows(rows)
+    assert s["candidate_identity_rate"] == 0.5          # 现有口径 2/4
+    ss = s["surface_scope"]
+    assert ss["R"] == 2 and ss["M"] == 2 and ss["matched_lost"] == 0
+    assert ss["excluded_R"] == 2 and ss["excluded_C"] == 2
+    assert ss["candidate_identity_rate"] == 1.0         # 表面口径 2/2
+    assert ss["left_right_role_agreement"] == 0.5       # 角色不变（L/A 只数匹配上的）
+    # "横向近、像素在背景上"的匹配：表面口径排除它（M 也减），代价可见
+    rows2 = [{
+        "counts": {"P_frames": 1, "C": 2, "R": 2, "M": 1, "L": 1, "A": 1,
+                   "C_outside_P": 0},
+        "n_candidates": 2, "candidates_off_road": 1,
+        "candidates": [
+            {"matched": True, "reference_available": True,
+             "off_road_frac": 0.0, "role_agrees": True},
+            {"matched": True, "reference_available": True,
+             "off_road_frac": 1.0, "role_agrees": True},
+        ],
+    }]
+    s2 = m.summarize_rows(rows2)
+    assert s2["candidate_identity_rate"] == 0.5         # 现口径 1/2
+    ss2 = s2["surface_scope"]
+    assert ss2["M"] == 1 and ss2["R"] == 1 and ss2["matched_lost"] == 1
+    assert ss2["candidate_identity_rate"] == 1.0
