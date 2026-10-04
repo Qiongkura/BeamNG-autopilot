@@ -422,3 +422,31 @@ def test_synthetic_line_dose_reports_negative_dose():
     assert d["candidate_frames"] == 132
     assert d["negative_frac"] == round(64 / 132, 4)
     assert d["level"] == "ok"          # 线剂量 8/132 = 0.061 安全
+
+
+def test_synthetic_line_dose_flags_negative_warn():
+    """负例占比超过实测转向点（~0.60，§25）时记 negative_warn（只 warn 不拦）。
+
+    8.5× 臂（负例占比 0.599）身份率均值 0.4147 < 6× 臂（0.51）0.4410，路外假线
+    +15087——转向点已实测，但不显著，所以只记录、不硬拦。
+    """
+    loop = _load()
+    K = loop._run_key_like
+    base = ["logs/experiments/human_a"]
+    pair = "logs/experiments/gen_pair"
+    neg = "logs/experiments/gen_neg"
+    frames = {K(base[0]): {"n_frames": 60}, K(pair): {"n_frames": 16},
+              K(neg): {"n_frames": 96}}
+    line_by = {K(pair): {"n_line_frames": 16}, K(neg): {"n_line_frames": 0}}
+    d = loop.synthetic_line_dose(added_runs=[pair, neg], base_runs=base,
+                                 line_by_dir=line_by, frames_by_run=frames)
+    # 96/172 = 0.558 > 0.55 -> warn
+    assert d["negative_frac"] == round(96 / 172, 4)
+    assert d["negative_warn"] is True
+    # 少一点负例（64/140 = 0.457）-> 不 warn
+    d2 = loop.synthetic_line_dose(
+        added_runs=[pair, neg], base_runs=base, line_by_dir=line_by,
+        frames_by_run={K(base[0]): {"n_frames": 60},
+                       K(pair): {"n_frames": 16},
+                       K(neg): {"n_frames": 64}})
+    assert d2["negative_warn"] is False

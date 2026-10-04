@@ -1685,6 +1685,11 @@ DOSE_HARD_FRAC = 0.25
 #: 剂量只在**够大**的训练池上判：实测的崩溃是"合成数据主导训练量"的域偏移，
 #: 池子只有个位数帧时（冒烟/接线测试）占比没有意义——那类轮次只记录不拦。
 DOSE_MIN_FRAMES = 40
+#: **负例剂量的记录警戒线**（只 warn，不拦）：负例通道没有线位先验、可以加量
+#: （§23/§24 单调递增），但实测在负例占比 ~0.60 时转向（§25：8.5× 臂身份率均值
+#: 0.4147 < 6× 臂 0.4410，路外假线 +15087）。超过它只记 `negative_warn`，
+#: 供报告与下一轮核对——不给硬门是因为该点还不显著（ci95 宽）。
+DOSE_NEG_WARN_FRAC = 0.55
 
 
 def synthetic_line_dose(*, added_runs: list, line_by_dir: dict,
@@ -1755,7 +1760,9 @@ def synthetic_line_dose(*, added_runs: list, line_by_dir: dict,
             "below_min_frames": below_min, "min_frames": DOSE_MIN_FRAMES,
             # 负例（零线）剂量：记录用；>0 时给出占比便于跨臂比较
             "negative_frames": int(neg),
-            "negative_frac": (round(neg / total, 4) if total else None)}
+            "negative_frac": (round(neg / total, 4) if total else None),
+            "negative_warn": bool(total and neg / total > DOSE_NEG_WARN_FRAC),
+            "negative_warn_frac": DOSE_NEG_WARN_FRAC}
 
 
 def _frames_by_run(run_id: str, runs: list) -> dict:
