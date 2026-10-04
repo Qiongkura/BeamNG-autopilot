@@ -421,3 +421,46 @@ def test_frame_structure_density_is_label_only():
     # 全帧无线：None（无线帧由负例通道管）
     nol = np.ones((4, 10), dtype=np.uint8)
     assert m.frame_structure_density(nol)["density"] is None
+
+def test_candidate_scope_scan_transforms():
+    """候选集扫描的纯变换：lateral 只丢超限（可按通道过滤）；parallel 同侧合并
+    且 matched 优先、否则保留 |lat| 小者；跨侧不合并（不同线的重复不可能跨侧）。
+    """
+    import importlib.util
+    from pathlib import Path as _P
+    root = _P(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_candidate_scope_scan",
+        root / "scripts" / "m5_candidate_scope_scan.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["m5_candidate_scope_scan"] = m
+    spec.loader.exec_module(m)
+    cands = [
+        {"lat_m": 1.6, "matched": True, "reference_available": True},
+        {"lat_m": 1.7, "matched": False, "reference_available": True},
+        {"lat_m": -6.0, "matched": False, "reference_available": True,
+         "learned_frac": None},
+        {"lat_m": -6.2, "matched": True, "reference_available": True,
+         "learned_frac": 0.9},
+        {"lat_m": 7.5, "matched": False, "reference_available": True,
+         "learned_frac": 0.5},
+    ]
+    # lateral：全部通道（-6.0 与 -6.2 都超 5.0，都丢）
+    out = m.apply_scope(cands, mode="lateral", param=5.0)
+    assert [c["lat_m"] for c in out] == [1.6, 1.7]
+    # lateral：只丢经典（-6.0 经典丢；-6.2/7.5 是学习通道，留）
+    out = m.apply_scope(cands, mode="lateral", param=5.0, only_classic=True)
+    assert [c["lat_m"] for c in out] == [1.6, 1.7, -6.2, 7.5]
+    # parallel：1.6/1.7 合并保留 matched 的 1.6；-6.0/-6.2 合并保留 matched 的 -6.2
+    out = m.apply_scope(cands, mode="parallel", param=0.5)
+    lats = sorted(c["lat_m"] for c in out)
+    assert lats == [-6.2, 1.6, 7.5], lats
+    assert sum(c.get("_merged") or 0 for c in out) == 2
+    # 跨侧不合并（+7.5 与 -6.2 差 13.7 > 0.5 本来就不合；构造近距跨侧用例）
+    cross = [{"lat_m": 0.2, "matched": False}, {"lat_m": -0.3, "matched": False}]
+    out = m.apply_scope(cross, mode="parallel", param=0.8)
+    assert len(out) == 2
+    # 都未匹配时保留 |lat| 小者
+    both = [{"lat_m": -1.2, "matched": False}, {"lat_m": -1.5, "matched": False}]
+    out = m.apply_scope(both, mode="parallel", param=0.5)
+    assert len(out) == 1 and out[0]["lat_m"] == -1.2
