@@ -270,3 +270,36 @@ def test_arm_gate_measure_surface_scope_dual():
     ss2 = s2["surface_scope"]
     assert ss2["M"] == 1 and ss2["R"] == 1 and ss2["matched_lost"] == 1
     assert ss2["candidate_identity_rate"] == 1.0
+
+
+def test_surface_scope_counts_and_cost():
+    """表面范围口径（§10.3 提案，只报不判）：计数、比率与**召回代价**一起给。
+
+    判据用标签自己的类（`off_road_frac >= 0.5` = 标签说不在路面/漆线上）；
+    `matched_lost`（横向匹配但像素在背景上）必须可见——提案要求收益与代价并列，
+    不许只报收益。
+    """
+    from beamng_autopilot.experiments.candidate_metrics import (
+        SURFACE_OFF_ROAD_MAX, surface_scope)
+    rows = [{"candidates": [
+        {"matched": True, "reference_available": True, "off_road_frac": 0.0,
+         "role_agrees": True},
+        {"matched": True, "reference_available": True, "off_road_frac": 0.8,
+         "role_agrees": True},          # 擦边匹配：表面口径的召回代价
+        {"matched": False, "reference_available": True, "off_road_frac": 1.0},
+        {"matched": False, "reference_available": False, "off_road_frac": 0.0},
+    ]}]
+    s = surface_scope(rows)
+    assert SURFACE_OFF_ROAD_MAX == 0.5
+    assert s["reported_only"] is True
+    # C=2（第 1、4 个在表面上）、R=1（只有第 1 个既在表面上又有参考）、
+    # M/L/A=1；第 2 个是"擦边匹配"-> matched_lost=1；第 3、4 个被排除
+    assert s["counts"]["C"] == 2 and s["counts"]["R"] == 1
+    assert s["counts"]["M"] == 1 and s["counts"]["L"] == 1 and s["counts"]["A"] == 1
+    # 被排除的 2 条里，两条都"该侧有参考"（第 2 条擦边匹配、第 3 条纯假线）
+    assert s["excluded_C"] == 2 and s["excluded_R"] == 2
+    assert s["matched_lost"] == 1
+    assert s["candidate_identity_rate"] == 1.0
+    # 空输入：比率 None（不写 0）
+    e = surface_scope([])
+    assert e["candidate_identity_rate"] is None and e["matched_lost"] == 0
