@@ -16,6 +16,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import math
 from pathlib import Path
 
 import numpy as np
@@ -403,3 +404,31 @@ def test_negative_credential_carries_its_own_evidence(tmp_path):
     assert got.get("line_px") == 0
     assert got.get("structures") and got["structures"][0]["kind"] == "wall_stone"
     assert (got.get("structure_appearance") or {}).get("inside") == 1000
+
+
+def test_camera_block_from_frames_matches_render_pose():
+    """导出包必须带 `cameras` 块（探针建相机模型用；缺它整 run 判 UNKNOWN）。
+
+    实测踩到：R3 首轮验收 8/8 帧 UNKNOWN、C=0/R=0。局部系用**录制时的世界
+    位姿**换算（不猜约定）：合成相机沿站点方向看且带 -12° 俯角，故
+    `fwd_local` 应≈(0, cos12°, -sin12°)、`up_local`≈(0, sin12°, cos12°)；
+    offset 用采集/生成共用的 CAMERA_POS。
+    """
+    m = _load()
+    frames, _t = _frames_from_synthetic(with_line=False)
+    site_dir = [1.0, 0.0, 0.0]
+    blk = m.camera_block_from_frames(frames, site_dir)
+    assert "front_main" in blk, blk
+    cam = blk["front_main"]
+    assert cam["fov_deg"] == 65.0 and cam["width"] > 0 and cam["height"] > 0
+    fwd = cam["fwd"]
+    up = cam["up"]
+    # 合成相机的 fwd 沿站点方向（+x）且带 -12° 俯角 -> 车体系里是 (0,cos,-sin)
+    c, sn = math.cos(math.radians(12.0)), math.sin(math.radians(12.0))
+    assert abs(fwd[0]) < 1e-3 and abs(fwd[1] - c) < 1e-3, fwd
+    assert abs(fwd[2] + sn) < 1e-3, fwd
+    assert abs(up[0]) < 1e-3 and abs(up[1] - sn) < 1e-3, up
+    assert abs(up[2] - c) < 1e-3, up
+    # 缺相机/坏方向：返回空表（调用方写不出块 -> 探针判 UNKNOWN，不猜）
+    assert m.camera_block_from_frames([], site_dir) == {}
+    assert m.camera_block_from_frames(frames, [0.0, 0.0, 0.0]) == {}

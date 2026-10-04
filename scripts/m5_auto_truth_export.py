@@ -60,11 +60,13 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from beamng_autopilot.experiments.auto_truth import (  # noqa: E402
-    TRUTH_CONTRACT, VERIFIER_VERSION, _rotate_camera_basis,
+    TRUTH_CONTRACT, VERIFIER_VERSION, _rotate_camera_basis, camera_basis,
     frame_content_shas, line_evidence_coverage, line_evidence_mask,
     palette_sha, verify_batch, write_truth_credentials,
 )
 from beamng_autopilot_tech.annotations import annotation_palette  # noqa: E402
+from beamng_autopilot_tech.providers import (  # noqa: E402
+    CAMERA_FOV_DEG, CAMERA_POS)
 
 EXPORTER_VERSION = "auto_truth_export_v1"
 
@@ -278,6 +280,52 @@ def structure_appearance_split(frames: list, structures: list, *,
                          "structures",
             "radius_px": int(radius_px), "n_structures": len(structures or []),
             "inside": inside, "outside": outside, "per_frame": per_frame}
+
+
+def camera_block_from_frames(frames: list, site_dir) -> dict:
+    """导出包的 ``cameras`` 块（探针用它建相机模型；缺它整 run 判 UNKNOWN）。
+
+    为什么必须写：探针的相机来自 ``meta["cameras"][view]``（采集包的格式），
+    而导出包此前没有这一块——实测踩到：R3 首轮验收 8/8 帧 UNKNOWN、C=0/R=0。
+
+    局部系用**录制时的世界位姿**换算，不猜约定：
+    ``fwd_local = (f·right_v, f·fwd_v, f·up_v)``，其中 ``(right_v, fwd_v, up_v)``
+    是车体基（``fwd_v`` = 站点方向、``right_v``/``up_v`` 由世界 z 正交化）；
+    ``offset`` 直接用采集/生成共用的 ``CAMERA_POS``（相机相对车体的位移，
+    两边同一常量，不需要再换算）。
+    """
+    if not frames:
+        return {}
+    cam = frames[0].get("camera") or {}
+    try:
+        # 两种 pose 形态都要支持：采集侧是 `pose.basis`，合成/受控侧是 `rot`
+        # （实测踩到：只读 basis 时合成帧返回空表）
+        _pos, _right, f, u = camera_basis(cam)
+        f = np.asarray(f, dtype=float)
+        u = np.asarray(u, dtype=float)
+    except (TypeError, ValueError):
+        return {}
+    d = np.asarray(site_dir, dtype=float)
+    if f.shape != (3,) or u.shape != (3,) or d.shape != (3,):
+        return {}
+    fwd_v = d / max(float(np.linalg.norm(d)), 1e-12)
+    right_v = np.cross(fwd_v, np.array([0.0, 0.0, 1.0]))
+    n = float(np.linalg.norm(right_v))
+    if n < 1e-9:
+        return {}
+    right_v = right_v / n
+    up_v = np.cross(right_v, fwd_v)
+
+    def _local(v):
+        return [round(float(v @ right_v), 6), round(float(v @ fwd_v), 6),
+                round(float(v @ up_v), 6)]
+
+    h, w = np.asarray(frames[0]["rgb"]).shape[:2]
+    return {"front_main": {
+        "offset": [float(v) for v in CAMERA_POS],
+        "fwd": _local(f), "up": _local(u),
+        "fov_deg": float(cam.get("fov_y_deg") or CAMERA_FOV_DEG),
+        "width": int(w), "height": int(h)}}
 
 
 def scene_frame_paths(batch: Path, name: str) -> list:
@@ -512,6 +560,10 @@ def export_scene(rec: dict, truth: list, frames: list, *, out_root: Path,
         "source_id": f"m5auto_a{anchor}",
         "map_name_source": "m5_controlled_scenes.py (generated scenario)",
         "generated_by": f"{EXPORTER_VERSION}",
+        # 探针（评价侧）用它建相机模型：缺这一块整 run 判 UNKNOWN（实测踩到）
+        "cameras": camera_block_from_frames(
+            frames, ((rec.get("generated") or {}).get("dir")
+                     or rec.get("dir"))),
         "frames": frame_records}, indent=1, ensure_ascii=False), encoding="utf-8")
 
     # 出口复核前**套上逐帧静态投影标定**（标定是场景的渲染/相机常数，已在
