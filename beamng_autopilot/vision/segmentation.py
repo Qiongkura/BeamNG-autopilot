@@ -471,6 +471,59 @@ def merge_close_candidates(markings, *, pos=None, heading=None,
     return out, info
 
 
+def scope_lateral_candidates(markings, *, pos=None, heading=None,
+                             max_lat_m: float | None = None,
+                             enable: bool | None = None,
+                             debug: dict | None = None) -> tuple:
+    """横向口径门：``|lat|`` 超过上限的候选不产出（参考无关，纯几何）。
+
+    为什么（2026-10-04，R3 第二轮归因 + 离线扫描）：v7 身份率门的剩余项在
+    **候选集本身**——远场路外尾带（未匹配候选 64% 在 |lat| ≥ 5 m，中位 6.1 m，
+    是墙/杆/植被边的细小亮条）。离线扫描（``scripts/m5_candidate_scope_scan.py``，
+    seed 42）实测：丢弃 |lat| > 3 m 的候选，dev 身份 0.4396 → 0.7129、
+    R3 0.3989 → 0.7576；R3 上**零匹配代价**（M 恒 75），dev 上有真·远线
+    （M 160 → 72）→ 代价在召回，必须用像素级门复核后才能改默认。
+
+    默认**关**（``max_lat_m <= 0`` 或 ``BEAMNG_LINE_LAT_MAX_M`` 未设）：候选集
+    属于冻结口径，改默认要走协议新版本；本开关只用于单因子测量。
+    无法定位横向的候选（world 缺失）**保留**——判不了就不丢（不猜）。
+    """
+    from beamng_autopilot.vision.lanes import LaneMarking  # noqa: F401
+    if enable is None:
+        enable = os.environ.get("BEAMNG_LINE_LAT_MAX_M", "").strip() not in (
+            "", "0", "off")
+    if max_lat_m is None:
+        _env = os.environ.get("BEAMNG_LINE_LAT_MAX_M", "").strip()
+        max_lat_m = float(_env) if _env not in ("", "off") else 0.0
+    ms = list(markings or [])
+    info = {"enabled": bool(enable), "in": len(ms), "out": len(ms),
+            "dropped": 0, "unknown_kept": 0, "max_lat_m": float(max_lat_m)}
+    if not enable or float(max_lat_m) <= 0.0 or pos is None or heading is None:
+        if debug is not None:
+            debug["line_candidate_lat_scope"] = info
+        return ms, info
+    h = float(heading)
+    left = np.array([-math.sin(h), math.cos(h)])
+    pos2 = np.asarray(pos, dtype=float)[:2]
+    lim = float(max_lat_m)
+    out = []
+    for mk in ms:
+        w = np.asarray(getattr(mk, "world", None), dtype=float)
+        if w.ndim != 2 or len(w) == 0 or w.shape[1] < 2:
+            info["unknown_kept"] += 1
+            out.append(mk)
+            continue
+        lat = float((np.median(w[:, :2], axis=0) - pos2) @ left)
+        if abs(lat) > lim:
+            info["dropped"] += 1
+            continue
+        out.append(mk)
+    info["out"] = len(out)
+    if debug is not None:
+        debug["line_candidate_lat_scope"] = info
+    return out, info
+
+
 def gate_line_candidates(markings, line_mask, road_mask,
                          *, gate_on: bool | None = None,
                          surface_gate: bool | None = None):

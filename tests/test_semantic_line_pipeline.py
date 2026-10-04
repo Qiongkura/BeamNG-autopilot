@@ -623,3 +623,44 @@ def test_merge_close_candidates_same_side_only():
     out2, _ = merge_close_candidates([mk(1.7), mk(2.0), bad],
                                      pos=(0.0, 0.0, 0.0), heading=0.0)
     assert len(out2) == 2
+
+
+def test_scope_lateral_candidates_drops_only_beyond_limit():
+    """横向口径门（单因子开关，默认关）：只丢 |lat| 超限的；world 缺失的保留
+    （判不了不丢）；关掉/非正值是 no-op；debug 里能看到计数。
+
+    实测依据（R3 第二轮 + 离线扫描，seed 42）：丢 |lat|>3 m 的候选，
+    dev 身份 0.4396→0.7129（M 160→72）、R3 0.3989→0.7576（M 恒 75）——
+    代价在召回，改默认必须先过像素级门。
+    """
+    import numpy as np
+    from beamng_autopilot.vision.segmentation import (
+        scope_lateral_candidates)
+    from beamng_autopilot.vision.lanes import LaneMarking
+
+    def mk(lat, n=5):
+        return LaneMarking(world=np.array([[0.0, float(lat)]] * n),
+                           pixels=np.zeros((n, 2)), color="white",
+                           kind="thin", confidence=0.5)
+
+    debug = {}
+    out, info = scope_lateral_candidates(
+        [mk(1.7), mk(-6.0), mk(7.5), mk(-2.0)], pos=(0.0, 0.0, 0.0),
+        heading=0.0, max_lat_m=3.0, enable=True, debug=debug)
+    assert sorted(float(np.median(m.world[:, 1])) for m in out) == [-2.0, 1.7]
+    assert info["dropped"] == 2 and info["unknown_kept"] == 0
+    assert debug["line_candidate_lat_scope"]["dropped"] == 2
+    # world 缺失：保留（判不了不丢）
+    bad = LaneMarking(world=None, pixels=np.zeros((3, 2)), color="white",
+                      kind="thin", confidence=0.5)
+    out, info = scope_lateral_candidates([bad, mk(9.0)], pos=(0.0, 0.0, 0.0),
+                                         heading=0.0, max_lat_m=3.0,
+                                         enable=True)
+    assert len(out) == 1 and info["unknown_kept"] == 1 and info["dropped"] == 1
+    # 默认关 / 非正值：no-op（候选集属冻结口径，改默认要走协议新版）
+    for kw in ({"enable": False, "max_lat_m": 3.0},
+               {"enable": True, "max_lat_m": 0.0}):
+        out, info = scope_lateral_candidates([mk(1.7), mk(9.0)],
+                                             pos=(0.0, 0.0, 0.0), heading=0.0,
+                                             **kw)
+        assert len(out) == 2 and info["dropped"] == 0

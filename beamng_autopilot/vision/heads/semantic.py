@@ -404,6 +404,18 @@ class SemanticHead:
             finally:
                 stage_ms["classification"] = (
                     time.perf_counter() - stage_t) * 1000.0
+        # 候选集的**最后一步**：横向口径门（默认关，单因子开关）。
+        # 位置很关键：黄臂补候选、经典回退都在上面发生，门必须落在**最终**
+        # 候选集上——放在 detect_lines 里只覆盖一个贡献者（实测：门只丢 30/227，
+        # 离线扫描应丢 100/227，差的就是这些后补候选）。
+        try:
+            from ..segmentation import scope_lateral_candidates
+            markings, _lat_scope = scope_lateral_candidates(
+                markings, pos=ctx.pos, heading=ctx.heading,
+                debug=out.meta.setdefault("line_candidates", {}))
+        except Exception as _lse:                             # noqa: BLE001
+            out.meta.setdefault("line_errors", {})[
+                "lat_scope"] = str(_lse)
         out.meta["markings"] = markings
         stage_ms["total"] = (time.perf_counter() - started) * 1000.0
         return out
