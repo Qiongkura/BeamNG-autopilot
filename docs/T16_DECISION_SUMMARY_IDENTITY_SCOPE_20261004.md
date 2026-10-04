@@ -41,6 +41,9 @@
   "升为主口径需签核"的说明）——**硬门判定完全不变**（仍按 v7）。
 - 臂级测量入口 `scripts/m5_arm_gate_measure.py` 已出双口径（10 seed 表在
   `logs/experiments/t16_dual_scope_10seed.json`）。
+- **交叉验证**（两条独立代码路径、同一 checkpoint）：`identity_metrics` 直读与
+  臂级测量入口**逐项相同**——现口径 0.4396、表面口径 0.7267、
+  `matched_lost` 51、`excluded_R` 214（差 0.0000）。
 
 ## 5. 若定案 A：我会立刻按提案 §4 执行（预估 1–2 小时 + 全臂重测）
 
