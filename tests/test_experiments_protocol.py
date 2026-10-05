@@ -22,8 +22,8 @@ sys.path.insert(0, str(ROOT))
 
 from beamng_autopilot.experiments.protocol import (  # noqa: E402
     COVERAGE_REQUIREMENTS, METRIC_DEFINITIONS, MIN_EVAL_GROUPS, PROTOCOL_VERSION,
-    RESEARCH_ONLY_RANKS, SOURCE_ELIGIBILITY, can_promote, eligibility,
-    metric_denominator, protocol_blob, protocol_hash,
+    PROTOCOL_VERSION_V8, RESEARCH_ONLY_RANKS, SOURCE_ELIGIBILITY, can_promote,
+    eligibility, metric_denominator, protocol_blob, protocol_hash,
 )
 
 
@@ -48,7 +48,10 @@ def test_protocol_hash_is_stable_and_sensitive():
     assert a != protocol_hash(thresholds={"line_recall_min": 0.7,
                                           "extra": 1}), "多一个键也要变"
     blob = protocol_blob(thresholds={"line_recall_min": 0.7})
-    assert blob["version"] == PROTOCOL_VERSION
+    # version 用**生效版本**（不是冻结常量）：换协议 -> 哈希变 -> 封存/确认必须同协议
+    from beamng_autopilot.experiments.protocol import active_protocol_version
+    assert blob["version"] == active_protocol_version()
+    assert blob["version"] in (PROTOCOL_VERSION, PROTOCOL_VERSION_V8)
     assert blob["metrics"]["line_iou"]["level"] == "pixel"
     assert len(blob["coverage_requirements"]) == len(COVERAGE_REQUIREMENTS) == 6
     assert blob["min_eval_groups"] == MIN_EVAL_GROUPS == 6

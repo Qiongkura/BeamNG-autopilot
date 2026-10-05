@@ -30,7 +30,9 @@ def test_the_freeze_snapshot_records_the_protocol_and_unknowns(tmp_path):
         run_dirs=["/no/such/dir=agent_revision"],
         thresholds=Path("/no/such/thresholds.json"))
     assert snap["protocol_hash"] and len(snap["protocol_hash"]) == 16
-    assert snap["protocol"]["version"] == PROTOCOL_VERSION
+    # 快照记录的是**生成时生效**的协议版本（v8 生效后不再等于冻结常量）
+    from beamng_autopilot.experiments.protocol import PROTOCOL_VERSION_V8
+    assert snap["protocol"]["version"] in (PROTOCOL_VERSION, PROTOCOL_VERSION_V8)
     assert snap["models"][0]["status"] == "UNKNOWN"
     assert "error" in snap["models"][0]
     assert snap["runs"][0]["status"] == "UNKNOWN"
