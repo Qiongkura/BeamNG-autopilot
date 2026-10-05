@@ -524,3 +524,22 @@ def test_r2_verdict_gate_evaluation():
         raise AssertionError("未知语义必须报错")
     except ValueError:
         pass
+    # 召回范围（与"线"的定义配套）：paint 时召回门用标签∩像漆那一列判，
+    # 两列原始值都仍可见（不许把另一套定义的分母塞进来）
+    two = {42: {"candidate_reference_coverage": 0.95,
+                "candidate_identity_rate": 0.66, "line_precision": 0.89,
+                "line_recall": 0.50, "line_recall_paint_scope": 0.85,
+                "left_right_role_agreement": 0.88}}
+    gl = m.evaluate_gates(two, recall_scope="label")
+    gp = m.evaluate_gates(two, recall_scope="paint")
+    assert gl["gates"]["line_recall"]["verdict"] == "fail"      # 0.50 < 0.70
+    assert gp["gates"]["line_recall"]["verdict"] == "pass"      # 0.85 >= 0.70
+    assert gp["recall_scope"] == "paint"
+    assert gp["recall_gate_field"] == "line_recall_paint_scope"
+    assert gp["per_seed"]["42"]["line_recall"] == 0.50, "原始列仍要保留"
+    assert gp["per_seed"]["42"]["line_recall_paint_scope"] == 0.85
+    try:
+        m.evaluate_gates(two, recall_scope="nope")
+        raise AssertionError("未知范围必须报错")
+    except ValueError:
+        pass

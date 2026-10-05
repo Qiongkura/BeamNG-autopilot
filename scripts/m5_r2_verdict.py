@@ -49,12 +49,20 @@ GATES = {"candidate_reference_coverage": 0.80,
 PER_SCENE_MIN_CANDIDATES = 30
 
 
-def evaluate_gates(by_seed: dict, *, mode: str = "strict") -> dict:
+def evaluate_gates(by_seed: dict, *, mode: str = "strict",
+                   recall_scope: str = "label") -> dict:
     """逐 seed 判定 + 均值判定（纯函数，可单测）。
 
     ``by_seed``：``{seed: {metric: value|None}}``。缺测（None）记 UNKNOWN，
     **不算通过也不算失败**（方案纪律：缺测不当 PASS）。返回
     ``{"per_seed": {...}, "means": {...}, "gates": {...}, "verdict": ...}``。
+
+    ``recall_scope``（召回门的真值范围，与"线"的定义配套）：
+    * ``"label"``（默认）：召回按**人工标签**（v7 定义）；
+    * ``"paint"``：召回按**标签 ∩ 像漆**（v8 定义——它只承诺召回漆线；
+      用标签范围去判 v8 是把另一套定义的分母塞进来）。
+    两种范围都在返回里可见（``line_recall`` 与 ``line_recall_paint_scope``），
+    判门只看选中的那个。
 
     ``mode``（判定语义，方案层待裁决项②）：
     * ``"strict"``（默认）：**全 seed 通过**才算该门通过（任一 seed 跌破即 fail）；
@@ -65,11 +73,21 @@ def evaluate_gates(by_seed: dict, *, mode: str = "strict") -> dict:
     """
     if mode not in ("strict", "mean"):
         raise ValueError(f"未知判定语义 {mode!r}（strict|mean）")
+    if recall_scope not in ("label", "paint"):
+        raise ValueError(f"未知召回范围 {recall_scope!r}（label|paint）")
+    # 召回门按选定范围取值（其余门不变）；原始两列都保留在 per_seed 里
+    gate_field = {"label": "line_recall",
+                  "paint": "line_recall_paint_scope"}[recall_scope]
+    # 判门用 judge（召回列按选定范围替换），per_seed 仍保留**原始两列**
+    judge = {s_: dict(v) for s_, v in by_seed.items()}
+    if recall_scope == "paint":
+        for v in judge.values():
+            v["line_recall"] = v.get("line_recall_paint_scope")
     seeds = sorted(by_seed)
     out_gates = {}
     means = {}
     for metric, thr in GATES.items():
-        vals = [by_seed[s].get(metric) for s in seeds]
+        vals = [judge[s].get(metric) for s in seeds]
         measured = [float(v) for v in vals if v is not None]
         means[metric] = (round(float(np.mean(measured)), 4)
                          if measured else None)
@@ -99,7 +117,8 @@ def evaluate_gates(by_seed: dict, *, mode: str = "strict") -> dict:
     failing = [m for m, g in out_gates.items() if g["verdict"] == "fail"]
     unknown = [m for m, g in out_gates.items() if g["verdict"] == "unknown"]
     partial = [m for m, g in out_gates.items() if g["verdict"] == "partial"]
-    return {"mode": mode,
+    return {"mode": mode, "recall_scope": recall_scope,
+            "recall_gate_field": gate_field,
             "per_seed": {str(s): dict(by_seed[s]) for s in seeds},
             "means": means, "gates": out_gates,
             "failing_gates": failing, "unknown_gates": unknown,
@@ -125,6 +144,10 @@ def main() -> int:
     ap.add_argument("--dev-runs", nargs="+", required=True)
     ap.add_argument("--r3-runs", nargs="*", default=None)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--recall-scope", choices=("label", "paint"),
+                    default="label",
+                    help="召回门的真值范围：label=人工标签（v7 定义，默认）；"
+                         "paint=标签∩像漆（v8 定义）")
     ap.add_argument("--verdict-mode", choices=("strict", "mean"),
                     default="strict",
                     help="判定语义：strict=全 seed 必须过（默认）；"
@@ -192,6 +215,7 @@ def main() -> int:
                             if dev_pixel else None}},
            "gates_thresholds": GATES,
            "verdict_mode": args.verdict_mode,
+           "recall_scope": args.recall_scope,
            "per_scene_min_candidates": PER_SCENE_MIN_CANDIDATES,
            "dev": {"candidate": dev_cand, "pixel": dev_pixel,
                    "paint_recall": dev_pr},
@@ -210,8 +234,8 @@ def main() -> int:
             "line_recall_paint_scope": pr.get("recall_paint"),
             "label_nonpaint_frac": pr.get("nonpaint_frac"),
         }
-    out["dev"]["gates"] = evaluate_gates(by_seed,
-                                         mode=args.verdict_mode)
+    out["dev"]["gates"] = evaluate_gates(by_seed, mode=args.verdict_mode,
+                                         recall_scope=args.recall_scope)
     if r3 is not None:
         r3_seed = {}
         for name in r3["candidate"]:
@@ -229,7 +253,8 @@ def main() -> int:
                 "line_recall_paint_scope": prr.get("recall_paint"),
                 "label_nonpaint_frac": prr.get("nonpaint_frac")}
         out["r3"]["gates"] = evaluate_gates(r3_seed,
-                                            mode=args.verdict_mode)
+                                            mode=args.verdict_mode,
+                                            recall_scope=args.recall_scope)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(out, indent=1, ensure_ascii=False),
                              encoding="utf-8")
