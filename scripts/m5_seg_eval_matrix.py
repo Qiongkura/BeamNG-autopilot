@@ -278,10 +278,16 @@ def _finalize(acc: dict, *, n_frames: int, ms: list, per_frame: list,
     return out
 
 
-def evaluate_model(model_path: Path, frames: list, *, device: str = "cuda"
-                   ) -> dict:
-    """在一个 checkpoint 上跑完整评估（学习掩码 + 后处理，走 Segmenter）。"""
-    seg = Segmenter(model_path=str(model_path), device=device)
+def evaluate_model(model_path: Path, frames: list, *, device: str = "cuda",
+                   seg_kwargs: dict | None = None) -> dict:
+    """在一个 checkpoint 上跑完整评估（学习掩码 + 后处理，走 Segmenter）。
+
+    ``seg_kwargs``：候选/掩码后处理旋钮（``line_road_keep_frac`` /
+    ``line_road_elongated_frac`` / ``line_road_ksize``），只用于单因子扫描
+    （掩码侧精度门的杠杆）；默认 None = 生产常量。
+    """
+    seg = Segmenter(model_path=str(model_path), device=device,
+                    **(seg_kwargs or {}))
     acc: dict = {}
     ms: list = []
     per_frame = _eval_frames(seg, frames, acc, ms)
@@ -292,7 +298,8 @@ def evaluate_model(model_path: Path, frames: list, *, device: str = "cuda"
 
 
 def evaluate_model_per_group(model_path: Path, by_group: dict, *,
-                             device: str = "cuda") -> dict:
+                             device: str = "cuda",
+                             seg_kwargs: dict | None = None) -> dict:
     """按**场景/组**分别评估，再给总体（方案 §10.2/A7）。
 
     ``by_group``：``{组键: [(路径, colour, label), ...]}``。返回值与
@@ -300,7 +307,8 @@ def evaluate_model_per_group(model_path: Path, by_group: dict, *,
     ``per_group``：每个场景自己那一份完整指标（含它自己的 ``mask_compare``）。
     **每个场景各自是一份独立测量**：坏场景不会被池化均值稀释掉。
     """
-    seg = Segmenter(model_path=str(model_path), device=device)
+    seg = Segmenter(model_path=str(model_path), device=device,
+                    **(seg_kwargs or {}))
     acc: dict = {}
     ms: list = []
     per_frame: list = []
@@ -341,6 +349,11 @@ def main(argv=None) -> int:
     ap.add_argument("--dev-runs", nargs="*", default=[],
                     help="开发诊断集目录（可选，与主集分开报告）")
     ap.add_argument("--device", default=None, choices=("cuda", "cpu"))
+    # 掩码/候选后处理旋钮（单因子扫描用；默认 None = 生产常量）。掩码侧是
+    # 精度门唯一剩下的杠杆（候选集口径实测对像素指标零影响）。
+    ap.add_argument("--line-road-keep-frac", type=float, default=None)
+    ap.add_argument("--line-road-elongated-frac", type=float, default=None)
+    ap.add_argument("--line-road-ksize", type=int, default=None)
     ap.add_argument("--json", default=None)
     args = ap.parse_args(argv)
 
@@ -352,6 +365,16 @@ def main(argv=None) -> int:
         except Exception:                    # noqa: BLE001
             device = "cpu"
 
+    seg_kwargs = {}
+    if args.line_road_keep_frac is not None:
+        seg_kwargs["line_road_keep_frac"] = float(args.line_road_keep_frac)
+    if args.line_road_elongated_frac is not None:
+        seg_kwargs["line_road_elongated_frac"] = float(
+            args.line_road_elongated_frac)
+    if args.line_road_ksize is not None:
+        seg_kwargs["line_road_ksize"] = int(args.line_road_ksize)
+    if seg_kwargs:
+        print(f"[eval-matrix] seg 旋钮（单因子）: {seg_kwargs}", flush=True)
     frozen_groups = frames_by_group(args.runs)
     dev_groups = frames_by_group(args.dev_runs) if args.dev_runs else {}
     frozen = [f for g in frozen_groups.values() for f in g]
@@ -359,7 +382,7 @@ def main(argv=None) -> int:
     print(f"[eval-matrix] frozen {len(frozen)} frames / "
           f"{len(frozen_groups)} 场景, dev {len(dev)} frames / "
           f"{len(dev_groups)} 场景, device={device}", flush=True)
-    out = {"frozen": {}, "dev": {},
+    out = {"frozen": {}, "dev": {}, "seg_kwargs": seg_kwargs,
            "frozen_runs": [str(r) for r in args.runs],
            "dev_runs": [str(r) for r in args.dev_runs],
            "frozen_groups": sorted(frozen_groups),
@@ -374,10 +397,10 @@ def main(argv=None) -> int:
             # 分场景评估（总体形状不变，另有 per_group）：坏场景不能被池化均值
             # 抵消，所以 CLI 也按组算（方案 §10.2/A7）。
             out["frozen"][name] = evaluate_model_per_group(
-                path, frozen_groups, device=device)
+                path, frozen_groups, device=device, seg_kwargs=seg_kwargs)
             if dev_groups:
                 out["dev"][name] = evaluate_model_per_group(
-                    path, dev_groups, device=device)
+                    path, dev_groups, device=device, seg_kwargs=seg_kwargs)
         except Exception as exc:             # noqa: BLE001
             out["frozen"][name] = {"error": f"{type(exc).__name__}: {exc}"}
         f = out["frozen"][name]

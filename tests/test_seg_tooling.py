@@ -572,3 +572,41 @@ class TestEmptyPredictionIsMeasuredZeroNotUnknown:
         assert m["line_recall"] == 0.0, "有线真值 + 空预测 = 实测 0，不是 UNKNOWN"
         assert m["line_precision"] is None, "没有预测就没有 precision 的分母"
         assert m["line_iou"] == 0.0
+
+def test_eval_matrix_passes_postprocess_knobs(monkeypatch, tmp_path):
+    """掩码/候选后处理旋钮必须真的传到 Segmenter（单因子扫描的前提）。
+
+    为什么要有它：剩余未过的门是**像素精度**（掩码侧路外假阳性），而候选集口径
+    实测对 P/R/IoU 零影响——唯一剩下的杠杆是 `line_road_*` 旋钮，扫描前必须
+    证明它确实生效（否则又是一次静默 no-op）。
+    """
+    import importlib.util
+    import sys
+    from pathlib import Path as _P
+    root = _P(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_seg_eval_matrix_knobs", root / "scripts" / "m5_seg_eval_matrix.py")
+    tool = importlib.util.module_from_spec(spec)
+    sys.modules["m5_seg_eval_matrix_knobs"] = tool
+    spec.loader.exec_module(tool)
+    seen = {}
+
+    class _StubSeg:
+        def __init__(self, model_path=None, device=None, **kw):
+            seen.update(kw)
+            seen["_device"] = device
+            self.device = device
+
+    monkeypatch.setattr(tool, "Segmenter", _StubSeg)
+    ckpt = tmp_path / "ck.pt"
+    ckpt.write_bytes(b"stub")            # _finalize 会算 sha16，要真文件
+    out = tool.evaluate_model(ckpt, [], device="cpu",
+                              seg_kwargs={"line_road_keep_frac": 0.3,
+                                          "line_road_elongated_frac": 0.5})
+    assert seen.get("line_road_keep_frac") == 0.3
+    assert seen.get("line_road_elongated_frac") == 0.5
+    assert out.get("n_frames") == 0
+    # 不给旋钮：不传（= 生产常量），不是传 None 覆盖
+    seen.clear()
+    tool.evaluate_model(ckpt, [], device="cpu")
+    assert "line_road_keep_frac" not in seen
