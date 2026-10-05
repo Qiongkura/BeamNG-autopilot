@@ -37,6 +37,53 @@ RATIO_SPECS = {
 }
 
 
+#: 表面范围口径（§10.3 变更提案，**只报不判**）：判据用**人工标签自己的类**——
+#: 候选像素落在背景类（``off_road_frac >= 0.5``）即"标签说它不在路面/漆线上"。
+#: 与 v7 主口径的差别只有一个：分母里去掉这些候选。为什么可以只报不判：
+#: 被去掉的路外报告由既有的 ``offroad_false_ratio`` 硬门继续计罚，不存在"免罚"；
+#: 但**它会把臂排序反转**（实测：现口径 6× 优于基线，表面口径基线优于 6×，
+#: `docs/T16_PROTOCOL_V8_IDENTITY_SURFACE_PROPOSAL_20261004.md`），
+#: 所以升为主口径必须走 §10.3 签核，不能自行切换。
+SURFACE_OFF_ROAD_MAX = 0.5
+
+
+def surface_scope(rows: list) -> dict:
+    """逐帧探针行 -> 表面范围口径的计数与比率（纯函数，可单测）。
+
+    输入行的形状与探针 ``probe()['rows']`` 一致：每行含 ``candidates``
+    （逐候选 dict，带 ``matched``/``reference_available``/``off_road_frac``/
+    ``role_agrees``）。``matched_lost`` = 横向匹配但像素在背景上的候选数——
+    **这是表面口径的召回代价**，必须与收益并列报告，不许只报收益。
+    """
+    acc = empty()
+    extra = {"excluded_C": 0, "excluded_R": 0, "matched_lost": 0}
+    for r in rows or []:
+        for c in (r.get("candidates") or []):
+            on_surface = float(c.get("off_road_frac") or 0.0) < SURFACE_OFF_ROAD_MAX
+            matched = bool(c.get("matched"))
+            if on_surface:
+                acc["C"] += 1
+                if c.get("reference_available"):
+                    acc["R"] += 1
+                if matched:
+                    acc["M"] += 1
+                    if c.get("role_agrees") is not None:
+                        acc["L"] += 1
+                        if c.get("role_agrees"):
+                            acc["A"] += 1
+            else:
+                extra["excluded_C"] += 1
+                if c.get("reference_available"):
+                    extra["excluded_R"] += 1
+                if matched:
+                    extra["matched_lost"] += 1
+    rt = ratios(acc)
+    return {"counts": dict(acc), **extra, **rt,
+            "scope": "candidates_on_labelled_surface",
+            "off_road_max": SURFACE_OFF_ROAD_MAX,
+            "reported_only": True}
+
+
 def empty() -> dict:
     return {k: 0 for k in COUNTERS}
 
