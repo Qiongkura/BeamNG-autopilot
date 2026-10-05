@@ -493,3 +493,21 @@ def test_capture_path_reaps_its_own_game_processes():
     assert "game_pids()" in src, "要有'采集前'的进程基线（差集才安全）"
     assert "launched_after=_launched_after" in src, "要传启动时刻做所有权校验"
     assert "taskkill" not in src and "Stop-Process" not in src,         "不得自己手写 kill（所有权校验在助手里）"
+
+def test_fsd_drive_cleanup_has_vis_index_initialised():
+    """驾驶收尾路径引用的 `_vis_index` 必须在入口就初始化（实测崩溃 + 掩盖错误）。
+
+    2026-10-05 实测：非 --vis 的运行走到收尾就 `UnboundLocalError` ——
+    ① 把真正的失败原因（山道场景的 lane placement ABORT）盖掉；
+    ② 收尾中断，**游戏进程不被关闭**（本机因此积过 9 个 BeamNG 实例，
+    把 tests/test_seg_collect_unattended.py 的资源门打红）。
+    """
+    from pathlib import Path as _P
+    src = (_P(__file__).resolve().parents[1] / "beamng_autopilot"
+           / "fsd_drive.py").read_text(encoding="utf-8")
+    i_init = src.index("_vis_index: list[dict] = []")
+    i_use = src.index("if (_vis_index or []) and args.out:")
+    assert i_init < i_use, "初始化必须在收尾引用之前（同一函数、入口处）"
+    # 入口初始化应与 hist 同处（连接建立之前），不是只在 --vis 分支里
+    i_hist = src.index("hist: list[dict] = []")
+    assert abs(i_init - i_hist) < 400, "应与 hist 一起在入口初始化"
