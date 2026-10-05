@@ -26,7 +26,7 @@ import os
 from beamng_autopilot.lane.constants import LANE_PAIR_NEAR_MAX_M
 
 #: 默认协议（冻结）：三项全关，与 v7 历史判定可比
-DEFAULT_PROTOCOL = "v7"
+DEFAULT_PROTOCOL = "v8"
 #: v8 的横向范围 = 规划配对的"近"候选可达上限（有代码依据，不是调参）
 LAT_MAX_M_V8 = float(LANE_PAIR_NEAR_MAX_M)
 

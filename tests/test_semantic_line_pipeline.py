@@ -721,22 +721,27 @@ def test_paint_like_mask_and_appearance_gate(monkeypatch):
         raise AssertionError("形状不对必须抛错")
     except ValueError:
         pass
-    # 门：默认关 -> 原样；开着 -> 只删不加
+    # 门：v8 生效后**默认开**；显式单项 env 与协议 v7 都能关；开着只删不加
     seg = Segmenter.__new__(Segmenter)
     line = np.zeros((3, 4), bool)
     line[0, 0] = line[1, 0] = True    # 一个像漆、一个不像
     monkeypatch.delenv("BEAMNG_LINE_APPEARANCE_GATE", raising=False)
+    monkeypatch.delenv("BEAMNG_PROTOCOL", raising=False)
     out = seg._appearance_gate_line(line, rgb)
-    assert int(out.sum()) == 2, "默认关必须原样返回"
-    monkeypatch.setenv("BEAMNG_LINE_APPEARANCE_GATE", "1")
+    assert int(out.sum()) == 1, "v8 默认：门开着，只留像漆的像素"
+    monkeypatch.setenv("BEAMNG_LINE_APPEARANCE_GATE", "0")
+    assert int(seg._appearance_gate_line(line, rgb).sum()) == 2,         "单项 env 关掉后原样返回"
+    monkeypatch.delenv("BEAMNG_LINE_APPEARANCE_GATE", raising=False)
+    monkeypatch.setenv("BEAMNG_PROTOCOL", "v7")
+    assert int(seg._appearance_gate_line(line, rgb).sum()) == 2,         "协议 v7 下门默认关"
+    monkeypatch.setenv("BEAMNG_PROTOCOL", "v8")
     out = seg._appearance_gate_line(line, rgb)
-    assert out[0, 0] and not out[1, 0], "开了只保留像漆的像素"
-    assert int(out.sum()) == 1
+    assert out[0, 0] and not out[1, 0], "只保留像漆的像素"
     assert not seg._appearance_gate_line(line, rgb)[1, 0], "只删不加（单调）"
 
 def test_line_scope_protocol_switch(monkeypatch):
-    """协议开关：v7 默认三项全关；BEAMNG_PROTOCOL=v8 三项全开且 L=5.5（=配对可达
-    边界）；单项 env 优先于协议默认（供单因子测量/消融）。
+    """协议开关：**默认 v8**（2026-10-05 采纳生效）三项全开、L=5.5（=配对可达
+    边界）；`BEAMNG_PROTOCOL=v7` 回到三项全关；单项 env 优先于协议默认（测量/消融）。
 
     为什么要它：三项变更散在三个模块，采纳时"切默认"靠手改容易只改一半
     （本项目踩过"改了一半的口径"的坑）。这里把开关收成一处并锁住语义。
@@ -746,26 +751,32 @@ def test_line_scope_protocol_switch(monkeypatch):
     for k in ("BEAMNG_PROTOCOL", "BEAMNG_LINE_LAT_MAX_M",
               "BEAMNG_LINE_MERGE_FINAL", "BEAMNG_LINE_APPEARANCE_GATE"):
         monkeypatch.delenv(k, raising=False)
-    # 默认 v7：三项全关
+    # **默认 v8（2026-10-05 生效）**：三项全开，L 取配对可达边界
+    assert line_scope.protocol() == "v8"
+    assert line_scope.lat_max_m() == float(LANE_PAIR_NEAR_MAX_M) == 5.5
+    assert line_scope.merge_final_enabled()
+    assert line_scope.appearance_gate_enabled()
+    # 显式 v7：回到三项全关（历史判定口径仍可按需复现）
+    monkeypatch.setenv("BEAMNG_PROTOCOL", "v7")
     assert line_scope.protocol() == "v7"
     assert line_scope.lat_max_m() == 0.0
     assert not line_scope.merge_final_enabled()
     assert not line_scope.appearance_gate_enabled()
-    # v8：三项全开，L 取配对可达边界
     monkeypatch.setenv("BEAMNG_PROTOCOL", "v8")
-    assert line_scope.lat_max_m() == float(LANE_PAIR_NEAR_MAX_M) == 5.5
-    assert line_scope.merge_final_enabled()
-    assert line_scope.appearance_gate_enabled()
     # 单项 env 优先（消融：v8 下单独关掉外观门）
     monkeypatch.setenv("BEAMNG_LINE_APPEARANCE_GATE", "0")
     assert not line_scope.appearance_gate_enabled()
     assert line_scope.lat_max_m() == 5.5
-    # 未知协议值按默认（v7）处理，不猜
+    # 未知协议值按**默认**处理，不猜（默认现在是 v8）
+    monkeypatch.delenv("BEAMNG_LINE_APPEARANCE_GATE", raising=False)
     monkeypatch.setenv("BEAMNG_PROTOCOL", "v9")
-    assert line_scope.protocol() == "v7" and line_scope.lat_max_m() == 0.0
+    assert line_scope.protocol() == "v8" and line_scope.lat_max_m() == 5.5
     # 生效版本号跟着开关走（记录必须反映实际口径）
     from beamng_autopilot.experiments.protocol import (
         PROTOCOL_VERSION, PROTOCOL_VERSION_V8, active_protocol_version)
+    # 默认已是 v8（2026-10-05 采纳）-> 生效版本号随之；显式 v7 时回到冻结常量
+    assert active_protocol_version() == PROTOCOL_VERSION_V8
+    monkeypatch.setenv("BEAMNG_PROTOCOL", "v7")
     assert active_protocol_version() == PROTOCOL_VERSION
     monkeypatch.setenv("BEAMNG_PROTOCOL", "v8")
     assert active_protocol_version() == PROTOCOL_VERSION_V8
