@@ -46,3 +46,15 @@
 $env:BEAMNG_PROTOCOL="v8"; .venv\Scripts\python.exe scripts\m5_fsd_benchmark.py --scenarios town,mountain
 ```
 （记分卡输出路径以脚本实际输出为准；两次重复各存一份。）
+
+## 5. 执行记录与一处例外（**必须随证据一起读**）
+
+- 首次启动被 `check_exclusivity` 拒绝：`refusing to drive; pass --allow-contaminated
+  to override`，被点名的"另一个控制器"是 **pid 13944 = 本会话的启动器 shell**
+  （cmdline `bash.exe -c . .../snapshot-bash-....sh`，不含任何 `CONTROLLER_MARKERS`）
+  ——即代码注释里已记录的**启动器误报类**（"the shim is this process's parent and
+  carries the same command line... every run refuses to start"）。
+- 因此两次运行都带 **`--allow-contaminated`**：这是守卫**显式提供**的开关，且
+  **manifest 会记录该冲突**（可审计）。这不是"绕过检查"，而是把已知误报记在案；
+  若将来有人读这批数据，必须知道这一条。
+- 除该例外，命令与 §4 完全一致（场景注册表默认、单因子、两次重复）。
