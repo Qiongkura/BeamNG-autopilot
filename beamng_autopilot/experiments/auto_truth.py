@@ -323,12 +323,11 @@ def _line_truth_points(frame) -> list[dict]:
 #: 黄线按**黄度**（r-b）判：淡黄 (238,230,120) r-b=118 该过，
 #: 土肩 (150,120,86) r-b=64 必须不过（材质混合场景里土肩就是干扰项）。
 #: 这是**受控场景**的证据阈值：换场景/光照/材质要重新标定并写进报告。
-LINE_WHITE_MIN = 185
-LINE_WHITE_CHROMA = 30
-LINE_WARM_WHITE_RB = 25
-LINE_YELLOW_RG_MIN = 135
-LINE_YELLOW_B_MAX = 130
-LINE_YELLOW_RB_MIN = 90
+# 阈值只有一份（`beamng_autopilot.vision.paint_appearance`）：外观判据现在有三个
+# 消费者（本模块的外观证据、导出器漆面门、掩码侧外观门），各写一份会漂移。
+from beamng_autopilot.vision.paint_appearance import (  # noqa: E402
+    LINE_WHITE_CHROMA, LINE_WHITE_MIN, LINE_WARM_WHITE_RB, LINE_YELLOW_B_MAX,
+    LINE_YELLOW_RB_MIN, LINE_YELLOW_RG_MIN, paint_like_mask)
 
 
 def line_appearance(rgb, u, v, *, radius_px: int = 2) -> dict:
@@ -633,17 +632,7 @@ def line_evidence_mask(frame, *, mode: str = "annotation"):
     a = np.asarray(rgb)
     if a.ndim != 3 or a.shape[2] < 3 or a.size == 0:
         return None, mode, "rgb must be a nonempty HxWx3 image"
-    win = a[:, :, :3].astype(np.int16)
-    mx = win.max(axis=2)
-    mn = win.min(axis=2)
-    r, g, b = win[:, :, 0], win[:, :, 1], win[:, :, 2]
-    white = ((mx >= LINE_WHITE_MIN)
-             & (((mx - mn) <= LINE_WHITE_CHROMA)
-                | ((r - b) >= LINE_WARM_WHITE_RB)))
-    yellow = ((r >= LINE_YELLOW_RG_MIN) & (g >= LINE_YELLOW_RG_MIN)
-              & (b <= LINE_YELLOW_B_MAX) & (np.abs(r - g) <= 45)
-              & ((r - b) >= LINE_YELLOW_RB_MIN))
-    return (white | yellow), mode, ""
+    return paint_like_mask(a), mode, ""
 
 
 def line_distance_stats(frame, *, evidence: str = "annotation",
@@ -1808,7 +1797,13 @@ def _normalize_provenance(provenance, batch_report, frames, channels) -> dict:
     run = _block("run", ("id", "scene_seed", "game_version", "renderer"))
     camera = _block("camera", ("name", "calibration_sha", "frame_ids"))
     labels = _block("labels", ("source_image_sha", "label_sha",
-                               "channel_valid_area", "unknown_reason"))
+                               "channel_valid_area", "unknown_reason",
+                               # 负例的自证（2026-09-30）：`truth_kind="line_free"`
+                               # 与 `line_free_evidence`（零线像素 + 已声明的
+                               # 非漆结构 + 外观归因）以前被这里**丢掉**，于是
+                               # 负例凭证读不出"凭什么算合格负例"。白名单补上；
+                               # 正例不传这两键 -> 值为 null，无副作用。
+                               "truth_kind", "line_free_evidence"))
     report = _block("report", ("test_report_sha", "verifier_version", "verified"))
 
     if not generator.get("name"):
