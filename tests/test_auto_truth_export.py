@@ -476,3 +476,20 @@ def test_scene_block_tolerates_string_scene_field():
     assert m._scene_block({"scene": None}) == {}
     assert m._scene_block({}) == {}
     assert m._scene_block(None) == {}
+
+def test_capture_path_reaps_its_own_game_processes():
+    """采集脚本收尾必须关掉**本次新起**的游戏进程（只关连接不够）。
+
+    实测（2026-10-05）：连续四轮受控场景采集后机器上积了 9 个 BeamNG 实例
+    （conn.close() 只关连接），把 collect 的资源门打红（"采集前没有游戏进程"
+    断言失败），并会拖慢后续实验（2026-09-25 同款缺陷：一局挂 1.5 小时，
+    推理 p95 漂 7.6 倍）。必须复用采集侧助手（只杀"新起 + 创建时间可验证"的
+    pid，不碰用户会话），不得自己手写 kill。
+    """
+    from pathlib import Path as _P
+    src = (_P(__file__).resolve().parents[1] / "scripts"
+           / "m5_controlled_scenes.py").read_text(encoding="utf-8")
+    assert "close_started_game" in src, "收尾必须关自己起的游戏"
+    assert "game_pids()" in src, "要有'采集前'的进程基线（差集才安全）"
+    assert "launched_after=_launched_after" in src, "要传启动时刻做所有权校验"
+    assert "taskkill" not in src and "Stop-Process" not in src,         "不得自己手写 kill（所有权校验在助手里）"

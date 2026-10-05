@@ -1161,6 +1161,12 @@ def main() -> int:
                                   "script_sha16": _sha16(Path(__file__))},
                     "map": str(args.map), "anchor": list(ANCHOR),
                     "scenes": {}, "errors": []}
+    # 收尾要用的"游戏进程基线"（见 finally）：只关**本次新起**的实例，
+    # 用户自己的会话永远不碰（close_started_game 的所有权校验）
+    from beamng_autopilot.experiments.collection import (  # noqa: E402
+        close_started_game, game_pids)
+    _pids_before = game_pids()
+    _launched_after = time.time()
     conn.open(launch=not args.attach)
     try:
         # 规划站点要读 road network，需要先有**已加载的地图 + 一辆车**：
@@ -1353,6 +1359,15 @@ def main() -> int:
             conn.close()
         except Exception:                                    # noqa: BLE001
             pass
+        # **进程收尾**（2026-10-05 实测）：conn.close() 只关连接，游戏进程会留着
+        # ——本轮连续四轮采集后机器上积了 9 个 BeamNG 实例，直接把
+        # tests/test_seg_collect_unattended.py 的资源门打红（"采集前没有游戏进程"
+        # 断言失败），也会像 2026-09-25 那次一样拖慢后续实验。复用采集侧同一
+        # 助手：只杀"本次新起 + 创建时间可验证"的 pid，不碰别人的会话。
+        _ga = close_started_game(_pids_before, launched_after=_launched_after)
+        print(f"[scenes] 收尾关游戏：closed={_ga.get('closed')} "
+              f"killed={_ga.get('killed')} "
+              f"{_ga.get('reason') or _ga.get('note') or ''}")
     return 0 if not report["errors"] else 1
 
 
