@@ -664,3 +664,27 @@ def test_scope_lateral_candidates_drops_only_beyond_limit():
                                              pos=(0.0, 0.0, 0.0), heading=0.0,
                                              **kw)
         assert len(out) == 2 and info["dropped"] == 0
+
+def test_head_final_candidate_scope_call_sites():
+    """head 的最终候选集处理：合并补齐与横向口径门必须都在**写 meta 之前**，
+    且默认关、debug 键不互相覆盖（两处都实测踩过）。
+
+    实测（2026-10-04）：
+    * 把门接在 detect_lines 里只覆盖一个贡献者（门只丢 30/227，离线扫描应丢
+      100/227）——黄臂补候选/经典回退发生在 detect_lines 之后；
+    * 最终合并若复用 `line_candidate_merge` 键会覆盖提取器那次的 in/out。
+    """
+    from pathlib import Path as _P
+    src = (_P(__file__).resolve().parents[1] / "beamng_autopilot" / "vision"
+           / "heads" / "semantic.py").read_text(encoding="utf-8")
+    assert 'BEAMNG_LINE_MERGE_FINAL", "0"' in src, "合并补齐必须默认关"
+    assert "line_candidate_merge_final" in src, "最终合并要单独记，不覆盖提取器那次"
+    assert "scope_lateral_candidates(" in src
+    i_merge = src.index("merge_close_candidates(")
+    i_gate = src.index("scope_lateral_candidates(")
+    i_store = src.index('out.meta["markings"] = markings')
+    assert i_merge < i_gate < i_store, "顺序必须是：合并补齐 -> 横向门 -> 写 meta"
+    # env 默认关的定义在 segmentation.py（门自己的实现里），不在 head
+    seg = (_P(__file__).resolve().parents[1] / "beamng_autopilot" / "vision"
+           / "segmentation.py").read_text(encoding="utf-8")
+    assert 'BEAMNG_LINE_LAT_MAX_M", ""' in seg, "横向门 env 默认必须是空（关）"
