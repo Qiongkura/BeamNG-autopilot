@@ -83,7 +83,10 @@ def main(argv=None) -> int:
     totals = {"frames": 0, "frames_with_line_truth": 0,
               "frames_mask_recall_zero": 0, "frames_no_candidate": 0,
               "candidates": 0, "ref_available": 0, "matched": 0,
-              "role_comparable": 0, "role_agree": 0}
+              "role_comparable": 0, "role_agree": 0,
+              #: 不在 P（无线真值）的帧里的候选：协议口径归 `C_outside_P`，
+              #: 不进 C/R/M（下面按帧的适用性分开计）
+              "candidates_outside_p": 0}
     dist_ref_px: list[float] = []
     dist_unmatched_gap_m: list[float] = []
     unmatched_kinds: dict = {}
@@ -101,7 +104,8 @@ def main(argv=None) -> int:
         agg = {"frames": 0, "frames_with_line_truth": 0,
                "frames_mask_recall_zero": 0, "frames_no_candidate": 0,
                "candidates": 0, "ref_available": 0, "matched": 0,
-               "role_comparable": 0, "role_agree": 0}
+               "role_comparable": 0, "role_agree": 0,
+               "candidates_outside_p": 0}
         for d_str, dir_paths in sorted(_group_by_dir(paths).items()):
             d = Path(d_str)
             meta_p = d / "meta.json"
@@ -134,6 +138,16 @@ def main(argv=None) -> int:
                 if has_truth and not cands:
                     agg["frames_no_candidate"] += 1
                     totals["frames_no_candidate"] += 1
+                if not has_truth:
+                    # **适用性**：不在 P（无线真值）的帧里，候选按协议归
+                    # `C_outside_P`，不进 C/R/M——它们"没有参考"是**结构性**的
+                    # （这一帧本来就不判线）。把它们算成"假线"会把诊断读反：
+                    # 实测踩到（2026-09-30）两个 P_frames=0 的开发场景贡献了
+                    # 477/531 个"无参考候选"，于是"模型到处乱画"的结论是从
+                    # 不判线的帧里得出来的（协议口径 C=385，这里却报 1021）。
+                    agg["candidates_outside_p"] += len(cands)
+                    totals["candidates_outside_p"] += len(cands)
+                    continue
                 for c in cands:
                     agg["candidates"] += 1
                     totals["candidates"] += 1
@@ -186,6 +200,10 @@ def main(argv=None) -> int:
                       ("raw_inputs", "n_unique", "n_rejected", "n_conflicts")},
         "totals": tot,
         "ratios": {
+            # 口径说明：这里的分母只含**在 P（有标线真值）的帧**里的候选，
+            # 与协议计数契约的 C/R/M 同口径；`candidates_outside_p` 是
+            # 协议里的 `C_outside_P`，单独报、不进比率（见 totals 注释）。
+            "scope": "candidates from frames with line truth only (C/R/M)",
             "reference_coverage_R_over_C": (None if not tot["candidates"]
                                             else round(tot["ref_available"]
                                                        / tot["candidates"], 4)),
@@ -239,6 +257,10 @@ def main(argv=None) -> int:
           f"匹配 {t['matched']}（身份 {out['ratios']['identity_M_over_R']}）→ "
           f"角色可比 {t['role_comparable']}、一致 {t['role_agree']}"
           f"（角色 {out['ratios']['role_A_over_L']}）")
+    if t.get("candidates_outside_p"):
+        print(f"[attr] 另有 {t['candidates_outside_p']} 个候选来自"
+              f"**无线真值**的帧（协议记 C_outside_P，不进 C/R/M）——"
+              f"别把它们读成假线")
     print(f"[attr] 无参考候选的该侧参考像素直方图："
           f"{a['ref_missing_side_px_hist']}")
     print(f"[attr] 未匹配候选（有参考）离最近引擎线的横向距离："
