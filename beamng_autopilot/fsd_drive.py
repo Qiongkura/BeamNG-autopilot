@@ -2242,6 +2242,12 @@ class FSDriveSession:
         # BNGDisconnectedError at connect -> UnboundLocalError in finally
         # masked the real error)
         hist: list[dict] = []
+        # `_vis_index` 只在"开启可视化"的分支里赋值，但收尾路径**无条件**引用它：
+        # 非 --vis 的运行一旦走到收尾就 UnboundLocalError（2026-10-05 实测：山道
+        # 场景 ABORT 之后就是这个 traceback）——① 盖掉真正的失败原因；
+        # ② 收尾中断、游戏进程不被关闭（本机因此积过 9 个 BeamNG 实例，把采集
+        # 资源门打红）。与 `hist` 一样在入口初始化，任何路径都有定义。
+        _vis_index: list[dict] = []
         rec = None
         conn = BeamNGConnector(
             getattr(args, "map", None) or "italy", "etk800",
@@ -2438,7 +2444,7 @@ class FSDriveSession:
             _vis_control_every = int(
                 getattr(args, "vis_control_every", 0) or 0)
             _vis_written = 0
-            _vis_index: list[dict] = []
+            _vis_index = []
             # A shared "live" directory meant the next run overwrote the
             # previous run's frames (same collision class as the stage-C
             # telemetry tags): --vis-dir gives each run its own folder.
