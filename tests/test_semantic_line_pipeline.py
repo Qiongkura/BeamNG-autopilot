@@ -677,17 +677,18 @@ def test_head_final_candidate_scope_call_sites():
     from pathlib import Path as _P
     src = (_P(__file__).resolve().parents[1] / "beamng_autopilot" / "vision"
            / "heads" / "semantic.py").read_text(encoding="utf-8")
-    assert 'BEAMNG_LINE_MERGE_FINAL", "0"' in src, "合并补齐必须默认关"
+    # 三项开关收在 line_scope（协议级）；head/segmentation 只问它，不自己读 env
+    assert "line_scope.merge_final_enabled()" in src, "合并补齐必须走协议开关"
     assert "line_candidate_merge_final" in src, "最终合并要单独记，不覆盖提取器那次"
     assert "scope_lateral_candidates(" in src
     i_merge = src.index("merge_close_candidates(")
     i_gate = src.index("scope_lateral_candidates(")
     i_store = src.index('out.meta["markings"] = markings')
     assert i_merge < i_gate < i_store, "顺序必须是：合并补齐 -> 横向门 -> 写 meta"
-    # env 默认关的定义在 segmentation.py（门自己的实现里），不在 head
     seg = (_P(__file__).resolve().parents[1] / "beamng_autopilot" / "vision"
            / "segmentation.py").read_text(encoding="utf-8")
-    assert 'BEAMNG_LINE_LAT_MAX_M", ""' in seg, "横向门 env 默认必须是空（关）"
+    assert "line_scope.lat_max_m()" in seg, "横向门默认值必须来自协议开关"
+    assert "line_scope.appearance_gate_enabled()" in seg, "外观门必须走协议开关"
 
 def test_paint_like_mask_and_appearance_gate(monkeypatch):
     """外观判据：白/暖白/黄像漆，灰/彩色不像；形状错抛错（不静默全 False）。
@@ -732,3 +733,57 @@ def test_paint_like_mask_and_appearance_gate(monkeypatch):
     assert out[0, 0] and not out[1, 0], "开了只保留像漆的像素"
     assert int(out.sum()) == 1
     assert not seg._appearance_gate_line(line, rgb)[1, 0], "只删不加（单调）"
+
+def test_line_scope_protocol_switch(monkeypatch):
+    """协议开关：v7 默认三项全关；BEAMNG_PROTOCOL=v8 三项全开且 L=5.5（=配对可达
+    边界）；单项 env 优先于协议默认（供单因子测量/消融）。
+
+    为什么要它：三项变更散在三个模块，采纳时"切默认"靠手改容易只改一半
+    （本项目踩过"改了一半的口径"的坑）。这里把开关收成一处并锁住语义。
+    """
+    from beamng_autopilot.lane.constants import LANE_PAIR_NEAR_MAX_M
+    from beamng_autopilot.vision import line_scope
+    for k in ("BEAMNG_PROTOCOL", "BEAMNG_LINE_LAT_MAX_M",
+              "BEAMNG_LINE_MERGE_FINAL", "BEAMNG_LINE_APPEARANCE_GATE"):
+        monkeypatch.delenv(k, raising=False)
+    # 默认 v7：三项全关
+    assert line_scope.protocol() == "v7"
+    assert line_scope.lat_max_m() == 0.0
+    assert not line_scope.merge_final_enabled()
+    assert not line_scope.appearance_gate_enabled()
+    # v8：三项全开，L 取配对可达边界
+    monkeypatch.setenv("BEAMNG_PROTOCOL", "v8")
+    assert line_scope.lat_max_m() == float(LANE_PAIR_NEAR_MAX_M) == 5.5
+    assert line_scope.merge_final_enabled()
+    assert line_scope.appearance_gate_enabled()
+    # 单项 env 优先（消融：v8 下单独关掉外观门）
+    monkeypatch.setenv("BEAMNG_LINE_APPEARANCE_GATE", "0")
+    assert not line_scope.appearance_gate_enabled()
+    assert line_scope.lat_max_m() == 5.5
+    # 未知协议值按默认（v7）处理，不猜
+    monkeypatch.setenv("BEAMNG_PROTOCOL", "v9")
+    assert line_scope.protocol() == "v7" and line_scope.lat_max_m() == 0.0
+    # 生效版本号跟着开关走（记录必须反映实际口径）
+    from beamng_autopilot.experiments.protocol import (
+        PROTOCOL_VERSION, PROTOCOL_VERSION_V8, active_protocol_version)
+    assert active_protocol_version() == PROTOCOL_VERSION
+    monkeypatch.setenv("BEAMNG_PROTOCOL", "v8")
+    assert active_protocol_version() == PROTOCOL_VERSION_V8
+
+
+def test_lateral_scope_honours_protocol_switch(monkeypatch):
+    """横向门在 v8 下默认生效（L=5.5）：5.0 m 留、6.0 m 丢。"""
+    import numpy as np
+    from beamng_autopilot.vision.segmentation import scope_lateral_candidates
+    from beamng_autopilot.vision.lanes import LaneMarking
+
+    def mk(lat):
+        return LaneMarking(world=np.array([[0.0, float(lat)]] * 3),
+                           pixels=np.zeros((3, 2)), color="white",
+                           kind="thin", confidence=0.5)
+
+    monkeypatch.delenv("BEAMNG_LINE_LAT_MAX_M", raising=False)
+    monkeypatch.setenv("BEAMNG_PROTOCOL", "v8")
+    out, info = scope_lateral_candidates([mk(5.0), mk(6.0)],
+                                         pos=(0.0, 0.0, 0.0), heading=0.0)
+    assert len(out) == 1 and info["dropped"] == 1 and info["max_lat_m"] == 5.5

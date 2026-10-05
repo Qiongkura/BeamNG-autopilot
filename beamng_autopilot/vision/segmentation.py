@@ -484,17 +484,17 @@ def scope_lateral_candidates(markings, *, pos=None, heading=None,
     R3 0.3989 → 0.7576；R3 上**零匹配代价**（M 恒 75），dev 上有真·远线
     （M 160 → 72）→ 代价在召回，必须用像素级门复核后才能改默认。
 
-    默认**关**（``max_lat_m <= 0`` 或 ``BEAMNG_LINE_LAT_MAX_M`` 未设）：候选集
-    属于冻结口径，改默认要走协议新版本；本开关只用于单因子测量。
+    默认**关**（``max_lat_m <= 0``）：候选集属于冻结口径，改默认要走协议新版本
+    （`BEAMNG_PROTOCOL=v8` 才默认开，L 取 `LANE_PAIR_NEAR_MAX_M` = 配对可达
+    边界 5.5 m；单项 env ``BEAMNG_LINE_LAT_MAX_M`` 优先，供单因子测量）。
     无法定位横向的候选（world 缺失）**保留**——判不了就不丢（不猜）。
     """
+    from beamng_autopilot.vision import line_scope
     from beamng_autopilot.vision.lanes import LaneMarking  # noqa: F401
-    if enable is None:
-        enable = os.environ.get("BEAMNG_LINE_LAT_MAX_M", "").strip() not in (
-            "", "0", "off")
     if max_lat_m is None:
-        _env = os.environ.get("BEAMNG_LINE_LAT_MAX_M", "").strip()
-        max_lat_m = float(_env) if _env not in ("", "off") else 0.0
+        max_lat_m = line_scope.lat_max_m()
+    if enable is None:
+        enable = float(max_lat_m) > 0.0
     ms = list(markings or [])
     info = {"enabled": bool(enable), "in": len(ms), "out": len(ms),
             "dropped": 0, "unknown_kept": 0, "max_lat_m": float(max_lat_m)}
@@ -797,10 +797,12 @@ class Segmenter:
         实测（seed 42，离线扫描）：R3-b P 0.138→0.557、R 0.807→0.769；
         dev P 0.111→0.755、R 0.793→0.600。
 
-        阈值只一份（`vision.paint_appearance`）。默认关：`BEAMNG_LINE_APPEARANCE_GATE=1`
-        才启用（掩码口径属冻结范围，改默认要走协议新版本）。
+        阈值只一份（`vision.paint_appearance`）。默认关：`BEAMNG_PROTOCOL=v8`
+        才启用（掩码口径属冻结范围，改默认要走协议新版本）；单项 env
+        `BEAMNG_LINE_APPEARANCE_GATE` 优先，供单因子测量。
         """
-        if os.environ.get("BEAMNG_LINE_APPEARANCE_GATE", "0") != "1":
+        from beamng_autopilot.vision import line_scope
+        if not line_scope.appearance_gate_enabled():
             return line
         m = np.asarray(line, dtype=bool)
         if not m.any():
