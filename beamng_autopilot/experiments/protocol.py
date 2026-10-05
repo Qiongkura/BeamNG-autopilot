@@ -369,9 +369,16 @@ LAT_ESTIMATOR = {
 
 
 def protocol_blob(*, thresholds: dict | None = None) -> dict:
-    """协议快照：定义 + 覆盖 + 资格 + 统计 + 聚合 + 阈值版本（判定文件里存这份）。"""
+    """协议快照：定义 + 覆盖 + 资格 + 统计 + 聚合 + 阈值版本（判定文件里存这份）。
+
+    ``version`` 用**生效版本**（`active_protocol_version()`），不是冻结常量：
+    2026-10-06 实测踩到——v8 已生效但 blob 仍写 v7，于是协议哈希不变，
+    **最终确认记录会被标成 v7**（而流水线跑的是 v8），且"v7 下封存的最终集"
+    会放行"v8 候选"的确认（哈希相同）。用生效版本后：换协议 → 哈希变 →
+    封存/确认的协议必须一致（与"记录对不上不算确认"的纪律一致）。
+    """
     return {
-        "version": PROTOCOL_VERSION,
+        "version": active_protocol_version(),
         "metrics": METRIC_DEFINITIONS,
         "coverage_requirements": list(COVERAGE_REQUIREMENTS),
         "min_eval_groups": int(MIN_EVAL_GROUPS),
