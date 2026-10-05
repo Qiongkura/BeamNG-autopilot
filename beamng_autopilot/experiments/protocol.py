@@ -21,7 +21,36 @@ import json
 from .labels import PAINT_SOURCE_RANK
 
 #: 协议版本：定义/覆盖/资格任一处改动都要递增，并写进判定文件
-PROTOCOL_VERSION = "t14-protocol-v6"
+#:
+#: v7（2026-09-30）：**候选集口径**变了——候选提取新增"同侧近邻合并"
+#: （`vision.segmentation.merge_close_candidates`，生产默认半径 **1.0 m**）。
+#: 实测（6 arm 全表，T16 §19/§20）：半径 1.0 时**6/6 arm 过 0.70 角色门**
+#: （0.790…0.886），身份率比关闭时低 0.011…0.034；半径 0.5 时 5/6 过门。
+#: 候选集属于协议口径的一部分，所以必须递增版本、并**统一**应用到所有臂
+#: （旧判定里的 C/R/M 与 v7 不可混比）。开关：`BEAMNG_LINE_MERGE=0` 关，
+#: `BEAMNG_LINE_MERGE_GAP_M` 覆盖半径（仅测量用）。
+PROTOCOL_VERSION = "t14-protocol-v7"
+
+#: v8（候选，2026-10-05，**默认关**）：三项候选集/掩码定义——
+#: ① v7 合并补齐到最终候选集；② 横向范围 |lat| ≤ `LANE_PAIR_NEAR_MAX_M`（5.5 m，
+#: 规划配对可达边界）；③ 掩码外观门（标线像素必须像漆，阈值单一来源）。
+#: 实测：R3 认证集五门全过、dev 三门全过；代价（"线=漆"的口径收窄、臂间灵敏度
+#: 压缩）见 `docs/T16_DECISION_SUMMARY_PROTOCOL_V8_20261005.md`。
+#: 开关：`BEAMNG_PROTOCOL=v8`（单项 env 可覆盖，见 `vision.line_scope`）。
+PROTOCOL_VERSION_V8 = "t14-protocol-v8"
+
+
+def active_protocol_version() -> str:
+    """当前**生效**的协议版本（写进判定/冻结文件，不写死常量）。
+
+    默认 v7（与历史判定可比）；``BEAMNG_PROTOCOL=v8`` 时返回 v8 —— 记录必须
+    反映实际口径，否则"换了口径却沿用旧版本号"会让旧结论被悄悄沿用。
+    """
+    try:
+        from beamng_autopilot.vision.line_scope import protocol
+        return PROTOCOL_VERSION_V8 if protocol() == "v8" else PROTOCOL_VERSION
+    except Exception:                                        # noqa: BLE001
+        return PROTOCOL_VERSION
 
 # ---------------------------------------------------------------------------
 # 指标字典：name -> 定义
