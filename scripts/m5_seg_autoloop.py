@@ -1167,6 +1167,37 @@ def _protocol_snapshot(t: Thresholds) -> dict:
 LOWER_IS_BETTER = ("offroad_false_line_px", "inference_ms_p95")
 
 
+#: 身份率主口径的选择（§10.3 提案的**开关**，默认 v7 = 现行语义不动）：
+#: ``v7`` = 现口径（候选中心、含"横向擦边"匹配）；``surface`` = 表面口径
+#: （分母去掉"标签说在背景上"的候选）。**默认必须是 v7**：切到 surface 是
+#: 语义变更，需要方案层按 §10.3 签核（实测它会把臂排序反转，
+#: `docs/T16_PROTOCOL_V8_IDENTITY_SURFACE_PROPOSAL_20261004.md`）。
+IDENTITY_SCOPES = ("v7", "surface")
+
+
+def apply_identity_scope(ident: dict, scope: str) -> dict:
+    """按主口径选择改写身份/覆盖/角色三个门用值；v7 值另存 ``*_v7``（双报）。
+
+    纯函数（不改入参）：``scope="v7"`` 原样返回；``scope="surface"`` 时把三个
+    键换成 ``identity_surface_scope`` 里的值，并把 v7 值移到 ``*_v7``。
+    缺 surface 块（旧判定/探针拒测）时不猜：保持 v7 值并记 ``scope_fallback``。
+    """
+    out = dict(ident or {})
+    if str(scope) != "surface":
+        return out
+    surf = out.get("identity_surface_scope")
+    if not isinstance(surf, dict):
+        out["scope_fallback"] = "no identity_surface_scope block: v7 kept"
+        return out
+    for k in ("candidate_identity_rate", "candidate_reference_coverage",
+              "left_right_role_agreement"):
+        if surf.get(k) is not None:
+            out[k + "_v7"] = out.get(k)
+            out[k] = surf.get(k)
+    out["identity_scope"] = "surface"
+    return out
+
+
 def _seed_hard(metrics: dict, ident: dict | None, p95: float | None) -> dict:
     """一个 seed（或一个场景）自己的硬门输入（方案 §10.2：均值不能替它过门）。
 
@@ -1310,6 +1341,11 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
     # 覆盖率 0.40（应 0.80）——所以这里只加 counts。
     from beamng_autopilot.experiments import candidate_metrics as _cm
     counts_acc = _cm.empty()
+    # 表面范围口径（§10.3 提案，**只报不判**）：把"标签说在背景上"的候选
+    # 从分母里去掉后的身份率/覆盖率/角色率。它**不参与任何硬门**——升为主口径
+    # 必须走 §10.3 签核（实测它会把臂排序反转）。
+    surf_acc = _cm.empty()
+    surf_extra = {"excluded_C": 0, "excluded_R": 0, "matched_lost": 0}
     counts_by_group: dict = {}
     acc: dict = {k: [] for k in IDENTITY_FIELDS}
     gacc: dict = {}          # 逐场景（map/source_id 组）明细
@@ -1388,6 +1424,12 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
             _cm.accumulate(counts_acc, _c)
             _cm.accumulate(counts_by_group.setdefault(dir_group(r), _cm.empty()),
                            _c)
+        _srows = res.get("rows") or []
+        if _srows:
+            _s = _cm.surface_scope(_srows)
+            _cm.accumulate(surf_acc, _s.get("counts") or {})
+            for _k2 in surf_extra:
+                surf_extra[_k2] += int(_s.get(_k2) or 0)
         n_cand = summary.get("n_candidates")
         n_ref = summary.get("n_candidates_with_reference")
         vals = {
@@ -1420,6 +1462,17 @@ def identity_metrics(model_path: Path, eval_runs: list, *,
         "candidate_identity_rate": _r["candidate_identity_rate"],
         "left_right_role_agreement": _r["left_right_role_agreement"],
         "counts": dict(counts_acc),
+        # 表面范围口径（只报不判，§10.3 提案）：定义与代价（matched_lost）都在
+        # 这里，判定文件直接可读；硬门判定**不看**这一块。
+        "identity_surface_scope": {
+            **_cm.ratios(surf_acc), **surf_extra,
+            "scope": "candidates_on_labelled_surface",
+            "off_road_max": _cm.SURFACE_OFF_ROAD_MAX,
+            "reported_only": True,
+            "note": ("§10.3 proposal (docs/T16_PROTOCOL_V8_IDENTITY_SURFACE_"
+                     "PROPOSAL_20261004.md): reported only, never gating; "
+                     "promoting it to primary needs sign-off (it re-ranks "
+                     "arms)")},
         "counts_by_group": {g: dict(v) for g, v in counts_by_group.items()},
         "ratios_by_group": {g: _cm.ratios(v) for g, v in counts_by_group.items()},
         "n_candidates": float(counts_acc.get("C", 0)),
@@ -1613,9 +1666,193 @@ def train_cmd(args, runs, out: Path, seed: int, extra: list) -> list:
             *init_flags, *det_flags, *extra]
 
 
+def effective_split(args_split: str, base_runs: list, cand_runs: list) -> str:
+    """数据臂的划分口径：候选比基线多 run 时**必须**用 ``per-run``。
+
+    为什么（2026-09-30 实测）：``--split tail`` 取"所有 run 拼接后的全局尾部"
+    当验证集，而 ``add_runs`` 把新数据**追加**在列表末尾——新数据正好落进验证集。
+    实测：候选臂追加 2 个负例包（16 帧）< 验证集 18 帧 → **因子 100% 变成验证
+    数据**，训练输入一个字节没变；判定里 ``exposures_by_run`` 的生成 run 曝光
+    为 0，而"因子已生效"的检查只看 ``--runs`` 变没变 → 白跑一轮还记成有效实验。
+    ``per-run`` 让每个 run 各取时间尾部 val_frac，追加的 run 必然有训练帧。
+    两臂共用同一口径（这是配方，不是因子差异）。
+    """
+    if len(cand_runs) > len(base_runs) and str(args_split) == "tail":
+        return "per-run"
+    return str(args_split)
+
+
+def added_run_train_frames(added_runs: list, *, split: str, val_frac: float,
+                           n_frames_by_run: dict) -> dict:
+    """追加的 run 在各划分下能拿到多少**训练**帧；0 帧 = 因子改不动输入。
+
+    与训练器 ``split_frames`` 同一口径（``tail``：全局尾部；``per-run``：
+    每个 run 各取 ``max(1, int(k*val_frac))`` 帧做验证）。缺帧数的 run 记
+    ``None``（未知不当作通过）。键与采样器同口径（``_run_key_like``）。
+    """
+    out: dict = {}
+    for r in added_runs:
+        key = _run_key_like(r)
+        k = n_frames_by_run.get(key)
+        if k is None:
+            k = n_frames_by_run.get(str(r))
+        if k is None:
+            out[key] = None
+            continue
+        k = int(k)
+        if str(split) == "per-run":
+            n_val = max(1, int(k * float(val_frac))) if k > 0 else 0
+            out[key] = max(0, k - n_val)
+        else:
+            # tail：全局尾部是 val，追加的 run 在末尾 -> 全部进 val
+            out[key] = 0
+    never = [r for r, n in out.items() if n is not None and int(n) <= 0]
+    return {"train_frames_by_run": out, "never_trained": sorted(never),
+            "split": str(split)}
+
+
+def _run_key_like(path) -> str:
+    """训练器 ``_run_key`` 的同一口径：相对 LOGS_DIR 的 posix 路径。
+
+    采样器的 ``exposures_by_run`` 用这个键（``experiments/...``），而命令行给的是
+    ``logs\\experiments\\...``——不归一化就会把"因子有 176 次曝光"读成 0
+    （实测踩到：修好划分后判定仍报 ``factor_never_sampled: True``）。
+    """
+    p = Path(path)
+    try:
+        return p.resolve().relative_to(Path(config.LOGS_DIR).resolve()).as_posix()
+    except Exception:                                        # noqa: BLE001
+        return p.as_posix()
+
+
+#: 合成**线**数据的安全剂量与硬上限（占候选训练**池**帧的比例，与
+#: ``synthetic_line_dose`` 同一口径）。
+#: 三点实测（6 seed 配对，T16 §22.2；占比用本函数的真实数据算出）：
+#:   share 0.149（16 帧） -> 身份率 **+0.0214**（四项 candidate_better）
+#:   share 0.260（32 帧） -> **−0.1464**（崩溃）
+#:   share 0.381（56 帧） -> **−0.1691**（崩溃）
+#: 转折点在 0.149 与 0.260 之间，所以：≤0.15 安全；0.15–0.25 未知区（照跑但记
+#: warn）；>0.25 是**已实测的崩溃区**，必须显式 `--allow-overdose`（记进判定）。
+DOSE_SAFE_FRAC = 0.15
+DOSE_HARD_FRAC = 0.25
+#: 剂量只在**够大**的训练池上判：实测的崩溃是"合成数据主导训练量"的域偏移，
+#: 池子只有个位数帧时（冒烟/接线测试）占比没有意义——那类轮次只记录不拦。
+DOSE_MIN_FRAMES = 40
+#: **负例剂量的记录警戒线**（只 warn，不拦）：负例通道没有线位先验、可以加量
+#: （§23/§24 单调递增），但实测在负例占比 ~0.60 时转向（§25：8.5× 臂身份率均值
+#: 0.4147 < 6× 臂 0.4410，路外假线 +15087）。超过它只记 `negative_warn`，
+#: 供报告与下一轮核对——不给硬门是因为该点还不显著（ci95 宽）。
+DOSE_NEG_WARN_FRAC = 0.55
+
+
+def synthetic_line_dose(*, added_runs: list, line_by_dir: dict,
+                        frames_by_run: dict, base_runs: list) -> dict:
+    """合成**线**数据占候选训练帧的比例（剂量纪律，§22.3）。
+
+    ``line_by_dir`` 用审计报告里的 ``train_line_by_dir``（键与 ``_run_key_like``
+    同口径）；缺某目录的线帧计数时该目录按 **0** 计并记进 ``unknown_dirs``
+    （未知不虚增剂量，但必须可见）。占比是**池**口径（划分前的候选训练帧），
+    与 §22 报告里的"训练帧占比"略差（per-run 划分按比例去掉验证帧，比例几乎不变）。
+    返回 ``{share, synthetic_line_frames, candidate_frames, added_frames,
+    unknown_dirs, level}``；``level`` ∈ {"ok","warn","over"}。
+    """
+    # 键**两种形式都要认**：审计报告里的 `train_line_by_dir` 用 `_canon_dir`
+    # （绝对 posix 小写），而这里/采样器用 `_run_key_like`（相对 LOGS_DIR）。
+    # 实测踩到：只认一种时查不到 -> 剂量恒报 0（守卫形同虚设）。
+    # 取值也要两种形态都认：`frames_by_run` 是 int，`line_by_dir` 是 dict。
+    def _lookup(d: dict, r):
+        for k in (_run_key_like(r), _canon_dir(r), str(r)):
+            v = (d or {}).get(k)
+            if v is not None:
+                return k, v
+        return None, None
+
+    def _frames_of(r) -> int:
+        _k, v = _lookup(frames_by_run, r)
+        if v is None:
+            return 0
+        return int(v.get("n_frames") or 0) if isinstance(v, dict) else int(v or 0)
+
+    def _line_frames_of(r):
+        _k, v = _lookup(line_by_dir, r)
+        if v is None:
+            return None
+        return (int(v.get("n_line_frames") or 0) if isinstance(v, dict)
+                else int(v or 0))
+
+    cand = [str(r) for r in (base_runs or [])] + [str(r) for r in
+                                                  (added_runs or [])]
+    total = sum(_frames_of(r) for r in cand)
+    syn = 0
+    added_total = 0
+    unknown: list = []
+    for r in (added_runs or []):
+        n = _line_frames_of(r)
+        added_total += _frames_of(r)
+        if n is None:
+            unknown.append(_run_key_like(r))
+            continue
+        syn += n
+    # 负例剂量（记录用，不是门）：追加 run 里**零线帧**的数量与占比。
+    # 结构负例通道不受线数据剂量上限约束（§22.3），但它的剂量必须可从判定
+    # 直接读出来，否则跨臂比较"负例加到几倍"只能靠数目录（实测踩过）。
+    neg = max(0, added_total - syn)
+    share = (syn / total) if total else None
+    level = "ok"
+    below_min = bool(total and total < DOSE_MIN_FRAMES)
+    if share is not None and not below_min:
+        if share > DOSE_HARD_FRAC:
+            level = "over"
+        elif share > DOSE_SAFE_FRAC:
+            level = "warn"
+    return {"share": (None if share is None else round(float(share), 4)),
+            "synthetic_line_frames": int(syn), "candidate_frames": int(total),
+            "added_frames": sum(_frames_of(r) for r in (added_runs or [])),
+            "unknown_dirs": sorted(unknown), "level": level,
+            "safe_frac": DOSE_SAFE_FRAC, "hard_frac": DOSE_HARD_FRAC,
+            "below_min_frames": below_min, "min_frames": DOSE_MIN_FRAMES,
+            # 负例（零线）剂量：记录用；>0 时给出占比便于跨臂比较
+            "negative_frames": int(neg),
+            "negative_frac": (round(neg / total, 4) if total else None),
+            "negative_warn": bool(total and neg / total > DOSE_NEG_WARN_FRAC),
+            "negative_warn_frac": DOSE_NEG_WARN_FRAC}
+
+
+def _frames_by_run(run_id: str, runs: list) -> dict:
+    """逐 run 的帧数（只数 ``frame_*.npz``，不读内容）；键与采样器同口径。"""
+    import glob as _glob
+    out: dict = {}
+    for r in runs:
+        p = Path(r)
+        if not p.is_dir():
+            continue
+        out[_run_key_like(p)] = len(_glob.glob(str(p / "frame_*.npz")))
+    return out
+
+
 def steps_per_epoch(n_train: int, batch: int) -> int:
     """每个 epoch 的优化步数（与训练器一致：按批向上取整）。"""
     return max(1, -(-int(n_train) // max(1, int(batch))))
+
+
+def ckpt_steps_done(ckpt, *, batch: int, epochs: int) -> int | None:
+    """checkpoint 里记录的**实测**优化步数；旧 checkpoint 才退回估算。
+
+    预算模式（``--total-steps``）下这是唯一权威计数（训练器写 ``steps_done``，
+    与 ``stopped_by=step_budget`` 配套）。**两臂都必须走这条路**：用
+    ``epochs × steps_per_epoch`` 去估，在预算模式下会写出与实际不符的数——
+    实测踩到（2026-09-30 严格门实验）：候选臂实跑 480 步、判定里
+    ``steps_by_arm.candidate`` 却写 72（= 3 epochs × 24），看上去像"候选臂
+    只训了 72 步"，足以把一次有效的等预算对照读成"候选被欠训"。
+    """
+    ta = _ckpt_train_args(Path(ckpt))
+    if not ta.get("n_train"):
+        return None
+    if ta.get("steps_done") is not None:
+        return int(ta["steps_done"])
+    return steps_per_epoch(int(ta["n_train"]),
+                           int(ta.get("batch") or batch)) * int(
+        ta.get("epochs") or epochs)
 
 
 def equal_steps_epochs(*, target_steps: int, n_train: int, batch: int) -> int:
@@ -2121,6 +2358,10 @@ def _rounds_audit(args, train_runs, log) -> tuple:
               "group_overlap": overlap, "coverage": cov,
               # 数据入口四计数（看板"数据入口"面板）需要的原始量：生成=清单全部
               # 记录（含被拒），评价=开发集记录数，复核=开发集 paint 档位有效帧。
+              # 逐目录的"有标线真值的帧数"（审计时已算）：剂量纪律
+              # （§22.3：合成线数据占比）与负例资格都用这一份，不重复读盘
+              "train_line_by_dir": {k: dict(v) for k, v in
+                                    _neg_by_dir.items()},
               "n_records_train": len(mf_tr.records),
               "n_records_dev": len(mf_dev.records),
               "coverage_dev": mf_dev.coverage().get("dev", {}),
@@ -2311,6 +2552,61 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                   "（真实运行时这一轮会被拒绝）")
         extra, skipped = factor_to_flags(factor)
         cand_runs, data_note = arm_runs(args.runs, factor)
+        # **数据臂的划分口径**（2026-09-30 实测的静默白跑）：`--split tail`
+        # 取的是"所有 run 拼接后的全局尾部"当验证集，而 `add_runs` 把新数据
+        # **追加**在列表末尾——于是新数据正好落在验证集里。实测：2 个负例包
+        # 16 帧 < 18 帧验证集 -> **因子 100% 变成验证数据**，训练输入一个字节
+        # 都没变；而"因子已生效"的检查只看命令行的 --runs 变没变，于是历史上
+        # 所有 2 包负例臂（含 0.4316 那轮）都是白跑。数据臂一律改用 per-run
+        # 划分（每个 run 各取尾部 val_frac），两臂同口径。
+        _eff_split = effective_split(args.split, base_runs, cand_runs)
+        if _eff_split != args.split:
+            print(f"[rounds] 第 {rnd + 1} 轮划分改用 {_eff_split}："
+                  f"候选比基线多 {len(cand_runs) - len(base_runs)} 个 run，"
+                  f"tail 划分会把追加的 run 整段切进验证集")
+        args.split = _eff_split
+        _added = [r for r in cand_runs if r not in set(base_runs)]
+        _added_guard: dict | None = None
+        _factor_exposures: dict | None = None
+        if _added:
+            _guard = added_run_train_frames(_added, split=_eff_split,
+                                            val_frac=0.2,
+                                            n_frames_by_run=_frames_by_run(
+                                                args.run_id, cand_runs))
+            _added_guard = _guard
+            if _guard["never_trained"]:
+                _note = ("factor_not_sampled: 追加的 run 在 "
+                         f"{_eff_split} 划分下拿不到任何训练帧 "
+                         f"{_guard['never_trained']}（每个 run 需要 >=2 帧）"
+                         "——这样的因子改不动训练输入，拒绝训练")
+                _log_give_up(log, args.run_id, cand_id, "factor_not_sampled",
+                             _note, phase="needs_review")
+                print(f"[rounds] 第 {rnd + 1} 轮拒绝训练：{_note}")
+                return 3
+        # **剂量纪律**（T16 §22.3 实测）：合成**线**数据在 ~20% 训练帧以内为正
+        # （16 帧 +0.0214），超过就崩（56 帧 / 51% → −0.1691）。这里把占比算出来：
+        # warn 档照跑但记进判定；over 档必须显式 --allow-overdose 才跑。
+        _dose: dict | None = None
+        if _added:
+            _dose = synthetic_line_dose(
+                added_runs=_added, base_runs=base_runs,
+                line_by_dir=(_report.get("train_line_by_dir") or {}),
+                frames_by_run=_frames_by_run(args.run_id, cand_runs))
+            print(f"[rounds] 第 {rnd + 1} 轮合成线数据剂量："
+                  f"{_dose['synthetic_line_frames']}/"
+                  f"{_dose['candidate_frames']} = {_dose['share']}"
+                  f"（安全 ≤{DOSE_SAFE_FRAC}，硬上限 {DOSE_HARD_FRAC}）"
+                  f" level={_dose['level']}")
+            if _dose["level"] == "over" and not bool(
+                    getattr(args, "allow_overdose", False)):
+                _note = ("dose_overdose: 合成线数据占候选训练帧 "
+                         f"{_dose['share']} > 硬上限 {DOSE_HARD_FRAC}"
+                         "（实测 51% 时身份率 −0.1691，§22.3）——"
+                         "要跑这种剂量必须显式 --allow-overdose（会记进判定）")
+                _log_give_up(log, args.run_id, cand_id, "dose_overdose",
+                             _note, phase="needs_review")
+                print(f"[rounds] 第 {rnd + 1} 轮拒绝训练：{_note}")
+                return 3
         # 预算模式（quota 采样器）与 run_weights 互斥：训练器会硬报错，但那时
         # 一轮训练已经启动、报错信息埋在 train_error 里。这里提前拒绝并说明
         # 该用什么替代（配额轮换已经按 run 均衡曝光；要改权重得先让采样器支持）。
@@ -2388,10 +2684,10 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 base_neg[str(seed)] = m.get("negative_line") or {}
                 # 任务主指标也逐 seed 收（方案 G05）：判定要求主指标有可信改善，
                 # 只送 IoU 等于让任何候选都晋不了级。
-                _idb = identity_metrics(out / "checkpoint_last.pt",
-                                        args.eval_runs,
-                                        frames_by_dir=_report.get(
-                                            "dev_frames_by_dir"))
+                _idb = apply_identity_scope(identity_metrics(
+                    out / "checkpoint_last.pt", args.eval_runs,
+                    frames_by_dir=_report.get("dev_frames_by_dir")),
+                    getattr(args, "identity_scope", "v7"))
                 champ_task[str(seed)] = {
                     name: task_metric_value(name, m, _idb)
                     for name in TASK_METRICS}
@@ -2406,11 +2702,11 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                     # 实际步数以训练器落盘的 steps_done 为准（T16 §3.1：
                     # 预算模式的权威计数是 optimizer.step() 数）；旧 checkpoint
                     # 没有该字段才退回 epochs×steps_per_epoch 的估算。
-                    if ta_b.get("steps_done") is not None:
-                        base_steps[str(seed)] = int(ta_b["steps_done"])
-                    else:
-                        base_steps[str(seed)] = steps_per_epoch(
-                            ta_b["n_train"], ta_b.get("batch") or args.batch)                         * int(ta_b.get("epochs") or args.epochs)
+                    _bs = ckpt_steps_done(out / "checkpoint_last.pt",
+                                          batch=args.batch,
+                                          epochs=args.epochs)
+                    if _bs is not None:
+                        base_steps[str(seed)] = _bs
             # 等步数对照（精确版）：两臂 **epochs 不变**，把帧多的一臂按
             # run 配额截到与基线相同的训练帧数 —— 步数因此逐位相等，
             # 不需要用"最接近的整数轮"去凑（那会留下 +33% 的残余差）。
@@ -2506,10 +2802,10 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 else metrics.get("line_iou") or 0.0)
             cand_neg[str(seed)] = metrics.get("negative_line") or {}
             cand_meta[str(seed)] = _train_meta(out)
-            _idc = identity_metrics(out / "checkpoint_last.pt",
-                                    args.eval_runs,
-                                    frames_by_dir=_report.get(
-                                        "dev_frames_by_dir"))
+            _idc = apply_identity_scope(identity_metrics(
+                out / "checkpoint_last.pt", args.eval_runs,
+                frames_by_dir=_report.get("dev_frames_by_dir")),
+                getattr(args, "identity_scope", "v7"))
             if _idc.get("eval_run_errors"):
                 print(f"[rounds] 第 {rnd + 1} 轮 seed {seed}："
                       f"{_idc['n_eval_run_errors']} 个评价 run 没测到"
@@ -2612,6 +2908,20 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
         # 之后会在写盘那一行 UnboundLocalError，训练全跑完却拿不到判定）
         all_at_plateau = _both_at_plateau(plateau_by_seed,
                                          plateau_base_by_seed)
+        # 因子**实际曝光**（跨 seed 相加）：追加的 run 有没有真的进 batch。
+        # 判定里有了这个，"白跑一轮"（因子 0 曝光）就能一眼看出来，而不是靠
+        # 事后翻 train_meta。
+        if _added:
+            _factor_exposures = {}
+            for _s in args.seeds:
+                _ebr = (((cand_meta.get(str(_s)) or {})
+                         .get("sampler_report") or {})
+                        .get("exposures_by_run") or {})
+                for _r in _added:
+                    _k = _run_key_like(_r)
+                    _factor_exposures[_k] = (
+                        _factor_exposures.get(_k, 0)
+                        + int(_ebr.get(_k) or 0))
         champ = [champ_by_seed[str(s)] for s in args.seeds]
         cand = [cand_by_seed[str(s)] for s in args.seeds]
         road_only = bool(getattr(args, "allow_road_only", False))
@@ -2875,12 +3185,23 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 "hard_by_seed": hard_by_seed,
                 # v5 计数契约（方案 v2 §S3.7）：判定必须自带**整数计数**，
                 # 否则 replay 无法按新分母重判（legacy_replay_note 会明确说明）。
+                # **这是最后一个 seed 那一次评价的计数**（循环变量 `_idc` 出
+                # 循环后只剩末 seed）：它内部按候选池化（"micro 口径"），
+                # 但**不是**跨 seed 的池化，也不是逐 seed 均值。实测踩到：
+                # 把这里当"本臂的 micro 身份率"引用，会把某个 seed 的读数
+                # 当成整臂结论（0.4316 其实是 seed 44 的值，整臂均值 0.3979）。
                 "counts": _idc.get("counts") or {},
-                # 由 counts **派生**的池化比率（micro 口径）：replay 用它自查
-                # "计数与比率是不是同一批数"——只存 counts 的话，手改过的比率
-                # 查不出来（复核者 T12②）。它与 hard_gate 的逐 seed 均值不是
-                # 同一口径（micro vs macro），不能混比。
+                "counts_seed": str(args.seeds[-1]) if args.seeds else None,
+                # 由 counts **派生**的池化比率：replay 用它自查"计数与比率是不是
+                # 同一批数"——只存 counts 的话，手改过的比率查不出来（复核者
+                # T12②）。与 hard_gate 的逐 seed 均值不是同一口径，不能混比。
                 "counts_ratios": _cm.ratios(_idc.get("counts") or {}),
+                # 表面范围口径（§10.3 提案，只报不判）：决策所需的数字随每次
+                # 判定落盘，避免"要决策时再补测"
+                "identity_surface_scope": _idc.get("identity_surface_scope"),
+                # 主口径（§10.3 开关）：默认 v7；切 surface 需方案层签核
+                "identity_scope": str(getattr(args, "identity_scope", "v7")),
+                "protocol_version": _protocol_snapshot(t).get("version"),
                 "counts_by_group": _idc.get("counts_by_group") or {},
                 # 评价 run 的缺测（T11）：空列表才是"每个 run 都测到了"，
                 # 有内容时必须能在判定文件/看板上看到，不许当成 0 候选
@@ -2902,6 +3223,18 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 "deterministic": bool(getattr(args, "deterministic", False)),
                 "init_from": (str(getattr(args, "init", None))
                               if getattr(args, "init", None) else None),
+                # **因子有没有真的进训练**（2026-09-30 实测的静默白跑）：
+                # 追加的 run 在 tail 划分下会整段变成验证数据，而"因子已生效"
+                # 只看 --runs 变没变。这里落盘划分口径 + 追加 run 的训练帧数 +
+                # 采样器对追加 run 的**实际曝光**，让"白跑"在判定里一眼可见。
+                "effective_split": str(args.split),
+                "added_runs_train_frames": _added_guard,
+                "synthetic_line_dose": _dose,
+                "allow_overdose": bool(getattr(args, "allow_overdose", False)),
+                "factor_exposures_by_run": _factor_exposures,
+                "factor_never_sampled": bool(
+                    _factor_exposures is not None and _added
+                    and sum(int(v or 0) for v in _factor_exposures.values()) == 0),
                 "train_meta": {"baseline": base_meta, "candidate": cand_meta},
                 "per_scene": per_scene,
                 "scene_candidates": scene_candidates,
@@ -2922,16 +3255,16 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 "negative_line": {"baseline": sum_negative_summaries(base_neg),
                                   "candidate": sum_negative_summaries(cand_neg)},
                 "hard_gate": hard,
-                # 等步数对照的证据：两臂**实测**总步数（来自 checkpoint）
+                # 等步数对照的证据：两臂**实测**总步数（来自 checkpoint 的
+                # steps_done；两臂同一条路，不拿 epochs×steps_per_epoch 去估
+                # ——预算模式下那样估会写出与实际不符的数，实测踩到）
                 "steps_by_arm": {
                     "baseline": base_steps or None,
                     "candidate": {
-                        str(s): (steps_per_epoch(
-                            (_ckpt_train_args(exp_dir(args.run_id) / f"round{rnd}"
-                                              / f"seed{s}"
-                                              / "checkpoint_last.pt")
-                             .get("n_train") or 0),
-                            args.batch) * int(cand_epochs))
+                        str(s): ckpt_steps_done(
+                            exp_dir(args.run_id) / f"round{rnd}" / f"seed{s}"
+                            / "checkpoint_last.pt",
+                            batch=args.batch, epochs=int(cand_epochs))
                         for s in args.seeds}},
                 # 实际入训**样本数**（来自 checkpoint 的 train_args，不是配置声称）：
                 # 等步数对照的另一半证据，也是"四个计数"里"实际入训"的来源。
@@ -3116,6 +3449,9 @@ def main(argv=None) -> int:
     s.add_argument("--thresholds", default=None)
     s.add_argument("--paint-source", action="append", default=None,
                    metavar="RUN=SOURCE", help="与 rounds 同一口径：以凭证为准")
+    s.add_argument("--allow-overdose", action="store_true",
+                   help="允许合成线数据超过硬上限 0.35（实测 51%% 会崩，§22.3）；"
+                        "会记进判定")
     s.add_argument("--research-arm", action="store_true",
                    help="显式声明研究臂（来源资格不足时同样会降级）")
     s.add_argument("--production-mismatch", action="store_true")
@@ -3153,6 +3489,9 @@ def main(argv=None) -> int:
                    metavar="RUN=SOURCE",
                    help="逐 run 指定漆线真值来源；`engine_annotation_partial` "
                         "= 弱监督研究臂（line 通道不屏蔽，但不允许晋级）")
+    s.add_argument("--identity-scope", choices=IDENTITY_SCOPES, default="v7",
+                   help="身份率主口径（§10.3 提案的开关；默认 v7 = 现行语义）。"
+                        "surface 需要方案层签核：它会把臂排序反转")
     s.add_argument("--research-arm", action="store_true",
                    help="明标研究臂：判定照算，但不允许晋级（真值不完整）")
     s.add_argument("--eval-runs", nargs="+", required=True,

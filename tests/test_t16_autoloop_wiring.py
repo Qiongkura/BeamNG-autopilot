@@ -233,3 +233,254 @@ def test_sum_negative_summaries_keeps_v1_rows_readable():
     assert out["extra_counters"] == "absent"
     assert "false_positive_max_cc_px_max" not in out
     assert out["false_positive_frame_rate"] == 0.0
+
+
+# ------------------------------------------------- 实测步数（预算模式权威计数）
+
+def test_ckpt_steps_done_prefers_recorded_steps(tmp_path):
+    """预算模式：实测步数必须来自 checkpoint 的 steps_done，不是 epochs 估算。
+
+    实测踩到（2026-09-30 严格门实验）：候选臂实跑 480 步、判定里
+    `steps_by_arm.candidate` 却写 72（= 3 epochs × 24 steps/epoch），
+    把一次有效的等预算对照读成"候选被欠训"。
+    """
+    import torch
+    loop = _load()
+    ck = tmp_path / "checkpoint_last.pt"
+    torch.save({"train_args": {"n_train": 94, "batch": 4, "epochs": 3,
+                               "steps_done": 480}}, str(ck))
+    assert loop.ckpt_steps_done(ck, batch=4, epochs=3) == 480
+    # 旧 checkpoint 没有 steps_done 才退回估算（94/4=24 -> 3×24=72）
+    torch.save({"train_args": {"n_train": 94, "batch": 4, "epochs": 3}},
+               str(ck))
+    assert loop.ckpt_steps_done(ck, batch=4, epochs=3) == 72
+    # 连 n_train 都没有（旧格式）：None，不猜
+    torch.save({"train_args": {}}, str(ck))
+    assert loop.ckpt_steps_done(ck, batch=4, epochs=3) is None
+    assert loop.ckpt_steps_done(tmp_path / "missing.pt", batch=4,
+                                epochs=3) is None
+
+
+# ------------------------------------------------- 因子必须真的进训练（划分口径）
+
+def test_effective_split_switches_to_per_run_for_data_arms():
+    """数据臂（候选比基线多 run）必须用 per-run 划分。
+
+    实测踩到（2026-09-30）：`--split tail` 取"所有 run 拼接后的全局尾部"当验证集，
+    而 `add_runs` 把新数据追加在末尾 -> 新数据正好落进验证集。2 个负例包 16 帧
+    < 18 帧验证集 -> **因子 100% 变成验证数据**，训练输入一个字节没变，而
+    "因子已生效"的检查只看 --runs 变没变（历史上所有 2 包负例臂都是白跑）。
+    """
+    loop = _load()
+    base = ["a", "b"]
+    assert loop.effective_split("tail", base, base) == "tail"      # 非数据臂不动
+    assert loop.effective_split("tail", base, base + ["c"]) == "per-run"
+    assert loop.effective_split("per-run", base, base + ["c"]) == "per-run"
+    assert loop.effective_split("by-map-scene", base,
+                                base + ["c"]) == "by-map-scene"
+
+
+def test_added_run_train_frames_flags_zero_train_runs():
+    """追加 run 拿不到训练帧 = 因子改不动输入，必须能被判出来。"""
+    loop = _load()
+    counts = {"gen/one": 16, "gen/tiny": 1, "gen/ok": 8}
+    added = list(counts)
+    # tail：追加的 run 在列表末尾 -> 全部进验证集（0 训练帧）
+    g = loop.added_run_train_frames(added, split="tail", val_frac=0.2,
+                                    n_frames_by_run=counts)
+    assert g["never_trained"] == sorted(added), g
+    # per-run：每个 run 各取尾部 20% 做验证（>=2 帧的 run 都有训练帧）
+    g2 = loop.added_run_train_frames(added, split="per-run", val_frac=0.2,
+                                     n_frames_by_run=counts)
+    assert g2["train_frames_by_run"]["gen/ok"] == 7, g2      # 8 -> val 1
+    assert g2["train_frames_by_run"]["gen/one"] == 13, g2    # 16 -> val 3
+    assert g2["train_frames_by_run"]["gen/tiny"] == 0, g2    # 1 帧全进 val
+    assert g2["never_trained"] == ["gen/tiny"], g2
+    # 帧数未知（目录不存在）不当作通过：记 None，不进 never_trained
+    g3 = loop.added_run_train_frames(["missing"], split="per-run", val_frac=0.2,
+                                     n_frames_by_run={})
+    assert g3["train_frames_by_run"]["missing"] is None
+    assert g3["never_trained"] == []
+
+
+# ------------------------------------------------- 合成线数据的剂量纪律（§22.3）
+
+def test_synthetic_line_dose_levels():
+    """剂量纪律：合成**线**数据占候选训练帧的比例分三档（实测依据 §22.2/§22.3）。
+
+    16 帧（≈21%）身份率 +0.0214（四项 candidate_better）；56 帧（≈51%）−0.1691
+    崩溃。所以：≤0.20 照跑；0.20–0.35 记 warn；>0.35 必须显式 --allow-overdose。
+    """
+    loop = _load()
+    base = ["logs/experiments/human_a", "logs/experiments/human_b"]
+    added = ["logs/experiments/gen_a", "logs/experiments/gen_b"]
+    # 键用模块自己的归一化函数算（测试会话把 BEAMNG_LOGS_DIR 指到沙箱，
+    # 硬编码 "experiments/..." 会与运行期口径不一致）
+    K = loop._run_key_like
+    frames = {K(base[0]): 30, K(base[1]): 30, K(added[0]): 8, K(added[1]): 8}
+    line_by_dir = {K(added[0]): {"n_frames": 8, "n_line_frames": 8},
+                   K(added[1]): {"n_frames": 8, "n_line_frames": 8},
+                   K(base[0]): {"n_frames": 30, "n_line_frames": 15},
+                   K(base[1]): {"n_frames": 30, "n_line_frames": 15}}
+    # 16/76 = 0.21 -> warn（§21 那一档的池占比是 0.149 = ok，这里构造 warn 区）
+    d = loop.synthetic_line_dose(added_runs=added, base_runs=base,
+                                 line_by_dir=line_by_dir,
+                                 frames_by_run=frames)
+    assert d["synthetic_line_frames"] == 16 and d["candidate_frames"] == 76
+    assert d["share"] == round(16 / 76, 4) and d["level"] == "warn"
+    # 只用 4 帧：4/64 = 0.0625 -> ok
+    d2 = loop.synthetic_line_dose(
+        added_runs=added[:1], base_runs=base,
+        line_by_dir={K(added[0]): {"n_line_frames": 4}},
+        frames_by_run={K(base[0]): 30, K(base[1]): 30, K(added[0]): 8})
+    assert d2["share"] == round(4 / 68, 4) and d2["level"] == "ok"
+    # 大剂量：48/108 = 0.44 -> over（§22 的崩溃档 0.26/0.38）
+    big = dict(frames)
+    big.update({K(added[0]): 24, K(added[1]): 24})
+    d3 = loop.synthetic_line_dose(
+        added_runs=added, base_runs=base,
+        line_by_dir={K(added[0]): {"n_line_frames": 24},
+                     K(added[1]): {"n_line_frames": 24}},
+        frames_by_run=big)
+    assert d3["level"] == "over", d3
+    # 缺线帧计数：记 unknown_dirs，且不虚增剂量
+    d4 = loop.synthetic_line_dose(added_runs=added, base_runs=base,
+                                  line_by_dir={}, frames_by_run=frames)
+    assert d4["synthetic_line_frames"] == 0
+    assert d4["unknown_dirs"] == sorted([K(added[0]), K(added[1])])
+    assert d4["level"] == "ok"
+    # 0.26（32 帧那档的实测占比）必须落在 over：那是**已实测的崩溃区**
+    d5 = loop.synthetic_line_dose(
+        added_runs=added, base_runs=base,
+        line_by_dir={K(added[0]): {"n_line_frames": 10},
+                     K(added[1]): {"n_line_frames": 10}},
+        frames_by_run=frames)
+    assert d5["share"] == round(20 / 76, 4) and d5["level"] == "over", d5
+
+
+def test_synthetic_line_dose_accepts_both_key_forms():
+    """剂量查表要认**两种键**：审计报告的 `train_line_by_dir` 用 `_canon_dir`
+    （绝对 posix 小写），采样器/命令行用 `_run_key_like`（相对 LOGS_DIR）。
+
+    实测踩到（2026-10-01）：只认一种时查不到 -> 剂量恒报 0，守卫形同虚设
+    （那一轮恰好是安全剂量才没出事）。两种键形式都必须给出同一结果。
+    """
+    loop = _load()
+    pair = ("logs/experiments/t16_autotruth_devdist_strict_20260930/"
+            "m5auto_a0_material_mix_a0s4/front_main")
+    neg = ("logs/experiments/t16_autotruth_struct_strict_20260930/"
+           "m5auto_a0_structure_negative_a0s5/front_main")
+    human = ["logs/experiments/annotate_pkg_e2_it3_20260927/front_fisheye",
+             "logs/experiments/annotate_pkg_e1_jv_20260927/front_main"]
+    got = []
+    for keyer in (loop._run_key_like, loop._canon_dir):
+        line_by = {keyer(pair): {"n_frames": 8, "n_line_frames": 8},
+                   keyer(neg): {"n_frames": 8, "n_line_frames": 0},
+                   keyer(human[0]): {"n_frames": 30, "n_line_frames": 15},
+                   keyer(human[1]): {"n_frames": 30, "n_line_frames": 15}}
+        frames = {keyer(pair): {"n_frames": 8}, keyer(neg): {"n_frames": 8},
+                  keyer(human[0]): {"n_frames": 30},
+                  keyer(human[1]): {"n_frames": 30}}
+        d = loop.synthetic_line_dose(added_runs=[pair, neg], base_runs=human,
+                                     line_by_dir=line_by,
+                                     frames_by_run=frames)
+        got.append((d["synthetic_line_frames"], d["candidate_frames"],
+                    d["share"], d["level"], tuple(d["unknown_dirs"])))
+    assert got[0] == got[1], got
+    syn, tot, share, level, unknown = got[0]
+    # 8/76 = 0.105 -> ok（安全区）；键形式不影响结果
+    assert (syn, tot) == (8, 76) and share == round(8 / 76, 4)
+    assert level == "ok" and unknown == ()
+    # 池子太小（< DOSE_MIN_FRAMES）时只记录不拦：冒烟/接线轮次不该被剂量门挡
+    d_small = loop.synthetic_line_dose(
+        added_runs=[pair], base_runs=[human[0]],
+        line_by_dir={loop._run_key_like(pair): {"n_line_frames": 3}},
+        frames_by_run={loop._run_key_like(pair): 3,
+                       loop._run_key_like(human[0]): 3})
+    assert d_small["below_min_frames"] is True and d_small["level"] == "ok"
+    assert d_small["share"] == 0.5      # 占比照算，只是不拦
+
+
+def test_synthetic_line_dose_reports_negative_dose():
+    """剂量里要能读出**负例剂量**（零线帧数与占比）——记录用，不是门。
+
+    结构负例通道不受线数据剂量上限约束（§22.3），但跨臂比较"负例加到几倍"
+    必须能从判定直接读（否则只能靠数目录，实测踩过）。
+    """
+    loop = _load()
+    K = loop._run_key_like
+    base = ["logs/experiments/human_a", "logs/experiments/human_b"]
+    pair = "logs/experiments/gen_pair"
+    neg = "logs/experiments/gen_neg"
+    frames = {K(base[0]): {"n_frames": 30}, K(base[1]): {"n_frames": 30},
+              K(pair): {"n_frames": 8}, K(neg): {"n_frames": 64}}
+    line_by = {K(pair): {"n_line_frames": 8},
+               K(neg): {"n_line_frames": 0}}
+    d = loop.synthetic_line_dose(added_runs=[pair, neg], base_runs=base,
+                                 line_by_dir=line_by, frames_by_run=frames)
+    assert d["synthetic_line_frames"] == 8 and d["negative_frames"] == 64
+    assert d["candidate_frames"] == 132
+    assert d["negative_frac"] == round(64 / 132, 4)
+    assert d["level"] == "ok"          # 线剂量 8/132 = 0.061 安全
+
+
+def test_synthetic_line_dose_flags_negative_warn():
+    """负例占比超过实测转向点（~0.60，§25）时记 negative_warn（只 warn 不拦）。
+
+    8.5× 臂（负例占比 0.599）身份率均值 0.4147 < 6× 臂（0.51）0.4410，路外假线
+    +15087——转向点已实测，但不显著，所以只记录、不硬拦。
+    """
+    loop = _load()
+    K = loop._run_key_like
+    base = ["logs/experiments/human_a"]
+    pair = "logs/experiments/gen_pair"
+    neg = "logs/experiments/gen_neg"
+    frames = {K(base[0]): {"n_frames": 60}, K(pair): {"n_frames": 16},
+              K(neg): {"n_frames": 96}}
+    line_by = {K(pair): {"n_line_frames": 16}, K(neg): {"n_line_frames": 0}}
+    d = loop.synthetic_line_dose(added_runs=[pair, neg], base_runs=base,
+                                 line_by_dir=line_by, frames_by_run=frames)
+    # 96/172 = 0.558 > 0.55 -> warn
+    assert d["negative_frac"] == round(96 / 172, 4)
+    assert d["negative_warn"] is True
+    # 少一点负例（64/140 = 0.457）-> 不 warn
+    d2 = loop.synthetic_line_dose(
+        added_runs=[pair, neg], base_runs=base, line_by_dir=line_by,
+        frames_by_run={K(base[0]): {"n_frames": 60},
+                       K(pair): {"n_frames": 16},
+                       K(neg): {"n_frames": 64}})
+    assert d2["negative_warn"] is False
+
+
+# ------------------------------------------- 身份率主口径开关（§10.3 提案）
+
+def test_apply_identity_scope_switches_and_keeps_v7():
+    """主口径开关：surface 时换三个门用值、v7 值另存 `*_v7`（双报）；缺块不猜。
+
+    默认必须是 v7（现行语义）；surface 是语义变更，需 §10.3 签核（会反转臂排序）。
+    """
+    loop = _load()
+    ident = {
+        "candidate_identity_rate": 0.44,
+        "candidate_reference_coverage": 0.95,
+        "left_right_role_agreement": 0.82,
+        "identity_surface_scope": {
+            "candidate_identity_rate": 0.77,
+            "candidate_reference_coverage": 0.96,
+            "left_right_role_agreement": 0.83},
+    }
+    v7 = loop.apply_identity_scope(ident, "v7")
+    assert v7["candidate_identity_rate"] == 0.44
+    assert "candidate_identity_rate_v7" not in v7
+    surf = loop.apply_identity_scope(ident, "surface")
+    assert surf["candidate_identity_rate"] == 0.77
+    assert surf["candidate_identity_rate_v7"] == 0.44
+    assert surf["candidate_reference_coverage_v7"] == 0.95
+    assert surf["identity_scope"] == "surface"
+    # 入参不被改写（纯函数）
+    assert ident["candidate_identity_rate"] == 0.44
+    # 缺 surface 块：保持 v7 并记 fallback（不猜、不静默切换）
+    fb = loop.apply_identity_scope(
+        {"candidate_identity_rate": 0.44}, "surface")
+    assert fb["candidate_identity_rate"] == 0.44
+    assert "no identity_surface_scope block" in fb["scope_fallback"]
