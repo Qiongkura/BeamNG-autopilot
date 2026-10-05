@@ -572,3 +572,119 @@ class TestOptionalSurfaceGate:
                                                 surface_gate=True)
         assert len(kept) == 1 and not dropped, "路面未知时不得据此丢弃"
         assert mk.meta["surface_frac"] is None
+
+
+# ------------------------------------------------- 同侧近邻候选合并（路线 b）
+
+def test_merge_close_candidates_same_side_only():
+    """同侧 <1.5 m 合并成一条（并集），异侧/远距不动，可关。
+
+    实测依据（T16 §18.5 路线 b）：未匹配候选里 15–23% 与**同侧 1.5 m 内的已匹配
+    候选**成对出现（同一根线被切成两条），合并是**参考无关**的，离线账面身份率
+    +0.040…+0.065 且已匹配候选一条不丢。真线间距 ≥2.5 m（车道宽），
+    1.5 m 半径不会把两根真线并成一根。
+    """
+    import numpy as np
+    from beamng_autopilot.vision.segmentation import merge_close_candidates
+    from beamng_autopilot.vision.lanes import LaneMarking
+
+    def mk(lat, n=5):
+        return LaneMarking(world=np.array([[0.0, float(lat)]] * n),
+                           pixels=np.zeros((n, 2)), color="white",
+                           kind="thin", confidence=0.5)
+
+    # 生产默认半径 1.0 m（实测选定，§20：6/6 arm 过角色门）：0.8 m 的两条并成一条
+    out, info = merge_close_candidates([mk(1.7), mk(2.5)], pos=(0.0, 0.0, 0.0),
+                                       heading=0.0)
+    assert len(out) == 1 and info["merged"] == 1
+    assert out[0].meta["merged_from"] == 2
+    assert len(out[0].world) == 10          # 并集：信息只增不减
+    # 同侧 1.2 m：超过默认半径 -> 不合并（真线近/远档可以只差 1.0–1.5 m）
+    assert len(merge_close_candidates([mk(1.7), mk(2.9)], pos=(0.0, 0.0, 0.0),
+                                      heading=0.0)[0]) == 2
+    # 小半径（测量用，§19 的 0.5 m 档）：0.8 m 也不合并
+    small, _ = merge_close_candidates([mk(1.7), mk(2.5)],
+                                      pos=(0.0, 0.0, 0.0), heading=0.0,
+                                      max_gap_m=0.5)
+    assert len(small) == 2
+    # 同侧 2.5 m（真线间距量级）：不合并
+    assert len(merge_close_candidates([mk(1.7), mk(4.2)], pos=(0.0, 0.0, 0.0),
+                                      heading=0.0)[0]) == 2
+    # 异侧 1.2 m：不合并（横向符号不同）
+    assert len(merge_close_candidates([mk(1.7), mk(-1.7)], pos=(0.0, 0.0, 0.0),
+                                      heading=0.0)[0]) == 2
+    # 关掉：原样返回
+    off, info_off = merge_close_candidates([mk(1.7), mk(2.0)],
+                                           pos=(0.0, 0.0, 0.0), heading=0.0,
+                                           enable=False)
+    assert len(off) == 2 and info_off["enabled"] is False
+    # 缺 world 的候选（无法定位）：保留、不参与合并
+    bad = LaneMarking(world=np.zeros((0, 2)), pixels=np.zeros((3, 2)))
+    out2, _ = merge_close_candidates([mk(1.7), mk(2.0), bad],
+                                     pos=(0.0, 0.0, 0.0), heading=0.0)
+    assert len(out2) == 2
+
+
+def test_scope_lateral_candidates_drops_only_beyond_limit():
+    """横向口径门（单因子开关，默认关）：只丢 |lat| 超限的；world 缺失的保留
+    （判不了不丢）；关掉/非正值是 no-op；debug 里能看到计数。
+
+    实测依据（R3 第二轮 + 离线扫描，seed 42）：丢 |lat|>3 m 的候选，
+    dev 身份 0.4396→0.7129（M 160→72）、R3 0.3989→0.7576（M 恒 75）——
+    代价在召回，改默认必须先过像素级门。
+    """
+    import numpy as np
+    from beamng_autopilot.vision.segmentation import (
+        scope_lateral_candidates)
+    from beamng_autopilot.vision.lanes import LaneMarking
+
+    def mk(lat, n=5):
+        return LaneMarking(world=np.array([[0.0, float(lat)]] * n),
+                           pixels=np.zeros((n, 2)), color="white",
+                           kind="thin", confidence=0.5)
+
+    debug = {}
+    out, info = scope_lateral_candidates(
+        [mk(1.7), mk(-6.0), mk(7.5), mk(-2.0)], pos=(0.0, 0.0, 0.0),
+        heading=0.0, max_lat_m=3.0, enable=True, debug=debug)
+    assert sorted(float(np.median(m.world[:, 1])) for m in out) == [-2.0, 1.7]
+    assert info["dropped"] == 2 and info["unknown_kept"] == 0
+    assert debug["line_candidate_lat_scope"]["dropped"] == 2
+    # world 缺失：保留（判不了不丢）
+    bad = LaneMarking(world=None, pixels=np.zeros((3, 2)), color="white",
+                      kind="thin", confidence=0.5)
+    out, info = scope_lateral_candidates([bad, mk(9.0)], pos=(0.0, 0.0, 0.0),
+                                         heading=0.0, max_lat_m=3.0,
+                                         enable=True)
+    assert len(out) == 1 and info["unknown_kept"] == 1 and info["dropped"] == 1
+    # 默认关 / 非正值：no-op（候选集属冻结口径，改默认要走协议新版）
+    for kw in ({"enable": False, "max_lat_m": 3.0},
+               {"enable": True, "max_lat_m": 0.0}):
+        out, info = scope_lateral_candidates([mk(1.7), mk(9.0)],
+                                             pos=(0.0, 0.0, 0.0), heading=0.0,
+                                             **kw)
+        assert len(out) == 2 and info["dropped"] == 0
+
+def test_head_final_candidate_scope_call_sites():
+    """head 的最终候选集处理：合并补齐与横向口径门必须都在**写 meta 之前**，
+    且默认关、debug 键不互相覆盖（两处都实测踩过）。
+
+    实测（2026-10-04）：
+    * 把门接在 detect_lines 里只覆盖一个贡献者（门只丢 30/227，离线扫描应丢
+      100/227）——黄臂补候选/经典回退发生在 detect_lines 之后；
+    * 最终合并若复用 `line_candidate_merge` 键会覆盖提取器那次的 in/out。
+    """
+    from pathlib import Path as _P
+    src = (_P(__file__).resolve().parents[1] / "beamng_autopilot" / "vision"
+           / "heads" / "semantic.py").read_text(encoding="utf-8")
+    assert 'BEAMNG_LINE_MERGE_FINAL", "0"' in src, "合并补齐必须默认关"
+    assert "line_candidate_merge_final" in src, "最终合并要单独记，不覆盖提取器那次"
+    assert "scope_lateral_candidates(" in src
+    i_merge = src.index("merge_close_candidates(")
+    i_gate = src.index("scope_lateral_candidates(")
+    i_store = src.index('out.meta["markings"] = markings')
+    assert i_merge < i_gate < i_store, "顺序必须是：合并补齐 -> 横向门 -> 写 meta"
+    # env 默认关的定义在 segmentation.py（门自己的实现里），不在 head
+    seg = (_P(__file__).resolve().parents[1] / "beamng_autopilot" / "vision"
+           / "segmentation.py").read_text(encoding="utf-8")
+    assert 'BEAMNG_LINE_LAT_MAX_M", ""' in seg, "横向门 env 默认必须是空（关）"
