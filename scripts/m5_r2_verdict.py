@@ -49,13 +49,22 @@ GATES = {"candidate_reference_coverage": 0.80,
 PER_SCENE_MIN_CANDIDATES = 30
 
 
-def evaluate_gates(by_seed: dict) -> dict:
+def evaluate_gates(by_seed: dict, *, mode: str = "strict") -> dict:
     """逐 seed 判定 + 均值判定（纯函数，可单测）。
 
     ``by_seed``：``{seed: {metric: value|None}}``。缺测（None）记 UNKNOWN，
     **不算通过也不算失败**（方案纪律：缺测不当 PASS）。返回
     ``{"per_seed": {...}, "means": {...}, "gates": {...}, "verdict": ...}``。
+
+    ``mode``（判定语义，方案层待裁决项②）：
+    * ``"strict"``（默认）：**全 seed 通过**才算该门通过（任一 seed 跌破即 fail）；
+    * ``"mean"``：按**池化均值**判门（方案原文"逐 seed 判定 + 配对/均值双报"的
+      "均值"读法）；逐 seed 分布仍完整报出（``n_pass/n_fail``），未过的 seed 需要
+      另附归因（人工/文档层，脚本不代替）。
+    两种模式下缺测都记 UNKNOWN。
     """
+    if mode not in ("strict", "mean"):
+        raise ValueError(f"未知判定语义 {mode!r}（strict|mean）")
     seeds = sorted(by_seed)
     out_gates = {}
     means = {}
@@ -73,18 +82,25 @@ def evaluate_gates(by_seed: dict) -> dict:
         n_pass = sum(1 for x in per.values() if x == "pass")
         n_fail = sum(1 for x in per.values() if x == "fail")
         n_unk = sum(1 for x in per.values() if x == "UNKNOWN")
+        if mode == "strict":
+            verdict = ("pass" if n_fail == 0 and n_unk == 0 and n_pass
+                       else "fail" if n_fail
+                       else "unknown" if n_unk and not n_pass
+                       else "partial")
+        else:                      # mean：按池化均值判门（逐 seed 分布仍报出）
+            verdict = ("pass" if (means[metric] is not None
+                                  and means[metric] >= thr)
+                       else "fail" if means[metric] is not None
+                       else "unknown")
         out_gates[metric] = {
             "threshold": thr, "mean": means[metric], "per_seed": per,
             "n_pass": n_pass, "n_fail": n_fail, "n_unknown": n_unk,
-            # 判定：全 seed 通过才算过；有缺测且无失败记 partial（不冒充通过）
-            "verdict": ("pass" if n_fail == 0 and n_unk == 0 and n_pass
-                        else "fail" if n_fail
-                        else "unknown" if n_unk and not n_pass
-                        else "partial")}
+            "mode": mode, "verdict": verdict}
     failing = [m for m, g in out_gates.items() if g["verdict"] == "fail"]
     unknown = [m for m, g in out_gates.items() if g["verdict"] == "unknown"]
     partial = [m for m, g in out_gates.items() if g["verdict"] == "partial"]
-    return {"per_seed": {str(s): dict(by_seed[s]) for s in seeds},
+    return {"mode": mode,
+            "per_seed": {str(s): dict(by_seed[s]) for s in seeds},
             "means": means, "gates": out_gates,
             "failing_gates": failing, "unknown_gates": unknown,
             "partial_gates": partial,
@@ -109,6 +125,10 @@ def main() -> int:
     ap.add_argument("--dev-runs", nargs="+", required=True)
     ap.add_argument("--r3-runs", nargs="*", default=None)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--verdict-mode", choices=("strict", "mean"),
+                    default="strict",
+                    help="判定语义：strict=全 seed 必须过（默认）；"
+                         "mean=按池化均值判门（逐 seed 分布仍完整报出）")
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -150,6 +170,16 @@ def main() -> int:
         return cand, pixel, pr
 
     dev_cand, dev_pixel, dev_pr = run_set(dev_dirs)
+    # R3（受限认证类）：方案 §5 要求 R3 结论与 R2 并列记录；--r3-runs 给了就必须
+    # 真跑（不给就明说没测，绝不静默忽略——本项目已被静默 no-op 坑过）
+    r3_dirs = [Path(p) for p in (args.r3_runs or []) if Path(p).is_dir()]
+    r3 = None
+    if r3_dirs:
+        rc, rp, rr = run_set(r3_dirs)
+        r3 = {"sets": {"dirs": [str(d) for d in r3_dirs]},
+              "candidate": rc, "pixel": rp, "paint_recall": rr}
+    elif args.r3_runs:
+        raise SystemExit(f"--r3-runs 给了但没有有效目录：{args.r3_runs}")
     out = {"protocol": active_protocol_version(),
            "definition": ("v8: line = paint on pavement within lat scope"
                           if line_scope.protocol() == "v8"
@@ -161,9 +191,11 @@ def main() -> int:
                             "frames": dev_pixel[next(iter(dev_pixel))]["n_frames"]
                             if dev_pixel else None}},
            "gates_thresholds": GATES,
+           "verdict_mode": args.verdict_mode,
            "per_scene_min_candidates": PER_SCENE_MIN_CANDIDATES,
            "dev": {"candidate": dev_cand, "pixel": dev_pixel,
-                   "paint_recall": dev_pr}}
+                   "paint_recall": dev_pr},
+           "r3": r3}
     by_seed = {}
     for name in dev_cand:
         c = dev_cand[name]
@@ -178,7 +210,26 @@ def main() -> int:
             "line_recall_paint_scope": pr.get("recall_paint"),
             "label_nonpaint_frac": pr.get("nonpaint_frac"),
         }
-    out["dev"]["gates"] = evaluate_gates(by_seed)
+    out["dev"]["gates"] = evaluate_gates(by_seed,
+                                         mode=args.verdict_mode)
+    if r3 is not None:
+        r3_seed = {}
+        for name in r3["candidate"]:
+            c = r3["candidate"][name]
+            pp = r3["pixel"][name]
+            prr = (r3["paint_recall"].get(name) or {})
+            r3_seed[name] = {
+                "candidate_reference_coverage":
+                    c["candidate_reference_coverage"],
+                "candidate_identity_rate": c["candidate_identity_rate"],
+                "left_right_role_agreement":
+                    c["left_right_role_agreement"],
+                "line_precision": pp.get("line_precision"),
+                "line_recall": pp.get("line_recall"),
+                "line_recall_paint_scope": prr.get("recall_paint"),
+                "label_nonpaint_frac": prr.get("nonpaint_frac")}
+        out["r3"]["gates"] = evaluate_gates(r3_seed,
+                                            mode=args.verdict_mode)
     Path(args.out).parent.mkdir(parents=True, exist_ok=True)
     Path(args.out).write_text(json.dumps(out, indent=1, ensure_ascii=False),
                              encoding="utf-8")
@@ -191,6 +242,14 @@ def main() -> int:
               f"unknown={gg['n_unknown']} -> {gg['verdict']}")
     print(f"[r2] verdict={g['verdict']} failing={g['failing_gates']} "
           f"partial={g['partial_gates']}")
+    if r3 is not None:
+        g3 = out["r3"]["gates"]
+        print("[r2] R3 受限认证类（逐 seed）：")
+        for metric, gg in g3["gates"].items():
+            print(f"      {metric:32s} thr={gg['threshold']:.2f} "
+                  f"mean={gg['mean']} pass={gg['n_pass']} fail={gg['n_fail']} "
+                  f"-> {gg['verdict']}")
+        print(f"[r2] R3 verdict={g3['verdict']} failing={g3['failing_gates']}")
     print(f"[r2] -> {args.out}")
     return 0
 

@@ -504,3 +504,23 @@ def test_r2_verdict_gate_evaluation():
     assert g["gates"]["line_precision"]["per_seed"]["42"] == "UNKNOWN"
     assert g["gates"]["line_precision"]["verdict"] == "unknown"
     assert g["verdict"] == "incomplete"
+    # 判定语义（方案层待裁决项②）：mean 模式按池化均值判门，但逐 seed 分布仍报出
+    g_mean = m.evaluate_gates(bad, mode="mean")
+    assert g_mean["mode"] == "mean"
+    assert g_mean["gates"]["line_recall"]["verdict"] == "fail",         "bad 的均值 0.68 < 0.70，mean 模式下也该 fail"
+    # 构造一个均值过、单 seed 跌破的组合：两种语义给出不同判定
+    _third = dict(ok[43], candidate_identity_rate=0.65)   # ok 只有 42/43 两个 seed
+    mixed = {42: dict(ok[42], line_recall=0.90),
+             43: dict(ok[43], line_recall=0.55),
+             44: dict(_third, line_recall=0.80)}
+    gs = m.evaluate_gates(mixed, mode="strict")
+    gm = m.evaluate_gates(mixed, mode="mean")
+    assert gs["gates"]["line_recall"]["verdict"] == "fail"      # 全 seed 口径
+    assert gm["gates"]["line_recall"]["verdict"] == "pass"      # 均值口径（0.75）
+    assert gm["gates"]["line_recall"]["n_fail"] == 1, "分布仍要报出来"
+    assert gm["verdict"] == "pass" and gs["verdict"] == "fail"
+    try:
+        m.evaluate_gates(ok, mode="nope")
+        raise AssertionError("未知语义必须报错")
+    except ValueError:
+        pass
