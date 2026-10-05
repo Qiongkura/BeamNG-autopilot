@@ -1321,3 +1321,42 @@ def test_replay_detects_a_decision_whose_ratios_do_not_match_its_counts(tmp_path
     assert r2.returncode == 1, r2.stdout[-600:]
     assert "计数与比率不一致" in r2.stdout, r2.stdout[-600:]
     assert "计数↔比率不一致 1" in r2.stdout
+
+def test_trainer_refuses_silent_overwrite_of_arm_artifacts(tmp_path):
+    """训练器必须**硬失败**而不是静默覆盖旧臂产物（2026-10-05 事故的护栏）。
+
+    事故：启动器 bug 让新臂写进了旧臂目录，覆盖 checkpoint_last.pt/best.pt/
+    epoch_*/train_hist，判定文件里的 sha 从此对不上（只能重跑确定性命令恢复）。
+    """
+    import importlib.util
+    import sys as _sys
+    from pathlib import Path as _P
+    root = _P(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_train_seg_guard", root / "scripts" / "m5_train_seg.py")
+    m = importlib.util.module_from_spec(spec)
+    _sys.modules["m5_train_seg_guard"] = m
+    spec.loader.exec_module(m)
+    d = tmp_path / "arm"
+    d.mkdir()
+    # 空目录：放行
+    m.refuse_silent_overwrite(d, resume=False, overwrite=False)
+    (d / "checkpoint_last.pt").write_bytes(b"x")
+    # 有产物：默认拒绝
+    try:
+        m.refuse_silent_overwrite(d, resume=False, overwrite=False)
+        raise AssertionError("有旧产物时必须拒绝")
+    except SystemExit as exc:
+        assert "拒绝写入" in str(exc) and "overwrite-out" in str(exc)
+    # 显式覆盖 / 续训：放行
+    m.refuse_silent_overwrite(d, resume=False, overwrite=True)
+    m.refuse_silent_overwrite(d, resume=True, overwrite=False)
+    # best.pt 单独存在也要拒绝
+    d2 = tmp_path / "arm2"
+    d2.mkdir()
+    (d2 / "best.pt").write_bytes(b"x")
+    try:
+        m.refuse_silent_overwrite(d2, resume=False, overwrite=False)
+        raise AssertionError("只有 best.pt 时也要拒绝")
+    except SystemExit:
+        pass
