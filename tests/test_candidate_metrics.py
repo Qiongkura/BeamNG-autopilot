@@ -543,3 +543,29 @@ def test_r2_verdict_gate_evaluation():
         raise AssertionError("未知范围必须报错")
     except ValueError:
         pass
+
+def test_final_set_compose_road_filter():
+    """最终集组成：路段不重叠才保留；路段未知**不收**（判不了不猜）。
+
+    为什么（2026-10-05 两次错误封存）：判"是否与训练同路段"必须用生成侧的
+    road_id；用目录名锚点号会静默不命中（各批 offset 不同，跨批不可比）。
+    """
+    import importlib.util
+    from pathlib import Path as _P
+    root = _P(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_final_set_compose", root / "scripts" / "m5_final_set_compose.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["m5_final_set_compose"] = m
+    spec.loader.exec_module(m)
+    train = {"45260.0", "45202.0"}
+    cands = [("known_line", "known_line_a27s0", "45084.0", ["f1", "f2"]),
+             ("occluded_line", "occluded_line_a0s2", "45260.0", ["f3"]),
+             ("known_no_line", "known_no_line_a1s1", None, ["f4"])]
+    r = m.compose(train, cands)
+    assert [k[1] for k in r["keep"]] == ["known_line_a27s0"]
+    assert [d[0] for d in r["drop_same_road"]] == ["occluded_line_a0s2"]
+    assert [d[0] for d in r["drop_unknown_road"]] == ["known_no_line_a1s1"]
+    # 全被排除时 keep 为空（调用方据此拒绝封存）
+    r2 = m.compose(train, [("known_line", "x", "45260.0", ["f"])])
+    assert r2["keep"] == []
