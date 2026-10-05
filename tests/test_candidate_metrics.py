@@ -464,3 +464,43 @@ def test_candidate_scope_scan_transforms():
     both = [{"lat_m": -1.2, "matched": False}, {"lat_m": -1.5, "matched": False}]
     out = m.apply_scope(both, mode="parallel", param=0.5)
     assert len(out) == 1 and out[0]["lat_m"] == -1.2
+
+def test_r2_verdict_gate_evaluation():
+    """R2 判定：全 seed 通过才算过；缺测记 UNKNOWN（不当 PASS）；有缺测且无失败
+    记 incomplete/partial（不冒充通过）。门阈值不得放宽。
+    """
+    import importlib.util
+    from pathlib import Path as _P
+    root = _P(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_r2_verdict", root / "scripts" / "m5_r2_verdict.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["m5_r2_verdict"] = m
+    spec.loader.exec_module(m)
+    assert m.GATES["candidate_identity_rate"] == 0.60, "门不得放宽"
+    assert m.GATES["line_recall"] == 0.70
+    # 全过
+    ok = {42: {"candidate_reference_coverage": 0.95,
+               "candidate_identity_rate": 0.66,
+               "line_precision": 0.89, "line_recall": 0.81,
+               "left_right_role_agreement": 0.88},
+          43: {"candidate_reference_coverage": 0.95,
+               "candidate_identity_rate": 0.67,
+               "line_precision": 0.90, "line_recall": 0.79,
+               "left_right_role_agreement": 0.87}}
+    g = m.evaluate_gates(ok)
+    assert g["verdict"] == "pass" and not g["failing_gates"]
+    assert g["gates"]["candidate_identity_rate"]["n_pass"] == 2
+    # 一个 seed 失败 -> fail（不放宽成"均值过"）
+    bad = {42: dict(ok[42]), 43: dict(ok[43], line_recall=0.55)}
+    g = m.evaluate_gates(bad)
+    assert g["verdict"] == "fail"
+    assert g["failing_gates"] == ["line_recall"]
+    assert g["gates"]["line_recall"]["verdict"] == "fail"
+    assert g["gates"]["line_recall"]["mean"] == round((0.81 + 0.55) / 2, 4)
+    # 缺测：UNKNOWN 不当 PASS
+    unk = {42: dict(ok[42], line_precision=None)}
+    g = m.evaluate_gates(unk)
+    assert g["gates"]["line_precision"]["per_seed"]["42"] == "UNKNOWN"
+    assert g["gates"]["line_precision"]["verdict"] == "unknown"
+    assert g["verdict"] == "incomplete"
