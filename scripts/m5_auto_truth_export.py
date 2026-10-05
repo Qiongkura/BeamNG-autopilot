@@ -560,6 +560,12 @@ def export_scene(rec: dict, truth: list, frames: list, *, out_root: Path,
         "source_id": f"m5auto_a{anchor}",
         "map_name_source": "m5_controlled_scenes.py (generated scenario)",
         "generated_by": f"{EXPORTER_VERSION}",
+        # **路段身份**（2026-10-05 审计踩到）：最终集封存要判"是否与训练同路段
+        # （相邻站点）"，而 meta 里原先没有可机读的路段标识——只能靠目录名，
+        # 各批次锚点编号互不可比。这里把生成侧的路段/站点原样带出来。
+        "road_id": ((rec.get("scene") or {}).get("road_id")),
+        "station_m": ((rec.get("scene") or {}).get("station_m")),
+        "mid": ((rec.get("scene") or {}).get("mid")),
         # 探针（评价侧）用它建相机模型：缺这一块整 run 判 UNKNOWN（实测踩到）
         "cameras": camera_block_from_frames(
             frames, ((rec.get("generated") or {}).get("dir")
@@ -657,7 +663,7 @@ def export_scene(rec: dict, truth: list, frames: list, *, out_root: Path,
 
 def export_line_free_package(frames: list, *, out_root: Path, scene: str,
                              anchor: int, map_name: str, generator: dict,
-                             evidence: dict,
+                             evidence: dict, site: dict | None = None,
                              camera_name: str = "front_main") -> dict:
     """写一个**已确认无线**的负例包（生成器声明 + 帧内零线像素 + 外观无）。
 
@@ -684,6 +690,10 @@ def export_line_free_package(frames: list, *, out_root: Path, scene: str,
         "map_name": map_name, "source_id": f"m5auto_a{anchor}",
         "map_name_source": "m5_controlled_scenes.py (generated scenario)",
         "generated_by": EXPORTER_VERSION, "truth_kind": "line_free",
+        # 路段身份（可机读；负例路径由调用方传 site，缺省不写——老调用不受影响）
+        "road_id": ((site or {}).get("road_id")),
+        "station_m": ((site or {}).get("station_m")),
+        "mid": ((site or {}).get("mid")),
         "frames": frame_records}, indent=1, ensure_ascii=False), encoding="utf-8")
     batch = {"frames": [{"frame_id": f"{scene}_{i:05d}", "timestamp": 1000.0 + i,
                          "channel_ids": {"rgb": f"{scene}_{i:05d}",
@@ -801,6 +811,7 @@ def main() -> int:
                 res = export_line_free_package(
                     ev["frames"], out_root=out_root, scene=name, anchor=anchor,
                     map_name=str(args.map),
+                    site=(rec.get("scene") or {}),
                     generator=report.get("generator") or {},
                     evidence={"line_px": ev.get("line_px_in_frames"),
                               "appearance_like_px": ev.get("appearance_like_px"),

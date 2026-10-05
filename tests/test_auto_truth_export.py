@@ -432,3 +432,28 @@ def test_camera_block_from_frames_matches_render_pose():
     # 缺相机/坏方向：返回空表（调用方写不出块 -> 探针判 UNKNOWN，不猜）
     assert m.camera_block_from_frames([], site_dir) == {}
     assert m.camera_block_from_frames(frames, [0.0, 0.0, 0.0]) == {}
+
+def test_exported_meta_carries_road_identity():
+    """导出包 meta 必须带**可机读的路段身份**（road_id/station_m/mid）。
+
+    为什么（2026-10-05 最终集审计踩到）：封存最终集要判"是否与训练同路段
+    （相邻站点）"，而 meta 原先没有路段标识，只能靠目录名里的锚点编号——各批次
+    锚点编号互不可比（各批自己的 offset），于是"锚点不重叠"这条判据**静默失效**
+    （过滤器 0 排除）。测试：导出后用生成侧路段值对账，缺失即失败。
+    """
+    import importlib.util
+    from pathlib import Path as _P
+    root = _P(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_ate_road", root / "scripts" / "m5_auto_truth_export.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["m5_ate_road"] = m
+    spec.loader.exec_module(m)
+    src = (_P(__file__).resolve().parents[1] / "scripts"
+           / "m5_auto_truth_export.py").read_text(encoding="utf-8")
+    # 正例包从 rec 取；负例包没有 rec -> 走可选参数 site，由 main 传 rec["scene"]
+    assert '"road_id": ((rec.get("scene") or {}).get("road_id"))' in src
+    assert '"road_id": ((site or {}).get("road_id"))' in src
+    assert 'site=(rec.get("scene") or {})' in src, "main 必须把路段身份传给负例导出"
+    assert '"station_m"' in src and '"mid"' in src
+    assert "site: dict | None = None" in src, "负例导出的 site 必须是可选参数（老调用不受影响）"
