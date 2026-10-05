@@ -68,7 +68,8 @@ def _road(n_rows=60, step=10.0, width=4.0):
 def test_five_scene_classes_are_specified():
     m = _load()
     assert set(m.SCENES) == {"known_line", "known_no_line", "occluded_line",
-                             "slope_curve", "material_mix"}
+                             "slope_curve", "material_mix",
+                             "structure_negative"}
     assert m.SCENES["known_no_line"]["lines"] == []
     assert m.SCENES["occluded_line"].get("occluder") is True
     assert m.SCENES["material_mix"].get("gravel") is True
@@ -78,6 +79,28 @@ def test_five_scene_classes_are_specified():
         for kind, _sign, _role in spec["lines"]:
             assert kind in m._MAT
             assert "italy_road_markings" in m._MAT[kind]
+
+
+def test_structure_negative_is_line_free_with_map_props():
+    """结构负例：不生成漆线 + 放地图自带静态物件（石墙/护栏）。
+
+    机制（T16 §16.1）：身份率的损失是模型在"像线的非漆结构"上多画线。
+    这类场景必须**没有漆线**（否则不是负例），结构必须是**地图自己的资产**
+    （shapeName 取自 levels/italy，不引入域外外观），且摆放参数要落在路侧
+    而不是铺装上（压到铺装会挡住自车/真值）。
+    """
+    m = _load()
+    spec = m.SCENES["structure_negative"]
+    assert spec["lines"] == [], "结构负例不得生成漆线"
+    assert spec["structures"] == ["wall_stone", "guardrail"]
+    for kind in spec["structures"]:
+        shape, sign, off = m.STRUCT_SHAPES[kind]
+        assert "art/shapes" in shape or shape.endswith(".dae"), shape
+        assert abs(float(sign)) == 1.0 and float(off) > 0.0
+    # 跨度与线链一致（6–30 m），数量/步长自洽
+    assert m.STRUCT_FIRST_M == 6.0 and m.STRUCT_STEP_M == 4.0
+    assert m.STRUCT_COUNT == 7
+    assert (m.STRUCT_FIRST_M + m.STRUCT_STEP_M * (m.STRUCT_COUNT - 1)) <= 34.0
 
 
 def test_line_nodes_follow_the_site_direction_and_lateral_sign():
@@ -283,11 +306,11 @@ def test_measured_role_targets_cover_the_reference_vocabulary():
     assert not any(r.startswith("far_") for r in roles)
     assert max(abs(v) for v in m.LINE_ROLE_LATERAL_M.values()) <= 3.0,         "横向跨度要收在标定能对齐的范围内"
     # straddled 的位置必须在探针的 STRADDLE_M(0.5) 内（否则判不成 straddled）
-    lat = dict(m.LINE_ROLE_TARGETS)["straddled"]
+    lat = float(m.LINE_ROLE_LATERAL_M["straddled"])
     assert abs(lat) <= 0.5, lat
     # 每个位置都在一条合理车道范围内（生成时还会按铺装宽度夹紧）
-    for _r, lat0 in m.LINE_ROLE_TARGETS:
-        assert abs(lat0) <= 6.0, (_r, lat0)
+    for _r, lat0 in m.LINE_ROLE_LATERAL_M.items():
+        assert abs(float(lat0)) <= 6.0, (_r, lat0)
 
 
 def test_measured_convention_keeps_the_line_free_control_empty():
@@ -298,7 +321,8 @@ def test_measured_convention_keeps_the_line_free_control_empty():
     """
     src = (ROOT / "scripts" / "m5_controlled_scenes.py").read_text(
         encoding="utf-8")
-    assert 'if LINE_CONVENTION == "measured" and spec["lines"]:' in src,         "词表展开必须只对有线场景生效"
+    # 词表展开只对**有线**场景生效（measured/relative/tiers 三套约定都带这条守卫）
+    assert 'in ("measured", "relative", "tiers") and spec["lines"]' in src,         "词表展开必须只对有线场景生效"
 
 
 
@@ -352,3 +376,129 @@ def test_tier_convention_covers_wider_lateral_prior():
     src = (ROOT / "scripts" / "m5_controlled_scenes.py").read_text(encoding="utf-8")
     assert '"tiers"' in src and "LINE_TIER_M[k % len(LINE_TIER_M)]" in src
     assert 'if role == "straddled":' in src, "straddled 档要固定 -0.4（保角色可判）"
+
+
+def test_devdist_cycle_matches_measured_vocabulary_and_probe_roles():
+    """devdist 循环：实例配比贴近实测词表，且角色与**探针自己的**规则一致。
+
+    实测（174 实例，docs §2）：straddled 13.8% / near_left 32.2% / near_right
+    28.7% / far_left 12.1% / far_right 13.2%；横向主峰 −0.75…0.00（§1）。
+    探针 `assign_roles` 的规则是"同侧由近到远定 near_/far_"——生成侧声明的角色
+    必须满足它，否则生成词表与评价词表会漂移（角色一致率会被系统性扣分）。
+    """
+    m = _load()
+    cyc = m.LINE_DEVDIST_CYCLE
+    roles = [r for pair in cyc for r, _lat in pair]
+    from collections import Counter
+    c = Counter(roles)
+    n = len(roles)
+    assert n == 12, n
+    share = {k: v / n for k, v in c.items()}
+    measured = {"straddled": 0.138, "near_left": 0.322, "near_right": 0.287,
+                "far_left": 0.121, "far_right": 0.132}
+    for k, want in measured.items():
+        assert abs(share.get(k, 0.0) - want) <= 0.06, (k, share, measured)
+    assert set(share) == set(measured), share
+    # 密度：每站 2 条（开发集 2.3 条/帧）
+    assert all(len(p) == 2 for p in cyc)
+    # 主峰：straddled 的位置必须落在实测主峰 −0.75…0.00 且 |lat|<=STRADDLE_M
+    for pair in cyc:
+        for r, lat in pair:
+            if r == "straddled":
+                assert -0.75 <= lat <= 0.0 and abs(lat) <= 0.5, (r, lat)
+            if r.startswith("far_"):
+                assert abs(lat) >= 3.0, (r, lat)
+    # **用探针自己的 assign_roles 校验声明角色**
+    import importlib.util as _iu
+    spec = _iu.spec_from_file_location(
+        "m5_marking_identity_probe",
+        ROOT / "scripts" / "m5_marking_identity_probe.py")
+    ip = _iu.module_from_spec(spec)
+    sys.modules["m5_marking_identity_probe"] = ip
+    spec.loader.exec_module(ip)
+    for pair in cyc:
+        # straddled 由 role_of(|lat|<=STRADDLE_M) 决定，near_/far_ 由
+        # assign_roles（同侧由近到远）决定——两步都要对得上
+        got = ip.assign_roles([{"role": ip.role_of(float(lat)),
+                                "lat_m": float(lat)} for _r, lat in pair])
+        for (r, lat), g in zip(pair, got):
+            assert g["role"] == r, (pair, [x["role"] for x in got])
+
+
+def test_pick_anchors_filters_by_half_width():
+    """宽路过滤：devdist 的远线需要半宽够大的锚点；不够宽就不返回（不偷放）。"""
+    m = _load()
+    narrow = {"roadN": {"lanesLeft": 1, "lanesRight": 1, "edges": [
+        {"middle": [k * 10.0, 0.0, 1.0], "left": [k * 10.0, 2.5],
+         "right": [k * 10.0, -2.5]} for k in range(20)]}}
+    wide = {"roadW": {"lanesLeft": 2, "lanesRight": 2, "edges": [
+        {"middle": [500.0 + k * 10.0, 0.0, 1.0], "left": [500.0 + k * 10.0, 5.0],
+         "right": [500.0 + k * 10.0, -5.0]} for k in range(20)]}}
+    roads = {**narrow, **wide}
+    a0 = m.pick_anchors(roads, n_anchors=5, min_sep_m=50.0)
+    assert {a["road_id"] for a in a0} == {"roadN", "roadW"}
+    assert all(a["half_width_m"] is not None for a in a0)
+    a1 = m.pick_anchors(roads, n_anchors=5, min_sep_m=50.0,
+                        min_half_width_m=4.6)
+    assert [a["road_id"] for a in a1] == ["roadW"], a1
+    assert a1[0]["half_width_m"] >= 4.6
+
+
+def test_pairfar_cycle_is_all_same_side_pairs():
+    """pairfar 扩量循环：每站都是**同侧近+远成对**，且角色与探针规则一致。
+
+    依据（T16 §21）：近/远档配比臂（只有 16 帧成对数据）在 6 seed 下确认改善
+    身份率 +0.0214、精度 +0.1147、IoU +0.0828、路外假线 −32%；扩量就是让每个
+    有线站点都放一对。角色必须满足 `assign_roles` 的"同侧由近到远"，
+    否则生成词表与评价词表漂移。
+    """
+    m = _load()
+    cyc = m.LINE_PAIRFAR_CYCLE
+    assert len(cyc) == 6 and all(len(p) == 2 for p in cyc)
+    sides = set()
+    for pair in cyc:
+        roles = [r for r, _lat in pair]
+        # 同一侧（角色后缀相同）、一近一远
+        assert roles[0].split("_", 1)[1] == roles[1].split("_", 1)[1], pair
+        assert {roles[0].split("_", 1)[0], roles[1].split("_", 1)[0]} == {
+            "near", "far"}, pair
+        lats = [abs(float(lat)) for _r, lat in pair]
+        assert lats[0] < lats[1], pair          # 内近外远
+        assert lats[1] >= 3.0, pair             # 远线档
+        sides.add(roles[0].split("_", 1)[1])
+    assert sides == {"left", "right"}           # 两侧都要有
+    assert m.LINE_PAIRFAR_MIN_HALF_M >= max(
+        abs(float(lat)) for _p in cyc for _r, lat in _p) + 0.3
+    # 用探针自己的 role_of + assign_roles 校验
+    import importlib.util as _iu
+    spec = _iu.spec_from_file_location(
+        "m5_marking_identity_probe",
+        ROOT / "scripts" / "m5_marking_identity_probe.py")
+    ip = _iu.module_from_spec(spec)
+    sys.modules["m5_marking_identity_probe"] = ip
+    spec.loader.exec_module(ip)
+    for pair in cyc:
+        got = ip.assign_roles([{"role": ip.role_of(float(lat)),
+                                "lat_m": float(lat)} for _r, lat in pair])
+        assert [g["role"] for g in got] == [r for r, _l in pair], pair
+
+
+def test_anchor_offset_skips_used_routes():
+    """`--anchor-offset` 跳过已用路段（R3 要用没进过训练/开发集的新路段）。
+
+    `pick_anchors` 是确定性的：不跳过就会把 devdist/pairfar 批次采过的同一批
+    宽路再采一遍（那批已进训练/开发集）。这里验证"取全部 -> 跳过 K -> 取 N"
+    的切片语义，以及越界时返回空表（调用方如实报错，不静默重采）。
+    """
+    m = _load()
+    roads = {}
+    for i in range(6):
+        x = 100.0 * i
+        roads[f"road{i}"] = {"lanesLeft": 1, "lanesRight": 1, "edges": [
+            {"middle": [x + k * 10.0, 0.0, 1.0], "left": [x + k * 10.0, 5.0],
+             "right": [x + k * 10.0, -5.0]} for k in range(20)]}
+    all_a = m.pick_anchors(roads, n_anchors=10_000, min_sep_m=50.0)
+    assert len(all_a) == 6
+    got = all_a[2:2 + 3]
+    assert [a["road_id"] for a in got] == [a["road_id"] for a in all_a[2:5]]
+    assert all_a[2:2 + 3] and not all_a[7:7 + 3]     # 越界 = 空表（调用方报错）
