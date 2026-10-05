@@ -419,6 +419,12 @@ class SafetyVerdict:
     path_hold_age_s: float | None = None
     path_hold_phase: str = ""
     held_path: np.ndarray | None = None
+    # Why a no-path tick could NOT reuse the bounded hold (diagnostics).
+    # "hold offered N times, reused M times" is only attributable with
+    # this field: 2026-10-06 town acceptance had 24 offers / 2 reuses and
+    # nothing in the telemetry said which of the bounded re-checks (or
+    # the window itself) refused the rest.
+    hold_refuse_reason: str = ""
     # Structured body-boundary diagnostics (plan phase C1): the
     # current-pose crossing and the planned-sweep crossing are DIFFERENT
     # events with different responses (stop now vs slow down and
@@ -533,31 +539,41 @@ class PathHold:
             offered_at=float(now_s), strict=bool(strict))
         return True
 
-    def request(self, pos, now_s: float):
+    def request(self, pos, now_s: float, *, refuse_out: list | None = None):
         """Serve the held path when still inside its bounded window.
 
         Returns ``(held, age_s, phase)`` with ``held`` the :class:`HeldPath`
         and phase ``"grace"`` (keep the offered target) or ``"creep"``
         (decay to the minimal-risk speed), or None.  None also CLEARS an
         expired hold.
+
+        ``refuse_out`` (diagnostics only, optional): when the request is
+        refused, one short reason string is appended — the live drive
+        records it so a "hold offered N times, reused M times" gap can be
+        attributed instead of guessed (2026-10-06: 24 offers / 2 reuses).
         """
+        def _no(reason: str):
+            if refuse_out is not None:
+                refuse_out.append(reason)
+            return None
+
         held = self._held
         if held is None:
-            return None
+            return _no("no hold offered")
         age = max(0.0, float(now_s) - held.offered_at)
         if age > self.max_s:
             self._held = None
-            return None
+            return _no(f"expired (age {age:.2f}s > {self.max_s:.2f}s)")
         p = np.asarray(pos, dtype=float).ravel()[:2]
         pts = held.path
         d = np.linalg.norm(pts - p[None, :], axis=1)
         j = int(np.argmin(d))
         if float(d[j]) > self.max_lat_m:
-            return None
+            return _no(f"ego drifted {float(d[j]):.2f}m off the held path")
         arc = np.concatenate([[0.0], np.cumsum(
             np.linalg.norm(np.diff(pts, axis=0), axis=1))])
         if float(arc[-1] - arc[j]) < self.min_ahead_m:
-            return None
+            return _no(f"only {float(arc[-1] - arc[j]):.2f}m of path ahead")
         phase = "grace" if age <= self.grace_s else "creep"
         return held, age, phase
 
@@ -766,7 +782,7 @@ class SafetyMonitor:
             now_s=(time.time() if now_s is None else float(now_s)),
             strict=strict)
 
-    def _serve_hold(self, scene, now_s: float):
+    def _serve_hold(self, scene, now_s: float, *, refuse_out: list | None = None):
         """Re-check the held path against the CURRENT scene, then serve.
 
         The held trajectory was verified when it was offered; the world
@@ -776,9 +792,17 @@ class SafetyMonitor:
         now cross a detected boundary, and the occupancy grid must not
         have gone blocked along it.  Returns
         ``(held_path, age_s, phase, target_speed)`` or None.
+
+        ``refuse_out`` (diagnostics only, optional): the refusal reason.
         """
+        def _no(reason: str):
+            if refuse_out is not None:
+                refuse_out.append(reason)
+            return None
+
         req = self.path_hold.request(
-            np.asarray(scene.pos[:2], dtype=float), now_s)
+            np.asarray(scene.pos[:2], dtype=float), now_s,
+            refuse_out=refuse_out)
         if req is None:
             return None
         held, age, phase = req
@@ -786,12 +810,12 @@ class SafetyMonitor:
         half_width = HALF_WIDTH_M + BODY_CROSS_MARGIN_M
         if body_pose_crosses_lane(scene, scene.pos, float(scene.heading),
                                   half_len=half_len, half_width=half_width):
-            return None
+            return _no("current body crosses a boundary")
         if body_lane_cross_dist_m(scene, held.path, half_len=half_len,
                                   half_width=half_width) > 0.0:
-            return None
+            return _no("held path now crosses a boundary")
         if self._path_occupied_fraction(scene, held.path) >= self.occ_stop:
-            return None
+            return _no("held path now blocked (occupancy)")
         cap = (min(held.target_speed, self.max_speed) if phase == "grace"
                else min(held.target_speed, self.min_risk_speed))
         return held.path, age, phase, max(0.0, cap)
@@ -1100,9 +1124,11 @@ class SafetyMonitor:
             or float(snapshot_age_s or 0.0) > STALE_PIPELINE_S)
         stale_planner = planner_age_s > self.stale_s
         served = None
+        _hold_refuse: list = []
         if (path is None or len(path) < 2) and not stale_sensor and not stale_planner:
             served = self._serve_hold(
-                scene, time.time() if now_s is None else float(now_s))
+                scene, time.time() if now_s is None else float(now_s),
+                refuse_out=_hold_refuse)
             if served is not None:
                 path = served[0]
         path_occ = self._path_occupied_fraction(scene, path)
@@ -1153,6 +1179,7 @@ class SafetyMonitor:
             lane_age_s=freshness["lane_age_s"],
             range_age_s=freshness["range_age_s"])
         v.lane_ref_src = lane_ref_src
+        v.hold_refuse_reason = (_hold_refuse[0] if _hold_refuse else "")
         # Structured boundary diagnostics ride EVERY verdict (plan C1):
         # the current-pose and planned-sweep crossings are separate
         # events, and the planned one reports where on the path it
