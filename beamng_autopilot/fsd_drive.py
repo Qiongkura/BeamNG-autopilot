@@ -2249,6 +2249,19 @@ class FSDriveSession:
         # 资源门打红）。与 `hist` 一样在入口初始化，任何路径都有定义。
         _vis_index: list[dict] = []
         rec = None
+        # 本次驾驶若自己起游戏，收尾必须把它关掉（与采集侧同一纪律）：驾驶侧此前
+        # 只 `conn.close()`（只关连接）——2026-10-06 实测，验收轮跑完留下 9 个
+        # BeamNG 实例，而且它们**持有 stdout 管道**，把无人值守循环卡死。
+        # 用 `close_started_game` 的所有权校验：只关"新出现 + 创建时间晚于本次
+        # 启动"的 pid，用户自己的会话永远不碰。
+        _pids_before = None
+        _launch_t = None
+        if not getattr(args, "attach", False):
+            try:
+                from beamng_autopilot.experiments.collection import game_pids
+                _pids_before = game_pids()
+            except Exception:
+                _pids_before = None
         conn = BeamNGConnector(
             getattr(args, "map", None) or "italy", "etk800",
             port=config.runtime_port(args.runtime),
@@ -2261,6 +2274,7 @@ class FSDriveSession:
                                     hyst_mps=SPEED_HYST_MPS)
         monitor = SafetyMonitor(max_speed=args.speed)
         try:
+            _launch_t = time.time()
             conn.open(launch=not args.attach)
             try:
                 conn.attach_vehicle(already_open=True)
@@ -4953,6 +4967,11 @@ class FSDriveSession:
                         round(float(verd.path_hold_age_s), 2)
                         if getattr(verd, "path_hold_age_s", None) is not None
                         else None),
+                    # 无路径 tick 上"为什么没复用有界 hold"（诊断）：
+                    # 2026-10-06 验收轮 24 次 offer 只复用 2 次，遥测里
+                    # 没有任何字段能说明其余被哪一条有界复检挡住。
+                    "hold_refuse_reason": str(
+                        getattr(verd, "hold_refuse_reason", "") or ""),
                     "body_cross_current": int(bool(
                         getattr(verd, "body_cross_current", False))),
                     "body_cross_planned": int(bool(
@@ -5271,6 +5290,21 @@ class FSDriveSession:
             except Exception:
                 pass
             conn.close()
+            # 关掉本次自己起的游戏（只关差集 + 创建时间校验；--attach 不碰）
+            if _pids_before is not None and _launch_t is not None:
+                try:
+                    from beamng_autopilot.experiments.collection import (
+                        close_started_game,
+                    )
+                    _gc = close_started_game(_pids_before,
+                                             launched_after=_launch_t)
+                    print(f"[fsd-drive] 收尾关游戏：closed="
+                          f"{_gc.get('closed')} killed={_gc.get('killed')} "
+                          f"{_gc.get('reason') or _gc.get('note') or ''}",
+                          flush=True)
+                except Exception as _gc_e:
+                    print(f"[fsd-drive] 收尾关游戏失败（不吞）：{_gc_e}",
+                          flush=True)
             if (_vis_index or []) and args.out:
                 try:
                     Path(str(args.out) + ".vis_index.json").write_text(

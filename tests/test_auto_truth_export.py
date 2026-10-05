@@ -511,3 +511,27 @@ def test_fsd_drive_cleanup_has_vis_index_initialised():
     # 入口初始化应与 hist 同处（连接建立之前），不是只在 --vis 分支里
     i_hist = src.index("hist: list[dict] = []")
     assert abs(i_init - i_hist) < 400, "应与 hist 一起在入口初始化"
+
+
+def test_fsd_drive_cleanup_closes_the_game_it_started():
+    """驾驶侧收尾必须关掉**自己起的**游戏（与采集侧同一纪律）。
+
+    2026-10-06 实测：验收轮 4 次驾驶跑完，机器上留下 9 个 BeamNG 实例；
+    它们还**持有 stdout 管道**，把 `... | tail -8` 的无人值守循环卡死
+    （run 1 结束后 12 分钟没有任何输出）。所有权校验复用采集侧助手：
+    只关差集 + 创建时间晚于本次启动的 pid，`--attach` 一律不碰。
+    """
+    from pathlib import Path as _P
+    src = (_P(__file__).resolve().parents[1] / "beamng_autopilot"
+           / "fsd_drive.py").read_text(encoding="utf-8")
+    assert "close_started_game" in src, "收尾必须关自己起的游戏"
+    assert "_pids_before = game_pids()" in src, "要有'启动前'的进程基线（差集才安全）"
+    assert "launched_after=_launch_t" in src, "要传启动时刻做所有权校验"
+    assert "taskkill" not in src and "Stop-Process" not in src, \
+        "不得自己手写 kill（所有权校验在助手里）"
+    # 只在非 attach 时取基线（attach 是挂别人的会话，绝不能关）
+    i_base = src.index("if not getattr(args, \"attach\", False):")
+    i_pids = src.index("_pids_before = game_pids()")
+    assert i_base < i_pids, "基线只在非 attach 分支里取"
+    i_fin = src.index("close_started_game(_pids_before,")
+    assert i_fin > i_pids, "收尾关游戏在建立连接之后"
