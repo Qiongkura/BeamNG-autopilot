@@ -783,7 +783,31 @@ class Segmenter:
         line = constrain_line_to_road(line, road, **_kw)
         line = filter_line_shape(line)
         line = self._appearance_gate_line(line, frame_rgb)
+        line = self._dilate_line(line)
         return road, line
+
+    def _dilate_line(self, line):
+        """掩码膨胀（单因子开关，默认 0 = 关）。
+
+        为什么（2026-10-05 实测）：逐帧容差分析显示，真值线像素在**精确重叠**
+        口径下的召回被**~1 px 的笔画宽度差**压住——亮漆真值 0.894 精确 vs 0.920
+        ≤1px、0.932 ≤2px；暗漆 0.699 / 0.849 / 0.901。即在白漆门之后，+1 px 膨胀
+        把召回 0.607→0.789、精度 0.829→0.617，**IoU 基本不变**（0.539→0.530）。
+
+        **只在白漆门（外观门）之后安全**：v7 默认（无外观门）下膨胀会把路外假阳性
+        一起放大——实测 IoU 0.214→0.110（有害）。开关 `BEAMNG_LINE_DILATE_PX`
+        （0/1/2…，默认 0），单项优先于协议默认。
+        """
+        from beamng_autopilot.vision import line_scope
+        k = int(line_scope.dilate_px())
+        if k <= 0:
+            return line
+        import cv2
+        m = np.asarray(line, dtype=bool)
+        if not m.any():
+            return m
+        return cv2.dilate(m.astype(np.uint8),
+                          np.ones((2 * k + 1, 2 * k + 1), np.uint8)).astype(bool)
 
     def _appearance_gate_line(self, line, frame_rgb):
         """掩码侧**外观门**（单因子开关，默认关）：标线像素必须像漆。

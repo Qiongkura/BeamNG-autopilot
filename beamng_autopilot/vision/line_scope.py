@@ -53,6 +53,22 @@ def lat_max_m() -> float:
     return LAT_MAX_M_V8 if protocol() == "v8" else 0.0
 
 
+def dilate_px() -> int:
+    """掩码膨胀半径（px）。默认 0 = 关。
+
+    **不属于 v8 定义**（v8 三项不含膨胀）：它只在白漆门之后安全，属独立候选
+    单因子（实测见 `Segmenter._dilate_line`）；因此这里只读单项 env，
+    不跟 `BEAMNG_PROTOCOL` 联动——协议默认变了也不会悄悄打开它。
+    """
+    raw = os.environ.get("BEAMNG_LINE_DILATE_PX")
+    if raw is None or str(raw).strip() == "":
+        return 0
+    try:
+        return max(0, int(float(raw)))
+    except ValueError:
+        return 0
+
+
 def merge_final_enabled() -> bool:
     """v7 同侧近邻合并是否**补齐**到最终候选集。"""
     return _flag("BEAMNG_LINE_MERGE_FINAL", True)

@@ -787,3 +787,31 @@ def test_lateral_scope_honours_protocol_switch(monkeypatch):
     out, info = scope_lateral_candidates([mk(5.0), mk(6.0)],
                                          pos=(0.0, 0.0, 0.0), heading=0.0)
     assert len(out) == 1 and info["dropped"] == 1 and info["max_lat_m"] == 5.5
+
+def test_dilate_line_stage(monkeypatch):
+    """掩码膨胀阶段（默认 0 = 关）：只增不减、半径受 env 控制、非正值/坏值不崩。
+
+    实测依据：白漆门之后 +1 px 膨胀把召回 0.607→0.789、IoU 基本不变；
+    但 v7 默认（无外观门）下膨胀有害（IoU 0.214→0.110）——所以它**不跟
+    协议开关联动**，只读单项 env，协议默认变化不会悄悄打开它。
+    """
+    import numpy as np
+    from beamng_autopilot.vision import line_scope
+    from beamng_autopilot.vision.segmentation import Segmenter
+
+    seg = Segmenter.__new__(Segmenter)
+    line = np.zeros((7, 7), bool)
+    line[3, 3] = True
+    monkeypatch.delenv("BEAMNG_LINE_DILATE_PX", raising=False)
+    assert line_scope.dilate_px() == 0
+    assert int(seg._dilate_line(line).sum()) == 1, "默认关必须原样"
+    monkeypatch.setenv("BEAMNG_LINE_DILATE_PX", "1")
+    out = seg._dilate_line(line)
+    assert int(out.sum()) == 9, "1 px 膨胀应把单像素扩成 3x3"
+    assert out[3, 3] and out[2, 2], "只增不减（原像素保留）"
+    monkeypatch.setenv("BEAMNG_LINE_DILATE_PX", "bad")
+    assert line_scope.dilate_px() == 0, "坏值按关处理，不崩"
+    # 协议开关不会打开膨胀（v8 三项不含它）
+    monkeypatch.setenv("BEAMNG_PROTOCOL", "v8")
+    monkeypatch.delenv("BEAMNG_LINE_DILATE_PX", raising=False)
+    assert line_scope.dilate_px() == 0, "v8 不应默认开膨胀"
