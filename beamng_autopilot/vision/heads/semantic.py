@@ -409,7 +409,8 @@ class SemanticHead:
         # 发生在那之后——最终候选集里仍剩 36 对同侧 |Δlat| < 1.0 m 的重复
         # （半径 1.0 本就该并掉）。开关 BEAMNG_LINE_MERGE_FINAL=1 时在最终集合上
         # 再跑一次同一个合并（同一半径、同一参考无关规则），默认 "0" = 现行为。
-        if _os.environ.get("BEAMNG_LINE_MERGE_FINAL", "0") == "1" and markings:
+        from .. import line_scope
+        if line_scope.merge_final_enabled() and markings:
             try:
                 from ..segmentation import merge_close_candidates
                 _dbg: dict = {}
