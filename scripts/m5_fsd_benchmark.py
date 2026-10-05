@@ -225,6 +225,28 @@ def write_manifest(out_dir: Path, ts: int, names: list[str], base: dict,
         "seg_model": base.get("seg_model"),
         "line_seg_model": base.get("line_seg_model"),
     }
+    # 上面的 base 是**CLI 值**；场景注册表会在 scenario_args() 里覆盖 lane_mode/
+    # strict/goal/seg_model（town 的"铁律"就写在那里）。只记 base 会让 manifest
+    # 与实跑不符（2026-10-06 实测：验收轮 manifest 写 lane_mode=map/strict=false，
+    # 实际跑的是 sensor+strict+注册表 goal）——验收记录必须能自证配置。
+    try:
+        _eff: dict = {}
+        for n in names:
+            ns = vars(scenario_args(n, base, Path("_effective")))
+            _eff[n] = {k: ns.get(k) for k in (
+                "lane_mode", "strict", "goal", "seg_model", "line_seg_model",
+                "runtime", "attach", "traffic", "no_signal", "corridor_lane",
+                "no_e2e", "no_bc", "no_dqn", "seconds", "speed")}
+        run["effective"] = _eff
+    except Exception as exc:                    # pragma: no cover - never fatal
+        run["effective"] = {"error": f"{type(exc).__name__}: {exc}"}
+    try:
+        from beamng_autopilot.experiments.protocol import (
+            active_protocol_version,
+        )
+        run["protocol"] = active_protocol_version()
+    except Exception:                       # pragma: no cover - import guard
+        run["protocol"] = None
     # Tech version: the connector exposes no version API, so the install
     # path is the only place it is written down.  A run from another Tech
     # build is a different experiment and nothing said which build it was.
