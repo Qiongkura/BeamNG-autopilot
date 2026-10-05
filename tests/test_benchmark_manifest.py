@@ -187,3 +187,20 @@ def test_manifest_records_the_tech_build(tmp_path):
         tmp_path, 16, ["town"], {},
         env={"BEAMNG_TECH_HOME": r"G:\BeamNG.tech.v0.38.5.0"}, procs=[])
     assert man["tech"]["version"] == "v0.38.5.0"
+
+
+def test_manifest_records_the_effective_scenario_policy(tmp_path):
+    """manifest 不能只记 CLI base：场景注册表会覆盖 lane_mode/strict/goal/seg_model。
+
+    2026-10-06 实测：验收轮 manifest 写 `lane_mode=map`/`strict=false`，而 town 实际
+    跑的是注册表的 **sensor + strict + 固定 goal**（"铁律"就固化在注册表里）。
+    验收记录必须能自证"跑的是哪套配置"，否则"同一配置"只是假设。
+    """
+    mod = _mod()
+    man = mod.write_manifest(tmp_path, 99, ["town"], {}, env={}, procs=[])
+    eff = man["run"]["effective"]["town"]
+    assert eff["lane_mode"] == "sensor", "注册表覆盖必须记下来"
+    assert eff["strict"] is True
+    assert eff["goal"] == list(mod.SCENARIOS["town"]["goal"])
+    assert eff["seg_model"] == mod.SCENARIOS["town"]["seg_model"]
+    assert man["run"]["protocol"], "生效协议版本要进 manifest"

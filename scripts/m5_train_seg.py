@@ -824,6 +824,29 @@ def _augment(frame, rng: np.random.Generator,
     return colour, label
 
 
+def refuse_silent_overwrite(out_dir, *, resume: bool,
+                            overwrite: bool) -> None:
+    """拒绝把新训练写进已有臂产物的目录（防静默覆盖，纯函数，可单测）。
+
+    2026-10-05 事故：启动器 bug（``--out`` 字符串替换没命中记录里的双反斜杠
+    形式）让 β=0.8 的新臂直接写进了 base6x 的 seed42 目录，覆盖了
+    ``checkpoint_last.pt``/``best.pt``/``epoch_*``/``train_hist.json``。该臂的
+    判定文件里记的 sha 因此对不上——只能重跑同一条确定性命令恢复（指标逐项
+    复现，文件 sha 不可复现）。这里把"静默覆盖"变成**硬失败**：
+    目录里已有 ``checkpoint_last.pt``/``best.pt`` 时必须显式 ``--overwrite-out``
+    （``--resume`` 续训不算覆盖，放行）。
+    """
+    from pathlib import Path as _P
+    d = _P(out_dir)
+    existing = [n for n in ("checkpoint_last.pt", "best.pt")
+                if (d / n).is_file()]
+    if existing and not overwrite and not resume:
+        raise SystemExit(
+            f"[train] 拒绝写入：{d} 已有 {existing}（旧臂产物）。"
+            f"要覆盖请显式 --overwrite-out；续训请用 --resume。"
+            f"这条保护来自 2026-10-05 的静默覆盖事故。")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="分割训练")
     ap.add_argument("--runs", nargs="+", required=True,
@@ -929,6 +952,9 @@ def main() -> None:
     ap.add_argument("--init", default=None, metavar="CHECKPOINT",
                     help="只加载模型权重作为初始化；优化器/学习率/epoch 从头开始")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--overwrite-out", action="store_true",
+                    help="允许写入已有 checkpoint_last.pt/best.pt 的目录"
+                         "（默认拒绝，防静默覆盖旧臂产物）")
     # --- T14 实验台账（全部可选：不传时行为与以前完全一致）--------------
     ap.add_argument("--dataset-id", default="", metavar="ID",
                     help="数据版本 id（由 experiments.manifest 生成），写进 "
@@ -1524,6 +1550,15 @@ def main() -> None:
                 correct / max(1, n_pix), ious, present, int(steps))
 
     out_dir = Path(args.out)
+    # **产物保护**（2026-10-05 实测事故）：一次启动器 bug（--out 字符串替换没命中
+    # 记录里的双反斜杠形式）让新臂直接写进了旧臂目录，覆盖了 seed42 的
+    # checkpoint_last.pt/best.pt/epoch_*/train_hist（该臂的判定文件 sha 因此对不上，
+    # 只能重跑同一确定性命令恢复、指标逐项复现但文件 sha 不可复现）。
+    # 这里把"静默覆盖既有臂产物"变成**硬失败**：目录里已有 checkpoint_last.pt
+    # 或 best.pt 时必须显式 --overwrite-out（--resume 续训不受影响）。
+    refuse_silent_overwrite(out_dir, resume=bool(args.resume),
+                            overwrite=bool(getattr(args, "overwrite_out",
+                                                   False)))
     out_dir.mkdir(parents=True, exist_ok=True)
     start_ep = 0
     best_miou = -1.0
