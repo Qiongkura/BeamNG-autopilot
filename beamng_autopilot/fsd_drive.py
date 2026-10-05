@@ -4967,6 +4967,11 @@ class FSDriveSession:
                         round(float(verd.path_hold_age_s), 2)
                         if getattr(verd, "path_hold_age_s", None) is not None
                         else None),
+                    # 无路径 tick 上"为什么没复用有界 hold"（诊断）：
+                    # 2026-10-06 验收轮 24 次 offer 只复用 2 次，遥测里
+                    # 没有任何字段能说明其余被哪一条有界复检挡住。
+                    "hold_refuse_reason": str(
+                        getattr(verd, "hold_refuse_reason", "") or ""),
                     "body_cross_current": int(bool(
                         getattr(verd, "body_cross_current", False))),
                     "body_cross_planned": int(bool(
