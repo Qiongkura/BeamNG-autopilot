@@ -318,3 +318,54 @@ class TestJointConditionsStayOutOfTheWindow:
                        sigma_theta_rad=0.02, speed_mps=3.0, latency_s=0.35,
                        a_min_mps2=2.5)
         assert a.satisfied is True
+
+
+# ---------------------------------------------------------------------------
+# Hold-refusal diagnostics (2026-10-06): "offered N times, reused M" needs
+# an attributable reason, not a guess.
+# ---------------------------------------------------------------------------
+
+def test_request_reports_why_it_refused() -> None:
+    hold = PathHold()
+    why: list = []
+    # nothing offered at all
+    assert hold.request((0.0, 0.0), _T0, refuse_out=why) is None
+    assert why and "no hold offered" in why[-1]
+    hold.offer(_straight(), 0.0, 5.0, now_s=_T0)
+    # expired past the horizon
+    why.clear()
+    assert hold.request((0.0, 0.0), _T0 + FSD_PATH_HOLD_MAX_S + 0.1,
+                        refuse_out=why) is None
+    assert "expired" in why[-1]
+    # ego drifted off the held path
+    hold.offer(_straight(), 0.0, 5.0, now_s=_T0)
+    why.clear()
+    assert hold.request((0.0, 3.0), _T0 + 0.1, refuse_out=why) is None
+    assert "drifted" in why[-1]
+    # spent path (ego near its end)
+    hold2 = PathHold()
+    hold2.offer(np.column_stack([np.linspace(0, 10, 21), np.zeros(21)]),
+                0.0, 5.0, now_s=_T0)
+    why.clear()
+    assert hold2.request((9.5, 0.0), _T0 + 0.1, refuse_out=why) is None
+    assert "ahead" in why[-1]
+
+
+def test_serve_hold_records_the_scene_recheck_that_refused() -> None:
+    """A served hold is re-checked on the current scene; the refusal reason
+    must reach the verdict so the drive can record it (2026-10-06: 481
+    no-path frames had path_hold_active=0 and nothing said why)."""
+    from beamng_autopilot.safety_monitor import SafetyMonitor
+    mon = SafetyMonitor(max_speed=6.0)
+    mon.offer_verified_path(_straight(), 0.0, 5.0, now_s=_T0, strict=True)
+    # current body across the boundary -> refuse, with a reason
+    left = np.array([[0.0, 0.5], [30.0, 0.5]])
+    v = mon.evaluate(_scene(left=left, pos=(5.0, 0.4)), None, now_s=_T0 + 0.1)
+    assert v.level == "minimal_risk"
+    assert v.path_hold_active is False
+    assert v.hold_refuse_reason, "拒绝必须带原因"
+    assert "body" in v.hold_refuse_reason
+    # a served hold carries no refusal reason
+    v2 = mon.evaluate(_scene(), None, now_s=_T0 + 0.1)
+    assert v2.path_hold_active is True
+    assert v2.hold_refuse_reason == ""
