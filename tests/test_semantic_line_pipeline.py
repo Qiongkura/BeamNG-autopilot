@@ -688,3 +688,47 @@ def test_head_final_candidate_scope_call_sites():
     seg = (_P(__file__).resolve().parents[1] / "beamng_autopilot" / "vision"
            / "segmentation.py").read_text(encoding="utf-8")
     assert 'BEAMNG_LINE_LAT_MAX_M", ""' in seg, "横向门 env 默认必须是空（关）"
+
+def test_paint_like_mask_and_appearance_gate(monkeypatch):
+    """外观判据：白/暖白/黄像漆，灰/彩色不像；形状错抛错（不静默全 False）。
+
+    掩码门是**单调**的：`line & 像漆` 只删不加；env 默认关（掩码口径属冻结
+    范围）。实测依据见 `docs/T16_NEXT_FACTOR_FAR_OFFROAD_PROPOSAL_20261004.md` §9。
+    """
+    import numpy as np
+    from beamng_autopilot.vision.paint_appearance import paint_like_mask
+    from beamng_autopilot.vision.segmentation import Segmenter
+
+    rgb = np.zeros((3, 4, 3), np.uint8)
+    rgb[0, 0] = (230, 232, 228)      # 白漆：亮、无彩
+    rgb[0, 1] = (200, 180, 150)      # 暖白：r-b = 50
+    rgb[0, 2] = (200, 190, 60)       # 黄漆
+    rgb[1, 0] = (120, 120, 120)      # 中灰（沥青/阴影边界）不像漆
+    rgb[1, 1] = (150, 60, 40)        # 橙棕不像漆
+    rgb[1, 2] = (100, 180, 60)       # 饱和绿（植被）不像漆：r < 135 且不亮
+    m = paint_like_mask(rgb)
+    assert m[0, 0] and m[0, 1] and m[0, 2]
+    assert not m[1, 0] and not m[1, 1] and not m[1, 2]
+    # 已知的**宽松**处（实测记录，别当 bug 修）：黄绿植被 (200,240,60) 会命中
+    # 黄漆规则——这正是"外观判据不能当真值判据"的原因（负例上 13k–68k px）。
+    # 作门用没问题（单调过滤，只是不删这些像素）。
+    yg = np.zeros((1, 1, 3), np.uint8)
+    yg[0, 0] = (200, 240, 60)
+    assert paint_like_mask(yg)[0, 0], "黄绿命中黄漆规则：文档化的宽松边界"
+    try:
+        paint_like_mask(np.zeros((3, 4), np.uint8))
+        raise AssertionError("形状不对必须抛错")
+    except ValueError:
+        pass
+    # 门：默认关 -> 原样；开着 -> 只删不加
+    seg = Segmenter.__new__(Segmenter)
+    line = np.zeros((3, 4), bool)
+    line[0, 0] = line[1, 0] = True    # 一个像漆、一个不像
+    monkeypatch.delenv("BEAMNG_LINE_APPEARANCE_GATE", raising=False)
+    out = seg._appearance_gate_line(line, rgb)
+    assert int(out.sum()) == 2, "默认关必须原样返回"
+    monkeypatch.setenv("BEAMNG_LINE_APPEARANCE_GATE", "1")
+    out = seg._appearance_gate_line(line, rgb)
+    assert out[0, 0] and not out[1, 0], "开了只保留像漆的像素"
+    assert int(out.sum()) == 1
+    assert not seg._appearance_gate_line(line, rgb)[1, 0], "只删不加（单调）"

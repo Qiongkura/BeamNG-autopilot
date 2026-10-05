@@ -782,7 +782,31 @@ class Segmenter:
             _kw["ksize"] = self.line_road_ksize
         line = constrain_line_to_road(line, road, **_kw)
         line = filter_line_shape(line)
+        line = self._appearance_gate_line(line, frame_rgb)
         return road, line
+
+    def _appearance_gate_line(self, line, frame_rgb):
+        """掩码侧**外观门**（单因子开关，默认关）：标线像素必须像漆。
+
+        为什么（2026-10-04 实测，R3-b + dev）：剩余未过的门是**像素精度**
+        （0.38–0.44，门 0.40），而它来自**路面上的**假阳性（阴影边界/接缝/亮
+        铺装）：90.8% 的线块完全落在膨胀路面内（阈值窗口只占 0.3%），所以
+        `line_road_*` 旋钮结构性无效。外观门是**单调过滤**（`line & 像漆`，
+        只删不加）→ 精度与负例假阳性只可能改善，代价只在召回。
+
+        实测（seed 42，离线扫描）：R3-b P 0.138→0.557、R 0.807→0.769；
+        dev P 0.111→0.755、R 0.793→0.600。
+
+        阈值只一份（`vision.paint_appearance`）。默认关：`BEAMNG_LINE_APPEARANCE_GATE=1`
+        才启用（掩码口径属冻结范围，改默认要走协议新版本）。
+        """
+        if os.environ.get("BEAMNG_LINE_APPEARANCE_GATE", "0") != "1":
+            return line
+        m = np.asarray(line, dtype=bool)
+        if not m.any():
+            return m
+        from beamng_autopilot.vision.paint_appearance import paint_like_mask
+        return m & paint_like_mask(frame_rgb)
 
     # ------------------------------------------------------------------
     # The post-processing STAGES as named functions (review handoff P0-3).
