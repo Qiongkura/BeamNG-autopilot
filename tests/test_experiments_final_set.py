@@ -231,3 +231,40 @@ def test_the_confirmation_record_carries_the_same_counting_contract() -> None:
     bare = confirmation_results({"line_recall": 0.5}, model_path="m.pt",
                                 model_sha16="x")
     assert "counts" not in bare["overall"]
+
+
+def test_confirm_refuses_a_dataset_that_is_not_the_sealed_one(tmp_path):
+    """确认前必须核对"要评估的帧 == 封存帧"：确认是一次性的，拿另一批帧去确认
+    会让记录引用封存 digest 却评估了别的东西（记录对不上不算确认），所以要在
+    **消费之前**拦住（连访问都不登记）。
+    """
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "m5_final_set_mod", ROOT / "scripts" / "m5_final_set.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+
+    seal(_frames(tmp_path), name="final1", dataset_id="ds-1",
+         protocol_hash="ph-1", out_dir=tmp_path / "seal", sealed_by="pytest")
+    ok = mod._sealed_vs_dataset(tmp_path / "seal", [tmp_path / "final" / "front_main"])
+    assert ok["ok"] is True and ok["n_sealed"] == ok["n_dataset"] == 3
+
+    # 另一批帧（少一帧）→ 不 ok，且给出差集
+    other = tmp_path / "other" / "front_main"
+    other.mkdir(parents=True)
+    for i in range(2):
+        (other / f"frame_{i:05d}.npz").write_bytes(b"frame-%d" % i)
+    bad = mod._sealed_vs_dataset(tmp_path / "seal", [other])
+    assert bad["ok"] is False and bad["extra"] and bad["n_dataset"] == 2
+
+    # 内容被改过（同路径不同字节）→ 不 ok（逐帧 sha16 比对）
+    changed = tmp_path / "final" / "front_main" / "frame_00000.npz"
+    changed.write_bytes(b"tampered")
+    tampered = mod._sealed_vs_dataset(tmp_path / "seal",
+                                      [tmp_path / "final" / "front_main"])
+    assert tampered["ok"] is False and tampered["changed"]
+
+    # 未封存目录 → 不 ok（没有封存就没有最终集）
+    assert mod._sealed_vs_dataset(tmp_path / "nope",
+                                  [tmp_path / "final" / "front_main"])["ok"] is False

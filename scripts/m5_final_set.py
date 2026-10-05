@@ -1,4 +1,4 @@
-"""最终确认程序：封存最终集、登记访问（方案 §7/§10.3）。
+r"""最终确认程序：封存最终集、登记访问（方案 §7/§10.3）。
 
 只有本程序（`purpose=final_confirm`）被允许读最终集；搜索/训练入口读到带封存文件的
 目录会**拒训**（见 `m5_seg_autoloop._rounds_audit` 的 final-set 检查）。
@@ -113,13 +113,57 @@ def main(argv=None) -> int:
     return 0 if got["allowed"] else 3
 
 
+def _sealed_vs_dataset(seal_dir, dataset) -> dict:
+    """要评估的帧 vs 封存帧（按解析后路径比集合，再比逐帧 sha16）。
+
+    确认是**一次性**的：如果拿另一批帧去确认，记录却引用封存 digest，这份
+    确认就是"对不上"的（本项目纪律：记录对不上不算确认）。所以**先核对、后消费**。
+    """
+    from beamng_autopilot.experiments.final_set import frame_digests
+
+    rec = read_seal(seal_dir) or {}
+    sealed = {str(k): v for k, v in (rec.get("digests") or {}).items()}
+
+    def _abs(p: str) -> str:
+        q = Path(p)
+        if not q.is_absolute():
+            q = ROOT / q
+        try:
+            return str(q.resolve())
+        except OSError:                                    # pragma: no cover
+            return str(q)
+
+    sealed_abs = {_abs(k): k for k in sealed}
+    want = sorted(str(p) for r in dataset
+                  for p in Path(r).glob("frame_*.npz"))
+    want_abs = {_abs(p): p for p in want}
+    missing = sorted(set(sealed_abs) - set(want_abs))
+    extra = sorted(set(want_abs) - set(sealed_abs))
+    changed = []
+    if not missing and not extra:
+        now = frame_digests([Path(p) for p in want])
+        changed = sorted(k for k in sealed
+                         if now.get(want_abs[_abs(k)]) != sealed[k])
+    return {"n_sealed": len(sealed), "n_dataset": len(want),
+            "missing": missing[:10], "extra": extra[:10],
+            "changed": changed[:10],
+            "ok": bool(sealed) and not missing and not extra and not changed}
+
+
 def _cmd_confirm(args) -> int:
-    """访问（一次即消费）-> 在最终集上评估 -> 写确认记录。
+    """核对数据集 -> 访问（一次即消费）-> 在最终集上评估 -> 写确认记录。
 
     访问被拒时**不评估**（没被放行就不该读数据），rc=3；被拒也会留痕。
+    数据集与封存帧不一致时**连访问都不登记**（没核对上就不该消费）。
     记录里写清"测了哪些口径"，没测的（候选身份/左右角色探针）留 UNKNOWN
     并写进 notes——最终确认不允许拿一部分口径冒充整套（方案 §10.1）。
     """
+    pre = _sealed_vs_dataset(args.out, args.dataset)
+    if not pre["ok"]:
+        print(f"[final-set] 数据集与封存帧不一致（封存 {pre['n_sealed']} / "
+              f"数据 {pre['n_dataset']}）：缺 {pre['missing']} 多 {pre['extra']} "
+              f"改动 {pre['changed']} -> **不登记访问、不消费、不评估**")
+        return 3
     ph = args.protocol_hash or protocol_hash()
     got = access(args.out, protocol_hash=ph, candidate_id=args.candidate_id,
                  caller=args.caller, purpose=args.purpose,
