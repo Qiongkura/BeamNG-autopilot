@@ -452,8 +452,27 @@ def test_exported_meta_carries_road_identity():
     src = (_P(__file__).resolve().parents[1] / "scripts"
            / "m5_auto_truth_export.py").read_text(encoding="utf-8")
     # 正例包从 rec 取；负例包没有 rec -> 走可选参数 site，由 main 传 rec["scene"]
-    assert '"road_id": ((rec.get("scene") or {}).get("road_id"))' in src
-    assert '"road_id": ((site or {}).get("road_id"))' in src
+    assert '_scene_block(rec).get("road_id")' in src
+    # rec["scene"] 是字符串的批次不能崩（实测崩过 6 个场景）
+    assert "def _scene_block(rec) -> dict:" in src
+    assert "isinstance(sc, dict)" in src
+    assert 'site.get("road_id") if isinstance(site, dict) else None' in src
     assert 'site=(rec.get("scene") or {})' in src, "main 必须把路段身份传给负例导出"
     assert '"station_m"' in src and '"mid"' in src
     assert "site: dict | None = None" in src, "负例导出的 site 必须是可选参数（老调用不受影响）"
+
+def test_scene_block_tolerates_string_scene_field():
+    """``rec["scene"]`` 是字符串时按空处理（不崩）——实测 6 个场景因此被隔离过。"""
+    import importlib.util
+    from pathlib import Path as _P
+    root = _P(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_ate_block", root / "scripts" / "m5_auto_truth_export.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["m5_ate_block"] = m
+    spec.loader.exec_module(m)
+    assert m._scene_block({"scene": {"road_id": "1.0"}}) == {"road_id": "1.0"}
+    assert m._scene_block({"scene": "known_line_a0s0"}) == {}
+    assert m._scene_block({"scene": None}) == {}
+    assert m._scene_block({}) == {}
+    assert m._scene_block(None) == {}
