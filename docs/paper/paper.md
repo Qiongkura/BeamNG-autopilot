@@ -1,5 +1,5 @@
 ---
-title: "Zero-Manual-Annotation Lane Perception for Automated Driving: Engine-Derived Ground Truth, an Explicit Counting Contract, and Pre-Registered Single-Factor Evaluation"
+title: "Lane Perception for Automated Driving with Human-Anchored, Engine-Certified Ground Truth: An Explicit Counting Contract and Pre-Registered Single-Factor Evaluation"
 authors: "Anonymous Author(s)"
 affiliation: "Affiliation withheld for review"
 journal: "IEEE Transactions on Intelligent Transportation Systems (submission format)"
@@ -9,9 +9,11 @@ journal: "IEEE Transactions on Intelligent Transportation Systems (submission fo
 
 Lane perception for automated driving is bottlenecked by two problems that are usually conflated:
 the cost of pixel-accurate manual annotation, and the absence of an agreed definition of what a
-"lane line" is. We present a closed-loop research programme that attacks both. First, ground truth
-is derived entirely from the simulator's own rendering and physics state, and admitted only through
-four explicit certification gates; the manual annotation budget is zero by construction. Second, we
+"lane line" is. We present a closed-loop research programme that attacks both. First, every label carries an explicit provenance credential on a three-level ladder -- human frame-by-frame
+revision, per-frame agent review, or engine-derived truth admitted through four certification gates -- so no claim has to
+guess what truth it rests on. The evaluation packs and the 75-frame training anchor are human-revised; the
+machine-generated increment that the ablations vary is engine-certified, and the rounds reported here added no new manual
+annotation. Second, we
 make the evaluation definition explicit and versioned: a *counting contract* gives every ratio an
 explicit numerator and denominator, and a *protocol* fixes the geometric scope of a line candidate
 (lateral extent, same-side merging, paint-appearance). We then evaluate one segmentation arm
@@ -50,16 +52,16 @@ This paper reports a research programme built around those two obstacles. It is 
 architecture; it is an attempt to make the *data* and the *evaluation* rigorous enough that
 architectural progress can be measured. The programme has three components.
 
-**Engine-derived ground truth.** The perception stack is developed inside a commercial vehicle
-simulator whose renderer exposes both images and the semantic and geometric state that produced
-them. We derive lane ground truth from that state (paint material and geometry), never from human
-strokes, and we admit a frame only if it passes four explicit certification gates: a credential
+**Credentialed truth provenance.** Every label in this programme carries a provenance credential, and the credential is
+enforced rather than declared: a command-line claim cannot promote a label (Section III-B). The ladder has three rungs --
+human frame-by-frame revision, per-frame agent review, and engine-derived truth -- and the engine rung is admitted only
+through four explicit certification gates: a credential
 gate (the label source must be declared and verifiable), a paint-appearance gate (the pixels claimed
 as line must look like paint in the image), a road-type gate (the frame must carry the road-type
 column that makes pavement decidable), and a negative-evidence gate (frames claimed to contain no
-line must show evidence of their own, not merely the absence of a label). The manual annotation
-budget of the entire programme is zero by construction; this is a design constraint, not an
-achievement, and Section VII is explicit about what it costs us.
+line must show evidence of their own, not merely the absence of a label). The rounds reported here add no new manual annotation: the experimental variable is the composition of the
+engine-certified increment on top of the human-revised anchor, and Section VII states what the anchor's small size costs
+us.
 
 **An explicit counting contract.** Every reported ratio is defined by a counting contract that names
 its numerator and denominator over an explicit set chain: frames with candidates, extracted
@@ -86,8 +88,9 @@ record the rule's defect rather than reinterpreting the result; one such defect 
 that are frame *counts* and therefore scale with how far the car travelled — is analysed in
 Section V-F and quantified in {@fig:scaling}.
 
-**Contributions.** (1) A zero-manual-annotation, gate-certified ground-truth pipeline for lane
-perception, with its costs stated. (2) The counting contract, and the demonstration that the two
+**Contributions.** (1) A credentialed truth-provenance ladder (human revision / agent review / engine-certified) with enforcement, plus a
+certification-gated engine pipeline for the machine-generated increment; the composition of every pool is stated
+explicitly, and the reported rounds add no new manual annotation. (2) The counting contract, and the demonstration that the two
 natural readings of "line" fail different gates on the same data — a definitional disagreement worth
 30% of annotated pixels. (3) A protocol/version/hash mechanism that binds a held-out set to the
 definition under which it is read. (4) A one-shot, road-disjoint confirmation with an explicit
@@ -150,11 +153,14 @@ rate discussed in Section V-E.
 
 ![Candidate-scope pipeline (schematic) with the measured revocation rate.](fig31_pipeline.png){#fig:pipeline}
 
-## B. Engine-derived ground truth and its certification gates
+## B. Truth provenance, credentials, and certification gates
 
-Ground truth is produced by exporting, for each collected frame, the engine's own line geometry
-projected into the camera, together with a credential that names the label source and a content hash.
-A frame is admitted only when: (i) the credential is present and parseable, and the label source is
+The programme distinguishes three rungs of truth and records the rung with every label: **human revision** (a human
+annotates or corrects the line labels frame by frame), **agent revision** (a per-frame agent review of engine output), and
+**engine-certified** truth (the engine's own line geometry projected into the camera). Two pools are human-revised: the
+training anchor (5 directories, 75 frames) and the development/evaluation packs (9 packages, 117 frames), which is why the
+acceptance results of Section V-A are measured against human annotation. The machine-generated increment that the ablations
+vary is engine-certified; it is admitted only when: (i) the credential is present and parseable, and the label source is
 declared (frames whose provenance cannot be named are excluded rather than guessed); (ii) the pixels
 claimed as line satisfy a paint-appearance predicate — white paint requires high value, low chroma
 and a red/blue balance; yellow paint requires a hue ratio band; the predicate is a single-source
@@ -232,9 +238,11 @@ background structure (24 frames per arm). Neither shares frames with training po
 road-disjoint set of 200 frames (96 line-bearing) is sealed for the one-shot confirmation of
 Section V-D.
 
-**Arms.** All segmentation arms share one initialisation, one budget and one recipe; they differ only
-in training-pool composition (the dose arms) or in a single post-processing factor (protocol
-components). Six seeds are used for acceptance; composition arms are reported with their seed counts.
+**Arms.** All segmentation arms share one initialisation, one budget and one recipe; they differ only in training-pool
+composition (the dose arms) or in a single post-processing factor (protocol components). Composition is explicit: a
+human-revised anchor of 5 directories (75 frames) plus a varying number of engine-certified packages (2 paired-line
+packages of 16 frames and 12 certified negative packages of 96 frames in the reported base), with the negative dose as the
+varied axis. Six seeds are used for acceptance; composition arms are reported with their seed counts.
 
 **Metrics and gates.** The frozen gates are coverage $\ge 0.80$, identity $\ge 0.60$, precision
 $\ge 0.40$, recall $\ge 0.70$ and role agreement $\ge 0.70$; recall is read in the paint scope for
@@ -328,8 +336,10 @@ region. {@fig:confirm} shows the confirmation. Two properties of this result des
 **not** reproduce the acceptance numbers of Section V-A: the independent set is harder and its group
 composition differs (104 of 200 frames come from certified line-free packages), so the delivered
 candidate's claim is bounded by the numbers reported here rather than by the acceptance table.
-Second, the confirmation records that the instance-level probes (identity, role, reference coverage)
-were **not** run on this set; they are UNKNOWN and are not reported as confirmed.
+Second, the confirmation records that the instance-level probes (identity, role, reference coverage) were **not** run on
+this set; they are UNKNOWN and are not reported as confirmed. Third, and relevant to the gap with Section V-A, the sealed
+set's truth is **engine-certified** while the acceptance sets are **human-revised**: the two numbers are measured against
+different truth rungs, not only different data.
 
 ![One-shot final confirmation on the sealed road-disjoint set: per-group metrics (a) and negative-side diagnostics (b).](fig4_final_confirm.png){#fig:confirm}
 
@@ -424,9 +434,11 @@ rule defect as a methodological result rather than editing them.
 # VI. Discussion
 
 **What generalises.** Four artefacts from this programme seem reusable beyond the specific stack.
-(i) The **counting contract**: reporting every ratio with its denominator, and keeping frame-level and
-instance-level sets separate, removed an entire class of "good number, empty pool" errors and made
-per-scene failures visible instead of averaged away. (ii) **Protocol versioning with a hash bound to
+(i) The **provenance ladder with enforced credentials**: naming the truth rung of every label, and refusing to let a
+command-line string promote one, made "which truth is this number measured against" an answerable question; (ii) the
+**counting contract**: reporting every ratio with its denominator, and keeping frame-level and instance-level sets
+separate, removed an entire class of "good number, empty pool" errors and made per-scene failures visible instead of
+averaged away. (ii) **Protocol versioning with a hash bound to
 the sealed set**: the mechanism is cheap and it caught a real mislabelling defect; without it, an
 evaluation produced under one definition would have been attributed to another. (iii) **Appearance
 certification of generated labels**: requiring that a claimed line be recoverable from the image
@@ -453,11 +465,11 @@ the programme.
 
 # VII. Limitations and Threats to Validity
 
-**No human ground truth.** By design the programme uses zero manual annotation. The cost is that we
-cannot report agreement with human labels, and the definitional claims rest on our own certified
-truth and on the appearance analysis of Section V-B rather than on an adjudicated reference. A
-human-labelled validation subset would strengthen the definitional argument and is left to future
-work.
+**A small human anchor.** The human-revised anchor is small (75 training frames) and the human-revised evaluation packs
+cover 9 packages (117 frames), so scene diversity is limited; the sealed one-shot set is engine-certified rather than
+human-revised, so its numbers are not directly comparable to the human-revised acceptance numbers. A larger human-revised
+held-out set would strengthen the definitional argument and is left to future work. The programme deliberately added **no
+new manual annotation** during the reported rounds, which bounds both the cost and the coverage.
 
 **Single simulator, single map link.** All perception data come from one simulator and, for the
 driving results, one town link. The definitional gap and the deadlock mechanism are measured on that
@@ -483,9 +495,9 @@ were fixed before the runs and never relaxed.
 
 # VIII. Conclusion
 
-We set out to make lane perception for automated driving measurable without manual annotation, and to
-make its evaluation honest about definitions. Engine-derived truth with four certification gates
-removed the annotation budget from the programme; a counting contract gave every reported ratio an
+We set out to make lane perception for automated driving measurable on a small, explicitly credentialed truth base,
+and to make its evaluation honest about definitions. A credentialed provenance ladder with four certification gates for its engine rung kept the machine-generated increment
+trustworthy while the human anchor stayed small and unchanged; a counting contract gave every reported ratio an
 explicit denominator; and a versioned, hash-bound protocol made the definition of "line" an artefact
 rather than an assumption. The resulting measurements are informative precisely where they are
 uncomfortable: the two natural definitions of a line each fail a different gate on the same data, and
