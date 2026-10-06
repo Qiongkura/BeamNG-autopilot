@@ -102,6 +102,7 @@ from beamng_autopilot.watchdog import (
     heartbeat as wd_heartbeat,
 )
 from beamng_autopilot.vision.lanes import (
+    PLC_ON_SENSOR_LANE,
     PaintedLineLateralCorrector,
     painted_line_correction_active,
     painted_line_direction,
@@ -2801,8 +2802,11 @@ class FSDriveSession:
                                     best = _pre_shifted
                                     out.meta["plc_pre_shift_m"] = round(
                                         float(_shift1), 3)
-                except Exception:
-                    pass
+                except Exception as _plc_pre_e:
+                    # 静默 except 曾把 NameError（开关没 import）藏了一整轮 A/B：
+                    # 记录到遥测，让"没生效"能看出来。
+                    out.meta["plc_pre_error"] = (f"{type(_plc_pre_e).__name__}: "
+                                                 f"{_plc_pre_e}")
                 _strict_perc = _strict_lane
                 scene = getattr(out, "scene", None)
                 if scene is not None:
@@ -5114,6 +5118,7 @@ class FSDriveSession:
                     "plc_active": int(_plc_active),
                     "plc_shift": round(float(_plc_shift), 3),
                     "plc_pre_shift_m": out.meta.get("plc_pre_shift_m"),
+                    "plc_pre_error": out.meta.get("plc_pre_error"),
                     "plc_desired": (round(float(_plc_desired), 3)
                                     if _plc_desired is not None else None),
                     "end_ref": _end_ref,
