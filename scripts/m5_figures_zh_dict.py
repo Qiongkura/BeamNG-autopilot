@@ -182,7 +182,7 @@ TRANS: dict[str, str] = {
     "epoch": "轮次",
     "false-positive frame rate": "假阳性帧率",
     "false-positive pixels (% of eligible)": "假阳性像素（占合格像素 %）",
-    "frames": "帧",
+    "frames": "帧数",
     "frames (12 town runs, 2443 settled frames)": "帧（12 次城镇运行，2443 个已结算帧）",
     "frames (2 baseline diagnostic runs)": "帧（2 次基线诊断运行）",
     "frames (n=512)": "帧（n=512）",
