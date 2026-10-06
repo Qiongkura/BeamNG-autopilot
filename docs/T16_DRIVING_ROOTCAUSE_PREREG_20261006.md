@@ -149,3 +149,39 @@ town ×2（注册表默认），每次 50 / 30 次 verified offer，**只复用 
 （`out.lane_ref` vs `scene.lane_ref`），跑 town ×2 收直方图后定修法。
 
 **判定规则同 §3**（硬门 4/4、安全项最大值非劣、可用率中位与范围、UNKNOWN 不释放）。
+
+## 9. F-D（选项①：修横向参考——让驾驶栈用**已交付的感知臂**，2026-10-06 新增）
+
+**为什么是这条**：三条驾驶层因子（F-A/F-B/F-C）都改不动硬门，残余阻塞点已定位为
+**路径可用率只有 35%**（805 个 settled 帧里 284 帧有路径；`plan_blocked=no_perception_lane`
+是主要 blocker）。路径可用率的上游是**感知车道可用率**（配对可用 + 未被铺装门撤销）。
+选项①"修横向参考（感知侧）"的**最直接、单因子**实现是：**驾驶栈目前用的不是本方案
+交付的感知臂**——`town` 注册表钉的是 `logs/m5_seg/seg_model_hand/best_task.pt`
+（2026-09-11 的人工标注小模型），而 T16 全流程交付的感知臂是
+`logs/experiments/t16_negdose6x_20261001/round0/seed42/checkpoint_last.pt`
+（R2 过门、一次性最终确认已消费的那个候选）。
+
+**候选不是按分数挑的**（避免在评价集上选型）：它就是本方案记录在案的**交付候选**
+（规则 = 项目默认 seed 42，按索引选，见 `docs/T16_FINAL_CONFIRM_20261006.md` §1）。
+本因子只回答一个问题：**把交付的感知臂装进驾驶栈，路径可用率与硬门会不会变好。**
+
+**单因子**：`seg_model`（town 场景），CLI 覆盖（`--seg-model`；注册表只在 CLI 未给时
+才用自己的 pin，`scenario_args` 的既有语义）。其它一切不动（相机/规划/安全阈值/协议）。
+
+| 臂 | 命令差异 |
+|---|---|
+| off（对照） | 注册表默认 pin = `logs/m5_seg/seg_model_hand/best_task.pt` |
+| on（交付臂） | 追加 `--seg-model logs/experiments/t16_negdose6x_20261001/round0/seed42/checkpoint_last.pt` |
+
+**臂分类**：从每次运行的 manifest 的 `run.effective.town.seg_model` 读（不按运行顺序）。
+
+**兼容性前置检查（已做，离线）**：两个 checkpoint 都能被驾驶栈的 `Segmenter` 加载并
+推理；在无漆线帧上交付臂输出 0 个线像素（正确），人工臂输出少量（假线）。
+
+**判定规则（同 §3，另加本因子主指标）**：
+1. 硬门 4/4 才 PASS；UNKNOWN 不释放门；
+2. 安全项取两臂最大值比较，**任一项 on 更差即否决**；
+3. **主指标（本因子）**：**路径可用率**——settled 帧中"规划器产出路径"的占比
+   （遥测口径：`lane_dev_m` 有值 = 有路径；另报 `lane_sel=="sensor"` 占比、
+   `source!="none"` 占比、`plan_blocked` 直方图）；报中位与范围；
+4. 可用率（stall_frac / travelled / goal_dist）报中位与范围。
