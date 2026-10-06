@@ -11,6 +11,7 @@ path to the right side of a solid line.
 from __future__ import annotations
 
 import math
+import os
 import time
 from dataclasses import dataclass, field
 
@@ -1207,11 +1208,20 @@ class PaintedLineLateralCorrector:
         return out
 
 
+PLC_ON_SENSOR_LANE = os.environ.get("BEAMNG_PLC_ON_SENSOR_LANE", "0") != "0"
+#: A path within this of the lane reference counts as centred (no pull).
+PLC_SENSOR_DEV_TOL_M = 0.30
+
+
 def painted_line_correction_active(
         lane_src_sel: str,
         arbiter_source: str,
         rem_end: float | None,
         end_pull_start_m: float,
+        *,
+        path_dev_m: float | None = None,
+        dev_tol_m: float = PLC_SENSOR_DEV_TOL_M,
+        on_sensor_lane: bool | None = None,
 ) -> bool:
     """Policy gate for the painted-line steady-state corrector.
 
@@ -1222,9 +1232,25 @@ def painted_line_correction_active(
     already carries its own obstacle-avoidance shape and must not get
     a superimposed centring pull).  Inside the end-zone the dedicated
     stop ray owns the steering reference, so the corrector is off.
+
+    ``lane_src_sel == "sensor"`` used to disable the pull outright, on
+    the premise "a perception reference means the path already runs on
+    it".  Measured 2026-10-06 (12 town runs, 999 sensor-lane frames):
+    the chosen path sits 0.773 m (median) off the lane centre and 62%
+    of those frames are >0.5 m off -- the premise does not hold, and
+    the pull was off exactly where it was needed (this is the same
+    0.7-1.0 m map-lane-vs-painted-lane offset PLC_MAX_SHIFT_M exists
+    for).  With ``BEAMNG_PLC_ON_SENSOR_LANE`` the pull stays enabled
+    there, but only when the deviation is MEASURED and above
+    ``dev_tol_m``: an unmeasured deviation abstains (never "fine").
     """
     if str(lane_src_sel) == "sensor":
-        return False
+        on = (PLC_ON_SENSOR_LANE if on_sensor_lane is None
+              else bool(on_sensor_lane))
+        if not on:
+            return False
+        if path_dev_m is None or float(path_dev_m) <= float(dev_tol_m):
+            return False
     if str(arbiter_source) == "rule":
         return False
     if rem_end is not None and float(rem_end) < float(end_pull_start_m):

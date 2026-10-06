@@ -160,3 +160,42 @@ def test_gate_off_inside_end_zone():
 def test_gate_active_without_route_remaining():
     assert painted_line_correction_active(
         "map", "fsd", rem_end=None, end_pull_start_m=20.0)
+
+
+def test_gate_on_sensor_lane_only_with_a_measured_offset():
+    """F-C：sensor 参考不等于"路径已在中心上"（实测 999 帧里 62% 偏差 >0.5 m）。
+
+    默认关：sensor 参考照旧不拉（对照臂行为逐字不变）。
+    打开后：**测到**偏差超容差才拉；测不到（None）弃权；已居中不拉；
+    rule 回退仍然不拉（它自带避障形状）。
+    """
+    # 默认（开关关）——与历史行为一致
+    assert not painted_line_correction_active(
+        "sensor", "fsd", rem_end=None, end_pull_start_m=20.0,
+        path_dev_m=0.9, on_sensor_lane=False)
+    # 打开 + 测到明显偏差 -> 拉
+    assert painted_line_correction_active(
+        "sensor", "fsd", rem_end=None, end_pull_start_m=20.0,
+        path_dev_m=0.9, on_sensor_lane=True)
+    # 打开但已居中 -> 不拉
+    assert not painted_line_correction_active(
+        "sensor", "fsd", rem_end=None, end_pull_start_m=20.0,
+        path_dev_m=0.1, on_sensor_lane=True)
+    # 打开但没测到 -> 弃权（UNKNOWN 不是"没问题"）
+    assert not painted_line_correction_active(
+        "sensor", "fsd", rem_end=None, end_pull_start_m=20.0,
+        path_dev_m=None, on_sensor_lane=True)
+    # 打开也不能盖过 rule 回退
+    assert not painted_line_correction_active(
+        "sensor", "rule", rem_end=None, end_pull_start_m=20.0,
+        path_dev_m=0.9, on_sensor_lane=True)
+    # 容差边界：恰好等于容差不拉，略大就拉
+    assert not painted_line_correction_active(
+        "sensor", "fsd", rem_end=None, end_pull_start_m=20.0,
+        path_dev_m=0.30, on_sensor_lane=True)
+    assert painted_line_correction_active(
+        "sensor", "fsd", rem_end=None, end_pull_start_m=20.0,
+        path_dev_m=0.31, on_sensor_lane=True)
+    # map 参考的行为不受影响
+    assert painted_line_correction_active(
+        "map", "fsd", rem_end=50.0, end_pull_start_m=20.0)
