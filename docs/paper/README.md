@@ -5,25 +5,34 @@
 | 文件 | 说明 |
 |---|---|
 | `T16_paper.pdf` | 英文版成品（11 页，双栏 IEEE 式；已按你的回答填入作者/声明/致谢，并修正了"无人工标注"的旧表述） |
-| `T16_paper_zh.pdf` | **中文版成品**（13 页，与英文版同结构、同图号顺序、同数字） |
-| `T16_supplement.pdf` | **补充材料**（4 页，16 张补充图 Fig. S1–S16 + 读数约定与已声明缺口） |
+| `T16_paper_zh.pdf` | **中文版成品**（13 页，与英文版同结构、同图号顺序、同数字，**图内文字也是中文**） |
+| `T16_supplement.pdf` | **补充材料（英文）**（4 页，16 张补充图 Fig. S1–S16 + 读数约定与已声明缺口） |
+| `T16_supplement_zh.pdf` | **补充材料（中文）**（4 页，图内文字中文，图号 图 S1–S16） |
 | `main.tex` / `main_zh.tex` / `supplement.tex` | 投稿用 LaTeX 源（IEEEtran journal；自带 `thebibliography`，单次 `pdflatex` 可编译；中文版用 `ctex`） |
 | `paper.md` | 英文主稿（唯一主源：26 张正文图、3 张表、15 条参考文献） |
 | `paper_zh.md` | 中文主稿（与英文逐段对应，图号/引文编号由脚本自动生成） |
-| `supplement.md` | 补充材料主源（16 图） |
+| `supplement.md` / `supplement_zh.md` | 补充材料主源（英文／中文，各 16 图） |
 | `references.bib` | 参考文献（你提供的 11 篇 + 8 篇经典工作；9 篇中文文献按中文题录著录，标 `[In Chinese]`） |
 | `build_paper.py` | 构建脚本：Markdown → LaTeX + 双栏 HTML（图号、表题、引文编号自动生成；`--lang zh` 出中文版） |
 | `logs/paper_build/` | 构建产物与预览（gitignored） |
 
-**重新构建（三步，无需安装 LaTeX）**
+**重新构建（四步，无需安装 LaTeX）**
 
 ```pwsh
-# 1) 三个 Markdown 源 -> LaTeX + HTML
+# 0) 中文图（图内文字中文化；英文图不动，中文图写到 logs\paper_figures_zh\）
+.venv\Scripts\python.exe scripts\m5_figures_i18n.py
+
+# 1) 四个 Markdown 源 -> LaTeX + HTML
 .venv\Scripts\python.exe docs\paper\build_paper.py
 .venv\Scripts\python.exe docs\paper\build_paper.py --md docs\paper\paper_zh.md `
-    --tex docs\paper\main_zh.tex --html logs\paper_build\paper_zh.html --lang zh
+    --tex docs\paper\main_zh.tex --html logs\paper_build\paper_zh.html --lang zh `
+    --figs logs\paper_build\figures_zh --img-dir figures_zh --figs-src logs\paper_figures_zh
 .venv\Scripts\python.exe docs\paper\build_paper.py --md docs\paper\supplement.md `
     --tex docs\paper\supplement.tex --html logs\paper_build\supplement.html --fig-prefix S
+.venv\Scripts\python.exe docs\paper\build_paper.py --md docs\paper\supplement_zh.md `
+    --tex docs\paper\supplement_zh.tex --html logs\paper_build\supplement_zh.html `
+    --lang zh --fig-prefix S --figs logs\paper_build\figures_zh `
+    --img-dir figures_zh --figs-src logs\paper_figures_zh
 
 # 2) HTML -> PDF（Edge headless）
 $edge = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
@@ -36,7 +45,15 @@ $edge = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
 & $edge --headless=new --disable-gpu --no-pdf-header-footer `
     --print-to-pdf="I:\projects\beamng-autopilot\docs\paper\T16_supplement.pdf" `
     "file:///I:/projects/beamng-autopilot/logs/paper_build/supplement.html"
+& $edge --headless=new --disable-gpu --no-pdf-header-footer `
+    --print-to-pdf="I:\projects\beamng-autopilot\docs\paper\T16_supplement_zh.pdf" `
+    "file:///I:/projects/beamng-autopilot/logs/paper_build/supplement_zh.html"
 ```
+
+**中文图怎么来的**：`scripts\m5_figures_i18n.py` 不碰三个英文图脚本，只在 `Figure.savefig` 上挂钩子，
+按 `scripts\m5_figures_zh_dict.py` 的词典把图内文字（标题/轴标签/刻度/图例/注释）换成中文，输出到
+`logs\paper_figures_zh\`；数据标识符（包名、运行名、规则名、种子名）保持原样。`--collect` 只打印图内
+文字清单（413 条），用于补词典；出图时会报「未翻译」条目，当前只剩 5 条对数轴数字刻度。
 
 ## 论文结构（SCI 投稿规范）
 
@@ -67,7 +84,7 @@ Availability → **Nomenclature** → **Open problems and unfinished work** → 
 | B10 目标期刊 | 现按 IEEE T-ITS 双栏格式 |
 | B11 正文/补充切分 | 正文 26 张 + 补充 16 张 |
 | B12 参考文献 | 15 条全保留；9 篇中文文献按中文题录著录 |
-| B13 图内文字 | 全英文（中英两版共用同一套图） |
+| B13 图内文字 | 英文版英文图；**中文版中文图**（同一批数据，另出一套，见 `scripts\m5_figures_i18n.py`） |
 | B14 语言版本 | 英文版与中文版分开（本目录两份 PDF） |
 | B15 补充材料 PDF | 已出（`T16_supplement.pdf`） |
 
@@ -77,7 +94,7 @@ Availability → **Nomenclature** → **Open problems and unfinished work** → 
 2. **目标期刊与模板**：现为 IEEEtran。若投 Elsevier 系（如 *TR Part C*、*ESWA*），需要换模板并补 **Graphical Abstract**（可从 42 张图里挑一张改）。
 3. **第 8 条中文文献（朱威等）的期刊名**：抽取文本里读不到，现为 `Journal name to be confirmed`，请你核对后填 `references.bib`。
 4. **邮箱是否上首页**：现只写在投稿系统层面，论文正文未出现邮箱；要显示的话告诉我放在哪。
-5. **中文版用途**：中文版按同一套数据撰写，可直接投国内期刊（图注为英文，如需图内中文标注需要另出一套图）。
+5. **中文版用途**：中文版按同一套数据撰写、图内文字已中文化，可直接投国内期刊。
 
 ## 写作纪律（与项目一致）
 

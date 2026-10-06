@@ -32,7 +32,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parents[1]
-FIGS_SRC = ROOT / "logs" / "paper_figures"
+FIGS_SRC = ROOT / "logs" / "paper_figures"      # 图源目录（--figs-src 可换成中文图）
 BUILD = ROOT / "logs" / "paper_build"
 MD = HERE / "paper.md"
 BIB = HERE / "references.bib"
@@ -40,6 +40,7 @@ LANG = "en"
 HTML_OUT = BUILD / "paper.html"
 TEX_OUT = HERE / "main.tex"
 FIG_PREFIX = ""
+IMG_DIR = "figures"
 FIG_WORD = "Fig."
 
 # ---------------------------------------------------------------- bib
@@ -314,7 +315,7 @@ def emit_html(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
         fig = re.match(r"^!\[(.*?)\]\((.*?)\)\{#(fig:[^}]+)\}$", b, re.S)
         if fig:
             cap, img, key = fig.groups()
-            lines.append(f'<figure id="{key}"><img src="figures/{img}" alt="">'
+            lines.append(f'<figure id="{key}"><img src="{IMG_DIR}/{img}" alt="">'
                          f'<b>{FIG_WORD} {FIG_PREFIX}{fig_no[key]}.</b> '
                          f'{md_inline_to_html(cap, fig_no)}</figcaption></figure>')
             continue
@@ -349,7 +350,7 @@ def emit_html(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
 
 
 def main() -> int:
-    global CITE_NO, LANG, MD, BIB, HTML_OUT, TEX_OUT, FIG_PREFIX, FIG_WORD
+    global CITE_NO, LANG, MD, BIB, HTML_OUT, TEX_OUT, FIG_PREFIX, FIG_WORD, IMG_DIR, FIGS_SRC
     import argparse
     ap = argparse.ArgumentParser(description="build paper.md -> LaTeX + HTML")
     ap.add_argument("--md", default=str(MD), help="markdown master (default: paper.md)")
@@ -359,11 +360,15 @@ def main() -> int:
     ap.add_argument("--figs", default=str(BUILD / "figures"), help="figure copy target")
     ap.add_argument("--lang", default="en", choices=["en", "zh"])
     ap.add_argument("--fig-prefix", default="", help='e.g. "S" for Fig. S1')
+    ap.add_argument("--img-dir", default="figures", help="figure folder name inside the HTML dir")
+    ap.add_argument("--figs-src", default=str(FIGS_SRC), help="figure source dir (default: logs/paper_figures)")
     a = ap.parse_args()
     MD, BIB = Path(a.md), Path(a.bib)
     TEX_OUT, HTML_OUT = Path(a.tex), Path(a.html)
     LANG = a.lang
+    FIGS_SRC = Path(a.figs_src)
     FIG_PREFIX = a.fig_prefix
+    IMG_DIR = a.img_dir
     FIG_WORD = "图" if LANG == "zh" else "Fig."
     bib = parse_bib(BIB)
     meta, md = split_front(MD.read_text(encoding="utf-8"))
