@@ -2560,6 +2560,9 @@ class FSDriveSession:
                 _wall_dt = max(0.0, now_t - last_t)
                 last_t = now_t
                 dt = min(0.5, max(0.05, _wall_dt))
+                # F-C：本 tick 的 PLC 前置位移（None = 未跑；下游复用，避免
+                # 同一个 tick 里把限速器推进两次）
+                self._plc_pre_shift = None
                 # Long-tick brake guard: if the PREVIOUS tick took too long
                 # the car just drove open-loop for that long.  Brake now
                 # (before the next, possibly long, tick) so no more distance
@@ -2762,6 +2765,44 @@ class FSDriveSession:
                                                + max(0.0, float(v)) * dt)
                 except Exception:
                     _obs_age = None
+                # F-C（BEAMNG_PLC_ON_SENSOR_LANE）：把规划路径先拉到感知车道
+                # 中心，**再**交给安全监控器评估——这样"被评估的"就是"将被执行
+                # 的"路径。实测（12 次 town、999 个感知车道帧）：路径离车道中心
+                # 中位 0.773 m、62% 的帧 >0.5 m，而 PLC 校正器在 lane_src==sensor
+                # 时被整段关掉；ref_gap_m 全 0 证明偏差出在路径本身，不是两层参考
+                # 不一致。门的偏差用**上一 tick 实测**的 lane_dev_m（本 tick 的评估
+                # 还没发生），测不到就弃权。
+                try:
+                    if PLC_ON_SENSOR_LANE and best is not None                             and len(best) >= 2                             and str(out.meta.get("lane_src_sel", "")) == "sensor":
+                        _plc_pre_active = painted_line_correction_active(
+                            "sensor", "fsd", None, END_PULL_START_M,
+                            path_dev_m=getattr(self, "_last_lane_dev_m", None),
+                            on_sensor_lane=True)
+                        _sem1 = (out.head_outputs.get("semantic")
+                                 if getattr(out, "head_outputs", None) else None)
+                        if _plc_pre_active and _sem1 is not None                                 and out.cam is not None:
+                            _olc1 = painted_line_lane_center(
+                                _sem1, out.cam, pos, float(heading),
+                                ground_z=(float(pos[2])
+                                          - config.EGO_ORIGIN_GROUND_GAP_M
+                                          if len(pos) > 2 else None),
+                                marks=_plmarks)
+                            _des1 = (plc_corr.desired_shift(
+                                _olc1, pos, float(heading),
+                                max_shift_m=PLC_MAX_SHIFT_M)
+                                if _olc1 is not None else None)
+                            _shift1 = plc_corr.update(_des1, dt, v)
+                            self._plc_pre_shift = float(_shift1)
+                            if abs(_shift1) >= PLC_MIN_ENGAGE_M:
+                                _pre = np.asarray(best, dtype=float)
+                                _pre_shifted = plc_corr.apply(
+                                    _pre, pos, float(heading))
+                                if _pre_shifted is not None                                         and len(_pre_shifted) >= 2:
+                                    best = _pre_shifted
+                                    out.meta["plc_pre_shift_m"] = round(
+                                        float(_shift1), 3)
+                except Exception:
+                    pass
                 _strict_perc = _strict_lane
                 scene = getattr(out, "scene", None)
                 if scene is not None:
@@ -3315,6 +3356,9 @@ class FSDriveSession:
                 # obstacle/unsafe fallback) must not get a superimposed
                 # centring pull - the fallback path already carries its own
                 # avoidance shape, so the shift just holds then decays.
+                # 本 tick 实测的"路径 vs 车道参考"（无符号），供下一 tick 的
+                # F-C 门使用——偏差是持续的地图车道偏置，不是逐帧噪声。
+                self._last_lane_dev_m = getattr(verd, "lane_dev_m", None)
                 _plc_shift = 0.0
                 _plc_desired = None
                 plc_rejected = False
@@ -3341,7 +3385,12 @@ class FSDriveSession:
                                     max_shift_m=PLC_MAX_SHIFT_M)
                     except Exception:
                         pass
-                    _plc_shift = plc_corr.update(_plc_desired, dt, v)
+                    if self._plc_pre_shift is not None:
+                        # 前置位移已在同一 tick 推进过限速器（F-C），这里只复用，
+                        # 不再 update 一次。
+                        _plc_shift = float(self._plc_pre_shift)
+                    else:
+                        _plc_shift = plc_corr.update(_plc_desired, dt, v)
                     if steer_path is not None \
                             and abs(_plc_shift) >= PLC_MIN_ENGAGE_M:
                         _steer_pre_plc = steer_path
@@ -5061,6 +5110,7 @@ class FSDriveSession:
                     "line_lat": line_lat,
                     "plc_active": int(_plc_active),
                     "plc_shift": round(float(_plc_shift), 3),
+                    "plc_pre_shift_m": out.meta.get("plc_pre_shift_m"),
                     "plc_desired": (round(float(_plc_desired), 3)
                                     if _plc_desired is not None else None),
                     "end_ref": _end_ref,
