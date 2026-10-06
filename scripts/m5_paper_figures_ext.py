@@ -377,11 +377,17 @@ def fig20() -> None:
     for _n, rate, pxpct, cc in rows:
         ax.scatter(rate, pxpct, s=20 + cc / 40, color="#8172B3",
                    edgecolor="black", linewidth=0.3)
-    for name, rate, pxpct, cc in rows:
-        if cc > 800 or pxpct > 0.35:
-            ax.annotate(name.replace("_20261004.json", "").replace("_20261005.json", ""),
-                        xy=(rate, pxpct), fontsize=6, xytext=(3, 3),
-                        textcoords="offset points")
+    # 臂名很长且有两个点几乎重合：点内只放序号，名单另列，避免标签叠在一起
+    for i, (_n, rate, pxpct, _cc) in enumerate(rows, start=1):
+        off = (5, 4) if i % 2 else (5, -10)      # 相邻点序号上下交错，避免"14"叠一起
+        ax.annotate(str(i), xy=(rate, pxpct), fontsize=6.5, xytext=off,
+                    textcoords="offset points")
+    if rows:
+        listing = chr(10).join(
+            f"{i} " + n.replace("_20261004.json", "").replace("_20261005.json", "")
+            for i, (n, *_rest) in enumerate(rows, start=1))
+        ax.text(0.26, 0.62, listing, transform=ax.transAxes, fontsize=6.5,
+                va="top", ha="left")
     ax.set_xlabel("false-positive frame rate")
     ax.set_ylabel("false-positive pixels (% of eligible)")
     ax.set_title(f"Negative-side diagnostics across {len(rows)} recorded arms "
@@ -672,9 +678,12 @@ def fig28() -> None:
             edgecolor="black", linewidth=0.4, label="per 100 m travelled")
     ax2.grid(False)
     ax2.set_yscale("log")
+    ax2.tick_params(labelbottom=False)      # twin 会重复画一套 x 刻度标签，关掉
     for i, r in enumerate(rows):
         ax.text(i - 0.2, r[1] + 1, str(r[1]), ha="center", fontsize=6)
         ax2.text(i + 0.2, max(r[2], 0.5) * 1.15, f"{r[2]:.0f}", ha="center", fontsize=6)
+    ax.set_ylim(0, max([r[1] for r in rows] + [1]) * 1.18)   # 顶部数值标签别顶到标题
+    ax2.set_ylim(top=max([max(r[2], 0.5) for r in rows] + [1]) * 3.0)
     ax.set_xticks(x, [r[0] for r in rows], rotation=30, ha="right", fontsize=7)
     ax.set_ylabel("body-centre-cross frames (max)")
     ax2.set_ylabel("same, per 100 m travelled")

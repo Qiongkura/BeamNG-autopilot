@@ -358,13 +358,14 @@ def fig6() -> None:
         ctrl_s.append(med(c, "stall")); fact_s.append(med(f, "stall"))
         ctrl_b.append(mx(c, "bC")); fact_b.append(mx(f, "bC"))
     fig, axes = plt.subplots(1, 2, figsize=(7.4, 3.0))
+    labels = [lab.replace(" ", chr(10), 1) for lab in labels]   # "F-A hold window" -> "F-A" / "hold window"
     x = np.arange(len(labels))
     ax = axes[0]
     ax.bar(x - 0.2, ctrl_t, 0.4, label="control", color=C_CTRL,
            edgecolor="black", linewidth=0.4)
     ax.bar(x + 0.2, fact_t, 0.4, label="factor on", color=C_FACT,
            edgecolor="black", linewidth=0.4)
-    ax.set_xticks(x, labels, rotation=18, ha="right", fontsize=7.5)
+    ax.set_xticks(x, labels, fontsize=6.5)
     ax.set_ylabel("travelled (m, median of 4 runs)")
     ax.set_title("(a) the factors do move the car")
     ax.legend(frameon=False)
@@ -372,7 +373,7 @@ def fig6() -> None:
     ax.bar(x - 0.2, ctrl_s, 0.4, color=C_CTRL, edgecolor="black", linewidth=0.4)
     ax.bar(x + 0.2, fact_s, 0.4, color=C_FACT, edgecolor="black", linewidth=0.4)
     ax.axhline(0.0, color="black", lw=0.8)
-    ax.set_xticks(x, labels, rotation=18, ha="right", fontsize=7.5)
+    ax.set_xticks(x, labels, fontsize=6.5)
     ax.set_ylabel("stall fraction (median)")
     ax.set_ylim(0, 1.05)
     bcs = " / ".join(f"{cb:.0f}" + chr(0x2192) + f"{fb:.0f}"

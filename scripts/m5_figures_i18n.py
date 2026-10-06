@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import importlib
+import re
 import sys
 from pathlib import Path
 
@@ -33,6 +34,7 @@ from m5_figures_zh_dict import IDENT, PHRASES, TRANS, _IDENT_RE  # noqa: E402
 
 _seen: set[str] = set()
 _missing: set[str] = set()
+_mixed: set[str] = set()
 _collect = False
 
 
@@ -40,6 +42,12 @@ def _is_cjk(s: str) -> bool:
     """汉字、CJK 标点与全角形式都算"已是中文"（避免二次翻译）。"""
     return any("一" <= c <= "鿿" or "　" <= c <= "〿"
                or "＀" <= c <= "￯" for c in s)
+
+
+def _is_cjk_ident_ok(s: str) -> bool:
+    """中英混排是否可接受：只剩标识符（含下划线/连字符）与数字时算可接受。"""
+    words = [w for w in s.replace("(", " ").replace(")", " ").split() if re.search(r"[A-Za-z]", w)]
+    return all(re.fullmatch(r"[A-Za-z0-9_\-\./{}=+%:]+", w) or _is_cjk(w) for w in words)
 
 
 def tr(s: str) -> str:
@@ -50,11 +58,15 @@ def tr(s: str) -> str:
     out = s
     for a, b in PHRASES:
         out = out.replace(a, b)
+    if out != s and _is_cjk(out):
+        out = out.replace("(", "（").replace(")", "）")   # 中文串用全角括号
     if _collect:
         if any(c.isalpha() for c in s):
             _seen.add(s)
     elif out == s and any(c.isalpha() for c in s) and s not in IDENT             and not _IDENT_RE.match(s):
         _missing.add(s)
+    elif out != s and re.search(r"[A-Za-z]{3,}", out) and not _is_cjk_ident_ok(out):
+        _mixed.add(out)
     return out
 
 
@@ -146,6 +158,10 @@ def main() -> int:
         if _missing:
             print(f"[zh-figs] 未翻译 {len(_missing)} 条：")
             for s in sorted(_missing):
+                print("   ", repr(s))
+        if _mixed:
+            print(f"[zh-figs] 半中半英 {len(_mixed)} 条（确认是否漏译）：")
+            for s in sorted(_mixed):
                 print("   ", repr(s))
     return 0
 

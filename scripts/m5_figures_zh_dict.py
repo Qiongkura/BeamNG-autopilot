@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import re
 
+NL = chr(10)          # 词典里的换行：写成字面 "\n" 容易被编辑工具吃掉
+
 # 数据标识符族（包名/运行名/规则名）：保持原样，不报未翻译
 _IDENT_RE = re.compile(
     r"^(?:m5auto|pkg|annotate_pkg|collect|dev9|t14|base6x|seed42|seg_model|"
@@ -19,7 +21,7 @@ IDENT = {
     "n/a", "p50", "p95", "R2", "R3", "R3 pool", "R3 pool B", "t14", "dev",
     "base", "base6x", "final", "degraded", "collect", "c2", "c3", "e1",
     "a0", "a1", "a2", "a4", "a5", "a27", "a29", "s42", "s43", "s44", "s45",
-    "s46", "s47", "seed42", "seg_model", "factor on", "t14-protocol-v7",
+    "s46", "s47", "seed42", "seg_model", "t14-protocol-v7",
     "t14-protocol-v8", "dev9_v7_pixel", "dev_pixel_base",
     "active version = t14-protocol-v8",
     "minimal_risk", "planned_boundary_crossing", "F-F | F-E=1", "agent_src",
@@ -64,6 +66,11 @@ TRANS: dict[str, str] = {
         "驾驶层单因子阶梯（城镇，交替 A/B，每臂硬门均 0/4）",
     "F-A hold window": "F-A 保持窗口",
     "F-C path recentre": "F-C 路径重定中",
+    "F-A" + NL + "hold window": "F-A" + NL + "保持窗口",
+    "F-C" + NL + "path recentre": "F-C" + NL + "路径重定中",
+    "F-D" + NL + "delivered arm": "F-D" + NL + "交付感知臂",
+    "F-E" + NL + "lane gate": "F-E" + NL + "铺装门",
+    "F-F" + NL + "| F-E=1": "F-F" + NL + "| F-E=1",
     "F-D delivered arm": "F-D 交付感知臂",
     "F-E lane gate": "F-E 铺装门",
     "F-E lane-gate run (factor on) (ts 1791273507)": "F-E 铺装门运行（因子开，ts 1791273507）",
@@ -214,6 +221,16 @@ TRANS: dict[str, str] = {
     "negative-example dose (x, relative to the base pool)": "负例剂量（×，相对基础池）",
     "normalised value": "归一化值",
     "off-road candidate fraction": "路外候选比例",
+    "kept: no overlap (56 packages)": "保留：无重叠（56 个包）",
+    "partial overlap (9 packages)": "部分重叠（9 个包）",
+    "dropped: fully used (31 packages)": "剔除：全部已用（31 个包）",
+    "y = x" + NL + "(every frame already used)": "y = x" + NL + "（每帧都已被使用）",
+    "source package: frames": "来源包：帧数",
+    "frames already used": "已被使用的帧数",
+    "1 dev9_v7_pixel" + NL + "2 dev9_v8_pixel" + NL + "3 dev_pixel_appgate" + NL + "4 dev_pixel_base":
+        "1 dev9_v7_pixel" + NL + "2 dev9_v8_pixel" + NL + "3 dev_pixel_appgate" + NL + "4 dev_pixel_base",
+    "Final-set provenance audit: per source package, frames vs frames already used ":
+        "最终集来源审计：每个来源包的帧数与已用帧数 ",
     "candidates": "候选",
     "dev (reviewed)": "开发（人工修订）",
     "dev > 0.30 m": "开发 > 0.30 m",
@@ -254,6 +271,7 @@ TRANS: dict[str, str] = {
     "certified\nnegative": "已认证\n负例",
     "contains paint\n(excluded)": "含漆\n（排除）",
     "control": "对照",
+    "factor on": "因子开",
     "coverage": "覆盖率",
     "identity": "身份率",
     "identity gate 0.60": "身份门 0.60",
@@ -361,6 +379,12 @@ TRANS: dict[str, str] = {
 }
 
 PHRASES: list[tuple[str, str]] = [
+    ("one constant switches all three changes; the hash changes with the version, "
+     "so a seal/confirmation cannot be mislabelled",
+     "一个常量同时切换三处改动；哈希随版本变化，因此封存／确认不可能被错标"),
+    ("used frame hashes", "已用帧哈希"),
+    ("Final-set provenance audit: per source package, frames vs frames already used",
+     "最终集来源审计：每个来源包的帧数与已用帧数"),
     ("sealed frames = ", "封存帧 = "),
     ("confirmations = ", "确认次数 = "),
     ("digest = ", "摘要 = "),

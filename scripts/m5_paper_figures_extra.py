@@ -56,6 +56,7 @@ def fig35() -> None:
         ax.bar(x, vals, 0.55, bottom=bottom, label=fam,
                color=plt.get_cmap("tab10")(i % 10), edgecolor="black", linewidth=0.4)
         bottom += np.asarray(vals)
+    ax.set_ylim(0, float(bottom.max()) * 1.20)     # 顶部标签与标题之间留空
     for i, d in enumerate(dates):
         ax.text(i, bottom[i] + 4, f"{led[d].get('minutes', bottom[i]):.0f} min",
                 ha="center", fontsize=7)
@@ -213,22 +214,43 @@ def fig41() -> None:
 
 # ---------------------------------------------------------------- fig 42
 def fig42() -> None:
+    """来源包级审计：每个候选来源包的帧数 vs 其中已被使用的帧数。
+
+    早先的版本按"每个相机位一个柱 + 一个标签"画（243 个目录），标签全部叠在一起，
+    图不可读（2026-10-07 由 scripts/m5_figures_qa.py 的包围盒检查发现）。
+    这里按**来源包**聚合：y = x 对角线上的点 = 整包已被使用（封存前剔除），
+    y = 0 的点 = 无重叠（保留）。判定与数字不变，只是换了能读的画法。
+    """
     d = _load("final_pool_audit_20261005.json")
     rows = d.get("dirs") or []
-    labels = [Path(r["dir"]).parents[0].name[:26] for r in rows]
-    frames = [r.get("frames", 0) for r in rows]
-    overlap = [r.get("overlap", 0) for r in rows]
-    x = np.arange(len(rows))
-    fig, ax = plt.subplots(figsize=(7.4, 2.9))
-    ax.bar(x - 0.2, frames, 0.4, label="frames", color=C_CTRL,
-           edgecolor="black", linewidth=0.4)
-    ax.bar(x + 0.2, overlap, 0.4, label="already used (content-level overlap)",
-           color=C_FACT, edgecolor="black", linewidth=0.4)
-    ax.set_xticks(x, labels, rotation=60, ha="right", fontsize=6)
-    ax.set_ylabel("frames")
-    ax.set_title(f"Final-set provenance audit: content-level overlap with the used set "
+    agg: dict[str, list[int]] = {}
+    for r in rows:
+        p = Path(r["dir"])
+        pkg = p.parent.name if p.parent.name and p.parent.name != "experiments" else p.name
+        a = agg.setdefault(pkg, [0, 0])
+        a[0] += int(r.get("frames", 0))
+        a[1] += int(r.get("overlap", 0))
+    clean = [v for v in agg.values() if v[1] == 0]
+    part = [v for v in agg.values() if 0 < v[1] < v[0]]
+    full = [v for v in agg.values() if v[0] > 0 and v[1] >= v[0]]
+    fig, ax = plt.subplots(figsize=(6.4, 3.4))
+    lim = max([v[0] for v in agg.values()] + [1]) * 1.06
+    ax.plot([0, lim], [0, lim], ls="--", lw=0.8, color="#888888", zorder=1)
+    for pts, color, lab in ((clean, C_CTRL, f"kept: no overlap ({len(clean)} packages)"),
+                            (part, "#DD8452", f"partial overlap ({len(part)} packages)"),
+                            (full, C_FACT, f"dropped: fully used ({len(full)} packages)")):
+        ax.scatter([v[0] for v in pts], [v[1] for v in pts], s=26, color=color,
+                   edgecolor="black", linewidth=0.4, label=lab, zorder=3)
+    ax.text(lim * 0.62, lim * 0.42, "y = x" + chr(10) + "(every frame already used)",
+            fontsize=6.5,
+            color="#555555", ha="left", va="center")
+    ax.set_xlim(0, lim)
+    ax.set_ylim(-lim * 0.04, lim)
+    ax.set_xlabel("source package: frames")
+    ax.set_ylabel("frames already used")
+    ax.set_title(f"Final-set provenance audit: per source package, frames vs frames already used "
                  f"({d.get('used_shas')} used frame hashes)")
-    ax.legend(frameon=False, fontsize=7)
+    ax.legend(frameon=False, fontsize=6.5, loc="upper left")
     _save(fig, "fig42_overlap_audit")
 
 
