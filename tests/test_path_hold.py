@@ -369,3 +369,94 @@ def test_serve_hold_records_the_scene_recheck_that_refused() -> None:
     v2 = mon.evaluate(_scene(), None, now_s=_T0 + 0.1)
     assert v2.path_hold_active is True
     assert v2.hold_refuse_reason == ""
+
+
+# ---------------------------------------------------------------------------
+# Hold window bounded by the T09 observation contract (BEAMNG_HOLD_OBS_WINDOW)
+#
+# Measured 2026-10-06: the offer-age window (0.80 s) expired long before the
+# next drivable planner tick, so ~75% of the no-path frames had no hold to
+# serve at all (docs/T16_DRIVING_ROOTCAUSE_PREREG_20261006.md §6).  With the
+# switch ON the hold is served past its offer age while the observation is
+# fresh and the car has not driven far since it -- and it may only CREEP.
+# ---------------------------------------------------------------------------
+
+def _obs_window(monkeypatch, on: bool = True):
+    from beamng_autopilot import safety_monitor as sm
+    monkeypatch.setattr(sm, "HOLD_OBS_WINDOW", bool(on))
+
+
+def test_obs_window_serves_an_old_hold_as_creep(monkeypatch) -> None:
+    from beamng_autopilot.safety_monitor import SafetyMonitor
+    _obs_window(monkeypatch, True)
+    mon = SafetyMonitor(max_speed=6.0)
+    mon.offer_verified_path(_straight(), 0.0, 5.0, now_s=_T0, strict=True)
+    # offer is 2 s old (way past FSD_PATH_HOLD_MAX_S) but perception is fresh
+    # and the car has barely moved since the observation
+    v = mon.evaluate(_scene(), None, now_s=_T0 + 2.0,
+                     observation_age_s=0.3, travelled_since_obs_m=1.0)
+    assert v.path_hold_active is True
+    assert v.path_hold_phase == "creep", "过期 offer 只能蠕行，不得回到 grace"
+    assert v.level == "degraded" and v.drivable
+    assert v.target_speed == pytest.approx(mon.min_risk_speed)
+
+
+def test_obs_window_refuses_when_the_observation_is_stale(monkeypatch) -> None:
+    from beamng_autopilot.safety_monitor import SafetyMonitor
+    _obs_window(monkeypatch, True)
+    mon = SafetyMonitor(max_speed=6.0)
+    mon.offer_verified_path(_straight(), 0.0, 5.0, now_s=_T0, strict=True)
+    v = mon.evaluate(_scene(), None, now_s=_T0 + 2.0,
+                     observation_age_s=1.5, travelled_since_obs_m=1.0)
+    assert v.level == "minimal_risk" and v.target_speed == 0.0
+    assert v.path_hold_active is False
+    assert "observation" in v.hold_refuse_reason
+
+
+def test_obs_window_refuses_when_the_car_drove_too_far(monkeypatch) -> None:
+    from beamng_autopilot.safety_monitor import SafetyMonitor
+    _obs_window(monkeypatch, True)
+    mon = SafetyMonitor(max_speed=6.0)
+    mon.offer_verified_path(_straight(), 0.0, 5.0, now_s=_T0, strict=True)
+    v = mon.evaluate(_scene(), None, now_s=_T0 + 2.0,
+                     observation_age_s=0.3, travelled_since_obs_m=15.0)
+    assert v.level == "minimal_risk"
+    assert v.path_hold_active is False
+    assert "travelled" in v.hold_refuse_reason
+
+
+def test_obs_window_never_invents_a_missing_measurement(monkeypatch) -> None:
+    """没有观测年龄/行驶量就不放行（UNKNOWN 不是"没问题"）。"""
+    from beamng_autopilot.safety_monitor import SafetyMonitor
+    _obs_window(monkeypatch, True)
+    mon = SafetyMonitor(max_speed=6.0)
+    mon.offer_verified_path(_straight(), 0.0, 5.0, now_s=_T0, strict=True)
+    v = mon.evaluate(_scene(), None, now_s=_T0 + 2.0)
+    assert v.level == "minimal_risk" and v.path_hold_active is False
+    assert "unknown" in v.hold_refuse_reason
+
+
+def test_obs_window_off_keeps_the_offer_age_bound(monkeypatch) -> None:
+    """默认关：过期就是过期，即使观测新鲜也不行（这是 A/B 的对照臂）。"""
+    from beamng_autopilot.safety_monitor import SafetyMonitor
+    _obs_window(monkeypatch, False)
+    mon = SafetyMonitor(max_speed=6.0)
+    mon.offer_verified_path(_straight(), 0.0, 5.0, now_s=_T0, strict=True)
+    v = mon.evaluate(_scene(), None, now_s=_T0 + 2.0,
+                     observation_age_s=0.3, travelled_since_obs_m=1.0)
+    assert v.level == "minimal_risk" and v.path_hold_active is False
+    assert "expired" in v.hold_refuse_reason
+
+
+def test_obs_window_still_refuses_a_blocked_held_path(monkeypatch) -> None:
+    """观测窗口不能绕过场景复检：held path 现在被占住照样拒绝。"""
+    from beamng_autopilot.safety_monitor import SafetyMonitor
+    _obs_window(monkeypatch, True)
+    mon = SafetyMonitor(max_speed=6.0)
+    mon.offer_verified_path(_straight(), 0.0, 5.0, now_s=_T0, strict=True)
+    scene = _scene()
+    scene.grid.mark_obstacle_region(6.0, 0.0, 6.0, 0.5)
+    v = mon.evaluate(scene, None, now_s=_T0 + 2.0,
+                     observation_age_s=0.3, travelled_since_obs_m=1.0)
+    assert v.level == "minimal_risk" and v.path_hold_active is False
+    assert "blocked" in v.hold_refuse_reason
