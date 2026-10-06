@@ -1,11 +1,12 @@
-# T16 论文图表集（2026-10-06，34 张）
+# T16 论文图表集（2026-10-06，42 张）
 
-**生成入口（两个脚本，只读已记录的数据文件；不手写、不估计）**
+**生成入口（三个脚本，只读已记录的数据文件；不手写、不估计）**
 
 ```pwsh
 .venv\Scripts\python.exe scripts\m5_paper_figures.py          # fig1–fig8
 .venv\Scripts\python.exe scripts\m5_paper_figures_ext.py      # fig9–fig34
 .venv\Scripts\python.exe scripts\m5_paper_figures_ext.py --only fig21
+.venv\Scripts\python.exe scripts\m5_paper_figures_extra.py        # fig35–fig42
 ```
 
 输出：`logs/paper_figures/fig*.png`（300 dpi；`logs/` 不提交，图可随时重建）。
@@ -49,6 +50,15 @@
 | 32 | 安全仲裁阶梯（**示意图**） | `safety_monitor.ARBITRATION_RULES` / `RULE_WORST_LEVEL` |
 | 33 | 协议开关矩阵（**示意图**） | `experiments/protocol.py`（含实时哈希） |
 | 34 | 一次性最终集流程（**示意图**） | `final_set.py` + v5 封存/消费账 |
+
+| 35 | GPU 时间记账（按日期/任务族） | `gpu_ledger_machine.json` |
+| 36 | 推理延迟复测（静默前置 + 重复取较小值） | `timing_retest_20260927.json` |
+| 37 | 两套定义下的配对可用性（逐 run + 丢失帧数） | `pairing_v7v8_compare_20261005.json` |
+| 38 | 标线横向位置分布（人工修订池，261k 像素） | `lane_geometry_dev_20260928.json` |
+| 39 | 场景结构密度（R3 池筛选判据） | `t16_r3_density_dev.json`、`t16_r3_pool{,b}_density_scenes.json` |
+| 40 | 负例池认证漏斗（合格/疑似/含漆/未决） | `e1_negative_pool_20260927.json` |
+| 41 | 空间隔离审计（与开发锚点 50 m 缓冲） | `collect_isolation_20260927.json` |
+| 42 | 最终集来源包的内容级重叠审计 | `final_pool_audit_20261005.json` |
 
 ---
 
