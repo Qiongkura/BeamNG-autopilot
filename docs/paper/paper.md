@@ -1,7 +1,7 @@
 ---
 title: "Lane Perception for Automated Driving with Human-Anchored, Engine-Certified Ground Truth: An Explicit Counting Contract and Pre-Registered Single-Factor Evaluation"
-authors: "Anonymous Author(s)"
-affiliation: "Affiliation withheld for review"
+authors: "Zheyu Yuan (袁哲宇)"
+affiliation: "South China Agricultural University, Guangzhou, China"
 journal: "IEEE Transactions on Intelligent Transportation Systems (submission format)"
 ---
 
@@ -302,6 +302,8 @@ precision (0.402) and role (0.674); under the adopted definition all five gates 
 
 The per-seed view matters more than the mean: {@fig:r3seed} shows the limited-class pool seed by seed with each candidate-level gate marked when missed. Under the baseline definition the identity gate is missed in 6 of 6 seeds and role in 5 of 6; under the adopted definition no seed misses any of the three.
 
+TABLE: Table I. The two protocol definitions on both reference sets (means over seeds; bold marks a missed gate; the adopted protocol is read in paint scope, the baseline in label scope).
+
 | Set | Definition | Coverage | Identity | Precision | Recall | Role |
 |---|---|---|---|---|---|---|
 | Dev (9 scenes, 117 frames) | baseline (label scope) | 0.952 | **0.433** | 0.610 | 0.736 | 0.868 |
@@ -434,6 +436,8 @@ as negative; none of the factors was adopted.
 
 The arbitration histogram is the evidence behind the stall fraction: "no drivable path" is the largest single reason (383 of 2443 settled frames) followed by the planned body-sweep crossing (312), which together account for the bulk of the stationary time.
 
+TABLE: Table II. Five pre-registered driving-layer factors against the deadlock, with mechanism engagement, motion read-outs and the pre-registered verdict.
+
 | Factor | Mechanism engaged? | Travelled (median) | Stall (median) | Worst-case body-cross frames (control → factor) | Verdict |
 |---|---|---|---|---|---|
 | Bounded hold window | yes (reuse 7 → 42 frames) | 3.15 → 8.5 m | 0.986 → 0.958 | 29 → 30 | rejected |
@@ -466,6 +470,8 @@ issued every ~0.5 s, while in an arm where paths exist 12 sub-steps per frame yi
 ~31 Hz. Table III summarises. The practical consequence is that the perceived "stutter" of the
 vehicle is a control-cadence artefact of the path-availability blocker, not a rendering or compute
 failure.
+
+TABLE: Table III. Control cadence per configuration: tick cost, sub-step count and effective command rate.
 
 | Run | Tick (ms) | Sensor read (ms) | Renderer frame (ms) | Sub-steps per frame | Effective command rate |
 |---|---|---|---|---|---|
@@ -662,25 +668,38 @@ on the baseline definition is exactly a role/instance ambiguity rather than a pi
 
 # Declarations
 
-**Funding.** To be completed by the authors.
+**Funding.** This research received no external funding.
 
-**Competing interests.** The authors declare no competing interests.
+**Competing interests.** The author declares no competing interests.
 
-**Author contributions.** To be completed by the authors (conceptualisation, methodology,
-software, validation, formal analysis, investigation, data curation, writing — original draft,
-writing — review and editing, visualisation, supervision, funding acquisition).
+**Author contributions.** The author is the sole author and performed every role:
+conceptualisation, methodology, software, validation, formal analysis, investigation, data
+curation, writing — original draft, writing — review and editing, visualisation, supervision.
 
 **Ethics.** Not applicable: the work uses a commercial driving simulator and no human subjects.
-The human annotation referenced in this paper was performed by the authors on their own simulator
+The human annotation referenced in this paper was performed by the author on his own simulator
 recordings.
 
-**Data and code availability.** All quantitative claims are regenerated from recorded artefacts
-retained in the project repository: per-run scorecards, per-frame telemetry traces, run manifests,
-gate verdict files, sealed-set records, and the protocol hash. Three scripts regenerate every
-figure in this paper and its supplement from those files (`m5_paper_figures.py`,
-`m5_paper_figures_ext.py`, `m5_paper_figures_extra.py`); `build_paper.py` regenerates this
-manuscript's LaTeX and HTML from a single Markdown source. Per-epoch training snapshots and
-superseded run directories removed in a storage pass are listed in a machine-readable audit file.
+**Use of AI tools.** AI coding assistants (DeepSeek and OpenCode) were used as development tools
+during the implementation and documentation of this work; all experimental design, measurements,
+verdicts and conclusions were produced and verified by the author, and every quantitative claim in
+this paper is regenerated from recorded artefacts by the scripts listed below.
+
+**Data and code availability.** The project repository is
+`https://github.com/Qiongkura/BeamNG-autopilot` (branch `fix/round3-hardening-20260921`). All
+quantitative claims are regenerated from recorded artefacts retained in that repository: per-run
+scorecards, per-frame telemetry traces, run manifests, gate verdict files, sealed-set records and
+the protocol hash. Three scripts regenerate every figure in this paper and its supplement from
+those files (`m5_paper_figures.py`, `m5_paper_figures_ext.py`, `m5_paper_figures_extra.py`);
+`build_paper.py` regenerates this manuscript's LaTeX and HTML from a single Markdown source.
+Per-epoch training snapshots and superseded run directories removed in a storage pass are listed in
+a machine-readable audit file.
+
+# Acknowledgements
+
+The author thanks the BeamNG.tech team for the simulator and its scripting interface, and
+gratefully acknowledges his parents and friends for their support. He also thanks the developers of
+DeepSeek and OpenCode, whose coding assistants were used as development tools during this work.
 
 # Appendix A: Recorded artefacts behind each results section
 

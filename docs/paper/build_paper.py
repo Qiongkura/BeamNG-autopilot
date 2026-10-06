@@ -1,5 +1,8 @@
 """Build the paper from paper.md: IEEEtran LaTeX (submission) + two-column HTML (render).
 
+English edition by default; ``--lang zh`` builds the Chinese edition (CJK font
+stack in HTML, ``ctex`` in LaTeX) from ``paper_zh.md``.
+
     .venv\\Scripts\\python.exe docs\\paper\\build_paper.py
 
 Outputs
@@ -33,6 +36,11 @@ FIGS_SRC = ROOT / "logs" / "paper_figures"
 BUILD = ROOT / "logs" / "paper_build"
 MD = HERE / "paper.md"
 BIB = HERE / "references.bib"
+LANG = "en"
+HTML_OUT = BUILD / "paper.html"
+TEX_OUT = HERE / "main.tex"
+FIG_PREFIX = ""
+FIG_WORD = "Fig."
 
 # ---------------------------------------------------------------- bib
 
@@ -98,7 +106,7 @@ def collect(md: str):
 
 
 def md_inline_to_tex(s: str, fig_no: dict) -> str:
-    s = re.sub(r"\{@(fig:[^}]+)\}", lambda m: str(fig_no[m.group(1)]), s)
+    s = re.sub(r"\{@(fig:[^}]+)\}", lambda m: FIG_PREFIX + str(fig_no[m.group(1)]), s)
     s = re.sub(r"\[@([A-Za-z0-9_]+)\]", r"\\cite{\1}", s)
     s = s.replace("\\", "\\textbackslash{}") if False else s
     s = re.sub(r"\*\*(.+?)\*\*", r"\\textbf{\1}", s)
@@ -107,7 +115,7 @@ def md_inline_to_tex(s: str, fig_no: dict) -> str:
                  ("~", r"\textasciitilde{}"), ("%", r"\%"), ("&", r"\&"), ("#", r"\#")):
         s = s.replace(a, b)
     s = re.sub(r"(?<!\\)\$([^$]+)\$", lambda m: "$" + m.group(1) + "$", s)
-    for a, b in (("×", r"$	imes$"), ("⊆", r"$\subseteq$"), ("–", "--"),
+    for a, b in (("×", r"$\times$"), ("⊆", r"$\subseteq$"), ("–", "--"),
                  ("—", "---"), ("“", "``"), ("”", "''")):
         s = s.replace(a, b)
     return s
@@ -134,7 +142,7 @@ def _math_to_html(s: str) -> str:
     return re.sub(pat, conv, s)
 
 def md_inline_to_html(s: str, fig_no: dict) -> str:
-    s = re.sub(r"\{@(fig:[^}]+)\}", lambda m: str(fig_no[m.group(1)]), s)
+    s = re.sub(r"\{@(fig:[^}]+)\}", lambda m: FIG_PREFIX + str(fig_no[m.group(1)]), s)
     s = re.sub(r"\[@([A-Za-z0-9_]+)\]", lambda m: f"[{CITE_NO[m.group(1)]}]", s)
     s = _math_to_html(s)
     return s
@@ -145,6 +153,7 @@ CITE_NO: dict = {}
 
 def emit_tex(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
     body = []
+    pending_cap = None
     for block in re.split(r"\n\s*\n", md):
         b = block.strip()
         if not b:
@@ -157,6 +166,9 @@ def emit_tex(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
                 f"\\includegraphics[width=\\columnwidth]{{figures/{img}}}\n"
                 f"\\caption{{{md_inline_to_tex(cap, fig_no)}}}\n"
                 f"\\label{{{key}}}\n\\end{{figure}}")
+            continue
+        if b.startswith("TABLE:"):
+            pending_cap = b[6:].strip()
             continue
         if b.startswith("|"):                       # markdown table
             rows = [r for r in b.splitlines() if r.strip().startswith("|")]
@@ -172,11 +184,16 @@ def emit_tex(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
                    f"\\begin{{tabular}}{{@{{}}{'l' * ncol}@{{}}}}", "\\toprule",
                    head + r" \\", "\\midrule", *body_rows, "\\bottomrule",
                    "\\end{tabular}", "\\end{" + env + "}"]
+            _cap = re.sub(r"^(?:Table|表)\s*[IVX]+\.\s*", "", pending_cap) if pending_cap else ""
+            cap_tex = "\\caption{" + md_inline_to_tex(_cap, fig_no) + "}" if _cap else ""
+            if cap_tex:
+                tex.insert(2, cap_tex)
+            pending_cap = None
             body.append("\n".join(tex))
             continue
         if b.startswith("# "):
             title = b[2:].strip()
-            if title.lower().startswith("abstract"):
+            if title.lower().startswith("abstract") or title.strip() == "摘要":
                 continue
             if title.lower().startswith("references"):
                 break
@@ -190,28 +207,33 @@ def emit_tex(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
             sub = re.match(r"^([A-Z])\.\s+(.*)$", b[3:].strip())
             body.append(f"\\subsection{{{md_inline_to_tex(sub.group(2) if sub else b[3:], fig_no)}}}")
             continue
-        if b.startswith("# References"):
+        if b.startswith("# References") or b.startswith("# 参考文献"):
             break
-        if b.startswith("**Index Terms**"):
+        if b.startswith("**Index Terms**") or b.startswith("**关键词**"):
             body.append("\\begin{IEEEkeywords}\n"
-                        + md_inline_to_tex(b.replace("**Index Terms**—", ""), fig_no)
+                        + md_inline_to_tex(b.split("**—", 1)[-1].split("—", 1)[-1], fig_no)
                         + "\n\\end{IEEEkeywords}")
             continue
         body.append(md_inline_to_tex(b, fig_no))
 
-    abstract = re.search(r"# Abstract\n(.*?)\n# ", md, re.S)
-    _abs = (abstract.group(1) if abstract else "").split("**Index Terms**")[0]
+    abstract = re.search(r"# (?:Abstract|摘要)\n(.*?)\n# ", md, re.S)
+    _abs = re.split(r"\*\*(?:Index Terms|关键词)\*\*", abstract.group(1) if abstract else "")[0]
     abs_tex = md_inline_to_tex(" ".join(_abs.split()), fig_no)
     refs = "\n".join(f"\\bibitem{{{k}}} {ieee_entry(bib[k])}" for k in cites if k in bib)
     missing = [k for k in cites if k not in bib]
     if missing:
         raise SystemExit(f"citation keys missing from references.bib: {missing}")
+    if LANG == "zh":
+        # ctex 自带 UTF-8 处理与中文字库设置，不能再叠 inputenc
+        cjk = "\\usepackage[UTF8,fontset=windows]{{ctex}}" + chr(10)
+    else:
+        cjk = "\\usepackage[utf8]{{inputenc}}" + chr(10)
     return f"""\\documentclass[journal]{{IEEEtran}}
 \\usepackage{{graphicx}}
 \\usepackage{{amsmath}}
 \\usepackage{{booktabs}}
 \\usepackage{{url}}
-\\usepackage[utf8]{{inputenc}}
+{cjk}
 
 \\title{{{meta.get('title','')}}}
 \\author{{{meta.get('authors','')}}}
@@ -235,6 +257,8 @@ CSS = """
 @page { size: A4; margin: 18mm 15mm; }
 body { font: 9.6pt/1.42 'Times New Roman', Times, serif; color: #111; margin: 0;
        column-count: 2; column-gap: 7mm; text-align: justify; hyphens: auto; }
+body.zh { font-family: 'Times New Roman', 'Microsoft YaHei', 'SimSun', serif;
+          line-height: 1.62; hyphens: none; word-break: normal; }
 h1.title { column-span: all; font-size: 19pt; text-align: center; margin: 0 0 4pt; }
 p.authors { column-span: all; text-align: center; font-size: 11pt; margin: 0 0 10pt; }
 div.abstract { column-span: all; margin: 0 0 10pt; }
@@ -249,8 +273,10 @@ figcaption { font-size: 8.2pt; text-align: justify; margin-top: 3pt; }
 div.wide { column-span: all; }
 div.wide table { font-size: 8.6pt; }
 table { width: 100%; border-collapse: collapse; font-size: 8.2pt; margin: 6pt 0 10pt; }
+p.tcap { font-size: 8.6pt; margin: 8pt 0 2pt; break-after: avoid; }
 th, td { border-top: .5pt solid #444; border-bottom: .5pt solid #444; padding: 2pt 3pt;
          text-align: left; vertical-align: top; }
+body.zh td, body.zh th { overflow-wrap: anywhere; }
 th { border-bottom: .8pt solid #222; }
 ol.refs { font-size: 8.4pt; padding-left: 14pt; }
 ol.refs li { margin-bottom: 2pt; }
@@ -260,13 +286,14 @@ ol.refs li { margin-bottom: 2pt; }
 def emit_html(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
     import markdown as mdlib
     lines = []
+    pending_cap = None
     in_abstract = False
     for block in re.split(r"\n\s*\n", md):
         b = block.strip()
         if not b:
             continue
         # 摘要与 Index Terms 只出现在页首的全宽块：正文流跳过，避免重复渲染
-        if b.startswith("# Abstract"):
+        if b.startswith("# Abstract") or b.startswith("# 摘要"):
             in_abstract = True
             continue
         if in_abstract:
@@ -274,35 +301,41 @@ def emit_html(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
                 in_abstract = False
             else:
                 continue
-        if b.startswith("# References"):
+        if b.startswith("# References") or b.startswith("# 参考文献"):
             break
-        if b.startswith("**Index Terms**"):
+        if b.startswith("**Index Terms**") or b.startswith("**关键词**"):
             continue
+        if b.startswith("TABLE:"):
+            pending_cap = b[6:].strip()
+            continue
+        if b.startswith("|") and pending_cap:
+            lines.append(f'<p class="tcap">{md_inline_to_html(pending_cap, fig_no)}</p>')
+            pending_cap = None
         fig = re.match(r"^!\[(.*?)\]\((.*?)\)\{#(fig:[^}]+)\}$", b, re.S)
         if fig:
             cap, img, key = fig.groups()
             lines.append(f'<figure id="{key}"><img src="figures/{img}" alt="">'
-                         f'<figcaption><b>Fig. {fig_no[key]}.</b> '
+                         f'<b>{FIG_WORD} {FIG_PREFIX}{fig_no[key]}.</b> '
                          f'{md_inline_to_html(cap, fig_no)}</figcaption></figure>')
             continue
         b = md_inline_to_html(b, fig_no).replace(" — ", "&nbsp;&mdash; ")
         lines.append(b)
     body = mdlib.markdown("\n\n".join(lines), extensions=["tables"])
-    abstract = re.search(r"# Abstract\n(.*?)\n# ", md, re.S)
-    _absh = (abstract.group(1) if abstract else "").split("**Index Terms**")[0]
+    abstract = re.search(r"# (?:Abstract|摘要)\n(.*?)\n# ", md, re.S)
+    _absh = re.split(r"\*\*(?:Index Terms|关键词)\*\*", abstract.group(1) if abstract else "")[0]
     abs_html = mdlib.markdown(" ".join(_absh.split()))
-    idx = re.search(r"\*\*Index Terms\*\*—(.*)", md)
+    idx = re.search(r"\*\*(?:Index Terms|关键词)\*\*—(.*)", md)
     body = body.replace("<h1>Abstract</h1>", "")
     body = re.sub(r"<h1>(.*?)</h1>", lambda m: f"<h2>{m.group(1)}</h2>", body)
     refs = "".join(f"<li>{ieee_entry(bib[k])}</li>" for k in cites if k in bib)
-    html = f"""<!doctype html><html><head><meta charset="utf-8">
-<title>{meta.get('title','')}</title><style>{CSS}</style></head><body>
+    html = f"""<!doctype html><html lang="{"zh" if LANG == "zh" else "en"}"><head><meta charset="utf-8">
+<title>{meta.get('title','')}</title><style>{CSS}</style></head><body class="{LANG}">
 <h1 class="title">{meta.get('title','')}</h1>
 <p class="authors">{meta.get('authors','')} &mdash; {meta.get('affiliation','')}</p>
-<div class="abstract"><h2>Abstract</h2>{abs_html}</div>
-<p class="indexterms"><b>Index Terms</b>&mdash;{md_inline_to_html(idx.group(1), fig_no) if idx else ''}</p>
+<div class="abstract"><h2>{"摘要" if LANG == "zh" else "Abstract"}</h2>{abs_html}</div>
+<p class="indexterms"><b>{'关键词' if LANG == 'zh' else 'Index Terms'}</b>&mdash;{md_inline_to_html(idx.group(1), fig_no) if idx else ''}</p>
 {body}
-<h2>References</h2><ol class="refs">{refs}</ol>
+{"<h2>" + ("参考文献" if LANG == "zh" else "References") + "</h2>" if refs else ""}<ol class="refs">{refs}</ol>
 </body></html>"""
     # 破折号不得出现在行首（含表头/题注/表格单元格）
     html = html.replace(" — ", "&nbsp;&mdash; ").replace("— ", "&nbsp;&mdash; ")
@@ -316,22 +349,38 @@ def emit_html(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
 
 
 def main() -> int:
-    global CITE_NO
+    global CITE_NO, LANG, MD, BIB, HTML_OUT, TEX_OUT, FIG_PREFIX, FIG_WORD
+    import argparse
+    ap = argparse.ArgumentParser(description="build paper.md -> LaTeX + HTML")
+    ap.add_argument("--md", default=str(MD), help="markdown master (default: paper.md)")
+    ap.add_argument("--bib", default=str(BIB), help="bib file (default: references.bib)")
+    ap.add_argument("--tex", default=str(TEX_OUT), help="LaTeX output path")
+    ap.add_argument("--html", default=str(HTML_OUT), help="HTML output path")
+    ap.add_argument("--figs", default=str(BUILD / "figures"), help="figure copy target")
+    ap.add_argument("--lang", default="en", choices=["en", "zh"])
+    ap.add_argument("--fig-prefix", default="", help='e.g. "S" for Fig. S1')
+    a = ap.parse_args()
+    MD, BIB = Path(a.md), Path(a.bib)
+    TEX_OUT, HTML_OUT = Path(a.tex), Path(a.html)
+    LANG = a.lang
+    FIG_PREFIX = a.fig_prefix
+    FIG_WORD = "图" if LANG == "zh" else "Fig."
     bib = parse_bib(BIB)
     meta, md = split_front(MD.read_text(encoding="utf-8"))
     figs, fig_no, cites = collect(md)
     CITE_NO = {k: i + 1 for i, k in enumerate(cites)}
-    (HERE / "main.tex").write_text(emit_tex(md, meta, bib, fig_no, cites), encoding="utf-8")
-    BUILD.mkdir(parents=True, exist_ok=True)
-    (BUILD / "figures").mkdir(exist_ok=True)
+    TEX_OUT.write_text(emit_tex(md, meta, bib, fig_no, cites), encoding="utf-8")
+    figdir = Path(a.figs)
+    figdir.mkdir(parents=True, exist_ok=True)
     for _c, img, _k in figs:
         src = FIGS_SRC / img
         if not src.is_file():
             raise SystemExit(f"missing figure: {src}")
-        shutil.copy2(src, BUILD / "figures" / img)
-    (BUILD / "paper.html").write_text(emit_html(md, meta, bib, fig_no, cites), encoding="utf-8")
-    print(f"[paper] main.tex -> {HERE / 'main.tex'}")
-    print(f"[paper] html     -> {BUILD / 'paper.html'}  ({len(figs)} figures, {len(cites)} refs)")
+        shutil.copy2(src, figdir / img)
+    HTML_OUT.parent.mkdir(parents=True, exist_ok=True)
+    HTML_OUT.write_text(emit_html(md, meta, bib, fig_no, cites), encoding="utf-8")
+    print(f"[paper:{LANG}] tex  -> {TEX_OUT}")
+    print(f"[paper:{LANG}] html -> {HTML_OUT}  ({len(figs)} figures, {len(cites)} refs)")
     return 0
 
 

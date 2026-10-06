@@ -3,10 +3,11 @@
 \usepackage{amsmath}
 \usepackage{booktabs}
 \usepackage{url}
-\usepackage[utf8]{inputenc}
+\usepackage[utf8]{{inputenc}}
+
 
 \title{Lane Perception for Automated Driving with Human-Anchored, Engine-Certified Ground Truth: An Explicit Counting Contract and Pre-Registered Single-Factor Evaluation}
-\author{Anonymous Author(s)}
+\author{Zheyu Yuan (袁哲宇)}
 
 \begin{document}
 \maketitle
@@ -306,6 +307,7 @@ precision (0.402) and role (0.674); under the adopted definition all five gates 
 The per-seed view matters more than the mean: 10 shows the limited-class pool seed by seed with each candidate-level gate marked when missed. Under the baseline definition the identity gate is missed in 6 of 6 seeds and role in 5 of 6; under the adopted definition no seed misses any of the three.
 \begin{table*}[!t]
 \centering
+\caption{The two protocol definitions on both reference sets (means over seeds; bold marks a missed gate; the adopted protocol is read in paint scope, the baseline in label scope).}
 \begin{tabular}{@{}lllllll@{}}
 \toprule
 Set & Definition & Coverage & Identity & Precision & Recall & Role \\
@@ -366,9 +368,9 @@ The instance-level probe explains why the appearance gate can afford to be aggre
 \end{figure}
 \subsection{Training-composition dose response}
 16 shows the identity rate against the negative dose, per seed and as a mean: 0.707 (base
-composition, one seed), 0.711 (4$	imes$, six seeds, 0.667--0.732), \textbf{0.763 (6$	imes$, one seed)} and 0.701
-(8.5$	imes$, six seeds, 0.655--0.744). The response is non-monotonic with a peak at 6$	imes$ and a return to
-baseline at 8.5$	imes$; the 6$	imes$ arm is the delivered candidate's composition.
+composition, one seed), 0.711 (4$\times$, six seeds, 0.667--0.732), \textbf{0.763 (6$\times$, one seed)} and 0.701
+(8.5$\times$, six seeds, 0.655--0.744). The response is non-monotonic with a peak at 6$\times$ and a return to
+baseline at 8.5$\times$; the 6$\times$ arm is the delivered candidate's composition.
 The programme's training history (321 recorded runs across 44 families, supplement) converges within 20--40 epochs of the 120-epoch budget, and families whose line channel was masked sit at zero line IoU by construction rather than by failure (annotated in the figure), so their curves are not negative results. 17 sweeps the lateral
 scope instead: tightening it from 6.0 m to 3.0 m raises identity (dev 0.582 $\rightarrow$ 0.713; limited-class
 0.581 $\rightarrow$ 0.758) and removes candidates (477 $\rightarrow$ 166 and 166 $\rightarrow$ 127), while role agreement is flat --- the
@@ -482,6 +484,7 @@ as negative; none of the factors was adopted.
 The arbitration histogram is the evidence behind the stall fraction: "no drivable path" is the largest single reason (383 of 2443 settled frames) followed by the planned body-sweep crossing (312), which together account for the bulk of the stationary time.
 \begin{table*}[!t]
 \centering
+\caption{Five pre-registered driving-layer factors against the deadlock, with mechanism engagement, motion read-outs and the pre-registered verdict.}
 \begin{tabular}{@{}llllll@{}}
 \toprule
 Factor & Mechanism engaged? & Travelled (median) & Stall (median) & Worst-case body-cross frames (control $\rightarrow$ factor) & Verdict \\
@@ -522,6 +525,7 @@ vehicle is a control-cadence artefact of the path-availability blocker, not a re
 failure.
 \begin{table*}[!t]
 \centering
+\caption{Control cadence per configuration: tick cost, sub-step count and effective command rate.}
 \begin{tabular}{@{}llllll@{}}
 \toprule
 Run & Tick (ms) & Sensor read (ms) & Renderer frame (ms) & Sub-steps per frame & Effective command rate \\
@@ -583,7 +587,7 @@ driving results, one town link. The definitional gap and the deadlock mechanism 
 link; their magnitude elsewhere is unknown. The offline sets span several certified scenes but not
 several maps.
 \textbf{Six seeds, and unequal seed counts.} Acceptance uses six seeds; composition arms are reported with
-their seed counts (one to six), and the 6$	imes$ dose point rests on a single seed. Dose conclusions are
+their seed counts (one to six), and the 6$\times$ dose point rests on a single seed. Dose conclusions are
 therefore about a peak location, not about a precise effect size.
 \textbf{The held-out set is consumed.} The one-shot confirmation was performed once, as designed, and the
 set may not be read again; any future claim requires a newly sealed set. The instance-level probes
@@ -701,7 +705,7 @@ larger human-revised anchor and a newly sealed human-revised held-out set, which
 the confirmation's numbers be compared against the acceptance numbers on the same truth rung.
 \textbf{7. Scale and external validity.} All results come from one simulator, the driving results from
 one town link, the acceptance from six seeds, and the composition arms from one to six seeds
-(the 6$	imes$ dose point rests on a single seed). No real-vehicle data were used. The dose conclusions
+(the 6$\times$ dose point rests on a single seed). No real-vehicle data were used. The dose conclusions
 are therefore about a peak location, not an effect size, and the definitional findings should be
 re-measured on a second map before being treated as general.
 \textbf{8. Instance vocabulary for harder geometry.} The counting contract's role vocabulary
@@ -709,21 +713,31 @@ re-measured on a second map before being treated as general.
 estimation, and multi-lane role conventions are undefined, and the identity gate's failure mode
 on the baseline definition is exactly a role/instance ambiguity rather than a pixel error.
 \section*{Declarations}
-\textbf{Funding.} To be completed by the authors.
-\textbf{Competing interests.} The authors declare no competing interests.
-\textbf{Author contributions.} To be completed by the authors (conceptualisation, methodology,
-software, validation, formal analysis, investigation, data curation, writing --- original draft,
-writing --- review and editing, visualisation, supervision, funding acquisition).
+\textbf{Funding.} This research received no external funding.
+\textbf{Competing interests.} The author declares no competing interests.
+\textbf{Author contributions.} The author is the sole author and performed every role:
+conceptualisation, methodology, software, validation, formal analysis, investigation, data
+curation, writing --- original draft, writing --- review and editing, visualisation, supervision.
 \textbf{Ethics.} Not applicable: the work uses a commercial driving simulator and no human subjects.
-The human annotation referenced in this paper was performed by the authors on their own simulator
+The human annotation referenced in this paper was performed by the author on his own simulator
 recordings.
-\textbf{Data and code availability.} All quantitative claims are regenerated from recorded artefacts
-retained in the project repository: per-run scorecards, per-frame telemetry traces, run manifests,
-gate verdict files, sealed-set records, and the protocol hash. Three scripts regenerate every
-figure in this paper and its supplement from those files (`m5_paper_figures.py`,
-`m5_paper_figures_ext.py`, `m5_paper_figures_extra.py`); `build_paper.py` regenerates this
-manuscript's LaTeX and HTML from a single Markdown source. Per-epoch training snapshots and
-superseded run directories removed in a storage pass are listed in a machine-readable audit file.
+\textbf{Use of AI tools.} AI coding assistants (DeepSeek and OpenCode) were used as development tools
+during the implementation and documentation of this work; all experimental design, measurements,
+verdicts and conclusions were produced and verified by the author, and every quantitative claim in
+this paper is regenerated from recorded artefacts by the scripts listed below.
+\textbf{Data and code availability.} The project repository is
+`https://github.com/Qiongkura/BeamNG-autopilot` (branch `fix/round3-hardening-20260921`). All
+quantitative claims are regenerated from recorded artefacts retained in that repository: per-run
+scorecards, per-frame telemetry traces, run manifests, gate verdict files, sealed-set records and
+the protocol hash. Three scripts regenerate every figure in this paper and its supplement from
+those files (`m5_paper_figures.py`, `m5_paper_figures_ext.py`, `m5_paper_figures_extra.py`);
+`build_paper.py` regenerates this manuscript's LaTeX and HTML from a single Markdown source.
+Per-epoch training snapshots and superseded run directories removed in a storage pass are listed in
+a machine-readable audit file.
+\section*{Acknowledgements}
+The author thanks the BeamNG.tech team for the simulator and its scripting interface, and
+gratefully acknowledges his parents and friends for their support. He also thanks the developers of
+DeepSeek and OpenCode, whose coding assistants were used as development tools during this work.
 \section*{Appendix A: Recorded artefacts behind each results section}
 \begin{table}[!t]
 \centering
@@ -753,15 +767,15 @@ IV cost ledger & `gpu_ledger_machine.json` \\
 \bibitem{neven2018lanenet} Neven, Davy, De Brabandere, Bert, Georgoulis, Stamatios, Proesmans, Marc, Van Gool, Luc, “Towards End-to-End Lane Detection: An Instance Segmentation Approach,” in IEEE Intelligent Vehicles Symposium (IV), 2018.
 \bibitem{pan2018scnn} Pan, Xingang, Shi, Jianping, Luo, Ping, Wang, Xiaogang, Tang, Xiaoou, “Spatial As Deep: Spatial {CNN} for Traffic Scene Understanding,” in AAAI Conference on Artificial Intelligence, 2018.
 \bibitem{zheng2022clrnet} Zheng, Tu, Huang, Yifei, Liu, Yang, Tang, Wenjian, Yang, Zheng, Cai, Deng, He, Xiaofei, “{CLRNet}: Cross Layer Refinement Network for Lane Detection,” in IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), 2022.
-\bibitem{chen2026clrnetlight} Chen, Shuhui, “A Lightweight Method for the {CLRNet} Lane Detection Algorithm,” Software Engineering (Ruan Jian Gong Cheng), 29, no. 9, 2026. [In Chinese]
-\bibitem{huang2026bspline} Huang, Wei, others, “End-to-End Lane Detection Based on {B}-Spline Curves,” Journal of Chang'an University (Natural Science Edition), 46, no. 3, 2026. [In Chinese]
-\bibitem{jia2026gnn} Jia, Zihou, others, “Lane Detection Method Based on a {GNN}-{Transformer} Model,” Chinese Journal of Engineering Design, 33, no. 3, 2026. [In Chinese]
-\bibitem{li2026xca} Li, Rui, Ao, Yinhui, Chen, Xinsheng, Li, Guishen, “Lane Detection Based on {Transformer} and {XCA} Attention,” Electronic Measurement Technology, 49, no. 7, 2026. [In Chinese]
-\bibitem{zhu2024parallel} Zhu, Wei, Ou, Quanlin, Hong, Lidong, He, Defeng, “A Parallel Detection Network for Lane Lines Based on Image Sequences,” , 34, 2024. [In Chinese; venue to be verified against the publisher record]
-\bibitem{hu2026multiscale} Hu, Peng, Liu, Ping, Hu, Yao, “Lane Detection Method Based on Multi-Scale Feature Aggregation,” Chinese Journal of Automotive Engineering, 2026. [In Chinese; online first]
-\bibitem{shuai2026deeplab} Shuai, Qiang, others, “Lane Detection Method Based on an Improved {DeepLabV3+} Model,” Journal of Taiyuan University of Science and Technology, 47, no. 3, 2026. [In Chinese]
-\bibitem{lu2026symmetry} Lu, Jun, Zhang, Shusen, Wang, Lei, “Lane Detection Based on Symmetry Priors and Key-Point Prediction in Complex Scenes,” CAAI Transactions on Intelligent Systems, 2026. [In Chinese; online first]
-\bibitem{chen2025threed} Chen, Xiaohai, others, “Research on {3D} Lane Detection for Intelligent Vehicles under Deep Convolutional Network Architectures,” Modern Electronic Technique, 48, no. 24, 2025. [In Chinese]
+\bibitem{chen2026clrnetlight} 陈淑慧, “CLRNet车道线检测算法的一种轻量化方法,” 软件工程, 29, no. 9, 2026. [In Chinese]
+\bibitem{huang2026bspline} 黄炜, 等, “基于B样条曲线的端到端车道线检测方法,” 长安大学学报(自然科学版), 46, no. 3, 2026. [In Chinese]
+\bibitem{jia2026gnn} 贾子厚, 等, “基于GNN-Transformer模型的车道线检测方法,” 工程设计学报, 33, no. 3, 2026. [In Chinese]
+\bibitem{li2026xca} 李睿, 敖银辉, 陈新盛, 李桂伸, “基于Transformer和XCA注意力的车道线检测方法,” 电子测量技术, 49, no. 7, 2026. [In Chinese]
+\bibitem{zhu2024parallel} 朱威, 欧全林, 洪力栋, 何德峰, “基于图像序列的车道线并行检测网络,” Journal name to be confirmed, 34, 2024. [In Chinese]
+\bibitem{hu2026multiscale} 胡鹏, 刘平, 胡遥, “基于多尺度特征聚合的车道线检测方法,” 汽车工程学报, 2026. [In Chinese]
+\bibitem{shuai2026deeplab} 帅强, 等, “基于改进DeeplabV3+模型的车道线检测方法,” 太原科技大学学报, 47, no. 3, 2026. [In Chinese]
+\bibitem{lu2026symmetry} 陆军, 张澍森, 王磊, “复杂场景下基于对称先验与关键点预测的车道线检测,” 智能系统学报, 2026. [In Chinese]
+\bibitem{chen2025threed} 陈小海, 等, “深度卷积神经网络架构下智能车3D车道线检测研究,” 现代电子技术, 48, no. 24, 2025. [In Chinese]
 \bibitem{tusimple2017} {TuSimple}, “TuSimple Lane Detection Challenge,” 2017. Dataset
 \bibitem{borkar2012groundtruth} Borkar, Amol, Hayes, Monson, Smith, Mark T., “A Novel Lane Detection System With Efficient Ground Truth Generation,” IEEE Transactions on Intelligent Transportation Systems, 13, no. 1, 2012.
 \bibitem{mccall2006video} McCall, Joel C., Trivedi, Mohan M., “Video-Based Lane Estimation and Tracking for Driver Assistance: Survey, System, and Evaluation,” IEEE Transactions on Intelligent Transportation Systems, 7, no. 1, 2006.
