@@ -155,10 +155,21 @@ CITE_NO: dict = {}
 def emit_tex(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
     body = []
     pending_cap = None
+    in_abstract = False
     for block in re.split(r"\n\s*\n", md):
         b = block.strip()
         if not b:
             continue
+        # 摘要与关键词在 \begin{abstract}/IEEEkeywords 里单独输出，正文流必须跳过，
+        # 否则摘要正文会在 \end{abstract} 之后重复出现一遍（2026-10-07 审查发现）。
+        if b.startswith("# Abstract") or b.startswith("# 摘要"):
+            in_abstract = True
+            continue
+        if in_abstract:
+            if b.startswith("# "):
+                in_abstract = False
+            else:
+                continue
         fig = re.match(r"^!\[(.*?)\]\((.*?)\)\{#(fig:[^}]+)\}$", b, re.S)
         if fig:
             cap, img, key = fig.groups()

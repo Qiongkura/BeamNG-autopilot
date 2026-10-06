@@ -25,14 +25,16 @@ audit trail.
 
 # S-A. Driving-layer evidence
 
-The main text reports five pre-registered driving factors, all rejected, and localises the blocker to
-a static body-sweep deadlock. The figures below are the per-arm and per-frame evidence behind those
+The main text reports five pre-registered driving factors, of which four were implemented and rejected
+and one was refuted by prior measurement before implementation, and localises the blocker to a static
+body-sweep deadlock. The figures below are the per-arm and per-frame evidence behind those
 statements.
 
 ![Driving single-factor ladder: travelled distance (a) and stall fraction (b) per arm, with worst-case body-centre-cross frames.](fig6_factor_ladder.png){#fig:s6}
 
 Every arm in {@fig:s6} still fails the `no_stall` hard target (0 frames) and the hard gates stay 0/4;
-the ladder is what justifies reporting the factors as rejected rather than as partial progress.
+the ladder is what justifies reporting the implemented factors as rejected rather than as partial
+progress.
 
 ![Per-run time series (speed top, path-to-lane deviation bottom) for a baseline acceptance run and an F-E lane-gate run.](fig24_time_series.png){#fig:s24}
 
@@ -143,8 +145,9 @@ recorded verdict. The same machinery rejected the first two compositions of the 
 4. **Frame counts are confounded by motion.** `body_cross_centre_frames` scales with how far the car
    travelled; the F-C and F-E verdicts were taken under the pre-registered maximum-over-runs rule and
    a per-distance reading was pre-registered separately for later rounds.
-5. **Unequal seed counts in the dose arms.** base 1, 4× 5, 6× 1, 8.5× 5 seeds; the 6× point is the
-   delivered candidate's composition and rests on a single seed.
+5. **Unequal seed counts in the dose arms.** base 1, 4× 6, 6× 1, 8.5× 6 seeds; the 6× point is the
+   delivered candidate's composition and rests on a single seed, so the dose result locates the highest
+   observed reading rather than a stable optimum.
 6. **No eligible negative frames on the limited-class pool**, so that pool's false-positive rate is
    not measurable (Figure S15) and is never reported as zero.
 7. **Schematics are not measurements.** The five schematic figures in the main text are drawn from the
