@@ -826,3 +826,35 @@ def test_dilate_line_stage(monkeypatch):
     monkeypatch.setenv("BEAMNG_PROTOCOL", "v8")
     monkeypatch.delenv("BEAMNG_LINE_DILATE_PX", raising=False)
     assert line_scope.dilate_px() == 0, "v8 不应默认开膨胀"
+
+
+def test_drivable_fraction_detail_survives_points_outside_the_grid():
+    """铺装门证据分级必须容忍"部分采样点落在栅格外"。
+
+    2026-10-06 实测：近场诊断用 pts[seen] 索引（seen 只覆盖**映射进栅格**的点）
+    → 一旦有点落在外圈就 IndexError，把整条车道参考打断；离线单元检查在秒级抓到。
+    """
+    import numpy as _np
+    from beamng_autopilot.occupancy import OccupancyGrid
+    from beamng_autopilot.lane.reference import _drivable_fraction
+
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.origin = (0.0, 0.0)
+    grid.heading = 0.0
+    grid.drivable[:] = 0
+    grid.drivable[:, 28:34] = 1
+    # 观测层默认为空：没有观测证据时该门必须**弃权**（0 样本），
+    # 这里显式给一段观测，才能同时测"分级字段"和"部分点在栅格外"。
+    grid.observed[:] = 0
+    grid.observed[:, 26:36] = 1
+    center = _np.column_stack([_np.linspace(0, 60, 40), _np.zeros(40)])
+    detail: dict = {}
+    frac, n = _drivable_fraction(center, grid, pos=(0.0, 0.0), detail=detail)
+    assert n >= 3 and 0.0 <= frac <= 1.0
+    assert {"n", "n_unobserved", "n_obstacle", "n_off_mask",
+            "frac_near"} <= set(detail)
+    # 不要 detail 时行为不变（返回同一个 (frac, n)）
+    assert _drivable_fraction(center, grid)[1] == n
+    # 观测层为空 -> 弃权（0 样本），不是"没铺装"
+    grid.observed[:] = 0
+    assert _drivable_fraction(center, grid)[1] == 0

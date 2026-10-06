@@ -449,18 +449,23 @@ def _drivable_fraction(center, grid, *, pos=None,
     if drv is None or not getattr(drv, "any", lambda: False)():
         return 0.0, 0
     pts = np.asarray(center, dtype=float)[:, :2]
-    rows, cols, ok = [], [], []
+    rows, cols, kept = [], [], []
     for x, y in pts:
         cell = grid.world_to_cell(float(x), float(y))
         if cell is None:
             continue
         rows.append(int(cell[0]))
         cols.append(int(cell[1]))
-        ok.append(True)
-    if not ok:
+        kept.append((float(x), float(y)))
+    if not kept:
         return 0.0, 0
     rr = np.asarray(rows)
     cc = np.asarray(cols)
+    # ``pts_in`` = exactly the polyline points that mapped into the grid;
+    # ``seen`` indexes THAT subset, not the full polyline (2026-10-06: the
+    # near-range diagnostic indexed pts[seen] and raised IndexError as soon
+    # as some points fell outside the grid — caught by the offline check).
+    pts_in = np.asarray(kept, dtype=float)
     if obs is not None and getattr(obs, "size", 0) and obs.shape == drv.shape:
         seen = obs[rr, cc] > 0
     else:
@@ -483,7 +488,7 @@ def _drivable_fraction(center, grid, *, pos=None,
               "n_off_mask": int((~good & ~blocked).sum())}
         if pos is not None:
             _p = np.asarray(pos, dtype=float).ravel()[:2]
-            _dpts = pts[seen]
+            _dpts = pts_in[seen]
             _dd = np.linalg.norm(_dpts - _p[None, :], axis=1)
             _near = _dd <= float(near_m)
             _d["n_near"] = int(_near.sum())
