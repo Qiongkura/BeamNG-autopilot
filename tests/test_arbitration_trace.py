@@ -48,6 +48,7 @@ class TestRuleForReason:
             "planned boundary crossing ahead": "planned_boundary_crossing",
             "current vehicle body crosses lane boundary": "body_crosses_boundary",
             "planned vehicle body crosses lane boundary": "body_crosses_boundary",
+            "stationary recentre creep": "stationary_recentre",
             "path off-lane": "path_off_lane",
             "path near lane edge": "path_near_lane_edge",
             "obstacle very close": "obstacle_very_close",
