@@ -391,14 +391,18 @@ def fig20() -> None:
 
 # ---------------------------------------------------------------- fig 21
 def fig21() -> None:
-    """训练曲线：逐 run 的 train_hist.json（val_line_iou / train_loss）。"""
+    """训练曲线：按 family 聚合（321 个 run 逐条画会把图例压死）。
+
+    每个 family 取该 family 内所有 run 的 val_line_iou / train_loss 曲线，
+    画**中位曲线 + IQR 带**，图例只列 run 数最多的前 10 个 family（放轴外）。
+    """
+    import collections as _c
     hists = []
     for p in sorted(EXP.rglob("train_hist.json")):
         try:
             d = json.load(open(p, encoding="utf-8"))
         except Exception:
             continue
-        # train_hist.json 是**列式**存法：{"epoch": [...], "train_loss": [...], ...}
         if isinstance(d, dict) and isinstance(d.get("epoch"), list):
             cols = [k for k, v in d.items() if isinstance(v, list)]
             rows = [{k: d[k][i] for k in cols} for i in range(len(d["epoch"]))]
@@ -406,24 +410,57 @@ def fig21() -> None:
             rows = [r for r in d if isinstance(r, dict) and "epoch" in r]
         else:
             rows = []
-        if not rows:
-            continue
-        fam = p.relative_to(EXP).parts[0]
-        hists.append((fam, rows))
-    fig, axes = plt.subplots(1, 2, figsize=(8.4, 3.0))
+        if rows:
+            hists.append((p.relative_to(EXP).parts[0], rows))
+    by = _c.defaultdict(list)
     for fam, rows in hists:
-        xs = [r["epoch"] for r in rows]
+        by[fam].append(rows)
+    top = [f for f, _ in sorted(by.items(), key=lambda kv: -len(kv[1]))[:10]]
+    fig, axes = plt.subplots(1, 2, figsize=(9.6, 3.4))
+    cmap = plt.get_cmap("tab10")
+    for k, fam in enumerate(top):
+        color = cmap(k % 10)
         for ax, key in ((axes[0], "val_line_iou"), (axes[1], "train_loss")):
-            ys = [r.get(key) for r in rows]
-            if any(isinstance(y, (int, float)) for y in ys):
-                ax.plot(xs, ys, lw=0.9, alpha=0.8, label=fam if key == "val_line_iou" else None)
-    axes[0].set_ylabel("val line IoU")
-    axes[1].set_ylabel("train loss")
+            grid = np.arange(0, 121, 5)
+            curves = []
+            for rows in by[fam]:
+                xs = [r["epoch"] for r in rows]
+                ys = [r.get(key) for r in rows]
+                ok = [(x, y) for x, y in zip(xs, ys) if isinstance(y, (int, float))]
+                if len(ok) < 2:
+                    continue
+                curves.append(np.interp(grid, [x for x, _ in ok], [y for _, y in ok]))
+            if not curves:
+                continue
+            M = np.vstack(curves)
+            med = np.median(M, axis=0)
+            ax.plot(grid, med, lw=1.4, color=color, label=f"{fam} (n={len(curves)})")
+            ax.fill_between(grid, np.percentile(M, 25, axis=0),
+                            np.percentile(M, 75, axis=0), color=color, alpha=0.15, lw=0)
+    axes[0].set_ylabel("val line IoU (median, IQR band)")
+    axes[1].set_ylabel("train loss (median, IQR band)")
     for ax in axes:
         ax.set_xlabel("epoch")
-    axes[0].legend(frameon=False, fontsize=6, ncol=2)
-    fig.suptitle(f"Training curves from {len(hists)} recorded train_hist.json runs",
-                 fontsize=10)
+        ax.set_xlim(0, 120)
+    axes[1].set_ylim(0, 2.0)
+    # 诚实性：line 通道被屏蔽的 run，其 val_line_iou 恒为 0（构造使然，不是"学不会"）
+    try:
+        masked = {}
+        for r in _load("training_history.json")["runs"]:
+            if r.get("line_ignored"):
+                masked[r["family"]] = masked.get(r["family"], 0) + 1
+        shown = [f"{f} ({masked[f]})" for f in top if f in masked]
+        if shown:
+            head = ", ".join(shown[:3]) + (" ..." if len(shown) > 3 else "")
+            axes[0].annotate("line-masked runs: IoU = 0 by construction" + NL + head,
+                             xy=(0.02, 0.03), xycoords="axes fraction", fontsize=6.5)
+    except Exception:
+        pass
+    handles, labels = axes[0].get_legend_handles_labels()
+    fig.legend(handles, labels, loc="lower center", ncol=5, frameon=False, fontsize=7,
+               bbox_to_anchor=(0.5, -0.12))
+    fig.suptitle(f"Training curves by family ({len(hists)} recorded runs, "
+                 f"{len(by)} families; top {len(top)} shown)", fontsize=10)
     _save(fig, "fig21_training_curves")
 
 
