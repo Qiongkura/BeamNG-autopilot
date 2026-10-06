@@ -2773,6 +2773,31 @@ class FSDriveSession:
                         observation_age_s=_obs_age,
                         travelled_since_obs_m=getattr(
                             self, "_hold_travel_m", None))
+                # F-C 步骤 0（只读诊断）：0.77 m 的"路径离车道中心"必须能归因——
+                # 是规划器自己的路径偏，还是两层用的参考不一致。
+                try:
+                    from beamng_autopilot.planning.geometry import (
+                        polyline_point_distances,
+                    )
+                    _plan_ref = (np.asarray(out.lane_ref, dtype=float)
+                                 if out.lane_ref is not None else None)
+                    _mon_ref = (np.asarray(scene.lane_ref, dtype=float)
+                                if getattr(scene, "lane_ref", None) is not None
+                                else None)
+                    _b = (np.asarray(best, dtype=float)
+                          if best is not None and len(best) >= 2 else None)
+                    out.meta["plan_dev_m"] = (
+                        round(float(np.median(polyline_point_distances(
+                            _b[:, :2], _plan_ref[:, :2]))), 3)
+                        if _b is not None and _plan_ref is not None
+                        and len(_plan_ref) >= 2 else None)
+                    out.meta["ref_gap_m"] = (
+                        round(float(np.median(polyline_point_distances(
+                            _plan_ref[:, :2], _mon_ref[:, :2]))), 3)
+                        if _plan_ref is not None and _mon_ref is not None
+                        and len(_mon_ref) >= 2 else None)
+                except Exception:
+                    pass
                 else:
                     grid = OccupancyGrid(stack.grid_n, stack.grid_n,
                                          stack.grid_res,
@@ -4926,6 +4951,10 @@ class FSDriveSession:
                     # NOT the same as 0.0 = aligned.
                     "lane_dev_m": (None if getattr(verd, "lane_dev_m", None) is None
                                    else round(float(verd.lane_dev_m), 3)),
+                    # F-C 步骤 0 诊断（只读）：规划器路径 vs 规划器参考，
+                    # 以及规划器参考 vs 监控器参考（0.77 m 偏差归因用）。
+                    "plan_dev_m": out.meta.get("plan_dev_m"),
+                    "ref_gap_m": out.meta.get("ref_gap_m"),
                     "lat_left": lat_left,
                     "lat_right": lat_right,
                     "kind": str(out.meta.get("planner", {}).get("kind", "?")),
