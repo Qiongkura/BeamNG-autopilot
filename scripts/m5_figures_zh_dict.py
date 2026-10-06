@@ -231,6 +231,50 @@ TRANS: dict[str, str] = {
         "1 dev9_v7_pixel" + NL + "2 dev9_v8_pixel" + NL + "3 dev_pixel_appgate" + NL + "4 dev_pixel_base",
     "Final-set provenance audit: per source package, frames vs frames already used ":
         "最终集来源审计：每个来源包的帧数与已用帧数 ",
+    # ---- 契约图（fig30）与逐种子图（fig18）、身份范围图（fig10）
+    "P_frames" + NL + "frames with" + NL + "a candidate":
+        "P_frames" + NL + "标注在铺装上" + NL + "确实有线的帧",
+    "P_frames" + NL + "frames whose annotation" + NL + "carries a paint line":
+        "P_frames" + NL + "标注在铺装上" + NL + "确实有线的帧",
+    "C" + NL + "candidate instances" + NL + "(extracted)":
+        "C" + NL + "P 帧内进入评价的" + NL + "感知候选",
+    "C" + NL + "perception candidates" + NL + "inside P (evaluated)":
+        "C" + NL + "P 帧内进入评价的" + NL + "感知候选",
+    "C_outside_P" + NL + "candidates on frames" + NL + "outside P":
+        "C_outside_P" + NL + "落在 P 之外帧上的候选" + NL + "（只上报、不计分）",
+    "C_outside_P" + NL + "candidates outside P" + NL + "(reported, not scored)":
+        "C_outside_P" + NL + "落在 P 之外帧上的候选" + NL + "（只上报、不计分）",
+    "R ⊆ C" + NL + "reference instances" + NL + "(annotation truth)":
+        "R ⊆ C" + NL + "自身所在侧" + NL + "有参考的候选",
+    "R ⊆ C" + NL + "candidates whose own side" + NL + "has a reference":
+        "R ⊆ C" + NL + "自身所在侧" + NL + "有参考的候选",
+    "M ⊆ R" + NL + "matched (frozen" + NL + "condition)":
+        "M ⊆ R" + NL + "满足冻结" + NL + "匹配条件",
+    "L ⊆ M" + NL + "both sides" + NL + "role-decidable":
+        "L ⊆ M" + NL + "两侧角色" + NL + "皆可判",
+    "coverage is candidate-reference availability, not detection recall;" + NL
+    + "no instance-level recall is claimed (a missed marking on a frame with" + NL
+    + "no candidate enters pixel recall only)":
+        "覆盖率是候选参考可判率，而不是检出率；" + NL
+        + "本文不主张实例级召回（感知没有产生候选的帧上发生的漏检，" + NL
+        + "只进入像素级召回）。",
+    "v7 (baseline, label scope)": "v7（基线，标签范围）",
+    "v8 (adopted, paint scope)": "v8（采纳，漆范围）",
+    "coverage (gate 0.80)": "覆盖率（门 0.80）",
+    "identity (gate 0.60)": "身份率（门 0.60）",
+    "role (gate 0.70)": "角色（门 0.70）",
+    "R3 limited-class pool, per seed: candidate-level gates under both "
+    "definitions (x = below gate)":
+        "R3 有限类别池逐种子：两套定义下的候选级门（x = 低于门）",
+    "Identity scope changes the reading, and can reverse the ranking"
+    + NL + "(same checkpoints, 10 seeds per arm; dashed = 0.60 gate)":
+        "身份范围改变读数、并可反转排序"
+        + NL + "（同一批检查点，每臂 10 个种子；虚线 = 0.60 门）",
+    "mean shift: base 0.398 -> 0.867 | 6x 0.429 -> 0.771" + NL
+    + "the two arms swap order between scopes":
+        "均值位移：基础 0.398 → 0.867 | 6× 0.429 → 0.771" + NL
+        + "两条臂在两种范围之间交换了排序",
+    "A ⊆ L" + NL + "role" + NL + "agrees": "A ⊆ L" + NL + "角色" + NL + "一致",
     "candidates": "候选",
     "dev (reviewed)": "开发（人工修订）",
     "dev > 0.30 m": "开发 > 0.30 m",

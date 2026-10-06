@@ -128,8 +128,17 @@ def fig10() -> None:
     ax.set_xticks([0, 1], ["label scope", "surface scope"])
     ax.set_xlim(-0.25, 1.25)
     ax.set_ylabel("candidate identity rate")
-    ax.set_title("Identity scope changes the reading, not the model" + NL
-                 + "(same checkpoints, 5 seeds per arm; dashed = 0.60 gate)")
+    means = {fam: (st.mean([r[1] for r in rows]), st.mean([r[2] for r in rows]))
+             for fam, rows in pairs.items()}
+    base = means.get("base")
+    six = means.get("base6x")
+    if base and six:
+        ax.text(0.02, 0.06, "mean shift: base %.3f" % base[0] + " -> %.3f" % base[1]
+                + " | 6x %.3f" % six[0] + " -> %.3f" % six[1]
+                + NL + "the two arms swap order between scopes",
+                transform=ax.transAxes, fontsize=6.5, va="bottom")
+    ax.set_title("Identity scope changes the reading, and can reverse the ranking"
+                 + NL + "(same checkpoints, 10 seeds per arm; dashed = 0.60 gate)")
     _save(fig, "fig10_identity_scopes")
 
 
@@ -314,27 +323,41 @@ def fig17() -> None:
 
 # ---------------------------------------------------------------- fig 18
 def fig18() -> None:
-    arms = _load("r3_acceptance_20261004.json")["arms"]
-    fields = ["candidate_reference_coverage", "candidate_identity_rate",
-              "left_right_role_agreement"]
-    seeds = sorted(arms)
-    data = np.array([[arms[s].get(f) or np.nan for f in fields] for s in seeds],
-                    dtype=float)
-    fig, ax = plt.subplots(figsize=(7.0, 3.2))
-    im = ax.imshow(data, cmap="RdYlGn", vmin=0.2, vmax=1.0, aspect="auto")
-    ax.set_xticks(range(len(fields)), [GATE_LABEL[f] for f in fields])
-    ax.set_yticks(range(len(seeds)), seeds)
-    for i, s in enumerate(seeds):
-        for j, f in enumerate(fields):
-            v = arms[s].get(f)
-            if not isinstance(v, float):
-                ax.text(j, i, "n/a", ha="center", va="center", fontsize=7.5)
-                continue
-            ax.text(j, i, f"{v:.2f}" + ("" if v >= GATES[f] else " x"),
-                    ha="center", va="center", fontsize=7.5)
-    ax.set_title("R3 limited-class pool, per seed: candidate-level gates "
-                 "(x = below gate; label scope)")
-    fig.colorbar(im, ax=ax, shrink=0.8, label="metric")
+    """R3 有限类别池逐种子：两套定义下的三个候选级门。
+
+    数据源是 10-05 的两份判定文件——与表 I 同一批运行。早先版本读的是
+    10-04 的 `r3_acceptance_20261004.json`（另一批运行），图和表因此对不上
+    （2026-10-07 审查指出）。
+    """
+    srcs = [("v7 (baseline, label scope)", "r2_verdict_v7_20261005.json", C_CTRL),
+            ("v8 (adopted, paint scope)", "r2_verdict_v8_ADOPTED_20261005.json", C_FACT)]
+    fields = [("candidate_reference_coverage", "coverage (gate 0.80)", 0.80),
+              ("candidate_identity_rate", "identity (gate 0.60)", 0.60),
+              ("left_right_role_agreement", "role (gate 0.70)", 0.70)]
+    blocks = {f: (_load(f).get("r3") or {}).get("candidate") or {} for _n, f, _c in srcs}
+    seeds = sorted(blocks[srcs[0][1]])
+    x = np.arange(len(seeds))
+    fig, axes = plt.subplots(1, 3, figsize=(7.6, 3.0))
+    for ax, (field, title, gate) in zip(axes, fields):
+        for i, (_name, f, color) in enumerate(srcs):
+            blk = blocks[f]
+            vals = [blk[s].get(field) if isinstance(blk[s].get(field), (int, float)) else np.nan
+                    for s in seeds]
+            xs = x + (i - 0.5) * 0.38
+            ax.bar(xs, vals, 0.36, color=color, edgecolor="black", linewidth=0.4,
+                   label=_name)
+            for xi, v in zip(xs, vals):
+                if isinstance(v, float) and v < gate:
+                    ax.text(xi, v + 0.02, "x", ha="center", fontsize=6.5)
+        ax.axhline(gate, color="black", ls="--", lw=0.8)
+        ax.set_xticks(x, seeds, fontsize=6.5)
+        ax.set_title(title, fontsize=8.5)
+        ax.set_ylim(0, 1.05)
+    axes[0].set_ylabel("metric (per seed)")
+    axes[1].legend(frameon=False, fontsize=6.5, loc="upper center",
+                   bbox_to_anchor=(0.5, -0.14), ncol=1)   # 放到面板下方，避开刻度与柱
+    fig.suptitle("R3 limited-class pool, per seed: candidate-level gates under both "
+                 "definitions (x = below gate)", fontsize=9)
     _save(fig, "fig18_r3_per_seed")
 
 
@@ -726,14 +749,14 @@ def fig30() -> None:
     """计数契约 v5（按 AGENTS.md / candidate_metrics 的定义绘制；schematic）。"""
     fig, ax = plt.subplots(figsize=(7.6, 3.2))
     ax.set_axis_off()
-    _box(ax, 0.02, 0.62, 0.22, 0.24, "P_frames\nframes with\na candidate")
-    _box(ax, 0.30, 0.62, 0.22, 0.24, "C\ncandidate instances\n(extracted)")
-    _box(ax, 0.58, 0.62, 0.22, 0.24, "C_outside_P\ncandidates on frames\noutside P",
+    _box(ax, 0.02, 0.62, 0.22, 0.24, "P_frames\nframes whose annotation\ncarries a paint line")
+    _box(ax, 0.30, 0.62, 0.22, 0.24, "C\nperception candidates\ninside P (evaluated)")
+    _box(ax, 0.58, 0.62, 0.22, 0.24, "C_outside_P\ncandidates outside P\n(reported, not scored)",
          fc="#F3D9D9")
-    _box(ax, 0.30, 0.30, 0.22, 0.24, "R ⊆ C\nreference instances\n(annotation truth)")
-    _box(ax, 0.58, 0.30, 0.22, 0.24, "M ⊆ R\nmatched")
-    _box(ax, 0.84, 0.30, 0.14, 0.24, "L ⊆ M\nlateral\nagreed")
-    _box(ax, 0.84, 0.02, 0.14, 0.22, "A ⊆ L\nrole\nagreed")
+    _box(ax, 0.30, 0.30, 0.22, 0.24, "R ⊆ C\ncandidates whose own side\nhas a reference")
+    _box(ax, 0.58, 0.30, 0.22, 0.24, "M ⊆ R\nmatched (frozen\ncondition)")
+    _box(ax, 0.84, 0.30, 0.14, 0.24, "L ⊆ M\nboth sides\nrole-decidable")
+    _box(ax, 0.84, 0.02, 0.14, 0.22, "A ⊆ L\nrole\nagrees")
     ax.annotate("", xy=(0.30, 0.74), xytext=(0.24, 0.74),
                 arrowprops=dict(arrowstyle="->", lw=0.8))
     ax.annotate("", xy=(0.30, 0.42), xytext=(0.24, 0.74),
@@ -744,10 +767,14 @@ def fig30() -> None:
                 arrowprops=dict(arrowstyle="->", lw=0.8))
     ax.annotate("", xy=(0.91, 0.24), xytext=(0.91, 0.30),
                 arrowprops=dict(arrowstyle="->", lw=0.8))
-    ax.text(0.02, 0.50, "gates (mean over seeds):" + NL
+    ax.text(0.02, 0.30, "gates (mean over seeds):" + NL
             + "  coverage = R / C      identity = M / R" + NL
             + "  role     = A / L      precision/recall = pixels",
-            fontsize=8, va="top")
+            fontsize=7.5, va="top")
+    ax.text(0.02, 0.14, "coverage is candidate-reference availability, not detection recall;"
+            + NL + "no instance-level recall is claimed (a missed marking on a frame with"
+            + NL + "no candidate enters pixel recall only)",
+            fontsize=6.5, va="top")
     ax.set_title("Counting contract v5 (schematic): every ratio has an explicit "
                  "numerator and denominator", fontsize=9.5)
     _save(fig, "fig30_counting_contract")
