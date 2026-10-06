@@ -278,6 +278,17 @@ DIVIDER_MAX_CENTRE_OFFSET_M = 2.6
 # Fraction of sampled centre points that must land on drivable, observed
 # pavement before the shift may steer the car.
 DIVIDER_DRIVABLE_MIN_FRAC = 0.6
+# --- 铺装门只回答"在不在观测到的可行驶面上"（单因子开关，默认关）---------
+# 实测 2026-10-06（2 次 town、415 settled 帧）：被该门撤销的 202/202 帧**全部**由
+# obstacle 合取项触发，n_off_mask（观测到但不在可行驶掩码上）中位 0——即没有一帧是
+# 因为"中心不在可行驶面上"被撤销的。而 obstacle 层是 BEV 头的预测
+# （fsd_stack.py: `grid.obstacle[:] = (out.bev >= 0.6)`），于是该门在实车链上退化成
+# "BEV 头在车道中心误报障碍 → 撤掉整条车道" → plan_blocked=no_perception_lane
+# （119-175 帧/次）→ 无路径 → 停车，正是路径可用率只有 ~20-35% 的直接机制。
+# 打开后：车道接受只按可行驶掩码判定；obstacle 证据保留在诊断里，且所有**路径级**
+# 检查（path_blocked/占位、车体扫掠、风险层）一字不动。
+LANE_PAVEMENT_GATE_NO_OCC = os.environ.get(
+    "BEAMNG_LANE_PAVEMENT_GATE_NO_OCC", "0") != "0"
 
 
 def own_lane_beside_divider(markings, pos, heading, route_ref, grid,
@@ -430,7 +441,8 @@ def _median_lat_vs_ref(pts, ref, pos) -> float | None:
 
 def _drivable_fraction(center, grid, *, pos=None,
                        detail: dict | None = None,
-                       near_m: float = 8.0) -> tuple[float, int]:
+                       near_m: float = 8.0,
+                       ignore_obstacle: bool = False) -> tuple[float, int]:
     """(fraction of sampled centre points on observed-drivable, samples).
 
     ``detail`` (diagnostics only, optional): when given, it is filled with
@@ -481,11 +493,14 @@ def _drivable_fraction(center, grid, *, pos=None,
     blocked = np.zeros(int(seen.sum()), dtype=bool)
     if occ is not None and getattr(occ, "size", 0) and occ.shape == drv.shape:
         blocked = occ[rr[seen], cc[seen]] != 0
-        good = np.logical_and(good, ~blocked)
+        if not ignore_obstacle:
+            good = np.logical_and(good, ~blocked)
     if detail is not None:
         _d = {"n": int(seen.sum()), "n_unobserved": int((~seen).sum()),
               "n_obstacle": int(blocked.sum()),
-              "n_off_mask": int((~good & ~blocked).sum())}
+              "n_off_mask": (int((~good).sum()) if ignore_obstacle
+                             else int((~good & ~blocked).sum())),
+              "obstacle_veto": (not ignore_obstacle)}
         if pos is not None:
             _p = np.asarray(pos, dtype=float).ravel()[:2]
             _dpts = pts_in[seen]
@@ -966,8 +981,9 @@ def select_lane_reference(
         # drivable surface.  No grid / no observed evidence abstains
         # (recorded), and the check can only withdraw.
         _drv_detail: dict = {}
-        _drv_frac, _drv_n = _drivable_fraction(lane_ref, grid, pos=pos,
-                                              detail=_drv_detail)
+        _drv_frac, _drv_n = _drivable_fraction(
+            lane_ref, grid, pos=pos, detail=_drv_detail,
+            ignore_obstacle=LANE_PAVEMENT_GATE_NO_OCC)
         _drv_checked = bool(_drv_n >= 3)
         if _drv_checked and _drv_frac < DIVIDER_DRIVABLE_MIN_FRAC:
             _warn(warn, "lane_off_drivable",

@@ -858,3 +858,41 @@ def test_drivable_fraction_detail_survives_points_outside_the_grid():
     # 观测层为空 -> 弃权（0 样本），不是"没铺装"
     grid.observed[:] = 0
     assert _drivable_fraction(center, grid)[1] == 0
+
+
+def test_pavement_gate_can_ignore_the_bev_obstacle_layer():
+    """F-E：铺装门问的是"在不在观测到的可行驶面上"。
+
+    实测（2 次 town、415 帧）：被撤销的 202/202 帧全部由 obstacle 合取项触发，
+    n_off_mask 中位 0 —— obstacle 层是 BEV 头的预测，不该否决"车道在哪"。
+    默认关（obstacle 项照旧参与）；打开后只按可行驶掩码判定，且 obstacle 证据
+    仍留在诊断字段里。
+    """
+    import numpy as _np
+    from beamng_autopilot.occupancy import OccupancyGrid
+    from beamng_autopilot.lane.reference import _drivable_fraction
+
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.origin = (0.0, 0.0)
+    grid.heading = 0.0
+    grid.drivable[:] = 0
+    grid.drivable[:, 26:36] = 1          # 中心带是可行驶的
+    grid.observed[:] = 0
+    grid.observed[:, 26:36] = 1
+    grid.obstacle[:] = 0
+    grid.obstacle[:, 29:33] = 1          # BEV 头在中心误报一片障碍
+    center = _np.column_stack([_np.linspace(0, 25, 26), _np.zeros(26)])
+    d1: dict = {}
+    frac1, n1 = _drivable_fraction(center, grid, pos=(0.0, 0.0), detail=d1)
+    assert frac1 < 0.6, "默认：obstacle 项参与 -> 撤销"
+    assert d1["obstacle_veto"] is True and d1["n_obstacle"] > 0
+    d2: dict = {}
+    frac2, n2 = _drivable_fraction(center, grid, pos=(0.0, 0.0), detail=d2,
+                                   ignore_obstacle=True)
+    assert frac2 >= 0.6, "打开后：只按可行驶掩码 -> 接受"
+    assert d2["obstacle_veto"] is False
+    assert d2["n_obstacle"] > 0, "obstacle 证据仍留在诊断里"
+    # 真的不在可行驶面上时，两种设置都必须撤销（这条门没被架空）
+    center_off = _np.column_stack([_np.linspace(0, 25, 26), _np.full(26, 10.0)])
+    assert _drivable_fraction(center_off, grid, pos=(0.0, 10.0),
+                              ignore_obstacle=True)[0] < 0.6
