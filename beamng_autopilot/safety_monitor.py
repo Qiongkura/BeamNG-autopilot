@@ -191,6 +191,22 @@ ROAD_RECOVER_CONFIRM_S = float(
 PATH_HOLD_MAX_LAT_M = 2.5     # ego may not drift this far off the held path
 PATH_HOLD_MIN_AHEAD_M = 4.0   # the held path must still reach this far ahead
 PATH_HOLD_MIN_LEN_M = 6.0     # minimum usable offered trajectory length
+# --- bounded STATIONARY RECENTRE (option ②, single factor, default OFF) ----
+# Measured 2026-10-06 (12 town runs, 512 "planned vehicle body crosses" frames):
+# 96% of those frames have the car STATIONARY, the CURRENT body is inside the
+# lane in 512/512, and the planned sweep crosses at a median 2.50 m (509/512 in
+# 2-4 m, i.e. just inside the 4 m hard threshold) -- so a car parked crooked and
+# 0.86 m off the lane centre is refused every path and can never re-centre:
+# a static deadlock (stall_frac 0.93-1.0 across every arm measured).
+# With the switch ON a stationary car whose CURRENT body is inside the lane may
+# creep (minimal-risk speed x 0.5) while the crossing point is still at least
+# STATIONARY_RECENTRE_MIN_CLEAR_M ahead; a current crossing, a closer crossing,
+# a non-perception reference or stale sensors keep the original hard stop, and
+# the moment the car moves faster than STATIONARY_RECENTRE_MAX_SPEED_MPS the
+# exception stops applying, so it cannot be used to drive through a crossing.
+STATIONARY_RECENTRE = os.environ.get("BEAMNG_STATIONARY_RECENTRE", "0") != "0"
+STATIONARY_RECENTRE_MAX_SPEED_MPS = 0.3
+STATIONARY_RECENTRE_MIN_CLEAR_M = 2.0
 # --- hold window bounded by the T09 OBSERVATION contract (single factor) ---
 # Measured 2026-10-06 (town acceptance, 4 runs + 2 diagnostic runs): the
 # bounded hold was offered 24-50 times per run but reused on 1-5 frames, and
@@ -233,6 +249,7 @@ ARBITRATION_RULES: tuple[str, ...] = (
     "path_grazes",                   # degraded
     "lane_boundary_recovery",        # degraded
     "planned_boundary_crossing",     # degraded
+    "stationary_recentre",           # degraded
     "body_crosses_boundary",         # minimal_risk
     "path_off_lane",                 # minimal_risk
     "path_near_lane_edge",           # degraded
@@ -254,6 +271,7 @@ RULE_WORST_LEVEL: dict[str, str] = {
     "path_grazes": "degraded",
     "lane_boundary_recovery": "degraded",
     "planned_boundary_crossing": "degraded",
+    "stationary_recentre": "degraded",
     "body_crosses_boundary": "minimal_risk",
     "path_off_lane": "minimal_risk",
     "path_near_lane_edge": "degraded",
@@ -278,6 +296,7 @@ _REASON_TO_RULE: dict[str, str] = {
     "path grazes obstacle": "path_grazes",
     "lane boundary recovery": "lane_boundary_recovery",
     "planned boundary crossing ahead": "planned_boundary_crossing",
+    "stationary recentre creep": "stationary_recentre",
     "current vehicle body crosses lane boundary": "body_crosses_boundary",
     "planned vehicle body crosses lane boundary": "body_crosses_boundary",
     "path off-lane": "path_off_lane",
@@ -1410,8 +1429,21 @@ class SafetyMonitor:
         if far_crossing:
             self._cap_verdict(v, self.min_risk_speed * 2.0,
                               "planned boundary crossing ahead")
+        v.rules_evaluated.append("stationary_recentre")
+        _ego_speed = (0.0 if ego_speed_mps is None else float(ego_speed_mps))
+        stationary_recentre = bool(
+            STATIONARY_RECENTRE
+            and not body_now_cross
+            and body_cross > 0.0
+            and float(body_cross) >= STATIONARY_RECENTRE_MIN_CLEAR_M
+            and _ego_speed <= STATIONARY_RECENTRE_MAX_SPEED_MPS
+            and lane_ref_src == REF_SENSOR
+            and not stale_sensor and not stale_planner)
+        if stationary_recentre:
+            self._cap_verdict(v, self.min_risk_speed * 0.5,
+                              "stationary recentre creep")
         v.rules_evaluated.append("body_crosses_boundary")
-        if (body_now_cross or body_cross > 0.0) and not recovery and not far_crossing:
+        if (body_now_cross or body_cross > 0.0) and not recovery and not far_crossing                 and not stationary_recentre:
             v.level = "minimal_risk"
             v.reason = ("current vehicle body crosses lane boundary"
                         if body_now_cross

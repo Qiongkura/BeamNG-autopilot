@@ -740,3 +740,106 @@ def test_contact_risk_updates_the_final_trace_winner():
     assert "obstacle_risk" in v.rules_evaluated
     assert v.level == "minimal_risk"
     assert v.masked_hard_rules == []
+
+
+# ---------------------------------------------------------------------------
+# Bounded STATIONARY RECENTRE (option ②, BEAMNG_STATIONARY_RECENTRE)
+#
+# Measured 2026-10-06 (12 town runs, 512 "planned vehicle body crosses" frames):
+# 96% stationary, current body inside in 512/512, crossing at median 2.50 m
+# (509/512 in 2-4 m) -> a car parked crooked is refused every path and can
+# never re-centre (stall_frac 0.93-1.0 in every arm measured).
+# ---------------------------------------------------------------------------
+
+def _sensor_scene(*, left_y: float = 1.5, pos=(0.0, 0.0), heading: float = 0.0):
+    """Strict scene WITH a perception lane reference (lane_ref set -> REF_SENSOR)."""
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.origin = (0.0, 0.0)
+    grid.heading = 0.0
+    xs = np.linspace(0, 30, 31)
+    route = np.column_stack([xs, np.zeros_like(xs)])
+    left = np.array([[0.0, left_y], [30.0, left_y]])
+    return Scene(pos=np.asarray(pos, dtype=float), heading=heading, grid=grid,
+                 route=route, lane_ref=route, lane_left=left, lane_right=None,
+                 strict_perception=True)
+
+
+def _crossing_path(y: float = 0.55):
+    return np.column_stack([np.linspace(0, 15, 20), np.full(20, y)])
+
+
+def test_stationary_recentre_creeps_instead_of_a_static_stop(monkeypatch) -> None:
+    from beamng_autopilot import safety_monitor as sm
+    monkeypatch.setattr(sm, "STATIONARY_RECENTRE", True)
+    mon = SafetyMonitor(max_speed=6.0)
+    v = mon.evaluate(_sensor_scene(), _crossing_path(),
+                     ego_speed_mps=0.0)
+    assert v.body_cross_current is False
+    assert v.body_cross_planned is True
+    assert v.first_crossing_distance_m >= sm.STATIONARY_RECENTRE_MIN_CLEAR_M
+    assert v.level == "degraded", "静止 + 当前车体在内 -> 蠕行而不是锁死"
+    assert v.reason == "stationary recentre creep"
+    assert v.target_speed == pytest.approx(mon.min_risk_speed * 0.5)
+    assert v.effective_rule == "stationary_recentre"
+
+
+def test_stationary_recentre_does_not_apply_when_moving(monkeypatch) -> None:
+    """一旦车动起来（> 0.3 m/s），例外失效——不能用它带着越界扫掠行驶。"""
+    from beamng_autopilot import safety_monitor as sm
+    monkeypatch.setattr(sm, "STATIONARY_RECENTRE", True)
+    mon = SafetyMonitor(max_speed=6.0)
+    v = mon.evaluate(_sensor_scene(), _crossing_path(), ego_speed_mps=1.5)
+    assert v.level == "minimal_risk"
+    assert v.reason == "planned vehicle body crosses lane boundary"
+
+
+def test_stationary_recentre_does_not_apply_to_a_close_crossing(monkeypatch) -> None:
+    """越界点必须仍在 N m 之外（这里是 1.5 m < 2.0 m）。"""
+    from beamng_autopilot import safety_monitor as sm
+    monkeypatch.setattr(sm, "STATIONARY_RECENTRE", True)
+    mon = SafetyMonitor(max_speed=6.0)
+    v = mon.evaluate(_sensor_scene(left_y=1.5), _crossing_path(y=1.2),
+                     ego_speed_mps=0.0)
+    assert v.first_crossing_distance_m < sm.STATIONARY_RECENTRE_MIN_CLEAR_M
+    assert v.level == "minimal_risk"
+    assert v.reason == "planned vehicle body crosses lane boundary"
+
+
+def test_stationary_recentre_still_stops_on_a_current_crossing(monkeypatch) -> None:
+    """当前车体已越界：例外绝不适用（真实侵占立即停车）。"""
+    from beamng_autopilot import safety_monitor as sm
+    monkeypatch.setattr(sm, "STATIONARY_RECENTRE", True)
+    mon = SafetyMonitor(max_speed=6.0)
+    sc = _sensor_scene(left_y=0.5, pos=(5.0, 0.4))
+    v = mon.evaluate(sc, _crossing_path(), ego_speed_mps=0.0)
+    assert v.body_cross_current is True
+    assert v.level == "minimal_risk"
+    assert v.reason == "current vehicle body crosses lane boundary"
+
+
+def test_stationary_recentre_needs_a_perception_reference(monkeypatch) -> None:
+    """没有感知车道参考（REF_NONE）时不适用——铁律：横向参考只来自感知。"""
+    from beamng_autopilot import safety_monitor as sm
+    monkeypatch.setattr(sm, "STATIONARY_RECENTRE", True)
+    mon = SafetyMonitor(max_speed=6.0)
+    grid = OccupancyGrid(60, 60, 0.5)
+    grid.origin = (0.0, 0.0)
+    grid.heading = 0.0
+    xs = np.linspace(0, 30, 31)
+    route = np.column_stack([xs, np.zeros_like(xs)])
+    sc = Scene(pos=np.array([0.0, 0.0]), heading=0.0, grid=grid, route=route,
+               lane_ref=None, lane_left=np.array([[0.0, 1.5], [30.0, 1.5]]),
+               strict_perception=True)
+    v = mon.evaluate(sc, _crossing_path(), ego_speed_mps=0.0)
+    assert v.level == "minimal_risk"
+
+
+def test_stationary_recentre_off_keeps_the_hard_stop(monkeypatch) -> None:
+    """默认关：静止 + 当前车体在内 + 越界点在 2.5 m 之外 —— 仍然立即停车。"""
+    from beamng_autopilot import safety_monitor as sm
+    monkeypatch.setattr(sm, "STATIONARY_RECENTRE", False)
+    mon = SafetyMonitor(max_speed=6.0)
+    v = mon.evaluate(_sensor_scene(), _crossing_path(), ego_speed_mps=0.0)
+    assert v.level == "minimal_risk"
+    assert v.target_speed == 0.0
+    assert v.reason == "planned vehicle body crosses lane boundary"
