@@ -2885,6 +2885,12 @@ class FSDriveSession:
                             scene, best, observation_age_s=_obs_age,
                             travelled_since_obs_m=getattr(
                                 self, "_hold_travel_m", None))
+                # 本 tick 实测的"路径 vs 车道参考"（无符号），供**下一 tick** 的
+                # F-C 门使用（本 tick 的门在评估之前就要用，只能取上一 tick 的
+                # 实测值——偏差是持续的地图车道偏置，不是逐帧噪声）。必须在
+                # verdict 之后、且**每个 tick** 都赋值：晚段那段只在"已选中路径"
+                # 的 tick 才跑，实测 0/4 帧拿到值 → 门全弃权（2026-10-06 A/B）。
+                self._last_lane_dev_m = getattr(verd, "lane_dev_m", None)
                 # Bounded PATH_HOLD offer (plan phase B): cache the FSD
                 # path whenever this tick's verdict is drivable on FRESH
                 # sensors - the hold is the bounded reuse of exactly this
@@ -3356,9 +3362,6 @@ class FSDriveSession:
                 # obstacle/unsafe fallback) must not get a superimposed
                 # centring pull - the fallback path already carries its own
                 # avoidance shape, so the shift just holds then decays.
-                # 本 tick 实测的"路径 vs 车道参考"（无符号），供下一 tick 的
-                # F-C 门使用——偏差是持续的地图车道偏置，不是逐帧噪声。
-                self._last_lane_dev_m = getattr(verd, "lane_dev_m", None)
                 _plc_shift = 0.0
                 _plc_desired = None
                 plc_rejected = False
