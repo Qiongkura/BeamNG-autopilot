@@ -232,7 +232,7 @@ is then gated on the protocol hash, and a single confirmation **consumes** the s
 successful confirmation the set may not be read again, and a refused access is recorded in a ledger
 without consuming it. The confirmation program evaluates the candidate on the sealed frames and
 records which quantities were measured; quantities that were not measured are recorded as UNKNOWN
-and may not be reported as confirmed.
+and may not be reported as confirmed. The full flow, with the live seal, is shown in {@fig:oneshot}.
 
 ![One-shot final-confirmation flow (schematic) with the live seal.](fig34_final_set_flow.png){#fig:oneshot}
 
@@ -259,9 +259,7 @@ The limited-class pool is selected, not sampled: candidate scenes are ranked by 
 road-disjoint set of 200 frames (96 line-bearing) is sealed for the one-shot confirmation of
 Section V-D.
 
-![Spatial-isolation audit: frames per candidate directory and their verdict against the development anchors.](fig41_isolation_audit.png){#fig:isolation}
-
-Disjointness is audited with pose, not with names: {@fig:isolation} lists every candidate collection against the development anchors under a 50 m buffer, with a recorded verdict per directory. The same machinery rejected the first two compositions of the sealed set, which is why the sealed composition also carries a content-level audit ({@fig:overlap}).
+Disjointness is audited with pose, not with names: every candidate collection is checked against the development anchors under a 50 m buffer and gets a recorded verdict (supplement). The same machinery rejected the first two compositions of the sealed set, which is why the sealed composition also carries a content-level audit ({@fig:overlap}).
 
 **Arms.** All segmentation arms share one initialisation, one budget and one recipe; they differ only in training-pool
 composition (the dose arms) or in a single post-processing factor (protocol components). Composition is explicit: a
@@ -285,11 +283,9 @@ UNKNOWN never releases a gate.
 **Discipline.** Every factor in Section V was pre-registered with its reading rule; no threshold was
 relaxed at any point;
 
-![Recorded GPU-time ledger by task family (three logged days).](fig35_gpu_ledger.png){#fig:ledger}
-
 ![Timing hygiene: repeated inference measurements on a quiet machine.](fig36_timing_retest.png){#fig:timing}
 
-Experimental cost and timing hygiene are recorded rather than estimated: {@fig:ledger} is the machine's own GPU-time ledger for the days on which it was enabled, and {@fig:timing} is the repeated-measurement protocol used before any latency claim (quiet-machine precondition, repeated runs, smaller value taken — a leaked simulator instance once inflated p95 by a factor of 7.6). every verdict file, manifest and per-frame telemetry trace is retained, and
+Timing hygiene is recorded rather than estimated: {@fig:timing} is the repeated-measurement protocol used before any latency claim (quiet-machine precondition, repeated runs, smaller value taken — a leaked simulator instance once inflated p95 by a factor of 7.6). every verdict file, manifest and per-frame telemetry trace is retained, and
 every figure in this paper is regenerated from those files by two scripts.
 
 # V. Results
@@ -339,13 +335,7 @@ gate acting exactly as designed: precision rises sharply (dev 0.650 → 0.884; l
 0.387 → 0.650) and IoU improves on the limited-class set (0.347 → 0.532) at the cost of recall
 (dev 0.766 → 0.595).
 
-![Instance-level reference coverage versus lateral offset across the certified limited-class scenes.](fig19_instance_coverage.png){#fig:instcov}
-
-![Parallel-merge scan: candidates merged away and kept, with the identity consequence.](fig13_parallel_scan.png){#fig:parscan}
-
-![Threshold sensitivity of the mask post-processing (keep and elongation).](fig15_threshold_scans.png){#fig:thresh}
-
-The instance-level probe ({@fig:instcov}) explains why the appearance gate can afford to be aggressive: across the certified limited-class scenes the reference instances are covered by annotation at essentially 1.0 regardless of lateral offset, so a surviving candidate is still measured against complete truth. {@fig:parscan} shows the other post-processing lever: the parallel-merge radius removes near-duplicate same-side candidates (dev 477 → 166 kept as the radius tightens from 6.0 m to 3.0 m) at a cost in identity, which is why the adopted radius is 1.0 m rather than the aggressive end of the sweep. {@fig:thresh} sweeps the two mask thresholds; the negative side is not measurable on this pool (no eligible negative frames), which the figure states instead of plotting a zero.
+The instance-level probe explains why the appearance gate can afford to be aggressive: across the certified limited-class scenes the reference instances are covered by annotation at essentially 1.0 regardless of lateral offset, so a surviving candidate is still measured against complete truth. The other post-processing lever, the parallel-merge radius, removes near-duplicate same-side candidates (dev 477 → 166 kept as the radius tightens from 6.0 m to 3.0 m) at a cost in identity, which is why the adopted radius is 1.0 m rather than the aggressive end of the sweep. The two mask thresholds were swept as well; on this pool the negative side is not measurable (no eligible negative frames), so that sweep is reported in the supplement rather than plotted as a zero.
 
 ![Boundary map: dilation buys recall and pays precision; the limited-class set pays about three times more.](fig2_boundary_map.png){#fig:boundary}
 
@@ -358,32 +348,20 @@ composition, one seed), 0.711 (4×, six seeds, 0.667–0.732), **0.763 (6×, one
 (8.5×, six seeds, 0.655–0.744). The response is non-monotonic with a peak at 6× and a return to
 baseline at 8.5×; the 6× arm is the delivered candidate's composition.
 
-![Training curves by family (median with IQR band; line-masked runs are annotated).](fig21_training_curves.png){#fig:curves}
-
-{@fig:curves} summarises the training history of the programme: 321 recorded runs across 44 families, aggregated as median curves with interquartile bands. Two properties matter for reading the ablations: families converge within 20–40 epochs of the 120-epoch budget, and families whose line channel was masked sit at zero line IoU by construction rather than by failure (annotated in the figure), so their curves are not negative results. {@fig:lateral} sweeps the lateral
+The programme's training history (321 recorded runs across 44 families, supplement) converges within 20–40 epochs of the 120-epoch budget, and families whose line channel was masked sit at zero line IoU by construction rather than by failure (annotated in the figure), so their curves are not negative results. {@fig:lateral} sweeps the lateral
 scope instead: tightening it from 6.0 m to 3.0 m raises identity (dev 0.582 → 0.713; limited-class
 0.581 → 0.758) and removes candidates (477 → 166 and 166 → 127), while role agreement is flat — the
 lateral scope is an identity lever, not a role lever. Two further single factors were rejected:
-stochastic weight averaging over the last five epochs rescued no seed ({@fig:swa}) and a Tversky
+stochastic weight averaging over the last five epochs rescued no seed and a Tversky
 loss-weight arm tripled the false-positive frame rate on the negative side (11.5% → 51.9% of
 eligible frames; 329 → 1730 false-positive pixels; maximum component 320 → 808 px), which is why the
 delivered arm keeps the balanced loss.
 
-![Tversky β=0.8 arm versus base on the negative side.](fig17_beta08.png){#fig:beta08}
-
-![Negative-side diagnostics across all recorded pixel arms.](fig20_negatives_family.png){#fig:negfam}
-
-![Dose response across five metrics (per seed and mean).](fig9_dose_metrics.png){#fig:dosemetrics}
-
-![Pairing availability under the two definitions, per run.](fig37_pairing_compare.png){#fig:pairing}
-
-{@fig:beta08} is the rejected arm in detail: the same checkpoint's negative side triples its false-positive frame rate and its largest false component grows from 320 to 808 px — the mechanism behind the rejection. {@fig:negfam} places every recorded pixel arm on one plane (false-positive frame rate versus pixel fraction, marker size = largest component) and shows that the arms cluster rather than spread: no single factor moves the negative side by an order of magnitude, which is why the negative-example dose had to be varied instead. {@fig:dosemetrics} extends the dose response of Section V-C to five metrics: identity and role move with the dose while coverage and the off-road candidate fraction barely do. Finally, {@fig:pairing} quantifies the availability cost of the adopted definition at the pairing stage itself: 3 frames lost in one run and 4 in each of the others, out of 117.
+The rejected Tversky arm triples its false-positive frame rate (11.5% → 51.9% of eligible frames) and its largest false component grows from 320 to 808 px — the mechanism behind the rejection. Across every recorded pixel arm the negative-side readings cluster rather than spread (supplement), which is why the negative-example dose had to be varied instead of a loss-weight knob. Extending the dose response to five metrics (supplement) shows that identity and role move with the dose while coverage and the off-road candidate fraction barely do. The availability cost of the adopted definition is also visible at the pairing stage itself: 3–4 paired frames lost per 117-frame run.
 
 ![Dose response of the candidate identity rate (per seed and mean).](fig3_dose_response.png){#fig:dose}
 
 ![Lateral-scope scan on both sets: identity and role versus threshold, with the number of retained candidates.](fig12_lateral_scan.png){#fig:lateral}
-
-![Rejected single factor: last-five-epoch weight averaging rescues no seed (paint-scope recall).](fig16_swa.png){#fig:swa}
 
 ## D. One-shot held-out confirmation
 
@@ -434,15 +412,7 @@ hard-stop threshold. The car is parked 0.86 m off the lane centre with its headi
 bearing, so the inflated body sweep of *any* forward path crosses the boundary within ~2.5 m: every
 path is refused, and the car can never re-centre. {@fig:deadlock} shows the anatomy.
 
-![Per-run time series: speed and path-to-lane deviation for a baseline run and a lane-gate run.](fig24_time_series.png){#fig:series}
-
-![Per-arm distributions of travelled distance and stall fraction across the three driving A/Bs.](fig25_arm_boxplots.png){#fig:boxes}
-
-![Per-frame lane-placement deviation in the closed-loop round (baseline versus adopted definition).](fig26_lane_dev.png){#fig:lanedev}
-
-![Safety-margin distributions over four acceptance runs.](fig27_safety_margins.png){#fig:margins}
-
-{@fig:series} shows what the stall fraction means per run: the speed trace is a series of short creeps separated by full stops, while the path-to-lane deviation is measured in only a fraction of frames (the annotation states how many). {@fig:boxes} gives arm-level distributions rather than medians alone, and {@fig:lanedev} shows the placement distribution the deadlock analysis implies: the adopted definition concentrates the deviation while the baseline leaves a heavy tail beyond 2 m. {@fig:margins} reports the safety margins measured in the same runs (closest obstacle, minimum time-to-collision, path occupancy) — the evidence behind the statement that the acceptance failures are availability failures, not safety failures.
+Per-run traces (speed and path-to-lane deviation), arm-level distributions and the lane-placement distributions are in the supplement; the safety margins measured in the same runs (closest obstacle, minimum time-to-collision, path occupancy) are what backs the statement that the acceptance failures are availability failures, not safety failures.
 
 ![Driving hard-target checklist over the most recent town runs (green = pass, red = fail; an unmeasured target counts as fail).](fig22_gate_heatmap.png){#fig:heatmap}
 
@@ -460,11 +430,9 @@ perception arm produced no separation on path availability (0.179 → 0.200, ove
 worse worst case (36 → 49). All five verdicts follow the pre-registered maximum rule and are reported
 as negative; none of the factors was adopted.
 
-![Driving single-factor ladder: travelled distance and stall fraction per arm, with worst-case body-crossing frames.](fig6_factor_ladder.png){#fig:ladder2}
-
 ![Why the car does not move: safety-arbitration reasons over 2443 settled frames.](fig23_reason_hist.png){#fig:reasons}
 
-{@fig:ladder2} shows the ladder in one view: the lane-gate factor doubles the distance travelled and the recentre factor improves the worst-case crossing count most, yet the stall fraction stays above 0.93 in every arm. {@fig:reasons} is the arbitration histogram behind that number: "no drivable path" is the largest single reason (383 of 2443 settled frames) followed by the planned body-sweep crossing (312), which together account for the bulk of the stationary time.
+The arbitration histogram is the evidence behind the stall fraction: "no drivable path" is the largest single reason (383 of 2443 settled frames) followed by the planned body-sweep crossing (312), which together account for the bulk of the stationary time.
 
 | Factor | Mechanism engaged? | Travelled (median) | Stall (median) | Worst-case body-cross frames (control → factor) | Verdict |
 |---|---|---|---|---|---|
