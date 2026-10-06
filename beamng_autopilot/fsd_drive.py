@@ -2741,6 +2741,27 @@ class FSDriveSession:
                 # safety lateral check while the planner used the own lane).
                 # The rebuild below survives only as the fallback for stubs
                 # that publish no Scene (docs/fsd_realism.md §2/§4).
+                # T09 observation-contract inputs for the bounded hold
+                # (BEAMNG_HOLD_OBS_WINDOW): the age of the last REAL
+                # perception observation and how far the car has driven
+                # since it.  Computed BEFORE the arbitration because the
+                # monitor consults them when a tick loses its path; the
+                # audit below reuses the same numbers instead of counting
+                # the travel twice.
+                try:
+                    _sh0 = out.meta.get("lane_shadow") or {}
+                    _obs_age = (_sh0.get("age_since_update_s")
+                                if isinstance(_sh0, dict) else None)
+                    if _obs_age is None:
+                        _obs_age = out.meta.get("line_evidence_age_s")
+                    if _obs_age is not None and float(_obs_age) <= 0.2:
+                        self._hold_travel_m = 0.0
+                    else:
+                        self._hold_travel_m = (getattr(self, "_hold_travel_m",
+                                                       0.0)
+                                               + max(0.0, float(v)) * dt)
+                except Exception:
+                    _obs_age = None
                 _strict_perc = _strict_lane
                 scene = getattr(out, "scene", None)
                 if scene is not None:
@@ -2748,7 +2769,10 @@ class FSDriveSession:
                     verd = monitor.evaluate(
                         scene, best, planner_age_s=0.0,
                         snapshot_age_s=_sensor_snapshot_age(out),
-                        ego_speed_mps=v)
+                        ego_speed_mps=v,
+                        observation_age_s=_obs_age,
+                        travelled_since_obs_m=getattr(
+                            self, "_hold_travel_m", None))
                 else:
                     grid = OccupancyGrid(stack.grid_n, stack.grid_n,
                                          stack.grid_res,
@@ -2791,7 +2815,10 @@ class FSDriveSession:
                             ego_speed_mps=v)
                     else:
                         scene = Scene(pos=pos, heading=heading)
-                        verd = monitor.evaluate(scene, best)
+                        verd = monitor.evaluate(
+                            scene, best, observation_age_s=_obs_age,
+                            travelled_since_obs_m=getattr(
+                                self, "_hold_travel_m", None))
                 # Bounded PATH_HOLD offer (plan phase B): cache the FSD
                 # path whenever this tick's verdict is drivable on FRESH
                 # sensors - the hold is the bounded reuse of exactly this
@@ -3008,18 +3035,14 @@ class FSDriveSession:
                         HOLD_JOINT_GATE, audit_hold)
                     from beamng_autopilot.obstacle_risk import (
                         RISK_BRAKE_DECEL_MPS2)
+                    # ``_obs_age`` / ``_hold_travel_m`` were computed before
+                    # the arbitration (the monitor consults the same T09
+                    # contract); re-deriving them here would count the
+                    # travel twice.
                     _sh = out.meta.get("lane_shadow") or {}
-                    _obs_age = (_sh.get("age_since_update_s")
-                                if isinstance(_sh, dict) else None)
                     if _obs_age is None:
                         _obs_age = out.meta.get("line_evidence_age_s")
-                    # accumulated travel since the last fresh observation
-                    if getattr(verd, "fresh_reference", False) or                             (_obs_age is not None and _obs_age <= 0.2):
-                        self._hold_travel_m = 0.0
-                    else:
-                        self._hold_travel_m = (getattr(self, "_hold_travel_m",
-                                                       0.0)
-                                               + max(0.0, float(v)) * dt)
+
                     # A filter that has not measured yet carries INIT
                     # covariances, not measured ones: reporting those as a
                     # failed condition would blame the car for a number
