@@ -37,6 +37,9 @@ def main() -> int:
                          "with --attach this forces a scenario load to "
                          "switch the running instance to the map)")
     ap.add_argument("--seconds", type=float, default=20.0)
+    ap.add_argument("--max-wall-s", type=float, default=None,
+                    help="整轮墙钟上限（秒）：放置阶段超限即放弃并正常收尾；默认 None=不限"
+                         "（strict+sensor 的放置循环按设计不退出，扫位姿时必须设上限）")
     ap.add_argument("--speed", type=float, default=6.0)
     ap.add_argument("--steps", type=int, default=3)
     # 536x403 = segmentation training resolution: live frames feed the
