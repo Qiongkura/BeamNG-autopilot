@@ -769,8 +769,14 @@ sealed-set records and checkpoints live under `logs/` in the author's working co
 tracked by that repository (the ignore rules exclude it). Every number in this paper is regenerated
 from those local artefacts by the scripts named in Appendix A, and `CLAIMS_20261007.md` lists, for
 each claim, the exact input file, protocol, seed set and scope it rests on, so the mapping can be
-checked file by file. A public archive of the artefacts is \textbf{not yet available}; requests should go
-to the author. Per-epoch training snapshots and superseded run directories removed in a storage pass
+checked file by file. A public archive of the artefacts is \textbf{not yet available}; requests should go to the author. What
+does exist is the packaged evidence set itself: `scripts/m5_paper_evidence_archive.py` collects the
+minimal artefact set behind every number in this paper into one archive (531 files, 20 MB) together
+with a machine-readable manifest of paths, sizes and SHA-256 digests, under `logs/paper_release/` in
+the author's working copy. That directory is excluded from the public repository by the same rule as
+the rest of `logs/`, so the manifest doubles as the checklist for a request: it names exactly which
+files a given claim needs, and the archive can be deposited unchanged if a journal or a reader wants
+it. Per-epoch training snapshots and superseded run directories removed in a storage pass
 are listed in a machine-readable audit file (`logs/_cleanup_20261006.txt`), and that removal is why
 the balanced-seed dose comparison of Section V-C covers three of four doses.
 \section*{Acknowledgements}

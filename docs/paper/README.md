@@ -62,7 +62,10 @@ $edge = "C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe"
     "file:///I:/projects/beamng-autopilot/logs/paper_build/paper.html"
 # 中文正文与两份补充材料同理，只换 HTML 与输出名
 
-# 3) 投稿源包 + 静态检查（本机无 LaTeX 引擎，只做静态检查）
+# 3) 证据归档（论文每个数字的最小产物集 + SHA-256 清单，写到 logs\paper_release\）
+.venv\Scripts\python.exe scripts\m5_paper_evidence_archive.py
+
+# 4) 投稿源包 + 静态检查（本机无 LaTeX 引擎，只做静态检查）
 .venv\Scripts\python.exe scripts\m5_build_submission.py
 .venv\Scripts\python.exe scripts\m5_paper_texcheck.py docs\paper\submission\main.tex `
     docs\paper\submission\main_zh.tex docs\paper\submission\supplement.tex `
