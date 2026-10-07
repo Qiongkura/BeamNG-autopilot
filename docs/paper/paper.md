@@ -304,7 +304,7 @@ checkpoints under both post-processing settings and both scopes. Under the basel
 verdict fails identity on **both** sets (0.433 dev, 0.414 limited-class) and additionally precision (0.402)
 and role (0.674) on the limited-class set; under the adopted definition all five gates pass on both sets by
 the mean rule (coverage 0.956/0.861, identity 0.665/0.716, precision 0.894/0.659, paint recall 0.812/0.885,
-role 0.883/0.794). {@fig:c2}(a) shows the same numbers against the thresholds.
+role 0.883/0.793). {@fig:c2}(a) shows the same numbers against the thresholds.
 
 ![Definition sensitivity of the acceptance result: (a) gate metrics against the frozen thresholds for both protocol definitions, (b) the limited-class pool seed by seed under both definitions (x = below gate), (c) label- versus paint-scope recall with the non-paint fraction of label line pixels, (d) the same checkpoints under label- and surface-scope identity, where the two arms swap order.](figc2_definition_acceptance.png){#fig:c2}
 
@@ -335,7 +335,7 @@ Table II.
 | Dev (9 scenes, 117 frames) | baseline (label scope) | 0.952 | **0.433** | 0.610 | 0.736 | 0.868 |
 | Dev | adopted (paint scope) | 0.956 | 0.665 | 0.894 | 0.812 | 0.883 |
 | Limited-class (24 frames) | baseline (label scope) | 0.819 | **0.414** | **0.402** | 0.804 | **0.674** |
-| Limited-class | adopted (paint scope) | 0.861 | 0.716 | 0.659 | 0.885 | 0.794 |
+| Limited-class | adopted (paint scope) | 0.861 | 0.716 | 0.659 | 0.885 | 0.793 |
 
 TABLE: Table II. The recall gate re-tabulated: the same six checkpoints per pool, read under both
 post-processing settings and both scopes, with the number of seeds below the 0.70 threshold. The paint scope
@@ -638,10 +638,17 @@ human-revised, so its numbers are not directly comparable to the human-revised a
 held-out set would strengthen the definitional argument and is left to future work. The programme deliberately added **no
 new manual annotation** during the reported rounds, which bounds both the cost and the coverage.
 
-**Single simulator, single map link.** All perception data come from one simulator and, for the
-driving results, one town link. The definitional gap and the deadlock mechanism are measured on that
-link; their magnitude elsewhere is unknown. The offline sets span several certified scenes but not
-several maps.
+**Single simulator, single map.** All perception data come from one simulator and, for the perception
+results, one map. The controlled-scene generator derives its truth from that map's own road-marking
+decal materials and its camera-to-world projection is calibrated per map, so a second map is a
+scoped piece of work rather than a rerun: it needs (i) equivalent marking materials on that map,
+(ii) its own projection calibration, validated against the same geometry gates, and (iii) a
+certification pass on the generated batch. Native maps do not substitute for this: the one
+collection we ran on a different map (utah, 77 frames, ring of four camera mounts) contains **no
+line-class annotation pixels at all** in the forward mount, which is precisely why the generator
+exists. The definitional results should therefore be read as measured on one map; their direction,
+but not their magnitude, is reproduced on a second model (Section V-B). The driving results come
+from one town link as well.
 
 **Six seeds, and unequal seed counts.** Acceptance uses six seeds; composition arms are reported with their
 seed counts (base 1, 4× 6, 6× 1, 8.5× 6), and the 6× dose point rests on the single seed that was delivered.
@@ -777,11 +784,14 @@ now **consumed**: any further confirmation requires a newly sealed set. *Next ex
 larger human-revised anchor and a newly sealed human-revised held-out set, which would also let
 the confirmation's numbers be compared against the acceptance numbers on the same truth rung.
 
-**8. Scale and external validity.** All results come from one simulator, the driving results from
-one town link, the acceptance from six seeds, and the composition arms from one to six seeds
-(the 6× dose point rests on a single seed). No real-vehicle data were used. The dose conclusions
-are therefore about a peak location, not an effect size, and the definitional findings should be
-re-measured on a second map before being treated as general.
+**8. Second map (scoped, not built).** The definitional findings are measured on one map. A second map
+is the single most valuable remaining experiment and its blockers are now identified rather than
+assumed: the generator needs that map's marking materials, a per-map camera-to-world calibration
+validated against the same geometry gates, and a certification pass on its batch; a plain
+collection does not help because native maps carry no line-class annotation (measured on utah: zero
+line pixels in the forward mount over 77 frames). With those three pieces in place the same frozen
+protocol can be applied unchanged, and the scope sensitivity re-measured without new manual
+annotation.
 
 **9. Instance vocabulary for harder geometry.** The counting contract's role vocabulary
 (left/right, near/far) is defined for lane markings on a single carriageway; junctions, 3-D lane
