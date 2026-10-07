@@ -638,17 +638,20 @@ human-revised, so its numbers are not directly comparable to the human-revised a
 held-out set would strengthen the definitional argument and is left to future work. The programme deliberately added **no
 new manual annotation** during the reported rounds, which bounds both the cost and the coverage.
 
-**Single simulator, single map.** All perception data come from one simulator and, for the perception
-results, one map. The controlled-scene generator derives its truth from that map's own road-marking
-decal materials and its camera-to-world projection is calibrated per map, so a second map is a
-scoped piece of work rather than a rerun: it needs (i) equivalent marking materials on that map,
-(ii) its own projection calibration, validated against the same geometry gates, and (iii) a
-certification pass on the generated batch. Native maps do not substitute for this: the one
-collection we ran on a different map (utah, 77 frames, ring of four camera mounts) contains **no
-line-class annotation pixels at all** in the forward mount, which is precisely why the generator
-exists. The definitional results should therefore be read as measured on one map; their direction,
-but not their magnitude, is reproduced on a second model (Section V-B). The driving results come
-from one town link as well.
+**Single simulator, single map, and a measured reason for it.** All perception data come from one
+simulator and the perception results from one map, because engine-derived line truth is dense on
+that map only. We measured the alternative rather than assuming it: of the twenty maps installed
+with this simulator, three declare line-like decal materials at all, and of those, a controlled
+generation batch on `west_coast_usa` (six scenes, its own materials and an automatically fitted
+projection) was isolated 6/6 because the engine's annotation channel reported **zero** line-class
+pixels for the generated lines; a native collection on the same map (30 frames, forward camera)
+carries 803 line-class pixels in total (about 27 per frame), against 0 in the forward mount on
+`utah` (77 frames) — two orders of magnitude below the density the pipeline's certification gate
+requires. A second map therefore needs a *different truth channel* (annotation work on that map,
+or an engine-side class mapping), not a rerun of the generator. The generator itself is ready for
+one: it now takes per-map material profiles. The definitional results should be read as measured
+on one map; their direction, but not their magnitude, is reproduced on a second model
+(Section V-B). The driving results come from one town link as well.
 
 **Six seeds, and unequal seed counts.** Acceptance uses six seeds; composition arms are reported with their
 seed counts (base 1, 4× 6, 6× 1, 8.5× 6), and the 6× dose point rests on the single seed that was delivered.
@@ -784,14 +787,16 @@ now **consumed**: any further confirmation requires a newly sealed set. *Next ex
 larger human-revised anchor and a newly sealed human-revised held-out set, which would also let
 the confirmation's numbers be compared against the acceptance numbers on the same truth rung.
 
-**8. Second map (scoped, not built).** The definitional findings are measured on one map. A second map
-is the single most valuable remaining experiment and its blockers are now identified rather than
-assumed: the generator needs that map's marking materials, a per-map camera-to-world calibration
-validated against the same geometry gates, and a certification pass on its batch; a plain
-collection does not help because native maps carry no line-class annotation (measured on utah: zero
-line pixels in the forward mount over 77 frames). With those three pieces in place the same frozen
-protocol can be applied unchanged, and the scope sensitivity re-measured without new manual
-annotation.
+**8. Second map: attempted, and blocked by the truth channel.** The definitional findings are measured
+on one map. We attempted the second map rather than only proposing it, and the blocker is now
+measured: engine-derived line truth exists on one of the twenty installed maps. On `west_coast_usa`
+a controlled batch was generated with that map's own materials and its own fitted projection and was
+isolated 6/6 (annotation reported zero line-class pixels for the generated lines), while a native
+collection there carries about 27 line-class pixels per frame and `utah` carries none. Two routes
+remain, and both are real work rather than a rerun: annotate a new map (which breaks the
+no-new-manual-annotation property this programme has kept), or extend the engine-side class mapping
+so that a second map's markings are annotated as line. Until one is done, the scope sensitivity
+should be treated as measured on one map, with its direction reproduced on a second model.
 
 **9. Instance vocabulary for harder geometry.** The counting contract's role vocabulary
 (left/right, near/far) is defined for lane markings on a single carriageway; junctions, 3-D lane
