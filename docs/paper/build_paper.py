@@ -173,11 +173,14 @@ def emit_tex(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
         fig = re.match(r"^!\[(.*?)\]\((.*?)\)\{#(fig:[^}]+)\}$", b, re.S)
         if fig:
             cap, img, key = fig.groups()
+            wide = Path(img).name.startswith("figc")      # 组合图跨栏
+            env = "figure*" if wide else "figure"
+            width = r"\textwidth" if wide else r"\columnwidth"
             body.append(
-                "\\begin{{figure}}[!t]\n\\centering\n"
-                f"\\includegraphics[width=\\columnwidth]{{figures/{img}}}\n"
+                f"\\begin{{{env}}}[!t]\n\\centering\n"
+                f"\\includegraphics[width={width}]{{{IMG_DIR}/{img}}}\n"
                 f"\\caption{{{md_inline_to_tex(cap, fig_no)}}}\n"
-                f"\\label{{{key}}}\n\\end{{figure}}")
+                f"\\label{{{key}}}\n\\end{{{env}}}")
             continue
         if b.startswith("TABLE:"):
             pending_cap = b[6:].strip()
@@ -326,9 +329,12 @@ def emit_html(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
         fig = re.match(r"^!\[(.*?)\]\((.*?)\)\{#(fig:[^}]+)\}$", b, re.S)
         if fig:
             cap, img, key = fig.groups()
-            lines.append(f'<figure id="{key}"><img src="{IMG_DIR}/{img}" alt="">'
-                         f'<b>{FIG_WORD} {FIG_PREFIX}{fig_no[key]}.</b> '
-                         f'{md_inline_to_html(cap, fig_no)}</figcaption></figure>')
+            fig_html = (f'<figure id="{key}"><img src="{IMG_DIR}/{img}" alt="">'
+                        f'<figcaption><b>{FIG_WORD} {FIG_PREFIX}{fig_no[key]}.</b> '
+                        f'{md_inline_to_html(cap, fig_no)}</figcaption></figure>')
+            # 组合图（figc*）跨双栏：单格宽度≈单栏宽，格内文字不缩小
+            lines.append(f'<div class="wide">{fig_html}</div>'
+                         if Path(img).name.startswith("figc") else fig_html)
             continue
         b = md_inline_to_html(b, fig_no).replace(" — ", "&nbsp;&mdash; ")
         lines.append(b)
@@ -372,12 +378,13 @@ def main() -> int:
     ap.add_argument("--lang", default="en", choices=["en", "zh"])
     ap.add_argument("--fig-prefix", default="", help='e.g. "S" for Fig. S1')
     ap.add_argument("--img-dir", default="figures", help="figure folder name inside the HTML dir")
-    ap.add_argument("--figs-src", default=str(FIGS_SRC), help="figure source dir (default: logs/paper_figures)")
+    ap.add_argument("--figs-src", nargs="+", default=[str(FIGS_SRC)],
+                    help="figure source dirs, searched in order (default: logs/paper_figures)")
     a = ap.parse_args()
     MD, BIB = Path(a.md), Path(a.bib)
     TEX_OUT, HTML_OUT = Path(a.tex), Path(a.html)
     LANG = a.lang
-    FIGS_SRC = Path(a.figs_src)
+    FIGS_SRC = [Path(p) for p in a.figs_src]
     FIG_PREFIX = a.fig_prefix
     IMG_DIR = a.img_dir
     FIG_WORD = "图" if LANG == "zh" else "Fig."
@@ -389,9 +396,9 @@ def main() -> int:
     figdir = Path(a.figs)
     figdir.mkdir(parents=True, exist_ok=True)
     for _c, img, _k in figs:
-        src = FIGS_SRC / img
-        if not src.is_file():
-            raise SystemExit(f"missing figure: {src}")
+        src = next((d / img for d in FIGS_SRC if (d / img).is_file()), None)
+        if src is None:
+            raise SystemExit(f"missing figure: {img} (looked in {[str(d) for d in FIGS_SRC]})")
         shutil.copy2(src, figdir / img)
     HTML_OUT.parent.mkdir(parents=True, exist_ok=True)
     HTML_OUT.write_text(emit_html(md, meta, bib, fig_no, cites), encoding="utf-8")

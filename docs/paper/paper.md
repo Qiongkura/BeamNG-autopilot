@@ -6,36 +6,25 @@ journal: "IEEE Transactions on Intelligent Transportation Systems (submission fo
 ---
 
 # Abstract
-
-Lane perception for automated driving is bottlenecked by two problems that are usually conflated:
-the cost of pixel-accurate manual annotation, and the absence of an agreed definition of what a
-"lane line" is. We present a closed-loop research programme that attacks both. First, every label carries an explicit provenance credential on a three-level ladder -- human frame-by-frame
-revision, per-frame agent review, or engine-derived truth admitted through four certification gates -- so no claim has to
-guess what truth it rests on. The evaluation packs and the 75-frame training anchor are human-revised; the
-machine-generated increment that the ablations vary is engine-certified, and the rounds reported here added no new manual
-annotation. Second, we
-make the evaluation definition explicit and versioned: a *counting contract* gives every ratio an
-explicit numerator and denominator, and a *protocol* fixes the geometric scope of a line candidate
-(lateral extent, same-side merging, paint-appearance). We then evaluate one segmentation arm
-(six seeds) on two disjoint reference sets, on a road-disjoint one-shot held-out set, and in
-closed-loop driving. Three findings follow. (i) With the network weights held fixed, changing the post-processing switches and the evaluation scope
-changes the readings and can reverse the ranking of two arms; the two definitions each fail a *different*
-gate on the same data: under the paint-scope definition the adopted protocol clears all five gates on both sets (coverage 0.861,
-identity 0.716, precision 0.659, recall 0.885, role 0.794 on the limited-class pool), while the label-scope reading of the same checkpoints fails recall (0.559 on the development pool) because
-about 30% of annotated line pixels do not satisfy the appearance predicate the adopted definition uses
-(their visual identifiability is not independently verified in this work). (ii) The one-shot held-out
-confirmation does **not** reproduce those numbers (label-scope recall 0.460, precision 0.763), and we
-report that as the headline result of the independent test rather than hiding it. (iii) In closed-loop driving the same definition change was accompanied by no observed centre-line crossing in
-four runs (baseline: 8, 8, 8 and 13 frames) and by a collapse of availability (sensor lane-source rate median
-0.851 → 0.292, a 66% relative drop), with the car barely moving; the driving acceptance gate still fails 0/4
-runs, and we localise the remaining blocker with measurements rather than conjecture: a static deadlock in
-which a stationary, off-centre car has its generated path refused by a 4 m body-sweep rule.
-Throughout, changes are pre-registered, tested one factor at a time, and judged by rules fixed
-before the runs; negative results are reported with the same detail as positive ones. All figures
-and verdict files are regenerated from the recorded run artefacts.
+Lane perception for automated driving is bottlenecked by two conflated problems: the
+cost of pixel-accurate annotation, and the absence of an agreed definition of a "lane line". We
+present a closed-loop research programme that attacks both. Every label carries an explicit provenance
+credential --- human revision, agent review, or engine-certified truth --- so no claim has to guess what
+truth it rests on, and the reported rounds added no manual annotation. Evaluation is made explicit and
+versioned: a *counting contract* gives every ratio an explicit numerator and denominator, and a *protocol*
+fixes the geometric scope of a line candidate, with a hash binding the sealed set to its definition.
+One segmentation arm (six seeds) is evaluated on two reference sets, a road-disjoint held-out set
+and in closed-loop driving. Three findings follow. (i) With the weights fixed, changing the post-processing
+switches and the evaluation scope changes the readings and can reverse the ranking of two arms; about 30%
+of annotated line pixels fail the appearance predicate the adopted definition uses. (ii) The one-shot
+confirmation does **not** reproduce the acceptance numbers (label-scope recall 0.460, precision 0.763) ---
+the headline of that independent test. (iii) The same definition change came with no observed centre-line
+crossing in four runs, a 66% drop in lane-source availability, and an acceptance gate still failing 0/4;
+the blocker is a measured static body-sweep deadlock. All changes were pre-registered and judged by rules
+fixed before the runs.
 
 **Index Terms**—Lane detection, ground-truth generation, evaluation protocol, automated driving,
-simulator-based validation, pre-registration, single-factor ablation.
+simulator-based validation, pre-registration.
 
 # Highlights
 
@@ -95,7 +84,7 @@ were applied one factor at a time and judged against alternating control/factor 
 pre-registered rule produced a verdict we considered too coarse, we report the verdict as given and
 record the rule's defect rather than reinterpreting the result; one such defect — safety metrics
 that are frame *counts* and therefore scale with how far the car travelled — is analysed in
-Section V-F and quantified in {@fig:scaling}.
+Section V-F and quantified in {@fig:c5}(c).
 
 **Contributions.** (1) A credentialed truth-provenance ladder (human revision / agent review / engine-certified) with enforcement, plus a
 certification-gated engine pipeline for the machine-generated increment; the composition of every pool is stated
@@ -158,10 +147,11 @@ reference is selected from those markings under the protocol definition; a plann
 a safety monitor arbitrates the tick against hard checks (pose, boundaries, occupancy, obstacle
 risk) and publishes a speed and level; the controllers consume the arbitrated path. The iron rule of
 the stack is that the lateral reference comes from perception only — the map answers "where to",
-never "where the lane is". {@fig:pipeline} shows the candidate-scope pipeline with the measured revocation
+never "where the lane is". {@fig:c1}(a) shows the candidate-scope pipeline with the measured revocation
 rate discussed in Section V-E.
 
-![Candidate-scope pipeline (schematic) with the measured revocation rate.](fig31_pipeline.png){#fig:pipeline}
+![Research design and the counting contract (schematics): (a) the candidate-scope pipeline with the measured revocation rate, (b) the counting contract with the frozen counter definitions, (c) the protocol switch matrix and the live hash, (d) the one-shot confirmation flow with the live seal.](figc1_design_contract.png){#fig:c1}
+
 
 ## B. Truth provenance, credentials, and certification gates
 
@@ -180,9 +170,8 @@ carries positive evidence of its own (a certified negative), so that "no label" 
 "no line". Frames failing any gate are excluded from both training and evaluation and are counted in
 the audit, not silently dropped.
 
-![Negative-pool certification funnel: frames admitted as certified negatives versus excluded categories.](fig40_negative_audit.png){#fig:negaudit}
 
-The gate bookkeeping is itself a result: {@fig:negaudit} shows the negative-pool funnel for one collection round (admitted, suspect, contains paint, undecided) — a pool that looked plentiful on disk shrank to a certified subset before it was ever used as training signal.
+The gate bookkeeping is itself a result: {@fig:c7}(b) shows the negative-pool funnel for one collection round (admitted, suspect, contains paint, undecided) — a pool that looked plentiful on disk shrank to a certified subset before it was ever used as training signal.
 
 ## C. The counting contract
 
@@ -195,7 +184,7 @@ counts candidates whose own side has an available reference; $M \subseteq R$ tho
 matching condition; $L \subseteq M$ those where both the prediction and the reference have a decidable
 left/right role; and $A \subseteq L$ those whose role agrees. The reported instance-level ratios are
 coverage $|R|/|C|$, identity $|M|/|R|$ and role agreement $|A|/|L|$; pixel-level precision and recall are
-reported in two scopes (label, paint). {@fig:contract} shows the contract.
+reported in two scopes (label, paint). {@fig:c1}(b) shows the contract.
 
 Two consequences have to be read off this definition rather than assumed. First, coverage is the
 **candidate-reference availability**: the share of evaluated candidates whose own side has truth to compare
@@ -208,7 +197,6 @@ number of ground-truth instances together with an explicit one-to-one assignment
 has an explicit denominator, and the frame-level counter $P$ is reported separately from the candidate-level
 counters, so a run with few candidate-bearing frames cannot masquerade as a good one.
 
-![Counting contract (schematic): every ratio has an explicit numerator and denominator, over the frozen counter definitions; coverage is candidate-reference availability, not detection recall.](fig30_counting_contract.png){#fig:contract}
 
 ## D. Protocol definitions
 
@@ -217,15 +205,13 @@ a threshold from the ego's own lane are not "my lane's lines"), whether **same-s
 markings are merged** into one instance, and whether an **appearance gate** removes candidates whose
 pixels do not look like paint. The frozen baseline protocol applies none of the three (lateral scope
 off, merging off, appearance off); the adopted protocol applies all three with a lateral threshold of
-5.5 m, a merge radius of 1.0 m and the appearance predicate of Section III-B. {@fig:protocol} shows the
+5.5 m, a merge radius of 1.0 m and the appearance predicate of Section III-B. {@fig:c1}(c) shows the
 switch matrix and the live hash; the hash is a function of the active protocol, so evaluation
 artefacts cannot be reattributed across definitions.
 
-![Lateral position of line markings relative to the lane centre, pooled over the human-revised development pool.](fig38_lane_geometry.png){#fig:geom}
 
-The lateral scope is not arbitrary: it is set from the measured geometry of the reference pool, shown in {@fig:geom} (261 042 marking pixels, median offset −0.17 m, median absolute offset 1.22 m). A scope of 5.5 m retains the own lane's markings and their immediate neighbours while excluding the far-field markings that dominate the false pairings discussed in Section V-E.
+The lateral scope is not arbitrary: it is set from the measured geometry of the reference pool, shown in {@fig:c7}(d) (261 042 marking pixels, median offset −0.17 m, median absolute offset 1.22 m). A scope of 5.5 m retains the own lane's markings and their immediate neighbours while excluding the far-field markings that dominate the false pairings discussed in Section V-E.
 
-![Protocol switch matrix (schematic) and the live evaluation hash.](fig33_protocol_matrix.png){#fig:protocol}
 
 ## E. Training-composition design space
 
@@ -245,20 +231,20 @@ is then gated on the protocol hash, and a single confirmation **consumes** the s
 successful confirmation the set may not be read again, and a refused access is recorded in a ledger
 without consuming it. The confirmation program evaluates the candidate on the sealed frames and
 records which quantities were measured; quantities that were not measured are recorded as UNKNOWN
-and may not be reported as confirmed. The full flow, with the live seal, is shown in {@fig:oneshot}.
+and may not be reported as confirmed. The full flow, with the live seal, is shown in {@fig:c1}(d).
 
-![One-shot final-confirmation flow (schematic) with the live seal.](fig34_final_set_flow.png){#fig:oneshot}
 
 ## G. Driving stack and safety arbitration
 
 In closed loop the same perception feeds a planner and a safety monitor whose arbitration ladder
 evaluates rules in a fixed order; soft rules accumulate speed caps, while a rule whose worst level is
-`minimal_risk` stops the tick. {@fig:ladder} lists the ladder. Two rules matter for Section V-E: the
+`minimal_risk` stops the tick. {@fig:c6}(a) lists the ladder. Two rules matter for Section V-E: the
 **planned body-sweep rule**, which stops the tick when the body sweep of the planned path would cross
 a lane boundary closer than a hard threshold (4 m), and the **on-pavement gate**, which revokes the
 perception lane when the lane centre does not lie on observed drivable surface.
 
-![Safety arbitration ladder (schematic, from the monitor's rule registry).](fig32_arbitration_ladder.png){#fig:ladder}
+![Why the car does not move: (a) the safety arbitration ladder (schematic), (b) the deadlock anatomy, (c) the arbitration reasons over 2443 settled frames, (d) the lane-acceptance evidence — the on-pavement gate is driven by the BEV obstacle layer.](figc6_deadlock_mechanism.png){#fig:c6}
+
 
 # IV. Experimental Setup
 
@@ -266,13 +252,14 @@ perception lane when the lane centre does not lie on observed drivable surface.
 certified scenes (117 frames) and a limited-class pool of certified scenes chosen for near-field
 background structure (24 frames per arm). Neither shares frames with training pools.
 
-![Scene screening criterion: near-field structure density of the certified pools (black bar = median).](fig39_scene_density.png){#fig:density}
 
-The limited-class pool is selected, not sampled: candidate scenes are ranked by a model-independent near-field structure-density criterion computed from the human annotation ({@fig:density}), so the pool concentrates on the scenes where identity and role are hardest rather than on the average scene. A third,
+The limited-class pool is selected, not sampled: candidate scenes are ranked by a model-independent near-field structure-density criterion computed from the human annotation ({@fig:c7}(a)), so the pool concentrates on the scenes where identity and role are hardest rather than on the average scene. A third,
 road-disjoint set of 200 frames (96 line-bearing) is sealed for the one-shot confirmation of
 Section V-D.
 
-Disjointness is audited with pose, not with names: every candidate collection is checked against the development anchors under a 50 m buffer and gets a recorded verdict (supplement). The same machinery rejected the first two compositions of the sealed set, which is why the sealed composition also carries a content-level audit ({@fig:overlap}).
+![Rigour and audits: (a) the scene-screening criterion (near-field structure density), (b) the negative-pool certification funnel, (c) the timing-hygiene retest, (d) the measured lateral geometry of the reference markings.](figc7_rigour_audits.png){#fig:c7}
+
+Disjointness is audited with pose, not with names: every candidate collection is checked against the development anchors under a 50 m buffer and gets a recorded verdict (supplement). The same machinery rejected the first two compositions of the sealed set, which is why the sealed composition also carries a content-level audit ({@fig:c4}(c)).
 
 **Arms.** All segmentation arms share one initialisation, one budget and one recipe; they differ only in training-pool
 composition (the dose arms) or in a single post-processing factor (protocol components). Composition is explicit: a
@@ -299,9 +286,8 @@ UNKNOWN never releases a gate.
 **Discipline.** Every factor in Section V was pre-registered with its reading rule; no threshold was
 relaxed at any point;
 
-![Timing hygiene: repeated inference measurements on a quiet machine.](fig36_timing_retest.png){#fig:timing}
 
-Timing hygiene is recorded rather than estimated: {@fig:timing} is the repeated-measurement protocol used before any latency claim (quiet-machine precondition, repeated runs, smaller value taken — a leaked simulator instance once inflated p95 by a factor of 7.6). every verdict file, manifest and per-frame telemetry trace is retained, and
+Timing hygiene is recorded rather than estimated: {@fig:c7}(c) is the repeated-measurement protocol used before any latency claim (quiet-machine precondition, repeated runs, smaller value taken — a leaked simulator instance once inflated p95 by a factor of 7.6). every verdict file, manifest and per-frame telemetry trace is retained, and
 every figure in this paper is regenerated from those files by two scripts.
 
 # V. Results
@@ -313,7 +299,9 @@ checkpoints under both post-processing settings and both scopes. Under the basel
 verdict fails identity on **both** sets (0.433 dev, 0.414 limited-class) and additionally precision (0.402)
 and role (0.674) on the limited-class set; under the adopted definition all five gates pass on both sets by
 the mean rule (coverage 0.956/0.861, identity 0.665/0.716, precision 0.894/0.659, paint recall 0.812/0.885,
-role 0.883/0.794). {@fig:gates} shows the same numbers against the thresholds.
+role 0.883/0.794). {@fig:c2}(a) shows the same numbers against the thresholds.
+
+![Definition sensitivity of the acceptance result: (a) gate metrics against the frozen thresholds for both protocol definitions, (b) the limited-class pool seed by seed under both definitions (x = below gate), (c) label- versus paint-scope recall with the non-paint fraction of label line pixels, (d) the same checkpoints under label- and surface-scope identity, where the two arms swap order.](figc2_definition_acceptance.png){#fig:c2}
 
 Three qualifications belong with this table. (i) The two rows were not judged by the same rule. Re-tabulated
 under a common mean rule, the baseline's limited-class precision (0.4018) is above its 0.40 threshold even
@@ -325,11 +313,10 @@ attribute the whole difference to the definition; Table II separates the scope f
 recall, and the per-switch single-factor results are in Section V-B. (iii) The candidate-level gates are the
 stable part of the picture: the identity gate is missed by 6 of 6 baseline seeds on both sets and role by 5
 of 6 on the limited-class set, while under the adopted definition no seed misses any of the three
-({@fig:r3seed}).
+({@fig:c2}(b)).
 
-![R3 limited-class pool, per seed: the three candidate-level gates under both definitions, drawn from the same verdict files as Table I (x = below gate).](fig18_r3_per_seed.png){#fig:r3seed}
 
-{@fig:r3seed} plots the limited-class pool seed by seed under both definitions, with each candidate-level
+{@fig:c2}(b) plots the limited-class pool seed by seed under both definitions, with each candidate-level
 gate marked when missed; it is drawn from the same two verdict files as Table I, so the figure and the table
 cannot disagree about which run produced them.
 
@@ -361,8 +348,6 @@ reads each checkpoint under the adopted definition; the label scope under the ba
 | Limited-class | adopted switches (v8) | paint | 0.885 | 0/6 |
 
 
-![Gate metrics against frozen thresholds for the two protocol definitions, development pool (a) and limited-class pool (b).](fig1_gate_matrix.png){#fig:gates}
-
 ## B. The disagreement is definitional
 
 Two things move together here and they have to be separated. The **scope** changes the reading: Table II
@@ -373,14 +358,13 @@ reading, and not in the same direction: with the scope held at label, the adopte
 recall (0.736 → 0.559), because the lateral scope, the same-side merge and the appearance gate all remove
 candidates that the label scope counts. What the scope change is worth in pixels is measured, not assumed:
 the paint scope retains 69% of annotated line pixels on the development pool and 89% on the limited-class
-pool, and {@fig:scopes} shows the per-seed label-scope and paint-scope recall with the non-paint fraction of
+pool, and {@fig:c2}(c) shows the per-seed label-scope and paint-scope recall with the non-paint fraction of
 label line pixels overlaid (~0.30). Those excluded pixels are the ones the appearance predicate does not
 select; Section VI states what that does and does not license us to claim.
 
-![Identity scope changes the reading and can reverse the ranking: 20 checkpoints (two arms, ten seeds each) read in label and surface scope.](fig10_identity_scopes.png){#fig:idscope}
 
 The instance-level gate is more sensitive than that, and in a way that matters for model selection.
-{@fig:idscope} reads 20 checkpoints (two arms, ten seeds each) under the label-scope and surface-scope
+{@fig:c2}(d) reads 20 checkpoints (two arms, ten seeds each) under the label-scope and surface-scope
 identity definitions: the base arm moves from a mean of 0.399 to 0.867 and the 6× arm from 0.429 to 0.771.
 The absolute values nearly double for one arm and fall for the other, and **the ranking of the two arms
 reverses** (base below 6× by 0.031 under the label scope, above it by 0.095 under the surface scope). The
@@ -390,29 +374,27 @@ model-selection decision, not a reporting detail. An identity threshold must the
 exactly as the recall gate does. This experiment uses its own pool and its own ten seeds per arm, so its
 numbers are not comparable with Table I's six-seed means and are not presented as such.
 
-![Per-seed label-scope versus paint-scope recall with the non-paint fraction of label line pixels (development pool).](fig11_recall_scopes.png){#fig:scopes}
 
-Two further single-factor results constrain how the adopted definition behaves. {@fig:boundary} (boundary map)
+Two further single-factor results constrain how the adopted definition behaves. {@fig:c3}(a) (boundary map)
 sweeps mask dilation: dilation buys recall in both sets but costs precision, and the limited-class set pays
 much more for it (at one pixel of dilation its precision falls from 0.65 to 0.39, a drop of 0.26, against
 0.89 to 0.84, a drop of 0.05, on the development pool; the two rows are read at their own dilation
-settings), so no single dilation value clears both sets. {@fig:appearance} shows the appearance
+settings), so no single dilation value clears both sets. {@fig:c3}(b) shows the appearance
 gate acting exactly as designed: precision rises sharply (dev 0.650 → 0.884; limited-class
 0.387 → 0.650) and IoU improves on the limited-class set (0.347 → 0.532) at the cost of recall
 (dev 0.766 → 0.595).
+
+![Post-processing and composition single factors: (a) the boundary map (mask dilation), (b) the appearance-gate ablation on the pixel metrics, (c) the lateral-scope scan, (d) the negative-dose response of the candidate identity rate.](figc3_postproc_composition.png){#fig:c3}
 
 The appearance predicate is a mask gate, not a truth criterion: its own module documents 13k–68k px of hits
 on certified line-free frames (bright pavement and bright gravel both satisfy the white branch), which is why
 it is used to remove candidates rather than to declare where lines are. With that caveat, the instance-level
 probe explains why it can afford to be aggressive: across the certified limited-class scenes the reference instances are covered by annotation at essentially 1.0 regardless of lateral offset, so a surviving candidate is still measured against complete truth. The other post-processing lever, the parallel-merge radius, removes near-duplicate same-side candidates (dev 477 → 166 kept as the radius tightens from 6.0 m to 3.0 m) at a cost in identity, which is why the adopted radius is 1.0 m rather than the aggressive end of the sweep. The two mask thresholds were swept as well; on this pool the negative side is not measurable (no eligible negative frames), so that sweep is reported in the supplement rather than plotted as a zero.
 
-![Boundary map: dilation buys recall and pays precision; the limited-class set pays about three times more.](fig2_boundary_map.png){#fig:boundary}
-
-![Appearance-gate ablation on the pixel metrics (line IoU, precision, recall) for both sets, seed 42.](fig14_appearance_gate.png){#fig:appearance}
 
 ## C. Training-composition dose response
 
-{@fig:dose} shows the identity rate against the negative dose, per seed and as a mean: 0.707 (base
+{@fig:c3}(d) shows the identity rate against the negative dose, per seed and as a mean: 0.707 (base
 composition, one seed), 0.711 (4×, six seeds, 0.667–0.732), **0.763 (6×, one seed)** and 0.701
 (8.5×, six seeds, 0.655–0.744). The seed counts are unequal by construction (the 6× point is the delivered
 candidate's composition and rests on the seed that was delivered), so the response supports a narrower claim
@@ -422,7 +404,7 @@ comparison that would settle it — the same doses with paired seeds and equal c
 work, and the 6× arm remains the delivered composition because it was selected before the confirmation, not
 because the curve proves it optimal.
 
-The programme's training history (321 recorded runs across 44 families, supplement) converges within 20–40 epochs of the 120-epoch budget, and families whose line channel was masked sit at zero line IoU by construction rather than by failure (annotated in the figure), so their curves are not negative results. {@fig:lateral} sweeps the lateral
+The programme's training history (321 recorded runs across 44 families, supplement) converges within 20–40 epochs of the 120-epoch budget, and families whose line channel was masked sit at zero line IoU by construction rather than by failure (annotated in the figure), so their curves are not negative results. {@fig:c3}(c) sweeps the lateral
 scope instead: tightening it from 6.0 m to 3.0 m raises identity (dev 0.582 → 0.713; limited-class
 0.581 → 0.758) and removes candidates (477 → 166 and 166 → 127), while role agreement is flat — the
 lateral scope is an identity lever, not a role lever. Two further single factors were rejected:
@@ -431,9 +413,6 @@ loss-weight arm multiplied the false-positive frame rate on the negative side by
 eligible frames, +40.4 percentage points; 329 → 1730 false-positive pixels; maximum component 320 → 808 px),
 which is why the delivered arm keeps the balanced loss. Across every recorded pixel arm the negative-side readings cluster rather than spread (supplement), which is why the negative-example dose had to be varied instead of a loss-weight knob. Extending the dose response to five metrics (supplement) shows that identity and role move with the dose while coverage and the off-road candidate fraction barely do. The availability cost of the adopted definition is also visible at the pairing stage itself: 3–4 paired frames lost per 117-frame run.
 
-![Dose response of the candidate identity rate (per seed and mean).](fig3_dose_response.png){#fig:dose}
-
-![Lateral-scope scan on both sets: identity and role versus threshold, with the number of retained candidates.](fig12_lateral_scan.png){#fig:lateral}
 
 ## D. One-shot held-out confirmation
 
@@ -445,7 +424,7 @@ candidate largely fails rather than a clean high-precision group. One group carr
 (recall undefined, recorded as such), and the remaining groups range 0.43–0.63. On the negative side
 22 of 105 eligible frames carry false line pixels (20.9%), but those pixels are 0.084% of eligible
 pixels, the largest connected component is 1164 px, and no false candidate appears inside the control
-region. {@fig:confirm} shows the confirmation. Two properties of this result deserve emphasis. First, it does
+region. {@fig:c4}(a) shows the confirmation. Two properties of this result deserve emphasis. First, it does
 **not** reproduce the acceptance numbers of Section V-A: the independent set is harder and its group
 composition differs. Composition is counted two ways and both are recorded: by package, 104 of the 200
 frames come from certified line-free packages and 96 from line-bearing ones; by per-frame eligibility,
@@ -455,15 +434,13 @@ rather than by the acceptance table.
 Second, the confirmation records that the instance-level probes (identity, role, reference coverage) were **not** run on
 this set; they are UNKNOWN and are not reported as confirmed.
 
-![Sealed final-set composition by group, with digest and protocol hash.](fig29_final_set_composition.png){#fig:fscomp}
+![One-shot held-out confirmation: (a) per-group metrics and negative-side diagnostics on the sealed road-disjoint set, (b) the sealed composition by group with digest and protocol hash, (c) the provenance audit of the source packages.](figc4_one_shot_confirmation.png){#fig:c4}
 
-![Final-set provenance audit: content-level overlap of each source package with the used frame set.](fig42_overlap_audit.png){#fig:overlap}
 
-{@fig:fscomp} states the composition the confirmation ran on (200 frames across seven groups; digest and protocol hash printed in the title so the figure cannot be reattributed to another seal). {@fig:overlap} is the audit that admitted it: every source package is compared against the 407 frame hashes already used, and the packages that showed overlap were dropped before sealing. Third, and relevant to the gap with Section V-A, the sealed
+{@fig:c4}(b) states the composition the confirmation ran on (200 frames across seven groups; digest and protocol hash printed in the title so the figure cannot be reattributed to another seal). {@fig:c4}(c) is the audit that admitted it: every source package is compared against the 407 frame hashes already used, and the packages that showed overlap were dropped before sealing. Third, and relevant to the gap with Section V-A, the sealed
 set's truth is **engine-certified** while the acceptance sets are **human-revised**: the two numbers are measured against
 different truth rungs, not only different data.
 
-![One-shot final confirmation on the sealed road-disjoint set: per-group metrics (a) and negative-side diagnostics (b).](fig4_final_confirm.png){#fig:confirm}
 
 ## E. Closed loop
 
@@ -473,16 +450,17 @@ four runs. That is a statement about four runs, not a rate: the same runs travel
 0.93–1.00, see below), and zero events at near-zero exposure cannot be extrapolated. The adopted definition
 pays for it with availability: the sensor lane-source rate falls from a median of 0.851 (range 0.231–0.975)
 to 0.292 (0.097–0.524), a 66% relative drop, and the paired-lane rate from 0.890 (0.809–0.986) to 0.528
-(0.130–0.995). {@fig:closedloop} shows the trade-off. Both effects are consistent with
+(0.130–0.995). {@fig:c5}(a) shows the trade-off. Both effects are consistent with
 the offline finding that the baseline keeps far and non-paint candidates whose pairings pull the car
 across the lane centre.
 
-![Closed-loop trade-off: centre crossings versus sensor lane-source rate, four runs per arm.](fig8_closed_loop_tradeoff.png){#fig:closedloop}
+![Closed loop: (a) centre crossings versus sensor lane-source rate for the two definitions, (b) the hard-target checklist over the recent town runs, (c) why the safety rule needed re-specifying (raw counts scale with how far the car travelled).](figc5_closed_loop.png){#fig:c5}
+
 
 **Acceptance failure and its mechanism.** The driving acceptance gate (goal + perception-led lateral
 mode + strict arbitration, four runs) fails **0/4**: stall fraction 0.93–1.00, travelled 0.9–14.5 m
 in 120 s, 76.5–88.8 m remaining to goal; the safety-side checks that were measured held
-(0 collisions, 0 off-road frames, 0 reversing). {@fig:heatmap} shows the per-run hard-target matrix over the
+(0 collisions, 0 off-road frames, 0 reversing). {@fig:c5}(b) shows the per-run hard-target matrix over the
 recent runs. We then localised the blocker by measurement rather than conjecture. Over 12 town runs,
 the frames whose reason is "planned vehicle body crosses lane boundary" number 512; in those frames
 the car is stationary in 96% of cases, the current body is inside the lane in 512/512, and the
@@ -492,13 +470,10 @@ bearing, so the inflated body sweep of the path the planner actually generated c
 ~2.5 m. What the record supports is that the *generated* path is refused, repeatedly, in every frame of that
 set; it does not establish that no dynamically feasible forward path exists, because the planner's candidate
 set is not the set of all feasible paths. A controlled sweep over fixed poses is listed as unfinished work.
-{@fig:deadlock} shows the anatomy.
+{@fig:c6}(b) shows the anatomy.
 
 Per-run traces (speed and path-to-lane deviation), arm-level distributions and the lane-placement distributions are in the supplement; the safety margins measured in the same runs (closest obstacle, minimum time-to-collision, path occupancy) are what backs the statement that the acceptance failures are availability failures, not safety failures.
 
-![Driving hard-target checklist over the most recent town runs (green = pass, red = fail; an unmeasured target counts as fail).](fig22_gate_heatmap.png){#fig:heatmap}
-
-![Deadlock anatomy: the planned crossing sits just inside the 4 m threshold (a) and the car is stationary in 96% of those frames (b).](fig5_deadlock_anatomy.png){#fig:deadlock}
 
 **Four factors run, one proposal refuted before implementation.** We pre-registered five driving-layer
 factors against this blocker; four were implemented and run, and the fifth (pavement re-centring) was
@@ -513,7 +488,6 @@ perception arm produced no separation on path availability (0.179 → 0.200, ove
 worse worst case (36 → 49). All four implemented factors follow the pre-registered maximum rule and are reported as negative; none was
 adopted, and the fifth remains untested by construction.
 
-![Why the car does not move: safety-arbitration reasons over 2443 settled frames.](fig23_reason_hist.png){#fig:reasons}
 
 The arbitration histogram is the evidence behind the stall fraction: over 2443 settled frames (frames at
 least 8 s into a run, pooled over the twelve town runs the figure names), "no drivable path" is the largest
@@ -538,11 +512,10 @@ diagnostic runs (415 settled frames) shows that of 202 revoked frames, **all 202
 obstacle term (median 6 obstacle cells of ~12 observed samples), while the number of samples that
 were observed but outside the drivable mask is zero in 192 of them. The obstacle layer is populated
 from a neural bird's-eye-view head, so on this link the "on-pavement" gate was in effect an
-obstacle-prediction veto on the lane centre. {@fig:lanegate} shows the evidence and the availability funnel:
+obstacle-prediction veto on the lane centre. {@fig:c6}(d) shows the evidence and the availability funnel:
 in the baseline configuration only 116 of 415 settled frames (28%) have a perception lane and only
 79 (19%) a planner path.
 
-![Lane-acceptance evidence: baseline availability funnel (a) and the evidence behind the revoked lanes (b).](fig7_lane_gate_evidence.png){#fig:lanegate}
 
 ## F. Real-time behaviour and a metric defect
 
@@ -568,13 +541,12 @@ TABLE: Table IV. Control cadence per configuration: tick cost, sub-step count an
 | Path-re-centring arm | 403 | ~370 | 20 | 12 | ~31 Hz |
 
 **A defect in the safety reading rule.** The safety item used to judge every driving factor is a frame
-*count* of body-centre crossings, and a factor arm can travel twice as far as its control. {@fig:scaling}
+*count* of body-centre crossings, and a factor arm can travel twice as far as its control. {@fig:c5}(c)
 quantifies the consequence: the same arm can halve its per-metre crossing rate while showing a larger
 raw count. This is why, after the first two verdicts, we re-registered a per-distance reading
 (crossings per 100 m) alongside the raw maximum; the earlier verdicts stand as given, and we flag the
 rule defect as a methodological result rather than editing them.
 
-![Raw crossing counts versus the same quantity normalised per 100 m travelled (log scale).](fig28_metric_scaling.png){#fig:scaling}
 
 # VI. Discussion
 
@@ -718,7 +690,7 @@ next experiment.
 76.5–88.8 m remaining to goal), while the measured safety items hold (0 collisions, 0 off-road
 frames, 0 reversing). The blocker is localised to a static deadlock: a stationary car, off-centre by 0.86 m, whose inflated body
 sweep crosses the lane boundary within a median 2.50 m, so the path the planner generates is refused and the
-car cannot re-centre (Section V-E, Figs. {@fig:deadlock} and {@fig:reasons}). The record shows that the
+car cannot re-centre (Section V-E, Figs. {@fig:c6}(b) and {@fig:c6}(c)). The record shows that the
 generated path is refused, not that no feasible path exists; separating the two needs a controlled sweep over
 frozen poses that stores the perception boundary, the candidate paths, the sweep geometry and the final
 command for both executable and non-executable cases. *Next experiment*: the three factors that engaged
@@ -750,7 +722,7 @@ the existing keep-alive) measured as a single factor with both the tick cost and
 targets as read-outs.
 
 **5. Specification of safety metrics.** The driving factors were judged with a frame-count
-maximum, and a factor arm can travel twice as far as its control; Fig. {@fig:scaling} quantifies
+maximum, and a factor arm can travel twice as far as its control; Fig. {@fig:c5}(c) quantifies
 how the same arm can halve its per-metre crossing rate while showing a larger raw count. A
 per-distance reading has been pre-registered for new rounds; the earlier verdicts stand as
 recorded, and the rule defect is reported as a methodological result rather than edited away.
@@ -798,15 +770,19 @@ during the implementation and documentation of this work; all experimental desig
 verdicts and conclusions were produced and verified by the author, and every quantitative claim in
 this paper is regenerated from recorded artefacts by the scripts listed below.
 
-**Data and code availability.** The project repository is
-`https://github.com/Qiongkura/BeamNG-autopilot` (branch `fix/round3-hardening-20260921`). All
-quantitative claims are regenerated from recorded artefacts retained in that repository: per-run
-scorecards, per-frame telemetry traces, run manifests, gate verdict files, sealed-set records and
-the protocol hash. Three scripts regenerate every figure in this paper and its supplement from
-those files (`m5_paper_figures.py`, `m5_paper_figures_ext.py`, `m5_paper_figures_extra.py`);
-`build_paper.py` regenerates this manuscript's LaTeX and HTML from a single Markdown source.
-Per-epoch training snapshots and superseded run directories removed in a storage pass are listed in
-a machine-readable audit file.
+**Data and code availability.** What is public is the **code and the manuscript sources**:
+`https://github.com/Qiongkura/BeamNG-autopilot` (branch `fix/round3-hardening-20260921`) contains
+the evaluation stack, the protocol and counting-contract definitions, the figure generators, the
+manuscript Markdown, `build_paper.py` and `references.bib`. What is **not** public is the recorded
+evidence: the per-run scorecards, per-frame telemetry traces, run manifests, gate verdict files,
+sealed-set records and checkpoints live under `logs/` in the author's working copy, which is not
+tracked by that repository (the ignore rules exclude it). Every number in this paper is regenerated
+from those local artefacts by the scripts named in Appendix A, and `CLAIMS_20261007.md` lists, for
+each claim, the exact input file, protocol, seed set and scope it rests on, so the mapping can be
+checked file by file. A public archive of the artefacts is **not yet available**; requests should go
+to the author. Per-epoch training snapshots and superseded run directories removed in a storage pass
+are listed in a machine-readable audit file (`logs/_cleanup_20261006.txt`), and that removal is why
+the balanced-seed dose comparison of Section V-C covers three of four doses.
 
 # Acknowledgements
 

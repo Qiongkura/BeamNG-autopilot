@@ -156,3 +156,60 @@ recorded verdict. The same machinery rejected the first two compositions of the 
    storage pass (audit file `logs/_cleanup_20261006.txt`); every verdict file, scorecard, manifest,
    sealed frame and the delivered checkpoint are retained, so every figure in the main text and in
    this supplement is reproducible from the retained artefacts.
+
+
+# S-F. Individual panels of the main-text composites
+
+The seven composite figures in the main text are assembled from the 26 individual figures below, reproduced here at full size so that any panel can be inspected without the composite's scaling. The panel letter in each caption refers to its position in the composite.
+
+![Panel (a) of the main-text design and contract composite. Candidate-scope pipeline (schematic) with the measured revocation rate.](fig31_pipeline.png){#fig:s17}
+
+![Panel (b) of the main-text design and contract composite. Counting contract (schematic): every ratio has an explicit numerator and denominator, over the frozen counter definitions; coverage is candidate-reference availability, not detection recall.](fig30_counting_contract.png){#fig:s18}
+
+![Panel (c) of the main-text design and contract composite. Protocol switch matrix (schematic) and the live evaluation hash.](fig33_protocol_matrix.png){#fig:s19}
+
+![Panel (d) of the main-text design and contract composite. One-shot final-confirmation flow (schematic) with the live seal.](fig34_final_set_flow.png){#fig:s20}
+
+![Panel (a) of the main-text definition sensitivity composite. Gate metrics against frozen thresholds for the two protocol definitions, development pool (a) and limited-class pool (b).](fig1_gate_matrix.png){#fig:s21}
+
+![Panel (b) of the main-text definition sensitivity composite. R3 limited-class pool, per seed: the three candidate-level gates under both definitions, drawn from the same verdict files as Table I (x = below gate).](fig18_r3_per_seed.png){#fig:s22}
+
+![Panel (c) of the main-text definition sensitivity composite. Per-seed label-scope versus paint-scope recall with the non-paint fraction of label line pixels (development pool).](fig11_recall_scopes.png){#fig:s23}
+
+![Panel (d) of the main-text definition sensitivity composite. Identity scope changes the reading and can reverse the ranking: 20 checkpoints (two arms, ten seeds each) read in label and surface scope.](fig10_identity_scopes.png){#fig:s24}
+
+![Panel (a) of the main-text post-processing and composition composite. Boundary map: dilation buys recall and pays precision; the limited-class set pays about three times more.](fig2_boundary_map.png){#fig:s25}
+
+![Panel (b) of the main-text post-processing and composition composite. Appearance-gate ablation on the pixel metrics (line IoU, precision, recall) for both sets, seed 42.](fig14_appearance_gate.png){#fig:s26}
+
+![Panel (c) of the main-text post-processing and composition composite. Lateral-scope scan on both sets: identity and role versus threshold, with the number of retained candidates.](fig12_lateral_scan.png){#fig:s27}
+
+![Panel (d) of the main-text post-processing and composition composite. Dose response of the candidate identity rate (per seed and mean).](fig3_dose_response.png){#fig:s28}
+
+![Panel (a) of the main-text one-shot confirmation composite. One-shot final confirmation on the sealed road-disjoint set: per-group metrics (a) and negative-side diagnostics (b).](fig4_final_confirm.png){#fig:s29}
+
+![Panel (b) of the main-text one-shot confirmation composite. Sealed final-set composition by group, with digest and protocol hash.](fig29_final_set_composition.png){#fig:s30}
+
+![Panel (c) of the main-text one-shot confirmation composite. Final-set provenance audit: content-level overlap of each source package with the used frame set.](fig42_overlap_audit.png){#fig:s31}
+
+![Panel (a) of the main-text closed loop composite. Closed-loop trade-off: centre crossings versus sensor lane-source rate, four runs per arm.](fig8_closed_loop_tradeoff.png){#fig:s32}
+
+![Panel (b) of the main-text closed loop composite. Driving hard-target checklist over the most recent town runs (green = pass, red = fail; an unmeasured target counts as fail).](fig22_gate_heatmap.png){#fig:s33}
+
+![Panel (c) of the main-text closed loop composite. Raw crossing counts versus the same quantity normalised per 100 m travelled (log scale).](fig28_metric_scaling.png){#fig:s34}
+
+![Panel (a) of the main-text deadlock mechanism composite. Safety arbitration ladder (schematic, from the monitor's rule registry).](fig32_arbitration_ladder.png){#fig:s35}
+
+![Panel (b) of the main-text deadlock mechanism composite. Deadlock anatomy: the planned crossing sits just inside the 4 m threshold (a) and the car is stationary in 96% of those frames (b).](fig5_deadlock_anatomy.png){#fig:s36}
+
+![Panel (c) of the main-text deadlock mechanism composite. Why the car does not move: safety-arbitration reasons over 2443 settled frames.](fig23_reason_hist.png){#fig:s37}
+
+![Panel (d) of the main-text deadlock mechanism composite. Lane-acceptance evidence: baseline availability funnel (a) and the evidence behind the revoked lanes (b).](fig7_lane_gate_evidence.png){#fig:s38}
+
+![Panel (a) of the main-text rigour and audits composite. Scene screening criterion: near-field structure density of the certified pools (black bar = median).](fig39_scene_density.png){#fig:s39}
+
+![Panel (b) of the main-text rigour and audits composite. Negative-pool certification funnel: frames admitted as certified negatives versus excluded categories.](fig40_negative_audit.png){#fig:s40}
+
+![Panel (c) of the main-text rigour and audits composite. Timing hygiene: repeated inference measurements on a quiet machine.](fig36_timing_retest.png){#fig:s41}
+
+![Panel (d) of the main-text rigour and audits composite. Lateral position of line markings relative to the lane centre, pooled over the human-revised development pool.](fig38_lane_geometry.png){#fig:s42}
