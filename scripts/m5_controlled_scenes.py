@@ -67,6 +67,54 @@ MAT_LINE_YELLOW = "italy_road_markings_line_thin_yellow"
 MAT_LINE_BLUE = "italy_road_markings_line_thin_blue"
 MAT_GRAVEL = "m_dirt_road_gravels"
 
+#: 地图档案：键 = 地图名，值 = 该地图自带的 DecalRoad 材质名。
+#: 为什么需要：线材质必须来自**该地图自己的**贴花，否则生成物与地图不同材质，
+#: 等于引入目标域外的外观（方案 §4.2）。italy 是历史批次用的地图，逐位保留；
+#: west_coast_usa 的材质来自 2026-10-07 对 `content/levels/*.zip` 的离线扫描
+#: （`items.level.json` 里 line_white 3112 次、line_yellow 1470 次、
+#: line_dashed_short 215 次），用于第二张地图的复测（审查 E4）。
+#: 其余地图（gridmap_v2/smallgrid/utah/east_coast_usa/jungle_rock_island）扫描
+#: 未见成规模的白/黄线贴花，故不建档案；要用得先找材质再补档案。
+MAP_PROFILES: dict[str, dict] = {
+    "italy": {"pave": MAT_PAVE, "white": MAT_LINE_WHITE, "yellow": MAT_LINE_YELLOW,
+              "blue": MAT_LINE_BLUE, "gravel": MAT_GRAVEL,
+              "anchor": ANCHOR, "note": "历史批次地图（与既有采集同一片区域）"},
+    "west_coast_usa": {"pave": "road_asphalt_2lane", "white": "line_white",
+                       "yellow": "line_yellow", "blue": "line_dashed_short",
+                       "gravel": "m_dirt_road_gravels", "anchor": None,
+                       "note": "第二张地图（审查 E4）：材质为离线扫描所得"},
+}
+
+
+def apply_map_profile(map_name: str, *, overrides: dict | None = None) -> dict:
+    """把模块级材质常量切到该地图的档案（返回实际生效的档案，供报告记录）。
+
+    未建档案的地图：只有显式给了 ``--mat-*`` 才允许继续（否则材质名是 italy 的，
+    生成的"线"会用错材质——宁可报错也不要静默生成错东西）。
+    """
+    global MAT_PAVE, MAT_LINE_WHITE, MAT_LINE_YELLOW, MAT_LINE_BLUE, MAT_GRAVEL, _MAT
+    prof = dict(MAP_PROFILES.get(map_name) or {})
+    ov = {k: v for k, v in (overrides or {}).items() if v}
+    if not prof and not ov:
+        raise SystemExit(
+            f"地图 {map_name!r} 没有材质档案（已知：{sorted(MAP_PROFILES)}）；"
+            f"请先用 --mat-white/--mat-yellow/--mat-pave 显式给出该地图的材质名")
+    eff = {"pave": ov.get("pave") or prof.get("pave"),
+           "white": ov.get("white") or prof.get("white"),
+           "yellow": ov.get("yellow") or prof.get("yellow"),
+           "blue": ov.get("blue") or prof.get("blue"),
+           "gravel": ov.get("gravel") or prof.get("gravel"),
+           "anchor": prof.get("anchor"),
+           "note": (prof.get("note") or "") + ("（含 CLI 覆盖）" if ov else "")}
+    missing = [k for k in ("pave", "white", "yellow", "gravel") if not eff[k]]
+    if missing:
+        raise SystemExit(f"地图 {map_name!r} 档案缺材质：{missing}")
+    MAT_PAVE, MAT_LINE_WHITE = eff["pave"], eff["white"]
+    MAT_LINE_YELLOW, MAT_LINE_BLUE = eff["yellow"], eff["blue"]
+    MAT_GRAVEL = eff["gravel"]
+    _MAT = {"white": MAT_LINE_WHITE, "yellow": MAT_LINE_YELLOW, "blue": MAT_LINE_BLUE}
+    return eff
+
 LINE_WIDTH_M = 0.15
 #: 车道半宽（米）：受控场景里"行驶车道"是生成出来的——线放在 ±LAT_LANE_HALF。
 #: 不用地图路面的外缘：外缘常被边缘贴花覆盖（annotation 里是背景/非路面），
@@ -1111,7 +1159,13 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--attach", action="store_true", help="只连已跑的实例")
-    ap.add_argument("--map", default="italy")
+    ap.add_argument("--map", default="italy",
+                    help=f"地图名；已建材质档案的：{sorted(MAP_PROFILES)}")
+    ap.add_argument("--mat-white", default=None, help="覆盖白线材质名（探查新地图用）")
+    ap.add_argument("--mat-yellow", default=None, help="覆盖黄线材质名")
+    ap.add_argument("--mat-blue", default=None, help="覆盖蓝线材质名")
+    ap.add_argument("--mat-pave", default=None, help="覆盖铺装材质名")
+    ap.add_argument("--mat-gravel", default=None, help="覆盖碎石材质名")
     ap.add_argument("--scenes", nargs="*", default=list(SCENES),
                     help="要跑的场景（默认全部五类）")
     ap.add_argument("--frames", type=int, default=2,
@@ -1149,6 +1203,12 @@ def main() -> int:
           + (f"（近线 {LINE_LATERAL_M['near']:+.1f} / 远线 "
              f"{LINE_LATERAL_M['far']:+.1f} m）"
              if LINE_CONVENTION == "measured" else ""), flush=True)
+    profile = apply_map_profile(str(args.map), overrides={
+        "white": args.mat_white, "yellow": args.mat_yellow, "blue": args.mat_blue,
+        "pave": args.mat_pave, "gravel": args.mat_gravel})
+    print(f"[scenes] 地图档案 {args.map}: 铺装={profile['pave']} 白={profile['white']} "
+          f"黄={profile['yellow']} 蓝={profile['blue']} 碎石={profile['gravel']}",
+          flush=True)
     probe = _load_probe()
     out = Path(args.out) if args.out else (
         config.LOGS_DIR / "experiments"
@@ -1160,6 +1220,7 @@ def main() -> int:
     report: dict = {"generator": {"version": GENERATOR_VERSION,
                                   "script_sha16": _sha16(Path(__file__))},
                     "map": str(args.map), "anchor": list(ANCHOR),
+                    "map_profile": dict(profile),
                     "scenes": {}, "errors": []}
     # 收尾要用的"游戏进程基线"（见 finally）：只关**本次新起**的实例，
     # 用户自己的会话永远不碰（close_started_game 的所有权校验）
