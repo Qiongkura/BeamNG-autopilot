@@ -4,10 +4,10 @@
 
 | 文件 | 说明 |
 |---|---|
-| `T16_paper.pdf` | 英文版成品（13 页，双栏 IEEE 式；**正文 7 张跨栏组合图**） |
-| `T16_paper_zh.pdf` | 中文版成品（15 页，图内文字中文） |
-| `T16_supplement.pdf` | 补充材料（7 页，42 张图：S1–S16 原补充图 + S17–S42 正文组合图的单图版本） |
-| `T16_supplement_zh.pdf` | 补充材料中文版（7 页） |
+| `T16_paper.pdf` | 英文版成品（**18 页**，双栏 IEEE 式；正文 **7 张满栏单图**，图内文字按原尺寸可读） |
+| `T16_paper_zh.pdf` | 中文版成品（**15 页**，图内文字中文） |
+| `T16_supplement.pdf` | 补充材料（**21 页**，42 张满栏图：S1–S16 原补充图 + S17–S42 正文各图的单图版本） |
+| `T16_supplement_zh.pdf` | 补充材料中文版（**22 页**） |
 | `submission/` | **投稿源包**：四份 `.tex` + `figures/` + `figures_zh/` + `references.bib` + README（**未编译**：本机无 LaTeX 引擎） |
 | `CLAIMS_20261007.md` | 冻结主张清单：主张 → 数值 → 来源文件 → 协议/种子/范围 → 状态 |
 | `REVIEW_20261007.md` | 外部审查报告（本轮修正的依据） |
@@ -19,26 +19,29 @@
 
 **图的结构**
 
-正文 7 张组合图（跨栏，单格≈单栏宽，格内文字不缩小）：
+正文 **7 张满栏单图**（每主题一张承重图；满栏≈7 in，6.5 pt 图内文字显示约 6.5 pt，读者不必放大）：
 
-| 组合图 | 格 | 主题 |
-|---|---|---|
-| 图 1 | (a)(b)(c)(d) | 研究设计与计数契约（流水线／契约／协议矩阵／确认流程，示意） |
-| 图 2 | (a)(b)(c)(d) | 车为什么不动：仲裁阶梯／死锁解剖／仲裁原因 1383·512／车道接受证据 |
-| 图 3 | (a)(b)(c)(d) | 严谨性与审计：场景筛选／负例认证／计时复测／标线几何 |
-| 图 4 | (a)(b)(c)(d) | 验收结果的定义敏感性：门矩阵／逐种子／召回双范围／身份排序反转 |
-| 图 5 | (a)(b)(c)(d) | 后处理与组成：边界图／外观门／横向扫描／剂量 |
-| 图 6 | (a)(b)(c) | 一次性确认：按组指标与负例／封存组成／重叠审计 |
-| 图 7 | (a)(b)(c) | 闭环：权衡／硬门清单／指标量纲 |
+| 图 | 内容 |
+|---|---|
+| 1 | 计数契约（示意）——冻结计数定义、覆盖率是候选参考可判率 |
+| 2 | 两套协议定义的门指标与冻结阈值（开发池／有限类别池） |
+| 3 | 外观门消融——唯一用标签召回换精度的开关（对应表 V） |
+| 4 | 冻结协议 + 配对种子的剂量响应（对应表 VI） |
+| 5 | 一次性确认：按组指标与负例一侧诊断 |
+| 6 | 闭环权衡：压中心线 vs 传感器车道来源率 |
+| 7 | 死锁解剖：规划穿越落在 4 m 阈值内、96% 帧静止 |
 
-补充材料 42 张：S1–S16 为原补充图；**S17–S42 是正文七张组合图的单图版本**（原始尺寸，便于逐格查看）。
+补充材料 **42 张满栏单图**：S1–S16 为原补充图；**S17–S42 是正文用过的全部单图版本**
+（含正文未放的 19 张：流水线、协议矩阵、确认流程、逐种子、召回/身份双范围、边界图、横向扫描、
+封存组成、重叠审计、硬门清单、指标量纲、仲裁阶梯、铺装门证据、场景密度、计时复测、标线几何等）。
+
+正文里对被移到补充材料的内容一律写「补充材料」（不写具体图号：补充材料编号由脚本生成）。
 
 **重新构建（四步，无需安装 LaTeX）**
 
 ```pwsh
-# 0) 中文图 + 组合图
-.venv\Scripts\python.exe scripts\m5_figures_i18n.py          # 英文图脚本 -> 中文图
-.venv\Scripts\python.exe scripts\m5_paper_composites.py      # 26 单图 -> 7 组合图（中英各一套）
+# 0) 中文图（英文图脚本 -> 中文图；组合图脚本已不用，正文改为满栏单图）
+.venv\Scripts\python.exe scripts\m5_figures_i18n.py
 
 # 1) 四个 Markdown 源 -> LaTeX + HTML
 .venv\Scripts\python.exe docs\paper\build_paper.py --figs-src logs\paper_composites
@@ -47,7 +50,7 @@
     --figs logs\paper_build\figures_zh --img-dir figures_zh --figs-src logs\paper_composites_zh
 .venv\Scripts\python.exe docs\paper\build_paper.py --md docs\paper\supplement.md `
     --tex docs\paper\supplement.tex --html logs\paper_build\supplement.html --fig-prefix S `
-    --figs-src logs\paper_figures
+    --figs-src logs\paper_figures --wide-all
 .venv\Scripts\python.exe docs\paper\build_paper.py --md docs\paper\supplement_zh.md `
     --tex docs\paper\supplement_zh.tex --html logs\paper_build\supplement_zh.html --lang zh `
     --fig-prefix S --figs logs\paper_build\figures_zh --img-dir figures_zh --figs-src logs\paper_figures_zh
