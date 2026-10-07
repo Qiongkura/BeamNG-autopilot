@@ -485,8 +485,17 @@ hard-stop threshold. The car is parked 0.86 m off the lane centre with its headi
 bearing, so the inflated body sweep of the path the planner actually generated crosses the boundary within
 ~2.5 m. What the record supports is that the *generated* path is refused, repeatedly, in every frame of that
 set; it does not establish that no dynamically feasible forward path exists, because the planner's candidate
-set is not the set of all feasible paths. A controlled sweep over fixed poses is listed as unfinished work.
-{@fig:deadlock} shows the anatomy.
+set is not the set of all feasible paths. {@fig:deadlock} shows the anatomy.
+
+A frozen-pose probe sharpens this. Teleporting the same stack to the run's own start pose and driving for
+25 s produced 46 frames in which a path was accepted in 15 and refused in 31, with the car travelling
+0.56 m: at the baseline pose the dominant refusal is **no drivable path** (31 frames) and the body-sweep
+rule accounts for 8, so the sweep threshold is the dominant cause inside the deadlock set rather than at
+every pose. Offsetting the heading by +5° produced something harder than a refusal: the stack never
+obtained a placement at all (the perception lane stayed unavailable for the whole run), i.e. availability,
+not the sweep rule, is the binding constraint there. The full 3x3 pose matrix was not completed: the
+simulator stopped accepting new connections once the first run's instance had been closed, which is an
+execution limitation recorded in the result note rather than a measurement.
 
 Per-run traces (speed and path-to-lane deviation), arm-level distributions and the lane-placement distributions are in the supplement; the safety margins measured in the same runs (closest obstacle, minimum time-to-collision, path occupancy) are what backs the statement that the acceptance failures are availability failures, not safety failures.
 
@@ -742,11 +751,15 @@ sweep crosses the lane boundary within a median 2.50 m, so the path the planner 
 car cannot re-centre (Section V-E, Figs. {@fig:deadlock} and the supplement). The record shows that the
 generated path is refused, not that no feasible path exists; separating the two needs a controlled sweep over
 frozen poses that stores the perception boundary, the candidate paths, the sweep geometry and the final
-command for both executable and non-executable cases. *Next experiment*: the three factors that engaged
-(bounded hold window, path re-centring, lane gate) were each judged alone; the natural successor is a single
-pre-registered **combined** arm against the best single-factor arm, plus the plan-layer decisions that the
-programme may not take unilaterally — the planned-crossing hard threshold and the semantics of the
-on-pavement gate, both of which are safety rules.
+command for both executable and non-executable cases. A frozen-pose probe has been started and is **partly done**: two of nine poses
+produced a result (the baseline pose is refused mostly for *no drivable path*; a +5° heading offset never
+obtained a placement at all), and the rest are unmeasured because the simulator stopped accepting new
+connections after the first instance was closed — an execution limit that needs a clean-restart procedure,
+not a scientific finding. *Next experiment*: finish the pose matrix, then judge the three factors that
+engaged (bounded hold window, path re-centring, lane gate) as a single pre-registered **combined** arm
+against the best single-factor arm, plus the plan-layer decisions that the programme may not take
+unilaterally — the planned-crossing hard threshold and the semantics of the on-pavement gate, both of
+which are safety rules.
 
 ![Deadlock anatomy: the planned crossing sits just inside the 4 m threshold (a) and the car is stationary in 96% of those frames (b).](fig5_deadlock_anatomy.png){#fig:deadlock}
 
