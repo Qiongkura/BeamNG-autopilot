@@ -838,7 +838,9 @@ def fig33() -> None:
              PROTOCOL_VERSION_V8)]
     for i, (name, a, b, c, ver) in enumerate(rows):
         y = 0.72 - i * 0.30
-        _box(ax, 0.02, y, 0.20, 0.20, name, fc="#DCE3F0" if i == 0 else "#E8F0DC")
+        _box(ax, 0.02, y, 0.20, 0.20,
+             name.replace(" ", chr(10), 1) if " " in name else name,
+             fc="#DCE3F0" if i == 0 else "#E8F0DC", fontsize=7)
         _box(ax, 0.24, y, 0.17, 0.20, a)
         _box(ax, 0.43, y, 0.17, 0.20, b)
         _box(ax, 0.62, y, 0.17, 0.20, c)

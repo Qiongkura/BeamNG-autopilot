@@ -21,25 +21,20 @@ ZH_OUT = ROOT / "logs" / "paper_composites_zh"
 
 #: 组合图定义：key -> (文件名, [面板单图], 每行格数)
 COMPOSITES = {
-    "c1": ("figc1_design_contract", ["fig31_pipeline", "fig30_counting_contract",
-                                     "fig33_protocol_matrix", "fig34_final_set_flow"], 2),
-    "c2": ("figc2_definition_acceptance", ["fig1_gate_matrix", "fig18_r3_per_seed",
-                                           "fig11_recall_scopes", "fig10_identity_scopes"], 2),
-    "c3": ("figc3_postproc_composition", ["fig2_boundary_map", "fig14_appearance_gate",
-                                          "fig12_lateral_scan", "fig3_dose_response"], 2),
-    "c4": ("figc4_one_shot_confirmation", ["fig4_final_confirm", "fig29_final_set_composition",
-                                           "fig42_overlap_audit"], 2),
-    "c5": ("figc5_closed_loop", ["fig8_closed_loop_tradeoff", "fig22_gate_heatmap",
-                                 "fig28_metric_scaling"], 2),
-    "c6": ("figc6_deadlock_mechanism", ["fig32_arbitration_ladder", "fig5_deadlock_anatomy",
-                                        "fig23_reason_hist", "fig7_lane_gate_evidence"], 2),
-    "c7": ("figc7_rigour_audits", ["fig39_scene_density", "fig40_negative_audit",
-                                   "fig36_timing_retest", "fig38_lane_geometry"], 2),
+    # 单列（每格满栏宽）：字号按原图 1.0 倍即≈6.5 pt 有效，读者不必放大。
+    # 每组只留**承重**两格，其余单图全部在补充材料（S17–S42，满栏宽）。
+    "c1": ("figc1_design_contract", ["fig31_pipeline", "fig30_counting_contract"], 1),
+    "c2": ("figc2_definition_acceptance", ["fig1_gate_matrix", "fig18_r3_per_seed"], 1),
+    "c3": ("figc3_postproc_composition", ["fig14_appearance_gate", "fig3_dose_response"], 1),
+    "c4": ("figc4_one_shot_confirmation", ["fig4_final_confirm", "fig29_final_set_composition"], 1),
+    "c5": ("figc5_closed_loop", ["fig8_closed_loop_tradeoff", "fig22_gate_heatmap"], 1),
+    "c6": ("figc6_deadlock_mechanism", ["fig5_deadlock_anatomy", "fig23_reason_hist"], 1),
+    "c7": ("figc7_rigour_audits", ["fig40_negative_audit", "fig39_scene_density"], 1),
 }
 
-PANEL_W = 1560          # 每格统一宽度（像素）
-GAP = 26                # 格间距
-LABEL_H = 46            # 每格顶部留给 (a)(b) 标号的高度
+PANEL_W = 2100          # 每格统一宽度（像素）：单列满栏显示时字号≈原图大小，无需放大
+GAP = 14                # 格间距
+LABEL_H = 40            # 每格顶部留给 (a)(b) 标号的高度
 BG = "white"
 
 

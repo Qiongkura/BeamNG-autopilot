@@ -129,7 +129,7 @@ def fig38() -> None:
     fig, ax = plt.subplots(figsize=(6.8, 2.9))
     ax.bar(range(len(keys)), vals, color="#8172B3", edgecolor="black", linewidth=0.3)
     step = max(1, len(keys) // 10)
-    ax.set_xticks(range(0, len(keys), step), [keys[i] for i in range(0, len(keys), step)],
+    ax.set_xticks(range(0, len(keys), step * 2), [keys[i] for i in range(0, len(keys), step * 2)],
                   rotation=45, ha="right", fontsize=6)
     pooled = g.get("pooled") or {}
     ax.set_ylabel("marking pixels")

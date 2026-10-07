@@ -106,7 +106,7 @@ def fig1() -> None:
                color=C_FACT, hatch="///", edgecolor="black", linewidth=0.4)
         for j, f in enumerate(fields):
             ax.hlines(GATES[f], j - 0.45, j + 0.45, color="black", ls="--", lw=1.0)
-        ax.set_xticks(x, [GATE_LABEL[f] for f in fields])
+        ax.set_xticks(x, [GATE_LABEL[f] for f in fields], rotation=20, ha="right")
         ax.set_title(title)
         ax.set_ylim(0, 1.0)
     axes[0].set_ylabel("gate metric (mean over 6 seeds)")
@@ -220,7 +220,8 @@ def fig4() -> None:
         if v is None:
             ax.text(i - 0.2, 0.02, "n/a", ha="center", fontsize=6.5, rotation=90)
     short = [a.replace("m5auto_", "") for a in names]
-    ax.set_xticks(x, [f"{a}\n(n={b})" for a, b in zip(short, n)], fontsize=6.5)
+    ax.set_xticks(x, [f"{a}\n(n={b})" for a, b in zip(short, n)], fontsize=6.5,
+                  rotation=30, ha="right")
     ax.set_ylim(0, 1.05)
     ax.set_ylabel("pixel metric")
     ax.set_title("(a) held-out final set, per group (label scope)")
@@ -363,7 +364,7 @@ def fig6() -> None:
            edgecolor="black", linewidth=0.4)
     ax.bar(x + 0.2, fact_t, 0.4, label="factor on", color=C_FACT,
            edgecolor="black", linewidth=0.4)
-    ax.set_xticks(x, labels, fontsize=6.5)
+    ax.set_xticks(x, labels, fontsize=6.5, rotation=25, ha="right")
     ax.set_ylabel("travelled (m, median of 4 runs)")
     ax.set_title("(a) the factors do move the car")
     ax.legend(frameon=False)
@@ -371,7 +372,7 @@ def fig6() -> None:
     ax.bar(x - 0.2, ctrl_s, 0.4, color=C_CTRL, edgecolor="black", linewidth=0.4)
     ax.bar(x + 0.2, fact_s, 0.4, color=C_FACT, edgecolor="black", linewidth=0.4)
     ax.axhline(0.0, color="black", lw=0.8)
-    ax.set_xticks(x, labels, fontsize=6.5)
+    ax.set_xticks(x, labels, fontsize=6.5, rotation=25, ha="right")
     ax.set_ylabel("stall fraction (median)")
     ax.set_ylim(0, 1.05)
     bcs = " / ".join(f"{cb:.0f}" + chr(0x2192) + f"{fb:.0f}"

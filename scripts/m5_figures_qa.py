@@ -120,12 +120,26 @@ def _check(fig: Figure, name: str) -> None:
                 _issues.append((name, f"重叠 {frac:.0%}: {s1[:32]!r} × {s2[:32]!r}"))
 
 
-def _run(lang: str, tmp: Path) -> None:
+def _run(lang: str, tmp: Path, scale: float = 1.0) -> None:
     import m5_paper_figures
     import m5_paper_figures_ext
     import m5_paper_figures_extra
 
     mods = [m5_paper_figures, m5_paper_figures_ext, m5_paper_figures_extra]
+    if scale and abs(scale - 1.0) > 1e-9:
+        # 与 m5_figures_scale.py 同一钩子：字号统一乘系数后再查排版
+        from matplotlib.text import Text
+        import matplotlib.pyplot as plt
+        _orig = Text.set_fontsize
+
+        def _fs(self, size, _o=_orig, _s=scale):
+            try:
+                return _o(self, float(size) * _s)
+            except (TypeError, ValueError):
+                return _o(self, size)
+        Text.set_fontsize = _fs
+        plt.rcParams.update({k: v * scale for k, v in plt.rcParams.items()
+                             if k.endswith("size") and isinstance(v, (int, float))})
 
     if lang == "zh":
         import m5_figures_i18n as i18n
@@ -164,11 +178,13 @@ def main() -> int:
     ap.add_argument("--lang", default="both", choices=["en", "zh", "both"])
     ap.add_argument("--min-frac", type=float, default=0.30)
     ap.add_argument("--min-px", type=float, default=60.0)
+    ap.add_argument("--scale", type=float, default=1.0,
+                    help="字号放大系数（组合图用 1.6）")
     a = ap.parse_args()
     MIN_FRAC, MIN_PX = a.min_frac, a.min_px
     tmp = ROOT / "logs" / "paper_figures_qa_tmp"
     for lang in (["en", "zh"] if a.lang == "both" else [a.lang]):
-        _run(lang, tmp)
+        _run(lang, tmp, a.scale)
     if tmp.exists():
         import shutil
         shutil.rmtree(tmp, ignore_errors=True)
