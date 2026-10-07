@@ -31,19 +31,19 @@ def main() -> int:
     run([PY, "docs/paper/build_paper.py", "--md", "docs/paper/paper.md",
          "--tex", str(SUB / "main.tex"), "--html", str(BUILD / "submission_en.html"),
          "--figs", str(SUB / "figures"), "--img-dir", "figures",
-         "--figs-src", str(ROOT / "logs" / "paper_figures")])
+         "--figs-src", str(ROOT / "logs" / "paper_composites"), str(ROOT / "logs" / "paper_figures")])
     run([PY, "docs/paper/build_paper.py", "--md", "docs/paper/paper_zh.md",
          "--tex", str(SUB / "main_zh.tex"), "--html", str(BUILD / "submission_zh.html"),
          "--lang", "zh", "--figs", str(SUB / "figures_zh"), "--img-dir", "figures_zh",
-         "--figs-src", str(ROOT / "logs" / "paper_figures_zh")])
+         "--figs-src", str(ROOT / "logs" / "paper_composites_zh"), str(ROOT / "logs" / "paper_figures_zh")])
     run([PY, "docs/paper/build_paper.py", "--md", "docs/paper/supplement.md",
          "--tex", str(SUB / "supplement.tex"), "--html", str(BUILD / "submission_sup.html"),
          "--fig-prefix", "S", "--figs", str(SUB / "figures"), "--img-dir", "figures",
-         "--figs-src", str(ROOT / "logs" / "paper_figures")])
+         "--figs-src", str(ROOT / "logs" / "paper_composites"), str(ROOT / "logs" / "paper_figures")])
     run([PY, "docs/paper/build_paper.py", "--md", "docs/paper/supplement_zh.md",
          "--tex", str(SUB / "supplement_zh.tex"), "--html", str(BUILD / "submission_sup_zh.html"),
          "--lang", "zh", "--fig-prefix", "S", "--figs", str(SUB / "figures_zh"),
-         "--img-dir", "figures_zh", "--figs-src", str(ROOT / "logs" / "paper_figures_zh")])
+         "--img-dir", "figures_zh", "--figs-src", str(ROOT / "logs" / "paper_composites_zh"), str(ROOT / "logs" / "paper_figures_zh")])
 
     # 2) 参考文献源（供期刊用 bibtex 时参考；.tex 自带 thebibliography，不需要它）
     shutil.copy2(PAPER / "references.bib", SUB / "references.bib")

@@ -155,49 +155,47 @@ def fig2() -> None:
 
 # ---------------------------------------------------------------- fig 3
 def fig3() -> None:
-    # 剂量从臂名解析：base=0、neg4x=4、base6x=6、neg85x=8.5。名字里的 "85" 是
-    # 8.5 倍——早期版本按字面读成 85 倍，轴错了整张图就错了。
-    def dose_of(arm: str):
-        head = arm.split("-")[0]
-        if head == "base":
-            return 0.0
-        if head == "base6x":
-            return 6.0
-        if head.startswith("neg"):
-            body = head[3:].rstrip("x")
-            return 8.5 if body == "85" else float(body)
-        return None
-    rows = []
-    base = json.load(open(EXP / "dev_full_arms_20261005.json", encoding="utf-8"))
-    for name, a in (base.get("arms") or base).items():
-        dose = dose_of(name)
-        if dose is not None and isinstance(a, dict)                 and isinstance(a.get("candidate_identity_rate"), (int, float)):
-            rows.append((dose, name, a["candidate_identity_rate"]))
-    for p in sorted(EXP.glob("dev_full_dose_arms_s*.json")):
-        for name, a in json.load(open(p, encoding="utf-8"))["arms"].items():
-            dose = dose_of(name)
-            if dose is not None and isinstance(a.get("candidate_identity_rate"), (int, float)):
-                rows.append((dose, name, a["candidate_identity_rate"]))
-    doses = sorted({r[0] for r in rows})
-    fig, ax = plt.subplots(figsize=(5.6, 3.2))
-    for dose in doses:
-        v = [r[2] for r in rows if r[0] == dose]
-        if not v:
-            continue
-        ax.scatter([dose] * len(v), v, s=18, color=C_FACT if dose else C_CTRL,
-                   zorder=3, alpha=0.85)
-        ax.hlines(st.mean(v), dose * 0.93 if dose else -0.12,
-                  dose * 1.07 if dose else 0.12, color="black", lw=1.4, zorder=4)
-    ax.axhline(GATES["candidate_identity_rate"], color="black", ls="--", lw=1.0)
-    ax.annotate("identity gate 0.60", xy=(max(doses) * 0.52, 0.607), fontsize=7.5)
+    """剂量响应（身份率）：冻结协议 + 配对种子的重评，8.5× 用已记录值并标注来源。
+
+    见 `docs/T16_PROTOCOL_FACTOR_DECOMP_RESULT_20261007.md`：等种子对照下 0×/4×/6× 不可区分，
+    8.5× 的已记录值最高，因此「6× 是峰值」不成立。
+    """
+    def dev_identity(fname: str) -> list:
+        d = json.load(open(EXP / fname, encoding="utf-8"))["dev"]["candidate"]
+        return [d[s]["candidate_identity_rate"] for s in sorted(d)
+                if isinstance(d[s].get("candidate_identity_rate"), (int, float))]
+
+    groups = [(0.0, "0x (base)", dev_identity("e2_dose0x_20261007.json")),
+              (4.0, "4x", dev_identity("e2_dose4x_20261007.json")),
+              (6.0, "6x (delivered)", dev_identity("e1_c4_v8_20261007.json"))]
+    # 8.5×：检查点已删除，用已记录六种子值
+    rec = []
+    for f in ["dev_full_arms_20261005.json"] + [f"dev_full_dose_arms_s4{i}.json" for i in range(3, 8)]:
+        d = json.load(open(EXP / f, encoding="utf-8"))
+        for k, a in d["arms"].items():
+            if k.startswith("neg85x") and isinstance(a.get("candidate_identity_rate"), (int, float)):
+                rec.append(a["candidate_identity_rate"])
+    fig, ax = plt.subplots(figsize=(5.8, 3.3))
+    for dose, _lab, vals in groups:
+        ax.scatter([dose] * len(vals), vals, s=20, color=C_FACT, zorder=3,
+                   edgecolor="black", linewidth=0.3)
+        ax.plot([dose - 0.35, dose + 0.35], [st.mean(vals)] * 2, color="black", lw=1.6, zorder=4)
+    if rec:
+        ax.scatter([8.5] * len(rec), rec, s=20, facecolor="none", edgecolor=C_CTRL,
+                   linewidth=0.9, zorder=3)
+        ax.plot([8.15, 8.85], [st.mean(rec)] * 2, color=C_CTRL, lw=1.6, zorder=4)
+        ax.text(8.5, max(rec) + 0.012, "recorded\n(checkpoints removed)", fontsize=6,
+                ha="center", color=C_CTRL)
+    ax.axhline(GATES["candidate_identity_rate"], color="black", ls="--", lw=0.9)
+    ax.text(0.05, GATES["candidate_identity_rate"] + 0.004, "identity gate 0.60",
+            fontsize=6.5, color="black")
+    ax.set_xticks([0, 4, 6, 8.5], ["0x", "4x", "6x", "8.5x"])
+    ax.set_xlim(-1.0, 9.6)
+    ax.set_ylim(0.60, 0.78)
     ax.set_xlabel("negative-example dose (x, relative to the base pool)")
     ax.set_ylabel("candidate identity rate")
-    ax.set_title("Training-composition dose response: identity peaks at 6x, "
-                 "saturates at 8.5x")
-    ax.set_xlim(-0.8, 9.3)
-    ax.set_ylim(0.40, 0.78)
-    ax.annotate("y-axis truncated at 0.40", xy=(0.98, 0.03), xycoords="axes fraction",
-                ha="right", fontsize=6.5)
+    ax.set_title("Dose response on the frozen protocol (paired seeds 42-47):" + chr(10)
+                 + "the three re-evaluated doses are indistinguishable")
     _save(fig, "fig3_dose_response")
 
 

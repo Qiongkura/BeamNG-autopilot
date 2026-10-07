@@ -275,6 +275,11 @@ TRANS: dict[str, str] = {
         "均值位移：基础 0.398 → 0.867 | 6× 0.429 → 0.771" + NL
         + "两条臂在两种范围之间交换了排序",
     "A ⊆ L" + NL + "role" + NL + "agrees": "A ⊆ L" + NL + "角色" + NL + "一致",
+    "Dose response on the frozen protocol (paired seeds 42-47):" + NL
+    + "the three re-evaluated doses are indistinguishable":
+        "冻结协议下的剂量响应（配对种子 42–47）：" + NL + "重评的三档不可区分",
+    "recorded" + NL + "(checkpoints removed)": "已记录值" + NL + "（检查点已删除）",
+    "identity gate 0.60": "身份门 0.60",
     "candidates": "候选",
     "dev (reviewed)": "开发（人工修订）",
     "dev > 0.30 m": "开发 > 0.30 m",
