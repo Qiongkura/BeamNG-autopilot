@@ -324,6 +324,7 @@ scope is reported rather than promoted: a gate that can change which checkpoint 
 model-selection decision, not a reporting detail. An identity threshold must therefore name its scope,
 exactly as the recall gate does. This experiment uses its own pool and its own ten seeds per arm, so its
 numbers are not comparable with Table I's six-seed means and are not presented as such.
+The effect is not specific to the delivered arm. On a second arm trained on a different composition (near/far pair packages, six seeds, same frozen protocol), moving from the label to the paint scope raises recall from 0.459 to 0.673 (+0.214) against +0.252 for the delivered arm, and the identity gate reads 0.658 against 0.665. The direction of the scope effect reproduces on the second model; its magnitude is arm-specific, which is why this paper reports the scope with every number instead of quoting a single calibration.
 Two further single-factor results constrain how the adopted definition behaves. 5(a) (boundary map)
 sweeps mask dilation: dilation buys recall in both sets but costs precision, and the limited-class set pays
 much more for it (at one pixel of dilation its precision falls from 0.65 to 0.39, a drop of 0.26, against
