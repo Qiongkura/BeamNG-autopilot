@@ -2175,6 +2175,10 @@ class FSDriveSession:
                     except Exception as _spe:
                         print(f"[fsd-drive] placement attempt failed: "
                               f"{_spe}")
+                if _wall_hit():
+                    print("[fsd-drive] 墙钟上限到达（放置阶段）：放弃本轮，按"
+                          "未获得放置收尾", flush=True)
+                    return 3
                 if _elapsed > PLACEMENT_HOLD_S and _head_live:
                     # Yellow/US paint can appear a few ticks after the
                     # object head is live.  In strict sensor mode a failed
@@ -2237,6 +2241,10 @@ class FSDriveSession:
 
     def run(self) -> int:
         args = self.args
+        # 整轮墙钟上限（--max-wall-s）：见 m5_fsd_drive 的说明。默认 None，行为与既有运行一致。
+        _wall_t0 = time.time()
+        _wall_max = getattr(args, "max_wall_s", None)
+        _wall_hit = lambda: bool(_wall_max) and (time.time() - _wall_t0) > float(_wall_max)
 
         # initialised FIRST: the end-of-run finally touches these even when
         # the connection fails before the drive section (2026-09-06:
@@ -2519,6 +2527,9 @@ class FSDriveSession:
             _ema_tick = 0.35          # adaptive tick-budget EMA (seeded: a
                                       # typical warm tick is ~0.3-0.4 s)
             while time.time() < t_end:
+                if _wall_hit():
+                    print("[fsd-drive] 墙钟上限到达（行驶阶段）：结束本轮", flush=True)
+                    break
                 try:
                     if not wd_heartbeat(conn):
                         watchdog_lost = True
