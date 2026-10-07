@@ -69,24 +69,29 @@ def _unbrace(s: str) -> str:
 
 
 def ieee_entry(e: dict) -> str:
-    """One IEEE-style reference string (no page numbers when the source lacked them)."""
+    """One IEEE-style reference string (no page numbers when the source lacked them).
+
+    ``doi``（已核验）一并给出；``note`` 只渲染第一段——完整核验记录在
+    ``docs/paper/REFS_VERIFICATION_20261007.md``，参考文献表保持简洁。
+    """
     authors = _unbrace(e.get("author") or e.get("editor") or "")
     authors = authors.replace(" and ", ", ")
     title = _unbrace(e.get("title", ""))
+    doi = f"doi: {e['doi']}" if e.get("doi") else ""
+    note_txt = (e.get("note") or "").split(";")[0].strip()
+    note = f" [{note_txt}]" if note_txt else ""
     if e["kind"] == "article":
         venue = _unbrace(e.get("journal", ""))
         bits = [b for b in (e.get("volume"), f"no. {e['number']}" if e.get("number") else "",
-                            e.get("pages"), e.get("year")) if b]
+                            e.get("pages"), e.get("year"), doi) if b]
         tail = ", ".join(bits)
-        note = f" [{e['note']}]" if e.get("note") else ""
         return f"{authors}, \u201c{title},\u201d {venue}, {tail}.{note}".replace("  ", " ")
     if e["kind"] in ("inproceedings", "conference"):
         venue = _unbrace(e.get("booktitle", ""))
-        tail = e.get("year", "")
-        note = f" [{e['note']}]" if e.get("note") else ""
+        tail = ", ".join(x for x in (e.get("year", ""), doi) if x)
         return f"{authors}, \u201c{title},\u201d in {venue}, {tail}.{note}".replace("  ", " ")
-    note = f" {e.get('note','')}" if e.get("note") else ""
-    return f"{authors}, \u201c{title},\u201d {e.get('year','')}.{note}".replace("  ", " ")
+    tail = ", ".join(x for x in (e.get("year", ""), doi) if x)
+    return f"{authors}, \u201c{title},\u201d {tail}.{note}".replace("  ", " ")
 
 
 # ---------------------------------------------------------------- markdown
@@ -355,7 +360,8 @@ def emit_html(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
     idx = re.search(r"\*\*(?:Index Terms|关键词)\*\*—(.*)", md)
     body = body.replace("<h1>Abstract</h1>", "")
     body = re.sub(r"<h1>(.*?)</h1>", lambda m: f"<h2>{m.group(1)}</h2>", body)
-    refs = "".join(f"<li>{ieee_entry(bib[k])}</li>" for k in cites if k in bib)
+    refs = "".join("<li>" + ieee_entry(bib[k]).replace("--", "–") + "</li>"
+                  for k in cites if k in bib)
     html = f"""<!doctype html><html lang="{"zh" if LANG == "zh" else "en"}"><head><meta charset="utf-8">
 <title>{meta.get('title','')}</title><style>{CSS}</style></head><body class="{LANG}">
 <h1 class="title">{meta.get('title','')}</h1>
