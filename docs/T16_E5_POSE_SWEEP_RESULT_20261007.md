@@ -10,16 +10,24 @@
 |---|---|---|
 | (d=0.0 m, Δψ=0°) 基线位姿 | **完成**（46 帧 / 24.4 s） | 行进 **0.56 m**、最大速度 0.76 m/s；**被接受路径 15/46 帧**；规划车体穿越 13 帧；原因：无可用路径 31、规划车体穿越 8、障碍很近 5；车道来源 `sensor` 26 帧、`perception-unavailable` 20 帧；`first_cross_m` 多为 **2.5 m**；指令链递增（cmd_seq 2→48） |
 | (d=0.0 m, Δψ=+5°) | **未完成：始终未获得放置**（>20 min 未进入行驶阶段；按预注册的执行补记记为该类） | 日志持续 `placement not ready; stopped, refreshing perception`，`src=perception-unavailable`（可见 6 条标线、line_px 6327 但放不下去）；进程不自行退出 |
-| 其余 7 个位姿 | **未测** | 见第二节的阻塞点 |
+| 其余 7 个位姿 | **未测** | 见第二节：外部 `timeout` 让驱动收尾未执行 → 孤儿实例 → 端口/CEF 冲突 |
 
-## 二、阻塞点（工具层面，如实记录）
+## 二、阻塞点（已定位到根因，是工具缺陷）
 
-首轮跑完位姿 2 时该进程不退出，我按项目纪律关掉了它（`close_started_game` 的差集语义 + 手动清理）。
-此后**仿真器不再接受新连接**：连续重试得到
-`BNGDisconnectedError: Connecting to the simulator failed` / `BeamNG.tech is not running any more`，
-而游戏自身的 `beamng.log` 显示启动流程正常（5 s 内完成图形初始化）——即启动成功、连接握手失败
-（疑似上一实例的端口/锁在短时间内未释放）。因此剩余 7 个位姿没有数据。
-**这不是科学结论**，是执行限制；要跑满矩阵需要一个干净的重启流程（每次启动前等待端口释放并轮换端口）。
+链条（每一环都有实测）：
+
+1. `m5_fsd_drive.py` 的收尾只关**它自己起的**实例（`close_started_game` 的差集语义，防止误杀用户会话）。
+2. 我为"位姿墙钟上限"用了**外部** `timeout 150`——超时先把 python 驱动杀掉，**驱动的 `finally` 没机会执行**，
+   于是那次运行的实例变成孤儿（实测：一次性看到 8 个 `BeamNG.tech.x64.exe` 在跑）。
+3. 孤儿实例占着 CEF 缓存（`current/temp/html`）与 RPC 端口 64257；下一次启动时游戏判定 UI 子进程无响应，
+   弹出模态对话框并退出（`gameStartupError 0x00000001`，日志里是 `CEF client ID: "MainGEUI"` +
+   `TerminationStatus: TS_PROCESS_WAS_KILLED`）——表现就是 `RuntimeError: game at 127.0.0.1:64257 is
+   listening but not answering the RPC handshake`。
+4. 因此**上限必须做在驱动内部**（让它自己的收尾跑完），不能用外部 `timeout`；清理顺序也应是
+   先优雅关闭（关闭连接/让游戏自己退出），再对残留进程强杀。
+
+**这不是科学结论，是执行缺陷**；已定位到可直接修的一步（把上限搬进驱动 + 收尾前先优雅关闭）。
+本轮所有游戏进程已清空（`game_pids()` 归零，`tasklist` 无 BeamNG 条目）。
 
 ## 三、能得出什么（按预注册的裁决规则）
 
