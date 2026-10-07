@@ -441,11 +441,12 @@ A frozen-pose probe sharpens this. Teleporting the same stack to the run's own s
 25 s produced 46 frames in which a path was accepted in 15 and refused in 31, with the car travelling
 0.56 m: at the baseline pose the dominant refusal is \textbf{no drivable path} (31 frames) and the body-sweep
 rule accounts for 8, so the sweep threshold is the dominant cause inside the deadlock set rather than at
-every pose. Offsetting the heading by +5° produced something harder than a refusal: the stack never
-obtained a placement at all (the perception lane stayed unavailable for the whole run), i.e. availability,
-not the sweep rule, is the binding constraint there. The full 3x3 pose matrix was not completed: the
-simulator stopped accepting new connections once the first run's instance had been closed, which is an
-execution limitation recorded in the result note rather than a measurement.
+every pose. Offsetting the pose by +0.5 m laterally and +10° in heading produced the clean negative
+example: 26 frames, \textbf{no accepted path in any of them}, zero metres travelled, and the reason in every
+frame is again \emph{no drivable path} with the perception lane unavailable --- availability, not the sweep rule,
+is what binds there. A third pose (+5° heading alone) never obtained a placement at all. The remaining six
+poses are unmeasured: launching the simulator repeatedly failed at the connection handshake, an execution
+limitation recorded in the result note rather than a measurement.
 Per-run traces (speed and path-to-lane deviation), arm-level distributions and the lane-placement distributions are in the supplement; the safety margins measured in the same runs (closest obstacle, minimum time-to-collision, path occupancy) are what backs the statement that the acceptance failures are availability failures, not safety failures.
 \textbf{Four factors run, one proposal refuted before implementation.} We pre-registered five driving-layer
 factors against this blocker; four were implemented and run, and the fifth (pavement re-centring) was
