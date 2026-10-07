@@ -58,20 +58,29 @@ def parse_bib(path: Path) -> dict:
     return out
 
 
+def _unbrace(s: str) -> str:
+    """去掉 BibTeX 的大小写保护花括号（``{CNN}`` -> ``CNN``）。
+
+    题录里 ``{CNN}`` 之类的花括号在 LaTeX 里是保护大写用的，但直接渲染到 PDF 会留下
+    可见的花括号（2026-10-07 审查指出）。去掉花括号、保留内部文字即可。
+    """
+    return (s or "").replace("{", "").replace("}", "")
+
+
 def ieee_entry(e: dict) -> str:
     """One IEEE-style reference string (no page numbers when the source lacked them)."""
-    authors = e.get("author") or e.get("editor") or ""
+    authors = _unbrace(e.get("author") or e.get("editor") or "")
     authors = authors.replace(" and ", ", ")
-    title = e.get("title", "")
+    title = _unbrace(e.get("title", ""))
     if e["kind"] == "article":
-        venue = e.get("journal", "")
+        venue = _unbrace(e.get("journal", ""))
         bits = [b for b in (e.get("volume"), f"no. {e['number']}" if e.get("number") else "",
                             e.get("pages"), e.get("year")) if b]
         tail = ", ".join(bits)
         note = f" [{e['note']}]" if e.get("note") else ""
         return f"{authors}, \u201c{title},\u201d {venue}, {tail}.{note}".replace("  ", " ")
     if e["kind"] in ("inproceedings", "conference"):
-        venue = e.get("booktitle", "")
+        venue = _unbrace(e.get("booktitle", ""))
         tail = e.get("year", "")
         note = f" [{e['note']}]" if e.get("note") else ""
         return f"{authors}, \u201c{title},\u201d in {venue}, {tail}.{note}".replace("  ", " ")

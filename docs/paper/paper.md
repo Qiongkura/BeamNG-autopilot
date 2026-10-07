@@ -78,7 +78,8 @@ protocol, and a set sealed under the old definition would have authorised a conf
 new one.
 
 **Method discipline.** Every change in this paper was pre-registered with its reading rule before
-the runs; the rules include safety non-inferiority read as a maximum over runs, an explicit refusal
+the runs, and each
+pre-registration names the protocol version and the repository commit it was frozen against; the rules include safety non-inferiority read as a maximum over runs, an explicit refusal
 to treat an unmeasured quantity as a pass, and a prohibition on relaxing the frozen gates. Changes
 were applied one factor at a time and judged against alternating control/factor runs. Where a
 pre-registered rule produced a verdict we considered too coarse, we report the verdict as given and
@@ -110,13 +111,13 @@ and speed. Chinese-language work in the same family explores lightweight variant
 [@chen2026clrnetlight], B-spline end-to-end regression [@huang2026bspline], graph/transformer hybrids
 [@jia2026gnn], transformer with cross-attention [@li2026xca], parallel detection over image
 sequences [@zhu2024parallel], multi-scale feature aggregation [@hu2026multiscale], DeepLabV3+
-variants [@shuai2026deeplab], symmetry-prior and key-point methods for complex scenes
+variants [@shuai2026deeplab] of the original architecture [@chen2018deeplab], symmetry-prior and key-point methods for complex scenes
 [@lu2026symmetry], and 3-D lane estimation with convolutional architectures [@chen2025threed].
 These works share our object of study but differ in what they optimise: they report accuracy against
 datasets whose annotation conventions differ from each other, which is exactly the ambiguity this
 paper makes explicit.
 
-**Datasets and ground truth.** TuSimple [@tusimple2017] and CULane [@pan2018scnn] remain the
+**Datasets and ground truth.** TuSimple [@tusimple2017], CULane [@pan2018scnn] and Cityscapes [@cordts2016cityscapes] remain the
 standard benchmarks; their annotation conventions (lane presence per row, presence of far-field
 markings, treatment of occlusion) differ, and neither reports the annotation's *appearance*
 properties. Ground-truth generation has been studied as a problem in its own right: Borkar et al.
@@ -155,7 +156,11 @@ rate discussed in Section V-E.
 
 ## B. Truth provenance, credentials, and certification gates
 
-The programme distinguishes three rungs of truth and records the rung with every label: **human revision** (a human
+Two dimensions must not be conflated here. **Provenance** says who or what produced a label (human
+revision, agent review, engine); **certification** says whether that label passed the four gates below.
+A human-revised frame can fail the appearance gate and an engine frame can pass all four, so admission is
+decided by the gate result, never by the rung. With that separation stated, the programme distinguishes
+three rungs of truth and records the rung with every label: **human revision** (a human
 annotates or corrects the line labels frame by frame), **agent revision** (a per-frame agent review of engine output), and
 **engine-certified** truth (the engine's own line geometry projected into the camera). Two pools are human-revised: the
 training anchor (5 directories, 75 frames) and the development/evaluation packs (9 packages, 117 frames), which is why the
@@ -409,7 +414,7 @@ The programme's training history (321 recorded runs across 44 families, suppleme
 scope instead: tightening it from 6.0 m to 3.0 m raises identity (dev 0.582 → 0.713; limited-class
 0.581 → 0.758) and removes candidates (477 → 166 and 166 → 127), while role agreement is flat — the
 lateral scope is an identity lever, not a role lever. Two further single factors were rejected:
-stochastic weight averaging over the last five epochs rescued no seed and a Tversky
+stochastic weight averaging [@izmailov2018swa] over the last five epochs rescued no seed and a Tversky
 loss-weight arm multiplied the false-positive frame rate on the negative side by 4.5 (11.5% → 51.9% of
 eligible frames, +40.4 percentage points; 329 → 1730 false-positive pixels; maximum component 320 → 808 px),
 which is why the delivered arm keeps the balanced loss. Across every recorded pixel arm the negative-side readings cluster rather than spread (supplement), which is why the negative-example dose had to be varied instead of a loss-weight knob. Extending the dose response to five metrics (supplement) shows that identity and role move with the dose while coverage and the off-road candidate fraction barely do. The availability cost of the adopted definition is also visible at the pairing stage itself: 3–4 paired frames lost per 117-frame run.
@@ -597,6 +602,28 @@ per-distance or per-opportunity normalisations for safety counts, because motion
 counts. And run one independent, one-shot confirmation whose composition differs from the
 development pool; our confirmation's negative result is the single most informative measurement in
 the programme.
+
+TABLE: Table VII. Configuration of the evaluated arms, read from the delivered candidate's checkpoint metadata. Every arm shares this configuration; the composition arms differ only in training-pool composition and the single-factor arms only in the named switch.
+
+| Item | Value |
+|---|---|
+| Architecture | `SegUNet`, a lightweight U-Net [@ronneberger2015unet]: three encoder blocks (3x3 convolutions, batch norm, 2x max-pooling), transposed-convolution decoder with skip connections, 1x1 head; channel width factor 1.0 |
+| Parameters | 834,931 (counted from the delivered checkpoint) |
+| Input | 536 x 403 RGB frame |
+| Classes | background, asphalt, line |
+| Class weights | 0.147 / 1.0 / 40.0 (line class up-weighted) |
+| Loss | weighted cross-entropy + soft-clDice on the line channel (weight 1.0) + Tversky term [@salehi2017tversky] (alpha 0.3, beta 0.7, weight 1.0); the rejected arm of Section V-C differs only in the Tversky weights |
+| Optimiser | Adam (beta 0.9/0.999, no weight decay), lr 1e-3 |
+| LR schedule | CosineAnnealingLR, T_max 480 steps, stepped per iteration |
+| Batch size | 4 |
+| Training budget | 480 steps (40 per epoch; 12 epochs recorded across resumes) |
+| Sampling | quota sampler over the full pool; per-run validation fraction 0.2 (158 train / 29 validation frames in the delivered arm) |
+| Precision | AMP enabled; deterministic algorithms requested (CUDA cross-entropy has no deterministic implementation, which is recorded rather than hidden) |
+| Initialisation | every arm starts from the same checkpoint (`t14_e1_promotable_20260927/baseline/seed42`, sha16 `b3a4dd5a82dd4096`); that checkpoint's own initialisation lineage is **not** fully recorded (`provenance_complete = False`), so the ancestry above it cannot be reconstructed from the stored metadata |
+| Hardware | NVIDIA RTX 5070; torch 2.12.0.dev+cu128, CUDA 12.8, Python 3.10.11 |
+| Matching (frozen) | a candidate matches engine truth when a truth line lies within 0.8 m lateral tolerance; reference availability requires annotation pixels on the candidate's own side; role agreement compares the candidate's left/right role with the engine line's role |
+| Averaging | integer counters accumulated per frame, ratios computed once (never by averaging per-directory ratios); empty denominators are UNKNOWN with a stated reason, never 0 |
+| Pools | human-revised anchor 5 directories / 75 frames; development pool 9 deduplicated scenes / 117 frames; limited-class pool 24 frames; sealed road-disjoint held-out set 200 frames |
 
 # VII. Limitations and Threats to Validity
 

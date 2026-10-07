@@ -59,7 +59,8 @@ mechanism caught a real defect during the work: before it was fixed, the hash di
 protocol, and a set sealed under the old definition would have authorised a confirmation under the
 new one.
 \textbf{Method discipline.} Every change in this paper was pre-registered with its reading rule before
-the runs; the rules include safety non-inferiority read as a maximum over runs, an explicit refusal
+the runs, and each
+pre-registration names the protocol version and the repository commit it was frozen against; the rules include safety non-inferiority read as a maximum over runs, an explicit refusal
 to treat an unmeasured quantity as a pass, and a prohibition on relaxing the frozen gates. Changes
 were applied one factor at a time and judged against alternating control/factor runs. Where a
 pre-registered rule produced a verdict we considered too coarse, we report the verdict as given and
@@ -88,12 +89,12 @@ and speed. Chinese-language work in the same family explores lightweight variant
 \cite{chen2026clrnetlight}, B-spline end-to-end regression \cite{huang2026bspline}, graph/transformer hybrids
 \cite{jia2026gnn}, transformer with cross-attention \cite{li2026xca}, parallel detection over image
 sequences \cite{zhu2024parallel}, multi-scale feature aggregation \cite{hu2026multiscale}, DeepLabV3+
-variants \cite{shuai2026deeplab}, symmetry-prior and key-point methods for complex scenes
+variants \cite{shuai2026deeplab} of the original architecture \cite{chen2018deeplab}, symmetry-prior and key-point methods for complex scenes
 \cite{lu2026symmetry}, and 3-D lane estimation with convolutional architectures \cite{chen2025threed}.
 These works share our object of study but differ in what they optimise: they report accuracy against
 datasets whose annotation conventions differ from each other, which is exactly the ambiguity this
 paper makes explicit.
-\textbf{Datasets and ground truth.} TuSimple \cite{tusimple2017} and CULane \cite{pan2018scnn} remain the
+\textbf{Datasets and ground truth.} TuSimple \cite{tusimple2017}, CULane \cite{pan2018scnn} and Cityscapes \cite{cordts2016cityscapes} remain the
 standard benchmarks; their annotation conventions (lane presence per row, presence of far-field
 markings, treatment of occlusion) differ, and neither reports the annotation's \emph{appearance}
 properties. Ground-truth generation has been studied as a problem in its own right: Borkar et al.
@@ -128,7 +129,11 @@ rate discussed in Section V-E.
 \label{fig:c1}
 \end{figure*}
 \subsection{Truth provenance, credentials, and certification gates}
-The programme distinguishes three rungs of truth and records the rung with every label: \textbf{human revision} (a human
+Two dimensions must not be conflated here. \textbf{Provenance} says who or what produced a label (human
+revision, agent review, engine); \textbf{certification} says whether that label passed the four gates below.
+A human-revised frame can fail the appearance gate and an engine frame can pass all four, so admission is
+decided by the gate result, never by the rung. With that separation stated, the programme distinguishes
+three rungs of truth and records the rung with every label: \textbf{human revision} (a human
 annotates or corrects the line labels frame by frame), \textbf{agent revision} (a per-frame agent review of engine output), and
 \textbf{engine-certified} truth (the engine's own line geometry projected into the camera). Two pools are human-revised: the
 training anchor (5 directories, 75 frames) and the development/evaluation packs (9 packages, 117 frames), which is why the
@@ -364,7 +369,7 @@ The programme's training history (321 recorded runs across 44 families, suppleme
 scope instead: tightening it from 6.0 m to 3.0 m raises identity (dev 0.582 $\rightarrow$ 0.713; limited-class
 0.581 $\rightarrow$ 0.758) and removes candidates (477 $\rightarrow$ 166 and 166 $\rightarrow$ 127), while role agreement is flat --- the
 lateral scope is an identity lever, not a role lever. Two further single factors were rejected:
-stochastic weight averaging over the last five epochs rescued no seed and a Tversky
+stochastic weight averaging \cite{izmailov2018swa} over the last five epochs rescued no seed and a Tversky
 loss-weight arm multiplied the false-positive frame rate on the negative side by 4.5 (11.5\% $\rightarrow$ 51.9\% of
 eligible frames, +40.4 percentage points; 329 $\rightarrow$ 1730 false-positive pixels; maximum component 320 $\rightarrow$ 808 px),
 which is why the delivered arm keeps the balanced loss. Across every recorded pixel arm the negative-side readings cluster rather than spread (supplement), which is why the negative-example dose had to be varied instead of a loss-weight knob. Extending the dose response to five metrics (supplement) shows that identity and role move with the dose while coverage and the off-road candidate fraction barely do. The availability cost of the adopted definition is also visible at the pairing stage itself: 3--4 paired frames lost per 117-frame run.
@@ -549,6 +554,33 @@ per-distance or per-opportunity normalisations for safety counts, because motion
 counts. And run one independent, one-shot confirmation whose composition differs from the
 development pool; our confirmation's negative result is the single most informative measurement in
 the programme.
+\begin{table}[!t]
+\centering
+\caption{Configuration of the evaluated arms, read from the delivered candidate's checkpoint metadata. Every arm shares this configuration; the composition arms differ only in training-pool composition and the single-factor arms only in the named switch.}
+\begin{tabular}{@{}ll@{}}
+\toprule
+Item & Value \\
+\midrule
+Architecture & `SegUNet`, a lightweight U-Net \cite{ronneberger2015unet}: three encoder blocks (3x3 convolutions, batch norm, 2x max-pooling), transposed-convolution decoder with skip connections, 1x1 head; channel width factor 1.0 \\
+Parameters & 834,931 (counted from the delivered checkpoint) \\
+Input & 536 x 403 RGB frame \\
+Classes & background, asphalt, line \\
+Class weights & 0.147 / 1.0 / 40.0 (line class up-weighted) \\
+Loss & weighted cross-entropy + soft-clDice on the line channel (weight 1.0) + Tversky term \cite{salehi2017tversky} (alpha 0.3, beta 0.7, weight 1.0); the rejected arm of Section V-C differs only in the Tversky weights \\
+Optimiser & Adam (beta 0.9/0.999, no weight decay), lr 1e-3 \\
+LR schedule & CosineAnnealingLR, T_max 480 steps, stepped per iteration \\
+Batch size & 4 \\
+Training budget & 480 steps (40 per epoch; 12 epochs recorded across resumes) \\
+Sampling & quota sampler over the full pool; per-run validation fraction 0.2 (158 train / 29 validation frames in the delivered arm) \\
+Precision & AMP enabled; deterministic algorithms requested (CUDA cross-entropy has no deterministic implementation, which is recorded rather than hidden) \\
+Initialisation & every arm starts from the same checkpoint (`t14_e1_promotable_20260927/baseline/seed42`, sha16 `b3a4dd5a82dd4096`); that checkpoint's own initialisation lineage is \textbf{not} fully recorded (`provenance_complete = False`), so the ancestry above it cannot be reconstructed from the stored metadata \\
+Hardware & NVIDIA RTX 5070; torch 2.12.0.dev+cu128, CUDA 12.8, Python 3.10.11 \\
+Matching (frozen) & a candidate matches engine truth when a truth line lies within 0.8 m lateral tolerance; reference availability requires annotation pixels on the candidate's own side; role agreement compares the candidate's left/right role with the engine line's role \\
+Averaging & integer counters accumulated per frame, ratios computed once (never by averaging per-directory ratios); empty denominators are UNKNOWN with a stated reason, never 0 \\
+Pools & human-revised anchor 5 directories / 75 frames; development pool 9 deduplicated scenes / 117 frames; limited-class pool 24 frames; sealed road-disjoint held-out set 200 frames \\
+\bottomrule
+\end{tabular}
+\end{table}
 \section{Limitations and Threats to Validity}
 \textbf{No instance-level recall is claimed.} The counting contract reports coverage, identity and role as
 conditional ratios over evaluated candidates; a missed marking on a frame where the perception produced no
@@ -757,8 +789,8 @@ IV cost ledger & `gpu_ledger_machine.json` \\
 
 \begin{thebibliography}{99}
 \bibitem{neven2018lanenet} Neven, Davy, De Brabandere, Bert, Georgoulis, Stamatios, Proesmans, Marc, Van Gool, Luc, “Towards End-to-End Lane Detection: An Instance Segmentation Approach,” in IEEE Intelligent Vehicles Symposium (IV), 2018.
-\bibitem{pan2018scnn} Pan, Xingang, Shi, Jianping, Luo, Ping, Wang, Xiaogang, Tang, Xiaoou, “Spatial As Deep: Spatial {CNN} for Traffic Scene Understanding,” in AAAI Conference on Artificial Intelligence, 2018.
-\bibitem{zheng2022clrnet} Zheng, Tu, Huang, Yifei, Liu, Yang, Tang, Wenjian, Yang, Zheng, Cai, Deng, He, Xiaofei, “{CLRNet}: Cross Layer Refinement Network for Lane Detection,” in IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), 2022.
+\bibitem{pan2018scnn} Pan, Xingang, Shi, Jianping, Luo, Ping, Wang, Xiaogang, Tang, Xiaoou, “Spatial As Deep: Spatial CNN for Traffic Scene Understanding,” in AAAI Conference on Artificial Intelligence, 2018.
+\bibitem{zheng2022clrnet} Zheng, Tu, Huang, Yifei, Liu, Yang, Tang, Wenjian, Yang, Zheng, Cai, Deng, He, Xiaofei, “CLRNet: Cross Layer Refinement Network for Lane Detection,” in IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), 2022.
 \bibitem{chen2026clrnetlight} 陈淑慧, “CLRNet车道线检测算法的一种轻量化方法,” 软件工程, 29, no. 9, 2026. [In Chinese]
 \bibitem{huang2026bspline} 黄炜, 等, “基于B样条曲线的端到端车道线检测方法,” 长安大学学报(自然科学版), 46, no. 3, 2026. [In Chinese]
 \bibitem{jia2026gnn} 贾子厚, 等, “基于GNN-Transformer模型的车道线检测方法,” 工程设计学报, 33, no. 3, 2026. [In Chinese]
@@ -766,10 +798,15 @@ IV cost ledger & `gpu_ledger_machine.json` \\
 \bibitem{zhu2024parallel} 朱威, 欧全林, 洪力栋, 何德峰, “基于图像序列的车道线并行检测网络,” 模式识别与人工智能, 34, no. 5, 434--445, 2021. [In Chinese]
 \bibitem{hu2026multiscale} 胡鹏, 刘平, 胡遥, “基于多尺度特征聚合的车道线检测方法,” 汽车工程学报, 2026. [In Chinese]
 \bibitem{shuai2026deeplab} 帅强, 等, “基于改进DeeplabV3+模型的车道线检测方法,” 太原科技大学学报, 47, no. 3, 2026. [In Chinese]
+\bibitem{chen2018deeplab} Chen, Liang-Chieh, Zhu, Yukun, Papandreou, George, Schroff, Florian, Adam, Hartwig, “Encoder-Decoder with Atrous Separable Convolution for Semantic Image Segmentation,” in European Conference on Computer Vision (ECCV), 2018.
 \bibitem{lu2026symmetry} 陆军, 张澍森, 王磊, “复杂场景下基于对称先验与关键点预测的车道线检测,” 智能系统学报, 2026. [In Chinese]
 \bibitem{chen2025threed} 陈小海, 等, “深度卷积神经网络架构下智能车3D车道线检测研究,” 现代电子技术, 48, no. 24, 2025. [In Chinese]
-\bibitem{tusimple2017} {TuSimple}, “TuSimple Lane Detection Challenge,” 2017. Dataset
+\bibitem{tusimple2017} TuSimple, “TuSimple Lane Detection Challenge,” 2017. Dataset
+\bibitem{cordts2016cityscapes} Cordts, Marius, Omran, Mohamed, Ramos, Sebastian, Rehfeld, Timo, Enzweiler, Markus, Benenson, Rodrigo, Franke, Uwe, Roth, Stefan, Schiele, Bernt, “The Cityscapes Dataset for Semantic Urban Scene Understanding,” in IEEE Conference on Computer Vision and Pattern Recognition (CVPR), 2016.
 \bibitem{borkar2012groundtruth} Borkar, Amol, Hayes, Monson, Smith, Mark T., “A Novel Lane Detection System With Efficient Ground Truth Generation,” IEEE Transactions on Intelligent Transportation Systems, 13, no. 1, 2012.
 \bibitem{mccall2006video} McCall, Joel C., Trivedi, Mohan M., “Video-Based Lane Estimation and Tracking for Driver Assistance: Survey, System, and Evaluation,” IEEE Transactions on Intelligent Transportation Systems, 7, no. 1, 2006.
+\bibitem{izmailov2018swa} Izmailov, Pavel, Podoprikhin, Dmitrii, Garipov, Timur, Vetrov, Dmitry, Wilson, Andrew Gordon, “Averaging Weights Leads to Wider Optima and Better Generalization,” in Conference on Uncertainty in Artificial Intelligence (UAI), 2018.
+\bibitem{ronneberger2015unet} Ronneberger, Olaf, Fischer, Philipp, Brox, Thomas, “U-Net: Convolutional Networks for Biomedical Image Segmentation,” in Medical Image Computing and Computer-Assisted Intervention (MICCAI), 2015.
+\bibitem{salehi2017tversky} Salehi, Seyed Sadegh Mohseni, Erdogmus, Deniz, Gholipour, Ali, “Tversky Loss Function for Image Segmentation Using 3D Fully Convolutional Deep Networks,” in Machine Learning in Medical Imaging (MLMI), MICCAI Workshop, 2017.
 \end{thebibliography}
 \end{document}

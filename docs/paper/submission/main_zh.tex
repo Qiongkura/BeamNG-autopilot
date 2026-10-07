@@ -28,11 +28,11 @@
 \textbf{带凭证的真值来源。} 本计划中每一个标签都携带来源凭证，且凭证是被\emph{强制执行}而非仅仅声明：命令行的一句断言无法把一个标签「提升」到更高一级（见第 III-B 节）。凭证阶梯有三级------人工逐帧修订、逐帧智能体复核、引擎导出真值------而引擎一级只有通过四道显式认证门才被采纳：凭证门（标签来源必须声明且可核验）、漆面外观门（被声明为线的像素必须在图像中看起来像漆）、道路类型门（帧必须带有使「是否在铺装上」可判定的道路类型列）、负证据门（被声明为不含线的帧必须给出自身的正面证据，而不只是「没有标签」）。本文报告的各轮次不新增人工标注：实验变量是在人工修订基座之上、引擎认证增量的组成方式，第 VII 节说明基座规模偏小让我们付出了什么代价。
 \textbf{显式计数契约。} 每一个报告的比率都由一份计数契约定义，契约在一条显式的集合链上指明分子与分母：含候选的帧、抽取出的候选实例、标注中存在的参考实例、匹配实例、横向位置一致的实例、左右角色一致的实例。因此覆盖率、身份率与角色一致率是分母明确的实例级比率；精度与召回仍是像素级，并以两种\emph{范围}（标签像素、类漆像素）报告，因为二者回答的是不同的问题。
 \textbf{带哈希门控的版本化协议定义。} 协议固定候选车道线的几何范围，本身就是一等、可版本化的产物。协议变更会改变评价哈希，而被冻结的留出集与一次性确认都记录该哈希，因此在一套定义下产生的确认不可能被悄悄归到另一套定义名下。该机制在工作中捕获了一个真实缺陷：在修复之前，哈希并不跟随协议，于是按旧定义封存的集合将能授权一次新定义下的确认。
-\textbf{方法纪律。} 本文的每一处改动都在运行之前预注册，并写明读数规则；规则包括：安全非劣性按各次运行的最大值读取、明确拒绝把未测量的量当作通过、禁止放宽已冻结的门。改动按单因子逐个施加，并以交替的对照/因子运行裁决。当预注册规则给出的裁决我们认为过于粗糙时，我们照原样报告裁决，并记录规则本身的缺陷，而不是重新解释结果；其中一处缺陷------安全指标是帧\emph{计数}、因而随车辆行驶距离缩放------在第 V-F 节分析，并在图 7(c) 中量化。
+\textbf{方法纪律。} 本文的每一处改动都在运行之前预注册、并写明读数规则，且每份预注册都标明它所冻结的协议版本与仓库提交；规则包括：安全非劣性按各次运行的最大值读取、明确拒绝把未测量的量当作通过、禁止放宽已冻结的门。改动按单因子逐个施加，并以交替的对照/因子运行裁决。当预注册规则给出的裁决我们认为过于粗糙时，我们照原样报告裁决，并记录规则本身的缺陷，而不是重新解释结果；其中一处缺陷------安全指标是帧\emph{计数}、因而随车辆行驶距离缩放------在第 V-F 节分析，并在图 7(c) 中量化。
 \textbf{贡献。} （1）带凭证的真值来源阶梯（人工修订／智能体复核／引擎认证）及其强制执行，以及针对机器生成增量的认证门流水线；每个数据池的组成都被显式说明，且所报告的轮次不新增人工标注。（2）计数契约，以及「线」的两套自然读法在同一批数据上失败在不同门上的实证------它把约 30\% 的标注线像素移出采纳范围（采纳范围保留开发池 69\%、有限类别池 89\% 的标注线像素）。（3）协议／版本／哈希机制，把留出集绑定到它所依据的定义上。（4）一次按道路切分的一次性确认，配有显式的 UNKNOWN 政策，其负结果（未复现开发集数字）被我们当作发现来报告。（5）对「为什么一套通过全部离线门的感知栈仍然过不了闭环验收门」的测量式定位，包括一个静止死锁机制，以及「在铺装上」门实际上是由神经障碍层而非铺装证据驱动的这一观察。
 \section{相关工作}
-\textbf{车道线检测方法。} 现代车道线检测由深度分割与参数化／锚点式曲线回归主导。带空洞卷积与判别损失的编码器--解码器分割（LaneNet \cite{neven2018lanenet}）与逐行消息传递（SCNN \cite{pan2018scnn}）确立了本文系统所沿袭的分割路线；基于锚点头的跨层细化（CLRNet \cite{zheng2022clrnet}）提升了曲线精度与速度。同一族的中文工作探索了 CLRNet 的轻量化变体 \cite{chen2026clrnetlight}、B 样条端到端回归 \cite{huang2026bspline}、图／Transformer 混合模型 \cite{jia2026gnn}、带交叉注意力的 Transformer \cite{li2026xca}、图像序列上的并行检测 \cite{zhu2024parallel}、多尺度特征聚合 \cite{hu2026multiscale}、DeeplabV3+ 变体 \cite{shuai2026deeplab}、面向复杂场景的对称先验与关键点方法 \cite{lu2026symmetry}，以及基于卷积架构的 3D 车道线估计 \cite{chen2025threed}。这些工作与本文研究对象相同，但优化目标不同：它们报告的精度所依据的数据集，其标注约定彼此并不一致------而这正是本文要显式化的那种歧义。
-\textbf{数据集与真值。} TuSimple \cite{tusimple2017} 与 CULane \cite{pan2018scnn} 仍是标准基准；二者的标注约定（逐行车道存在性、远场标线是否计入、遮挡的处理方式）不同，且都没有报告标注的\emph{外观}属性。真值生成本身已被作为独立问题研究：Borkar 等 \cite{borkar2012groundtruth} 为夜间车道检测器构建了基于时间切片可视化的自动真值流程，McCall 与 Trivedi \cite{mccall2006video} 则明确从评测方法学的角度综述并评估了基于视频的车道估计。本文延续这一路线并补充两点：真值来自引擎状态而非图像；以及一份使每个报告比率的分母都可被审查的计数契约。
+\textbf{车道线检测方法。} 现代车道线检测由深度分割与参数化／锚点式曲线回归主导。带空洞卷积与判别损失的编码器--解码器分割（LaneNet \cite{neven2018lanenet}）与逐行消息传递（SCNN \cite{pan2018scnn}）确立了本文系统所沿袭的分割路线；基于锚点头的跨层细化（CLRNet \cite{zheng2022clrnet}）提升了曲线精度与速度。同一族的中文工作探索了 CLRNet 的轻量化变体 \cite{chen2026clrnetlight}、B 样条端到端回归 \cite{huang2026bspline}、图／Transformer 混合模型 \cite{jia2026gnn}、带交叉注意力的 Transformer \cite{li2026xca}、图像序列上的并行检测 \cite{zhu2024parallel}、多尺度特征聚合 \cite{hu2026multiscale}、DeeplabV3+ 变体 \cite{shuai2026deeplab}，其原始架构见 \cite{chen2018deeplab}、面向复杂场景的对称先验与关键点方法 \cite{lu2026symmetry}，以及基于卷积架构的 3D 车道线估计 \cite{chen2025threed}。这些工作与本文研究对象相同，但优化目标不同：它们报告的精度所依据的数据集，其标注约定彼此并不一致------而这正是本文要显式化的那种歧义。
+\textbf{数据集与真值。} TuSimple \cite{tusimple2017}、CULane \cite{pan2018scnn} 与 Cityscapes \cite{cordts2016cityscapes} 仍是标准基准；二者的标注约定（逐行车道存在性、远场标线是否计入、遮挡的处理方式）不同，且都没有报告标注的\emph{外观}属性。真值生成本身已被作为独立问题研究：Borkar 等 \cite{borkar2012groundtruth} 为夜间车道检测器构建了基于时间切片可视化的自动真值流程，McCall 与 Trivedi \cite{mccall2006video} 则明确从评测方法学的角度综述并评估了基于视频的车道估计。本文延续这一路线并补充两点：真值来自引擎状态而非图像；以及一份使每个报告比率的分母都可被审查的计数契约。
 \textbf{自动标注与仿真。} 自训练与自动标注被广泛用于降低标注成本，但其评价继承了上述定义问题。由仿真器导出的标签在合成基准中很常见；不那么常见的是对每个生成标签针对图像证据做认证的纪律------本文采用它，因为一个无法从图像中找回的标签不是可学习的目标。
 \textbf{评价纪律。} 预注册在实证科学中是标准做法，在感知研究中却很罕见。我们在此的贡献不是概念，而是一个完整记录的实例：一次预注册、一次交替的单因子 A/B、一条固定的读数规则，以及每个因子一份裁决------其中五个因子的裁决为负。
 \section{系统与方法}
@@ -45,7 +45,7 @@
 \label{fig:c1}
 \end{figure*}
 \subsection{真值来源、凭证与认证门}
-本计划区分三级真值，并为每个标签记录其级别：\textbf{人工修订}（由人逐帧标注或修正车道标签）、\textbf{智能体复核}（对引擎输出的逐帧智能体审查）、\textbf{引擎认证}真值（引擎自身的车道几何投影到相机坐标系）。有两个池是人工修订的：训练基座（5 个目录、75 帧）与开发／评价包（9 个包、117 帧），这也是第 V-A 节的验收结果是对照人工标注测量的原因。消融实验所变动的机器生成增量是引擎认证的；它只有在满足以下条件时才被采纳：(i) 凭证存在且可解析，且标签来源已声明（来源无法命名的帧被排除，而不是猜测）；(ii) 被声明为线的像素满足漆面外观谓词------白漆要求高亮度、低色度与红蓝平衡；黄漆要求特定的色调比区间；该谓词是单一来源模块，因此阈值变更是一次版本化变更，而不是局部修改；(iii) 帧带有道路类型列，缺少它则「在铺装上」不可判定；(iv) 被声明为不含线的帧携带自身的正面证据（已认证负例），因此「没有标签」永远不会被读成「没有线」。任何一道门不通过的帧都从训练与评价中排除，并计入审计，而不是被悄悄丢弃。
+这里必须区分两个维度。\textbf{来源}说的是标签由谁／什么产生（人工修订、智能体复核、引擎）；\textbf{认证}说的是该标签是否通过下面四道门。人工修订的帧可以不过外观门，引擎帧也可以四门全过，因此准入由门的结论决定、而不是由级别决定。在这个前提下，本计划区分三级真值，并为每个标签记录其级别：\textbf{人工修订}（由人逐帧标注或修正车道标签）、\textbf{智能体复核}（对引擎输出的逐帧智能体审查）、\textbf{引擎认证}真值（引擎自身的车道几何投影到相机坐标系）。有两个池是人工修订的：训练基座（5 个目录、75 帧）与开发／评价包（9 个包、117 帧），这也是第 V-A 节的验收结果是对照人工标注测量的原因。消融实验所变动的机器生成增量是引擎认证的；它只有在满足以下条件时才被采纳：(i) 凭证存在且可解析，且标签来源已声明（来源无法命名的帧被排除，而不是猜测）；(ii) 被声明为线的像素满足漆面外观谓词------白漆要求高亮度、低色度与红蓝平衡；黄漆要求特定的色调比区间；该谓词是单一来源模块，因此阈值变更是一次版本化变更，而不是局部修改；(iii) 帧带有道路类型列，缺少它则「在铺装上」不可判定；(iv) 被声明为不含线的帧携带自身的正面证据（已认证负例），因此「没有标签」永远不会被读成「没有线」。任何一道门不通过的帧都从训练与评价中排除，并计入审计，而不是被悄悄丢弃。
 门的记账本身就是一项结果：图 3(b) 给出某一采集轮次的负例池漏斗（采纳、可疑、含漆、未决）------一个在磁盘上看起来很充裕的池，在被用作训练信号之前就收缩为一个已认证子集。
 \subsection{计数契约}
 契约定义在一组逐帧累加的整数计数之上，比率由这些整数一次算出，绝不对各目录的比率再取平均。$P$ 是标注在铺装上确实有线的帧数（逐帧判定：不因同组另一帧有线而纳入）；$C$ 是 $P$ 帧内进入评价的感知候选数；$C_{\mathrm{out}}$ 是落在 $P$ 之外帧上的候选，单独上报；$R \subseteq C$ 是自身所在侧有可用真值参考的候选数；$M \subseteq R$ 是满足冻结匹配条件的候选数；$L \subseteq M$ 是预测与参考都有可判左右角色的候选数；$A \subseteq L$ 是角色一致的候选数。报告的实例级比率为覆盖率 $|R|/|C|$、身份率 $|M|/|R|$ 与角色一致率 $|A|/|L|$；像素级精度与召回以两种范围（标签、漆）报告。图 1(b) 给出该契约。
@@ -152,7 +152,7 @@ v8：三项全开（采纳） & 0.894 & 0.559 & 0.812 & 0.693 & 0.665 \\
 \end{table*}
 \subsection{训练组成的剂量--效应}
 图 5(d) 给出剂量响应当前的样子，而旧曲线没有通过它自己的检验。旧曲线（基础 1 种子、4$\times$ 6、6$\times$ 1、8.5$\times$ 6：0.707/0.711/\textbf{0.763}/0.701）是在另一套配置下测的，其身份率在冻结协议下无法复现------同一个 6$\times$ 检查点在那里读作 0.763、在这里读作 0.667------因此它与验收数字不可比，已被替换。新图报告冻结协议下的\textbf{配对种子重评}（凡检查点仍在的剂量都用种子 42--47；见表 VI）：0$\times$ 0.658（0.631--0.690）、4$\times$ 0.661（0.648--0.674）、6$\times$ 0.665（0.645--0.676）。相对 0$\times$ 的逐种子配对差值为 +0.003（4$\times$）与 +0.007（6$\times$），且符号不一致（两者在种子 45 上都是负的），因此\textbf{六种子下三档不可区分}，「6$\times$ 是剂量响应峰值」这一主张不成立。8.5$\times$ 臂的检查点已在存储清理中删除，其\emph{已记录}六种子均值为 0.701------高于 6$\times$，与旧曲线的排序相反。交付组成仍是 6$\times$，因为它在一次性确认之前就被选定，改动它需要重新封存一个集合；论文对组成的主张现在被限定为「未证明存在剂量效应」。
-本计划的训练历史（44 个家族、321 次已记录运行，见补充材料）在 120 轮预算的 20--40 轮内收敛，而线通道被掩蔽的家族按构造即处于零线 IoU（图中已标注），因此它们的曲线不是负结果。图 5(c) 转而扫描横向范围：从 6.0 m 收紧到 3.0 m 提升身份率（开发 0.582 $\rightarrow$ 0.713；有限类别 0.581 $\rightarrow$ 0.758）并减少候选（477 $\rightarrow$ 166 与 166 $\rightarrow$ 127），而角色一致率持平------横向范围是身份杠杆，不是角色杠杆。另有两个单因子被否决：在最后五个轮次上做随机权重平均没有救回任何种子；一个 Tversky 损失权重臂把负例一侧的假阳性帧率放大到 4.5 倍（占合格帧 11.5\% $\rightarrow$ 51.9\%，即 +40.4 个百分点；假阳性像素 329 $\rightarrow$ 1730；最大连通域 320 $\rightarrow$ 808 px），这也是交付臂保留平衡损失的原因。
+本计划的训练历史（44 个家族、321 次已记录运行，见补充材料）在 120 轮预算的 20--40 轮内收敛，而线通道被掩蔽的家族按构造即处于零线 IoU（图中已标注），因此它们的曲线不是负结果。图 5(c) 转而扫描横向范围：从 6.0 m 收紧到 3.0 m 提升身份率（开发 0.582 $\rightarrow$ 0.713；有限类别 0.581 $\rightarrow$ 0.758）并减少候选（477 $\rightarrow$ 166 与 166 $\rightarrow$ 127），而角色一致率持平------横向范围是身份杠杆，不是角色杠杆。另有两个单因子被否决：在最后五个轮次上做随机权重平均 \cite{izmailov2018swa} 没有救回任何种子；一个 Tversky 损失权重臂把负例一侧的假阳性帧率放大到 4.5 倍（占合格帧 11.5\% $\rightarrow$ 51.9\%，即 +40.4 个百分点；假阳性像素 329 $\rightarrow$ 1730；最大连通域 320 $\rightarrow$ 808 px），这也是交付臂保留平衡损失的原因。
 在所有已记录的像素臂上，负例一侧的读数呈聚集而非发散（见补充材料），这也是负例剂量必须被当作变动轴、而不是去调损失权重旋钮的原因。把剂量--效应扩展到五个指标（见补充材料）显示：身份率与角色随剂量变动，而覆盖率与路外候选比例几乎不动。采纳定义的可用率代价在配对阶段本身也可见：每 117 帧运行损失 3--4 个配对帧。
 \begin{table}[!t]
 \centering
@@ -226,6 +226,33 @@ v8：三项全开（采纳） & 0.894 & 0.559 & 0.812 & 0.693 & 0.665 \\
 \textbf{哪些没有奏效。} 范围缺口无法只靠工程手段弥合，而原因值得说准：约 30\% 的标注线像素不满足采纳定义所用的外观谓词，而该谓词只读 RGB 亮度与色度、不计算与周围铺装的空间对比度，因此这一测量所确立的是「这些像素不满足\emph{这个}谓词」。它们对人是可见的、能否从上下文或另一种模态中找回、以及是否可学，都是本工作没有回答的开放问题------强形式的说法（「不可见，因而不可学」）并不被测量支持。被支持的是算术：漆范围保留开发池 69\% 的标注线像素，而保留下来的像素被召回的比率高于被移除的像素（同一批检查点上 0.813 对 0.736），因此把召回条件化在这个谓词上并不是白得的改进，必须始终与完整标签读法并列报告。在被移除的像素上训练，目前是未测试，而不是已被否定。
 离线门也不会自动迁移到闭环验收：同一套通过全部离线门的感知，仍让车辆无法移动，其原因（静止的车体扫掠死锁）没有任何离线指标能表达。最后，可用率与安全沿定义轴相互权衡，这种权衡无法被单个标量概括：在我们已有的四次运行中，采纳定义伴随「未观察到压中心线」与「车道来源可用率相对下降 66\%」同时出现。
 \textbf{对评测实践的启示。} 有三种做法本会显著改变我们的结果。报告指标的同时报告其\emph{定义}，并把定义做成版本化产物。对安全计数报告按距离或按机会归一化的结果，因为运动量会污染原始计数。以及，运行一次组成与开发池不同的独立一次性确认；我们那次确认的负结果是整个计划中信息量最大的单项测量。
+\begin{table}[!t]
+\centering
+\caption{被评测各臂的配置，读自交付候选的 checkpoint 元数据。所有臂共用这套配置；组成臂只在训练池组成上不同，单因子臂只在所命名的那个开关上不同。}
+\begin{tabular}{@{}ll@{}}
+\toprule
+项 & 取值 \\
+\midrule
+结构 & `SegUNet`，轻量 U-Net \cite{ronneberger2015unet}：三个编码块（3x3 卷积、批归一化、2x 最大池化）、带跳跃连接的转置卷积解码器、1x1 头；通道宽度系数 1.0 \\
+参数量 & 834,931（由交付 checkpoint 统计） \\
+输入 & 536 x 403 RGB 帧 \\
+类别 & background、asphalt、line \\
+类别权重 & 0.147 / 1.0 / 40.0（线类别加权） \\
+损失 & 加权交叉熵 + 线通道的 soft-clDice（权重 1.0）+ Tversky 项 \cite{salehi2017tversky}（alpha 0.3、beta 0.7、权重 1.0）；第 V-C 节被否决的那一臂只改 Tversky 权重 \\
+优化器 & Adam（beta 0.9/0.999，无权重衰减），lr 1e-3 \\
+学习率计划 & CosineAnnealingLR，T_max 480 步，按迭代步进 \\
+批量 & 4 \\
+训练预算 & 480 步（每轮 40 步；含续训共记录 12 轮） \\
+采样 & 配额采样器覆盖全池；每轮验证比例 0.2（交付臂 158 训练帧 / 29 验证帧） \\
+精度 & 启用 AMP；请求确定性算法（CUDA 交叉熵没有确定性实现，这一点如实记录而非隐藏） \\
+初始化 & 所有臂从同一个 checkpoint 出发（`t14_e1_promotable_20260927/baseline/seed42`，sha16 `b3a4dd5a82dd4096`）；该 checkpoint 自身的初始化谱系\textbf{未完整记录}（`provenance_complete = False`），因此它之上的谱系无法由存储的元数据重建 \\
+硬件 & NVIDIA RTX 5070；torch 2.12.0.dev+cu128、CUDA 12.8、Python 3.10.11 \\
+匹配（冻结） & 候选与引擎真值的横向距离在 0.8 m 容差内即算匹配；参考可判要求候选\textbf{自身所在侧}有标注像素；角色一致率比较候选的左右角色与引擎线的角色 \\
+汇总方式 & 逐帧累加整数计数、比率只算一次（绝不平均各目录的比率）；分母为空记 UNKNOWN 并附原因，不写 0 \\
+数据池 & 人工修订基座 5 目录 / 75 帧；开发池 9 个去重场景 / 117 帧；有限类别池 24 帧；封存的道路不相交留出集 200 帧 \\
+\bottomrule
+\end{tabular}
+\end{table}
 \section{局限与效度威胁}
 \textbf{不主张实例级召回。} 计数契约报告的覆盖率、身份率与角色都是「进入评价的候选」上的条件比率；感知没有产生候选的帧上发生的漏检只进入像素级召回。需要实例召回的读者应按契约定义（第 III-C 节）理解，而不要从 $|R|/|C|$ 反推一个实例召回。
 \textbf{人工基座很小。} 人工修订基座规模偏小（75 个训练帧），人工修订评价包覆盖 9 个包（117 帧），因此场景多样性有限；封存的一次性集合是引擎认证而非人工修订的，因此其数字与人工修订的验收数字不能直接比较。一个更大的人工修订留出集会强化定义性论证，我们将其留给未来工作。在所报告的轮次中，本计划刻意\textbf{不新增人工标注}，这同时限定了成本与覆盖面。
@@ -325,8 +352,8 @@ IV 成本台账 & `gpu_ledger_machine.json` \\
 
 \begin{thebibliography}{99}
 \bibitem{neven2018lanenet} Neven, Davy, De Brabandere, Bert, Georgoulis, Stamatios, Proesmans, Marc, Van Gool, Luc, “Towards End-to-End Lane Detection: An Instance Segmentation Approach,” in IEEE Intelligent Vehicles Symposium (IV), 2018.
-\bibitem{pan2018scnn} Pan, Xingang, Shi, Jianping, Luo, Ping, Wang, Xiaogang, Tang, Xiaoou, “Spatial As Deep: Spatial {CNN} for Traffic Scene Understanding,” in AAAI Conference on Artificial Intelligence, 2018.
-\bibitem{zheng2022clrnet} Zheng, Tu, Huang, Yifei, Liu, Yang, Tang, Wenjian, Yang, Zheng, Cai, Deng, He, Xiaofei, “{CLRNet}: Cross Layer Refinement Network for Lane Detection,” in IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), 2022.
+\bibitem{pan2018scnn} Pan, Xingang, Shi, Jianping, Luo, Ping, Wang, Xiaogang, Tang, Xiaoou, “Spatial As Deep: Spatial CNN for Traffic Scene Understanding,” in AAAI Conference on Artificial Intelligence, 2018.
+\bibitem{zheng2022clrnet} Zheng, Tu, Huang, Yifei, Liu, Yang, Tang, Wenjian, Yang, Zheng, Cai, Deng, He, Xiaofei, “CLRNet: Cross Layer Refinement Network for Lane Detection,” in IEEE/CVF Conference on Computer Vision and Pattern Recognition (CVPR), 2022.
 \bibitem{chen2026clrnetlight} 陈淑慧, “CLRNet车道线检测算法的一种轻量化方法,” 软件工程, 29, no. 9, 2026. [In Chinese]
 \bibitem{huang2026bspline} 黄炜, 等, “基于B样条曲线的端到端车道线检测方法,” 长安大学学报(自然科学版), 46, no. 3, 2026. [In Chinese]
 \bibitem{jia2026gnn} 贾子厚, 等, “基于GNN-Transformer模型的车道线检测方法,” 工程设计学报, 33, no. 3, 2026. [In Chinese]
@@ -334,10 +361,15 @@ IV 成本台账 & `gpu_ledger_machine.json` \\
 \bibitem{zhu2024parallel} 朱威, 欧全林, 洪力栋, 何德峰, “基于图像序列的车道线并行检测网络,” 模式识别与人工智能, 34, no. 5, 434--445, 2021. [In Chinese]
 \bibitem{hu2026multiscale} 胡鹏, 刘平, 胡遥, “基于多尺度特征聚合的车道线检测方法,” 汽车工程学报, 2026. [In Chinese]
 \bibitem{shuai2026deeplab} 帅强, 等, “基于改进DeeplabV3+模型的车道线检测方法,” 太原科技大学学报, 47, no. 3, 2026. [In Chinese]
+\bibitem{chen2018deeplab} Chen, Liang-Chieh, Zhu, Yukun, Papandreou, George, Schroff, Florian, Adam, Hartwig, “Encoder-Decoder with Atrous Separable Convolution for Semantic Image Segmentation,” in European Conference on Computer Vision (ECCV), 2018.
 \bibitem{lu2026symmetry} 陆军, 张澍森, 王磊, “复杂场景下基于对称先验与关键点预测的车道线检测,” 智能系统学报, 2026. [In Chinese]
 \bibitem{chen2025threed} 陈小海, 等, “深度卷积神经网络架构下智能车3D车道线检测研究,” 现代电子技术, 48, no. 24, 2025. [In Chinese]
-\bibitem{tusimple2017} {TuSimple}, “TuSimple Lane Detection Challenge,” 2017. Dataset
+\bibitem{tusimple2017} TuSimple, “TuSimple Lane Detection Challenge,” 2017. Dataset
+\bibitem{cordts2016cityscapes} Cordts, Marius, Omran, Mohamed, Ramos, Sebastian, Rehfeld, Timo, Enzweiler, Markus, Benenson, Rodrigo, Franke, Uwe, Roth, Stefan, Schiele, Bernt, “The Cityscapes Dataset for Semantic Urban Scene Understanding,” in IEEE Conference on Computer Vision and Pattern Recognition (CVPR), 2016.
 \bibitem{borkar2012groundtruth} Borkar, Amol, Hayes, Monson, Smith, Mark T., “A Novel Lane Detection System With Efficient Ground Truth Generation,” IEEE Transactions on Intelligent Transportation Systems, 13, no. 1, 2012.
 \bibitem{mccall2006video} McCall, Joel C., Trivedi, Mohan M., “Video-Based Lane Estimation and Tracking for Driver Assistance: Survey, System, and Evaluation,” IEEE Transactions on Intelligent Transportation Systems, 7, no. 1, 2006.
+\bibitem{izmailov2018swa} Izmailov, Pavel, Podoprikhin, Dmitrii, Garipov, Timur, Vetrov, Dmitry, Wilson, Andrew Gordon, “Averaging Weights Leads to Wider Optima and Better Generalization,” in Conference on Uncertainty in Artificial Intelligence (UAI), 2018.
+\bibitem{ronneberger2015unet} Ronneberger, Olaf, Fischer, Philipp, Brox, Thomas, “U-Net: Convolutional Networks for Biomedical Image Segmentation,” in Medical Image Computing and Computer-Assisted Intervention (MICCAI), 2015.
+\bibitem{salehi2017tversky} Salehi, Seyed Sadegh Mohseni, Erdogmus, Deniz, Gholipour, Ali, “Tversky Loss Function for Image Segmentation Using 3D Fully Convolutional Deep Networks,” in Machine Learning in Medical Imaging (MLMI), MICCAI Workshop, 2017.
 \end{thebibliography}
 \end{document}
