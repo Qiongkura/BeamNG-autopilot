@@ -41,6 +41,7 @@ HTML_OUT = BUILD / "paper.html"
 TEX_OUT = HERE / "main.tex"
 FIG_PREFIX = ""
 IMG_DIR = "figures"
+WIDE_ALL = False
 FIG_WORD = "Fig."
 
 # ---------------------------------------------------------------- bib
@@ -182,7 +183,7 @@ def emit_tex(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
         fig = re.match(r"^!\[(.*?)\]\((.*?)\)\{#(fig:[^}]+)\}$", b, re.S)
         if fig:
             cap, img, key = fig.groups()
-            wide = Path(img).name.startswith("figc")      # 组合图跨栏
+            wide = WIDE_ALL or Path(img).name.startswith("figc")   # 满栏图
             env = "figure*" if wide else "figure"
             width = r"\textwidth" if wide else r"\columnwidth"
             body.append(
@@ -341,9 +342,9 @@ def emit_html(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
             fig_html = (f'<figure id="{key}"><img src="{IMG_DIR}/{img}" alt="">'
                         f'<figcaption><b>{FIG_WORD} {FIG_PREFIX}{fig_no[key]}.</b> '
                         f'{md_inline_to_html(cap, fig_no)}</figcaption></figure>')
-            # 组合图（figc*）跨双栏：单格宽度≈单栏宽，格内文字不缩小
+            # 满栏图：--wide-all（正文 7 张承重图 + 补充材料单图）或组合图名 figc*
             lines.append(f'<div class="wide">{fig_html}</div>'
-                         if Path(img).name.startswith("figc") else fig_html)
+                         if (WIDE_ALL or Path(img).name.startswith("figc")) else fig_html)
             continue
         b = md_inline_to_html(b, fig_no).replace(" — ", "&nbsp;&mdash; ")
         lines.append(b)
@@ -376,7 +377,7 @@ def emit_html(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
 
 
 def main() -> int:
-    global CITE_NO, LANG, MD, BIB, HTML_OUT, TEX_OUT, FIG_PREFIX, FIG_WORD, IMG_DIR, FIGS_SRC
+    global CITE_NO, LANG, MD, BIB, HTML_OUT, TEX_OUT, FIG_PREFIX, FIG_WORD, IMG_DIR, FIGS_SRC, WIDE_ALL
     import argparse
     ap = argparse.ArgumentParser(description="build paper.md -> LaTeX + HTML")
     ap.add_argument("--md", default=str(MD), help="markdown master (default: paper.md)")
@@ -387,6 +388,8 @@ def main() -> int:
     ap.add_argument("--lang", default="en", choices=["en", "zh"])
     ap.add_argument("--fig-prefix", default="", help='e.g. "S" for Fig. S1')
     ap.add_argument("--img-dir", default="figures", help="figure folder name inside the HTML dir")
+    ap.add_argument("--wide-all", action="store_true",
+                    help="所有图跨双栏（正文 7 张承重图与补充材料单图都用它）")
     ap.add_argument("--figs-src", nargs="+", default=[str(FIGS_SRC)],
                     help="figure source dirs, searched in order (default: logs/paper_figures)")
     a = ap.parse_args()
@@ -396,6 +399,7 @@ def main() -> int:
     FIGS_SRC = [Path(p) for p in a.figs_src]
     FIG_PREFIX = a.fig_prefix
     IMG_DIR = a.img_dir
+    WIDE_ALL = bool(a.wide_all)
     FIG_WORD = "图" if LANG == "zh" else "Fig."
     bib = parse_bib(BIB)
     meta, md = split_front(MD.read_text(encoding="utf-8"))
