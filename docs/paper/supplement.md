@@ -145,9 +145,11 @@ recorded verdict. The same machinery rejected the first two compositions of the 
 4. **Frame counts are confounded by motion.** `body_cross_centre_frames` scales with how far the car
    travelled; the F-C and F-E verdicts were taken under the pre-registered maximum-over-runs rule and
    a per-distance reading was pre-registered separately for later rounds.
-5. **Unequal seed counts in the dose arms.** base 1, 4× 6, 6× 1, 8.5× 6 seeds; the 6× point is the
-   delivered candidate's composition and rests on a single seed, so the dose result locates the highest
-   observed reading rather than a stable optimum.
+5. **Dose response re-evaluated.** The earlier curve's identity values do not reproduce under the frozen
+   protocol (the same 6× checkpoint reads 0.763 there and 0.667 here), so it was replaced by a paired-seed
+   re-evaluation (seeds 42–47): 0× 0.658, 4× 0.661, 6× 0.665 — indistinguishable — while the recorded 8.5×
+   value (0.701) is higher than 6×. The 8.5× checkpoints were removed in a storage pass, so that arm cannot
+   be re-evaluated.
 6. **No eligible negative frames on the limited-class pool**, so that pool's false-positive rate is
    not measurable (Figure S15) and is never reported as zero.
 7. **Schematics are not measurements.** The five schematic figures in the main text are drawn from the

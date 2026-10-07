@@ -353,10 +353,7 @@ reads each checkpoint under the adopted definition; the label scope under the ba
 Two things move together here and they have to be separated. The **scope** changes the reading: Table II
 shows that under a fixed post-processing setting, moving from the label scope to the paint scope changes
 development recall from 0.736 to 0.813 (baseline switches) and from 0.559 to 0.812 (adopted switches) — in
-the second case a 25-point swing with no change to the weights. The **post-processing** also changes the
-reading, and not in the same direction: with the scope held at label, the adopted switches cost 18 points of
-recall (0.736 → 0.559), because the lateral scope, the same-side merge and the appearance gate all remove
-candidates that the label scope counts. What the scope change is worth in pixels is measured, not assumed:
+the second case a 25-point swing with no change to the weights. The **post-processing** also changes the reading, and not in the same direction: with the scope held at label, the adopted switches cost 18 points of recall (0.736 → 0.559). Table V, which turns each switch on alone, attributes that cost entirely to the appearance gate: the lateral scope and the merge leave label recall untouched (0.736 in both) and act on identity instead (0.432 → 0.621 and 0.432 → 0.459 respectively), while the appearance gate is the only switch that trades label recall for pixel precision. What the scope change is worth in pixels is measured, not assumed:
 the paint scope retains 69% of annotated line pixels on the development pool and 89% on the limited-class
 pool, and {@fig:c2}(c) shows the per-seed label-scope and paint-scope recall with the non-paint fraction of
 label line pixels overlaid (~0.30). Those excluded pixels are the ones the appearance predicate does not
@@ -392,17 +389,19 @@ it is used to remove candidates rather than to declare where lines are. With tha
 probe explains why it can afford to be aggressive: across the certified limited-class scenes the reference instances are covered by annotation at essentially 1.0 regardless of lateral offset, so a surviving candidate is still measured against complete truth. The other post-processing lever, the parallel-merge radius, removes near-duplicate same-side candidates (dev 477 → 166 kept as the radius tightens from 6.0 m to 3.0 m) at a cost in identity, which is why the adopted radius is 1.0 m rather than the aggressive end of the sweep. The two mask thresholds were swept as well; on this pool the negative side is not measurable (no eligible negative frames), so that sweep is reported in the supplement rather than plotted as a zero.
 
 
+TABLE: Table V. Post-processing single factors on the frozen development pool, one switch at a time (six seeds each; C0 is the baseline definition, C4 the adopted one). The lateral scope is an identity lever (identity 0.432 → 0.621, all six seeds positive), the appearance gate is a precision lever that pays label recall (0.610 → 0.894 precision, 0.736 → 0.559 recall) and does not raise identity, and the merge is a small identity effect (+0.027).
+
+| Configuration | Label precision | Label recall | Paint recall | GT pixels kept | Identity |
+|---|---|---|---|---|---|
+| v7: all three off | 0.610 | 0.736 | 0.813 | 0.693 | 0.432 |
+| + lateral scope 5.5 m | 0.610 | 0.736 | 0.812 | 0.693 | 0.621 |
+| + same-side merge | 0.610 | 0.736 | 0.813 | 0.693 | 0.459 |
+| + appearance gate | 0.894 | 0.559 | 0.812 | 0.693 | 0.409 |
+| v8: all three on (adopted) | 0.894 | 0.559 | 0.812 | 0.693 | 0.665 |
+
 ## C. Training-composition dose response
 
-{@fig:c3}(d) shows the identity rate against the negative dose, per seed and as a mean: 0.707 (base
-composition, one seed), 0.711 (4×, six seeds, 0.667–0.732), **0.763 (6×, one seed)** and 0.701
-(8.5×, six seeds, 0.655–0.744). The seed counts are unequal by construction (the 6× point is the delivered
-candidate's composition and rests on the seed that was delivered), so the response supports a narrower claim
-than a dose–response curve usually carries: the highest *observed* reading sits at 6×, above the 4× and 8.5×
-means and above every individual 4×/8.5× seed, but a single seed cannot establish a stable optimum. The
-comparison that would settle it — the same doses with paired seeds and equal counts — is listed as unfinished
-work, and the 6× arm remains the delivered composition because it was selected before the confirmation, not
-because the curve proves it optimal.
+{@fig:c3}(d) shows the dose response as it now stands, and the earlier curve did not survive its own check. That curve (base one seed, 4× six, 6× one, 8.5× six: 0.707/0.711/**0.763**/0.701) was measured under an earlier configuration whose identity values do not reproduce under the frozen protocol — the same 6× checkpoint reads 0.763 there and 0.667 here — so it was not comparable with the acceptance numbers and has been replaced. The figure now reports a **paired-seed re-evaluation** on the frozen protocol (seeds 42–47 for every dose whose checkpoints still exist; Table VI): 0× 0.658 (0.631–0.690), 4× 0.661 (0.648–0.674), 6× 0.665 (0.645–0.676). The paired per-seed differences against 0× are +0.003 (4×) and +0.007 (6×), with mixed signs (seed 45 is negative for both), so **the three doses are indistinguishable at six seeds** and the claim that 6× is the peak of the response does not survive this test. The 8.5× arm, whose checkpoints were removed in a storage pass, has a *recorded* six-seed mean of 0.701 — higher than 6×, the opposite of the earlier curve's ordering. The delivered composition remains 6× because it was selected before the one-shot confirmation and changing it would require a newly sealed set; what the paper claims about the composition is now bounded to "no dose effect was demonstrated".
 
 The programme's training history (321 recorded runs across 44 families, supplement) converges within 20–40 epochs of the 120-epoch budget, and families whose line channel was masked sit at zero line IoU by construction rather than by failure (annotated in the figure), so their curves are not negative results. {@fig:c3}(c) sweeps the lateral
 scope instead: tightening it from 6.0 m to 3.0 m raises identity (dev 0.582 → 0.713; limited-class
@@ -413,6 +412,15 @@ loss-weight arm multiplied the false-positive frame rate on the negative side by
 eligible frames, +40.4 percentage points; 329 → 1730 false-positive pixels; maximum component 320 → 808 px),
 which is why the delivered arm keeps the balanced loss. Across every recorded pixel arm the negative-side readings cluster rather than spread (supplement), which is why the negative-example dose had to be varied instead of a loss-weight knob. Extending the dose response to five metrics (supplement) shows that identity and role move with the dose while coverage and the off-road candidate fraction barely do. The availability cost of the adopted definition is also visible at the pairing stage itself: 3–4 paired frames lost per 117-frame run.
 
+
+TABLE: Table VI. Balanced-seed dose comparison on the frozen protocol (seeds 42–47 paired across doses). The three re-evaluated doses are indistinguishable; the recorded 8.5× value is higher than 6×, so the earlier "6× is the peak" reading does not survive.
+
+| Dose | Identity mean | Identity range | Paired diff vs 0× | Role |
+|---|---|---|---|---|
+| 0× (base) | 0.658 | 0.631–0.690 | — | 0.874 |
+| 4× | 0.661 | 0.648–0.674 | +0.0030 | 0.864 |
+| 6× (delivered) | 0.665 | 0.645–0.676 | +0.0069 | 0.883 |
+| 8.5× (recorded; checkpoints removed) | 0.701 | 0.655–0.744 | — | — |
 
 ## D. One-shot held-out confirmation
 
@@ -608,8 +616,9 @@ several maps.
 
 **Six seeds, and unequal seed counts.** Acceptance uses six seeds; composition arms are reported with their
 seed counts (base 1, 4× 6, 6× 1, 8.5× 6), and the 6× dose point rests on the single seed that was delivered.
-The dose result is therefore the location of the highest observed reading, not a stable optimum or an effect
-size; the balanced-seed comparison that would settle it is unfinished work. Frame counts inside a pool are
+The dose result is therefore not an effect size: the balanced-seed comparison has been run (Table VI)
+and finds the three re-evaluable doses indistinguishable, while the recorded 8.5× value is higher than
+6×; the 8.5× checkpoints are gone, so that arm cannot be re-evaluated. Frame counts inside a pool are
 highly correlated, so the seeds are the unit of variation we report and we do not treat pixels as independent
 trials.
 
@@ -706,12 +715,11 @@ median 0.773 m from its own lane reference while the two layers' references agre
 or a fusion that does not depend on the sparse line class), or move the centring upstream so the
 path is planned on the lane reference rather than corrected after the fact.
 
-**3. Balanced-seed dose comparison.** The dose response is the weakest of the reported composition results:
-the 6× point rests on one seed while 4× and 8.5× rest on six. The checkpoints are retained, so the missing
-work is evaluation, not training: score the same pools under one frozen protocol with paired seeds and equal
-counts, report per-seed differences and intervals, and treat the small-sample intervals as exploratory. If
-the peak does not survive, the delivered composition is still the arm that was selected before the
-confirmation, and the paper's claims about it are bounded accordingly.
+**3. Dose response: done for three of four doses, and it did not reproduce.** The paired-seed comparison
+has been run (Section V-C, Table VI): 0×/4×/6× are indistinguishable at six seeds. What remains is the
+8.5× arm, whose checkpoints were removed in the storage pass, and any dose above 8.5×; both need training
+runs under the frozen protocol rather than re-evaluation. If a dose effect is to be claimed at all, it
+needs equal seed counts per dose on more than one map, with the seed as the unit of variation.
 
 **4. Control cadence.** The perception-and-planning tick costs 377–432 ms, of which 355 ms is
 sensor reading (camera ring plus range image) and 11–13 ms is planning; the control loop is paced
