@@ -581,6 +581,8 @@ TABLE: Table IV. Control cadence per configuration: tick cost, sub-step count an
 | Lane-gate factor arm | 377 | 355 | 20 | 1 (max 5) | ~5 Hz |
 | Path-re-centring arm | 403 | ~370 | 20 | 12 | ~31 Hz |
 
+**T18 sensor replay correctness.** After the T17 cadence diagnosis, we froze the source snapshot and ran the T18 replay contract. The first Tech attempt is retained but invalid for equal-exposure comparison: its telemetry span is 18.208 s against the 24 s qualification minimum. A protocol-identical retry qualified. On the first valid warmup capture, the old and current range-processing paths produced **bitwise-equal published geometry and ray-hit outputs in 48 same-input calls**; the best repeated p95 fell from 172.647 ms to 132.420 ms. The scope is deliberately narrow: fresh-tracker single-frame CPU processing, not whole-runtime equivalence, multi-frame tracking, safety truth, actuator execution or a model promotion. Sensor capture time, independent pavement/paint truth, body coverage and actuator acknowledgement remain UNKNOWN; these are not treated as passes. See `T18_SENSOR_REPLAY_CORRECTNESS_RESULT_20261011.md`.
+
 **A defect in the safety reading rule.** The safety item used to judge every driving factor is a frame
 *count* of body-centre crossings, and a factor arm can travel twice as far as its control. the supplement
 quantifies the consequence: the same arm can halve its per-metre crossing rate while showing a larger

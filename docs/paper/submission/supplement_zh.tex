@@ -12,7 +12,7 @@
 \begin{document}
 \maketitle
 \begin{abstract}
-本补充材料收录十六张图，它们的读数在正文中被引用，但不是正文论证的承重图。每张图都与正文一样，由三个脚本（`m5_paper_figures.py`、`m5_paper_figures_ext.py`、`m5_paper_figures_extra.py`）从同一批已记录产物（逐运行记分卡、逐帧遥测、运行清单、门判定文件与封存集记录）重新生成；本补充材料中的数字没有一个是手工抄录的。S-A 节汇集正文第 V-E 节背后的驾驶层证据（单因子阶梯、逐运行轨迹、各臂分布、车道放置偏差、安全裕度与配对对比）；S-B 节汇集第 V-C 节背后的组成与后处理扫描（五指标剂量响应、并行合并与阈值扫描、SWA、β=0.8 损失臂、实例覆盖与负例一侧全家）；S-C 节给出训练历史；S-D 节给出成本台账与空间隔离审计。适用于全部图的读数约定列在最后一节，其中包括三个「未测量而非为零」的量。
+本补充材料收录十六张补充图与旧版排版保留的 26 张独立诊断／示意图。测量图由三个脚本（`m5_paper_figures.py`、`m5_paper_figures_ext.py`、`m5_paper_figures_extra.py`）读取已记录产物（逐运行记分卡、逐帧遥测、运行清单、门判定文件与封存集记录）；示意图明确标注，数值主张绑定记录输入。S-A 节汇集正文第 V-E 节背后的驾驶层证据（单因子阶梯、逐运行轨迹、各臂分布、车道放置偏差、安全裕度与配对对比）；S-B 节汇集第 V-C 节背后的组成与后处理扫描（五指标剂量响应、并行合并与阈值扫描、SWA、β=0.8 损失臂、实例覆盖与负例一侧全家）；S-C 节给出训练历史；S-D 节给出成本台账与空间隔离审计。适用于全部图的读数约定列在最后一节，其中包括三个「未测量而非为零」的量。
 \end{abstract}
 
 \section*{S-A. 驾驶层证据}
@@ -21,115 +21,115 @@
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig6_factor_ladder.png}
 \caption{驾驶单因子阶梯：各臂行进距离 (a) 与停滞比例 (b)，并给出最坏车体中心穿越帧。}
-\label{fig:s6}
+\label{fig:s1}
 \end{figure}
 图 S1 中每一臂都仍未通过 `no_stall` 硬目标（0 帧），硬门保持 0/4；正是这张阶梯图支持了把已实现的因子报告为「被否决」而不是「部分进展」。
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig24_time_series.png}
 \caption{逐运行时间序列（上：速度；下：路径到车道偏差），基线验收运行与 F-E 铺装门运行各一。}
-\label{fig:s24}
+\label{fig:s2}
 \end{figure}
-图 S2 说明停滞属于可用率失败而非控制失败：速度长时间停在零平台，而偏差序列显示车辆停在车道中心之外；F-E 臂之所以走得更远，只是因为它带着更大的偏差行驶。
+图 S2 记录了长时间低速与偏离车道中心的停车状态，F-E 臂行进更远时偏差也更大。这些时间序列本身不能判定执行器是否正确响应；对应的规划与仲裁证据在正文中单列。
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig25_arm_boxplots.png}
 \caption{F-A／F-C／F-E 三次 A/B 的各臂分布（行进距离、停滞比例）。}
-\label{fig:s25}
+\label{fig:s3}
 \end{figure}
 图 S3 中的各臂分布是预注册最大值规则的原始材料：裁决按每臂最差一次运行读取；也正是区间的重叠，使得交付感知臂在路径可用率上没有产生分离（0.179 $\rightarrow$ 0.200）。
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig26_lane_dev.png}
 \caption{闭环轮次中的逐帧车道放置偏差（v7 与 v8；黑条 = 中位数）。}
-\label{fig:s26}
+\label{fig:s4}
 \end{figure}
-图 S4 是定义性结果的闭环对应物：在基线定义下，车道偏差中位数为 0.86 m，车体在 8/8/8/13 帧中压过中心线；在采纳定义下穿越消失，代价是可用率。
+图 S4 是定义性结果的闭环对应物：在基线定义下，车道偏差中位数为 0.86 m，记录的参考点中心线穿越为 8/8/8/13 帧；采纳定义的四次运行未观察到参考点穿越，代价是可用率。这不证明车体包络安全。
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig27_safety_margins.png}
 \caption{四次验收运行的安全裕度分布（最近障碍、最小碰撞时间、路径占用）。}
-\label{fig:s27}
+\label{fig:s5}
 \end{figure}
-图 S5 中的裕度是「验收失败属于可用率失败而非安全失败」这一结论的依据：四次运行都没有发生碰撞、没有路外帧、没有倒车帧，实测裕度落在各自分布的支持区间之内，而不是贴在极限上。
+图 S5 描述记录的障碍与路径裕度。四次正式验收记录零碰撞、零路外帧及零倒车帧，但车体中心线约束均失败（每次 12--24 穿越帧）。运动量低，这些局部指标不能证明驾驶安全，也不能独立确认车体始终处于铺装面。
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig37_pairing_compare.png}
 \caption{配对对比：各臂的配对帧与候选数（开发池与有限类别池）。}
-\label{fig:s37}
+\label{fig:s6}
 \end{figure}
-图 S6 在配对阶段本身量化了采纳定义的可用率代价：每 117 帧运行损失 3--4 个配对帧------这正是正文所述闭环可用率下降的机制。
+图 S6 在配对阶段量化了采纳定义的参考可用率代价：每次 117 帧评估损失 3--4 个配对帧。离线计数不能单独建立闭环可用率差异的因果机制。
 \section*{S-B. 组成与后处理扫描}
 以下是采纳组成（负例剂量 6$\times$）与采纳协议（横向范围 5.5 m、合并半径 1.0 m、外观门开启）背后的扫描。
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig9_dose_metrics.png}
 \caption{五个指标上的剂量响应（身份率、角色、覆盖率、路外候选比例、合并组），逐种子与均值。}
-\label{fig:s9}
+\label{fig:s7}
 \end{figure}
-图 S7 中身份率与角色随负例剂量变动，而覆盖率与路外候选比例几乎不动------这正是把剂量当作组成轴、而不是去调损失权重旋钮的原因。
+图 S7 是各臂记录配置下的历史多指标扫描。它独立于正文的六种子配对重评，不能建立该冻结协议下的剂量效应。
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig13_parallel_scan.png}
 \caption{并行合并扫描：被合并掉的与被保留的候选，以及身份率的后果。}
-\label{fig:s13}
+\label{fig:s8}
 \end{figure}
-图 S8 是采纳合并半径取 1.0 m 而非扫描激进端的原因：收紧半径会移除同侧近重复候选（半径从 6.0 m 到 3.0 m 时开发池保留数 477 $\rightarrow$ 166），代价是身份率。
+图 S8 给出记录的并行合并配置下被保留与被合并的候选数。它与横向范围扫描不同，不能单独建立最优半径；采纳半径以冻结协议为准。
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig15_threshold_scans.png}
 \caption{掩码后处理的阈值敏感性（保留阈值与伸长阈值）。}
-\label{fig:s15}
+\label{fig:s9}
 \end{figure}
 有限类别池没有合格负例帧，因此图 S9 中该池的假阳性序列不可测；图中已标注该缺口，不得读作零。
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig16_swa.png}
 \caption{SWA 单因子结果：末五轮平均没有救回任何种子。}
-\label{fig:s16}
+\label{fig:s10}
 \end{figure}
 \begin{figure}[!t]
 \centering
-\includegraphics[width=\columnwidth]{figures_zh/fig17_beta08.png}
+\includegraphics[width=\columnwidth]{figures_zh/fig17_beta08_20261009.png}
 \caption{Tversky β=0.8 臂与基线在负例一侧的对比（假阳性帧、假阳性像素、最大连通域）。}
-\label{fig:s17}
+\label{fig:s11}
 \end{figure}
-图 S10 与图 S11 是第 V-C 节被否决的两个单因子：权重平均没有救回任何种子；Tversky 损失臂把假阳性帧率提高到三倍（占合格帧 11.5\% $\rightarrow$ 51.9\%；假阳性像素 329 $\rightarrow$ 1730；最大连通域 320 $\rightarrow$ 808 px）。
+图 S10 与图 S11 是第 V-C 节被否决的两个单因子：权重平均没有救回任何种子；Tversky 损失臂把假阳性帧率提高到 4.5 倍（占合格帧 11.5\% $\rightarrow$ 51.9\%，增加 40.4 个百分点；假阳性像素 329 $\rightarrow$ 1730；最大连通域 320 $\rightarrow$ 808 px）。
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig19_instance_coverage.png}
 \caption{已认证有限类别场景中实例级参考覆盖随横向偏移的变化，按角色着色。}
-\label{fig:s19}
+\label{fig:s12}
 \end{figure}
-图 S12 解释了外观门为何可以足够激进：在已认证的有限类别场景中，参考实例被标注覆盖的程度基本为 1.0 且与横向偏移无关，因此存活下来的候选仍然是对照完整真值被测量的。
+图 S12 给出已观察有限类别参考实例的较高标注覆盖率，其中也有低于 1.0 的点。这一有限样本不能保证每个保留候选或其他地图都具备完整真值。
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig20_negatives_family.png}
 \caption{全部已记录像素臂的负例一侧诊断（假阳性帧率与假阳性像素比例；标记大小 = 最大连通域）。}
-\label{fig:s20}
+\label{fig:s13}
 \end{figure}
-在所有已记录的像素臂上，图 S13 中的负例一侧读数呈聚集而非发散------这正是促使我们变动负例剂量、而不是去调损失权重旋钮的测量。
+图 S13 描述各像素臂自身作用域与分母下的负例一侧指标。这不是受控损失权重对照，不能建立最优负例剂量；配对剂量实验另行报告。
 \section*{S-C. 训练历史}
 \begin{figure}[!t]
 \centering
-\includegraphics[width=\columnwidth]{figures_zh/fig21_training_curves.png}
-\caption{已记录 `train_hist.json` 运行的训练曲线（逐轮次验证线 IoU 与训练损失）。}
-\label{fig:s21}
+\includegraphics[width=\columnwidth]{figures_zh/fig21_learning_r3_20261009.png}
+\caption{冻结的 R3 学习流程检查：六份训练历史，每臂两个种子，每次运行 60 个优化器步。曲线表示验证线 IoU 和训练损失的中位数，色带表示四分位区间。}
+\label{fig:s14}
 \end{figure}
-本计划的训练历史共 321 次已记录运行、44 个家族；图 S14 给出代表性曲线。线通道被掩蔽的家族按构造即处于零线 IoU（图中已标注），属于构造结果而非失败，因此它们的曲线不是负结果。各运行在 120 轮预算的 20--40 轮内收敛。
+图 S14 的六份历史由 `figure_inputs_20261009.json` 明确列出并固定 SHA-256：基线、第 0 轮与第 1 轮各含种子 42、43，共用初始化检查点。这些短运行验证真实优化器执行及历史记录，不能证明收敛或学习收益。两轮候选均未通过独立开发门，实验在两轮预算处停止。曲线采用各训练运行自己的验证划分，不等于另行开展的 112 帧开发评估。这项流程检查独立于此前剂量实验，不增加该对照的种子数。
 \section*{S-D. 成本与数据治理审计}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig35_gpu_ledger.png}
-\caption{全计划各记录轮次的 GPU 成本台账。}
-\label{fig:s35}
+\caption{图中三个已记录日期的历史 GPU 成本台账，不含后来的 R3 学习流程检查。}
+\label{fig:s15}
 \end{figure}
-图 S15 是每一轮无人值守运行都保留的机器可读台账；它记录成本而不是估算成本，也是「所报告轮次未新增人工标注（人力换成机器时间）」这一说法的依据产物。
+图 S15 读取三个历史日期的机器台账。后来的 R3 学习流程检查在自己的运行台账中另记 7.4 GPU 墙钟分钟，不包含在这张图里。成本记录不能认证标签来源；「未新增人工标注」仅限所报告轮次及其数据凭证。
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig41_isolation_audit.png}
 \caption{空间隔离审计：每个候选采集在 50 m 缓冲下与开发锚点的比对。}
-\label{fig:s41}
+\label{fig:s16}
 \end{figure}
 图 S16 是准入参考集与封存集的隔离审计：不相交性用位姿在 50 m 缓冲下核验，而不是用目录名，且每个候选组成都留下一条已记录裁决。同一套机制曾否决封存集的前两个组成方案。
 \section*{S-E. 读数约定与已声明缺口}
@@ -139,164 +139,164 @@
 4. \textbf{帧计数被运动量污染。} `body_cross_centre_frames` 随车辆行进距离缩放；F-C 与 F-E 的裁决按预注册的「跨运行最大值」规则作出，按距离的读法已为后续轮次另行预注册。
 5. \textbf{剂量响应已重评。} 旧曲线的身份率在冻结协议下无法复现（同一 6$\times$ 检查点在那里 0.763、在这里 0.667），因此改为配对种子重评（种子 42--47）：0$\times$ 0.658、4$\times$ 0.661、6$\times$ 0.665------不可区分------而已记录的 8.5$\times$ 值（0.701）高于 6$\times$。8.5$\times$ 的检查点在存储清理中删除，该臂无法重评。
 6. \textbf{有限类别池没有合格负例帧}，因此该池的假阳性率不可测（图 S9），且从不被报告为零。
-7. \textbf{示意图不是测量结果。} 正文中五张示意图按代码与文档定义绘制，不来自运行数据。
-8. \textbf{产物保留。} 逐轮次快照与被取代的运行目录已在一次存储清理中删除（审计文件 `logs/_cleanup_20261006.txt`）；每份判定文件、记分卡、清单、封存帧与交付检查点都被保留，因此正文与本补充材料的每一张图都可由保留的产物复现。
-\section*{S-F. 正文组合图的单图版本}
-正文的七张组合图由下列 26 张单图拼成；这里按原始尺寸逐张给出，便于在不受组合缩放影响的情况下查看任意一格。题注中的格号指它在组合图里的位置。
+7. \textbf{示意图不是测量结果。} 示意图按代码与文档定义绘制，不来自运行数据。
+8. \textbf{产物保留。} 逐轮次快照与被取代的运行目录已在一次存储清理中删除（审计文件 `logs/_cleanup_20261006.txt`）。部分判定文件、记分卡、清单、封存记录及交付检查点仍在本地。这些汇总不能还原已删除的训练状态，也不能证明每张图均可完整重建；保留的输入范围与缺口以主张清单为准。
+\section*{S-F. 独立诊断与示意图}
+以下 26 张图由旧版组合排版分别保留。其中七张现在作为满栏单图用于正文，其余提供补充诊断与示意；范围以主张清单为准。
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig31_pipeline.png}
-\caption{正文「设计与契约」组合图 (a) 格。候选范围流水线（示意）与实测撤销率。}
+\caption{候选范围流水线（示意）与实测撤销率。}
 \label{fig:s17}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig30_counting_contract.png}
-\caption{正文「设计与契约」组合图 (b) 格。计数契约（示意）：每个比率都在冻结的计数定义上有显式分子与分母；覆盖率是候选参考可判率，不是检出率。}
+\caption{计数契约（示意）：每个比率都在冻结的计数定义上有显式分子与分母；覆盖率是候选参考可判率，不是检出率。}
 \label{fig:s18}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig33_protocol_matrix.png}
-\caption{正文「设计与契约」组合图 (c) 格。协议开关矩阵（示意）与实时评价哈希。}
+\caption{协议开关矩阵（示意）与实时评价哈希。}
 \label{fig:s19}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig34_final_set_flow.png}
-\caption{正文「设计与契约」组合图 (d) 格。一次性最终确认流程（示意）与实时封存信息。}
+\caption{一次性最终确认流程（示意）与实时封存信息。}
 \label{fig:s20}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig1_gate_matrix.png}
-\caption{正文「定义敏感性」组合图 (a) 格。两套协议定义下的门指标与冻结阈值：开发池 (a) 与有限类别池 (b)。}
+\caption{两套协议定义下的门指标与冻结阈值：开发池 (a) 与有限类别池 (b)。}
 \label{fig:s21}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig18_r3_per_seed.png}
-\caption{正文「定义敏感性」组合图 (b) 格。有限类别池逐种子：两套定义下的三个候选级门，与表 I 取自同一批判定文件（x = 低于门）。}
+\caption{有限类别池逐种子：两套定义下的三个候选级门，与表 I 取自同一批判定文件（x = 低于门）。}
 \label{fig:s22}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig11_recall_scopes.png}
-\caption{正文「定义敏感性」组合图 (c) 格。逐种子的标签范围与漆范围召回，并叠加标签线像素的非漆比例（开发池）。}
+\caption{逐种子的标签范围与漆范围召回，并叠加标签线像素的非漆比例（开发池）。}
 \label{fig:s23}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig10_identity_scopes.png}
-\caption{正文「定义敏感性」组合图 (d) 格。身份范围改变读数、并可反转排序：20 个检查点（两条臂、每臂 10 个种子）在标签范围与表面范围下的读法。}
+\caption{身份范围改变读数、并可反转排序：20 个检查点（两条臂、每臂 10 个种子）在标签范围与表面范围下的读法。}
 \label{fig:s24}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig2_boundary_map.png}
-\caption{正文「后处理与组成」组合图 (a) 格。边界图：膨胀换来召回、付出精度；有限类别池的代价约为三倍。}
+\caption{边界图：膨胀换来召回、付出精度；有限类别池的代价约为三倍。}
 \label{fig:s25}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig14_appearance_gate.png}
-\caption{正文「后处理与组成」组合图 (b) 格。外观门消融对像素指标（线 IoU、精度、召回）的影响，两个集合，种子 42。}
+\caption{外观门消融对像素指标（线 IoU、精度、召回）的影响，两个集合，种子 42。}
 \label{fig:s26}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig12_lateral_scan.png}
-\caption{正文「后处理与组成」组合图 (c) 格。两个集合上的横向范围扫描：身份率与角色随阈值变化，并给出保留候选数。}
+\caption{两个集合上的横向范围扫描：身份率与角色随阈值变化，并给出保留候选数。}
 \label{fig:s27}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig3_dose_response.png}
-\caption{正文「后处理与组成」组合图 (d) 格。候选身份率随负例剂量的响应（逐种子与均值）。}
+\caption{候选身份率随负例剂量的响应（逐种子与均值）。}
 \label{fig:s28}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig4_final_confirm.png}
-\caption{正文「一次性确认」组合图 (a) 格。封存的道路不相交集上的一次性最终确认：按组指标 (a) 与负例一侧诊断 (b)。}
+\caption{封存的道路不相交集上的一次性最终确认：按组指标 (a) 与负例一侧诊断 (b)。}
 \label{fig:s29}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig29_final_set_composition.png}
-\caption{正文「一次性确认」组合图 (b) 格。封存最终集的按组组成，含摘要与协议哈希。}
+\caption{封存最终集的按组组成，含摘要与协议哈希。}
 \label{fig:s30}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig42_overlap_audit.png}
-\caption{正文「一次性确认」组合图 (c) 格。最终集来源审计：各来源包与已用帧集的内容级重叠。}
+\caption{最终集来源审计：各来源包与已用帧集的内容级重叠。}
 \label{fig:s31}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig8_closed_loop_tradeoff.png}
-\caption{正文「闭环」组合图 (a) 格。闭环权衡：中心线穿越与传感器车道来源率，每臂四次运行。}
+\caption{闭环权衡：中心线穿越与传感器车道来源率，每臂四次运行。}
 \label{fig:s32}
 \end{figure}
 \begin{figure}[!t]
 \centering
-\includegraphics[width=\columnwidth]{figures_zh/fig22_gate_heatmap.png}
-\caption{正文「闭环」组合图 (b) 格。最近各次城镇运行的驾驶硬目标清单（绿=通过，红=未通过；未测量的目标计为未通过）。}
+\includegraphics[width=\columnwidth]{figures_zh/fig22_gate_heatmap_frozen_20261009.png}
+\caption{明确冻结的 32 次历史城镇运行诊断清单；输入路径与摘要列在 `figure_inputs_20261009.json`（绿=记录通过，红=失败或 UNKNOWN）。新增运行或修改文件时间不会改变选取范围。这张清单不构成新的 strict 驾驶合格证据。}
 \label{fig:s33}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig28_metric_scaling.png}
-\caption{正文「闭环」组合图 (c) 格。原始穿越计数与同一量按每 100 m 行进归一化后的对比（对数轴）。}
+\caption{原始穿越计数与同一量按每 100 m 行进归一化后的对比（对数轴）。}
 \label{fig:s34}
 \end{figure}
 \begin{figure}[!t]
 \centering
-\includegraphics[width=\columnwidth]{figures_zh/fig32_arbitration_ladder.png}
-\caption{正文「死锁机制」组合图 (a) 格。安全仲裁阶梯（示意，取自监视器的规则注册表）。}
+\includegraphics[width=\columnwidth]{figures_zh/fig32_arbitration_ladder_20261009.png}
+\caption{安全仲裁阶梯（示意，取自监视器的规则注册表）。}
 \label{fig:s35}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig5_deadlock_anatomy.png}
-\caption{正文「死锁机制」组合图 (b) 格。死锁解剖：规划穿越恰好落在 4 m 阈值之内 (a)，且在这些帧中车辆 96\% 时间静止 (b)。}
+\caption{死锁解剖：规划穿越恰好落在 4 m 阈值之内 (a)，且在这些帧中车辆 96\% 时间静止 (b)。}
 \label{fig:s36}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig23_reason_hist.png}
-\caption{正文「死锁机制」组合图 (c) 格。车为什么不动：2443 个已结算帧上的安全仲裁原因分布。}
+\caption{车为什么不动：2443 个已结算帧上的安全仲裁原因分布。}
 \label{fig:s37}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig7_lane_gate_evidence.png}
-\caption{正文「死锁机制」组合图 (d) 格。车道接受证据：基线可用率漏斗 (a) 与车道被撤销背后的证据 (b)。}
+\caption{车道接受证据：基线可用率漏斗 (a) 与车道被撤销背后的证据 (b)。}
 \label{fig:s38}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig39_scene_density.png}
-\caption{正文「严谨性与审计」组合图 (a) 格。场景筛选准则：已认证池的近场结构密度（黑条为中位数）。}
+\caption{场景筛选准则：已认证池的近场结构密度（黑条为中位数）。}
 \label{fig:s39}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig40_negative_audit.png}
-\caption{正文「严谨性与审计」组合图 (b) 格。负例池认证漏斗：被采纳的已认证负例与各类被排除的帧。}
+\caption{负例池认证漏斗：被采纳的已认证负例与各类被排除的帧。}
 \label{fig:s40}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig36_timing_retest.png}
-\caption{正文「严谨性与审计」组合图 (c) 格。计时卫生：在安静机器上重复测量推理。}
+\caption{计时卫生：在安静机器上重复测量推理。}
 \label{fig:s41}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures_zh/fig38_lane_geometry.png}
-\caption{正文「严谨性与审计」组合图 (d) 格。标线相对于车道中心的横向位置分布（在人工修订开发池上汇总）。}
+\caption{标线相对于车道中心的横向位置分布（在人工修订开发池上汇总）。}
 \label{fig:s42}
 \end{figure}
 

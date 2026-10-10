@@ -12,7 +12,7 @@
 \begin{document}
 \maketitle
 \begin{abstract}
-This supplement carries the sixteen figures whose readings are quoted in the main text but which are not load-bearing for its argument. Every figure is regenerated from the same recorded artefacts as the main text (per-run scorecards, per-frame telemetry traces, run manifests, gate verdict files and sealed-set records) by `m5_paper_figures.py`, `m5_paper_figures_ext.py` and `m5_paper_figures_extra.py`; no number in this supplement is transcribed by hand. Section S-A collects the driving-layer evidence behind Section V-E of the main text (the single-factor ladder, per-run traces, arm distributions, lane-placement deviation, safety margins and the pairing comparison); S-B collects the composition and post-processing scans behind Section V-C (dose response over five metrics, parallel-merge and threshold scans, SWA, the β=0.8 loss arm, instance coverage and the negative-side family); S-C carries the training history; S-D carries the cost ledger and the spatial-isolation audit. The reading conventions that apply to all of them are stated in the last section, including the three quantities that are UNKNOWN rather than zero.
+This supplement contains sixteen supplementary figures and 26 individual diagnostic or schematic figures retained from the earlier layout. Measured plots read the same recorded artefacts as the main text (per-run scorecards, per-frame telemetry traces, run manifests, gate verdict files and sealed-set records) by `m5_paper_figures.py`, `m5_paper_figures_ext.py` and `m5_paper_figures_extra.py`; schematics are labelled and numerical claims are tied to recorded inputs. Section S-A collects the driving-layer evidence behind Section V-E of the main text (the single-factor ladder, per-run traces, arm distributions, lane-placement deviation, safety margins and the pairing comparison); S-B collects the composition and post-processing scans behind Section V-C (dose response over five metrics, parallel-merge and threshold scans, SWA, the β=0.8 loss arm, instance coverage and the negative-side family); S-C carries the training history; S-D carries the cost ledger and the spatial-isolation audit. The reading conventions that apply to all of them are stated in the last section, including the three quantities that are UNKNOWN rather than zero.
 \end{abstract}
 
 \section*{S-A. Driving-layer evidence}
@@ -24,7 +24,7 @@ statements.
 \centering
 \includegraphics[width=\columnwidth]{figures/fig6_factor_ladder.png}
 \caption{Driving single-factor ladder: travelled distance (a) and stall fraction (b) per arm, with worst-case body-centre-cross frames.}
-\label{fig:s6}
+\label{fig:s1}
 \end{figure}
 Every arm in S1 still fails the `no_stall` hard target (0 frames) and the hard gates stay 0/4;
 the ladder is what justifies reporting the implemented factors as rejected rather than as partial
@@ -33,48 +33,51 @@ progress.
 \centering
 \includegraphics[width=\columnwidth]{figures/fig24_time_series.png}
 \caption{Per-run time series (speed top, path-to-lane deviation bottom) for a baseline acceptance run and an F-E lane-gate run.}
-\label{fig:s24}
+\label{fig:s2}
 \end{figure}
-S24 shows why the stall is an availability failure and not a control failure: speed stays at
-zero for long plateaus while the deviation series shows the car parked off the lane centre, and the
-F-E arm moves further only by travelling with a larger deviation.
+S2 records long intervals of low speed and a car parked off the lane centre; the F-E arm
+travels further with a larger deviation. These time series alone do not identify whether the
+actuator responded correctly. The corresponding planning and arbitration evidence is reported
+separately in the main text.
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig25_arm_boxplots.png}
 \caption{Per-arm distributions (travelled, stall fraction) for the F-A/F-C/F-E A/Bs.}
-\label{fig:s25}
+\label{fig:s3}
 \end{figure}
-The arm-level distributions in S25 are the raw material of the pre-registered maximum rule:
+The arm-level distributions in S3 are the raw material of the pre-registered maximum rule:
 verdicts were read as the worst run per arm, and the overlap of the ranges is why the delivered
 perception arm produced no separation on path availability (0.179 $\rightarrow$ 0.200).
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig26_lane_dev.png}
 \caption{Per-frame lane-placement deviation in the closed-loop round (v7 vs v8; black bar = median).}
-\label{fig:s26}
+\label{fig:s4}
 \end{figure}
-S26 is the closed-loop counterpart of the definitional result: under the baseline definition
-the median lane deviation is 0.86 m with the body crossing the centre line in 8/8/8/13 frames, and
-under the adopted definition the crossings vanish at the cost of availability.
+S4 is the closed-loop counterpart of the definitional result: under the baseline definition
+the median lane deviation is 0.86 m with recorded reference-point centre crossings in 8/8/8/13
+frames. No reference-point crossings were observed under the adopted definition, at a cost in
+availability; this does not establish full-body lane safety.
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig27_safety_margins.png}
 \caption{Safety-margin distributions (closest obstacle, minimum time-to-collision, path occupancy) over four acceptance runs.}
-\label{fig:s27}
+\label{fig:s5}
 \end{figure}
-The margins in S27 are what backs the statement that the acceptance failures are availability
-failures, not safety failures: no collision, no off-road frame and no reversing frame occurred in any
-of the four runs, and the measured margins stay inside their distributions' support rather than at
-their limits.
+S5 describes recorded obstacle and path margins. The four formal acceptance runs recorded
+zero collisions, off-road frames and reversing frames, but also failed full-body centre-line
+constraints (12--24 crossing frames per run). The small amount of motion and these partial metrics
+cannot establish driving safety or independently confirm paved-surface containment.
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig37_pairing_compare.png}
 \caption{Pairing comparison: paired-frame and candidate counts per arm (dev and limited-class pools).}
-\label{fig:s37}
+\label{fig:s6}
 \end{figure}
-S37 quantifies the availability cost of the adopted definition at the pairing stage itself:
-3--4 paired frames are lost per 117-frame run, which is the mechanism behind the closed-loop
-availability drop reported in the main text.
+S6 quantifies the availability cost of the adopted definition at the pairing stage itself:
+3--4 paired frames are lost per 117-frame evaluation. These offline counts describe a loss of
+reference availability; they do not by themselves establish the cause of the closed-loop
+availability difference.
 \section*{S-B. Composition and post-processing scans}
 These are the scans behind the adopted composition (negative dose 6$\times$) and the adopted protocol
 (lateral scope 5.5 m, merge radius 1.0 m, appearance gate on).
@@ -82,25 +85,25 @@ These are the scans behind the adopted composition (negative dose 6$\times$) and
 \centering
 \includegraphics[width=\columnwidth]{figures/fig9_dose_metrics.png}
 \caption{Dose response across five metrics (identity, role, coverage, off-road candidate fraction, merge groups), per seed and mean.}
-\label{fig:s9}
+\label{fig:s7}
 \end{figure}
-In S7 identity and role move with the negative dose while coverage and the off-road candidate
-fraction barely do, which is why the dose was varied as the composition axis instead of a loss-weight
-knob.
+S7 is a historical multi-metric scan under each arm's recorded configuration. It is separate
+from the paired six-seed re-evaluation in the main text and does not establish a dose effect under
+that frozen protocol.
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig13_parallel_scan.png}
 \caption{Parallel-merge scan: candidates merged away and kept, with the identity consequence.}
-\label{fig:s13}
+\label{fig:s8}
 \end{figure}
-S8 is why the adopted merge radius is 1.0 m rather than the aggressive end of the sweep:
-tightening the radius removes near-duplicate same-side candidates (dev 477 $\rightarrow$ 166 kept from 6.0 m to
-3.0 m) but costs identity.
+S8 reports candidates kept and merged under the recorded parallel-merge scan configuration.
+It is separate from the lateral-scope sweep and does not establish an optimal radius. The adopted
+radius is specified in the frozen protocol.
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig15_threshold_scans.png}
 \caption{Threshold sensitivity of the mask post-processing (keep and elongation thresholds).}
-\label{fig:s15}
+\label{fig:s9}
 \end{figure}
 The limited-class pool carries no eligible negative frames, so the false-positive series in
 S9 is not measurable there; the gap is marked in the figure and is not read as a zero.
@@ -108,63 +111,67 @@ S9 is not measurable there; the gap is marked in the figure and is not read as a
 \centering
 \includegraphics[width=\columnwidth]{figures/fig16_swa.png}
 \caption{SWA single-factor result: no seed is rescued by last-five-epoch averaging.}
-\label{fig:s16}
+\label{fig:s10}
 \end{figure}
 \begin{figure}[!t]
 \centering
-\includegraphics[width=\columnwidth]{figures/fig17_beta08.png}
+\includegraphics[width=\columnwidth]{figures/fig17_beta08_20261009.png}
 \caption{Tversky β=0.8 arm versus base on the negative side (false-positive frames, false-positive pixels, largest connected component).}
-\label{fig:s17}
+\label{fig:s11}
 \end{figure}
-S10 and S17 are the two rejected single factors of Section V-C: weight averaging
-rescued no seed, and the Tversky loss arm tripled the false-positive frame rate (11.5\% $\rightarrow$ 51.9\% of
+S10 and S11 are the two rejected single factors of Section V-C: weight averaging
+rescued no seed, and the Tversky loss arm raised the false-positive frame rate by a factor of 4.5 (11.5\% $\rightarrow$ 51.9\% of
 eligible frames; 329 $\rightarrow$ 1730 false-positive pixels; largest component 320 $\rightarrow$ 808 px).
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig19_instance_coverage.png}
 \caption{Instance-level reference coverage versus lateral offset across the certified limited-class scenes, coloured by role.}
-\label{fig:s19}
+\label{fig:s12}
 \end{figure}
-S19 explains why the appearance gate can afford to be aggressive: across the certified
-limited-class scenes the reference instances are covered by annotation at essentially 1.0 regardless
-of lateral offset, so a surviving candidate is still measured against complete truth.
+S12 reports high annotation coverage for the observed limited-class reference instances,
+including points below 1.0. This finite sample does not guarantee complete truth for every retained
+candidate or for other maps.
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig20_negatives_family.png}
 \caption{Negative-side diagnostics across all recorded pixel arms (false-positive frame rate versus false-positive pixel fraction; marker size = largest connected component).}
-\label{fig:s20}
+\label{fig:s13}
 \end{figure}
-Across every recorded pixel arm the negative-side readings in S20 cluster rather than spread,
-which is the measurement that motivated varying the negative-example dose instead of a loss-weight
-knob.
+S13 describes negative-side metrics under each recorded pixel arm's own scope and
+denominators. This plot is not a controlled loss-weight comparison and does not establish an
+optimal negative-example dose; the paired dose experiment is reported separately.
 \section*{S-C. Training history}
 \begin{figure}[!t]
 \centering
-\includegraphics[width=\columnwidth]{figures/fig21_training_curves.png}
-\caption{Training curves from the recorded `train_hist.json` runs (validation line IoU and training loss per epoch).}
-\label{fig:s21}
+\includegraphics[width=\columnwidth]{figures/fig21_learning_r3_20261009.png}
+\caption{Frozen R3 mechanical learning check: six training histories, two seeds per arm, 60 optimiser steps per run. Lines show median validation line IoU and training loss; bands show the interquartile range.}
+\label{fig:s14}
 \end{figure}
-The programme's training history comprises 321 recorded runs across 44 families; S21 shows the
-representative curves. Families whose line channel was masked sit at zero line IoU by construction
-rather than by failure and are annotated as such in the figure, so their curves are not negative
-results. Runs converge within 20--40 epochs of the 120-epoch budget.
+The six histories in S14 are explicitly listed and SHA-256 pinned in
+`figure_inputs_20261009.json`: baseline, round 0 and round 1, each with seeds 42 and 43 and a shared
+initial checkpoint. These short runs verify actual optimiser execution and history recording, not
+convergence or learning gain. Both candidate rounds were rejected by the independent development
+gates and the experiment stopped at its two-round budget. Validation curves use each training
+run's validation split; they are not the separate 112-frame development evaluation. This mechanical
+check is separate from the earlier dose experiment and does not add seeds to that comparison.
 \section*{S-D. Cost and data-governance audits}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig35_gpu_ledger.png}
-\caption{GPU cost ledger across the programme's recorded rounds.}
-\label{fig:s35}
+\caption{Historical GPU cost ledger for the three recorded days shown; it excludes the later R3 mechanical check.}
+\label{fig:s15}
 \end{figure}
-S35 is the machine-readable ledger kept for every unattended round; it records cost rather than
-estimating it, and it is the artefact behind the statement that the reported rounds added no new
-manual annotation (the labour was machine time).
+S15 reads the historical three-day machine ledger. The later R3 mechanical check separately
+records 7.4 GPU wall-clock minutes in its own run ledger and is not included in this plot. Cost
+records do not certify label provenance; the no-new-manual-annotation claim is scoped to the
+reported rounds and their data credentials.
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig41_isolation_audit.png}
 \caption{Spatial-isolation audit: every candidate collection against the development anchors under a 50 m buffer.}
-\label{fig:s41}
+\label{fig:s16}
 \end{figure}
-S41 is the isolation audit that admitted the reference and sealed sets: disjointness is checked
+S16 is the isolation audit that admitted the reference and sealed sets: disjointness is checked
 with pose under a 50 m buffer, not with directory names, and each candidate composition gets a
 recorded verdict. The same machinery rejected the first two compositions of the sealed set.
 \section*{S-E. Reading conventions and stated gaps}
@@ -185,169 +192,172 @@ recorded verdict. The same machinery rejected the first two compositions of the 
    value (0.701) is higher than 6$\times$. The 8.5$\times$ checkpoints were removed in a storage pass, so that arm cannot
    be re-evaluated.
 6. \textbf{No eligible negative frames on the limited-class pool}, so that pool's false-positive rate is
-   not measurable (Figure S15) and is never reported as zero.
-7. \textbf{Schematics are not measurements.} The five schematic figures in the main text are drawn from the
-   code and document definitions, not from run data.
+   not measurable (Figure S9) and is never reported as zero.
+7. \textbf{Schematics are not measurements.} Schematic figures are drawn from code and document
+   definitions, not from run data.
 8. \textbf{Artefact retention.} Per-epoch snapshots and superseded run directories were removed in a
-   storage pass (audit file `logs/_cleanup_20261006.txt`); every verdict file, scorecard, manifest,
-   sealed frame and the delivered checkpoint are retained, so every figure in the main text and in
-   this supplement is reproducible from the retained artefacts.
-\section*{S-F. Individual panels of the main-text composites}
-The seven composite figures in the main text are assembled from the 26 individual figures below, reproduced here at full size so that any panel can be inspected without the composite's scaling. The panel letter in each caption refers to its position in the composite.
+   storage pass (audit file `logs/_cleanup_20261006.txt`). Selected verdict files, scorecards,
+   manifests, seal records and the delivered checkpoint remain locally. These summaries do not
+   recover removed training states or establish complete reconstruction of every figure;
+   retained input scopes and remaining gaps are recorded in the claim manifest.
+\section*{S-F. Individual diagnostic and schematic figures}
+The 26 figures below are retained individually from the earlier composite layout. Seven now appear
+as full-width single figures in the main text; the others provide supplementary diagnostics and
+schematics. Their scope is specified in the claim manifest.
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig31_pipeline.png}
-\caption{Panel (a) of the main-text design and contract composite. Candidate-scope pipeline (schematic) with the measured revocation rate.}
+\caption{Candidate-scope pipeline (schematic) with the measured revocation rate.}
 \label{fig:s17}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig30_counting_contract.png}
-\caption{Panel (b) of the main-text design and contract composite. Counting contract (schematic): every ratio has an explicit numerator and denominator, over the frozen counter definitions; coverage is candidate-reference availability, not detection recall.}
+\caption{Counting contract (schematic): every ratio has an explicit numerator and denominator, over the frozen counter definitions; coverage is candidate-reference availability, not detection recall.}
 \label{fig:s18}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig33_protocol_matrix.png}
-\caption{Panel (c) of the main-text design and contract composite. Protocol switch matrix (schematic) and the live evaluation hash.}
+\caption{Protocol switch matrix (schematic) and the live evaluation hash.}
 \label{fig:s19}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig34_final_set_flow.png}
-\caption{Panel (d) of the main-text design and contract composite. One-shot final-confirmation flow (schematic) with the live seal.}
+\caption{One-shot final-confirmation flow (schematic) with the live seal.}
 \label{fig:s20}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig1_gate_matrix.png}
-\caption{Panel (a) of the main-text definition sensitivity composite. Gate metrics against frozen thresholds for the two protocol definitions, development pool (a) and limited-class pool (b).}
+\caption{Gate metrics against frozen thresholds for the two protocol definitions, development pool (a) and limited-class pool (b).}
 \label{fig:s21}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig18_r3_per_seed.png}
-\caption{Panel (b) of the main-text definition sensitivity composite. R3 limited-class pool, per seed: the three candidate-level gates under both definitions, drawn from the same verdict files as Table I (x = below gate).}
+\caption{R3 limited-class pool, per seed: the three candidate-level gates under both definitions, drawn from the same verdict files as Table I (x = below gate).}
 \label{fig:s22}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig11_recall_scopes.png}
-\caption{Panel (c) of the main-text definition sensitivity composite. Per-seed label-scope versus paint-scope recall with the non-paint fraction of label line pixels (development pool).}
+\caption{Per-seed label-scope versus paint-scope recall with the non-paint fraction of label line pixels (development pool).}
 \label{fig:s23}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig10_identity_scopes.png}
-\caption{Panel (d) of the main-text definition sensitivity composite. Identity scope changes the reading and can reverse the ranking: 20 checkpoints (two arms, ten seeds each) read in label and surface scope.}
+\caption{Identity scope changes the reading and can reverse the ranking: 20 checkpoints (two arms, ten seeds each) read in label and surface scope.}
 \label{fig:s24}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig2_boundary_map.png}
-\caption{Panel (a) of the main-text post-processing and composition composite. Boundary map: dilation buys recall and pays precision; the limited-class set pays about three times more.}
+\caption{Boundary map: dilation buys recall and pays precision; the limited-class set pays about three times more.}
 \label{fig:s25}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig14_appearance_gate.png}
-\caption{Panel (b) of the main-text post-processing and composition composite. Appearance-gate ablation on the pixel metrics (line IoU, precision, recall) for both sets, seed 42.}
+\caption{Appearance-gate ablation on the pixel metrics (line IoU, precision, recall) for both sets, seed 42.}
 \label{fig:s26}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig12_lateral_scan.png}
-\caption{Panel (c) of the main-text post-processing and composition composite. Lateral-scope scan on both sets: identity and role versus threshold, with the number of retained candidates.}
+\caption{Lateral-scope scan on both sets: identity and role versus threshold, with the number of retained candidates.}
 \label{fig:s27}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig3_dose_response.png}
-\caption{Panel (d) of the main-text post-processing and composition composite. Dose response of the candidate identity rate (per seed and mean).}
+\caption{Dose response of the candidate identity rate (per seed and mean).}
 \label{fig:s28}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig4_final_confirm.png}
-\caption{Panel (a) of the main-text one-shot confirmation composite. One-shot final confirmation on the sealed road-disjoint set: per-group metrics (a) and negative-side diagnostics (b).}
+\caption{One-shot final confirmation on the sealed road-disjoint set: per-group metrics (a) and negative-side diagnostics (b).}
 \label{fig:s29}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig29_final_set_composition.png}
-\caption{Panel (b) of the main-text one-shot confirmation composite. Sealed final-set composition by group, with digest and protocol hash.}
+\caption{Sealed final-set composition by group, with digest and protocol hash.}
 \label{fig:s30}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig42_overlap_audit.png}
-\caption{Panel (c) of the main-text one-shot confirmation composite. Final-set provenance audit: content-level overlap of each source package with the used frame set.}
+\caption{Final-set provenance audit: content-level overlap of each source package with the used frame set.}
 \label{fig:s31}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig8_closed_loop_tradeoff.png}
-\caption{Panel (a) of the main-text closed loop composite. Closed-loop trade-off: centre crossings versus sensor lane-source rate, four runs per arm.}
+\caption{Closed-loop trade-off: centre crossings versus sensor lane-source rate, four runs per arm.}
 \label{fig:s32}
 \end{figure}
 \begin{figure}[!t]
 \centering
-\includegraphics[width=\columnwidth]{figures/fig22_gate_heatmap.png}
-\caption{Panel (b) of the main-text closed loop composite. Driving hard-target checklist over the most recent town runs (green = pass, red = fail; an unmeasured target counts as fail).}
+\includegraphics[width=\columnwidth]{figures/fig22_gate_heatmap_frozen_20261009.png}
+\caption{Historical diagnostic checklist over 32 explicitly frozen town runs, listed with input digests in `figure_inputs_20261009.json` (green = recorded pass, red = fail or UNKNOWN). Adding runs or changing modification times cannot change this selection. This checklist does not qualify these runs as new strict-driving evidence.}
 \label{fig:s33}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig28_metric_scaling.png}
-\caption{Panel (c) of the main-text closed loop composite. Raw crossing counts versus the same quantity normalised per 100 m travelled (log scale).}
+\caption{Raw crossing counts versus the same quantity normalised per 100 m travelled (log scale).}
 \label{fig:s34}
 \end{figure}
 \begin{figure}[!t]
 \centering
-\includegraphics[width=\columnwidth]{figures/fig32_arbitration_ladder.png}
-\caption{Panel (a) of the main-text deadlock mechanism composite. Safety arbitration ladder (schematic, from the monitor's rule registry).}
+\includegraphics[width=\columnwidth]{figures/fig32_arbitration_ladder_20261009.png}
+\caption{Safety arbitration ladder (schematic, from the monitor's rule registry).}
 \label{fig:s35}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig5_deadlock_anatomy.png}
-\caption{Panel (b) of the main-text deadlock mechanism composite. Deadlock anatomy: the planned crossing sits just inside the 4 m threshold (a) and the car is stationary in 96\% of those frames (b).}
+\caption{Deadlock anatomy: the planned crossing sits just inside the 4 m threshold (a) and the car is stationary in 96\% of those frames (b).}
 \label{fig:s36}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig23_reason_hist.png}
-\caption{Panel (c) of the main-text deadlock mechanism composite. Why the car does not move: safety-arbitration reasons over 2443 settled frames.}
+\caption{Why the car does not move: safety-arbitration reasons over 2443 settled frames.}
 \label{fig:s37}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig7_lane_gate_evidence.png}
-\caption{Panel (d) of the main-text deadlock mechanism composite. Lane-acceptance evidence: baseline availability funnel (a) and the evidence behind the revoked lanes (b).}
+\caption{Lane-acceptance evidence: baseline availability funnel (a) and the evidence behind the revoked lanes (b).}
 \label{fig:s38}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig39_scene_density.png}
-\caption{Panel (a) of the main-text rigour and audits composite. Scene screening criterion: near-field structure density of the certified pools (black bar = median).}
+\caption{Scene screening criterion: near-field structure density of the certified pools (black bar = median).}
 \label{fig:s39}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig40_negative_audit.png}
-\caption{Panel (b) of the main-text rigour and audits composite. Negative-pool certification funnel: frames admitted as certified negatives versus excluded categories.}
+\caption{Negative-pool certification funnel: frames admitted as certified negatives versus excluded categories.}
 \label{fig:s40}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig36_timing_retest.png}
-\caption{Panel (c) of the main-text rigour and audits composite. Timing hygiene: repeated inference measurements on a quiet machine.}
+\caption{Timing hygiene: repeated inference measurements on a quiet machine.}
 \label{fig:s41}
 \end{figure}
 \begin{figure}[!t]
 \centering
 \includegraphics[width=\columnwidth]{figures/fig38_lane_geometry.png}
-\caption{Panel (d) of the main-text rigour and audits composite. Lateral position of line markings relative to the lane centre, pooled over the human-revised development pool.}
+\caption{Lateral position of line markings relative to the lane centre, pooled over the human-revised development pool.}
 \label{fig:s42}
 \end{figure}
 
