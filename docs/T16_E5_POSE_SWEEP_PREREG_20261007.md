@@ -66,3 +66,23 @@ E5 要回答的是：**这种拒绝是否依赖起始位姿**——即在同一�
 * 位姿：3 个（基线、横向 +0.5 m、航向 +5°），判据与 town 相同（有路径帧 / 行进 / 主因）；
 * 产物：`logs/experiments/e5_pose_sweep_mountain_20261007/`；
 * 裁决规则：若第二路段同样只有基线位姿有路径，则「可走集合近似单点」记为**两段路共有**；若第二路段在偏移位姿下也有路径，则记为**路段相关**，论文措辞限定到 town 路段。
+
+## 扩展-II（2026-10-11，审计入口专轮）
+
+E5 的 3×3 请求矩阵已有资格化尝试（1 completed、8 unplaceable），现在补两批**不追认旧结果**的扩展：
+
+### A. Italy 更大偏移
+
+* anchor/goal/config 与原 town 完全相同；只把请求位姿扩到横向 `{1.5, 2.0}` m、航向 `{0, 10}`°；
+* 4 个请求，`pose_contract=production_alignment`，不是 fixed_actual_pose；每个结果必须保存 request/actual/placement/qualification；
+* 用 `scripts/m5_pose_sweep.ps1`，`--max-wall-s 150`，端口从 64730 开始逐姿态递增，运行器自己等待/轮换/退避/清理；
+* `unplaceable`、启动失败、资格失败都单独保存，不当作驾驶成功或路径拒绝。
+
+### B. Italy mountain 第二路段
+
+* anchor `(729.6,763.9,45.0)`，goal `(616.2,894.5)`（benchmark mountain 固定定义）；
+* 4 个请求：横向 `{0.0,0.5}` m、航向 `{0,5}`°；其余配置与 A 相同；
+* 输出到 `logs/experiments/e5_pose_sweep_mountain_20261011/`；
+* 裁决：若 mountain 也全部 unplaceable，结论只写“该第二路段未获得放置”；若有 qualified exposure，才比较路径可用率，UNKNOWN 保持 UNKNOWN。
+
+本扩展不改变论文安全结论，不放宽 strict、不倒车、不使用地图固定横向偏移作为成功。

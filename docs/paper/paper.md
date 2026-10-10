@@ -494,20 +494,23 @@ bearing, so the inflated body sweep of the path the planner actually generated c
 set; it does not establish that no dynamically feasible forward path exists, because the planner's candidate
 set is not the set of all feasible paths. {@fig:deadlock} shows the anatomy.
 
-The qualified pose-sweep entry (source/config/exit/cleanup and exposure checked per pose) attempted
-all nine poses: **one of nine was completed and eight were classified `unplaceable`** (`placement_rc=3`,
-no equal-exposure drive measurement). The completed nominal baseline had 46 frames, 15 accepted-path
-frames, a perception lane in 26, and a net displacement of 0.56 m; production placement shifted the
-requested pose by 1.05 m, so it is a `production_alignment` observation rather than a fixed-actual-pose
-experiment. The six non-baseline cases that were still outstanding were then rerun with the port-wait,
-port-rotation and backoff entry; all six were again qualified as `unplaceable`. These records establish
-a placement-availability failure, not a causal fixed-pose grid result: the requested pose, the actual
-post-placement pose and the exposure qualification are not interchangeable. The old raw files remain
-historical evidence and are not counted as qualified measurements. A fixed-actual-pose experiment would
-require a placement contract that rejects pose drift before exposure, plus a clean restart between
-poses. Within the one completed observation, lack of a perception lane frequently precedes path generation;
-sweep rejection is a separate downstream event and is the principal reason in 8 of the 46 baseline
-frames.
+The audited pose-sweep entry (source/config/exit/cleanup and exposure checked per pose) attempted
+all nine requested poses: **one of nine was completed and eight were classified `unplaceable`**
+(`placement_rc=3`, no equal-exposure drive measurement). The completed nominal baseline had 46 frames,
+15 accepted-path frames, a perception lane in 26, and a net displacement of 0.56 m; production placement
+shifted the requested pose by 1.05 m, so it is a `production_alignment` observation rather than a
+fixed-actual-pose experiment. The remaining six requests were then reattempted with the audited
+PowerShell/qualification entry (port wait, port rotation, backoff, owned cleanup); all six were again
+qualified as `unplaceable`. These records establish a **placement-availability failure**, not a causal
+fixed-pose grid result: the requested pose, the actual post-placement pose and the exposure qualification
+are not interchangeable. The old raw files remain historical evidence and are not counted as qualified
+measurements. A fixed-actual-pose experiment would require a placement contract that rejects pose drift
+before exposure, plus a clean restart between poses. Within the one completed observation, lack of a
+perception lane frequently precedes path generation; sweep rejection is a separate downstream event and
+is the principal reason in 8 of the 46 baseline frames. The larger-offset extension and the mountain
+second-link extension were also run through the same qualified entry: the larger-offset batch yielded
+two `completed` but exposure-invalid cases and two valid completions, while the mountain batch yielded
+four `unplaceable` results; neither batch supplies equal-exposure driving evidence.
 
 Per-run traces, arm-level distributions and lane-placement distributions are in the supplement.
 Zero observed collisions, off-pavement frames and reversing in the four formal acceptance runs do not
