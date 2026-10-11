@@ -1909,6 +1909,9 @@ def write_truth_credentials(d: str | Path, *, batch_report, provenance) -> dict:
         "truth_contract": TRUTH_CONTRACT,
         "truth_provenance": prov,
         "frames": merged_frames,
+        # Preserve each channel's original status, including UNKNOWN and N/A.
+        # A verified LINE export does not establish SHOULDER/ROLE/occlusion.
+        "channels": dict(channels),
         "why": why,
     })
     path.write_text(json.dumps(out, ensure_ascii=False, indent=1), encoding="utf-8")
