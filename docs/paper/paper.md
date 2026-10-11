@@ -418,7 +418,17 @@ TABLE: Table V. Post-processing single factors on the frozen development pool, o
 
 Line-masked training metrics cannot establish line learning. A separately frozen mechanical check
 of the unattended learner is documented in the supplement; it is not an additional arm in this
-dose experiment. The supplement sweeps the lateral
+dose experiment. The R3 check has since gained a measured mechanism: its training pool
+composed 15 line-bearing frames with 60 verified line-free frames (line-frame share 0.20), and a
+pre-registered composition sweep (five paired seeds, four line-frame shares over the same pool
+family, identical initialization and 60-step budget) shows the development line IoU rising with the
+line share — the all-line pool beats the diluted composition in 5 of 5 paired seeds (+0.087 ± 0.116)
+with the smallest seed variance (0.049 vs 0.130–0.145), and precision rises with dose (0.58 → 0.89)
+at flat recall, while intermediate doses are not separable at this noise level. One diluted-composition
+seed collapsed to IoU 0.170 against its arm median of 0.439, and the paired comparison now carries
+an explicit collapse diagnostic. The reading is directional (one pool family, one initialization, a
+60-step budget) and no gate changed; what it establishes is that the R3 rejections are attributable,
+in part, to training-pool composition rather than to the increments being unlearnable. The supplement sweeps the lateral
 scope instead: tightening it from 6.0 m to 3.0 m raises identity (dev 0.582 → 0.713; limited-class
 0.581 → 0.758) and removes candidates (477 → 166 and 166 → 127), while role agreement is flat — the
 lateral scope is an identity lever, not a role lever. Two further single factors were rejected:
@@ -547,7 +557,16 @@ adopted, and the fifth remains untested by construction.
 The arbitration histogram is the evidence behind the stall fraction: over 2443 settled frames (frames at
 least 8 s into a run, pooled over the twelve town runs the figure names), "no drivable path" is the largest
 single reason at **1383 frames**, followed by the planned body-sweep crossing at **512**, which together
-account for the bulk of the stationary time.
+account for the bulk of the stationary time. A pre-registered production-input replay over the two
+probe-equipped verification rounds (91 frames) reproduces every recorded safety verdict offline (91/91)
+and classifies each frame by mechanism: perception-lane loss with a strict refusal of all candidates (23),
+all 14 planner candidates rejected at the constraint layer (20; cumulative lane-crossing 191 and
+body-crossing 103 counts), a safety rejection of an already-selected path (28), an accepted path at
+near-zero speed (19), and accepted motion (1). No rejection happened with a geometrically clear
+ahead-corridor (0 of 48 rejected frames; nearest corridor intrusion 1.0–5.6 m), so within these rounds
+the conservative mechanisms responded to recorded near-field evidence rather than mis-stopping on free
+space. The recorded reason strings are preserved verbatim; a derived per-frame mechanism field
+separates the conflated `no drivable path` cases.
 
 TABLE: Table III. The pre-registered driving-layer factors against the deadlock, with mechanism engagement,
 motion read-outs and the pre-registered verdict. Four were implemented and run; the fifth was refuted by
