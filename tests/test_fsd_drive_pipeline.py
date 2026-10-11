@@ -38,12 +38,16 @@ class Connection:
         self.clock, self.state = clock, state
         self.commands = []
         self.vehicle = SimpleNamespace(vid="ego")
+        self.startup_calls = []
 
     def open(self, **kwargs):
-        pass
+        self.startup_calls.append(("open", kwargs.get("launch")))
 
     def attach_vehicle(self, **kwargs):
-        pass
+        self.startup_calls.append(("attach",))
+
+    def load_scenario(self):
+        self.startup_calls.append(("load",))
 
     def get_state(self):
         return self.state
@@ -131,7 +135,9 @@ class Stack:
 
 def drive(monkeypatch, tmp_path, *, caps=(3.3,), delays=None,
           levels=None, speed=0.0, obstacle=None, dqn=False, painted=False,
-          route_end=100.0, heading=0.0, ref_authority=None, lateral=0.0):
+          route_end=100.0, heading=0.0, ref_authority=None, lateral=0.0,
+          max_wall_s=None, expected_rc=0, expected_frames=None, probe_geometry=False,
+          attach=True, replay_capture=False):
     clock = Clock()
     delays = list(delays or [0.5] * len(caps))
     state = SimpleNamespace(pos=np.array([0.0, lateral, 0.0]), heading=heading,
@@ -140,6 +146,11 @@ def drive(monkeypatch, tmp_path, *, caps=(3.3,), delays=None,
     conn = Connection(clock, state)
     stack = Stack(clock, state, delays, obstacle=obstacle, painted=painted,
                   ref_authority=ref_authority)
+    disarms = []
+    def disarm():
+        disarms.append(clock.value)
+        return {"status": "pending"}
+    stack.range_prov = SimpleNamespace(disarm_replay_capture=disarm)
 
     class Monitor:
         def __init__(self, **kwargs):
@@ -179,20 +190,28 @@ def drive(monkeypatch, tmp_path, *, caps=(3.3,), delays=None,
     monkeypatch.setattr(fd.FSDriveSession, "_setup_runtime",
                         lambda self, conn, args: (None, stack, None, None, policy))
     monkeypatch.setattr(fd.FSDriveSession, "_prewarm_and_place",
-                        lambda *args: (None, True, 0))
+                        lambda *args, **kwargs: (None, True, 0))
     if painted:
         marking = SimpleNamespace(world=np.column_stack([
             np.linspace(-5.0, 20.0, 26), np.full(26, 0.5)]))
         monkeypatch.setattr(fd, "painted_line_markings", lambda *a, **k: [marking])
     output = tmp_path / "drive.json"
-    args = SimpleNamespace(runtime="tech", attach=True, map=None,
+    args = SimpleNamespace(runtime="tech", attach=attach, map=None,
                            teleport=None, speed=6.0, strict=True,
                            lane_mode="sensor", no_shadow=True, no_signal=True,
                            seconds=sum(max(0.5, x) for x in delays) - 0.01,
-                           out=str(output), vis=0)
-    assert fd.FSDriveSession(args).run() == 0
+                           out=str(output), vis=0, max_wall_s=max_wall_s,
+                           probe_geometry=probe_geometry, capture_range_replay=replay_capture)
+    assert fd.FSDriveSession(args).run() == expected_rc
     frames = json.loads(output.read_text(encoding="utf-8"))
-    assert len(frames) == len(caps)
+    audit = json.loads(Path(str(output) + ".session.json").read_text(encoding="utf-8"))
+    if replay_capture:
+        assert len(disarms) == 1
+        assert audit["range_replay"]["disarmed_wall_t"] == disarms[0]
+        assert disarms[0] <= audit["drive_started_wall_t"] <= frames[0]["cmd_t"]
+    else:
+        assert not disarms and "range_replay" not in audit
+    assert len(frames) == (len(caps) if expected_frames is None else expected_frames)
     for frame in frames:
         sent = [c for t, c in conn.commands if t == frame["cmd_t"]]
         assert any(round(c["throttle"], 4) == frame["throttle"]
@@ -213,6 +232,34 @@ def test_default_loop_sends_lower_cap_and_serializes_evidence(monkeypatch, tmp_p
     assert frame["rules_evaluated"] == ["fixture"]
     assert frame["consumed"]["semantic"]["age_s"] == 0.5
     assert frame["consumed"]["semantic"]["publish_age_s"] == 0.0
+
+
+def test_capture_disarms_before_drive_and_preserves_pending_diagnostic(monkeypatch, tmp_path):
+    drive(monkeypatch, tmp_path, replay_capture=True)
+
+
+def test_fresh_driver_loads_before_querying_current_vehicles(monkeypatch, tmp_path):
+    frames, conn = drive(monkeypatch, tmp_path, attach=False)
+    assert frames
+    assert conn.startup_calls == [("open", True), ("load",)]
+
+
+def test_attached_driver_reuses_existing_vehicle(monkeypatch, tmp_path):
+    frames, conn = drive(monkeypatch, tmp_path, attach=True)
+    assert frames
+    assert conn.startup_calls == [("open", False), ("attach",)]
+
+
+def test_real_loop_geometry_carries_the_final_command(monkeypatch, tmp_path):
+    frames, _ = drive(monkeypatch, tmp_path, probe_geometry=True)
+    frame = frames[0]
+    probe = frame["geometry_probe"]
+    assert "error" not in probe, probe
+    assert probe["command"]["cmd_seq"] == frame["cmd_seq"]
+    assert round(probe["command"]["throttle"], 4) == frame["throttle"]
+    assert probe["command"]["execution_status"] == "unknown"
+    assert probe["control_path"] is not None
+    assert frame["geometry_probe_ms"] >= 0
 
 
 def test_long_planner_cannot_raise_monitor_cap_in_real_loop(monkeypatch, tmp_path):
@@ -255,6 +302,20 @@ def test_real_loop_watchdog_brakes_without_substep_slack(monkeypatch, tmp_path):
     assert frame["watchdog_braked"]
     assert frame["cmd_gap_s"] == 2.0
     assert frame["throttle"] == 0.0 and frame["brake"] == 1.0
+
+
+def test_drive_timeout_after_slow_sensor_never_sends_another_throttle(monkeypatch, tmp_path):
+    frames, conn = drive(monkeypatch, tmp_path, caps=(6.0, 6.0),
+                         delays=(0.5, 2.0), max_wall_s=1.5,
+                         expected_rc=4, expected_frames=1)
+    assert frames[0]["throttle"] > 0.0
+    after_deadline = [cmd for t, cmd in conn.commands if t >= 101.5]
+    assert after_deadline
+    assert all(cmd["throttle"] == 0.0 and cmd["brake"] == 1.0
+               for cmd in after_deadline)
+    audit = json.loads((tmp_path / "drive.json.session.json").read_text(encoding="utf-8"))
+    assert audit["exit_code"] == 4 and audit["termination"] == "drive_wall_timeout"
+    assert audit["placed"] and audit["telemetry_frames"] == 1
 
 
 def test_end_alignment_creep_cannot_override_monitor_stop(monkeypatch, tmp_path):

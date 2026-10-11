@@ -477,7 +477,8 @@ def compensate_range_motion(sample: RangeSample | None,
             + grow))
     return RangeSample(
         obstacles=out,
-        ray_hits=list(getattr(sample, "ray_hits", []) or []))
+        ray_hits=list(getattr(sample, "ray_hits", []) or []),
+        meta=dict(getattr(sample, "meta", {}) or {}))
 from beamng_autopilot.vision.hydra import FrameContext, HydraNet
 from beamng_autopilot.fsd_realism import (
     SRC_SENSOR,
@@ -792,8 +793,8 @@ class FSDStack:
         if result is not None:
             if result.ok:
                 self._last_range = result.value
-                # the cloud was captured when the job was FETCHED, so that
-                # is the honest age of the evidence it produced
+                # Poll-start proxy includes fetch and worker waiting. The
+                # actual sensor capture timestamp is not available here.
                 self._last_range_t = float(
                     getattr(self, "_range_job_t", 0.0) or time.time())
                 rng = result.value
@@ -820,23 +821,25 @@ class FSDStack:
                 _deferred = True
             else:
                 payload = None
+                _fetch_started_t = time.time()
                 try:
                     payload = self.range_prov.fetch(pos)
                 except Exception as exc:
                     error = str(exc)
                 if payload is not None:
-                    self._range_job_t = time.time()
+                    self._range_job_t = _fetch_started_t
                     runner.submit(self.range_prov.process, payload, pos)
                     _submitted = True
                 else:
                     # the provider declared a split but produced no
                     # payload: fall back to the synchronous scan
                     _t_scan = time.perf_counter()
+                    _scan_started_t = time.time()
                     rng = self.range_prov.scan(pos)
                     ran_ms = round(
                         (time.perf_counter() - _t_scan) * 1000.0, 1)
                     self._last_range = rng
-                    self._last_range_t = time.time()
+                    self._last_range_t = _scan_started_t
                     _scanned = True
         if error is not None:
             state = "error"
@@ -854,6 +857,8 @@ class FSDStack:
             state = "async_in_flight"
         else:
             state = "reused"
+        _age = (time.time() - float(getattr(self, "_last_range_t", 0.0))
+                if getattr(self, "_last_range", None) is not None else None)
         return rng, error, {"state": state, "age_s": _age,
                             "compute_ms": ran_ms}
 
@@ -1373,11 +1378,12 @@ class FSDStack:
                             "compute_ms": None}
                     else:
                         _t_scan = time.perf_counter()
+                        _scan_started_t = time.time()
                         rng = self.range_prov.scan(pos)
                         _scan_ms = round(
                             (time.perf_counter() - _t_scan) * 1000.0, 1)
                         self._last_range = rng
-                        self._last_range_t = time.time()
+                        self._last_range_t = _scan_started_t
                         self._range_skip = max(
                             0, int(getattr(self, 'range_every_n', 1)) - 1)
                         out.meta["range_sched"] = {
@@ -1394,11 +1400,12 @@ class FSDStack:
                         # fixing the throttle alone only handed the
                         # starvation to the budget gate.
                         _t_scan = time.perf_counter()
+                        _scan_started_t = time.time()
                         rng = self.range_prov.scan(pos)
                         _scan_ms = round(
                             (time.perf_counter() - _t_scan) * 1000.0, 1)
                         self._last_range = rng
-                        self._last_range_t = time.time()
+                        self._last_range_t = _scan_started_t
                         self._range_skip = max(
                             0, int(getattr(self, 'range_every_n', 1)) - 1)
                         out.meta["range_sched"] = {
@@ -1413,6 +1420,8 @@ class FSDStack:
                             "compute_ms": None}
                 if rng is None:
                     raise RuntimeError("no range sample")
+                out.meta["range_timing"] = dict(getattr(rng, "meta", {}) or {})
+                out.meta["range_age_basis"] = "poll_start_proxy"
                 out.ray_hits = list(getattr(rng, "ray_hits", []) or [])
                 out.forward_clearance = forward_clearance_m(
                     out.ray_hits, pos,
@@ -2147,6 +2156,10 @@ class FSDStack:
             fans.add(np.asarray(lane_center_ref, dtype=float)[:, :2],
                      "lane_center", offset=0.0)
         out.n_candidates = len(fans.candidates)
+        if getattr(self, "probe_geometry", False):
+            out.probe_candidates = [
+                {"path": np.asarray(c.path, dtype=float).tolist(), "meta": dict(c.meta)}
+                for c in fans.candidates]
         # Candidate hysteresis (plan phase D1): the fan is re-scored every
         # tick and two near-equal candidates would otherwise win on
         # alternate frames, flipping the steering intent every 0.5 s.

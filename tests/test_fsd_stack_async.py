@@ -294,6 +294,83 @@ def test_async_range_does_not_block_the_tick() -> None:
     assert out2.meta["range_age_s"] is not None
 
 
+@pytest.mark.parametrize("skip", [0, 1])
+def test_sync_range_age_includes_scan_latency_and_forced_scan_latency(monkeypatch, skip):
+    from beamng_autopilot.runtime import RangeSample
+
+    clock = [1000.0]
+    monkeypatch.setattr(fs.time, "time", lambda: clock[0])
+    monkeypatch.setattr(fs, "ASYNC_HEADS_ENABLED", False)
+    st = _stack()
+    monkeypatch.setattr(fs, "SCHED_KEEPALIVE_ENABLED", True)
+    st._range_skip = skip
+    st._last_range = RangeSample()
+    st._last_range_t = 998.0
+
+    def scan(pos):
+        clock[0] += 0.7
+        return RangeSample(ray_hits=[(6, 0)], meta={"source_poll_started_t": 1000.0})
+
+    st.range_prov.scan = scan
+    out = st.tick()
+    assert st._last_range_t == 1000.0
+    assert out.meta["range_age_s"] == pytest.approx(0.7)
+    assert out.meta["range_timing"]["source_poll_started_t"] == 1000.0
+    assert out.meta["range_age_basis"] == "poll_start_proxy"
+    if skip:
+        assert out.meta["range_sched"]["state"] == "keepalive_forced"
+
+
+def test_async_range_source_time_precedes_slow_fetch_and_worker_queue(monkeypatch):
+    from types import SimpleNamespace
+    from beamng_autopilot.runtime import RangeSample
+
+    clock = [1000.0]
+    monkeypatch.setattr(fs.time, "time", lambda: clock[0])
+    sample = RangeSample(meta={"source_poll_started_t": 1000.0})
+
+    class Runner:
+        busy = False
+        result = None
+
+        def poll(self):
+            result, self.result = self.result, None
+            return result
+
+        def submit(self, *args):
+            self.busy = True
+
+    runner = Runner()
+    st = _stack()
+    st._range_worker = runner
+    st.range_prov = _SplitRange(0)
+
+    def fetch(pos):
+        clock[0] += 0.5
+        return {"pos": pos}
+
+    st.range_prov.fetch = fetch
+    _, _, sched = st._range_async_step(np.zeros(3), None, 1000, [])
+    assert sched["state"] == "async_submitted"
+    assert st._range_job_t == 1000.0  # Before half a second of IO.
+    clock[0] += 0.7  # Worker compute and queue waiting.
+    runner.result = SimpleNamespace(ok=True, value=sample, duration_s=0.4)
+    result, _, sched = st._range_async_step(np.zeros(3), None, 1000, [])
+    assert result is sample
+    assert st._last_range_t == 1000.0
+    assert sched["age_s"] == pytest.approx(1.2)
+
+
+def test_motion_compensation_retains_source_metadata_without_sharing_top_level():
+    from beamng_autopilot.runtime import RangeSample
+
+    sample = RangeSample(meta={"source_poll_started_t": 1000, "process_ms": 40})
+    compensated = fs.compensate_range_motion(sample, 0.5)
+    assert compensated.meta == sample.meta
+    compensated.meta["process_ms"] = 99
+    assert sample.meta["process_ms"] == 40
+
+
 def test_range_worker_health_is_published_for_telemetry() -> None:
     """A wedged clustering worker must be visible, not only its age.
 
