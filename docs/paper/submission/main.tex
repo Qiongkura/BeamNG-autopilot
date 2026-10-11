@@ -466,8 +466,9 @@ offset is along the heading, not road-lateral) then \textbf{qualified}: position
 heading error 0.087°, `placement_rc=0`, 26.203 s drive elapsed, 42 frames and 22 accepted-path frames; owned cleanup
 was verified. A pre-registered start-pose A/B (order O$\rightarrow$B$\rightarrow$B$\rightarrow$O, two repeats per arm) then gave \textbf{3/4 qualified}
 runs, with one O-arm repeat recorded invalid (telemetry exposure too short, preserved as-is). The three qualified
-runs had near-equal exposure (24.61--24.79 s); the two B-arm repeats differ 2.5$\times$ in net travel (3.944 m vs 1.573 m),
-while the single qualified O observation (3.484 m, 20 accepted-path frames) falls inside the B-arm repeat range ---
+runs had near-equal exposure (24.61--24.79 s); the two B-arm repeats differ 2.5$\times$ in net travel (3.944 m vs 1.573 m);
+the single qualified O observation has net travel 3.484 m, inside the B-arm repeat range, while its 20 accepted-path
+frames sit \textbf{below} the B repeats' 26--30 (the two readings are stated separately) ---
 **session-level run-to-run variability exceeds the start-pose difference, and no causal start-pose separation is
 claimed**; the contrast reinforces our reserve about single closed-loop readings. The two extensions remain
 placement-contract outcomes, not driving-quality or safety results.

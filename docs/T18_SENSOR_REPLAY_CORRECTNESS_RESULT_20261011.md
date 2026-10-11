@@ -13,7 +13,7 @@
 
 | 项 | 结果 |
 |---|---|
-| T17 源快照 | `logs/experiments/t18_reference_20260910/providers_9b10da96.py`（sha256 `50bc24fb57eb2039a6aea05dccd685036cc37728f528748ae99c5b19a8ce8a18`） |
+| T17 源快照 | `logs/experiments/t18_reference_20261009/providers_9b10da96.py`（sha256 `50bc24fb57eb2039a6aea05dccd685036cc37728f528748ae99c5b19a8ce8a18`） |
 | 当前源快照 | `logs/experiments/t18_codefreeze_after_gate_20261009.json`；代码 hash 在 T18 配置中绑定 |
 | 修改范围 | Tech provider 的 source metadata/阶段时间、range replay、segmentation raw API 的 argmax/road 保留、geometry probe/资格入口 |
 | 默认行为 | 经典 CV、Steam、控制/安全硬约束、默认异步开关与形状阈值不改；捕获默认关闭 |
@@ -55,7 +55,7 @@
 
 * `qualified=true`，同一模型、地图、起点、goal、strict/sensor、25 s/150 s、geometry probe、capture 开关；
 * cleanup：`closed=true`、`failed=[]`、`unverified=[]`、`still_running=[]`；
-* `source_poll_times_strictly_increasing=true`；range `scanned` 40 帧；capture artifact 已验证；
+* `source_poll_times_strictly_increasing=true`；range `scanned` 37 帧（遥测逐帧记录 37 帧，非 40）；capture artifact 已验证；
 * geometry/replay 结果：生产安全评估回放与记录一致；没有把 body coverage UNKNOWN 读作安全通过。
 
 ## 4. UNKNOWN 与边界
