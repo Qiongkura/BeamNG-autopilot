@@ -123,6 +123,40 @@ def test_explicit_mask_must_match_image_shape():
                          line_mask=np.zeros((20, 20), bool))
 
 
+@pytest.mark.parametrize("explicit_road", [False, True])
+def test_self_prediction_passes_same_call_road_to_candidate_gate(monkeypatch, explicit_road):
+    from beamng_autopilot.vision import segmentation, lanes
+    seg = _segmenter()
+    road = np.ones((40, 40), bool)
+    line = np.zeros((40, 40), bool)
+    line[10:25, 20:23] = True
+    supplied = np.zeros_like(road) if explicit_road else None
+    calls, seen = [], []
+    def predict(frame):
+        calls.append(frame)
+        return road, line
+    def gate(markings, learned, road_mask):
+        seen.append(road_mask)
+        return [], {}, True
+    seg.predict = predict
+    monkeypatch.setattr(lanes, "_mask_to_markings", lambda *a, **k: [])
+    monkeypatch.setattr(lanes, "recover_dashed_boundaries", lambda *a, **k: [])
+    monkeypatch.setattr(segmentation, "gate_line_candidates", gate)
+    ctx = _ctx()
+    seg.detect_lines(ctx.frame_rgb, None, ctx.pos, ctx.heading, road_mask=supplied)
+    assert len(calls) == 1 and len(seen) == 1
+    assert seen[0] is (supplied if explicit_road else road)
+
+
+@pytest.mark.parametrize("line_provided", [False, True])
+def test_mismatched_road_shape_rejects_both_prediction_paths(line_provided):
+    seg, ctx = _segmenter(), _ctx()
+    with pytest.raises(ValueError, match="road_mask shape"):
+        seg.detect_lines(ctx.frame_rgb, None, ctx.pos, ctx.heading,
+                         road_mask=np.zeros((20, 20), bool),
+                         line_mask=np.zeros((40, 40), bool) if line_provided else None)
+
+
 def test_head_uses_observation_timestamp_and_resets_history():
     class Evidence:
         def __init__(self):

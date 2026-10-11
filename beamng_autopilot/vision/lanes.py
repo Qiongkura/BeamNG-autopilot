@@ -168,7 +168,8 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
                       ground_z: float | None = None,
                       min_area: int | None = None, min_height: int | None = None,
                       max_dist: float = 45.0, solid_len: float = 6.0,
-                      debug: dict | None = None, rotation=None
+                      debug: dict | None = None, rotation=None,
+                      component_roi: bool = False
                       ) -> list[LaneMarking]:
     """Turn a binary mask into LaneMarking polylines (shared pipeline).
 
@@ -184,6 +185,10 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
     in the mask and no marking), and without it the reason is invisible.
     Sets ``components``, ``drops`` (``"<L|R>:<reason>"``), ``kept`` and
     ``kinds``.
+
+    ``component_roi`` confines learned-mask pixel lookups to each component's
+    exact stats rectangle. Row-major order and the existing sampling stay
+    identical. Classic-CV callers retain their original default path.
     """
     import cv2
 
@@ -222,14 +227,19 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
         side = "L" if (float(x) + 0.5 * float(w)) < _cx else "R"
         key = f"{side}:{reason}"
         debug["drops"][key] = int(debug["drops"].get(key, 0)) + 1
-        stats = debug.setdefault("drop_stats", [])
-        if len(stats) < 4000:
+        drop_stats = debug.setdefault("drop_stats", [])
+        if len(drop_stats) < 4000:
             n_px = gt_px = 0
             if _gt is not None and label_id >= 0:
-                comp = labels == label_id
+                if component_roi:
+                    bx, by, bw, bh, _ = stats[label_id]
+                    comp = labels[by:by + bh, bx:bx + bw] == label_id
+                    gt = np.asarray(_gt)[by:by + bh, bx:bx + bw]
+                else:
+                    comp, gt = labels == label_id, _gt
                 n_px = int(comp.sum())
-                gt_px = int(np.logical_and(comp, _gt).sum())
-            stats.append((side, reason, int(w), int(h), int(area),
+                gt_px = int(np.logical_and(comp, gt).sum())
+            drop_stats.append((side, reason, int(w), int(h), int(area),
                           n_px, gt_px))
 
     mask = cv2.morphologyEx(mask0, cv2.MORPH_OPEN, kernel)
@@ -253,7 +263,11 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
         if w * h <= 0 or area / (w * h) < 0.10:
             _drop(x, w, "too_sparse", h, area, i)
             continue
-        ys, xs = np.where(labels == i)
+        if component_roi:
+            ys, xs = np.where(labels[y:y + h, x:x + w] == i)
+            ys, xs = ys + y, xs + x
+        else:
+            ys, xs = np.where(labels == i)
         order = np.argsort(ys)
         xs = xs[order].astype(float)
         ys = ys[order].astype(float)

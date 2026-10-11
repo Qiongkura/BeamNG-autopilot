@@ -884,6 +884,8 @@ class Segmenter:
         maps_small = softmax_maps(probs, line_index=self._line_idx,
                                   road_index=self._road_idx,
                                   background_index=self._bg_idx)
+        if maps_small.road is None or maps_small.line is None:
+            raise ValueError("probability API requires road and line channels")
         out = {}
         for name in ("line", "road", "background"):
             m = getattr(maps_small, name)
@@ -894,11 +896,10 @@ class Segmenter:
                                    interpolation=cv2.INTER_LINEAR)
         maps = type(maps_small)(
             line=out["line"], road=out["road"], background=out["background"])
-        raw_road = maps.road >= maps.line
-        raw_line = maps.line >= maps.road
-        if maps.background is not None:
-            raw_road = raw_road & (maps.road >= maps.background)
-            raw_line = raw_line & (maps.line >= maps.background)
+        # Match ordinary predict EXACTLY: argmax before nearest-neighbour
+        # resizing. Interpolated probabilities are deliberately a separate
+        # signal; ties and interpolated boundaries cannot redefine the raw mask.
+        raw_road, raw_line = self._argmax_masks(logits, frame_rgb)
         return maps, raw_road, raw_line
 
     def predict_with_probs(self, frame_rgb: np.ndarray):
@@ -935,11 +936,17 @@ class Segmenter:
         # An explicit (possibly empty) mask is authoritative: do not run
         # inference again or discard the head's temporal fusion.
         if line_mask is None:
-            _, line = self.predict(frame_rgb)
+            predicted_road, line = self.predict(frame_rgb)
+            if road_mask is None:
+                road_mask = predicted_road
         else:
             line = np.asarray(line_mask, dtype=bool)
             if line.shape != frame_rgb.shape[:2]:
                 raise ValueError("line_mask shape must match image shape")
+        if road_mask is not None:
+            road_mask = np.asarray(road_mask, dtype=bool)
+            if road_mask.shape != frame_rgb.shape[:2]:
+                raise ValueError("road_mask shape must match image shape")
         # Classic-CV bright-stroke recovery, contrast-based: on a light
         # concrete road the absolute brightness of the paint and the
         # pavement are both high, so a global threshold fires on the whole
@@ -987,7 +994,7 @@ class Segmenter:
         if white_mask.any():
             _white = _mask_to_markings(
                 white_mask, "white", cam_model, pos, heading,
-                ground_z=ground_z, rotation=rotation)
+                ground_z=ground_z, rotation=rotation, component_roi=True)
             _kept, _dropped, _gate_on = gate_line_candidates(
                 _white, line, road_mask)
             out.extend(_kept)

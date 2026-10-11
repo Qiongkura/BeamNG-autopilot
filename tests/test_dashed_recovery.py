@@ -274,3 +274,39 @@ def test_batch_marking_distance_gate_keeps_scalar_hypot_rounding(monkeypatch):
                                     np.zeros(3), 0.0, max_dist=limit)
     assert marks, "points exactly on max_dist must survive"
 
+
+@pytest.mark.parametrize("color", ["white", "yellow"])
+@pytest.mark.parametrize("ground_delta", [0.0, -0.55, 4.0])
+def test_learned_component_roi_keeps_pixels_geometry_and_gt_diagnostics(color, ground_delta):
+    from beamng_autopilot.vision import lanes
+    from beamng_autopilot.vision.projection import default_camera
+
+    cam = default_camera(536, 403)
+    pos = np.array([24.0, -50.0, 3.0])
+    mask = np.zeros((403, 536), dtype=np.uint8)
+    # Nested bounding boxes, slanted line, border touch, wide repair blob,
+    # valid near/far line and shape failures. ROI must not include a neighbour.
+    mask[210:395, 240:245] = 255
+    mask[240:388, 312:328] = 255
+    mask[280:292, 350:356] = 255
+    mask[330:334, 80:130] = 255
+    mask[350:403, 0:5] = 255
+    for row in range(220, 300):
+        x = 40 + (row - 220) // 2
+        mask[row:row + 3, x:x + 5] = 255
+    truth = mask > 0
+    debug_roi, debug_full = {"gt": truth}, {"gt": truth}
+    args = (mask, color, cam, pos, 0.7)
+    roi = lanes._mask_to_markings(*args, ground_z=pos[2] + ground_delta,
+                                  debug=debug_roi, component_roi=True)
+    full = lanes._mask_to_markings(*args, ground_z=pos[2] + ground_delta,
+                                   debug=debug_full)
+    debug_roi.pop("gt")
+    debug_full.pop("gt")
+    assert debug_roi == debug_full
+    assert len(roi) == len(full)
+    for a, b in zip(roi, full):
+        assert (a.color, a.kind, a.confidence) == (b.color, b.kind, b.confidence)
+        np.testing.assert_array_equal(a.pixels, b.pixels)
+        np.testing.assert_array_equal(a.world, b.world)
+

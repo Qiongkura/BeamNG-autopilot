@@ -184,6 +184,8 @@ def test_budget_mode_stops_at_the_step_budget_end_to_end(tmp_path):
     assert rep["exposures_total"] >= 5
 
     ta = _ckpt(out)["train_args"]
+    assert hist["source_unchanged"] is True
+    assert ta["source_sha256"] == hist["source_before"]["sha256"] == hist["source_after"]["sha256"]
     assert ta["steps_done"] == 5 and ta["total_steps"] == 5
     assert ta["sampler"] == "quota"
     assert ta["sampling"] == "quota_full_pool"

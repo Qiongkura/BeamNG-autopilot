@@ -182,17 +182,61 @@ def test_predict_proba_returns_normalised_maps_and_raw_argmax(tmp_path) -> None:
     seg = Segmenter(model_path=ckpt, device="cpu", use_half=False)
     frame = np.random.default_rng(3).integers(
         0, 255, (48, 64, 3), dtype=np.uint8)
-    maps, raw_road, raw_line = seg.predict_proba(frame)
+    logits = seg._infer_logits(frame)
+    maps, raw_road, raw_line = seg.predict_proba(frame, _logits=logits)
     assert maps.line.shape == (48, 64)
     assert maps.road.shape == (48, 64)
     total = maps.line + maps.road + maps.background
     assert np.allclose(total, 1.0, atol=1e-4)
     assert maps.line.min() >= 0.0 and maps.line.max() <= 1.0
     # the raw masks are exactly the argmax decision, channel by channel
-    stack = np.stack([maps.background, maps.road, maps.line], axis=0)
-    winner = stack.argmax(axis=0)
-    assert np.array_equal(raw_road, winner == 1)
-    assert np.array_equal(raw_line, winner == 2)
+    road, line = seg._argmax_masks(logits, frame)
+    assert np.array_equal(raw_road, road)
+    assert np.array_equal(raw_line, line)
+
+
+@pytest.mark.parametrize("road_index,line_index,winner", [(1, 2, "road"), (2, 1, "line")])
+def test_raw_ties_are_exclusive_and_follow_native_channel_order(road_index, line_index, winner):
+    torch = pytest.importorskip("torch")
+    from beamng_autopilot.vision.segmentation import Segmenter
+    seg = object.__new__(Segmenter)
+    seg._road_idx, seg._line_idx, seg._bg_idx = road_index, line_index, 0
+    logits = torch.full((1, 3, 1, 2), 3.0)
+    logits[:, 0] = -10
+    frame = np.zeros((2, 4, 3), np.uint8)
+    _maps_out, road, line = seg.predict_proba(frame, _logits=logits)
+    assert not (road & line).any()
+    assert road.all() == (winner == "road")
+    assert line.all() == (winner == "line")
+    logits.zero_()  # Background wins a three-way tie.
+    _maps_out, road, line = seg.predict_proba(frame, _logits=logits)
+    assert not road.any() and not line.any()
+
+
+def test_raw_resize_precedes_probability_interpolation_decisions():
+    torch = pytest.importorskip("torch")
+    from beamng_autopilot.vision.segmentation import Segmenter
+    seg = object.__new__(Segmenter)
+    seg._road_idx, seg._line_idx, seg._bg_idx = 1, 2, 0
+    logits = torch.tensor([[[[-100., -100.]],
+                            [[np.log(.51), np.log(.01)]],
+                            [[np.log(.49), np.log(.99)]]]])
+    maps, road, line = seg.predict_proba(np.zeros((1, 4, 3), np.uint8), _logits=logits)
+    np.testing.assert_array_equal(road, [[True, True, False, False]])
+    np.testing.assert_array_equal(line, [[False, False, True, True]])
+    assert maps.line[0, 1] > maps.road[0, 1]  # Linear probabilities differ here.
+    assert maps.road[0, 1] == pytest.approx(.385, abs=1e-5)
+
+
+@pytest.mark.parametrize("missing,index", [("road", None), ("line", None), ("line", 4)])
+def test_probability_api_rejects_missing_channels_explicitly(missing, index):
+    torch = pytest.importorskip("torch")
+    from beamng_autopilot.vision.segmentation import Segmenter
+    seg = object.__new__(Segmenter)
+    seg._road_idx, seg._line_idx, seg._bg_idx = 1, 2, 0
+    setattr(seg, f"_{missing}_idx", index)
+    with pytest.raises(ValueError, match="requires road and line"):
+        seg.predict_proba(np.zeros((2, 4, 3), np.uint8), _logits=torch.zeros(1, 3, 1, 2))
 
 
 def test_predict_and_predict_with_probs_agree(tmp_path) -> None:
