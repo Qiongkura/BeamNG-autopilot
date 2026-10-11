@@ -36,8 +36,8 @@
 | 18 | R3 池逐 seed 候选级门 | `r3_acceptance_20261004.json` |
 | 19 | 实例级参考覆盖 vs 横向位置 | `r3_instance_ann_cov.json` |
 | 20 | 负例诊断全家（各臂） | `logs/experiments/*_pixel_*.json` |
-| 21 | 训练曲线 | `logs/experiments/**/train_hist.json` |
-| 22 | 驾驶硬门清单热图 | `logs/fsd_benchmark/scorecard_*.json`（最近 32 次） |
+| 21 | R3 学习流程检查（2026-10-09 更新，六次短训练；非旧图复原） | `docs/paper/figure_inputs_20261009.json` 固定路径与摘要 |
+| 22 | 历史驾驶硬门诊断热图 | 同一清单明确的 32 次运行，路径、顺序与摘要固定 |
 | 23 | 仲裁原因直方图 | 12 次 town 遥测的 `reason` 字段 |
 | 24 | 逐帧时间线（速度/车道偏差） | `town_1791221139.json`、`town_1791273507.json` |
 | 25 | 各臂分布箱线图 | 各 A/B 的 scorecard + manifest |
@@ -127,10 +127,11 @@ scenes, coloured by role (near/far left, near right, straddled).
 **Fig. 20.** Negative-side diagnostics across all recorded pixel arms (FP frame rate vs FP
 pixel fraction; marker size = max connected component).
 
-**Fig. 21.** Training curves from the recorded `train_hist.json` runs (val line IoU and
-train loss per epoch).
+**Fig. 21.** Frozen R3 mechanical learning check: six histories, two seeds per arm,
+60 optimiser steps per run; validation line IoU and training loss by epoch (median and IQR).
+Both candidate rounds were rejected. This is separate from the earlier dose comparison.
 
-**Fig. 22.** Driving hard-gate checklist over the last 32 town runs (green = pass, red = fail;
+**Fig. 22.** Historical diagnostic checklist over 32 explicitly frozen town runs (green = recorded pass, red = fail;
 UNKNOWN counts as fail).
 
 **Fig. 23.** Why the car does not move: safety-arbitration reasons over 2443 settled frames

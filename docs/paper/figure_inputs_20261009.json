@@ -1,0 +1,443 @@
+{
+ "schema": "paper-inputs-v1",
+ "frozen_at": "2026-10-09",
+ "note": "Figure 21 is new mechanical validation, not reconstruction of the historical 321-run graph. Figure 22 pins the existing 32-run order; future files and mtimes cannot select runs.",
+ "figures": {
+  "fig21": {
+   "scope": "R3 two paired seeds, shared init, sixty optimizer steps; both candidates rejected; not at plateau; no learning gain claim",
+   "inputs": [
+    {
+     "path": "logs/experiments/t16_learning_validation_20261009_r3/baseline/seed42/train_hist.json",
+     "role": "history",
+     "family": "R3 baseline",
+     "seed": 42,
+     "sha256": "dcd0188aaf10a53893c4f11d1428b0ac84695de7895338260abbc8063722897d"
+    },
+    {
+     "path": "logs/experiments/t16_learning_validation_20261009_r3/baseline/seed43/train_hist.json",
+     "role": "history",
+     "family": "R3 baseline",
+     "seed": 43,
+     "sha256": "ca07b9e0410a6f5dba158df265a203f2685b0adf1a3146a4e90070e172ae4602"
+    },
+    {
+     "path": "logs/experiments/t16_learning_validation_20261009_r3/round0/seed42/train_hist.json",
+     "role": "history",
+     "family": "R3 round0",
+     "seed": 42,
+     "sha256": "4032c028a041e293dac808c7c14e927f11cd800761b54c870b91be6138daa4e1"
+    },
+    {
+     "path": "logs/experiments/t16_learning_validation_20261009_r3/round0/seed43/train_hist.json",
+     "role": "history",
+     "family": "R3 round0",
+     "seed": 43,
+     "sha256": "17806f6038d81e50bfd07c55491d05b1fca4229d10614f9d8a5d4bb48d7fa1f0"
+    },
+    {
+     "path": "logs/experiments/t16_learning_validation_20261009_r3/round1/seed42/train_hist.json",
+     "role": "history",
+     "family": "R3 round1",
+     "seed": 42,
+     "sha256": "e315557a7314c45118631638fe5f6e5910b82455191f722440041bbd97febc67"
+    },
+    {
+     "path": "logs/experiments/t16_learning_validation_20261009_r3/round1/seed43/train_hist.json",
+     "role": "history",
+     "family": "R3 round1",
+     "seed": 43,
+     "sha256": "6b7f358f9f3e56bad83abaf189240caf007f0d1c46cf4df5137e34a5fa067eaa"
+    }
+   ]
+  },
+  "fig22": {
+   "scope": "32 historical town runs explicitly pinned on 2026-10-09; not new qualified driving or causal pose evidence",
+   "inputs": [
+    {
+     "path": "logs/fsd_benchmark/manifest_1791265187.json",
+     "role": "manifest",
+     "run_id": "1791265187",
+     "sha256": "5ff93e477f7e9b023d641d281e36dad1157b20c67b604b7da6e2d9caba520d4e"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791265187.json",
+     "role": "scorecard",
+     "run_id": "1791265187",
+     "sha256": "0925d130d0fb93c50405f3f93e823f39048f13a1545586aa9c7055128fae80a4"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791265603.json",
+     "role": "manifest",
+     "run_id": "1791265603",
+     "sha256": "3bb148fa584bf29b4c8c6fa230bc4e02ceacd88833b17d616e09b88137ebb1ab"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791265603.json",
+     "role": "scorecard",
+     "run_id": "1791265603",
+     "sha256": "ed00163bcb856de63a46a9487f54a9d55b2afa5b057c2c29c3718d0e10ced742"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791265809.json",
+     "role": "manifest",
+     "run_id": "1791265809",
+     "sha256": "2364c855f4dae348d9194f3ad6803135c20994f71456bef040a879944a2d2e02"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791265809.json",
+     "role": "scorecard",
+     "run_id": "1791265809",
+     "sha256": "92004b34109b05fe8caf961ea4a99b9c12a4c661b16a7c456d141af98be9da07"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791266012.json",
+     "role": "manifest",
+     "run_id": "1791266012",
+     "sha256": "bbc563cb9bc7fe4da73e7a120deae3e91714b083c59cd82dc06473700d6a4480"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791266012.json",
+     "role": "scorecard",
+     "run_id": "1791266012",
+     "sha256": "4d4539f23a3a60f8f2a49bde695a811cf29cd509d3eeda2374d6b7c63c0ed190"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791266211.json",
+     "role": "manifest",
+     "run_id": "1791266211",
+     "sha256": "e9ec8e5879f76e5825929ce8c4d903d34b3ea52404d87107a536a439b9c6e474"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791266211.json",
+     "role": "scorecard",
+     "run_id": "1791266211",
+     "sha256": "df6bb3937ec71ec982c914a5212a368007412956581eb955fe7ec48f4796d915"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791266411.json",
+     "role": "manifest",
+     "run_id": "1791266411",
+     "sha256": "9309ed7af7ef693b764a6e10c3ccfc315600a33bf71d8ba704e74cc1b89d604f"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791266411.json",
+     "role": "scorecard",
+     "run_id": "1791266411",
+     "sha256": "10922d961ff0b52cc9ab3284cdf53a8433b2d7762c5af5157356fa6a478dd021"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791266609.json",
+     "role": "manifest",
+     "run_id": "1791266609",
+     "sha256": "c85b557df22e20b27dd361d500b07fe2a003aca5e9236cfb15ed9ebe107a80d8"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791266609.json",
+     "role": "scorecard",
+     "run_id": "1791266609",
+     "sha256": "c1429f6a4b09be92f4fdf670f7bc59906c83cd95647f416ca68a6862e0d93077"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791266809.json",
+     "role": "manifest",
+     "run_id": "1791266809",
+     "sha256": "48a466a0ad6a085f41010306a64b8b8b38342f5be5dff88ff86c6ce85e7a0c86"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791266809.json",
+     "role": "scorecard",
+     "run_id": "1791266809",
+     "sha256": "ddad764d0eca584047a31b79d29d8d54292b31b3aaafe032a9968a3d2bc0b804"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791267013.json",
+     "role": "manifest",
+     "run_id": "1791267013",
+     "sha256": "4c5333d002bfc26a3ef758232abfc0214fbea95c581a672a872e7bc8e066a0ff"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791267013.json",
+     "role": "scorecard",
+     "run_id": "1791267013",
+     "sha256": "046c85159a5deb6363164aba21e00faa6288bfe8f5da43aa1a7da7c27e83b986"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791267605.json",
+     "role": "manifest",
+     "run_id": "1791267605",
+     "sha256": "79eaa037106e45494a2209c2db5fcbd5526cbe6c00ea0ae89871fcec535c7866"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791267605.json",
+     "role": "scorecard",
+     "run_id": "1791267605",
+     "sha256": "26e64b89dc75cd06e0f7d2a86948d0cd35dec8697d11f2b13a8d2675c9038d71"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791267810.json",
+     "role": "manifest",
+     "run_id": "1791267810",
+     "sha256": "0061166a1c13f5b17295ec8c5978fa12c51c7c57d56c412b3dd47b75e9a2e4d9"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791267810.json",
+     "role": "scorecard",
+     "run_id": "1791267810",
+     "sha256": "437f79188bb0305d0b109dc66f541ab91aa5927af00c84c8bbfb4c3db2c0d2ae"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791268012.json",
+     "role": "manifest",
+     "run_id": "1791268012",
+     "sha256": "24673f3e0b4b7aeddbeef1a9841b85ee2932a031c1586818039348d60c1d35b3"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791268012.json",
+     "role": "scorecard",
+     "run_id": "1791268012",
+     "sha256": "7ce41c5ecac969905cdf02fbdb268980870d46b1347ee8da6cdaba042b552f24"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791268211.json",
+     "role": "manifest",
+     "run_id": "1791268211",
+     "sha256": "8a8128bb3a6e8a23f08cf2e7cfddd448333f7bd5729b8027819de8d60f181926"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791268211.json",
+     "role": "scorecard",
+     "run_id": "1791268211",
+     "sha256": "ae19c82ab0a260d5b6b74648f39920847a5c693fc7ac195a6b3aa42e2f180005"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791268412.json",
+     "role": "manifest",
+     "run_id": "1791268412",
+     "sha256": "c566b90ea3ceafafba80815826ffc6c51d5ccb6c5925958fb9202d6fd17e8a4b"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791268412.json",
+     "role": "scorecard",
+     "run_id": "1791268412",
+     "sha256": "6c39c331235db48b7051bbfc5f088593a3e8cc17a06c189a3ec692973bc58554"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791268614.json",
+     "role": "manifest",
+     "run_id": "1791268614",
+     "sha256": "b90926eddfc3fc85ff4bb9806abc5639df4d3a8241de92ba99ef9fcea4794fca"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791268614.json",
+     "role": "scorecard",
+     "run_id": "1791268614",
+     "sha256": "6861aec0a2dbf0157d801e855fe33f18aed58a2ed8f780bcc314c73b01ee284d"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791268813.json",
+     "role": "manifest",
+     "run_id": "1791268813",
+     "sha256": "f2a1b2e29d226b3c3f787f4c19422ef13eeeadbfbf5e54fa7b09b34169181fb4"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791268813.json",
+     "role": "scorecard",
+     "run_id": "1791268813",
+     "sha256": "1086359569c9ac5acf433f295d6b1d542580c09db792b163066a6a4badcfca39"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791269014.json",
+     "role": "manifest",
+     "run_id": "1791269014",
+     "sha256": "97c69cbc8d3f2d6be14cdcb25b923b48a06921e853b307f078b7eed012b01ee4"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791269014.json",
+     "role": "scorecard",
+     "run_id": "1791269014",
+     "sha256": "b6467b31b9961252fce822f211453fbad6661a4ebe5d47492b47c9cf7305a796"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791272266.json",
+     "role": "manifest",
+     "run_id": "1791272266",
+     "sha256": "49cc947fb7743b12730742f349ca34e59558618b49f666d04c3f949092555b81"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791272266.json",
+     "role": "scorecard",
+     "run_id": "1791272266",
+     "sha256": "2ba850310600acde49e0d62a662a7fbeafc38525704e9637d25f4cfc7a7369a3"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791272479.json",
+     "role": "manifest",
+     "run_id": "1791272479",
+     "sha256": "e0805a43d0129468a6ef3d10cd26e5f9d61dff84861f1d8dd1acd21a27bddeb0"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791272479.json",
+     "role": "scorecard",
+     "run_id": "1791272479",
+     "sha256": "350d2732004d7b8a78d0d82ad8694b6e93b8cd878bf651a66328bc6589c4c1fb"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791273305.json",
+     "role": "manifest",
+     "run_id": "1791273305",
+     "sha256": "f708235620b5987efdc0b7456144483f0dc221217b6a2e4007e16878e6ad068a"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791273305.json",
+     "role": "scorecard",
+     "run_id": "1791273305",
+     "sha256": "5d09d50285d78deec55525c780424d5d55862ad8c74c174d1b45a6a3f0f8ba38"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791273507.json",
+     "role": "manifest",
+     "run_id": "1791273507",
+     "sha256": "5977f81ace4c3b5fe0910b180b1176999bc4890b4112a0d6f78e2f7e319da8ac"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791273507.json",
+     "role": "scorecard",
+     "run_id": "1791273507",
+     "sha256": "04fa05aa4c2a6eb95f008638ea5f60835fed14ff8b869694b77955646ec72ba5"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791273712.json",
+     "role": "manifest",
+     "run_id": "1791273712",
+     "sha256": "0ea867f5f88d451214058eb6144ed7d52329615eb8167bba60d096c6a978b9bc"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791273712.json",
+     "role": "scorecard",
+     "run_id": "1791273712",
+     "sha256": "637bf0d222ffeb0d506d6a8f6029e889556b22d805739359db465879f9e7e1f0"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791273929.json",
+     "role": "manifest",
+     "run_id": "1791273929",
+     "sha256": "498c60f5bc47f6cf9c89d12d354a039607a9e6a507b41d5e5a3f0a53a0008c49"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791273929.json",
+     "role": "scorecard",
+     "run_id": "1791273929",
+     "sha256": "255fe7cabf613b16f8b2c57e8993689eb323929ac2db83436628f07c589339ba"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791274145.json",
+     "role": "manifest",
+     "run_id": "1791274145",
+     "sha256": "8e3400abf8c332d8c519c06d3d1e69f3e8786e2273dcbe64853cc1fafb81731d"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791274145.json",
+     "role": "scorecard",
+     "run_id": "1791274145",
+     "sha256": "328b413c4bbaaf12c73f1e97d0eb5f8172b5fa2ee5a2df25c5505386c24d5f66"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791274365.json",
+     "role": "manifest",
+     "run_id": "1791274365",
+     "sha256": "409f355d73a53f49004c0170785616d57dc81746896c70f0085d7b3b54aa78cf"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791274365.json",
+     "role": "scorecard",
+     "run_id": "1791274365",
+     "sha256": "6ed08e7639c0e1737e1430a9858e5c081c93b56e2497ed6199d5894d3aa884b1"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791274585.json",
+     "role": "manifest",
+     "run_id": "1791274585",
+     "sha256": "ace1b83dd85af4c09a4b135f86c81420ace0b17d6172b1d825699de7b6223b42"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791274585.json",
+     "role": "scorecard",
+     "run_id": "1791274585",
+     "sha256": "4716137257f61ac2e02a1d39c4f99d7f1d063a9a749dd4b5cafa35f0727c1392"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791274789.json",
+     "role": "manifest",
+     "run_id": "1791274789",
+     "sha256": "065e572f4a1991dae9e5de4c7dad8142fc771dca6452f8e69ab2ec951bc8c007"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791274789.json",
+     "role": "scorecard",
+     "run_id": "1791274789",
+     "sha256": "a0bb89d3aec2c82f298c44826d09a8af677a4c2c28824a191b3902f2de8aec98"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791277012.json",
+     "role": "manifest",
+     "run_id": "1791277012",
+     "sha256": "c7b52c19a33d27ef833c38f63bc185a67af58b05346c67e69e3481733d090f23"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791277012.json",
+     "role": "scorecard",
+     "run_id": "1791277012",
+     "sha256": "184342df6375bb53b2da21975c3a3742e9e0067c947169eac1cd0a0059ea37c8"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791277231.json",
+     "role": "manifest",
+     "run_id": "1791277231",
+     "sha256": "e489ca50811f6f103bc2097a1af7296071ae34d7a9e6db48d4f3c10e294ed1f1"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791277231.json",
+     "role": "scorecard",
+     "run_id": "1791277231",
+     "sha256": "fa755b1deb70363bdcfa9fb1ac8d6a92c58bf928697ceceeed469499c8612ac3"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791277438.json",
+     "role": "manifest",
+     "run_id": "1791277438",
+     "sha256": "0b18ff52d54bc1900e2d46016229f990096f4eb99ffa93b5d96a2e09da3a0bb4"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791277438.json",
+     "role": "scorecard",
+     "run_id": "1791277438",
+     "sha256": "a71bc849cdcbfa69d4eb236042ed7d722b1702b0d3cb671f63c03bb77f4f8252"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791277644.json",
+     "role": "manifest",
+     "run_id": "1791277644",
+     "sha256": "6011e5c12f26e6af8a88e3bc0d118b2f0fcd92fe109708031722e4e872bf45c2"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791277644.json",
+     "role": "scorecard",
+     "run_id": "1791277644",
+     "sha256": "dab8fab6cfc141e66e41ee6275aabf8b6c6c75eacd6ba86e0d2bb67096298fbd"
+    },
+    {
+     "path": "logs/fsd_benchmark/manifest_1791277850.json",
+     "role": "manifest",
+     "run_id": "1791277850",
+     "sha256": "e548ca377412deb1e3e717827037ff5727953c4ebe899b439f061f632dd73a70"
+    },
+    {
+     "path": "logs/fsd_benchmark/scorecard_1791277850.json",
+     "role": "scorecard",
+     "run_id": "1791277850",
+     "sha256": "1a5fbaae6e1e971ee824eda4b8c40113d7094bb47b325773cbfa7d31039490cf"
+    }
+   ]
+  }
+ }
+}

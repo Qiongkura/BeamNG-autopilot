@@ -26,6 +26,7 @@ Design notes
 from __future__ import annotations
 
 import re
+import os
 import shutil
 import sys
 from pathlib import Path
@@ -41,6 +42,7 @@ HTML_OUT = BUILD / "paper.html"
 TEX_OUT = HERE / "main.tex"
 FIG_PREFIX = ""
 IMG_DIR = "figures"
+TEX_IMG_DIR = "figures"
 WIDE_ALL = False
 FIG_WORD = "Fig."
 
@@ -112,6 +114,11 @@ def split_front(txt: str) -> tuple[dict, str]:
 def collect(md: str):
     """Number the figures by appearance and resolve citations by first use."""
     figs = re.findall(r"!\[(.*?)\]\((.*?)\)\{#(fig:[^}]+)\}", md)
+    seen = set()
+    for _caption, _file, key in figs:
+        if key in seen:
+            raise ValueError(f"duplicate figure identifier: {key}")
+        seen.add(key)
     fig_no = {key: i + 1 for i, (_c, _f, key) in enumerate(figs)}
     order = [k for k in re.findall(r"\[@([A-Za-z0-9_]+)\]", md)]
     cites = []
@@ -193,7 +200,7 @@ def emit_tex(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
             width = r"\textwidth" if wide else r"\columnwidth"
             body.append(
                 f"\\begin{{{env}}}[!t]\n\\centering\n"
-                f"\\includegraphics[width={width}]{{{IMG_DIR}/{img}}}\n"
+                f"\\includegraphics[width={width}]{{{TEX_IMG_DIR}/{img}}}\n"
                 f"\\caption{{{md_inline_to_tex(cap, fig_no)}}}\n"
                 f"\\label{{{key}}}\n\\end{{{env}}}")
             continue
@@ -302,11 +309,11 @@ figure img { width: 100%; }
 figcaption { font-size: 8.2pt; text-align: justify; margin-top: 3pt; }
 div.wide { column-span: all; }
 div.wide table { font-size: 8.6pt; }
-table { width: 100%; border-collapse: collapse; font-size: 8.2pt; margin: 6pt 0 10pt; }
+table { width: 100%; border-collapse: collapse; font-size: 8.2pt; margin: 6pt 0 10pt;
+        break-inside: avoid; page-break-inside: avoid; }
 p.tcap { font-size: 8.6pt; margin: 8pt 0 2pt; break-after: avoid; }
 th, td { border-top: .5pt solid #444; border-bottom: .5pt solid #444; padding: 2pt 3pt;
-         text-align: left; vertical-align: top; }
-body.zh td, body.zh th { overflow-wrap: anywhere; }
+         text-align: left; vertical-align: top; overflow-wrap: anywhere; }
 th { border-bottom: .8pt solid #222; }
 ol.refs { font-size: 8.4pt; padding-left: 14pt; }
 ol.refs li { margin-bottom: 2pt; }
@@ -383,7 +390,7 @@ def emit_html(md: str, meta: dict, bib: dict, fig_no: dict, cites: list) -> str:
 
 
 def main() -> int:
-    global CITE_NO, LANG, MD, BIB, HTML_OUT, TEX_OUT, FIG_PREFIX, FIG_WORD, IMG_DIR, FIGS_SRC, WIDE_ALL
+    global CITE_NO, LANG, MD, BIB, HTML_OUT, TEX_OUT, FIG_PREFIX, FIG_WORD, IMG_DIR, TEX_IMG_DIR, FIGS_SRC, WIDE_ALL
     import argparse
     ap = argparse.ArgumentParser(description="build paper.md -> LaTeX + HTML")
     ap.add_argument("--md", default=str(MD), help="markdown master (default: paper.md)")
@@ -405,6 +412,9 @@ def main() -> int:
     FIGS_SRC = [Path(p) for p in a.figs_src]
     FIG_PREFIX = a.fig_prefix
     IMG_DIR = a.img_dir
+    # HTML and LaTeX may be written to different directories.  Resolve the
+    # TeX image path against its own file, rather than the HTML location.
+    TEX_IMG_DIR = os.path.relpath(Path(a.figs).resolve(), TEX_OUT.parent.resolve()).replace("\\", "/")
     WIDE_ALL = bool(a.wide_all)
     FIG_WORD = "图" if LANG == "zh" else "Fig."
     bib = parse_bib(BIB)
