@@ -29,3 +29,9 @@ probe_route.json
 data/*
 !data/track_smallgrid.npz
 .playwright-cli/
+
+# 历史重写救援备份与本地工具状态（只留在本机，不入库）
+.git.bak-*/
+rescue-*/
+.workbuddy-ai/
+/Item
