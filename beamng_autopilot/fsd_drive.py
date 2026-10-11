@@ -2497,6 +2497,48 @@ class FSDriveSession:
             if _placement_rc:
                 _run_record["exit_code"] = _placement_rc
                 return _placement_rc
+            # 曝光前预热（复核方案阶段一第 3 项）：用放置阶段最后一帧**真实**
+            # 感知输出跑一次已启用的神经运行时，再清理其时序状态（e2e 历史）。
+            # 预热不发任何驾驶油门；失败/跳过原样记录，不降低曝光资格，
+            # 也不用预热结果伪装首帧性能。
+            _warm: dict = {}
+            if _pw_out is None:
+                _warm["skipped"] = "no_prewarm_output"
+            else:
+                _ap = _run_record.get("actual_pose") or {}
+                try:
+                    _apos = np.asarray(_ap.get("pos") or [0.0, 0.0, 0.0],
+                                       dtype=float)
+                    _ahdg = float(_ap.get("heading_rad") or 0.0)
+                except (TypeError, ValueError):
+                    _apos = np.zeros(3)
+                    _ahdg = 0.0
+                if e2e_rt is not None:
+                    try:
+                        _t0 = time.perf_counter()
+                        e2e_rt.step(_pw_out, _apos, _ahdg, 0.0)
+                        _warm["e2e"] = {
+                            "ms": round((time.perf_counter() - _t0) * 1000.0, 1)}
+                    except Exception as _we:
+                        _warm["e2e"] = {"error": f"{type(_we).__name__}: {_we}"}
+                    finally:
+                        try:
+                            e2e_rt.reset()
+                        except Exception:
+                            pass
+                if bc_rt is not None:
+                    _bw_frame = getattr(_pw_out, "frame", None)
+                    if _bw_frame is None:
+                        _warm["bc"] = {"skipped": "no_frame"}
+                    else:
+                        try:
+                            _t0 = time.perf_counter()
+                            bc_rt.predict_steer(_bw_frame)
+                            _warm["bc"] = {"ms": round(
+                                (time.perf_counter() - _t0) * 1000.0, 1)}
+                        except Exception as _wb:
+                            _warm["bc"] = {"error": f"{type(_wb).__name__}: {_wb}"}
+            _run_record["warmup"] = _warm
             if not _percep_ok:
                 print("[fsd-drive] painted line not perceived; keeping the "
                       "ground-safe route snap")
@@ -4551,6 +4593,11 @@ class FSDriveSession:
                 _sent = _commands.send(
                     throttle=thr, brake=brk, steering=steer,
                     gear=gear_use, parkingbrake=pb)
+                # 完整计时（复核方案阶段一第 3 项）：感知返回→发送完成的后链
+                # 时长；tick_wall_ms 的终点在 stack.tick 后，不含这段。
+                # 发布年龄 + 本时长的和即 stale_at_send_s 的下界，不重复计。
+                out.meta["send_chain_ms"] = round(
+                    (time.monotonic() - _out_mono) * 1000.0, 1)
                 thr, brk = _sent["throttle"], _sent["brake"]
                 steer, pb = _sent["steering"], _sent["parkingbrake"]
                 final_stop = bool(final_stop or _commands.braked)
@@ -5287,6 +5334,8 @@ class FSDriveSession:
                     # 感知返回后的单调时长），以及过期时按既有硬停收尾的原因。
                     "stale_at_send_s": out.meta.get("stale_at_send_s"),
                     "send_stale_stop_reason": out.meta.get("send_stale_stop_reason"),
+                    # 感知返回→发送完成的后链时长（tick_wall_ms 不覆盖的一段）
+                    "send_chain_ms": out.meta.get("send_chain_ms"),
                     "plc_desired": (round(float(_plc_desired), 3)
                                     if _plc_desired is not None else None),
                     "end_ref": _end_ref,

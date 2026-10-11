@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import math
 import sys
+import time as _time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -28,6 +29,10 @@ class Clock:
 
     def monotonic(self):
         return self.value
+
+    def perf_counter(self):
+        # 预热计时的真实时钟（时长语义，与可控制的挂钟分离）
+        return _time.perf_counter()
 
     def sleep(self, duration):
         self.value += max(0.0, duration)
@@ -142,7 +147,7 @@ def drive(monkeypatch, tmp_path, *, caps=(3.3,), delays=None,
           route_end=100.0, heading=0.0, ref_authority=None, lateral=0.0,
           max_wall_s=None, expected_rc=0, expected_frames=None, probe_geometry=False,
           attach=True, replay_capture=False, provide_scene=True,
-          downstream_stall_s=None):
+          downstream_stall_s=None, e2e_rt=None, pw_out=None):
     clock = Clock()
     delays = list(delays or [0.5] * len(caps))
     state = SimpleNamespace(pos=np.array([0.0, lateral, 0.0]), heading=heading,
@@ -199,9 +204,10 @@ def drive(monkeypatch, tmp_path, *, caps=(3.3,), delays=None,
     monkeypatch.setattr(fd.FSDriveSession, "_build_route",
                         lambda self, conn: (route, route, None, None))
     monkeypatch.setattr(fd.FSDriveSession, "_setup_runtime",
-                        lambda self, conn, args: (None, stack, None, None, policy))
+                        lambda self, conn, args: (None, stack, e2e_rt, None,
+                                                  policy))
     monkeypatch.setattr(fd.FSDriveSession, "_prewarm_and_place",
-                        lambda *args, **kwargs: (None, True, 0))
+                        lambda *args, **kwargs: (pw_out, True, 0))
     if painted:
         marking = SimpleNamespace(world=np.column_stack([
             np.linspace(-5.0, 20.0, 26), np.full(26, 0.5)]))
@@ -544,6 +550,7 @@ def test_stale_perception_at_send_cannot_send_throttle(monkeypatch, tmp_path):
     assert frame["stale_at_send_s"] >= 2.0
     assert frame["throttle"] == pytest.approx(0.0)
     assert frame["brake"] == pytest.approx(1.0)
+    assert frame["send_chain_ms"] >= 2000.0
     assert conn.commands
     for _, c in conn.commands:
         assert c["throttle"] == pytest.approx(0.0)
@@ -554,6 +561,8 @@ def test_fresh_tick_records_no_send_hold(monkeypatch, tmp_path):
     frames, conn = drive(monkeypatch, tmp_path, caps=(6.0,), delays=[0.5])
     assert frames[0].get("send_stale_stop_reason") is None
     assert frames[0].get("stale_at_send_s") is None
+    # 完整计时：感知返回→发送完成的后链时长随帧记录（无停滞时为时钟零点）
+    assert frames[0]["send_chain_ms"] >= 0.0
 
 
 def test_snapshot_age_at_send_is_a_monotonic_lower_bound(monkeypatch):
@@ -587,3 +596,43 @@ def test_snapshot_age_at_send_is_a_monotonic_lower_bound(monkeypatch):
     dead = SimpleNamespace(snapshot=None, meta={}, frame=None,
                            head_outputs=None, lane_envelope=None)
     assert fd._snapshot_age_at_send(dead, 100.0) == float("inf")
+
+
+def test_warmup_runs_once_before_exposure_and_resets_state(
+        monkeypatch, tmp_path):
+    """复核方案阶段一第 3 项：曝光前用放置帧预热已启用运行时并清理状态。
+
+    预热不发驾驶油门；e2e 历史在预热后 reset（reset 恰一次）；耗时/失败
+    原样记入会话审计，不用预热结果伪装首帧性能。
+    """
+    resets: list = []
+    e2e_spy = SimpleNamespace(
+        weights="spy.pt",
+        step=lambda *a, **k: (None, None, 0.0),
+        reset=lambda: resets.append(1),
+        last_reject="", last_validation=None)
+    pw = FSDTick()
+    pw.snapshot = PerceptionSnapshot(
+        captured_at=1.0, tick_id=0, pos=np.zeros(3), heading=0.0,
+        bev=np.zeros((4, 4), dtype=np.float32),
+        head_age_s={"semantic": 0.0}, bev_age_s=0.0)
+    pw.frame = np.zeros((4, 4, 3), dtype=np.uint8)
+    frames, conn = drive(monkeypatch, tmp_path, caps=(6.0,), delays=[0.5],
+                         e2e_rt=e2e_spy, pw_out=pw)
+    audit = json.loads(
+        Path(str(tmp_path / "drive.json") + ".session.json")
+        .read_text(encoding="utf-8"))
+    assert resets == [1]
+    assert audit["warmup"]["e2e"]["ms"] >= 0
+    assert "error" not in audit["warmup"]["e2e"]
+    # bc 运行时未启用 → 原样缺席，不伪装预热
+    assert audit["warmup"].get("bc") is None
+
+
+def test_warmup_skipped_is_recorded_not_faked(monkeypatch, tmp_path):
+    """无放置帧输出（fixture 既有路径）时预热记为 skipped，不编造数字。"""
+    frames, conn = drive(monkeypatch, tmp_path, caps=(6.0,), delays=[0.5])
+    audit = json.loads(
+        Path(str(tmp_path / "drive.json") + ".session.json")
+        .read_text(encoding="utf-8"))
+    assert audit["warmup"] == {"skipped": "no_prewarm_output"}
