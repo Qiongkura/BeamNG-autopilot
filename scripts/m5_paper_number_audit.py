@@ -169,6 +169,40 @@ def main() -> int:
                     .read_text(encoding="utf-8"))
     expect("E5 AB 04_O 保持 invalid", int(bool(r4.get("qualified"))), 0)
 
+    # 停车归因与负例剂量扫描（2026-10-11）：论文 V-C/V-E 新增数字回查
+    g = json.loads((E / "stall_geometry_check_20261011_v2.json")
+                   .read_text(encoding="utf-8"))
+    rows = g["frames"]
+    classes = collections.Counter(r["class"] for r in rows)
+    expect("归因 C 感知丢失帧", classes["C_perception_missing"], 23)
+    expect("归因 A2 候选全拒帧", classes["A2_candidates_all_rejected"], 20)
+    expect("归因 B2 安全拒绝帧", classes["B2_rejected_blocked_ahead"], 28)
+    expect("归因 D1 接受慢速帧", classes["D1_accepted_slow"], 19)
+    expect("归因 D2 接受运动帧", classes["D2_accepted_moving"], 1)
+    expect("归因 B1 走廊空闲被拒", classes.get("B1_rejected_corridor_free", 0), 0)
+    expect("归因 lane_cross 累计",
+           sum((r.get("planner_rejects") or {}).get("lane_cross", 0)
+               for r in rows), 191)
+    expect("归因 body_cross 累计",
+           sum((r.get("planner_rejects") or {}).get("body_cross", 0)
+               for r in rows), 191 - 191 + 103)
+    corr = [r["corridor_ahead_m"] for r in rows
+            if r["class"].startswith("B") and r["corridor_ahead_m"] is not None]
+    expect("归因 被拒帧走廊侵入数", len(corr), 28)
+    expect("归因 走廊最近侵入", round(min(corr), 1), 1.0, 5e-2)
+    # 稿件用常规 half-up 一位小数（5.55 → 5.6）；Python round 是银行家舍入。
+    expect("归因 走廊最远侵入",
+           math.floor(max(corr) * 10 + 0.5) / 10, 5.6, 5e-2)
+
+    ds = json.loads((E / "t16_dose_sweep_20261011" / "dose_sweep_summary.json")
+                    .read_text(encoding="utf-8"))
+    expect("剂量 d100 mean", round(ds["arms"]["d100"]["mean_iou"], 4), 0.4565)
+    expect("剂量 d100 std", round(ds["arms"]["d100"]["std_iou"], 4), 0.0486)
+    expect("剂量 d20 mean", round(ds["arms"]["d20"]["mean_iou"], 4), 0.3694)
+    pd = ds["arms"]["d100"]["paired_diff_vs_d20"]
+    expect("剂量 d100−d20 mean", round(pd["mean"], 4), 0.0871)
+    expect("剂量 d100−d20 正向种子数", pd["positive_count"], 5)
+
     print(f"=== 数字审计：检查 {checked} 项 ===")
     for b in bad:
         print("  ✗", b)
