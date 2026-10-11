@@ -1,0 +1,30 @@
+{
+  "schema": "t17-async-diagnostic-prereg-v1",
+  "source_sha256": "9b10da96f91b5613e0e840f328bdf5c4392a2f9fdcf8b8df6fb6ccb054d89582",
+  "reference_run": "logs/experiments/t17_geometry_20261009/pose_00",
+  "output": "logs/experiments/t17_geometry_async_20261009",
+  "map": "italy",
+  "anchor": [779.7, 735.6, -13.0],
+  "goal": [868.3, 744.9],
+  "lateral": [0.0],
+  "yaw": [0.0],
+  "lane_mode": "sensor",
+  "strict": true,
+  "seconds": 25.0,
+  "max_wall_s": 150.0,
+  "speed": 6.0,
+  "port": 64721,
+  "seg_model": "logs/m5_seg/seg_model_hand/best_task.pt",
+  "seg_model_sha256": "19f54e5363e86323834a9f885fe930a0e7996029d4b7cef8633e3edf1ef3a36e",
+  "pose_contract": "production_alignment",
+  "probe_geometry": true,
+  "environment_factor": {"BEAMNG_ASYNC_HEADS": "1"},
+  "activation_evidence": "range_sched async states + range_worker/head_worker; session config hash covers arguments, this file separately pins the environment factor",
+  "interpretation": "existing global async switch affects range and eligible non-semantic heads; strict semantic stays sync. Not an isolated range-only factor. Production alignment permits different actual initial poses. One run per condition cannot establish a paired causal speedup or safety qualification.",
+  "acceptance": [
+    "same full source and model hashes before/after; no concurrent training or regression",
+    "report actual pose, exposure qualification, source ages/worker health, command gaps and deadlines",
+    "separate physical/final-path witnesses from production predicate replay",
+    "do not enable the default or promote a model based on this diagnostic"
+  ]
+}

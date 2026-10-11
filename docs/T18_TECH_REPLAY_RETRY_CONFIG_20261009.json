@@ -1,0 +1,15 @@
+{
+  "schema": "t18-repeat-prereg-v1",
+  "parent_config": "docs/T18_TECH_REPLAY_CONFIG_20261009.json",
+  "failed_attempt": "logs/experiments/t18_geometry_replay_20261009/pose_00",
+  "failed_attempt_reason": "first telemetry t=7.146s; last=25.354s; span=18.208s below frozen 24s minimum, despite 26.359s drive duration",
+  "preservation": "failed attempt, capture, telemetry and qualification retained; excluded from equal-exposure live comparison, not discarded",
+  "source_sha256": "b62d396c65e12fa394cad79b594eea38bdbac7e34085c8f43c97980fed246308",
+  "same_parameters": "same model, map, anchor, goal, sensor/strict, 25s/150s, 6m/s, production alignment, geometry probe and warmup capture",
+  "output": "logs/experiments/t18_geometry_replay_retry_20261009",
+  "port": 64723,
+  "max_additional_attempts": 1,
+  "code_or_threshold_change": false,
+  "interpretation": "one diagnostic retry for equal-exposure qualification; report both outcomes, no speed or safety selection by successful outcome",
+  "cpu_input_rule": "the first attempt's independently hash-validated warmup capture remains the predetermined CPU input; it does not need a qualified driving outcome to be a same-input algorithm witness"
+}

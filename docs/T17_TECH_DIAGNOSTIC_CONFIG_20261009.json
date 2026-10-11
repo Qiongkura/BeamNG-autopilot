@@ -1,0 +1,31 @@
+{
+  "schema": "t17-diagnostic-prereg-v1",
+  "source_sha256": "9b10da96f91b5613e0e840f328bdf5c4392a2f9fdcf8b8df6fb6ccb054d89582",
+  "reference_run": "logs/experiments/e5r_geometry_20261009/pose_00",
+  "output": "logs/experiments/t17_geometry_20261009",
+  "map": "italy",
+  "anchor": [779.7, 735.6, -13.0],
+  "goal": [868.3, 744.9],
+  "lateral": [0.0],
+  "yaw": [0.0],
+  "lane_mode": "sensor",
+  "strict": true,
+  "seconds": 25.0,
+  "max_wall_s": 150.0,
+  "speed": 6.0,
+  "port": 64720,
+  "seg_model": "logs/m5_seg/seg_model_hand/best_task.pt",
+  "seg_model_sha256": "19f54e5363e86323834a9f885fe930a0e7996029d4b7cef8633e3edf1ef3a36e",
+  "model_digest_note": "full SHA256 captured before the gate and checked again by run_probe",
+  "pose_contract": "production_alignment",
+  "probe_geometry": true,
+  "interpretation": "single diagnostic, no causal speedup or safety certificate; short exposure remains rejected; poll-start proxy is not a true sensor capture timestamp",
+  "measurements": [
+    "source identity before/after, pose, control receipt and cleanup",
+    "range lock wait/lidar poll/lua poll/unpack/prepare/fusion/fetch/process timings and source errors",
+    "tick deadlines, semantic prediction/markings times and geometry capture overhead",
+    "physical footprint and final control-path crossing witnesses",
+    "safety-assessed scene/path/inflated dimensions and predicate replay match",
+    "independent road truth and actuator execution remain UNKNOWN"
+  ]
+}

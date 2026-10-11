@@ -20,4 +20,4 @@
 
 - 公开上传本地证据归档到 Zenodo（当前只生成 `logs/paper_release/` 本地 zip）。
 - ORCID、目标期刊、中文版是否投稿、邮箱是否放首页。
-- 更大偏移/第二路段已用固定实际位姿契约阻止漂移后曝光：大偏移 4/4 rc=4、mountain 4/4 rc=3。随后反锚定此前实际 baseline 位姿，获得 1/1 qualified（位置误差 0.0215m、航向 0.076°、26.609s）；这是合格 baseline 重复，不是大偏移因果证据。
+- 更大偏移/第二路段已用固定实际位姿契约阻止漂移后曝光：大偏移 4/4 rc=4、mountain 4/4 rc=3。随后先做 +5m production_alignment 反向标定，再用实测 actual_pose 作为 fixed_actual_pose anchor，获得 1/1 qualified 等曝光偏移观察（位置误差 0.0209m、航向 0.087°、26.203s、6.284m、22 个有路径帧）。它证明契约可实现和偏移点可测，但不是相对 baseline 的严格因果 A/B。

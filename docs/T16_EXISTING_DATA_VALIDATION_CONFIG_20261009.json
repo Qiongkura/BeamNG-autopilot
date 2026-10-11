@@ -1,0 +1,37 @@
+{
+ "collect": "off",
+ "proposals": "logs/experiments/t16_autonomous_validation_20261009_r2/proposals_auto_truth.json",
+ "pause_while_user_active": false,
+ "min_free_vram_mb": 2048.0,
+ "min_free_disk_gb": 20.0,
+ "daily_gpu_minutes": 0.0,
+ "max_wall_minutes": 45.0,
+ "max_candidates": 2,
+ "max_rounds_without_gain": 2,
+ "rounds": 2,
+ "seeds": [42, 43],
+ "epochs": 3,
+ "total_steps": 60,
+ "init": "logs/experiments/t14_e1_promotable_20260927/baseline/seed42/checkpoint_last.pt",
+ "batch": 4,
+ "lr": 0.001,
+ "equal_steps": true,
+ "dry_run": true,
+ "runs": [
+  "logs/experiments/annotate_pkg_e2_it3_20260927/front_fisheye",
+  "logs/experiments/annotate_pkg_e1_jv_20260927/front_fisheye",
+  "logs/experiments/annotate_pkg_e1_jv_20260927/front_main",
+  "logs/experiments/annotate_pkg_e1_jv_20260927/pillar_left",
+  "logs/experiments/annotate_pkg_e1_jv_20260927/pillar_right"
+ ],
+ "eval_runs": [
+  "logs/experiments/review_pack_20260926/reviewed_full/pkg_collect_t14_collect_dirt_20260926_20260926_123625/front_main",
+  "logs/experiments/review_pack_20260926/reviewed_full/pkg_collect_t14_collect_plain2_20260926_20260926_123944/front_main",
+  "logs/experiments/review_pack_20260926/reviewed_full/pkg_diverse_curve_20260924/front_main",
+  "logs/experiments/review_pack_20260926/reviewed_full/pkg_diverse_plain_20260924/front_main",
+  "logs/experiments/review_pack_20260926/reviewed_full/pkg_plain/front_main",
+  "logs/experiments/review_pack_20260926/reviewed_full/pkg_t13_corner/front_main",
+  "logs/experiments/review_pack_20260926/reviewed_full/pkg_t13_junction2/front_main",
+  "logs/experiments/review_pack_20260926/reviewed_full/pkg_town/front_main"
+ ]
+}
