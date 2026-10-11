@@ -313,7 +313,9 @@ table { width: 100%; border-collapse: collapse; font-size: 8.2pt; margin: 6pt 0 
         break-inside: avoid; page-break-inside: avoid; }
 p.tcap { font-size: 8.6pt; margin: 8pt 0 2pt; break-after: avoid; }
 th, td { border-top: .5pt solid #444; border-bottom: .5pt solid #444; padding: 2pt 3pt;
-         text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+         text-align: left; vertical-align: top; overflow-wrap: break-word; }
+/* 代码令牌（文件名/哈希）允许任意断行，普通词保持完整（"Architecture" 不再拆成三截） */
+td code, th code { overflow-wrap: anywhere; }
 th { border-bottom: .8pt solid #222; }
 ol.refs { font-size: 8.4pt; padding-left: 14pt; }
 ol.refs li { margin-bottom: 2pt; }
