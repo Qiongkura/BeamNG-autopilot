@@ -79,12 +79,13 @@ class Stack:
     grid_res = 0.5
 
     def __init__(self, clock, state, delays, *, obstacle=None, painted=False,
-                 ref_authority=None, provide_scene=True):
+                 ref_authority=None, provide_scene=True, meta_extra=None):
         self.clock, self.state = clock, state
         self.delays, self.obstacle = delays, obstacle
         self.painted = painted
         self.ref_authority = ref_authority
         self.provide_scene = provide_scene
+        self.meta_extra = meta_extra
         self.created_scenes: list = []
         self.index = -1
 
@@ -128,6 +129,8 @@ class Stack:
                 "source_t": source_t, "publish_t": self.clock.value,
                 "state": "ran", "result_available": True}},
         }
+        if self.meta_extra:
+            out.meta.update(self.meta_extra)
         if self.ref_authority is not None:
             # Per-tick list is supported: the T04 counterexample needs the
             # authority to DROP between ticks (full -> limited) while the
@@ -147,7 +150,8 @@ def drive(monkeypatch, tmp_path, *, caps=(3.3,), delays=None,
           route_end=100.0, heading=0.0, ref_authority=None, lateral=0.0,
           max_wall_s=None, expected_rc=0, expected_frames=None, probe_geometry=False,
           attach=True, replay_capture=False, provide_scene=True,
-          downstream_stall_s=None, e2e_rt=None, pw_out=None):
+          downstream_stall_s=None, e2e_rt=None, pw_out=None,
+          meta_extra=None, reasons=None):
     clock = Clock()
     delays = list(delays or [0.5] * len(caps))
     state = SimpleNamespace(pos=np.array([0.0, lateral, 0.0]), heading=heading,
@@ -155,7 +159,8 @@ def drive(monkeypatch, tmp_path, *, caps=(3.3,), delays=None,
                             dir=np.array([1.0, 0.0, 0.0]))
     conn = Connection(clock, state)
     stack = Stack(clock, state, delays, obstacle=obstacle, painted=painted,
-                  ref_authority=ref_authority, provide_scene=provide_scene)
+                  ref_authority=ref_authority, provide_scene=provide_scene,
+                  meta_extra=meta_extra)
     disarms = []
     def disarm():
         disarms.append(clock.value)
@@ -175,8 +180,9 @@ def drive(monkeypatch, tmp_path, *, caps=(3.3,), delays=None,
             i = stack.index
             cap = caps[i]
             level = levels[i] if levels else ("degraded" if cap < 6 else "safe")
+            reason = (reasons[i] if reasons else "fixture monitor")
             v = SafetyVerdict(level=level, target_speed=cap,
-                              reason="fixture monitor", closest_obs_m=999.0)
+                              reason=reason, closest_obs_m=999.0)
             v.corridor_open = True
             v.corridor_state = "feasible"
             v.corridor_reason = "fixture geometry"
@@ -636,3 +642,30 @@ def test_warmup_skipped_is_recorded_not_faked(monkeypatch, tmp_path):
         Path(str(tmp_path / "drive.json") + ".session.json")
         .read_text(encoding="utf-8"))
     assert audit["warmup"] == {"skipped": "no_prewarm_output"}
+
+
+@pytest.mark.parametrize("meta_extra,want", [
+    ({"plan_blocked": "no_perception_lane"}, "perception_lane_missing"),
+    ({"plan_rejects": {"lane_cross": 11, "body_cross": 3}},
+     "all_candidates_rejected"),
+    (None, "no_candidates_or_unrecorded"),
+])
+def test_no_path_mechanism_splits_the_conflated_reason(
+        monkeypatch, tmp_path, meta_extra, want):
+    """停车归因（62e78bd）的实证：reason 字符串混合三种机制。
+
+    reason 字段保持原样（冻结计数依赖），新增派生字段 no_path_mechanism
+    按既有 plan_blocked / plan_rejects 拆分；其余 reason 不 annotate。
+    """
+    frames, conn = drive(monkeypatch, tmp_path, caps=(6.0,), delays=[0.5],
+                         reasons=["no drivable path"], meta_extra=meta_extra)
+    assert frames[0]["reason"] == "no drivable path"
+    assert frames[0]["no_path_mechanism"] == want
+
+
+def test_other_reasons_are_not_annotated(monkeypatch, tmp_path):
+    frames, conn = drive(monkeypatch, tmp_path, caps=(6.0,), delays=[0.5],
+                         reasons=["obstacle very close"],
+                         meta_extra={"plan_blocked": "no_perception_lane"})
+    assert frames[0]["reason"] == "obstacle very close"
+    assert frames[0]["no_path_mechanism"] is None

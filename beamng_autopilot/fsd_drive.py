@@ -4815,6 +4815,18 @@ class FSDriveSession:
                 _consumed = consumed_from_head_sched(
                     (out.meta or {}).get("head_sched"), _cmd_t)
                 _sub_digest = substep_digest(SUBSTEP_HZ, None, 0)
+                # "no drivable path" 一个字符串名三种机制（2026-10-11 停车归因）：
+                # 感知车道丢失（strict 拒绝全部候选）、规划器候选全被内部拒绝、
+                # 或无候选。reason 字符串本身冻结（论文 fig23 计数依赖它），
+                # 这个派生字段只增不改地拆开它；其余 reason 不 annotate。
+                _no_path_mech = None
+                if (verd.reason or "") == "no drivable path":
+                    if out.meta.get("plan_blocked") == "no_perception_lane":
+                        _no_path_mech = "perception_lane_missing"
+                    elif out.meta.get("plan_rejects"):
+                        _no_path_mech = "all_candidates_rejected"
+                    else:
+                        _no_path_mech = "no_candidates_or_unrecorded"
                 hist.append({
                     "t": round(time.time() - t0, 3),
                     "pos": [round(float(p), 3) for p in pos[:3]],
@@ -4823,6 +4835,7 @@ class FSDriveSession:
                     "signed": round(float(signed), 3),
                     "level": str(verd.level),
                     "reason": verd.reason or "-",
+                    "no_path_mechanism": _no_path_mech,
                     "path_occ_frac": round(
                         float(getattr(verd, "path_occupied_frac", 0.0)), 4),
                     "corridor_open": bool(
