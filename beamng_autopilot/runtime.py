@@ -18,6 +18,9 @@ class RangeSample:
 
     obstacles: list[Obstacle] = field(default_factory=list)
     ray_hits: list[tuple[float, float]] = field(default_factory=list)
+    # Per-sample diagnostics survive caching/worker adoption; never a shared
+    # provider timing side channel. Empty for providers without measurements.
+    meta: dict = field(default_factory=dict)
 
 
 class CameraProvider:
