@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+# Historical runner has unsafe process cleanup and unqualified output counting.
+# Retained as experiment provenance; use scripts/m5_pose_sweep.ps1 instead.
+echo 'Retired runner: use the audited PowerShell entry scripts/m5_pose_sweep.ps1.' >&2
+exit 2
 # 冻结位姿扫描（E5 用；可复用于任何"多姿态、无人值守、一次一实例"的驾驶测量）：
 # 端口等待 + 端口轮换 + 失败退避 + 残留清理。
 #
