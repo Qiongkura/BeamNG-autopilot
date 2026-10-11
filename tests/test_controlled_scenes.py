@@ -14,6 +14,8 @@ import sys
 import threading
 from pathlib import Path
 
+import pytest
+
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -555,3 +557,35 @@ def test_anchor_offset_skips_used_routes():
     got = all_a[2:2 + 3]
     assert [a["road_id"] for a in got] == [a["road_id"] for a in all_a[2:5]]
     assert all_a[2:2 + 3] and not all_a[7:7 + 3]     # 越界 = 空表（调用方报错）
+
+
+def test_ndc_depth_conversion_endpoints_and_monotonicity():
+    """浮点深度标定帧的反解：0→near、1→far、单调递增（§9 仪表化的度量基础）。"""
+    import importlib.util
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_controlled_scenes", root / "scripts" / "m5_controlled_scenes.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    import numpy as np
+
+    near, far = 0.05, 150.0
+    d = np.linspace(0.0, 1.0, 101)
+    m = mod.ndc_depth_to_meters(d, near=near, far=far)
+    assert m[0] == pytest.approx(near, rel=1e-6)
+    assert m[-1] == pytest.approx(far, rel=1e-6)
+    assert np.all(np.diff(m) > 0)
+    # 中点不在几何中点（NDC 非线性），但必须是有限正数
+    assert 0 < m[50] < far
+    # 超界输入不产生负深度（饱和行为由调用方把关，这里只锁公式）
+    assert mod.ndc_depth_to_meters(np.array([1.0]), near=near, far=far)[0] > 0
+
+
+def test_depth_calibration_shot_is_wired_into_capture():
+    """接线证明：capture_site 请求非共享内存标定帧并落盘 depthcal npz。"""
+    src = (Path(__file__).resolve().parents[1] / "scripts"
+           / "m5_controlled_scenes.py").read_text("utf-8")
+    assert "is_using_shared_memory=False" in src
+    assert "_depthcal.npz" in src
+    assert "ndc_depth_unavailable" in src   # 失败/跳过原样记录，不编造

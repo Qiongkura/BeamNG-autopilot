@@ -788,6 +788,17 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
     return scen, record
 
 
+def ndc_depth_to_meters(depth_ndc, *, near: float, far: float) -> np.ndarray:
+    """OpenGL NDC 浮点深度 -> 沿光轴米。端点：0→near，1→far，单调递增。
+
+    为什么需要它：共享内存深度是 **uint8 米制**（量化 ~1 m，见探针
+    2026-09-27 实测），分辨不出链-贴花的亚米分离（T16_LINEPOOL_COLLECTION
+    结果 §8）；非共享内存路径返回 [0,1] NDC 浮点，按 near/far 反解。
+    """
+    d = np.asarray(depth_ndc, dtype=float)
+    return (2.0 * near * far) / (far + near - (2.0 * d - 1.0) * (far - near))
+
+
 def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
                  height: int, out_dir: Path, tag: str,
                  frame_truth: list | None = None,
@@ -984,13 +995,59 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
                 out_dir / f"{tag}_{i:05d}.npz", rgb=fr["rgb"],
                 annotation=fr["annotation"], depth_raw=np.asarray(fr["depth"]),
                 label=fr["label"], camera_json=json.dumps(fr["camera"]))
+        # 浮点深度标定帧（T16_LINEPOOL_COLLECTION_RESULT §9）：uint8 米制深度
+        # 量化 ~1 m，分辨不出链-贴花的亚米分离；非共享内存路径返回 [0,1] NDC
+        # 浮点。只拍一帧专供诊断；失败/跳过原样记录，不影响主产物。
+        _NEAR, _FAR = 0.05, 150.0
+        try:
+            from beamngpy.sensors import Camera as _CalCam
+            with conn.io_lock:
+                cam_cal = _CalCam(f"{name}_depthcal", conn.bng, conn.vehicle,
+                                  requested_update_time=0.05, pos=CAMERA_POS,
+                                  dir=cam_dir, up=(0.0, 0.0, 1.0),
+                                  resolution=(width, height),
+                                  field_of_view_y=CAMERA_FOV_DEG,
+                                  near_far_planes=(_NEAR, _FAR),
+                                  is_using_shared_memory=False,
+                                  is_render_colours=False,
+                                  is_render_annotations=False,
+                                  is_render_depth=True, is_visualised=False,
+                                  integer_depth=False)
+                try:
+                    conn.bng.control.step(3)
+                    cal_data = cam_cal.poll() or {}
+                finally:
+                    try:
+                        cam_cal.remove()
+                    except Exception:                          # noqa: BLE001
+                        pass
+            _ndc = np.asarray(cal_data.get("depth"), dtype=float)
+            _ndc_max = (float(_ndc.max()) if _ndc.size else float("nan"))
+            if _ndc.size and 0.0 < _ndc_max <= 1.5:
+                depth_cal_m = ndc_depth_to_meters(_ndc, near=_NEAR, far=_FAR)
+                np.savez_compressed(
+                    out_dir / f"{tag}_depthcal.npz",
+                    depth_m=np.ascontiguousarray(depth_cal_m, dtype=np.float32),
+                    near=_NEAR, far=_FAR,
+                    camera_json=json.dumps(frames[-1]["camera"] if frames else {}))
+                depth_cal_stats = {"ndc_max": round(_ndc_max, 4),
+                                   "m_min": round(float(depth_cal_m.min()), 3),
+                                   "m_median": round(float(np.median(depth_cal_m)), 3),
+                                   "m_max": round(float(depth_cal_m.max()), 3)}
+            else:
+                depth_cal_stats = {"skipped": "ndc_depth_unavailable",
+                                   "ndc_max": (None if not _ndc.size
+                                               else round(_ndc_max, 4))}
+        except Exception as _cal_e:                          # noqa: BLE001
+            depth_cal_stats = {"error": f"{type(_cal_e).__name__}: {_cal_e}"}
     finally:
         try:
             with conn.io_lock:
                 cam.remove()
         except Exception:                                    # noqa: BLE001
             pass
-    return frames, palette, {"depth_raw": depth_raw_stats}
+    return frames, palette, {"depth_raw": depth_raw_stats,
+                             "depth_cal": depth_cal_stats}
 
 
 def run_scene(conn, probe, *, name: str, site: dict, rec: dict, truth_points: list,
