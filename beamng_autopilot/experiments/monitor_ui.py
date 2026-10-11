@@ -147,7 +147,8 @@ _TEMPLATE = r"""<!DOCTYPE html>
 const P = __PAYLOAD__;
 const state = {recs: [], bySeq: new Set(), task: null, errors: [], problems: [],
                win: 'all', smooth: {loss: 24, hw: 32}, zoom: {}, device: null,
-               connected: P.mode === 'snapshot', lastSeq: 0, note: ''};
+               connected: P.mode === 'snapshot', lastSeq: 0, note: '',
+               runId: P.run_id, switchNote: '', switchedAt: 0, pipeline: null};
 
 function put(records){
   for (const r of records || []){
@@ -164,15 +165,38 @@ function put(records){
   }
 }
 
+function resetForRun(rid){
+  /* 服务端跟随到了新的一轮：上一轮的点必须整体丢。新轮次的 seq 从 0 重新
+     开始，若继续用旧的 since，页面会永远拉不到新数据（看着像卡死）。 */
+  state.recs = []; state.bySeq = new Set(); state.lastSeq = 0;
+  state.task = null; state.errors = []; state.problems = []; state.zoom = {};
+  state.pipeline = null;
+  state.runId = rid;
+  state.switchNote = `已跟随到新的一轮：${rid}`;
+  state.switchedAt = Date.now();
+}
+
+async function fetchMetrics(since){
+  const res = await fetch(`${P.base}/metrics?since=${since}`, {cache:'no-store'});
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return await res.json();
+}
+
 async function poll(){
   if (P.mode !== 'live') return;
   try{
-    const u = `${P.base}/metrics?since=${state.lastSeq}`;
-    const res = await fetch(u, {cache:'no-store'});
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    const j = await res.json();
+    let j = await fetchMetrics(state.lastSeq);
+    if (j.run_id && j.run_id !== state.runId){
+      const first = !state.runId;
+      resetForRun(j.run_id);                   // 跟随模式等到第一轮也算切换
+      j = await fetchMetrics(0);               // 新轮次：全量重拉
+      if (first) state.switchNote = '';
+    }
     put(j.records); state.problems = j.problems || [];
-    state.connected = true; state.note = '';
+    state.pipeline = j.pipeline || null;
+    state.connected = true;
+    if (state.switchedAt && Date.now() - state.switchedAt > 15000)
+      state.switchNote = '';                   // 提示留 15 秒，不常驻
   }catch(e){
     state.connected = false;
     state.note = '连接断开，正在自动重试：' + e.message;
@@ -419,6 +443,7 @@ function statusbar(){
                  completed:'已完成', failed:'已失败'};
   const rows = [
     ['任务名称', t.name || P.title],
+    ['当前轮次', state.runId || '（等待新训练）'],
     ['运行状态', `<span class="pill ${cls}">${names[cls]||cls}${state.connected?'':'（离线）'}</span>`],
     ['step', `${last.step ?? t.current_step ?? '—'} / ${t.total_steps ?? '—'}`],
     ['epoch', `${last.epoch ?? t.epoch ?? '—'}`],
@@ -427,6 +452,16 @@ function statusbar(){
     ['平均每步耗时', meanStep===null? '—' : meanStep.toFixed(4)+' s/it'],
     ['当前时间', new Date().toLocaleTimeString()],
   ];
+  const p = state.pipeline;
+  if (p){
+    const value = v => v===null || v===undefined ? '未测' : String(v);
+    rows.push(['自动数据状态', value(p.collection_status)],
+              ['通过准入的帧', value(p.qualified_frames)],
+              ['隔离的数据包', value(p.isolated_packages)],
+              ['实际学习步数', `${value(p.steps_done)} / ${value(p.total_steps)}`],
+              ['可用 / 已采样的不同帧', `${value(p.unique_available)} / ${value(p.unique_seen)}`],
+              ['最近候选结论', value(p.decisions?.length ? p.decisions[p.decisions.length-1].decision : null)]);
+  }
   document.getElementById('statusbar').innerHTML = rows.map(
     ([k,v])=>`<span class="item"><span class="k">${k}</span><span class="v">${v}</span></span>`).join('');
 }
@@ -441,6 +476,8 @@ function banners(){
     html.push(`<div class="banner err">记录文件有 ${state.problems.length} 行不可读（半写行/损坏）：${state.problems[0]}</div>`);
   if (!state.connected && P.mode === 'live')
     html.push(`<div class="banner note">${state.note || '正在连接…'}</div>`);
+  if (state.switchNote)
+    html.push(`<div class="banner note">${state.switchNote}（图表已清空重画，不再显示上一轮的点）</div>`);
   const reason = unavailableReason('gpu_power');
   if (reason) html.push(`<div class="banner note">GPU 功耗：该设备未提供功耗数据（${reason}）</div>`);
   if (state.task && state.task.aggregate)
