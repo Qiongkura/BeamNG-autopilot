@@ -51,6 +51,48 @@ def _config(tmp_path: Path, **over) -> Path:
     return p
 
 
+def test_controlled_collection_returns_only_qualified_proposal_and_recovers_phase(tmp_path, monkeypatch):
+    loop = _load()
+    from beamng_autopilot.experiments import autonomous_data as auto
+    from beamng_autopilot.experiments.controller import LoopConfig, ResourceState
+    from beamng_autopilot.experiments.events import EventLog
+
+    monkeypatch.setattr(loop, "exp_dir", lambda rid: tmp_path / rid)
+    monkeypatch.setattr(loop, "probe_machine", lambda: (False, 99999, 99999))
+    monkeypatch.setattr(loop, "python_can_import", lambda *a: True)
+    monkeypatch.setattr(loop, "game_pids", lambda: set())
+    monkeypatch.setattr(loop, "machine_gpu_minutes_today", lambda: 0)
+    monkeypatch.setattr(loop, "probe_resources", lambda **kw: ResourceState(
+        now_hour=12, free_vram_mb=99999, free_disk_gb=99999, gpu_minutes_today=0, user_active=False))
+    monkeypatch.setattr(loop, "machine_lease", lambda: type("Lease", (), {"heartbeat": lambda s: True})())
+    monkeypatch.setattr(loop, "close_started_game", lambda *a, **kw: {"closed": True})
+    monkeypatch.setattr(loop, "mark_gpu_start", lambda *a: None)
+    monkeypatch.setattr(loop, "settle_gpu_minutes", lambda *a: 0)
+    stage_calls = []
+
+    def stage(command, path, **kwargs):
+        stage_calls.append(command)
+        return {"rc": 0}
+
+    monkeypatch.setattr(auto, "run_stage", stage)
+    monkeypatch.setattr(auto, "qualify_export", lambda *a, **kw: {
+        "qualified": True, "admitted": [], "isolated": [], "frames": 2,
+        "runs": [str(tmp_path / "verified" / "front_main")], "line_free_frames": 0})
+    cfg = LoopConfig(collect="tech", collect_source="controlled")
+    log = EventLog(tmp_path / "fixture")
+    log.append(loop._ev("fixture", "training", "idle"))
+    args = type("Args", (), {"run_id": "fixture", "user_active": False})()
+    rep, rc = loop.collect_once(args, cfg, log=log)
+    assert rc == 0 and rep["status"] == "admitted", rep
+    assert len(stage_calls) == 2
+    assert stage_calls[0][1].endswith("m5_controlled_scenes.py")
+    assert stage_calls[1][1].endswith("m5_auto_truth_export.py")
+    proposal = json.loads(Path(rep["proposal_path"]).read_text(encoding="utf-8"))
+    assert proposal["proposals"][0]["factor"]["add_runs"] == rep["runs"]
+    assert not list((tmp_path / "fixture").glob("review_queue*"))
+    assert log.last().status == "auto_truth_admitted"
+
+
 @pytest.fixture()
 def sandbox(tmp_path, monkeypatch):
     """把 exp_dir 指到 tmp，并记录 cmd_rounds 的调用参数。"""
@@ -136,6 +178,25 @@ def test_run_no_dry_run_reuses_the_rounds_flow_and_records_the_budget(
               (loop.exp_dir("e1") / "events.jsonl").read_text(
                   encoding="utf-8").splitlines() if ln.strip()]
     assert "training" in phases and ("paused" in phases or "training" in phases)
+
+
+def test_background_recipe_reaches_actual_training_commands(sandbox, tmp_path):
+    loop, _root, calls = sandbox
+    config = _config(tmp_path, total_steps=120, init="weights/shared.pt")
+    rc = loop.main(["run", "--run-id", "recipe", "--no-dry-run",
+                    "--config", str(config), "--user-inactive"])
+    assert rc == 1 and len(calls) == 1
+    args = calls[0]
+    for seed in args.seeds:
+        for arm in ("baseline", "candidate"):
+            command = loop.train_cmd(args, args.runs,
+                                     tmp_path / arm / f"seed{seed}", seed, [])
+            assert command[command.index("--total-steps") + 1] == "120"
+            assert command[command.index("--init") + 1] == "weights/shared.pt"
+            assert "--max-train-frames" not in command
+    saved = json.loads((loop.exp_dir("recipe") / "loop_config.json").read_text(
+        encoding="utf-8"))
+    assert saved["total_steps"] == 120 and saved["init"] == "weights/shared.pt"
 
 
 def test_the_daily_budget_blocks_the_entry_point_before_training(

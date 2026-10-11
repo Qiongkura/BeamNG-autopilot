@@ -117,9 +117,10 @@ def _log(run_id: str) -> EventLog:
 
 
 def _ev(run_id: str, phase: str, status: str, *, candidate: str = "loop",
-        seed: int = 0, dataset: str = "", note: str = "", **kw) -> Event:
+        seed: int = 0, dataset: str = "", note: str = "",
+        config_hash: str | None = None, **kw) -> Event:
     return Event(run_id=run_id, candidate_id=candidate, dataset_id=dataset,
-                 config_hash=Thresholds().config_hash, seed=seed, phase=phase,
+                 config_hash=config_hash or Thresholds().config_hash, seed=seed, phase=phase,
                  status=status, note=note, **kw)
 
 
@@ -534,6 +535,9 @@ def collect_once(args, cfg, *, log) -> tuple:
     rc 约定：0 通过；6 前置检查不通过（**没启动**游戏）；7 采集进程失败或
     身份审计拒收。三种情况分别写事件，日志里能分清"没跑"和"跑了但不要"。
     """
+    _begin_collection(args.run_id, cfg, log)
+    if cfg.collect_source == "controlled":
+        return collect_auto_truth_once(args, cfg, log=log)
     run_id = args.run_id
     spec = spec_from(cfg, args)
     stamp = time.strftime("%Y%m%d_%H%M%S")
@@ -604,7 +608,8 @@ def collect_once(args, cfg, *, log) -> tuple:
     # 进程留着，一局游戏 4.4 GB 显存 + 持续吃 CPU/GPU 挂了 1.5 小时，把后面
     # 几轮实验的吞吐拖慢一个量级、推理 p95 漂到 7.6 倍。
     game_after = close_started_game(pids_before,
-                                    launched_after=launched_after)
+                                    launched_after=launched_after,
+                                    verify_timeout_s=10.0)
     _ga_closed = game_after.get("closed")
     _ga_killed = game_after.get("killed")
     _ga_note = game_after.get("reason") or game_after.get("note") or ""
@@ -613,6 +618,9 @@ def collect_once(args, cfg, *, log) -> tuple:
     rep = verify_collection(
         out_dir, expected_roles=spec.roles,
         expected_frames=int(spec.frames) * max(1, len(spec.roles)))
+    if game_after.get("closed") is not True:
+        rep["ok"] = False
+        rep["reasons"].append("owned game cleanup unproven; training blocked")
     rep.update({"game_pids_before": (sorted(pids_before)
                                  if pids_before is not None else None),
                 "game_after_collect": game_after,
@@ -751,6 +759,109 @@ def collect_once(args, cfg, *, log) -> tuple:
     return rep, (0 if (rc == 0 and rep["ok"]) else 7)
 
 
+def _begin_audit(run_id, cfg, log, *, purpose, note):
+    previous = log.last()
+    if previous is None:
+        log.append(_ev(run_id, "queued", "start", config_hash=cfg.hash(), note=note))
+    if previous is not None and previous.phase not in (
+            "queued", "auditing", "paused", "needs_review"):
+        log.append(_ev(run_id, "paused", purpose + "_resume_checkpoint",
+                       config_hash=cfg.hash(), note="恢复前保留上一阶段状态"))
+    log.append(_ev(run_id, "auditing", purpose + "_requested",
+                   config_hash=cfg.hash(), note=note))
+
+
+def _begin_collection(run_id, cfg, log):
+    _begin_audit(run_id, cfg, log, purpose="collection",
+                 note=f"source={cfg.collect_source}")
+
+
+def collect_auto_truth_once(args, cfg, *, log) -> tuple:
+    """Generate and certify new training scenes without a human-label exit."""
+    from beamng_autopilot.experiments.autonomous_data import (
+        run_collection, spec_from_config)
+    from beamng_autopilot.experiments.reproducibility import source_snapshot
+
+    run_id = args.run_id
+    source = source_snapshot(ROOT)
+    if not source["complete"]:
+        log.append(_ev(run_id, "paused", "source_snapshot_incomplete",
+                       config_hash=cfg.hash(), note="; ".join(source["errors"])[:200]))
+        return None, 6
+    spec = spec_from_config(cfg)
+    directory = exp_dir(run_id) / "auto_truth"
+    py, py_source = collector_python(ROOT, configured=cfg.python)
+    running, free_vram, free_disk = probe_machine()
+    pf = preflight(spec=spec_from(cfg, args), game_running=running,
+                   free_vram_mb=free_vram, free_disk_gb=free_disk,
+                   collector_python_ok=python_can_import(py), collector_python=py)
+    if not pf["ok"]:
+        log.append(_ev(run_id, "auditing", "collect_blocked",
+                       config_hash=cfg.hash(), note="; ".join(pf["reasons"])[:200]))
+        return None, 6
+
+    def runner(cmd, path, timeout_s, owns_game):
+        # Every new game attempt rechecks exclusivity. Resource ownership is
+        # the same MachineLease acquired by run/collect, not a second protocol.
+        before = game_pids()
+        if before is None or before:
+            return {"rc": 6, "blocked": True,
+                    "why": "existing game or unknown process state"}
+        active = getattr(args, "user_active", None)
+        activity = (user_activity_probe() if active is None else
+                    {"active": bool(active), "idle_s": None, "source": "caller-declared"})
+        st = probe_resources(disk_path=ROOT,
+                             gpu_minutes_today=machine_gpu_minutes_today(),
+                             user_active=active, activity_probe=lambda: activity)
+        gate = resource_gate(cfg, st)
+        stop = should_stop(cfg, [], gpu_minutes_today=machine_gpu_minutes_today(),
+                           candidates_used=0,
+                           wall_minutes=RunClock(exp_dir(run_id) / "run_state.json").minutes())
+        if not gate["allowed"] or stop["stop"]:
+            return {"rc": 6, "blocked": True,
+                    "why": "; ".join(gate["reasons"] + stop["reasons"])}
+        launched = time.time()
+        mark_gpu_start(run_id)
+        try:
+            from beamng_autopilot.experiments.autonomous_data import run_stage
+            result = run_stage(cmd, path, timeout_s=timeout_s,
+                               heartbeat=machine_lease().heartbeat, cwd=ROOT)
+        finally:
+            cleanup = (close_started_game(before, launched_after=launched,
+                                          verify_timeout_s=10.0) if owns_game
+                       else {"closed": game_pids() == set()})
+            settle_gpu_minutes(run_id)
+        result["cleanup"] = cleanup
+        return result
+
+    log.append(_ev(run_id, "auditing", "generating_auto_truth",
+                   config_hash=cfg.hash(), note=f"bounded attempts={spec.attempts}"))
+    rep = run_collection(spec, directory, python=py, scripts=ROOT / "scripts",
+                         runner=runner, identity=source["sha256"])
+    rep["source"] = source
+    if source_snapshot(ROOT)["sha256"] != source["sha256"]:
+        rep.update(ok=False, status="source_changed")
+    rep.update(preflight=pf, collector_python=py, collector_python_source=py_source,
+               out_dir=str(directory), rc=0 if rep["ok"] else 7,
+               map_name=cfg.collect_map, source_id="automatic-controlled-scenes",
+               frames_total=rep.get("frames", 0))
+    if rep["ok"]:
+        proposal = collection_proposal(
+            role_dirs=rep["runs"], candidate_id="auto-truth-" + spec.digest()[:12],
+            note="自动生成并通过逐帧凭证核验的训练场景；资格仅覆盖本批，不代替独立评价")
+        path = exp_dir(run_id) / "proposals_auto_truth.json"
+        path.write_text(json.dumps(proposal, ensure_ascii=False, indent=1), encoding="utf-8")
+        rep["proposal_path"] = str(path)
+    (directory / "admission.json").write_text(
+        json.dumps(rep, ensure_ascii=False, indent=1), encoding="utf-8")
+    log.append(_ev(run_id, "auditing" if rep["ok"] else "paused",
+                   "auto_truth_admitted" if rep["ok"] else "auto_truth_isolated",
+                   config_hash=cfg.hash(), note=f"{rep['status']}; frames={rep['frames_total']}"))
+    print(f"[collect] 自动真值 {rep['status']}：合格 {rep['frames_total']} 帧；"
+          f"详情 {directory / 'admission.json'}")
+    return rep, rep["rc"]
+
+
 def cmd_collect(args) -> int:
     """单独跑一次无人值守采集（不起训练），供 runbook/验收单独调用。"""
     cfg_path = Path(args.config)
@@ -761,9 +872,15 @@ def cmd_collect(args) -> int:
     if not held["acquired"]:
         print(f"[collect] 单实例锁：{held['reason']}")
         return 4
+    lease = machine_lease()
+    lease_result = lease.acquire()
+    if not lease_result["acquired"]:
+        lock.release()
+        return 4
     try:
         rep, rc = collect_once(args, cfg, log=log)
     finally:
+        lease.release()
         lock.release()
     if rep is None:
         print("[collect] 未启动：前置检查不通过（游戏可能有人在开）")
@@ -934,6 +1051,8 @@ def cmd_run(args) -> int:
                                   collect_proposals=collect_proposals)
         mark_gpu_start(args.run_id)
         _t0 = time.time()
+        _begin_audit(args.run_id, cfg, log, purpose="training",
+                     note=f"后台入口配置 {cfg.hash()}")
         log.append(_ev(args.run_id, "training", "running",
                        note=f"后台入口启动 rounds={r_args.rounds} "
                             f"config_hash={cfg.hash()}"))
@@ -1117,6 +1236,7 @@ def rounds_args_from(cfg, run_id: str, *, device: str = "cuda",
         runs=list(cfg.runs), baseline_runs=list(cfg.baseline_runs) or None,
         eval_runs=list(cfg.eval_runs), proposals=props,
         seeds=list(cfg.seeds), epochs=int(cfg.epochs), batch=int(cfg.batch),
+        total_steps=int(cfg.total_steps), init=cfg.init,
         lr=float(cfg.lr), split="tail", device=device,
         thresholds=thresholds, config=str(cfg_path),
         hard_recall=0.70, hard_precision=0.40, hard_p95=45.0,
@@ -2483,11 +2603,11 @@ def cmd_rounds(args) -> int:
 
 
 def _cmd_rounds_inner(args, cfg, log) -> int:
-    if log.last() is None:
-        log.append(_ev(args.run_id, "queued", "start",
-                       note=f"rounds={args.rounds} seeds={args.seeds}"))
-        log.append(_ev(args.run_id, "auditing", "started",
-                       note="训练前数据准入门（逐通道真值/身份/整组隔离）"))
+    from beamng_autopilot.experiments.reproducibility import (
+        read_baseline_evidence, source_snapshot, write_baseline_evidence)
+
+    _begin_audit(args.run_id, cfg, log, purpose="rounds",
+                 note=f"rounds={args.rounds} seeds={args.seeds}；训练前准入")
     props = []
     if args.proposals:
         props = json.loads(Path(args.proposals).read_text(
@@ -2511,6 +2631,19 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
             return rc
         log.append(_ev(args.run_id, "training", "running", note="候选逐轮训练"))
     champ_file = exp_dir(args.run_id) / "champion.json"
+    baseline_checkpoints = {str(seed): exp_dir(args.run_id) / "baseline"
+                            / f"seed{seed}" / "checkpoint_last.pt"
+                            for seed in args.seeds}
+    evaluation_identity = {
+        "dev_dataset_id": _report.get("dev_dataset_id"),
+        "eval_runs": [_canon_dir(Path(r)) for r in args.eval_runs],
+        "baseline_runs": [_canon_dir(r) for r in base_runs],
+        "identity_scope": getattr(args, "identity_scope", "v7"),
+        "thresholds_hash": t.config_hash, "source_sha256": source_snapshot(ROOT)["sha256"],
+        "step_budget": int(getattr(args, "total_steps", 0) or 0),
+        "epochs": args.epochs, "batch": args.batch, "lr": args.lr,
+        "init": getattr(args, "init", None),
+        "road_only": bool(getattr(args, "allow_road_only", False))}
     history: list = []
     for rnd in range(int(args.rounds)):
         prop = props[rnd % len(props)] if props else {}
@@ -2656,13 +2789,13 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
         base_steps: dict = {}
         base_meta: dict = {}      # 逐 seed 预算/采样/init 证据（T16 §3）
         champ_task: dict = {}     # 逐 seed 任务主指标（G05）：{seed: {metric: value}}
+        base_neg: dict = {}
         base_n_train: int = 0
         equal_cap: int = 0
         plateau_base_by_seed: dict = {}
         cand_epochs = factor_epochs(args.epochs, extra)
         if rnd == 0:
             champ_by_seed: dict = {}
-            base_neg: dict = {}      # 逐 seed 负例诊断（E1 主指标）
             for seed in args.seeds:
                 out = exp_dir(args.run_id) / "baseline" / f"seed{seed}"
                 cmd = train_cmd(args, base_runs, out, seed, [])
@@ -2727,7 +2860,13 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 else:
                     print(f"[rounds] --equal-steps：候选训练帧 {n_train_c} "
                           f"≤ 基线 {base_n_train}，无需截帧")
-            champ_file.write_text(json.dumps({
+            write_baseline_evidence(champ_file, {
+                "schema": "baseline-evidence-v1",
+                "evaluation_identity": evaluation_identity,
+                "checkpoint_sha16": {seed: _ckpt_sha16(path)
+                                     for seed, path in baseline_checkpoints.items()},
+                "task_by_seed": champ_task, "negative_by_seed": base_neg,
+                "plateau_by_seed": plateau_base_by_seed, "train_meta_by_seed": base_meta,
                 "by_seed": champ_by_seed, "source": "baseline_arm",
                 "arm_runs": [str(r) for r in base_runs],
                 "epochs": args.epochs, "seeds": list(args.seeds),
@@ -2741,21 +2880,24 @@ def _cmd_rounds_inner(args, cfg, log) -> int:
                 "step_budget": int(getattr(args, "total_steps", 0) or 0),
                 "sampling": sampling_label(args, equal_cap),
                 "init_from": (str(getattr(args, "init", None))
-                              if getattr(args, "init", None) else None)},
-                indent=1, ensure_ascii=False), encoding="utf-8")
+                              if getattr(args, "init", None) else None)})
         elif champ_file.exists():
-            champ_by_seed = json.loads(champ_file.read_text(
-                encoding="utf-8")).get("by_seed") or {}
-            base_steps = json.loads(champ_file.read_text(
-                encoding="utf-8")).get("steps_by_seed") or {}
-            equal_cap = int(json.loads(champ_file.read_text(
-                encoding="utf-8")).get("max_train_frames") or 0)
-            # 基线臂的预算/采样/init 证据在跨轮复用时也要能读出来（否则第 1+
-            # 轮的判定只剩候选侧可追溯，"两臂起始身份"就断了一半）。
-            for seed in args.seeds:
-                _bdir = exp_dir(args.run_id) / "baseline" / f"seed{seed}"
-                if (_bdir / "checkpoint_last.pt").exists():
-                    base_meta[str(seed)] = _train_meta(_bdir)
+            try:
+                saved = read_baseline_evidence(champ_file,
+                    identity=evaluation_identity, checkpoints=baseline_checkpoints)
+            except (OSError, ValueError, TypeError) as exc:
+                _log_give_up(log, args.run_id, cand_id, "baseline_evidence_invalid",
+                             str(exc), phase="needs_review")
+                print(f"[rounds] 基线证据不可复用：{exc}")
+                return 3
+            champ_by_seed = saved["by_seed"]
+            base_steps = saved["steps_by_seed"]
+            champ_task = saved["task_by_seed"]
+            base_neg = saved["negative_by_seed"]
+            plateau_base_by_seed = saved["plateau_by_seed"]
+            base_meta = saved["train_meta_by_seed"]
+            base_n_train = int(saved.get("base_n_train") or 0)
+            equal_cap = int(saved.get("max_train_frames") or 0)
         else:
             print("[rounds] 没有基线记录（champion.json 缺失）：拒绝用本轮"
                   "候选自己的值当对照")

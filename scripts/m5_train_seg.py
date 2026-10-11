@@ -1002,6 +1002,10 @@ def main() -> None:
                          "headroom for the running game so its rendering "
                          "never starves (white windows)")
     args = ap.parse_args()
+    from beamng_autopilot.experiments.reproducibility import source_snapshot
+    source_before = source_snapshot(config.PROJECT_ROOT)
+    if not source_before["complete"]:
+        raise SystemExit("训练源码摘要不完整：" + "; ".join(source_before["errors"]))
 
     try:
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -1694,6 +1698,8 @@ def main() -> None:
             sampling = "legacy_epoch"
         return {
             "total_steps": int(budget),
+            "source_sha256": source_before["sha256"],
+            "source_commit": source_before["commit"],
             "steps_done": int(steps_done),
             "steps_in_epoch": int(steps_in_epoch),
             "stopped_by": str(stopped_by),
@@ -1987,8 +1993,14 @@ def main() -> None:
         hist.setdefault("sampler_report", None)
         hist.setdefault("sampler_state_digest", None)
     hist["init"] = dict(init_block)
+    hist["source_before"] = source_before
+    hist["source_after"] = source_snapshot(config.PROJECT_ROOT)
+    hist["source_unchanged"] = (hist["source_after"]["complete"]
+                                and hist["source_after"]["sha256"] == source_before["sha256"])
     (out_dir / "train_hist.json").write_text(
         json.dumps(hist, ensure_ascii=False, indent=1), encoding="utf-8")
+    if not hist["source_unchanged"]:
+        raise SystemExit("训练期间源码发生变化：保留产物，本轮不允许晋级")
     try:
         import matplotlib
         matplotlib.use("Agg")
