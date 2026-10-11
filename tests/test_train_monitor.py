@@ -227,6 +227,153 @@ class TestMonitorServer:
 
 
 # ---------------------------------------------------------------------------
+class TestFollowNewestRun:
+    """跟随最新一轮：开了新训练不用重启监控（页面自己清空重画）。"""
+
+    def _run(self, root, name, steps=2, age=0.0):
+        from beamng_autopilot.experiments.metrics import MetricsStore
+        st = MetricsStore(Path(root) / name)
+        for i in range(steps):
+            st.append({"kind": "train", "step": i + 1, "loss": 1.0 / (i + 1)})
+        if age:
+            m = Path(root) / name / "metrics.jsonl"
+            old = m.stat().st_mtime - age
+            os.utime(m, (old, old))
+        return st
+
+    def test_newest_run_dir_only_looks_at_the_marker(self, tmp_path):
+        from beamng_autopilot.experiments import monitor_server as ms
+        exp = tmp_path / "experiments"
+        (exp / "no_marker").mkdir(parents=True)
+        (exp / "machine_lease.json").write_text("{}", encoding="utf-8")
+        self._run(exp, "run_a", age=600)
+        self._run(exp, "run_b")
+        assert ms.newest_run_dir(exp).name == "run_b"
+        assert ms.newest_run_dir(tmp_path / "nope") is None
+        assert ms.newest_run_dir(exp / "no_marker") is None
+
+    def test_follow_switches_to_a_newer_run_and_never_back(self, tmp_path):
+        from beamng_autopilot.experiments import monitor_server as ms
+        exp = tmp_path / "experiments"
+        # 第一轮显式更旧：Windows 文件时间戳只有 ~15 ms 粒度，连着写两个文件
+        # 可能拿到相同 mtime；而 mtime 相等时**不切换**（这正是想要的行为，
+        # 见下一个用例）。
+        self._run(exp, "run_a", age=600)
+        # 间隔下限是 0.2 s（库里的 max(0.2, interval)），所以等待要长于它
+        tgt = ms.FollowTarget(follow=True, root=exp, interval=0.2)
+        assert tgt.current()["run_id"] == "run_a"
+        assert tgt.current()["store"].task() is None
+
+        self._run(exp, "run_b")                      # 新的一轮：mtime 明显更新
+        time.sleep(0.3)
+        cur = tgt.current()
+        assert cur["run_id"] == "run_b"
+        assert cur["store"].path.parent.name == "run_b"
+
+        # 旧轮次再被写一下也不能把视角抢回去（只向前跟随）
+        m = exp / "run_a" / "metrics.jsonl"
+        old = time.time() - 999
+        os.utime(m, (old, old))
+        time.sleep(0.3)
+        assert tgt.current()["run_id"] == "run_b"
+
+    def test_equal_mtime_does_not_flip_the_view(self, tmp_path):
+        """mtime 相等时保持当前轮次，不在两轮之间来回跳。"""
+        from beamng_autopilot.experiments import monitor_server as ms
+        exp = tmp_path / "experiments"
+        self._run(exp, "run_a")
+        self._run(exp, "run_b")
+        stamp = (exp / "run_a" / "metrics.jsonl").stat().st_mtime
+        for name in ("run_a", "run_b"):
+            m = exp / name / "metrics.jsonl"
+            os.utime(m, (stamp, stamp))
+        tgt = ms.FollowTarget(exp / "run_a", follow=True, root=exp,
+                              interval=0.2)
+        time.sleep(0.3)
+        assert tgt.current()["run_id"] == "run_a"
+
+    def test_follow_waits_when_nothing_has_metrics_yet(self, tmp_path):
+        from beamng_autopilot.experiments import monitor_server as ms
+        exp = tmp_path / "experiments"
+        exp.mkdir(parents=True)
+        tgt = ms.FollowTarget(follow=True, root=exp, interval=0.2)
+        cur = tgt.current()
+        assert cur["run_id"] == "" and cur["run_dir"] is None
+        assert "跟随最新一轮" in cur["title"]
+        self._run(exp, "run_later")
+        time.sleep(0.3)
+        assert tgt.current()["run_id"] == "run_later"
+
+    def test_a_pinned_target_never_follows(self, tmp_path):
+        from beamng_autopilot.experiments import monitor_server as ms
+        exp = tmp_path / "experiments"
+        a = self._run(exp, "run_a")
+        self._run(exp, "run_b")
+        tgt = ms.FollowTarget(exp / "run_a", follow=False, root=exp)
+        assert tgt.current()["run_id"] == "run_a"
+        assert tgt.current()["store"].path == a.path
+
+    def test_http_metrics_carries_the_run_id_so_the_page_can_reset(
+            self, tmp_path):
+        """切轮次时 seq 从 0 重来：响应必须带 run_id，页面才知道要清空。"""
+        from beamng_autopilot.experiments import monitor_server as ms
+        exp = tmp_path / "experiments"
+        self._run(exp, "run_a", steps=3, age=600)
+        exp.mkdir(exist_ok=True)
+        srv, _th, url = ms.serve(follow=True, root=exp, port=0,
+                                 follow_interval=0.2)
+        try:
+            with urllib.request.urlopen(url + "state", timeout=5) as r:
+                st = json.loads(r.read().decode("utf-8"))
+            assert st["follow"] is True and st["run_id"] == "run_a"
+
+            with urllib.request.urlopen(url + "metrics?since=0", timeout=5) as r:
+                j = json.loads(r.read().decode("utf-8"))
+            assert j["run_id"] == "run_a" and len(j["records"]) == 3
+
+            self._run(exp, "run_b", steps=1)          # 新的一轮开始
+            time.sleep(0.4)
+            with urllib.request.urlopen(url + "metrics?since=3", timeout=5) as r:
+                j = json.loads(r.read().decode("utf-8"))
+            assert j["run_id"] == "run_b"
+            assert j["records"] == [], "旧 since 在新轮次上应当什么都取不到"
+            with urllib.request.urlopen(url + "metrics?since=0", timeout=5) as r:
+                j = json.loads(r.read().decode("utf-8"))
+            assert [x["step"] for x in j["records"]] == [1]
+            with urllib.request.urlopen(url + "state", timeout=5) as r:
+                assert json.loads(r.read().decode("utf-8"))["run_id"] == "run_b"
+        finally:
+            srv.shutdown()
+
+    def test_metrics_query_reports_the_run_id(self, tmp_path):
+        from beamng_autopilot.experiments import monitor_server as ms
+        st = self._run(tmp_path / "experiments", "run_a")
+        assert ms.metrics_query(st, 0, "run_a")["run_id"] == "run_a"
+
+
+# ---------------------------------------------------------------------------
+class TestFollowUiContract:
+    """前端契约：payload 带 run_id；切换轮次必须整体清空重画。"""
+
+    def _html(self):
+        from beamng_autopilot.experiments.monitor_ui import render_html
+        return render_html(run_id="run_x", title="t")
+
+    def test_payload_carries_the_run_id(self):
+        assert '"run_id": "run_x"' in self._html()
+
+    def test_the_page_resets_when_the_served_run_changes(self):
+        html = self._html()
+        assert "function resetForRun(" in html
+        assert "state.bySeq = new Set(); state.lastSeq = 0" in html
+        assert "已跟随到新的一轮" in html
+        assert "j.run_id !== state.runId" in html
+
+    def test_statusbar_shows_the_current_run(self):
+        assert "当前轮次" in self._html()
+
+
+# ---------------------------------------------------------------------------
 class TestTrainingWiring:
     """端到端：真跑一次小训练，检查逐 step 指标与任务状态真的落盘。"""
 
@@ -255,6 +402,7 @@ class TestTrainingWiring:
         env = dict(os.environ)
         env["BEAMNG_LOGS_DIR"] = str(tmp_path / "logs")
         r = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                           encoding="utf-8", errors="replace",
                            timeout=600)
         assert r.returncode == 0, r.stdout[-2000:] + r.stderr[-2000:]
         mfile = tmp_path / "logs" / "experiments" / metrics_run / "metrics.jsonl"
@@ -285,6 +433,7 @@ class TestTrainingWiring:
         env = dict(os.environ)
         env["BEAMNG_LOGS_DIR"] = str(tmp_path / "logs")
         r = subprocess.run(cmd, capture_output=True, text=True, env=env,
+                           encoding="utf-8", errors="replace",
                            timeout=300)
         assert r.returncode != 0
         mfile = (tmp_path / "logs" / "experiments" / metrics_run

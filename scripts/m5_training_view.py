@@ -8,8 +8,10 @@
 
 * ``dashboard``：把最近一轮的 ``events.jsonl`` 交给 ``m5_seg_dashboard.py``
   的渲染器，出一张自包含 HTML 再用默认浏览器打开；
-* ``monitor``：把最近一轮带逐 step 指标的 run 交给 ``monitor_server``
-  起只读服务，再用默认浏览器打开；
+* ``monitor``：起实时监控（``monitor_server``）——**默认跟随最新一轮**：
+  只看 ``logs/experiments/*/metrics.jsonl`` 里 mtime 最新的那个 run，出现
+  更新的一轮就自动切过去，页面自己清空重画，所以**开了新训练不用重启监控**；
+  给了 ``--run-id`` 就钉住那一轮不跟随；
 * ``history``：全仓训练台账（``m5_training_history.py``）——**不挑某一轮**，
   把 ``logs/`` 下所有训练产物扫成一张历史表；它只列事实、不做排行。
 
@@ -57,7 +59,6 @@ for _p in (str(ROOT), str(HERE)):
 
 from beamng_autopilot import config  # noqa: E402
 from beamng_autopilot.experiments import monitor_server  # noqa: E402
-from beamng_autopilot.experiments.metrics import MetricsStore  # noqa: E402
 import m5_seg_dashboard  # noqa: E402  （同目录脚本，复用它的渲染器）
 import m5_training_history  # noqa: E402  （台账渲染器）
 
@@ -134,11 +135,12 @@ def open_target(target: str, *, no_open: bool) -> None:
         print(f"[view] 打不开默认浏览器，请手动打开 {target}")
 
 
-def _serving(url: str) -> str | None:
-    """该端口上监控服务正在看的 ``run_id``；不是我们的服务/没人监听则 None。
+def _serving(url: str) -> dict | None:
+    """该端口上监控服务的 ``/state``；不是我们的服务/没人监听则 None。
 
-    只认 ``/state`` 且必须同时带 ``run_id`` 与 ``status``（我们的服务一定
-    有这两项）：否则"某个别的程序占着这个端口"会被误判成"已在看这一轮"。
+    只认 ``/state`` 且必须带 ``status``（我们的服务一定有这一项）：否则"某个
+    别的程序占着这个端口"会被误判成"已在看这一轮"。返回值里 ``follow`` 表示
+    那个服务是不是在跟随最新一轮（跟随中的服务天然会看到最新，直接复用）。
     """
     try:
         with urllib.request.urlopen(url.rstrip("/") + "/state",
@@ -151,7 +153,9 @@ def _serving(url: str) -> str | None:
     if not isinstance(blob, dict) or "status" not in blob:
         return None
     rid = blob.get("run_id")
-    return str(rid) if rid else None
+    return {"run_id": str(rid) if rid else "",
+            "follow": bool(blob.get("follow")),
+            "status": str(blob.get("status", ""))}
 
 
 # ---------------------------------------------------------------------------
@@ -187,36 +191,45 @@ def cmd_dashboard(args) -> int:
 
 
 # ---------------------------------------------------------------------------
-# monitor：给最近一轮带逐 step 指标的 run 起实时服务
+# monitor：起实时服务——默认**跟随最新一轮**（开了新训练不用重启）
 # ---------------------------------------------------------------------------
 def cmd_monitor(args) -> int:
     root = experiments_root()
-    run, reason = resolve_run(root, MARKER_MONITOR, args.run_id)
-    if run is None:
-        return _no_data(
-            "监控", root, MARKER_MONITOR, reason,
-            "逐 step 指标只在训练时带 --metrics-run 才写："
-            "m5_train_seg.py --metrics-run <run_id>。没有它的 run 只能看"
-            "看板（events.jsonl 是另一条流）。")
-    run_id, run_dir = run
+    pinned = bool(args.run_id)
+    run_id = run_dir = None
+    if pinned:
+        run, reason = resolve_run(root, MARKER_MONITOR, args.run_id)
+        if run is None:
+            return _no_data(
+                "监控", root, MARKER_MONITOR, reason,
+                "逐 step 指标只在训练时带 --metrics-run 才写："
+                "m5_train_seg.py --metrics-run <run_id>。没有它的 run 只能看"
+                "看板（events.jsonl 是另一条流）。")
+        run_id, run_dir = run
     url = f"http://{args.host}:{args.port}/"
 
     already = _serving(url)
-    if already == run_id:
-        print(f"[view] {url} 上已经在看 {run_id}，直接打开（不重复起）。")
+    if already and (already["follow"] or (pinned and already["run_id"] == run_id)):
+        # 跟随中的服务本来就会看到最新一轮；钉住时同一轮也算。别的 run 的
+        # 服务不顺手打开（那是别的实验的曲线）。
+        what = "（跟随最新一轮）" if already["follow"] else run_id
+        print(f"[view] {url} 上已经在看 {what}，直接打开（不重复起）。")
         open_target(url, no_open=args.no_open)
         return 0
 
+    target = monitor_server.FollowTarget(
+        run_dir, run_id=args.run_id or "", poll_ms=args.poll_ms,
+        follow=not pinned, root=root)
+    cur = target.current()
+
     def start(port: int):
-        return monitor_server.serve(
-            run_dir, host=args.host, port=port, run_id=run_id,
-            title=f"训练监控 · {run_id}", poll_ms=args.poll_ms)
+        return monitor_server.serve(target=target, host=args.host, port=port,
+                                    poll_ms=args.poll_ms)
 
     conflict = ""
     if already:
-        # 端口上跑的是**别的 run**：不能顺手打开（那是别的实验的曲线），
-        # 也不硬抢端口——直接用系统分配端口，并把冲突原因说出来。
-        conflict = f"端口 {args.port} 上跑的是另一个 run（{already}）"
+        conflict = (f"端口 {args.port} 上跑的是另一个 run"
+                    f"（{already['run_id'] or '未知'}）")
         want = 0
     else:
         want = args.port
@@ -238,9 +251,19 @@ def cmd_monitor(args) -> int:
     if conflict:
         print(f"[view] {conflict} → 本轮改用 {url}")
 
-    store = MetricsStore(run_dir)
+    store = cur["store"]
     task = store.task() or {}
-    print(f"[view] run={run_id} 指标文件 {store.path}")
+    if pinned:
+        print(f"[view] 钉住 run={run_id}（不跟随）· 指标文件 "
+              f"{store.path}")
+    else:
+        print(f"[view] 跟随最新一轮：根目录 {root}，出现更新的轮次自动切换"
+              f"（页面自己清空重画，不用重启）")
+        if cur["run_id"]:
+            print(f"[view] 当前轮次 {cur['run_id']} · 指标文件 {store.path}")
+        else:
+            print("[view] 还没有带 metrics.jsonl 的轮次：页面显示『等待中』，"
+                  "训练带上 --metrics-run 开始写指标就会自动接上")
     print(f"[view] 任务状态 {task.get('status', 'waiting')} · "
           f"{len(store.read()[0])} 条记录")
     print(f"[view] 页面 {url}（Ctrl+C 退出；关掉页面不影响训练）")
@@ -305,9 +328,9 @@ def main(argv: list[str] | None = None) -> int:
     d.set_defaults(func=cmd_dashboard)
 
     m = sub.add_parser("monitor",
-                       help="给最近一轮带逐 step 指标的 run 起实时监控")
+                       help="起实时监控：默认跟随最新一轮（开新训练不用重启）")
     m.add_argument("--run-id", default=None,
-                   help="指定 run（默认取 metrics.jsonl 最新的那个）")
+                   help="钉住某一轮（不跟随）；不给就跟最新的一轮")
     m.add_argument("--host", default="127.0.0.1")
     m.add_argument("--port", type=int, default=8760)
     m.add_argument("--poll-ms", type=int, default=2000)

@@ -2,10 +2,13 @@
 
 用法::
 
-    # 实时看板（训练进行中刷新浏览器即可；默认只绑回环地址）
-    pwsh> .venv\\Scripts\\python.exe scripts\\m5_train_monitor.py serve --run-id t14_monitor_demo --port 8760
+    # 实时看板：不给 --run-id 就**跟随最新一轮**（开了新训练不用重启监控）
+    pwsh> .venv\\Scripts\\python.exe scripts\\m5_train_monitor.py serve --port 8760
 
-    # 训练结束后回看（生成自包含 HTML，不需要服务）
+    # 钉住某一轮（不跟随）
+    pwsh> .venv\\Scripts\\python.exe scripts\\m5_train_monitor.py serve --run-id t14_monitor_demo
+
+    # 训练结束后回看（生成自包含 HTML，不需要服务；不给 --run-id 取最新一轮）
     pwsh> .venv\\Scripts\\python.exe scripts\\m5_train_monitor.py snapshot `
               --run-id t14_monitor_demo --out logs\\experiments\\monitor_snapshot.html
 
@@ -15,6 +18,8 @@
 
 训练进程写指标的方式见 ``scripts/m5_train_seg.py --metrics-run <run_id>``：
 每个优化步一行 train 记录，硬件按 ``--monitor-interval``（默认 2 s）采样。
+**跟随模式只认写了这个文件的轮次**：没带 ``--metrics-run`` 的训练不会出现，
+页面显示"等待中"，不编造轮次。
 """
 
 from __future__ import annotations
@@ -41,15 +46,45 @@ def run_dir(run_id: str) -> Path:
     return Path(config.LOGS_DIR) / "experiments" / run_id
 
 
+def _newest_or_die(args) -> str:
+    """``--run-id`` 没给时取最新一轮；没有任何一轮就报原因退出（不猜）。"""
+    if args.run_id:
+        return args.run_id
+    d = monitor_server.newest_run_dir(args.root)
+    if d is None:
+        root = Path(args.root) if args.root else monitor_server.experiments_root()
+        print(f"[monitor] {root} 下没有任何带 "
+              f"{monitor_server.MARKER} 的轮次：逐 step 指标只在训练带 "
+              f"--metrics-run 时才写。用 --run-id 指定其它轮次。")
+        raise SystemExit(2)
+    print(f"[monitor] 未指定 --run-id：取最新一轮 {d.name}")
+    return d.name
+
+
 def cmd_serve(args) -> int:
-    d = run_dir(args.run_id)
-    d.mkdir(parents=True, exist_ok=True)
-    _srv, _th, url = monitor_server.serve(
-        d, host=args.host, port=args.port, run_id=args.run_id,
-        title=args.title or f"训练监控 · {args.run_id}", poll_ms=args.poll_ms)
-    store = MetricsStore(d)
+    """起服务。给了 ``--run-id`` 就钉住那一轮；没给就跟随最新一轮。"""
+    follow = args.run_id is None
+    target = monitor_server.FollowTarget(
+        None if follow else run_dir(args.run_id),
+        run_id="" if follow else args.run_id,
+        title=args.title, poll_ms=args.poll_ms, follow=follow,
+        root=args.root, interval=args.follow_interval)
+    cur = target.current()
+    if follow:
+        print(f"[monitor] 跟随最新一轮：根目录 {target.root}，每 "
+              f"{args.follow_interval:g}s 检查一次，出现更新的一轮自动切换"
+              f"（页面自己清空重画，不用重启）")
+    if cur["run_id"]:
+        print(f"[monitor] 当前轮次 {cur['run_id']} · 指标文件 "
+              f"{cur['store'].path}")
+    else:
+        print("[monitor] 还没有可跟随的轮次：页面显示『等待中』，等训练带上 "
+              "--metrics-run 开始写指标就会自动接上")
+
+    _srv, _th, url = monitor_server.serve(target=target, host=args.host,
+                                          port=args.port, poll_ms=args.poll_ms)
+    store = cur["store"]
     task = store.task()
-    print(f"[monitor] 指标文件 {store.path}")
     print(f"[monitor] 任务状态 {(task or {}).get('status', 'waiting')} · "
           f"{len(store.read()[0])} 条记录")
     print(f"[monitor] 页面 {url}  （Ctrl+C 退出；关闭页面不影响训练）")
@@ -62,13 +97,14 @@ def cmd_serve(args) -> int:
 
 
 def cmd_snapshot(args) -> int:
-    store = MetricsStore(run_dir(args.run_id))
+    run_id = _newest_or_die(args)
+    store = MetricsStore(run_dir(run_id))
     recs, problems = store.read()
     if not recs:
         print(f"[monitor] {store.path} 没有记录：快照会是一张空页"
               f"（不编造数据）")
-    p = write_snapshot(args.out, run_id=args.run_id, records=recs,
-                       title=args.title or f"训练监控快照 · {args.run_id}")
+    p = write_snapshot(args.out, run_id=run_id, records=recs,
+                       title=args.title or f"训练监控快照 · {run_id}")
     task = store.task() or {}
     print(f"[monitor] {len(recs)} 条记录 -> {p}（状态 "
           f"{task.get('status', 'waiting')}，不可读行 {len(problems)}）")
@@ -98,10 +134,11 @@ def cmd_probe(args) -> int:
 
 
 def cmd_status(args) -> int:
-    store = MetricsStore(run_dir(args.run_id))
+    run_id = _newest_or_die(args)
+    store = MetricsStore(run_dir(run_id))
     recs, problems = store.read()
     task = store.task() or {}
-    print(f"[monitor] run={args.run_id} 记录 {len(recs)} 条 "
+    print(f"[monitor] run={run_id} 记录 {len(recs)} 条 "
           f"last_seq={store.last_seq()} 状态={task.get('status', 'waiting')}")
     if task.get("error"):
         print(f"[monitor] 失败原因：{task['error']}")
@@ -114,18 +151,26 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="训练过程可视化（实时/快照/演示）")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("serve", help="起只读监控服务")
-    s.add_argument("--run-id", required=True)
+    s = sub.add_parser("serve", help="起只读监控服务（不给 --run-id 就跟随最新一轮）")
+    s.add_argument("--run-id", default=None,
+                   help="钉住某一轮；不给则跟随根目录下最新的一轮")
     s.add_argument("--host", default="127.0.0.1")
     s.add_argument("--port", type=int, default=8760)
     s.add_argument("--title", default="")
     s.add_argument("--poll-ms", type=int, default=2000)
+    s.add_argument("--root", default=None,
+                   help="跟随哪个目录（默认 logs/experiments）")
+    s.add_argument("--follow-interval", type=float,
+                   default=monitor_server.FOLLOW_INTERVAL_S,
+                   help=f"跟随模式多久检查一次新轮次（秒，默认 "
+                        f"{monitor_server.FOLLOW_INTERVAL_S:g}）")
     s.set_defaults(func=cmd_serve)
 
     s = sub.add_parser("snapshot", help="把已有记录渲染成自包含 HTML")
-    s.add_argument("--run-id", required=True)
+    s.add_argument("--run-id", default=None, help="不给则取最新一轮")
     s.add_argument("--out", required=True)
     s.add_argument("--title", default="")
+    s.add_argument("--root", default=None)
     s.set_defaults(func=cmd_snapshot)
 
     s = sub.add_parser("demo", help="写入演示记录（界面会标 DEMO）")
@@ -138,8 +183,9 @@ def main(argv=None) -> int:
     s = sub.add_parser("probe", help="打印一次真实硬件采样")
     s.set_defaults(func=cmd_probe)
 
-    s = sub.add_parser("status", help="打印指标文件状态")
-    s.add_argument("--run-id", required=True)
+    s = sub.add_parser("status", help="打印指标文件状态（不给 --run-id 取最新一轮）")
+    s.add_argument("--run-id", default=None)
+    s.add_argument("--root", default=None)
     s.set_defaults(func=cmd_status)
 
     args = ap.parse_args(argv)

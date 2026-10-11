@@ -238,79 +238,144 @@ def test_no_open_never_launches_a_browser(tmp_path, monkeypatch, no_browser):
 # ---------------------------------------------------------------------------
 # monitor
 # ---------------------------------------------------------------------------
-def test_monitor_without_metrics_explains_metrics_run(
+def _raise_interrupt(_s=None):
+    raise KeyboardInterrupt
+
+
+def test_monitor_pinned_without_metrics_explains_metrics_run(
         tmp_path, monkeypatch, capsys, no_browser):
+    """指名了 --run-id 但那轮没有逐 step 指标：退出码 2 + 说清为什么。"""
     logs = _logs_root(tmp_path, monkeypatch)
     _write_events(logs / "experiments" / "run_a", run_id="run_a")
 
-    assert tv.main(["monitor"]) == tv.EXIT_NO_DATA
+    assert tv.main(["monitor", "--run-id", "run_a"]) == tv.EXIT_NO_DATA
     out = capsys.readouterr().out
     assert "metrics.jsonl" in out
     assert "--metrics-run" in out
     assert no_browser == []
 
 
-def test_monitor_serves_the_newest_run_with_metrics(
+def test_monitor_follows_the_newest_run_by_default(
         tmp_path, monkeypatch, no_browser, capsys):
+    """不给 --run-id：起的是**跟随**服务（跟着最新一轮走，不用重启）。"""
     logs = _logs_root(tmp_path, monkeypatch)
     exp = logs / "experiments"
-    _write_events(exp / "run_a", run_id="run_a")
     _write_metrics(exp / "run_a")
     _write_metrics(exp / "run_b")
     _touch_older(exp / "run_a" / "metrics.jsonl", seconds=600)
 
     monkeypatch.setattr(tv, "_serving", lambda url: None)
     srv = _StubServer()
-    seen: list[dict] = []
+    seen: dict = {}
 
-    def fake_serve(run_dir, **kw):
-        seen.append({"run_dir": Path(run_dir), **kw})
+    def fake_serve(**kw):
+        seen["target"] = kw["target"]
+        seen.update(kw)
         return srv, None, f"http://{kw['host']}:{kw['port']}/"
 
     monkeypatch.setattr(tv.monitor_server, "serve", fake_serve)
-    monkeypatch.setattr(tv.time, "sleep",
-                        lambda _s: (_ for _ in ()).throw(KeyboardInterrupt))
+    monkeypatch.setattr(tv.time, "sleep", _raise_interrupt)
 
     assert tv.main(["monitor", "--port", "8799"]) == 0
-    assert seen[0]["run_dir"] == exp / "run_b"
-    assert seen[0]["run_id"] == "run_b"
-    assert seen[0]["port"] == 8799
+    assert seen["target"].follow is True
+    assert seen["target"].current()["run_id"] == "run_b"   # 最新的一轮
+    assert seen["port"] == 8799
     assert no_browser == ["http://127.0.0.1:8799/"]
     assert srv.shutdown_called
-    assert "Ctrl+C 退出" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "跟随最新一轮" in out and "run_b" in out
 
 
-def test_monitor_reuses_a_service_already_serving_the_same_run(
+def test_monitor_starts_and_waits_when_nothing_has_metrics_yet(
+        tmp_path, monkeypatch, capsys, no_browser):
+    """一轮都没有也照起服务：页面显示"等待中"，训练一开始就自动接上。
+
+    这是"开新训练不用重启"的另一半——先双击等着，比先双击报错再双击一次好。
+    """
+    logs = _logs_root(tmp_path, monkeypatch)
+    (logs / "experiments").mkdir(parents=True)
+
+    monkeypatch.setattr(tv, "_serving", lambda url: None)
+    srv = _StubServer()
+    seen: dict = {}
+
+    def fake_serve(**kw):
+        seen["target"] = kw["target"]
+        return srv, None, f"http://{kw['host']}:{kw['port']}/"
+
+    monkeypatch.setattr(tv.monitor_server, "serve", fake_serve)
+    monkeypatch.setattr(tv.time, "sleep", _raise_interrupt)
+
+    assert tv.main(["monitor", "--port", "8799"]) == 0
+    assert seen["target"].follow is True
+    assert seen["target"].current()["run_id"] == ""
+    out = capsys.readouterr().out
+    assert "等待中" in out and "--metrics-run" in out
+    assert no_browser == ["http://127.0.0.1:8799/"]
+
+
+def test_monitor_run_id_pins_that_run(
+        tmp_path, monkeypatch, capsys, no_browser):
+    """给了 --run-id 就钉住那一轮（不跟随），即使有更新的一轮。"""
+    logs = _logs_root(tmp_path, monkeypatch)
+    exp = logs / "experiments"
+    _write_metrics(exp / "run_b")
+    _write_metrics(exp / "run_newer")
+
+    monkeypatch.setattr(tv, "_serving", lambda url: None)
+    srv = _StubServer()
+    seen: dict = {}
+
+    def fake_serve(**kw):
+        seen["target"] = kw["target"]
+        return srv, None, f"http://{kw['host']}:{kw['port']}/"
+
+    monkeypatch.setattr(tv.monitor_server, "serve", fake_serve)
+    monkeypatch.setattr(tv.time, "sleep", _raise_interrupt)
+
+    assert tv.main(["monitor", "--run-id", "run_b", "--port", "8799"]) == 0
+    assert seen["target"].follow is False
+    assert seen["target"].current()["run_id"] == "run_b"
+    assert "钉住 run=run_b（不跟随）" in capsys.readouterr().out
+
+
+def test_monitor_reuses_a_service_that_is_already_following(
         tmp_path, monkeypatch, no_browser, capsys):
+    """端口上已有一个**跟随中**的服务：它本来就会看到最新一轮，直接开页面。"""
     logs = _logs_root(tmp_path, monkeypatch)
     _write_metrics(logs / "experiments" / "run_b")
-    monkeypatch.setattr(tv, "_serving", lambda url: "run_b")
+    monkeypatch.setattr(tv, "_serving",
+                        lambda url: {"run_id": "run_old", "follow": True,
+                                     "status": "running"})
     monkeypatch.setattr(tv.monitor_server, "serve",
-                        lambda *a, **k: pytest.fail("不该重复起服务"))
+                        lambda **k: pytest.fail("不该重复起服务"))
 
     assert tv.main(["monitor", "--port", "8799"]) == 0
     assert no_browser == ["http://127.0.0.1:8799/"]
-    assert "已经在看 run_b" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "已经在看" in out and "跟随最新一轮" in out
 
 
-def test_monitor_never_reuses_a_service_showing_another_run(
+def test_monitor_never_reuses_a_pinned_service_for_another_run(
         tmp_path, monkeypatch, no_browser, capsys):
-    """别的 run 占着端口：不顺手打开，换系统分配端口并说明原因。"""
+    """别的 run 的**钉住**服务占着端口：不顺手打开，换系统分配端口并说明原因。"""
     logs = _logs_root(tmp_path, monkeypatch)
-    _write_metrics(logs / "experiments" / "run_b")
-    monkeypatch.setattr(tv, "_serving", lambda url: "run_old")
+    exp = logs / "experiments"
+    _write_metrics(exp / "run_b")
+    monkeypatch.setattr(tv, "_serving",
+                        lambda url: {"run_id": "run_old", "follow": False,
+                                     "status": "running"})
     srv = _StubServer()
     ports: list[int] = []
 
-    def fake_serve(run_dir, **kw):
+    def fake_serve(**kw):
         ports.append(kw["port"])
         return srv, None, f"http://{kw['host']}:{kw['port']}/"
 
     monkeypatch.setattr(tv.monitor_server, "serve", fake_serve)
-    monkeypatch.setattr(tv.time, "sleep",
-                        lambda _s: (_ for _ in ()).throw(KeyboardInterrupt))
+    monkeypatch.setattr(tv.time, "sleep", _raise_interrupt)
 
-    assert tv.main(["monitor", "--port", "8799"]) == 0
+    assert tv.main(["monitor", "--run-id", "run_b", "--port", "8799"]) == 0
     assert ports == [0]          # 明知被别的 run 占着，就不去试那个端口
     out = capsys.readouterr().out
     assert "另一个 run（run_old）" in out
@@ -326,15 +391,14 @@ def test_monitor_busy_port_falls_back_to_a_free_one(
     srv = _StubServer()
     ports: list[int] = []
 
-    def flaky_serve(run_dir, **kw):
+    def flaky_serve(**kw):
         ports.append(kw["port"])
         if kw["port"] == 8799:
             raise OSError("[WinError 10048] 通常每个套接字地址只允许使用一次")
         return srv, None, f"http://{kw['host']}:{kw['port']}/"
 
     monkeypatch.setattr(tv.monitor_server, "serve", flaky_serve)
-    monkeypatch.setattr(tv.time, "sleep",
-                        lambda _s: (_ for _ in ()).throw(KeyboardInterrupt))
+    monkeypatch.setattr(tv.time, "sleep", _raise_interrupt)
 
     assert tv.main(["monitor", "--port", "8799"]) == 0
     assert ports == [8799, 0]
@@ -358,7 +422,7 @@ def test_monitor_exits_3_when_even_a_free_port_fails(
 
 
 def test_serving_only_trusts_our_own_state_payload(monkeypatch):
-    """别人占着这个端口时不能当成"已有监控服务"。"""
+    """别人占着这个端口时不能当成"已有监控服务"；跟随标志要读出来。"""
     import io
 
     class _Resp(io.BytesIO):
@@ -379,7 +443,13 @@ def test_serving_only_trusts_our_own_state_payload(monkeypatch):
 
     monkeypatch.setattr(tv.urllib.request, "urlopen",
                         reply(b'{"run_id": "run_b", "status": "running"}'))
-    assert tv._serving("http://127.0.0.1:8799/") == "run_b"
+    assert tv._serving("http://127.0.0.1:8799/") == {
+        "run_id": "run_b", "follow": False, "status": "running"}
+
+    monkeypatch.setattr(
+        tv.urllib.request, "urlopen",
+        reply(b'{"run_id": "run_c", "follow": true, "status": "running"}'))
+    assert tv._serving("http://127.0.0.1:8799/")["follow"] is True
 
     def refused(url, timeout=0):
         raise OSError("connection refused")
@@ -448,9 +518,8 @@ def test_both_modes_leave_the_run_directory_untouched(
     monkeypatch.setattr(tv, "_serving", lambda url: None)
     srv = _StubServer()
     monkeypatch.setattr(tv.monitor_server, "serve",
-                        lambda run_dir, **kw: (srv, None, "http://x/"))
-    monkeypatch.setattr(tv.time, "sleep",
-                        lambda _s: (_ for _ in ()).throw(KeyboardInterrupt))
+                        lambda **kw: (srv, None, "http://x/"))
+    monkeypatch.setattr(tv.time, "sleep", _raise_interrupt)
     assert tv.main(["monitor", "--no-open"]) == 0
 
     assert _tree(run_dir) == before
