@@ -39,3 +39,25 @@
 * 本轮配置（probe 开启）与源身份均不同于 E5 A/B 批次，按预注册不与 A/B 做等曝光
   并列或重复性比较。
 * 验证的是两项修复在实机的可观测行为；不声称可靠驾驶、安全或学习收益。
+
+## 4. 第二轮：完整批次代码的合格运行（f64d6bd）
+
+第一批代码补齐阶段一第 3 项（曝光前预热 + 感知返回→发送后链计时）并重新冻结
+（HEAD `f64d6bd`，pytest 3406 项 + 深度离线 ALL PASS，`gate_20261011_173542.log`）后，
+按同一预注册参数重跑一轮：`logs/experiments/e5_postfix_sendgate2_20261011/pose_00`。
+
+| 项 | 值 |
+|---|---|
+| status / qualified | **completed / qualified=true**（`source_unchanged=true`） |
+| 放置 | `placement_rc=0`，误差 0.0215 m / 0.0750° |
+| 帧 / 跨度 | 47 帧，24.709 s（曝光资格通过） |
+| 发送时效门 | 0 帧 `stale_at_send_s>1.5`（本轮后链健康：`send_chain_ms` p50 63 / max 94 ms）；门在新鲜帧静默 ✓ |
+| 几何链 | 47/47 帧 `geometry_probe.command.cmd_seq` 与 `cmd_seq` 一致 ✓ |
+| 诊断 | `plan_dev_m` 25 帧（选择后只读） |
+| 驾驶读数 | 净行进 0.463 m、最大速度 0.577 m/s、被接受路径 32 帧、sensor 车道 32 帧；主因 no drivable path 22、planned body cross 19 |
+| 安全字段 | damage 增量 0、倒车 0；cleanup closed、收尾后 BeamNG 进程 0 |
+
+**两轮合并读法**：第一轮（97a45db）证明发送门在真实停滞帧正确记录过期年龄且无正油门；
+第二轮（f64d6bd）证明完整批次在合格曝光下门静默、后链时长可测、几何链逐帧可回放连接。
+仍不声称：可靠驾驶（净行进仍处于已知可用率阻塞）、安全或学习收益。曝光不足的冷启动
+机制（第一轮）与预热的关系需在阶段二的确定性归因中继续检验。
