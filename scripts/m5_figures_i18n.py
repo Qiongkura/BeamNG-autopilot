@@ -97,6 +97,10 @@ def _walk(fig: Figure) -> None:
             if leg.get_title() is not None:
                 leg.get_title().set_text(tr(leg.get_title().get_text()))
     do_texts(fig.texts)
+    for leg in fig.legends:
+        do_texts(leg.get_texts())
+        if leg.get_title() is not None:
+            leg.get_title().set_text(tr(leg.get_title().get_text()))
     if fig._suptitle is not None:
         fig._suptitle.set_text(tr(fig._suptitle.get_text()))
 

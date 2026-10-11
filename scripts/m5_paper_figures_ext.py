@@ -30,6 +30,9 @@ sys.path.insert(0, str(_HERE.parents[1]))      # 仓库根（导入 beamng_autop
 from m5_paper_figures import (  # noqa: E402
     BENCH, C_CTRL, C_FACT, EXP, GATES, GATE_LABEL, OUT, _save,
 )
+from beamng_autopilot.experiments.paper_inputs import read_figure_inputs
+
+PAPER_INPUTS = _HERE.parents[1] / "docs" / "paper" / "figure_inputs_20261009.json"
 
 ARROW = chr(0x2192)
 NL = chr(10)
@@ -315,10 +318,11 @@ def fig17() -> None:
         ax.set_title(label, fontsize=8.5)
         ax.tick_params(axis="x", labelrotation=15, labelsize=7)
         for i, v in enumerate(vals):
-            ax.text(i, (v or 0) * 1.02, str(v), ha="center", fontsize=7)
+            value = "UNKNOWN" if v is None else (f"{v:.3f}" if field.endswith("rate") else f"{v:g}")
+            ax.text(i, (v or 0) * 1.02, value, ha="center", fontsize=7)
     fig.suptitle("Tversky beta=0.8 arm vs base: the negative side gets worse "
                  "(R3 pool, seed 42)", fontsize=10)
-    _save(fig, "fig17_beta08")
+    _save(fig, "fig17_beta08_20261009")
 
 
 # ---------------------------------------------------------------- fig 18
@@ -420,18 +424,11 @@ def fig20() -> None:
 
 # ---------------------------------------------------------------- fig 21
 def fig21() -> None:
-    """训练曲线：按 family 聚合（321 个 run 逐条画会把图例压死）。
-
-    每个 family 取该 family 内所有 run 的 val_line_iou / train_loss 曲线，
-    画**中位曲线 + IQR 带**，图例只列 run 数最多的前 10 个 family（放轴外）。
-    """
+    """Frozen R3 mechanical validation; paired seeds, no gain claim."""
     import collections as _c
     hists = []
-    for p in sorted(EXP.rglob("train_hist.json")):
-        try:
-            d = json.load(open(p, encoding="utf-8"))
-        except Exception:
-            continue
+    for entry in read_figure_inputs(_HERE.parents[1], PAPER_INPUTS, "fig21"):
+        d = entry["data"]
         if isinstance(d, dict) and isinstance(d.get("epoch"), list):
             cols = [k for k, v in d.items() if isinstance(v, list)]
             rows = [{k: d[k][i] for k in cols} for i in range(len(d["epoch"]))]
@@ -440,7 +437,7 @@ def fig21() -> None:
         else:
             rows = []
         if rows:
-            hists.append((p.relative_to(EXP).parts[0], rows))
+            hists.append((entry["family"], rows))
     by = _c.defaultdict(list)
     for fam, rows in hists:
         by[fam].append(rows)
@@ -450,7 +447,7 @@ def fig21() -> None:
     for k, fam in enumerate(top):
         color = cmap(k % 10)
         for ax, key in ((axes[0], "val_line_iou"), (axes[1], "train_loss")):
-            grid = np.arange(0, 121, 5)
+            grid = np.arange(0, 4)
             curves = []
             for rows in by[fam]:
                 xs = [r["epoch"] for r in rows]
@@ -470,27 +467,14 @@ def fig21() -> None:
     axes[1].set_ylabel("train loss (median, IQR band)")
     for ax in axes:
         ax.set_xlabel("epoch")
-        ax.set_xlim(0, 120)
-    axes[1].set_ylim(0, 2.0)
-    # 诚实性：line 通道被屏蔽的 run，其 val_line_iou 恒为 0（构造使然，不是"学不会"）
-    try:
-        masked = {}
-        for r in _load("training_history.json")["runs"]:
-            if r.get("line_ignored"):
-                masked[r["family"]] = masked.get(r["family"], 0) + 1
-        shown = [f"{f} ({masked[f]})" for f in top if f in masked]
-        if shown:
-            head = ", ".join(shown[:3]) + (" ..." if len(shown) > 3 else "")
-            axes[0].annotate("line-masked runs: IoU = 0 by construction" + NL + head,
-                             xy=(0.02, 0.03), xycoords="axes fraction", fontsize=6.5)
-    except Exception:
-        pass
+        ax.set_xlim(0, 3)
+    axes[1].set_ylim(bottom=0)
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=5, frameon=False, fontsize=7,
                bbox_to_anchor=(0.5, -0.12))
-    fig.suptitle(f"Training curves by family ({len(hists)} recorded runs, "
-                 f"{len(by)} families; top {len(top)} shown)", fontsize=10)
-    _save(fig, "fig21_training_curves")
+    fig.suptitle("Frozen R3 learning histories: 2 seeds per arm, 60 steps per run"
+                 + NL + "mechanical validation; both candidates rejected", fontsize=10)
+    _save(fig, "fig21_learning_r3_20261009")
 
 
 def _bench_runs() -> list:
@@ -513,13 +497,24 @@ def _bench_runs() -> list:
 
 # ---------------------------------------------------------------- fig 22
 def fig22() -> None:
-    runs = _bench_runs()[-32:]
+    pinned = read_figure_inputs(_HERE.parents[1], PAPER_INPUTS, "fig22")
+    cards = {r["run_id"]: r["data"] for r in pinned if r["role"] == "scorecard"}
+    runs = []
+    for entry in pinned:
+        if entry["role"] != "manifest":
+            continue
+        if (entry["data"].get("run") or {}).get("scenarios") != ["town"]:
+            raise ValueError("frozen driving input is not a town run")
+        ts = entry["run_id"]
+        result = cards[ts]["results"][0]
+        runs.append({"ts": ts, "checks": result.get("checks") or {},
+                     "unknown": result.get("unknown") or []})
     order = ["has_frames", "no_reversing", "no_centre_crossing", "no_edge_crossing",
              "no_stall", "on_road", "no_collision", "reached_goal"]
     M = np.zeros((len(order), len(runs)))
     for j, r in enumerate(runs):
         for i, k in enumerate(order):
-            M[i, j] = 1.0 if r["checks"].get(k) else 0.0
+            M[i, j] = 1.0 if r["checks"].get(k) is True and k not in r["unknown"] else 0.0
     fig, ax = plt.subplots(figsize=(12.0, 3.4))
     ax.imshow(M, cmap="RdYlGn", vmin=0, vmax=1, aspect="auto")
     short = {"has_frames": "frames", "no_reversing": "no reversing",
@@ -530,9 +525,9 @@ def fig22() -> None:
     fig.subplots_adjust(left=0.13)
     ax.set_xticks(range(len(runs)), [r["ts"][-5:] for r in runs], rotation=90,
                   fontsize=5)
-    ax.set_title(f"Driving hard-gate checklist over the last {len(runs)} town runs "
+    ax.set_title(f"Driving hard-gate checklist over {len(runs)} frozen town runs "
                  "(green = pass, red = fail; UNKNOWN counts as fail)")
-    _save(fig, "fig22_gate_heatmap")
+    _save(fig, "fig22_gate_heatmap_frozen_20261009")
 
 
 # ---------------------------------------------------------------- fig 23
@@ -812,17 +807,19 @@ def fig32() -> None:
     worst = [sm.RULE_WORST_LEVEL.get(r, "?") for r in rules]
     fig, ax = plt.subplots(figsize=(7.6, 7.2))
     ax.set_axis_off()
-    y = 0.94
-    for r, w in zip(rules, worst):
+    # Reserve space below the complete registry for the explanatory footer.
+    row_step = 0.82 / max(1, len(rules))
+    row_height = row_step * 0.84
+    for i, (r, w) in enumerate(zip(rules, worst)):
+        y = 0.94 - i * row_step
         fc = {"degraded": "#FDF3D0", "minimal_risk": "#F3D9D9"}.get(w, "#DCE3F0")
-        _box(ax, 0.02, y - 0.05, 0.62, 0.048, r, fc=fc, fontsize=7.5)
-        ax.text(0.66, y - 0.028, w, fontsize=7, va="center")
-        y -= 0.0565
+        _box(ax, 0.02, y - row_height, 0.62, row_height, r, fc=fc, fontsize=7.5)
+        ax.text(0.66, y - row_height / 2, w, fontsize=7, va="center")
     ax.text(0.02, 0.02, "soft rules accumulate caps; a minimal_risk rule stops the tick "
             "(order is the evaluated order, not severity)", fontsize=7)
     ax.set_title("Safety arbitration ladder (schematic, from ARBITRATION_RULES)",
                  fontsize=9.5)
-    _save(fig, "fig32_arbitration_ladder")
+    _save(fig, "fig32_arbitration_ladder_20261009")
 
 
 def fig33() -> None:

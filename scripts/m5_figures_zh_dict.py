@@ -28,6 +28,13 @@ IDENT = {
 }
 
 TRANS: dict[str, str] = {
+    "Frozen R3 learning histories: 2 seeds per arm, 60 steps per run\nmechanical validation; both candidates rejected":
+        "冻结的 R3 学习历史：每臂 2 个种子，每作业 60 步\n机械验证；两轮候选均被拒绝",
+    "Driving hard-gate checklist over 32 frozen town runs (green = pass, red = fail; UNKNOWN counts as fail)":
+        "固定 32 次历史城镇运行的驾驶硬门清单（绿=通过，红=失败；UNKNOWN 计为失败）",
+    "R3 baseline (n=2)": "R3 基线（n=2）",
+    "R3 round0 (n=2)": "R3 第一轮（n=2）",
+    "R3 round1 (n=2)": "R3 第二轮（n=2）",
     # ---- 标题 / suptitle -------------------------------------------------
     "(a) dev pool": "（a）开发池",
     "(a) dev pool (9 scenes, 117 frames)": "（a）开发池（9 场景，117 帧）",

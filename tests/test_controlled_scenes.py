@@ -29,6 +29,59 @@ def _load():
     return mod
 
 
+class _BootstrapConn:
+    def __init__(self, *, attached=False, attach_error=False, empty_load=False):
+        self.calls = []
+        self.vehicle = object() if attached else None
+        self.attach_error = attach_error
+        self.empty_load = empty_load
+
+    def open(self, *, launch):
+        self.calls.append(("open", launch))
+
+    def attach_vehicle(self, *, already_open):
+        self.calls.append(("attach", already_open))
+        if self.attach_error:
+            raise RuntimeError("no active scenario")
+
+    def load_scenario(self):
+        self.calls.append(("load",))
+        if not self.empty_load:
+            self.vehicle = object()
+
+
+def test_fresh_collection_loads_before_any_current_vehicle_query():
+    m = _load()
+    conn = _BootstrapConn(attach_error=True)
+    m.prepare_initial_scene(conn, attach=False)
+    assert conn.calls == [("open", True), ("load",)]
+    assert conn.vehicle is not None
+
+
+def test_explicit_attach_reuses_existing_vehicle():
+    m = _load()
+    conn = _BootstrapConn(attached=True)
+    original = conn.vehicle
+    m.prepare_initial_scene(conn, attach=True)
+    assert conn.calls == [("open", False), ("attach", True)]
+    assert conn.vehicle is original
+
+
+def test_unavailable_explicit_attach_keeps_existing_load_fallback():
+    m = _load()
+    conn = _BootstrapConn(attach_error=True)
+    m.prepare_initial_scene(conn, attach=True)
+    assert conn.calls == [("open", False), ("attach", True), ("load",)]
+
+
+def test_missing_vehicle_after_load_stops_before_scene_generation():
+    import pytest
+    m = _load()
+    conn = _BootstrapConn(empty_load=True)
+    with pytest.raises(RuntimeError, match="no connected vehicle"):
+        m.prepare_initial_scene(conn, attach=False)
+
+
 class _State:
     def __init__(self, pos, heading):
         self.pos = np.asarray(pos, dtype=float)

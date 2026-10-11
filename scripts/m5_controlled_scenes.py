@@ -1155,6 +1155,27 @@ def run_scene(conn, probe, *, name: str, site: dict, rec: dict, truth_points: li
     }
 
 
+def prepare_initial_scene(conn, *, attach: bool) -> None:
+    """Fresh launches need a scenario before any current-vehicle RPC."""
+    print(f"[scenes] startup: opening connection (attach={attach})", flush=True)
+    conn.open(launch=not attach)
+    print("[scenes] startup: connection ready", flush=True)
+    if not attach:
+        print("[scenes] startup: loading initial scenario", flush=True)
+        conn.load_scenario()
+    else:
+        try:
+            conn.attach_vehicle(already_open=True)
+        except Exception:                                    # noqa: BLE001
+            print("[scenes] startup: attach unavailable; loading scenario", flush=True)
+            conn.load_scenario()
+        if getattr(conn, "vehicle", None) is None:
+            conn.load_scenario()
+    if getattr(conn, "vehicle", None) is None:
+        raise RuntimeError("initial scenario has no connected vehicle")
+    print("[scenes] startup: initial vehicle ready", flush=True)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -1228,17 +1249,10 @@ def main() -> int:
         close_started_game, game_pids)
     _pids_before = game_pids()
     _launched_after = time.time()
-    conn.open(launch=not args.attach)
     try:
-        # 规划站点要读 road network，需要先有**已加载的地图 + 一辆车**：
-        # 新启动的实例只有空场景，attach 会失败——失败就自己加载一次
-        # （italy 默认出生点），之后再换成我们生成的受控场景。
-        try:
-            conn.attach_vehicle(already_open=True)
-        except Exception:                                    # noqa: BLE001
-            conn.load_scenario()
-        if getattr(conn, "vehicle", None) is None:
-            conn.load_scenario()
+        # Fresh launches start at the menu. Do not issue GetCurrentVehicles
+        # there: load the requested map first. Opening is inside cleanup too.
+        prepare_initial_scene(conn, attach=bool(args.attach))
         # 站点：先挑锚点（互不相邻的路段），每个锚点沿其道路链布站；
         # 五类场景按顺序轮转，所以每个锚点都覆盖全部五类（§4.4：先加路段，
         # 再加近邻帧；帧数只是预算规划，不是质量门）。
@@ -1425,7 +1439,8 @@ def main() -> int:
         # tests/test_seg_collect_unattended.py 的资源门打红（"采集前没有游戏进程"
         # 断言失败），也会像 2026-09-25 那次一样拖慢后续实验。复用采集侧同一
         # 助手：只杀"本次新起 + 创建时间可验证"的 pid，不碰别人的会话。
-        _ga = close_started_game(_pids_before, launched_after=_launched_after)
+        _ga = close_started_game(_pids_before, launched_after=_launched_after,
+                                 verify_timeout_s=10.0)
         print(f"[scenes] 收尾关游戏：closed={_ga.get('closed')} "
               f"killed={_ga.get('killed')} "
               f"{_ga.get('reason') or _ga.get('note') or ''}")
