@@ -474,6 +474,8 @@ class SafetyVerdict:
     first_crossing_distance_m: float | None = None
     crossing_path_index: int | None = None
     crossing_boundary_side: str = ""
+    assessment_geometry: dict | None = None
+    assessment_geometry_ms: float | None = None
     # Obstacle risk grading (plan phase C3): the worst class seen this
     # tick, the closest confirmed time-to-collision, and the distance of
     # the nearest graded obstacle.  ``risk_kind`` is "" when no track was
@@ -786,7 +788,9 @@ class SafetyMonitor:
                  corridor_open_floor_frac: float = 0.55,
                  road_lost_degrade_s: float = ROAD_LOST_DEGRADE_S,
                  road_lost_stop_s: float = ROAD_LOST_STOP_S,
-                 road_surface_gate: bool | None = None):
+                 road_surface_gate: bool | None = None,
+                 capture_geometry: bool = False):
+        self.capture_geometry = bool(capture_geometry)
         self.occ_degrade = occ_fraction_degrade
         self.occ_stop = occ_fraction_stop
         self.lane_degrade_m = lane_dev_degrade_m
@@ -1274,6 +1278,22 @@ class SafetyMonitor:
             v.first_crossing_distance_m = float(body_cross)
             v.crossing_path_index = int(cross_idx)
             v.crossing_boundary_side = str(cross_side)
+        if self.capture_geometry:
+            _capture_t0 = time.perf_counter()
+            try:
+                from .geometry_probe import capture_safety_assessment
+                v.assessment_geometry = capture_safety_assessment(
+                    scene, path, half_len=HALF_LENGTH_M + BODY_CROSS_MARGIN_M,
+                    half_width=HALF_WIDTH_M + BODY_CROSS_MARGIN_M,
+                    max_cross_m=0.05, path_source="held" if served is not None else "input",
+                    checks={key: getattr(v, key) for key in
+                            ("body_cross_current", "body_cross_planned",
+                             "first_crossing_distance_m", "crossing_path_index",
+                             "crossing_boundary_side")})
+            except Exception as exc:
+                v.assessment_geometry = {"error": str(exc)}
+            finally:
+                v.assessment_geometry_ms = 1000.0 * (time.perf_counter() - _capture_t0)
 
         v.rules_evaluated.append("stale_sensor_planner")
         if stale_sensor or stale_planner:
