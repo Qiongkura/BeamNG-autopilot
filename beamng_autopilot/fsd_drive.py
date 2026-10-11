@@ -92,7 +92,7 @@ from beamng_autopilot.planner import (
     emergency_stop_clearance_m,
     path_grid_clearance_m,
 )
-from beamng_autopilot.safety_monitor import SafetyMonitor
+from beamng_autopilot.safety_monitor import SafetyMonitor, STALE_PIPELINE_S
 from beamng_autopilot.traffic import select_signal_rule
 from beamng_autopilot.vision.heads import (
     LaneTopologyHead, ObjectHead, SemanticHead, TrafficSignalHead,
@@ -997,6 +997,25 @@ def _sensor_snapshot_age(out) -> float:
             and not getattr(out, "head_outputs", None):
         return float("inf")
     return max([0.0] + ages)
+
+
+def _snapshot_age_at_send(out, recv_mono: float | None) -> float:
+    """Required-modality age advanced to the final-send boundary.
+
+    Published head/BEV/lane ages freeze at publish time and do not advance
+    with downstream planning / safety / neural-head / arbitration work (the
+    2026-10-11 review measured a send-time proxy age of 6.16 s against a
+    published 0.27 s on a stalled tick).  The elapsed part is a pure
+    monotonic delta, so adding it to a published age is clock-basis safe and
+    never double-counts compute.  Without a real sensor capture timestamp
+    the result stays a LOWER BOUND on the true age - it is never reported as
+    a capture age.  A non-finite base (invalid/missing evidence) is returned
+    unchanged: that decision belongs to SafetyMonitor's stale path.
+    """
+    base = _sensor_snapshot_age(out)
+    if not math.isfinite(base) or recv_mono is None:
+        return base
+    return base + max(0.0, time.monotonic() - float(recv_mono))
 
 
 def _pose_geometry_ok(out, pos, heading: float, pts: np.ndarray,
@@ -2776,6 +2795,9 @@ class FSDriveSession:
                 out = stack.tick(st=st, route_ref=route_local,
                                  map_lane_override=map_lane,
                                  time_budget_s=_budget)
+                # 单调时钟下的感知返回时刻：最终发送门用它把发布期年龄推进
+                # 到发送边界（时长=单调差，与时钟基准无关）。
+                _out_mono = time.monotonic()
                 if _wall_hit():
                     _run_record.update(exit_code=4, termination="drive_wall_timeout")
                     print("[fsd-drive] 墙钟上限到达（感知返回后）：制动收尾",
@@ -2941,31 +2963,6 @@ class FSDriveSession:
                         observation_age_s=_obs_age,
                         travelled_since_obs_m=getattr(
                             self, "_hold_travel_m", None))
-                # F-C 步骤 0（只读诊断）：0.77 m 的"路径离车道中心"必须能归因——
-                # 是规划器自己的路径偏，还是两层用的参考不一致。
-                try:
-                    from beamng_autopilot.planning.geometry import (
-                        polyline_point_distances,
-                    )
-                    _plan_ref = (np.asarray(out.lane_ref, dtype=float)
-                                 if out.lane_ref is not None else None)
-                    _mon_ref = (np.asarray(scene.lane_ref, dtype=float)
-                                if getattr(scene, "lane_ref", None) is not None
-                                else None)
-                    _b = (np.asarray(best, dtype=float)
-                          if best is not None and len(best) >= 2 else None)
-                    out.meta["plan_dev_m"] = (
-                        round(float(np.median(polyline_point_distances(
-                            _b[:, :2], _plan_ref[:, :2]))), 3)
-                        if _b is not None and _plan_ref is not None
-                        and len(_plan_ref) >= 2 else None)
-                    out.meta["ref_gap_m"] = (
-                        round(float(np.median(polyline_point_distances(
-                            _plan_ref[:, :2], _mon_ref[:, :2]))), 3)
-                        if _plan_ref is not None and _mon_ref is not None
-                        and len(_mon_ref) >= 2 else None)
-                except Exception:
-                    pass
                 else:
                     grid = OccupancyGrid(stack.grid_n, stack.grid_n,
                                          stack.grid_res,
@@ -3012,6 +3009,33 @@ class FSDriveSession:
                             scene, best, observation_age_s=_obs_age,
                             travelled_since_obs_m=getattr(
                                 self, "_hold_travel_m", None))
+                # F-C 步骤 0（只读诊断）：0.77 m 的"路径离车道中心"必须能归因——
+                # 是规划器自己的路径偏，还是两层用的参考不一致。诊断在场景选择
+                # **完成之后**读取；它绝不重建场景（2026-10-11 复核：诊断的
+                # try/else 曾劫持回退分支，诊断成功反而替换有效 Scene）。
+                try:
+                    from beamng_autopilot.planning.geometry import (
+                        polyline_point_distances,
+                    )
+                    _plan_ref = (np.asarray(out.lane_ref, dtype=float)
+                                 if out.lane_ref is not None else None)
+                    _mon_ref = (np.asarray(scene.lane_ref, dtype=float)
+                                if getattr(scene, "lane_ref", None) is not None
+                                else None)
+                    _b = (np.asarray(best, dtype=float)
+                          if best is not None and len(best) >= 2 else None)
+                    out.meta["plan_dev_m"] = (
+                        round(float(np.median(polyline_point_distances(
+                            _b[:, :2], _plan_ref[:, :2]))), 3)
+                        if _b is not None and _plan_ref is not None
+                        and len(_plan_ref) >= 2 else None)
+                    out.meta["ref_gap_m"] = (
+                        round(float(np.median(polyline_point_distances(
+                            _plan_ref[:, :2], _mon_ref[:, :2]))), 3)
+                        if _plan_ref is not None and _mon_ref is not None
+                        and len(_mon_ref) >= 2 else None)
+                except Exception:
+                    pass
                 # 本 tick 实测的"路径 vs 车道参考"（无符号），供**下一 tick** 的
                 # F-C 门使用（本 tick 的门在评估之前就要用，只能取上一 tick 的
                 # 实测值——偏差是持续的地图车道偏置，不是逐帧噪声）。必须在
@@ -4512,6 +4536,18 @@ class FSDriveSession:
                 if _wall_hit():
                     _run_record.update(exit_code=4, termination="drive_wall_timeout")
                     break
+                # 最终发送前的时效重判（2026-10-11 复核 P0）：发布期年龄不含
+                # 规划/安全/神经头/仲裁的下游耗时，过期控制不得沿用——按既有
+                # 硬停契约收尾并记录原因。阈值沿用 STALE_PIPELINE_S（健康观测
+                # 之上、看门狗之下），不改既有 0.8 s 模态门的标定。
+                _send_age_s = _snapshot_age_at_send(out, _out_mono)
+                if _send_age_s > STALE_PIPELINE_S:
+                    out.meta["stale_at_send_s"] = round(float(_send_age_s), 3)
+                    if not final_stop:
+                        out.meta["send_stale_stop_reason"] = "stale_snapshot"
+                    final_stop = True
+                    thr, brk, steer, pb = _final_stop_controls(
+                        thr, brk, steer, pb, stop=True, speed=v)
                 _sent = _commands.send(
                     throttle=thr, brake=brk, steering=steer,
                     gear=gear_use, parkingbrake=pb)
@@ -5247,6 +5283,10 @@ class FSDriveSession:
                     "plc_shift": round(float(_plc_shift), 3),
                     "plc_pre_shift_m": out.meta.get("plc_pre_shift_m"),
                     "plc_pre_error": out.meta.get("plc_pre_error"),
+                    # 最终发送时效门：发送边界的必需模态年龄下界（发布年龄 +
+                    # 感知返回后的单调时长），以及过期时按既有硬停收尾的原因。
+                    "stale_at_send_s": out.meta.get("stale_at_send_s"),
+                    "send_stale_stop_reason": out.meta.get("send_stale_stop_reason"),
                     "plc_desired": (round(float(_plc_desired), 3)
                                     if _plc_desired is not None else None),
                     "end_ref": _end_ref,

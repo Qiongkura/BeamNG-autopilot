@@ -74,11 +74,13 @@ class Stack:
     grid_res = 0.5
 
     def __init__(self, clock, state, delays, *, obstacle=None, painted=False,
-                 ref_authority=None):
+                 ref_authority=None, provide_scene=True):
         self.clock, self.state = clock, state
         self.delays, self.obstacle = delays, obstacle
         self.painted = painted
         self.ref_authority = ref_authority
+        self.provide_scene = provide_scene
+        self.created_scenes: list = []
         self.index = -1
 
     def tick(self, **kwargs):
@@ -105,9 +107,11 @@ class Stack:
                 "semantic": SimpleNamespace(masks={"line": np.ones((4, 4), bool)})}
         out = FSDTick()
         out.snapshot = snapshot
-        out.scene = Scene(pos=pos, heading=self.state.heading, grid=grid,
-                          lane_ref=path, perception_snapshot=snapshot,
-                          strict_perception=True)
+        out.scene = (Scene(pos=pos, heading=self.state.heading, grid=grid,
+                           lane_ref=path, perception_snapshot=snapshot,
+                           strict_perception=True)
+                     if self.provide_scene else None)
+        self.created_scenes.append(out.scene)
         out.lane_ref = path
         out.best_path = path
         out.best_speed = 6.0
@@ -137,7 +141,8 @@ def drive(monkeypatch, tmp_path, *, caps=(3.3,), delays=None,
           levels=None, speed=0.0, obstacle=None, dqn=False, painted=False,
           route_end=100.0, heading=0.0, ref_authority=None, lateral=0.0,
           max_wall_s=None, expected_rc=0, expected_frames=None, probe_geometry=False,
-          attach=True, replay_capture=False):
+          attach=True, replay_capture=False, provide_scene=True,
+          downstream_stall_s=None):
     clock = Clock()
     delays = list(delays or [0.5] * len(caps))
     state = SimpleNamespace(pos=np.array([0.0, lateral, 0.0]), heading=heading,
@@ -145,7 +150,7 @@ def drive(monkeypatch, tmp_path, *, caps=(3.3,), delays=None,
                             dir=np.array([1.0, 0.0, 0.0]))
     conn = Connection(clock, state)
     stack = Stack(clock, state, delays, obstacle=obstacle, painted=painted,
-                  ref_authority=ref_authority)
+                  ref_authority=ref_authority, provide_scene=provide_scene)
     disarms = []
     def disarm():
         disarms.append(clock.value)
@@ -154,9 +159,14 @@ def drive(monkeypatch, tmp_path, *, caps=(3.3,), delays=None,
 
     class Monitor:
         def __init__(self, **kwargs):
-            pass
+            self.scenes: list = []
+            created_monitors.append(self)
 
         def evaluate(self, scene, path, **kwargs):
+            self.scenes.append(scene)
+            if downstream_stall_s:
+                # 下游停滞（规划/安全/神经头/仲裁耗时）：只推时钟，不改判定。
+                clock.sleep(downstream_stall_s)
             i = stack.index
             cap = caps[i]
             level = levels[i] if levels else ("degraded" if cap < 6 else "safe")
@@ -172,6 +182,7 @@ def drive(monkeypatch, tmp_path, *, caps=(3.3,), delays=None,
         def offer_verified_path(self, *args, **kwargs):
             return False
 
+    created_monitors: list = []
     policy = None
     if dqn:
         policy = SimpleNamespace(
@@ -217,6 +228,8 @@ def drive(monkeypatch, tmp_path, *, caps=(3.3,), delays=None,
         assert any(round(c["throttle"], 4) == frame["throttle"]
                    and round(c["brake"], 4) == frame["brake"]
                    and round(c["steering"], 4) == frame["steer"] for c in sent)
+    conn.fixture_stack = stack
+    conn.fixture_monitors = created_monitors
     return frames, conn
 
 
@@ -444,3 +457,133 @@ class TestFlagCapture:
         src = (Path(__file__).resolve().parents[1] / "beamng_autopilot"
                / "fsd_drive.py").read_text("utf-8")
         assert "_t{" in src and "vis_index.json" in src
+
+
+def test_diagnostic_success_cannot_replace_a_valid_planner_scene(
+        monkeypatch, tmp_path):
+    """复核 P0-A：诊断成功也不得重建安全场景。
+
+    修复前的结构缺陷：诊断 try/else 劫持了 ``if scene is not None`` 的回退
+    else——诊断成功反而用 out.bev 另建 Scene 并重新评估。回归用身份断言钉住：
+    监控器收到的必须是 Stack 创建的那个 Scene 对象（grid/lane_ref 同一）。
+    """
+    frames, conn = drive(monkeypatch, tmp_path, caps=(6.0, 6.0),
+                         delays=[0.5, 0.5])
+    stack = conn.fixture_stack
+    monitor = conn.fixture_monitors[0]
+    assert len(monitor.scenes) == len(stack.created_scenes) == 2
+    for i, created in enumerate(stack.created_scenes):
+        assert created is not None
+        assert monitor.scenes[i] is created
+        assert monitor.scenes[i].grid is created.grid
+
+
+def test_diagnostic_failure_keeps_the_planner_scene(monkeypatch, tmp_path):
+    """诊断抛异常只影响诊断状态：场景不变、驾驶照常、诊断字段缺席。"""
+    import beamng_autopilot.planning.geometry as geom
+
+    def _boom(*a, **k):
+        raise ValueError("fixture diagnostic failure")
+
+    monkeypatch.setattr(geom, "polyline_point_distances", _boom)
+    frames, conn = drive(monkeypatch, tmp_path, caps=(6.0, 6.0),
+                         delays=[0.5, 0.5])
+    stack = conn.fixture_stack
+    monitor = conn.fixture_monitors[0]
+    for i, created in enumerate(stack.created_scenes):
+        assert monitor.scenes[i] is created
+        assert monitor.scenes[i].grid is created.grid
+    assert all(f.get("plan_dev_m") is None for f in frames)
+    assert all(f.get("ref_gap_m") is None for f in frames)
+
+
+def test_missing_scene_still_enters_the_explicit_fallback(
+        monkeypatch, tmp_path):
+    """缺 Scene 时才允许兼容构造：回退场景由 out.bev 重建并送同一评估。"""
+    frames, conn = drive(monkeypatch, tmp_path, caps=(6.0,), delays=[0.5],
+                         provide_scene=False)
+    monitor = conn.fixture_monitors[0]
+    assert conn.fixture_stack.created_scenes == [None]
+    assert len(monitor.scenes) == 1
+    scene = monitor.scenes[0]
+    assert scene is not None and scene.grid is not None
+    assert float(scene.pos[0]) == pytest.approx(0.0)
+
+
+def test_real_monitor_verdict_is_a_pure_function_of_scene_content():
+    """真实 SafetyMonitor：同一场景重复评估结果一致，内容变化才改变裁定。"""
+    monitor = fd.SafetyMonitor(road_surface_gate=False)
+    grid = OccupancyGrid(60, 60, 0.5, origin=(0.0, 0.0), heading=0.0)
+    grid.drivable[:] = 1
+    grid.observed[:] = 1
+    path = np.column_stack([np.arange(0.0, 15.0), np.zeros(15)])
+    snap = PerceptionSnapshot(captured_at=1000.0, tick_id=0,
+                              pos=np.zeros(3), heading=0.0,
+                              head_age_s={"semantic": 0.0}, bev_age_s=0.0)
+    scene = Scene(pos=np.zeros(3), heading=0.0, grid=grid, lane_ref=path,
+                  perception_snapshot=snap, strict_perception=True)
+    v1 = monitor.evaluate(scene, path, planner_age_s=0.0, snapshot_age_s=0.0)
+    v2 = monitor.evaluate(scene, path, planner_age_s=0.0, snapshot_age_s=0.0)
+    assert v1.level == v2.level and v1.reason == v2.reason
+    grid.mark_obstacle_region(2.0, 0.0, 0.25, 0.25)
+    v3 = monitor.evaluate(scene, path, planner_age_s=0.0, snapshot_age_s=0.0)
+    assert (v3.level, v3.target_speed) != (v1.level, v1.target_speed)
+
+
+def test_stale_perception_at_send_cannot_send_throttle(monkeypatch, tmp_path):
+    """复核 P0-B：下游停滞把年龄推进到发送边界后，过期控制不得发送。
+
+    感知新鲜（发布年龄 0 s），但评估到发送之间停滞 2 s——发送年龄
+    0+2 s 超过 STALE_PIPELINE_S。门按既有硬停契约收尾（0 油门/满刹），
+    原因与下界年龄写入遥测；所有实际发出的命令都无正油门。
+    """
+    frames, conn = drive(monkeypatch, tmp_path, caps=(6.0,), delays=[0.5],
+                         downstream_stall_s=2.0, expected_frames=1)
+    frame = frames[0]
+    assert frame["send_stale_stop_reason"] == "stale_snapshot"
+    assert frame["stale_at_send_s"] >= 2.0
+    assert frame["throttle"] == pytest.approx(0.0)
+    assert frame["brake"] == pytest.approx(1.0)
+    assert conn.commands
+    for _, c in conn.commands:
+        assert c["throttle"] == pytest.approx(0.0)
+
+
+def test_fresh_tick_records_no_send_hold(monkeypatch, tmp_path):
+    """无下游停滞时发送门保持静默，不改变既有指令路径。"""
+    frames, conn = drive(monkeypatch, tmp_path, caps=(6.0,), delays=[0.5])
+    assert frames[0].get("send_stale_stop_reason") is None
+    assert frames[0].get("stale_at_send_s") is None
+
+
+def test_snapshot_age_at_send_is_a_monotonic_lower_bound(monkeypatch):
+    """发布年龄 + 单调时长 = 发送边界年龄下界；不重复计、不伪装采集年龄。"""
+    out = SimpleNamespace(
+        snapshot=PerceptionSnapshot(captured_at=100.0, tick_id=0,
+                                    pos=np.zeros(3), heading=0.0,
+                                    bev=np.zeros((4, 4), dtype=np.float32),
+                                    head_age_s={"semantic": 0.3},
+                                    bev_age_s=0.0),
+        meta={}, frame=object(), lane_envelope=None)
+    # 无接收时刻（代理不可用）→ 原样返回发布年龄
+    assert fd._snapshot_age_at_send(out, None) == pytest.approx(0.3)
+
+    class _Clock:
+        def __init__(self, value):
+            self.value = value
+
+        def monotonic(self):
+            return self.value
+
+    monkeypatch.setattr(fd, "time", _Clock(105.0))
+    # 发布 0.3 s + 感知返回后 5 s = 5.3 s（下界，不重复加计算耗时）
+    assert fd._snapshot_age_at_send(out, 100.0) == pytest.approx(5.3)
+
+    monkeypatch.setattr(fd, "time", _Clock(99.0))
+    # 时钟回拨：年龄增量按非负计，不产生负年龄
+    assert fd._snapshot_age_at_send(out, 100.0) == pytest.approx(0.3)
+
+    # 无效/缺失证据：原样返回 inf，裁定权留给 SafetyMonitor 的 stale 路径
+    dead = SimpleNamespace(snapshot=None, meta={}, frame=None,
+                           head_outputs=None, lane_envelope=None)
+    assert fd._snapshot_age_at_send(dead, 100.0) == float("inf")
