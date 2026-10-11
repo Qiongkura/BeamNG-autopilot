@@ -17,14 +17,17 @@
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import sys
 import time
-import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from beamng_autopilot.experiments.evidence_archive import build_archive
+from beamng_autopilot.experiments.reproducibility import source_snapshot
+from beamng_autopilot.experiments.paper_inputs import figure_input_specs
 E = ROOT / "logs" / "experiments"
 BENCH = ROOT / "logs" / "fsd_benchmark"
 PAPER = ROOT / "docs" / "paper"
@@ -47,6 +50,18 @@ EXP_FILES = [
     "final_pool_audit_20261005.json", "collect_isolation_20260927.json",
     "timing_retest_20260927.json", "e1_negative_pool_20260927.json",
     "gpu_ledger_machine.json", "t16_r3_density_dev.json",
+    "r2_verdict_v8_paint_nodilate_mean_20261005.json",
+    "r2_verdict_v8_paint_dil1b_20261005.json", "r2_verdict_v8_paint_dil2_20261005.json",
+    "r2_verdict_swa_20261005.json", "dev9_beta08_v8d1_20261005.json",
+    "r3b_scan_lateral_20261004.json", "r3b_scan_parallel_20261004.json",
+    "t16_r3_pool_density_scenes.json", "t16_r3_pool_b_density_scenes.json",
+    "t16_learning_validation_20261009_r3/decision_auto-truth-b73b1b5a0228-r0.json",
+    "t16_learning_validation_20261009_r3/decision_auto-truth-b73b1b5a0228-r1.json",
+    "t16_learning_validation_20261009_r3/champion.json",
+    "t16_learning_validation_20261009_r3/loop_config.json",
+    "t16_learning_validation_20261009_r3/gpu_minutes.json",
+    "t16_learning_validation_20261009_r3/events.jsonl",
+    "t16_scenes_wcu_20261007/scene_report.json",
     "final_set_v5_20261005/seal/final_set_seal.json",
     "final_set_v5_20261005/seal/confirmation_base6x-seed42.json",
     "final_set_v5_20261005/seal/final_set_ledger.jsonl",
@@ -55,54 +70,52 @@ EXP_FILES = [
 BENCH_GLOB = ("scorecard_*.json", "manifest_*.json", "town_*.json")
 PAPER_FILES = ["paper.md", "paper_zh.md", "supplement.md", "supplement_zh.md",
                "references.bib", "CLAIMS_20261007.md", "REVIEW_20261007.md",
-               "REFS_VERIFICATION_20261007.md"]
-
-
-def sha256(p: Path) -> str:
-    h = hashlib.sha256()
-    with p.open("rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
-    return h.hexdigest()
+               "REFS_VERIFICATION_20261007.md", "build_paper.py",
+               "figure_inputs_20261009.json"]
 
 
 def main() -> int:
     OUT.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d")
+    stamp = time.strftime("%Y%m%d_%H%M%S")
     zp = OUT / f"T16_evidence_{stamp}.zip"
-    manifest = {"generated": time.strftime("%Y-%m-%d %H:%M:%S"),
-                "note": "论文每个数字所依赖的最小产物集；路径为仓库内相对路径",
-                "entries": []}
-    missing = []
-    with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED, compresslevel=9) as z:
-        def add(p: Path, arc: str) -> None:
-            if not p.is_file():
-                missing.append(str(p.relative_to(ROOT)))
-                return
-            z.write(p, arc)
-            manifest["entries"].append({"arc": arc, "bytes": p.stat().st_size,
-                                        "sha256": sha256(p)})
-        for name in EXP_FILES:
-            add(E / name, f"experiments/{name}")
-        for pat in BENCH_GLOB:
-            for p in sorted(BENCH.glob(pat)):
-                add(p, f"fsd_benchmark/{p.name}")
-        for name in PAPER_FILES:
-            add(PAPER / name, f"paper/{name}")
-        add(ROOT / "docs" / "T16_PROTOCOL_FACTOR_DECOMP_PREREG_20261007.md",
-            "docs/T16_PROTOCOL_FACTOR_DECOMP_PREREG_20261007.md")
-        add(ROOT / "docs" / "T16_PROTOCOL_FACTOR_DECOMP_RESULT_20261007.md",
-            "docs/T16_PROTOCOL_FACTOR_DECOMP_RESULT_20261007.md")
-        add(ROOT / "docs" / "T16_E4_SECOND_MAP_RESULT_20261007.md",
-            "docs/T16_E4_SECOND_MAP_RESULT_20261007.md")
-        z.writestr("MANIFEST.json", json.dumps(manifest, ensure_ascii=False, indent=1))
+    entries = [(E / name, f"experiments/{name}") for name in EXP_FILES]
+    for pattern in BENCH_GLOB:
+        entries += [(p, f"fsd_benchmark/{p.name}") for p in sorted(BENCH.glob(pattern))]
+    entries += [(PAPER / name, f"paper/{name}") for name in PAPER_FILES]
+    expected = {}
+    for figure in ("fig21", "fig22"):
+        for entry in figure_input_specs(ROOT, PAPER / "figure_inputs_20261009.json", figure):
+            path = ROOT / entry["path"]
+            if entry["path"].startswith("logs/experiments/"):
+                arc = "experiments/" + entry["path"][len("logs/experiments/"):]
+            else:
+                arc = "fsd_benchmark/" + path.name
+            if not any(existing == arc for _, existing in entries):
+                entries.append((path, arc))
+            expected[arc] = entry["sha256"]
+    for name in ("T16_PROTOCOL_FACTOR_DECOMP_PREREG_20261007.md",
+                 "T16_PROTOCOL_FACTOR_DECOMP_RESULT_20261007.md",
+                 "T16_E4_SECOND_MAP_RESULT_20261007.md",
+                 "T16_E5_POSE_SWEEP_RESULT_20261007.md",
+                 "T16_RUNTIME_LEARNING_REPAIR_20261009.md",
+                 "T16_DEVELOPMENT_RESULT_20261009.md",
+                 "T16_EXISTING_DATA_VALIDATION_CONFIG_20261009.json"):
+        entries.append((ROOT / "docs" / name, f"docs/{name}"))
+    source = source_snapshot(ROOT)
+    entries += [(ROOT / name, f"source/{name}") for name in source["files"]]
+    expected.update({f"source/{name}": digest for name, digest in source["files"].items()})
+    manifest = build_archive(zp, entries, metadata={
+        "generated": time.strftime("%Y-%m-%d %H:%M:%S"), "source": source,
+        "note": "限定证据与对应源码；不包含模型或原始训练帧，不替代完整数据复现"}, expected_sha256=expected)
     (OUT / f"MANIFEST_{stamp}.json").write_text(
         json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
     print(f"[archive] {zp} ({zp.stat().st_size/1e6:.2f} MB, {len(manifest['entries'])} 个文件)")
-    if missing:
-        print(f"[archive] 缺失 {len(missing)} 项（清单里已跳过）: {missing[:6]}")
+    if manifest["missing"]:
+        print(f"[archive] 缺失 {len(manifest['missing'])} 项：已入清单，归档不完整")
+    if manifest["validation_errors"]:
+        print(f"[archive] 冻结摘要不符 {len(manifest['validation_errors'])} 项：归档不完整")
     print(f"[archive] 清单 -> {OUT / f'MANIFEST_{stamp}.json'}")
-    return 0
+    return 0 if manifest["complete"] and source["complete"] else 2
 
 
 if __name__ == "__main__":
