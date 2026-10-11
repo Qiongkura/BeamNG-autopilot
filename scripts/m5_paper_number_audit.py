@@ -149,6 +149,26 @@ def main() -> int:
     expect("开发池真值保留", round(v7d["gt_keep"], 2), 0.69, 5e-3)
     expect("有限类别池真值保留", round(v7r["gt_keep"], 2), 0.89, 5e-3)
 
+    # E5 起点位姿 A/B（2026-10-11）：逐 run 指标回查
+    import math
+    ab = [("01_O", 41, 24.79, 3.484, 20), ("02_B", 43, 24.73, 3.944, 26),
+          ("03_B", 42, 24.61, 1.573, 30)]
+    nets = []
+    for name, n_fr, span, net, acc in ab:
+        t = json.loads((E / "e5_ab_20261011" / name / "pose_00" / "telemetry.json")
+                       .read_text(encoding="utf-8"))
+        net_src = sum(math.dist(f["pos"][:2], g["pos"][:2]) for f, g in zip(t, t[1:]))
+        acc_src = sum(1 for f in t if not f.get("plan_blocked"))
+        expect(f"E5 AB {name} 帧数", len(t), n_fr)
+        expect(f"E5 AB {name} 曝光s", round(t[-1]["t"] - t[0]["t"], 2), span, 5e-3)
+        expect(f"E5 AB {name} 净行进m", round(net_src, 3), net, 5e-4)
+        expect(f"E5 AB {name} 被接受路径帧", acc_src, acc)
+        nets.append(round(net_src, 3))
+    expect("E5 AB B 臂重复净行进比", round(max(nets[1], nets[2]) / min(nets[1], nets[2]), 1), 2.5)
+    r4 = json.loads((E / "e5_ab_20261011" / "04_O" / "pose_00" / "result.json")
+                    .read_text(encoding="utf-8"))
+    expect("E5 AB 04_O 保持 invalid", int(bool(r4.get("qualified"))), 0)
+
     print(f"=== 数字审计：检查 {checked} 项 ===")
     for b in bad:
         print("  ✗", b)
