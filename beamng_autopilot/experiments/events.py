@@ -39,6 +39,9 @@ TRANSITIONS = {
     "training": ("evaluating", "failed", "paused"),
     "evaluating": ("rejected", "shadow_candidate", "needs_evidence",
                    "training", "paused", "failed"),
+    # A rejected candidate closes a round, not the lifetime of its controller.
+    # Restart still enters queued/paused; it cannot jump to final approval.
+    "rejected": ("queued", "paused", "failed"),
     "needs_evidence": ("evaluating", "training", "paused", "failed"),
     "shadow_candidate": ("final_testing", "rejected", "paused", "failed"),
     "final_testing": ("approved_for_review", "rejected", "paused", "failed"),

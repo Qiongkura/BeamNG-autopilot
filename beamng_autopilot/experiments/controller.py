@@ -56,6 +56,9 @@ class LoopConfig:
     proposals: str = ""
     rounds: int = 2
     epochs: int = 3
+    # 两臂共享优化步预算与初始权重；0 / None 保留既有 epoch 配方。
+    total_steps: int = 0
+    init: str | None = None
     batch: int = 4
     lr: float = 1e-3
     allow_road_only: bool = False
@@ -80,6 +83,31 @@ class LoopConfig:
     collect_teleport: tuple = ()        # (x, y, yaw_deg)：换没采过的路段
     collect_runtime: str = "tech"
     collect_timeout_s: int = 1800
+    # native retains the existing camera-ring collection; controlled uses the
+    # existing Tech scene generator plus independent automatic truth exporter.
+    collect_source: str = "native"       # native | controlled
+    collect_truth_anchors: int = 1
+    collect_truth_sites: int = 5
+    collect_truth_frames: int = 2
+    collect_truth_anchor_offset: int = 0
+    collect_truth_attempts: int = 2
+    collect_truth_line_convention: str = "tiers"
+
+    def __post_init__(self) -> None:
+        if (isinstance(self.total_steps, bool)
+                or not isinstance(self.total_steps, int)
+                or self.total_steps < 0):
+            raise ValueError("total_steps must be a non-negative integer")
+        if self.init is not None and (
+                not isinstance(self.init, str) or not self.init.strip()):
+            raise ValueError("init must be a non-empty checkpoint path or null")
+        if self.collect_source not in ("native", "controlled"):
+            raise ValueError("collect_source must be native or controlled")
+        if self.collect_source == "controlled":
+            if self.collect_runtime != "tech":
+                raise ValueError("controlled truth requires Tech")
+            from .autonomous_data import spec_from_config
+            spec_from_config(self)
 
     def hash(self) -> str:
         blob = json.dumps(asdict(self), sort_keys=True, default=str)
@@ -88,8 +116,12 @@ class LoopConfig:
     @classmethod
     def load(cls, path: Path | str) -> "LoopConfig":
         blob = json.loads(Path(path).read_text(encoding="utf-8"))
-        known = {k: v for k, v in blob.items()
-                 if k in cls.__dataclass_fields__}
+        if not isinstance(blob, dict):
+            raise ValueError("LoopConfig must be a JSON object")
+        unknown = sorted(set(blob) - set(cls.__dataclass_fields__))
+        if unknown:
+            raise ValueError("unknown LoopConfig fields: " + ", ".join(unknown))
+        known = dict(blob)
         if "seeds" in known:
             known["seeds"] = tuple(known["seeds"])
         if "collect_roles" in known:
@@ -608,6 +640,10 @@ def plan_once(cfg: LoopConfig, *, run_id: str, candidate_id: str,
              "--events", str(Path(cfg.experiments_root) / run_id
                              / "events.jsonl"),
              "--out", str(out_dir), "--seed", str(seed)]
+    if cfg.total_steps > 0:
+        train += ["--total-steps", str(cfg.total_steps)]
+    if cfg.init is not None:
+        train += ["--init", cfg.init]
     if extra_train_args:
         train += list(extra_train_args)
     acts = [PlanAction(name="train_candidate", cmd=train, phase="training",
@@ -624,24 +660,39 @@ def plan_once(cfg: LoopConfig, *, run_id: str, candidate_id: str,
         reason=("四层评估：像素/候选/几何(UNKNOWN)/性能；成对输入与硬门槛值由"
                 "评估前的产物文件提供，评估本身不猜数")))
     if cfg.collect == "tech":
-        acts.append(PlanAction(
-            name="collect_tech", phase="auditing", gpu_minutes=5.0,
-            optional=True,
-            cmd=[py, str(Path(script_dir) / "m5_collect_seg_ring.py"),
-                 "--runtime", cfg.collect_runtime,
-                 "--map", cfg.collect_map,
-                 "--frames", str(int(cfg.collect_frames)),
-                 "--step-m", str(float(cfg.collect_step_m)),
-                 "--step", str(int(cfg.collect_step)),
-                 "--roles", *[str(r) for r in cfg.collect_roles],
-                 *(["--teleport"] + [str(float(v)) for v in cfg.collect_teleport]
-                   if len(tuple(cfg.collect_teleport or ())) == 3 else []),
-                 *(["--follow-road"] if cfg.collect_follow_road else []),
-                 *(["--save-annotation"] if cfg.collect_save_annotation else []),
-                 "--out", str(Path("logs/m5_seg") / f"collect_{run_id}_<stamp>")],
-            reason=("用户 2026-09-25 已授权无人值守采集；启动前过前置检查"
-                    "（游戏在跑就不抢会话），采集后过身份审计（缺 "
-                    "map_name/source_id 拒收）")))
+        if cfg.collect_source == "controlled":
+            from .autonomous_data import export_command, scene_command, spec_from_config
+            spec = spec_from_config(cfg)
+            directory = Path(cfg.experiments_root) / run_id / "auto_truth"
+            acts[0:0] = [
+                PlanAction(name="generate_auto_truth", phase="auditing", gpu_minutes=5.0,
+                           cmd=scene_command(spec, directory / "attempt_00" / "raw",
+                                             python=py, scripts=script_dir, attempt=0),
+                           reason="Tech 受控场景；有限换路段重试，保留失败证据"),
+                PlanAction(name="certify_auto_truth", phase="auditing", gpu_minutes=0.0,
+                           cmd=export_command(spec, directory / "attempt_00" / "raw",
+                                              directory / "attempt_00" / "qualified",
+                                              python=py, scripts=script_dir),
+                           reason="资格与逐帧摘要核验；通过的数据才进入训练提议")]
+        else:
+            acts.append(PlanAction(
+                name="collect_tech", phase="auditing", gpu_minutes=5.0,
+                optional=True,
+                cmd=[py, str(Path(script_dir) / "m5_collect_seg_ring.py"),
+                     "--runtime", cfg.collect_runtime,
+                     "--map", cfg.collect_map,
+                     "--frames", str(int(cfg.collect_frames)),
+                     "--step-m", str(float(cfg.collect_step_m)),
+                     "--step", str(int(cfg.collect_step)),
+                     "--roles", *[str(r) for r in cfg.collect_roles],
+                     *(["--teleport"] + [str(float(v)) for v in cfg.collect_teleport]
+                       if len(tuple(cfg.collect_teleport or ())) == 3 else []),
+                     *(["--follow-road"] if cfg.collect_follow_road else []),
+                     *(["--save-annotation"] if cfg.collect_save_annotation else []),
+                     "--out", str(Path("logs/m5_seg") / f"collect_{run_id}_<stamp>")],
+                reason=("用户 2026-09-25 已授权无人值守采集；启动前过前置检查"
+                        "（游戏在跑就不抢会话），采集后过身份审计（缺 "
+                        "map_name/source_id 拒收）")))
     return LoopPlan(run_id=run_id, config_hash=cfg.hash(), actions=acts,
                     notes=[f"collect={cfg.collect}",
                            f"collect_roles={list(cfg.collect_roles)}",

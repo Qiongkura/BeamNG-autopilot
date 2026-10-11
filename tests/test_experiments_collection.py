@@ -347,6 +347,39 @@ def test_close_started_game_reports_what_is_still_running(monkeypatch):
     assert got["closed"] is False and got["still_running"] == [6], got
     assert "GPU 仍在被占用" in got["reason"], got
 
+def test_post_cleanup_unknown_is_not_reported_as_closed(monkeypatch):
+    from beamng_autopilot.experiments import collection as col
+    snapshots = [{8}, None]
+    monkeypatch.setattr(col, "game_pids", lambda *a, **k: snapshots.pop(0))
+    monkeypatch.setattr(col.subprocess, "run",
+                        lambda *a, **k: type("Result", (), {"returncode": 0})())
+    result = col.close_started_game(set())
+    assert result["closed"] is False and result["verification_unknown"]
+
+
+def test_cleanup_waits_for_authoritative_exit_after_taskkill(monkeypatch):
+    from beamng_autopilot.experiments import collection as col
+    snapshots = [{8}, {8}, set()]
+    monkeypatch.setattr(col, "game_pids", lambda *a, **k: snapshots.pop(0))
+    monkeypatch.setattr(col.time, "sleep", lambda *a: None)
+    monkeypatch.setattr(col.subprocess, "run",
+                        lambda *a, **k: type("Result", (), {"returncode": 0})())
+    result = col.close_started_game(set(), verify_timeout_s=1.0)
+    assert result["closed"] and not result["still_running"]
+
+
+def test_vanished_child_is_not_killed_or_treated_as_live_unverified(monkeypatch):
+    from beamng_autopilot.experiments import collection as col
+    snapshots = [{8}, set()]
+    monkeypatch.setattr(col, "game_pids", lambda *a, **k: snapshots.pop(0))
+    monkeypatch.setattr(col, "game_procs", lambda *a, **k: {})
+    calls = []
+    monkeypatch.setattr(col.subprocess, "run", lambda *a, **k: calls.append(a))
+    result = col.close_started_game(set(), launched_after=1.0, verify_timeout_s=1.0)
+    assert result["closed"] and not calls
+    assert result["vanished_before_verification"][0]["pid"] == 8
+
+
 
 def test_the_game_is_closed_only_with_proven_ownership(monkeypatch):
     """G06：新出现的 pid 还要能证明是这次任务起的才关。

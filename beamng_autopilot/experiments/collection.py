@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
+import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -205,7 +206,8 @@ def game_pids(images: tuple = GAME_IMAGES) -> set | None:
 
 def close_started_game(pids_before, *, images: tuple = GAME_IMAGES,
                        timeout_s: int = 30,
-                       launched_after: float | None = None) -> dict:
+                       launched_after: float | None = None,
+                       verify_timeout_s: float = 0.0) -> dict:
     """结束**本次采集期间新出现**的游戏进程；已存在的会话一律不碰。
 
     实测缺陷（2026-09-25）：无人值守采集结束后游戏还在跑——采集器只关了连接，
@@ -244,8 +246,8 @@ def close_started_game(pids_before, *, images: tuple = GAME_IMAGES,
                 continue
             verified.append(pid)
         started = verified
-    if not started:
-        return {"closed": True, "killed": [],
+    if not started and not unverified:
+        return {"closed": not bool(unverified), "killed": [],
                 "unverified": unverified,
                 "note": ("采集没有留下新的游戏进程"
                          + ("（有进程无法证明归属，未动）"
@@ -262,12 +264,26 @@ def close_started_game(pids_before, *, images: tuple = GAME_IMAGES,
             failed.append(pid)
             _ = exc
     left = game_pids(images)
-    still = sorted((set(int(p) for p in left) if left is not None else set())
-                   & set(started))
-    return {"closed": not still, "killed": killed, "failed": failed,
+    # taskkill can return before process teardown is visible to tasklist;
+    # a child can also disappear while its creation time is being read.
+    # Wait for authoritative absence, never reclassify that race as ownership
+    # and never kill a process whose creation time was unavailable.
+    verify_end = time.monotonic() + max(0.0, float(verify_timeout_s))
+    before_set = set(int(p) for p in pids_before)
+    while (left is None or set(left) - before_set) and time.monotonic() < verify_end:
+        time.sleep(0.25)
+        left = game_pids(images)
+    still = sorted(set(left) - before_set) if left is not None else []
+    vanished = [u for u in unverified if left is not None and u["pid"] not in left]
+    unverified = [u for u in unverified if left is None or u["pid"] in left]
+    return {"closed": left is not None and not still and not unverified,
+            "killed": killed, "failed": failed,
             "unverified": unverified, "still_running": still,
-            "reason": ("" if not still else
-                       f"仍在运行：{still}（GPU 仍在被占用，后续计时会被污染）")}
+            "vanished_before_verification": vanished,
+            "verification_unknown": left is None,
+            "reason": ("收尾后进程状态 UNKNOWN" if left is None else
+                       f"仍在运行：{still}（GPU 仍在被占用，后续计时会被污染）"
+                       if still else "进程归属未证实" if unverified else "")}
 
 
 def preflight(*, spec: CollectSpec, game_running: bool | None,
