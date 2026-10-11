@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -233,15 +234,15 @@ class _RawRange:
     ray_hits: list = field(default_factory=list)
     heading: float | None = None
     radius: float = 55.0
+    meta: dict = field(default_factory=dict)
 
 
 class TechRangeProvider(RangeProvider):
     """LiDAR plus scenario/vehicle obstacle sources on BeamNG.tech.
 
-    Declares the two-phase range split: ``fetch`` holds ``io_lock`` only
-    for the sensor reads, ``process`` does the 200+ ms of clustering with
-    no lock held, so a caller may run that half on a worker thread (plan
-    phase A4) without ever putting socket access on two threads.
+    Declares the two-phase range split: ``fetch`` holds ``io_lock`` for
+    sensor reads, ``process`` clusters without that lock. Per-sample timings
+    distinguish IO from CPU work; socket access remains on the caller thread.
     """
 
     range_split = True
@@ -312,6 +313,38 @@ class TechRangeProvider(RangeProvider):
         except Exception:
             return None
 
+    def arm_replay_capture(self, directory) -> None:
+        """Opt-in first valid warmup payload; never enabled by normal driving."""
+        self._replay_capture_lock = threading.Lock()
+        self._replay_capture_dir = directory
+        self._replay_capture_result = {"status": "pending"}
+
+    def disarm_replay_capture(self) -> dict:
+        """Join any diagnostic write before measurement, including async warmup."""
+        lock = getattr(self, "_replay_capture_lock", None)
+        if lock is None:
+            return {}
+        with lock:
+            self._replay_capture_dir = None
+            return dict(getattr(self, "_replay_capture_result", {}) or {})
+
+    def _capture_replay(self, payload, pos) -> None:
+        with self._replay_capture_lock:
+            capture_dir = self._replay_capture_dir
+            if capture_dir is None:
+                return
+            # Disarm BEFORE the write: a failed/partial diagnostic may not
+            # repeatedly tax the control loop or overwrite evidence.
+            self._replay_capture_dir = None
+            try:
+                from beamng_autopilot.experiments.range_replay import write_replay
+                self._replay_capture_result = write_replay(
+                    capture_dir, payload, pos=pos,
+                    ego_half_len=self._ego_half_len, ego_half_width=self._ego_half_w)
+            except Exception as exc:
+                self._replay_capture_result = {"status": "failed", "reason": str(exc)}
+            payload.meta["replay_capture"] = dict(self._replay_capture_result)
+
     def fetch(self, pos, ego_vid=None, radius: float = 55.0):
         """Connection-only phase: LiDAR poll + Lua fan, under ``io_lock``.
 
@@ -322,21 +355,34 @@ class TechRangeProvider(RangeProvider):
         stays exactly ``process(fetch(...))``.
         """
         cloud = np.empty((0, 3), dtype=float)
+        fetch_t0 = time.perf_counter()
+        meta = {"schema": "range-timing-v1", "source_poll_started_t": time.time(),
+                "age_basis": "poll_start_proxy",
+                "sensor_capture_t": None, "lidar_unpack_ms": None, "source_errors": {}}
         lua_obstacles: list[Obstacle] = []
         ray_hits: list[tuple[float, float]] = []
         heading: float | None = None
         with self.conn.io_lock:
+            meta["lock_wait_ms"] = 1000.0 * (time.perf_counter() - fetch_t0)
+            lidar_t0 = time.perf_counter()
             try:
                 data = self.lidar.poll()
+                meta["lidar_poll_ms"] = 1000.0 * (time.perf_counter() - lidar_t0)
+                unpack_t0 = time.perf_counter()
                 cloud = np.asarray(data.get("pointCloud"), dtype=float)
                 if cloud.ndim != 2 or cloud.shape[1] < 3:
                     cloud = np.empty((0, 3), dtype=float)
                 cloud = cloud[np.isfinite(cloud).all(axis=1)]
                 heading = self._ego_heading()
+                meta["lidar_unpack_ms"] = 1000.0 * (time.perf_counter() - unpack_t0)
                 last_error["raycast"] = None
             except Exception as exc:
+                meta["source_errors"]["lidar"] = str(exc)
                 last_error["raycast"] = str(exc)
                 print(f"[tech] lidar scan failed: {exc}")
+            finally:
+                meta.setdefault("lidar_poll_ms", 1000.0 * (time.perf_counter() - lidar_t0))
+            lua_t0 = time.perf_counter()
             try:
                 # Scenario / vehicle registry / raycast fan (shared with
                 # Steam).  The dense 360 LiDAR is a first-class obstacle
@@ -348,11 +394,21 @@ class TechRangeProvider(RangeProvider):
                     return_hits=True)
                 last_error["raycast"] = None
             except Exception as exc:
+                meta["source_errors"]["lua"] = str(exc)
                 last_error["raycast"] = str(exc)
                 print(f"[tech] raycast scan failed: {exc}")
-        return _RawRange(cloud=cloud, lua_obstacles=list(lua_obstacles),
-                         ray_hits=list(ray_hits), heading=heading,
-                         radius=float(radius))
+            finally:
+                meta["lua_poll_ms"] = 1000.0 * (time.perf_counter() - lua_t0)
+        meta["fetch_ms"] = 1000.0 * (time.perf_counter() - fetch_t0)
+        meta["fetch_finished_t"] = time.time()
+        meta["finite_cloud_points"] = len(cloud)
+        payload = _RawRange(cloud=cloud, lua_obstacles=list(lua_obstacles),
+                            ray_hits=list(ray_hits), heading=heading,
+                            radius=float(radius), meta=meta)
+        capture_dir = getattr(self, "_replay_capture_dir", None)
+        if capture_dir is not None and len(cloud) >= 4 and not meta["source_errors"]:
+            self._capture_replay(payload, pos)
+        return payload
 
     def process(self, payload, pos, ego_vid=None,
                 radius: float = 55.0) -> RangeSample:
@@ -364,6 +420,10 @@ class TechRangeProvider(RangeProvider):
         """
         if payload is None:
             payload = _RawRange()
+        process_t0 = time.perf_counter()
+        meta = dict(payload.meta)
+        meta["source_errors"] = dict(meta.get("source_errors", {}))
+        meta["process_started_t"] = time.time()
         cloud = payload.cloud
         heading = payload.heading
         radius = float(payload.radius or radius)
@@ -395,8 +455,17 @@ class TechRangeProvider(RangeProvider):
                          <= self._ego_half_w + LIDAR_SELF_MARGIN))
             keep = keep & ~on_car
             near_keep = near_keep & ~on_car
-        kept = downsample_cloud(cloud[keep])
-        pts = [(float(x), float(y)) for x, y, _ in kept]
+        if payload.ray_hits:
+            # This was already the published corridor source. Do not voxelise
+            # hundreds of thousands of far points only to replace that list.
+            pts = list(payload.ray_hits)
+            meta["corridor_source"] = "existing_ray_hits"
+            meta["corridor_downsampled"] = False
+        else:
+            kept = downsample_cloud(cloud[keep])
+            pts = [(float(x), float(y)) for x, y, _ in kept]
+            meta["corridor_source"] = "lidar"
+            meta["corridor_downsampled"] = True
         # Drop the local ground plane from the near field the same way
         # lidar_obstacles does: on flat ground the 1-2.5 m band is full of
         # ground returns that project onto the emergency corridor and pin
@@ -413,12 +482,12 @@ class TechRangeProvider(RangeProvider):
             else:
                 near_cloud = near_cloud[:0]
         near_pts = [(float(x), float(y)) for x, y, _ in near_cloud]
-        if payload.ray_hits:
-            pts = list(payload.ray_hits)
         # Merge the 360-LiDAR near field on top of the Lua fan so a wall
         # right in front of the bonnet is never invisible, whichever
         # sensor channel happened to fire this frame.
         pts = pts + near_pts
+        meta["prepare_ms"] = 1000.0 * (time.perf_counter() - process_t0)
+        fusion_t0 = time.perf_counter()
         # Tech-native LiDAR obstacles: cluster the dense 360 cloud (with
         # local ground removal) and fuse with the Lua sources.  Lua boxes
         # come first so a vehicle's registry velocity survives the merge;
@@ -432,9 +501,21 @@ class TechRangeProvider(RangeProvider):
                                self._ego_half_w + LIDAR_SELF_MARGIN,
                                float(heading if heading is not None
                                      else 0.0)))
-                self._lidar_tracker.update(boxes, time.time())
+                processed_t = time.time()
+                source_t = meta.get("source_poll_started_t")
+                if (isinstance(source_t, (int, float)) and not isinstance(source_t, bool)
+                        and np.isfinite(source_t)
+                        and 0 < source_t <= processed_t):
+                    tracker_t = float(source_t)
+                    meta["tracker_time_basis"] = "poll_start_proxy"
+                else:
+                    tracker_t = processed_t
+                    meta["tracker_time_basis"] = "processing_time_fallback"
+                meta["tracker_timestamp_t"] = tracker_t
+                self._lidar_tracker.update(boxes, tracker_t)
                 obstacles = merge_obstacles(obstacles + boxes)
             except Exception as exc:
+                meta["source_errors"]["lidar_fusion"] = str(exc)
                 last_error["raycast"] = str(exc)
                 print(f"[tech] lidar obstacle fusion failed: {exc}")
         elif not obstacles and pts:
@@ -442,7 +523,10 @@ class TechRangeProvider(RangeProvider):
             # lidar channel are unavailable: cluster the corridor hits.
             for sector in _split_raycast_sectors(pts, (ox, oy)):
                 obstacles.extend(_cluster_points(sector, split_walls=True))
-        return RangeSample(obstacles=obstacles, ray_hits=pts)
+        meta["fusion_ms"] = 1000.0 * (time.perf_counter() - fusion_t0)
+        meta["process_ms"] = 1000.0 * (time.perf_counter() - process_t0)
+        meta["process_finished_t"] = time.time()
+        return RangeSample(obstacles=obstacles, ray_hits=pts, meta=meta)
 
     def scan(self, pos, ego_vid=None, radius: float = 55.0) -> RangeSample:
         """Synchronous contract: exactly ``process(fetch(...))``.
