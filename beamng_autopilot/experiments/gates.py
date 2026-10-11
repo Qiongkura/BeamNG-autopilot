@@ -183,6 +183,11 @@ class PairedResult:
     candidate: list = field(default_factory=list)
     lower_is_better: bool = False
 
+    #: 崩坏种子判据（2026-10-11 剂量扫描实测）：值 < 自臂中位数的这个比例
+    #: 即为崩坏（d20 的 s46 dev IoU 0.170 vs 臂中位 0.439）。中位数基准
+    #: 免标定、免量纲；只在 n>=3 时判（更少的样本里中位数本身不稳）。
+    COLLAPSE_FRACTION = 0.5
+
     @property
     def n(self) -> int:
         return min(len(self.champion), len(self.candidate))
@@ -192,11 +197,44 @@ class PairedResult:
         return [float(c) - float(b) for b, c in
                 zip(self.champion, self.candidate)]
 
+    def _collapse_seeds(self, values: list) -> list[int]:
+        """崩坏种子索引：值 < 自臂中位数的 COLLAPSE_FRACTION（n>=3 才判）。"""
+        vals = [float(v) for v in values]
+        if len(vals) < 3:
+            return []
+        med = (sorted(vals)[len(vals) // 2] if len(vals) % 2
+               else (sorted(vals)[len(vals) // 2 - 1]
+                     + sorted(vals)[len(vals) // 2]) / 2.0)
+        if med == 0:
+            return []
+        return [i for i, v in enumerate(vals)
+                if v < self.COLLAPSE_FRACTION * med]
+
+    def _collapse_report(self) -> dict:
+        """崩坏诊断：verdict/mean_delta 口径不动，只把崩坏对摊开给读者。"""
+        ci = self._collapse_seeds(self.champion)
+        ca = self._collapse_seeds(self.candidate)
+        excluded = sorted(set(ci) | set(ca))
+        kept = [d for i, d in enumerate(self.deltas) if i not in excluded]
+        return {
+            "rule": (f"value < {self.COLLAPSE_FRACTION} x own-arm median, "
+                     "n>=3"),
+            "champion_indices": ci, "candidate_indices": ca,
+            "excluded_pairs": excluded,
+            "n_pairs_excluded": len(excluded),
+            "mean_delta_excluding_collapse": (
+                round(sum(kept) / len(kept), 5) if kept else None),
+            "why_it_matters": ("2026-10-11 dose sweep: one d20 seed collapsed "
+                               "to IoU 0.170 (arm median 0.439); unflagged "
+                               "collapse seeds contaminate paired means"),
+        }
+
     def summary(self) -> dict:
         d = self.deltas
         if not d:
             return {"metric": self.metric, "n": 0, "mean_delta": None,
                     "missing": "no paired seeds measured"}
+        collapse = self._collapse_report()
         mean = sum(d) / len(d)
         sd = (math.sqrt(sum((x - mean) ** 2 for x in d) / (len(d) - 1))
               if len(d) > 1 else 0.0)
@@ -222,6 +260,9 @@ class PairedResult:
                 "candidate": [round(float(x), 5) for x in self.candidate],
                 "deltas": [round(x, 5) for x in d],
                 "mean_delta": round(mean, 5), "sd": round(sd, 5),
+                # 崩坏种子诊断（只增不改）：mean_delta 的口径保持冻结；
+                # 排除崩坏对的均值另行给出，供读者判断配对结论的稳健性。
+                "collapse": collapse,
                 "ci95_halfwidth": (None if half == float("inf")
                                    else round(half, 5)),
                 "ci95_halfwidth_approx_2sd": (

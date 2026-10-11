@@ -992,3 +992,37 @@ def test_the_calibrated_candidate_gates_only_bite_when_declared():
     from beamng_autopilot.experiments.protocol import CANDIDATE_GATES
     assert "HAVE a line reference" in CANDIDATE_GATES["coverage_denominator"]
     assert CANDIDATE_GATES["candidate_reference_coverage_min"] == 0.80
+
+
+def test_paired_compare_flags_collapse_seeds_additively():
+    """崩坏种子诊断（剂量扫描实证）：verdict/mean_delta 口径冻结不动。
+
+    候选侧一个崩坏种子（0.170，臂中位 0.439）会把配对均值从 +0.037 拖成
+    -0.024——诊断字段把它摊开：排除后均值另行给出，读者自会判断。
+    """
+    from beamng_autopilot.experiments.gates import paired_compare
+    r = paired_compare("line_iou",
+                       [0.4548, 0.4773, 0.3055, 0.4390, 0.4390],
+                       [0.4758, 0.5163, 0.3829, 0.4484, 0.1703])
+    # mean_delta 与 verdict 口径不变（冻结）：崩坏种子撑大 CI，原始口径
+    # 只能给 inconclusive——排除后的均值翻正在诊断字段里可见。
+    assert r["mean_delta"] == -0.02438
+    assert r["verdict"] == "inconclusive"
+    # 诊断：候选侧 index 4 是崩坏种子；排除后均值翻正并可见
+    c = r["collapse"]
+    assert c["candidate_indices"] == [4] and c["champion_indices"] == []
+    assert c["excluded_pairs"] == [4]
+    assert c["mean_delta_excluding_collapse"] == 0.0367
+    assert "0.5 x own-arm median" in c["rule"]
+
+
+def test_paired_compare_no_collapse_reports_empty_diagnostic():
+    from beamng_autopilot.experiments.gates import paired_compare
+
+    r = paired_compare("line_iou", [0.45, 0.48, 0.46], [0.49, 0.52, 0.51])
+    c = r["collapse"]
+    assert c["excluded_pairs"] == []
+    assert c["mean_delta_excluding_collapse"] == r["mean_delta"]
+    # n=2 不判崩坏（中位数本身不稳）
+    r2 = paired_compare("line_iou", [0.1, 0.5], [0.5, 0.6])
+    assert r2["collapse"]["excluded_pairs"] == []
