@@ -134,3 +134,93 @@ def test_the_gate_is_recorded_in_the_rounds_audit(tmp_path) -> None:
             for w in gate["weak"]] == [True], gate
     assert gate["note"].startswith("confirmed=0 weak=1"), gate["note"]
     assert "弱负例" in r.stdout, r.stdout[-500:]
+
+
+def test_line_evidence_rollup_and_rounds_record(tmp_path) -> None:
+    """回合级线证据占比入 rounds_dataset.json（阶段二第 5 项分母）。
+
+    R3 实测教训：60/75 帧无线像素的池子照训不误——占比必须显式落盘，
+    配比单因子实验才有可比分母。
+    """
+    from scripts.m5_seg_autoloop import line_evidence_rollup  # noqa: E402
+
+    roll = line_evidence_rollup({
+        "a": {"n_frames": 60, "n_line_frames": 0},
+        "b": {"n_frames": 15, "n_line_frames": 15}})
+    assert roll == {"train_frames": 75, "train_frames_with_line": 15,
+                    "line_frame_share": 15 / 75}
+    assert line_evidence_rollup({}) == {"train_frames": 0,
+                                        "train_frames_with_line": 0,
+                                        "line_frame_share": None}
+
+    # 接线证明：真跑一轮（桩训练器），rounds_dataset.json 带上 line_evidence
+    import importlib.util
+    import json
+    import os
+    import subprocess
+    import sys
+
+    import numpy as np
+
+    root = Path(__file__).resolve().parents[1]
+    neg = tmp_path / "runs" / "coll_neg" / "front_main"
+    neg.mkdir(parents=True)
+    for i in range(3):
+        np.savez(neg / f"frame_{i:05d}.npz",
+                 colour=np.full((30, 40, 3), 40 + i, np.uint8),
+                 label=np.zeros((30, 40), np.uint8))
+    (tmp_path / "runs" / "coll_neg" / "meta.json").write_text(json.dumps({
+        "map_name": "italy", "source_id": "ring_neg",
+        "map_name_source": "session.get_current().level",
+        "frames": [{"i": i, "view": "front_main", "exposure": i,
+                    "path": f"front_main/frame_{i:05d}.npz"}
+                   for i in range(3)]}), encoding="utf-8")
+    pos = tmp_path / "runs" / "coll_pos" / "front_main"
+    pos.mkdir(parents=True)
+    for i in range(3):
+        lab = np.zeros((30, 40), np.uint8)
+        lab[6:26, :] = 1
+        lab[15, :6] = 2
+        np.savez(pos / f"frame_{i:05d}.npz",
+                 colour=np.full((30, 40, 3), 10 + i * 5, np.uint8), label=lab)
+    (tmp_path / "runs" / "coll_pos" / "meta.json").write_text(json.dumps({
+        "map_name": "italy", "source_id": "ring_pos",
+        "map_name_source": "session.get_current().level",
+        "frames": [{"i": i, "view": "front_main", "exposure": i,
+                    "path": f"front_main/frame_{i:05d}.npz"}
+                   for i in range(3)]}), encoding="utf-8")
+    dev = tmp_path / "runs" / "coll_dev" / "front_main"
+    dev.mkdir(parents=True)
+    for i in range(2):
+        lab = np.zeros((30, 40), np.uint8)
+        lab[6:26, :] = 1
+        np.savez(dev / f"frame_{i:05d}.npz",
+                 colour=np.full((30, 40, 3), 200 + i, np.uint8), label=lab)
+    (tmp_path / "runs" / "coll_dev" / "meta.json").write_text(json.dumps({
+        "map_name": "italy", "source_id": "ring_dev",
+        "map_name_source": "session.get_current().level",
+        "frames": [{"i": i, "view": "front_main", "exposure": i,
+                    "path": f"front_main/frame_{i:05d}.npz"}
+                   for i in range(2)]}), encoding="utf-8")
+    prop = tmp_path / "props.json"
+    prop.write_text(json.dumps({"proposals": [
+        {"candidate_id": "cand", "factor": {"lr": 0.0005}}]}),
+        encoding="utf-8")
+    env = dict(os.environ)
+    env["BEAMNG_LOGS_DIR"] = str(tmp_path / "logs")
+    env["PYTHONPATH"] = str(root) + os.pathsep + env.get("PYTHONPATH", "")
+    r = subprocess.run(
+        [sys.executable, str(root / "scripts" / "m5_seg_autoloop.py"), "rounds",
+         "--run-id", "line_ev", "--rounds", "1",
+         "--runs", str(pos), str(neg), "--eval-runs", str(dev),
+         "--allow-road-only", "--seeds", "42", "--epochs", "24",
+         "--device", "cpu", "--proposals", str(prop),
+         "--trainer-script", str(root / "tests" / "_stub_trainer_e2e.py")],
+        capture_output=True, text=True, env=env, timeout=900)
+    assert r.returncode == 0, r.stdout[-900:] + r.stderr[-400:]
+    rep = json.loads((tmp_path / "logs" / "experiments" / "line_ev"
+                      / "rounds_dataset.json").read_text(encoding="utf-8"))
+    assert rep["line_evidence"] == {"train_frames": 6,
+                                    "train_frames_with_line": 3,
+                                    "line_frame_share": 0.5}, \
+        rep.get("line_evidence")

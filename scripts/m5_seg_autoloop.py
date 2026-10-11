@@ -2405,6 +2405,21 @@ def resolve_paint_sources(args) -> dict:
     return out
 
 
+def line_evidence_rollup(line_by_dir: dict) -> dict:
+    """回合级线证据占比（复核方案阶段二第 5 项的分母要求）。
+
+    R3 实测（2026-10-11 审计）：75 个训练帧里 60 帧来自 verified 无线目录
+    （line_pixels=0），线候选照样训练、IoU 掉到 0.370——配比单因子实验
+    必须有这个显式占比做分母，否则"负例剂量"只是口头描述。
+    """
+    frames = sum(int(v.get("n_frames") or 0) for v in line_by_dir.values())
+    with_line = sum(int(v.get("n_line_frames") or 0)
+                    for v in line_by_dir.values())
+    return {"train_frames": frames,
+            "train_frames_with_line": with_line,
+            "line_frame_share": (with_line / frames) if frames else None}
+
+
 def _rounds_audit(args, train_runs, log) -> tuple:
     """训练前的数据准入门（方案步骤 5 的"审计"那一步）。
 
@@ -2482,6 +2497,7 @@ def _rounds_audit(args, train_runs, log) -> tuple:
               # （§22.3：合成线数据占比）与负例资格都用这一份，不重复读盘
               "train_line_by_dir": {k: dict(v) for k, v in
                                     _neg_by_dir.items()},
+              "line_evidence": line_evidence_rollup(_neg_by_dir),
               "n_records_train": len(mf_tr.records),
               "n_records_dev": len(mf_dev.records),
               "coverage_dev": mf_dev.coverage().get("dev", {}),
