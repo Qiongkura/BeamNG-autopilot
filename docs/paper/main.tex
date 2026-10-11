@@ -460,11 +460,17 @@ perception lane frequently precedes path generation; sweep rejection is a separa
 is the principal reason in 8 of the 46 baseline frames. The larger-offset and mountain extensions were then rerun with the explicit `fixed_actual_pose` contract.
 All four larger-offset poses were rejected before exposure because production placement drifted by 2.57--3.08 m
 against the 0.10 m tolerance (`placement_rc=4`); all four mountain poses reached the placement deadline
-without equal-exposure drive measurement (`placement_rc=3`). A re-anchored repeat at a measured +5 m production-alignment actual pose then \textbf{qualified}: position error 0.0209 m,
+without equal-exposure drive measurement (`placement_rc=3`). A re-anchored repeat at the measured actual
+pose of a +5 m along-track request after production placement (7.85 m forward, +2.19° heading change; the
+offset is along the heading, not road-lateral) then \textbf{qualified}: position error 0.0209 m,
 heading error 0.087°, `placement_rc=0`, 26.203 s drive elapsed, 42 frames and 22 accepted-path frames; owned cleanup
-was verified. This is one qualified fixed-actual-pose \textbf{offset} observation after reverse calibration, not a strict
-randomized A/B against the baseline; the two extensions remain placement-contract outcomes, not driving-quality
-or safety results.
+was verified. A pre-registered start-pose A/B (order O$\rightarrow$B$\rightarrow$B$\rightarrow$O, two repeats per arm) then gave \textbf{3/4 qualified}
+runs, with one O-arm repeat recorded invalid (telemetry exposure too short, preserved as-is). The three qualified
+runs had near-equal exposure (24.61--24.79 s); the two B-arm repeats differ 2.5$\times$ in net travel (3.944 m vs 1.573 m),
+while the single qualified O observation (3.484 m, 20 accepted-path frames) falls inside the B-arm repeat range ---
+**session-level run-to-run variability exceeds the start-pose difference, and no causal start-pose separation is
+claimed**; the contrast reinforces our reserve about single closed-loop readings. The two extensions remain
+placement-contract outcomes, not driving-quality or safety results.
 Per-run traces, arm-level distributions and lane-placement distributions are in the supplement.
 Zero observed collisions, off-pavement frames and reversing in the four formal acceptance runs do not
 establish safety, particularly under near-stationary operation. The body-footprint centre-crossing
