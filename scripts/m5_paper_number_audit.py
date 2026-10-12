@@ -203,6 +203,14 @@ def main() -> int:
     expect("剂量 d100−d20 mean", round(pd["mean"], 4), 0.0871)
     expect("剂量 d100−d20 正向种子数", pd["positive_count"], 5)
 
+    # 第二线帧池跨池配对（2026-10-13）
+    cp = json.loads((E / "t16_crosspool_20261012" / "crosspool_summary.json")
+                    .read_text(encoding="utf-8"))
+    cp_iou = cp["paired"]["line_iou"]
+    expect("跨池 line IoU E−H mean", round(cp_iou["mean_delta"], 4), 0.1003)
+    expect("跨池 line IoU E−H 正向种子数", sum(1 for d in cp_iou["deltas"] if d > 0), 5)
+    expect("跨池 line IoU 配对 n", cp_iou["n"], 5)
+
     print(f"=== 数字审计：检查 {checked} 项 ===")
     for b in bad:
         print("  ✗", b)
