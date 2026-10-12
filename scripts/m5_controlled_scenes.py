@@ -1045,19 +1045,26 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
                                   is_render_depth=True, is_visualised=False,
                                   integer_depth=False)
                 try:
-                    conn.bng.control.step(3)
-                    cal_data = cam_cal.poll() or {}
+                    cal_data = {}
+                    for _cal_try in range(6):
+                        with conn.io_lock:
+                            conn.bng.control.step(3)
+                            cal_data = cam_cal.poll() or {}
+                        _candidate = np.asarray(cal_data.get("depth"), dtype=float)
+                        if _candidate.size:
+                            break
+                    _ndc = _candidate if "_candidate" in locals() else np.asarray([], dtype=float)
                 finally:
                     try:
                         cam_cal.remove()
                     except Exception:                          # noqa: BLE001
                         pass
-            _ndc = np.asarray(cal_data.get("depth"), dtype=float)
             _ndc_max = (float(_ndc.max()) if _ndc.size else float("nan"))
             if _ndc.size and 0.0 < _ndc_max <= 1.5:
                 depth_cal_m = ndc_depth_to_meters(_ndc, near=_NEAR, far=_FAR)
                 np.savez_compressed(
                     out_dir / f"{tag}_depthcal.npz",
+                    depth_ndc=np.ascontiguousarray(_ndc, dtype=np.float32),
                     depth_m=np.ascontiguousarray(depth_cal_m, dtype=np.float32),
                     near=_NEAR, far=_FAR,
                     camera_json=json.dumps(frames[-1]["camera"] if frames else {}))

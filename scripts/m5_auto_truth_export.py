@@ -329,7 +329,9 @@ def camera_block_from_frames(frames: list, site_dir) -> dict:
 
 
 def scene_frame_paths(batch: Path, name: str) -> list:
-    return sorted((batch / "frames").glob(f"{name}_*.npz"))
+    """Return ordinary frame files, excluding the float-depth calibration shot."""
+    return sorted(fp for fp in (batch / "frames").glob(f"{name}_*.npz")
+                  if not fp.name.endswith("_depthcal.npz"))
 
 
 def load_scene_frames(batch: Path, name: str) -> list:

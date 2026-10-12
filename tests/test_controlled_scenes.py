@@ -588,6 +588,7 @@ def test_depth_calibration_shot_is_wired_into_capture():
            / "m5_controlled_scenes.py").read_text("utf-8")
     assert "is_using_shared_memory=False" in src
     assert "_depthcal.npz" in src
+    assert "depth_ndc=" in src
     assert "ndc_depth_unavailable" in src   # 失败/跳过原样记录，不编造
 
 

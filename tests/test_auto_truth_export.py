@@ -535,3 +535,16 @@ def test_fsd_drive_cleanup_closes_the_game_it_started():
     assert i_base < i_pids, "基线只在非 attach 分支里取"
     i_fin = src.index("close_started_game(_pids_before,")
     assert i_fin > i_pids, "收尾关游戏在建立连接之后"
+
+
+def test_scene_frame_paths_excludes_float_depth_calibration_shots(tmp_path):
+    """标定 depthcal npz 不是 RGB/annotation 帧，不能进入导出器主清单。"""
+    mod = _load()
+    frames = tmp_path / "frames"
+    frames.mkdir()
+    (frames / "known_line_a0s0_00000.npz").write_bytes(b"frame")
+    (frames / "known_line_a0s0_00001.npz").write_bytes(b"frame")
+    (frames / "known_line_a0s0_depthcal.npz").write_bytes(b"cal")
+    paths = mod.scene_frame_paths(tmp_path, "known_line_a0s0")
+    assert [p.name for p in paths] == [
+        "known_line_a0s0_00000.npz", "known_line_a0s0_00001.npz"]
