@@ -28,3 +28,4 @@
 - 线帧池阻断的三轮离线诊断（191033a/696fbe4/9b2397c）：相机基架假设否定、径向尺度否定、残差=链弧长单调函数 → **根因=生成器弯/坡道站点真值链与贴花沿弧分离**。浮点深度标定帧已实现冻结（f845c9a，门 3415 绿）；仪表化重采集两次因 Tech 启动握手失败推迟（环境级，非代码）。
 - 采集器相机姿态链已修复（26c1835，pytest 3417 + 深度离线 ALL PASS）：保存创建时车体系 `mount_dir_local`，逐帧用当前车辆基架正向变换到世界系；旧版每帧重瞄 `site.dir` 会在坡/弯道吞掉挂载俯仰/侧倾，形成伪投影残差。Tech 重采集验证待启动环境恢复。
 - Tech 恢复后窄化验证（2026-10-12，端口 50000）：修复后的相机局部光轴采集成功，known_line 覆盖/外观均 1.0，`_depthcal.npz` 生成；但冻结投影门仍 `after_px_median=1.271>1.0`，未获准入。浮点深度原始 buffer 已落盘但通用 near/far 反解背景饱和（真值点 affine RMSE 4.15m），暂不能定量链-贴花分离；跨池族配比仍锁定。见 `T16_LINEPOOL_COLLECTION_FINAL_20261012.md`。
+- non-shared depth 编码校准已完成：known4 53 个投影 truth points、每五点 holdout；5–10m p95 0.221m、10–15m p95 0.636m 支持，15m 外 p95 2.27–6.60m 拒绝；known3 无 depthcal，保持 UNKNOWN。工具与报告见 `scripts/m5_depth_calibration_audit.py` / `docs/T16_DEPTH_CALIBRATION_RESULT_20261012.md`。这不是链-贴花修复或安全证明。
