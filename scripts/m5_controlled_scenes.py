@@ -298,6 +298,43 @@ def _unit(v) -> np.ndarray:
     return a / n if n > 1e-12 else a
 
 
+def _vehicle_basis_from_state(state) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Return the current vehicle (forward, left, up) world basis."""
+    fwd = _unit(getattr(state, "dir", None))
+    if fwd.size < 3 or not np.isfinite(fwd[:3]).all() or np.linalg.norm(fwd[:3]) < 1e-9:
+        h = float(getattr(state, "heading", 0.0))
+        fwd = np.array([math.cos(h), math.sin(h), 0.0], dtype=float)
+    else:
+        fwd = fwd[:3]
+    up = _unit(getattr(state, "up", None))
+    if up.size < 3 or not np.isfinite(up[:3]).all() or np.linalg.norm(up[:3]) < 1e-9:
+        up = np.array([0.0, 0.0, 1.0], dtype=float)
+    else:
+        up = up[:3]
+    left = _unit(np.cross(up, fwd))
+    if left.size < 3 or np.linalg.norm(left[:3]) < 1e-9:
+        left = _unit(np.cross(np.array([0.0, 0.0, 1.0]), fwd))
+    up = _unit(np.cross(fwd, left))
+    return fwd, left, up
+
+
+def _camera_arg_to_world(camera_dir, state) -> np.ndarray:
+    """Transform BeamNG ``Camera(dir=...)`` local arg to current world direction.
+
+    ``_camera_dir_arg`` applies the BeamNG convention ``arg=(local_left,
+    -local_forward, local_up)``. The inverse is therefore ``local=(-arg_y,
+    arg_x,arg_z)``. Keeping this local vector fixed is essential: the camera is
+    vehicle-mounted, so its world optical axis must follow the vehicle's current
+    pitch/roll instead of being re-aimed at the road direction each frame.
+    """
+    fwd, left, up = _vehicle_basis_from_state(state)
+    arg = np.asarray(camera_dir, dtype=float).ravel()[:3]
+    if arg.size < 3 or not np.isfinite(arg).all():
+        raise ValueError("camera local direction must contain three finite values")
+    local = np.array([-arg[1], arg[0], arg[2]], dtype=float)
+    return _unit(local[0] * fwd + local[1] * left + local[2] * up)
+
+
 # ── 站点几何（沿 road network 走）─────────────────────────────────────────────
 def _walk_chain(edges, i0, t0, step_dir, *, max_hops=600):
     """沿一条 DecalRoad 的边链走到端点，返回 ``(i, t, 走过的米数)``。
@@ -898,15 +935,15 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
             # 这个偏差污染成 PROJECTION_MISMATCH。车辆状态带 dir/up（含俯仰与
             # 侧倾），挂载偏移在车体系里已知，重建的位姿与渲染一致。
             st = st_pre          # 用 poll **前**的姿态（最接近渲染时刻）
-            fwd_w = _unit(np.asarray(st.dir, dtype=float))
-            up_w = _unit(np.asarray(st.up, dtype=float))
-            left_w = _unit(np.cross(up_w, fwd_w))
-            # 车体系：x=左, y=-前, z=上（与 Camera(dir=) 的参数约定一致，见
-            # `m5_auto_truth_probe._camera_dir_arg` 的实测记录）
-            # 位置用**传感器读回**（权威）：实测（2026-09-27 扩量批次）我按
-            # 车体系 + CAMERA_POS 重建的位置与读回差 ~0.36 m——10 m 处就是 ~4 px，
-            # 正好是扩量后残差 3–5 px 的量级。方向仍用车辆状态（get_direction()
-            # 不含俯仰/侧倾，见 `m5_auto_truth_probe` 的记录）：两个量各取权威来源。
+            # 相机是挂载在车辆上的：创建时传入的 cam_dir 是车体系局部
+            # 光轴，采帧时必须用当前车辆基架把同一个局部向量正向变换回世界系。
+            # 旧代码反过来用 site.dir 重建，等价于每帧把相机重新瞄回世界道路
+            # 方向；在坡/弯道上会把挂载姿态误差伪装成链-贴花投影残差。
+            fwd_w, left_w, up_w = _vehicle_basis_from_state(st)
+            fwd = _camera_arg_to_world(cam_dir, st)
+            right = _unit(np.cross(fwd, up_w))
+            up = _unit(np.cross(right, fwd))
+            # 位置用**传感器读回**（权威）：重建失败才用当前车辆基架 + 挂载偏移。
             try:
                 _pos_read = [float(v) for v in cam.get_position()]
             except Exception:                                 # noqa: BLE001
@@ -915,14 +952,7 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
                     np.asarray(st.pos, dtype=float) + float(_CPOS[0]) * left_w
                     + (-float(_CPOS[1])) * fwd_w + float(_CPOS[2]) * up_w)]
             cam_pos = _pos_read
-            rd = _unit(np.asarray(site["dir"], dtype=float))
-            d_local = np.array([float(rd @ left_w), -float(rd @ fwd_w),
-                                float(rd @ up_w)])
-            fwd = _unit(d_local[0] * left_w + (-d_local[1]) * fwd_w
-                        + d_local[2] * up_w)
-            right = _unit(np.cross(fwd, up_w))
-            up = np.cross(right, fwd)
-            # 传感器读回（只作记录：两者的角度差就是上面那条发现的证据）
+            # 传感器读回只作记录；其方向不替代挂载相机的局部光轴重建。
             try:
                 _read_fwd = _unit(np.asarray(cam.get_direction(), dtype=float))
                 _read_pos = [float(v) for v in cam.get_position()]
@@ -933,7 +963,8 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
                         "pose": {"pos": cam_pos,
                                  "basis": {"right": [float(v) for v in right],
                                            "fwd": [float(v) for v in fwd],
-                                           "up": [float(v) for v in up]}}}
+                                           "up": [float(v) for v in up]}},
+                        "mount_dir_local": [float(v) for v in np.asarray(cam_dir)[:3]]}
             if palette is None:
                 palette = probe._tech_palette(conn, ann)
             label = np.ascontiguousarray(probe.to_label(

@@ -589,3 +589,32 @@ def test_depth_calibration_shot_is_wired_into_capture():
     assert "is_using_shared_memory=False" in src
     assert "_depthcal.npz" in src
     assert "ndc_depth_unavailable" in src   # 失败/跳过原样记录，不编造
+
+
+def test_camera_local_arg_follows_vehicle_pitch_not_world_road_direction():
+    """回归根因：挂载相机的局部光轴随车辆姿态旋转，不被每帧重瞄到 site.dir。"""
+    m = _load()
+    import math
+    from types import SimpleNamespace
+
+    cam_arg = np.array([0.0, -1.0, 0.0])  # Camera(dir=) 的车头前向
+    flat = SimpleNamespace(dir=np.array([1.0, 0.0, 0.0]),
+                           up=np.array([0.0, 0.0, 1.0]), heading=0.0)
+    pitch = math.radians(10.0)
+    tilted = SimpleNamespace(
+        dir=np.array([math.cos(pitch), 0.0, math.sin(pitch)]),
+        up=np.array([-math.sin(pitch), 0.0, math.cos(pitch)]),
+        heading=0.0)
+    f0 = m._camera_arg_to_world(cam_arg, flat)
+    f1 = m._camera_arg_to_world(cam_arg, tilted)
+    assert f0 == pytest.approx(np.array([1.0, 0.0, 0.0]), abs=1e-6)
+    assert f1 == pytest.approx(tilted.dir, abs=1e-6)
+    # 旧实现会返回平面 site.dir=(1,0,0)，把这 10° 车辆俯仰吞掉。
+    assert abs(float(f1[2])) > 0.1
+
+
+def test_capture_records_local_mount_direction_for_replay():
+    src = (Path(__file__).resolve().parents[1] / "scripts"
+           / "m5_controlled_scenes.py").read_text("utf-8")
+    assert "_camera_arg_to_world(cam_dir, st)" in src
+    assert "mount_dir_local" in src
