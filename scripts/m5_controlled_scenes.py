@@ -1040,8 +1040,8 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
                                   field_of_view_y=CAMERA_FOV_DEG,
                                   near_far_planes=(_NEAR, _FAR),
                                   is_using_shared_memory=False,
-                                  is_render_colours=False,
-                                  is_render_annotations=False,
+                                  is_render_colours=True,
+                                  is_render_annotations=True,
                                   is_render_depth=True, is_visualised=False,
                                   integer_depth=False)
                 try:
@@ -1074,6 +1074,7 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
                                    "m_max": round(float(depth_cal_m.max()), 3)}
             else:
                 depth_cal_stats = {"skipped": "ndc_depth_unavailable",
+                                   "ndc_keys": sorted(str(k) for k in cal_data.keys()),
                                    "ndc_max": (None if not _ndc.size
                                                else round(_ndc_max, 4))}
         except Exception as _cal_e:                          # noqa: BLE001
