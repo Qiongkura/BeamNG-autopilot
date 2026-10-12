@@ -60,6 +60,10 @@ def _predict(model: np.ndarray, raw: np.ndarray) -> np.ndarray:
 
 def _load_samples(depthcal: Path, scene: Path) -> tuple[np.ndarray, np.ndarray, dict]:
     d = np.load(depthcal, allow_pickle=False)
+    if "depth_ndc" not in d.files:
+        return np.zeros(0, dtype=float), np.zeros(0, dtype=float), {
+            "truth_points": 0, "skipped": {"depth_ndc_missing": 1},
+            "depthcal_files": list(d.files)}
     raw = np.asarray(d["depth_ndc"], dtype=np.float32)
     cam = json.loads(str(d["camera_json"]))
     blob = json.loads(scene.read_text(encoding="utf-8"))
