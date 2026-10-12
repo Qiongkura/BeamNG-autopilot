@@ -1050,7 +1050,23 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
                         with conn.io_lock:
                             conn.bng.control.step(3)
                             cal_data = cam_cal.poll() or {}
-                        _candidate = np.asarray(cal_data.get("depth"), dtype=float)
+                            _candidate = np.asarray(cal_data.get("depth"), dtype=float)
+                            # Some BeamNGpy/non-shared-memory combinations return
+                            # the processed dict with an empty depth while the raw
+                            # float buffer is available. Decode that raw channel
+                            # explicitly instead of silently calling it unavailable.
+                            if not _candidate.size:
+                                try:
+                                    _raw_cal = cam_cal.poll_raw() or {}
+                                    _raw_depth = _raw_cal.get("depth")
+                                    if isinstance(_raw_depth, str):
+                                        _raw_depth = _raw_depth.encode()
+                                    if _raw_depth:
+                                        _candidate = np.frombuffer(
+                                            _raw_depth, dtype=np.float32).reshape(
+                                                int(height), int(width))
+                                except Exception:
+                                    pass
                         if _candidate.size:
                             break
                     _ndc = _candidate if "_candidate" in locals() else np.asarray([], dtype=float)
@@ -1075,6 +1091,9 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
             else:
                 depth_cal_stats = {"skipped": "ndc_depth_unavailable",
                                    "ndc_keys": sorted(str(k) for k in cal_data.keys()),
+                                   "ndc_types": {str(k): type(v).__name__ for k, v in cal_data.items()},
+                                   "ndc_shapes": {str(k): (list(np.asarray(v).shape) if v is not None else None)
+                                                  for k, v in cal_data.items()},
                                    "ndc_max": (None if not _ndc.size
                                                else round(_ndc_max, 4))}
         except Exception as _cal_e:                          # noqa: BLE001
