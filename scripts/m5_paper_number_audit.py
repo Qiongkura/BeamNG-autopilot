@@ -222,6 +222,18 @@ def main() -> int:
            int(rp_iou["verdict"] == "inconclusive"), 1)
     expect("跨池重复 collapse pair 数", rp_iou["collapse"]["n_pairs_excluded"], 2)
 
+    # 跨池步预算扫描（2026-10-13）：30/60/120 steps，同池/种子/评测冻结
+    bs = json.loads((E / "t16_crosspool_budget_20261013" /
+                     "budget_summary.json").read_text(encoding="utf-8"))
+    want_budget = {"30": (-0.0957, 1), "60": (-0.0622, 2),
+                   "120": (-0.2139, 0)}
+    for steps, (mean_want, pos_want) in want_budget.items():
+        bp = bs["budgets"][steps]["paired"]["iou"]
+        expect(f"预算{steps} E−H mean", round(bp["mean_delta"], 4), mean_want)
+        expect(f"预算{steps} E−H 正向数", sum(1 for d in bp["deltas"] if d > 0), pos_want)
+    expect("预算120原始裁决champion_better",
+           int(bs["budgets"]["120"]["paired"]["iou"]["verdict"] == "champion_better"), 1)
+
     print(f"=== 数字审计：检查 {checked} 项 ===")
     for b in bad:
         print("  ✗", b)
