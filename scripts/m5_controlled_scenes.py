@@ -1151,8 +1151,25 @@ def run_scene(conn, probe, *, name: str, site: dict, rec: dict, truth_points: li
     # 站点对齐的朝向（与生成时的 ego 朝向同一约定）
     heading = math.atan2(site["dir"][1], site["dir"][0])
     mid = site["mid"]
-    conn.safe_teleport(float(mid[0]), float(mid[1]),
-                       heading_deg=math.degrees(heading))
+    try:
+        _ground_before = conn.ground_z_at(float(mid[0]), float(mid[1]))
+    except Exception:
+        _ground_before = None
+    _teleport_ok = conn.safe_teleport(float(mid[0]), float(mid[1]),
+                                      heading_deg=math.degrees(heading))
+    try:
+        _state_after_teleport = conn.get_state()
+        _actual_after_teleport = [float(v) for v in _state_after_teleport.pos]
+    except Exception:
+        _actual_after_teleport = None
+    site["teleport_alignment"] = {
+        "safe_teleport_ok": bool(_teleport_ok),
+        "ground_z_before": (None if _ground_before is None else float(_ground_before)),
+        "requested_mid_z": float(mid[2]),
+        "actual_pos_after": _actual_after_teleport,
+        "actual_minus_requested_z": (
+            None if _actual_after_teleport is None else
+            float(_actual_after_teleport[2] - float(mid[2]))) }
     # 驻车 + **显式挂前进挡**：实测（2026-09-27）场景里的玩家车 spawn 后挡位
     # 停在 R（NPC 是 N），teleport 与驻车指令都不改挡位——不显式选前进挡，
     # 留给人的就是一台挂着倒挡的车（用户实测反馈"卡在倒车档"）。
