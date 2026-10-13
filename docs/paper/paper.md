@@ -434,6 +434,8 @@ A second independent repeat of the cross-pool comparison used new paired seeds (
 
 A third, budget-controlled scan kept both pools, the initialization, the five paired seeds and the eight development packages fixed while varying only total optimization steps (30, 60, 120). The engine-minus-human line-IoU difference was −0.0957 ± 0.1354 (1/5 positive) at 30 steps, −0.0622 ± 0.2297 (2/5) at 60, and −0.2139 ± 0.1340 (0/5; `champion_better`) at 120; collapse diagnostics flagged anomalous pairs but did not replace the preregistered verdicts. Thus the second repeat and the budget scan jointly rule out a stable engine-pool advantage: the observed contrast is dominated by small-pool, seed and optimization-budget interactions.
 
+A 240-step independent budget repeat, with the same pools, initialization, seeds and evaluation, made the reversal stronger: engine minus human line-IoU was −0.4106 ± 0.0426, negative in all 5 pairs and `champion_better`; recall was −0.4214 ± 0.0447 in all 5 pairs. Precision was UNKNOWN in all five pairs because no valid positive denominator was present, and was not filled with zero. A third independent human pool (H2) gave a near-zero, inconclusive contrast (engine minus H2 +0.0119 ± 0.0164, positive in 2/5; precision UNKNOWN in 5/5). These results reinforce that pool content, seed and budget interactions dominate this small-pool study; no provenance ordering is established.
+
 The supplement sweeps the lateral
 scope instead: tightening it from 6.0 m to 3.0 m raises identity (dev 0.582 → 0.713; limited-class
 0.581 → 0.758) and removes candidates (477 → 166 and 166 → 127), while role agreement is flat — the
