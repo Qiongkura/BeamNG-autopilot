@@ -155,9 +155,9 @@ class LineSegLoss(nn.Module):
         """``class_mask`` 见 :func:`masked_cross_entropy`。
 
         整条通道被屏蔽时（``class_mask`` 不含 ``LINE_CLASS``）**不计算**
-        line 的区域项：区域项拿不到"哪些像素是线"，硬算等于用未标注的像素当
-        负样本。逐样本掩码若与本批的 line 权重同用，说明这一批混了"可信/不可信"
-        两种帧——那是调用方该拆批的场景，直接报错而不是悄悄改损失口径。
+        UNKNOWN/N-A/unverified frames are masked per sample; measured frames in
+        the same batch still contribute.  A mixed batch is valid because the
+        CE denominator and region-term valid mask are both sample-specific.
         """
         # 整帧/整批都是 ignore：没有任何监督可算。直接交给 F.cross_entropy
         # 会得到 **NaN**（零个有效像素求均值），NaN 会顺着反向传播污染整步权重。
@@ -165,20 +165,19 @@ class LineSegLoss(nn.Module):
         if not bool((target != self.ignore_index).any()):
             return logits.sum() * 0.0
         line_allowed = True
+        line_frame_mask = None
         if class_mask is not None:
-            m = torch.as_tensor(class_mask, dtype=torch.bool)
-            line_allowed = bool(m[LINE_CLASS]) if m.dim() == 1                 else bool(m[:, LINE_CLASS].all())
-            if not line_allowed and (self.w_tversky > 0.0
-                                     or self.w_cldice > 0.0):
-                if m.dim() == 2 and bool(m[:, LINE_CLASS].any()):
-                    raise ValueError(
-                        "这一批同时含'可信 line'与'不可信 line'的帧，而 line 区域"
-                        "项是开着的一一请拆批，或把 --line-tversky-weight / "
-                        "--line-cldice-weight 设为 0（路面通道实验的常规配方）")
-                # 整批禁用：丢掉区域项（不静默改口径，调用方在 CLI 里会看到提示）
-                region_w = 0.0
+            m = torch.as_tensor(class_mask, dtype=torch.bool,
+                                device=logits.device)
+            if m.dim() == 1:
+                line_allowed = bool(m[LINE_CLASS])
+                line_frame_mask = m[LINE_CLASS].view(1, 1, 1).expand_as(target)
+            elif m.dim() == 2:
+                line_frame_mask = m[:, LINE_CLASS].view(-1, 1, 1).expand_as(target)
+                line_allowed = bool(m[:, LINE_CLASS].any())
             else:
-                region_w = 1.0
+                raise ValueError(f"class_mask 维度只支持 [C] 或 [B,C]，得到 {m.shape}")
+            region_w = 1.0 if line_allowed else 0.0
         else:
             region_w = 1.0
         if class_mask is not None:
@@ -193,6 +192,8 @@ class LineSegLoss(nn.Module):
         prob = F.softmax(logits.float(), dim=1)[:, LINE_CLASS]
         tgt = (target == LINE_CLASS).float()
         valid = (target != self.ignore_index).float()
+        if line_frame_mask is not None:
+            valid = valid * line_frame_mask.float()
         loss = ce
         if self.w_tversky > 0.0:
             loss = loss + self.w_tversky * tversky_line_loss(

@@ -153,13 +153,16 @@ def test_masking_the_line_channel_drops_the_region_terms():
     assert float(masked) == pytest.approx(float(ce_only), rel=1e-6), \
         "区域项不该在整通道屏蔽时混进来"
 
-    # 混批（部分样本可信 line）+ 开着的区域项 = 调用方该拆批，直接报错
+    # 混批：逐样本区域项只对 measured line 样本计算；unknown sample 的 line
+    # 目标必须先由调用方改为 IGNORE（训练入口的 qualification mask 会做这一步）。
     mixed = torch.tensor([[True, True, True], [True, True, False]])
-    with _pytest.raises(ValueError, match="请拆批"):
-        crit(logits, target, class_mask=mixed)
-    # 关掉区域项后，混批是可算的
+    target_mixed = target.clone()
+    target_mixed[1][target_mixed[1] == 2] = 255
+    mixed_loss = crit(logits, target_mixed, class_mask=mixed)
+    assert torch.isfinite(mixed_loss)
+    # 关掉区域项后，混批同样可算
     assert float(LineSegLoss(w_tversky=0.0, w_cldice=0.0)(
-        logits, target, class_mask=mixed)) > 0.0
+        logits, target_mixed, class_mask=mixed)) > 0.0
 
 
 def _logits(*, line_hot: bool, h=16, w=16) -> torch.Tensor:
