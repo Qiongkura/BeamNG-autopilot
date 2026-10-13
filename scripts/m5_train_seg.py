@@ -62,6 +62,8 @@ from beamng_autopilot.vision.segmentation import (
     SegUNet, N_CLASSES, CLASS_NAMES, iou_from_accum,
 )
 from beamng_autopilot.experiments.checkpoint import checkpoint_extras, file_sha16
+from beamng_autopilot.experiments.credentials import read_dir_credentials
+from beamng_autopilot.experiments.labels import audit_label
 from beamng_autopilot.vision.dataset_split import (
     FrameRef, coverage_digest, cross_view_leak, frame_refs_from_meta,
     leak_check, select_weak_lines, split_audit, split_by_group,
@@ -121,6 +123,107 @@ def _run_key(rd: Path) -> str:
         return p.as_posix()
 
 
+def _channel_qualification(run_dir: Path, label: np.ndarray) -> dict:
+    """Resolve per-frame channel statuses without upgrading UNKNOWN to PASS.
+
+    A credential's explicit ``channels`` map is authoritative.  Legacy human
+    pools have no channel map, so ROAD/LINE are derived from the existing label
+    audit while SHOULDER/ROLE remain UNKNOWN.  The returned object travels with
+    the frame tuple and is consumed by both loss and metric denominators.
+    """
+    cred = read_dir_credentials(run_dir)
+    # No credential means a legacy/unversioned training directory.  Preserve
+    # the historical loader semantics (and do not invent a channel status);
+    # explicit credentials with missing channels still fall through to the
+    # conservative UNKNOWN derivation below.
+    if cred is None:
+        return None
+    blob = None
+    if cred and cred.get("path"):
+        try:
+            blob = json.loads(Path(cred["path"]).read_text(encoding="utf-8"))
+        except Exception:  # noqa: BLE001
+            blob = None
+    raw = (blob or {}).get("channels") if isinstance(blob, dict) else None
+    if not isinstance(raw, dict) and isinstance(blob, dict):
+        prov = blob.get("truth_provenance") or {}
+        labels = prov.get("labels") if isinstance(prov, dict) else None
+        raw = (labels or {}).get("channel_valid_area") \
+            if isinstance(labels, dict) else None
+    if isinstance(raw, dict):
+        statuses = {}
+        for name in ("LINE", "ROAD", "SHOULDER", "ROLE"):
+            value = raw.get(name)
+            statuses[name] = (str(value.get("status") or "unknown")
+                              if isinstance(value, dict)
+                              else str(value or "unknown"))
+        return {"channels": statuses,
+                "source": str((blob or {}).get("label_source") or "")}
+    source = str((cred or {}).get("label_source") or "engine_annotation")
+    try:
+        q = audit_label(label, paint_source=source, credential=cred)
+        statuses = {
+            "LINE": "measured" if q.paint.valid else
+                    ("unverified_labels" if q.paint.usable else "unknown"),
+            "ROAD": "measured" if q.road.valid else
+                    ("unverified_labels" if q.road.usable else "unknown"),
+            "SHOULDER": "measured" if q.road_type_px else "unknown",
+            "ROLE": "unknown",
+        }
+    except Exception:  # noqa: BLE001
+        statuses = {name: "unknown" for name in
+                    ("LINE", "ROAD", "SHOULDER", "ROLE")}
+    return {"channels": statuses, "source": source}
+
+
+def _frame_qualification(frame) -> dict | None:
+    if isinstance(frame, (tuple, list)) and len(frame) >= 3 \
+            and isinstance(frame[2], dict):
+        return frame[2]
+    if isinstance(frame, dict) and isinstance(frame.get("qualification"), dict):
+        return frame["qualification"]
+    return None
+
+
+def _qualification_mask(batch, ys: torch.Tensor):
+    """Build per-sample class masks from LINE/ROAD/SHOULDER/ROLE status.
+
+    The current network has ROAD(class 1) and LINE(class 2) outputs; SHOULDER
+    and ROLE are still carried in the qualification contract and reported, but
+    have no output channel in this 3-class model.  Any non-``measured`` status
+    masks its represented class from both loss and metric denominators.
+    """
+    quals = [_frame_qualification(f) for f in batch]
+    if not any(quals):
+        return ys, None, {"frames": 0, "masked": 0, "statuses": {}}
+    y_eval = ys.clone()
+    cmask = torch.ones((ys.shape[0], N_CLASSES), dtype=torch.bool,
+                       device=ys.device)
+    statuses: dict[str, dict[str, int]] = {}
+    masked_frames = 0
+    class_map = {"ROAD": 1, "LINE": 2}
+    for b, qual in enumerate(quals):
+        channels = (qual or {}).get("channels") or {}
+        frame_masked = False
+        for channel, class_id in class_map.items():
+            status = str(channels.get(channel) or "unknown")
+            bucket = statuses.setdefault(channel, {})
+            bucket[status] = bucket.get(status, 0) + 1
+            if status == "measured":
+                continue
+            frame_masked = True
+            cmask[b, class_id] = False
+            y_eval[b][ys[b] == class_id] = 255
+        # Preserve visibility of the non-output channels in the report.
+        for channel in ("SHOULDER", "ROLE"):
+            status = str(channels.get(channel) or "unknown")
+            bucket = statuses.setdefault(channel, {})
+            bucket[status] = bucket.get(status, 0) + 1
+        masked_frames += int(frame_masked)
+    return y_eval, cmask, {"frames": len(quals), "masked": masked_frames,
+                            "statuses": statuses}
+
+
 def line_supervision_flags(ys, paint_source: str) -> list:
     """逐样本判断：这一帧的 **line 通道**有没有可信真值。
 
@@ -159,7 +262,7 @@ def load_frames(
     run_dirs: list[Path], min_line_frac: float = 0.0,
     line_only_dirs: set[str] | None = None,
     thin_line: int = 0,
-) -> tuple[list[tuple[np.ndarray, np.ndarray]], dict]:
+) -> tuple[list[tuple[np.ndarray, np.ndarray, dict]], dict]:
     """读取所有 npz 帧，按文件名排序（时间序）。
 
     ``min_line_frac > 0`` 时丢弃标线像素占比低于阈值的帧。返回
@@ -225,7 +328,12 @@ def load_frames(
             n_run += 1
             if min_line_frac > 0 and (label == 2).mean() < min_line_frac:
                 continue
-            frames.append((colour, label))
+            channel_qualification = _channel_qualification(rd, label)
+            channel_counts = rec.setdefault("channel_status_counts", {})
+            for _ch, _st in ((channel_qualification or {}).get("channels") or {}).items():
+                channel_counts.setdefault(_ch, {})[_st] = (
+                    channel_counts.setdefault(_ch, {}).get(_st, 0) + 1)
+            frames.append((colour, label, channel_qualification))
             # kept so the weak/faded-line band can be selected for real
             # (plan E7) instead of inferred from the run average
             rec.setdefault("fracs", []).append(float((label == 2).mean()))
@@ -266,7 +374,8 @@ def median_freq_weights(labels: list[np.ndarray],
                        line_weight: float = 2.0) -> torch.Tensor:
     """Median frequency balancing：权重与类别频率成反比。"""
     hist = np.zeros(N_CLASSES, dtype=np.float64)
-    for _, lab in labels:
+    for frame in labels:
+        lab = frame[1]
         known = np.asarray(lab).ravel()
         known = known[known < N_CLASSES]
         hist += np.bincount(known, minlength=N_CLASSES)
@@ -762,7 +871,7 @@ def _augment(frame, rng: np.random.Generator,
     """
     import cv2
 
-    colour, label = frame
+    colour, label = frame[:2]
     if rng.random() < 0.5:                      # 水平翻转
         colour = np.fliplr(colour).copy()
         label = np.fliplr(label).copy()
@@ -821,7 +930,10 @@ def _augment(frame, rng: np.random.Generator,
                 ww = int(rng.integers(2, 12))
                 erase[ys:ys + hh, xs:xs + ww] = True
             label[erase & line.astype(bool)] = 1
-    return colour, label
+    qualification = frame[2] if isinstance(frame, (tuple, list)) \
+        and len(frame) >= 3 else None
+    return ((colour, label, qualification)
+            if qualification is not None else (colour, label))
 
 
 def refuse_silent_overwrite(out_dir, *, resume: bool,
@@ -1342,7 +1454,7 @@ def main() -> None:
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
     def to_tensor(frame, dev):
-        colour, label = frame
+        colour, label = frame[:2]
         # All sources must share one batch shape: Tech captures are
         # 536x403 while the user's manual line frames are 400x300.
         # Resize RGB smoothly and labels with nearest-neighbour so class
@@ -1365,6 +1477,7 @@ def main() -> None:
                  "steps_per_epoch": 0}
     # 被整通道屏蔽的帧数（证据：这一轮到底有没有真的屏蔽掉 line 监督）
     _IGN = {"frames": 0}
+    _QUAL = {"frames": 0, "masked_frames": 0, "statuses": {}}
 
     def monitor_step(batch_i: int, ep: int, *, loss_v: float, acc_v: float,
                      lr_v: float, step_s: float) -> None:
@@ -1477,14 +1590,22 @@ def main() -> None:
             with torch.set_grad_enabled(train), \
                     torch.autocast("cuda", enabled=use_amp):
                 logits = model(xs)
-                ys_eval = ys
-                cmask = None
+                ys_eval, cmask, _qrep = _qualification_mask(batch, ys)
+                if _qrep["frames"]:
+                    _QUAL["frames"] += int(_qrep["frames"])
+                    _QUAL["masked_frames"] += int(_qrep["masked"])
+                    for _ch, _counts in _qrep["statuses"].items():
+                        dst = _QUAL["statuses"].setdefault(_ch, {})
+                        for _st, _n in _counts.items():
+                            dst[_st] = dst.get(_st, 0) + int(_n)
                 if args.ignore_line_class:
                     flags = line_supervision_flags(ys, args.paint_source)
                     if not all(flags):
-                        ys_eval = ys.clone()
-                        cmask = torch.ones((ys.shape[0], N_CLASSES),
-                                           dtype=torch.bool, device=device)
+                        if cmask is None:
+                            cmask = torch.ones((ys.shape[0], N_CLASSES),
+                                               dtype=torch.bool, device=device)
+                        if ys_eval is ys:
+                            ys_eval = ys.clone()
                         for _b, _ok in enumerate(flags):
                             if _ok:
                                 continue
@@ -1679,6 +1800,15 @@ def main() -> None:
         print(f"[train] 指标 -> {_mstore.path}（逐 step；硬件每 "
               f"{args.monitor_interval:g}s 采样）", flush=True)
 
+    if not bool(torch.isfinite(weights).all()):
+        _bad_weights = FloatingPointError(
+            f"非有限类别权重 weights={weights.tolist()}：按 T14 §4 立即失败")
+        # MetricsStore is initialized above when --metrics-run is used, so the
+        # failure is visible to the unattended dashboard rather than being a
+        # bare process exit with no terminal task record.
+        record_training_failure(_bad_weights)
+        raise _bad_weights
+
     # 恢复的 checkpoint 已经跑满预算时，循环一次都不进——停止原因要按事实写，
     # 不能因为没进循环就落成默认的 epochs
     stopped_by = ("step_budget"
@@ -1754,6 +1884,11 @@ def main() -> None:
         if args.ignore_line_class:
             hist.setdefault("line_ignored_frames", []).append(
                 int(_IGN["frames"]))
+        hist["channel_qualification"] = {
+            "frames": int(_QUAL["frames"]),
+            "masked_frames": int(_QUAL["masked_frames"]),
+            "statuses": {k: dict(v) for k, v in _QUAL["statuses"].items()},
+        }
         hist.setdefault("val_line_iou", []).append(
             None if line_iou_ep is None else round(line_iou_ep, 4))
         if mon["store"] is not None:
@@ -1862,6 +1997,12 @@ def main() -> None:
                 "ignore_line_class": bool(args.ignore_line_class),
                 "paint_source": args.paint_source,
                 "line_ignored_frames": int(_IGN["frames"]),
+                "channel_qualification": {
+                    "frames": int(_QUAL["frames"]),
+                    "masked_frames": int(_QUAL["masked_frames"]),
+                    "statuses": {k: dict(v)
+                                  for k, v in _QUAL["statuses"].items()},
+                },
                 "amp": use_amp,
                 "epochs": args.epochs,
                 "batch": args.batch,

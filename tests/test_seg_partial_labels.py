@@ -54,3 +54,37 @@ def test_verified_labels_allow_a_confirmed_empty_frame_as_a_negative():
     with_line = torch.zeros((1, 8, 8), dtype=torch.int64)
     with_line[0, 4, :4] = 2
     assert tr.line_supervision_flags(with_line, "human_revision") == [True]
+
+
+def test_channel_qualification_masks_unknown_road_and_unverified_line_per_sample():
+    """四通道资格掩码：UNKNOWN/N-A/unverified 不进相应 loss/metric 分母。"""
+    tr = _load_trainer()
+    import numpy as np
+    import torch
+
+    colour = np.zeros((8, 8, 3), dtype=np.uint8)
+    label = np.zeros((8, 8), dtype=np.uint8)
+    label[2:6, :] = 1
+    label[4, :] = 2
+    measured = {"channels": {"LINE": "measured", "ROAD": "measured",
+                              "SHOULDER": "unknown", "ROLE": "measured"}}
+    unknown = {"channels": {"LINE": "unverified_labels", "ROAD": "unknown",
+                             "SHOULDER": "not_applicable", "ROLE": "unknown"}}
+    batch = [(colour, label, measured), (colour, label, unknown)]
+    ys = torch.from_numpy(np.stack([label, label]).astype(np.int64))
+    y_eval, mask, report = tr._qualification_mask(batch, ys)
+    assert mask.shape == (2, 3)
+    assert bool(mask[0, 1]) and bool(mask[0, 2])
+    assert not bool(mask[1, 1]) and not bool(mask[1, 2])
+    assert int((y_eval[1] == 255).sum()) == int((label == 1).sum() + (label == 2).sum())
+    assert report["masked"] == 1
+    assert report["statuses"]["LINE"]["unverified_labels"] == 1
+    assert report["statuses"]["SHOULDER"]["not_applicable"] == 1
+
+
+def test_channel_qualification_fallback_keeps_unknown_channels_unknown():
+    tr = _load_trainer()
+    import numpy as np
+    label = np.zeros((4, 4), dtype=np.uint8)
+    q = tr._channel_qualification(Path("does-not-exist"), label)
+    assert q is None  # no credential: legacy loader does not invent qualification
