@@ -21,3 +21,17 @@
 通过；修复后重新采集仍出现 0 annotation line pixels、3/3 隔离，说明高程对齐不是唯一
 阻断，当前地图的 line material/渲染可见性链仍需独立排查。没有降低准入门，也没有把
 这批数据送入训练。
+
+## 7. 详细排查结论
+
+WCU4 的运行时调色板已保存：`SOLID_LINE=[255,196,128]`、`DASHED_LINE=[196,196,255]`，
+annotation API 映射本身可用；raw annotation 仍没有 line 类。进一步检查发现：
+
+* scene road-chain `mid.z=144.678`；
+* `ground_z_at`/teleport 后实际车辆 z≈213.6；
+* camera readback z≈213.6；
+* z 差约 69m，生成的 DecalRoad 与 truth chain 在实际相机/地面下方。
+
+因此 west_coast 当前首要阻断是 **road-network 高程与加载地图地面坐标不一致**，不是
+单纯 palette 名称；ground 对齐修复已加入，但首次重试仍未消除这个不一致，后续要在
+场景加载后再次测量并重建/平移受控道路对象，不能只换材质名。

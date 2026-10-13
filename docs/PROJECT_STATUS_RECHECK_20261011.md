@@ -48,3 +48,4 @@
 - 第五 LINE=measured 池扩展尝试收口（预注册 902442e/修订，2026-10-13）：offset140无anchor、offset130五链均过短、offset110采集挂起，均保留失败原因；本批次无新增准入池，已停止盲扫。下一扩展应改不同地图/道路档案或先扩展anchor规划容量。见 `T16_LINE_MEASURED_LARGE5_RESULT_20261013.md`。
 - west_coast_usa 第五地图尝试（预注册 c59bafe，2026-10-13）：3 known_line站点/9帧全部隔离，coverage/annotation line/appearance均无证据，准入0；启动与清理通过，未降门、未入训练。与E4地图线通道阻断一致，需材质/渲染对齐修复。见 `T16_LINE_MEASURED_WCU2_RESULT_20261013.md`。
 - west_coast 高程对齐修复（88f1bde）已通过纯逻辑/全量 pytest；重采集仍 0 annotation line pixels、3/3隔离，说明高程不是唯一阻断，地图材质/渲染可见性链仍需排查。
+- west_coast palette 已确认 API 映射可用（SOLID_LINE/DASHED_LINE存在），但运行证据显示 road-chain mid.z≈144.7、ground/vehicle/camera z≈213.6，约69m高程坐标不一致；ground对齐初修后仍未消除，下一步需场景加载后重建/平移受控道路对象。
