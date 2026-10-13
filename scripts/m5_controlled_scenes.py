@@ -335,6 +335,42 @@ def _camera_arg_to_world(camera_dir, state) -> np.ndarray:
     return _unit(local[0] * fwd + local[1] * left + local[2] * up)
 
 
+def _align_sites_to_ground(conn, sites: list[dict], map_name: str) -> list[dict]:
+    """Align generated road-chain heights to the loaded map surface.
+
+    west_coast_usa's road-network ``middle.z`` was observed about 69 m below
+    the actual terrain at the captured anchor.  Keeping that value made both
+    DecalRoad lines and truth points invisible while the vehicle/camera stood
+    on the real surface.  We only apply the correction to that map and record
+    every delta; a missing ground read is UNKNOWN and never guessed.
+    """
+    if str(map_name) != "west_coast_usa":
+        return sites
+    for site in sites:
+        mid = np.asarray(site.get("mid", []), dtype=float)
+        if mid.size < 3:
+            site["ground_alignment"] = {"status": "unknown", "why": "mid.z missing"}
+            continue
+        try:
+            gz = conn.ground_z_at(float(mid[0]), float(mid[1]))
+        except Exception as exc:  # noqa: BLE001
+            gz = None
+            site["ground_alignment"] = {"status": "unknown",
+                                         "why": f"ground query failed: {exc}"}
+        if gz is None or not np.isfinite(float(gz)):
+            site.setdefault("ground_alignment", {
+                "status": "unknown", "why": "ground_z_at returned no finite value"})
+            continue
+        delta = float(gz) - float(mid[2])
+        site["mid"][2] = float(gz)
+        prof = site.get("z_profile") or []
+        site["z_profile"] = [[float(s), float(z) + delta] for s, z in prof]
+        site["ground_alignment"] = {"status": "measured",
+                                     "ground_z_m": float(gz),
+                                     "delta_m": delta}
+    return sites
+
+
 # ── 站点几何（沿 road network 走）─────────────────────────────────────────────
 def _walk_chain(edges, i0, t0, step_dir, *, max_hops=600):
     """沿一条 DecalRoad 的边链走到端点，返回 ``(i, t, 走过的米数)``。
@@ -1415,6 +1451,8 @@ def main() -> int:
             raise RuntimeError("没有布出任何站点")
         report["sites"] = sites
         report["scene_types"] = scene_types
+        _align_sites_to_ground(conn, sites, str(args.map))
+        report["sites_after_ground_alignment"] = sites
         scen, rec = build_scenario(conn, sites, scene_types=scene_types,
                                    scene_names=scene_names)
         report["scenario"] = {"name": scen.name, "level": str(scen.level),

@@ -619,3 +619,19 @@ def test_capture_records_local_mount_direction_for_replay():
            / "m5_controlled_scenes.py").read_text("utf-8")
     assert "_camera_arg_to_world(cam_dir, st)" in src
     assert "mount_dir_local" in src
+
+
+def test_west_coast_ground_alignment_shifts_mid_and_z_profile_only_for_that_map():
+    m = _load()
+    class Conn:
+        def ground_z_at(self, x, y):
+            return 213.5
+    sites = [{"mid": [1.0, 2.0, 144.5],
+              "z_profile": [[0.0, 144.5], [10.0, 145.5]]}]
+    m._align_sites_to_ground(Conn(), sites, "west_coast_usa")
+    assert sites[0]["mid"][2] == pytest.approx(213.5)
+    assert sites[0]["z_profile"] == [[0.0, 213.5], [10.0, 214.5]]
+    assert sites[0]["ground_alignment"]["status"] == "measured"
+    other = [{"mid": [1.0, 2.0, 144.5], "z_profile": [[0.0, 144.5]]}]
+    m._align_sites_to_ground(Conn(), other, "italy")
+    assert "ground_alignment" not in other[0]
