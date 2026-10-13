@@ -635,3 +635,10 @@ def test_west_coast_ground_alignment_shifts_mid_and_z_profile_only_for_that_map(
     other = [{"mid": [1.0, 2.0, 144.5], "z_profile": [[0.0, 144.5]]}]
     m._align_sites_to_ground(Conn(), other, "italy")
     assert "ground_alignment" not in other[0]
+
+
+def test_run_scene_metadata_preserves_requested_map_and_palette_source():
+    src = (Path(__file__).resolve().parents[1] / "scripts"
+           / "m5_controlled_scenes.py").read_text("utf-8")
+    assert '"map": str(map_name)' in src
+    assert '"annotation_palette": palette' in src

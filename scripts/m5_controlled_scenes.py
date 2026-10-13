@@ -1141,11 +1141,12 @@ def capture_site(conn, probe, *, site: dict, n_frames: int, width: int,
         except Exception:                                    # noqa: BLE001
             pass
     return frames, palette, {"depth_raw": depth_raw_stats,
-                             "depth_cal": depth_cal_stats}
+                             "depth_cal": depth_cal_stats,
+                             "annotation_palette": palette}
 
 
 def run_scene(conn, probe, *, name: str, site: dict, rec: dict, truth_points: list,
-              n_frames: int, width: int, height: int, out_dir: Path,
+              map_name: str = "italy", n_frames: int, width: int, height: int, out_dir: Path,
               step_m: float = 0.0) -> dict:
     """一个站点的完整流程：teleport → 采帧 → 两种证据校验 → 记录。"""
     # 站点对齐的朝向（与生成时的 ego 朝向同一约定）
@@ -1190,7 +1191,7 @@ def run_scene(conn, probe, *, name: str, site: dict, rec: dict, truth_points: li
         fr["truth_points"] = [dict(p) for p in truth_points]
     batch = {
         "frames": frames,
-        "scene": {"map": "italy", "segment": rec.get("road_id", ""),
+        "scene": {"map": str(map_name), "segment": rec.get("road_id", ""),
                   "run_id": f"m5_controlled_{name}",
                   "scene_seed": 0, "game_version": "beamng_tech",
                   "renderer": "beamng_tech",
@@ -1318,6 +1319,7 @@ def run_scene(conn, probe, *, name: str, site: dict, rec: dict, truth_points: li
         "truth_contract": TRUTH_CONTRACT, "verifier_version": VERIFIER_VERSION,
         "generated": rec,
         "camera_meta": cam_meta,
+        "annotation_palette": palette,
         "verification_appearance": rep_app,
         "verification_annotation": rep_ann,
     }
@@ -1501,7 +1503,8 @@ def main() -> int:
                               "class": 1, "role": None})
             try:
                 res = run_scene(conn, probe, name=name, site=site, rec=rec_site,
-                                truth_points=truth, n_frames=int(args.frames),
+                                map_name=str(args.map), truth_points=truth,
+                                n_frames=int(args.frames),
                                 width=int(args.width), height=int(args.height),
                                 out_dir=out / "frames",
                                 step_m=float(args.step_m or 0.0))
