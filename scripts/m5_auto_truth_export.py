@@ -611,8 +611,14 @@ def export_scene(rec: dict, truth: list, frames: list, *, out_root: Path,
                        "run_id": f"m5_controlled_{scene}", "scene_seed": 0,
                        "game_version": "beamng_tech", "renderer": "beamng_tech",
                        "line_generated": True, "line_texture_embedded": False,
-                       "roles_defined": True, "road_defined": True,
-                       "label_source": "engine_annotation"},
+                        "roles_defined": True, "road_defined": True,
+                        # This batch is being exported only after the frozen
+                        # verify_batch gates passed; the source rank must match
+                        # the credential that the trainer will later read.
+                        # Leaving this as engine_annotation silently downgraded
+                        # LINE to unverified_labels even when projection,
+                        # coverage and appearance all passed.
+                        "label_source": "engine_verified"},
              "generator": {"name": "m5_controlled_scenes.py",
                            "version": str(generator.get("version") or ""),
                            "sha": str(generator.get("script_sha16") or "")},
@@ -651,10 +657,9 @@ def export_scene(rec: dict, truth: list, frames: list, *, out_root: Path,
         "labels": {"source_image_sha": _sha16_bytes(
                        "|".join(sorted(src_shas)).encode()),
                    "label_sha": _labels_digest(label_shas),
-                   "channel_valid_area": "full frame (generated scene: no "
-                                         "unknown pixels)",
-                   "unknown_reason": "",
-                   "occlusion_margin_m": occl_margin,
+                    "channel_valid_area": dict(rep.get("channels") or {}),
+                    "unknown_reason": "",
+                    "occlusion_margin_m": occl_margin,
                    "occlusion_mode": "report",
                    "certified_points": n_kept,
                    "declared_points": cert["n_total"],

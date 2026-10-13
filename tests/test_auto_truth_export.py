@@ -109,6 +109,7 @@ def test_export_writes_training_package_and_credential(tmp_path):
     assert (prov.get("labels") or {}).get("label_sha")
     # 合成批次复核通过 -> 才允许 engine_verified
     assert cred.get("label_source") == "engine_verified", cred.get("why")
+    assert cred["channels"]["LINE"]["status"] == "measured"
     assert res["verified"] is True
 
 
