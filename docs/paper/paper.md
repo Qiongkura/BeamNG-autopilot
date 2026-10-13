@@ -432,6 +432,8 @@ in part, to training-pool composition rather than to the increments being unlear
 
 A second independent repeat of the cross-pool comparison used new paired seeds (47--51) with the same pools, initialization, 60-step budget and development evaluation. It did **not** reproduce the first-round advantage: engine minus human line-IoU was −0.0574 ± 0.2356, positive in only 2/5 pairs, and the paired verdict was inconclusive. Two engine-arm seeds were flagged by the pre-registered collapse diagnostic; excluding them is shown only as a robustness diagnostic (+0.0972), not substituted for the preregistered result. The combined reading is therefore that the pool-family effect is **not established and is highly seed-/small-pool-sensitive**, not that either provenance is generally superior.
 
+A third, budget-controlled scan kept both pools, the initialization, the five paired seeds and the eight development packages fixed while varying only total optimization steps (30, 60, 120). The engine-minus-human line-IoU difference was −0.0957 ± 0.1354 (1/5 positive) at 30 steps, −0.0622 ± 0.2297 (2/5) at 60, and −0.2139 ± 0.1340 (0/5; `champion_better`) at 120; collapse diagnostics flagged anomalous pairs but did not replace the preregistered verdicts. Thus the second repeat and the budget scan jointly rule out a stable engine-pool advantage: the observed contrast is dominated by small-pool, seed and optimization-budget interactions.
+
 The supplement sweeps the lateral
 scope instead: tightening it from 6.0 m to 3.0 m raises identity (dev 0.582 → 0.713; limited-class
 0.581 → 0.758) and removes candidates (477 → 166 and 166 → 127), while role agreement is flat — the
