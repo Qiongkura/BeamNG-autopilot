@@ -19,3 +19,10 @@ anchor offset=60、5 个站点、3 帧/站，目标建立第二个独立 engine-
 5站所需的最小间距约束（30m×4）。该失败原样保留。为完成同一预注册因子的可执行
 验证，**只把站点数改为 3**（同 offset、同 frames/step/scene types/冻结门不变），
 目标调整为至少 3 站、9 帧；不把道路布站失败读成数据准入结果。
+
+## 修订 B（2026-10-13）
+
+修订 A 的 `--sites 3` 在该 offset 的单条道路链上仍被拒绝（实际只走到 2 站，
+链长 60m；失败原样保留）。本次改为 **`--anchors 2 --sites 2`**：每条独立道路链
+只布 2 站，目标 4 站/12 帧；offset、场景循环、frames/step、冻结准入门全部不变。
+跨 anchor 的组/content/exposure overlap 仍由 dataset audit 检查，任一冲突隔离。
