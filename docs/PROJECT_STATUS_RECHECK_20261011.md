@@ -36,3 +36,4 @@
 - 通道资格掩码训练支持已完成并冻结（b4b0a41）：LINE/ROAD 的 UNKNOWN、N-A、unverified 从损失与 IoU 分母移除，SHOULDER/ROLE 状态保留并审计；混合 measured/unverified batch 的区域损失支持逐样本 mask；全量 pytest 与深度离线均 PASS。见 `docs/T16_CHANNEL_QUALIFICATION_MASK_RESULT_20261013.md`。
 - 真实通道凭证小训练回归完成（2026-10-13）：engine_verified annotation.json/truth_provenance 实测输入，2 steps CPU；hist/checkpoint 均记录 LINE=unverified、ROAD=measured、SHOULDER=unknown、ROLE=unverified，6/6 帧 masked，line IoU 分母未伪造；loss/梯度有限且训练正常结束。见 `T16_CHANNEL_MASK_SMOKE_RESULT_20261013.md`。
 - 跨池 240-step 独立预算重复（预注册 6276f8c）完成：10训练/10评测；line IoU E−H −0.4106±0.0426、recall −0.4214±0.0447，均 0/5 正向、paired verdict=champion_better；precision 5/5 UNKNOWN（无有效正例分母）。结果进一步否定稳定 engine 池优势，见 `T16_CROSSPOOL_BUDGET240_RESULT_20261013.md`。
+- 第三个独立池 H2 跨池配对（预注册 ac38003，2026-10-13）：10训练/10评测0失败；H2 human 臂5种子 line IoU全0，E−H均值+0.0119±0.0164、正向2/5、inconclusive；recall +0.0123±0.0171、2/5；precision 5/5 UNKNOWN。不能解释为来源质量排序，进一步说明小池/内容/预算交互主导。见 `T16_CROSSPOOL_H2_RESULT_20261013.md`。
