@@ -234,6 +234,21 @@ def main() -> int:
     expect("预算120原始裁决champion_better",
            int(bs["budgets"]["120"]["paired"]["iou"]["verdict"] == "champion_better"), 1)
 
+    # 240-step repeat与第三独立 H2 池（2026-10-13）
+    b240 = json.loads((E / "t16_crosspool_budget240_20261013" /
+                       "budget240_summary.json").read_text(encoding="utf-8"))
+    b240_iou = b240["paired"]["iou"]
+    expect("预算240 E−H mean", round(b240_iou["mean_delta"], 4), -0.4106)
+    expect("预算240 E−H 正向数", sum(1 for d in b240_iou["deltas"] if d > 0), 0)
+    expect("预算240原始裁决champion_better",
+           int(b240_iou["verdict"] == "champion_better"), 1)
+    h2 = json.loads((E / "t16_crosspool_h2_20261013" /
+                     "h2_summary.json").read_text(encoding="utf-8"))
+    h2_iou = h2["paired"]["iou"]
+    expect("H2 E−H2 mean", round(h2_iou["mean_delta"], 4), 0.0119)
+    expect("H2 E−H2 正向数", sum(1 for d in h2_iou["deltas"] if d > 0), 2)
+    expect("H2 precision UNKNOWN seeds", len(h2["paired"]["prec"].get("unknown_seeds", [])), 5)
+
     print(f"=== 数字审计：检查 {checked} 项 ===")
     for b in bad:
         print("  ✗", b)
