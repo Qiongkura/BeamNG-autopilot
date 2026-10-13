@@ -211,6 +211,17 @@ def main() -> int:
     expect("跨池 line IoU E−H 正向种子数", sum(1 for d in cp_iou["deltas"] if d > 0), 5)
     expect("跨池 line IoU 配对 n", cp_iou["n"], 5)
 
+    # 第二独立跨池重复（2026-10-13）：首轮优势不复现，论文必须如实收缩
+    rp = json.loads((E / "t16_crosspool_repeat_20261013" /
+                     "crosspool_repeat_summary.json").read_text(encoding="utf-8"))
+    rp_iou = rp["paired"]["iou"]
+    expect("跨池重复 E−H mean", round(rp_iou["mean_delta"], 4), -0.0574)
+    expect("跨池重复 E−H 正向种子数", sum(1 for d in rp_iou["deltas"] if d > 0), 2)
+    expect("跨池重复配对 n", rp_iou["n"], 5)
+    expect("跨池重复原始 verdict inconclusive",
+           int(rp_iou["verdict"] == "inconclusive"), 1)
+    expect("跨池重复 collapse pair 数", rp_iou["collapse"]["n_pairs_excluded"], 2)
+
     print(f"=== 数字审计：检查 {checked} 项 ===")
     for b in bad:
         print("  ✗", b)
