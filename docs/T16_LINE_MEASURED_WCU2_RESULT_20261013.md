@@ -13,3 +13,11 @@
 渲染/annotation 中没有提供可验证线证据，因此不能作为 LINE=measured 池。该负结果
 与 E4 地图线通道阻断一致；需要地图材质/相机渲染对齐的独立修复后再试，不把它当
 成训练池或跨地图收益证据。
+
+## 6. 高程对齐修复尝试（2026-10-13）
+
+代码提交 `88f1bde` 增加 west_coast_usa 的 `ground_z_at` 对齐与 teleport_alignment 记录，
+因为此前 road-network `mid.z` 与实际场景高度存在明显不一致。纯逻辑回归和全量 pytest
+通过；修复后重新采集仍出现 0 annotation line pixels、3/3 隔离，说明高程对齐不是唯一
+阻断，当前地图的 line material/渲染可见性链仍需独立排查。没有降低准入门，也没有把
+这批数据送入训练。
