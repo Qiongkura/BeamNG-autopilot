@@ -26,3 +26,10 @@ anchor offset=60、5 个站点、3 帧/站，目标建立第二个独立 engine-
 链长 60m；失败原样保留）。本次改为 **`--anchors 2 --sites 2`**：每条独立道路链
 只布 2 站，目标 4 站/12 帧；offset、场景循环、frames/step、冻结准入门全部不变。
 跨 anchor 的组/content/exposure overlap 仍由 dataset audit 检查，任一冲突隔离。
+
+## 修订 C（2026-10-13）
+
+实际 anchor0 道路链不足，anchor1 仅 `known_line_a1s0` 通过冻结准入并导出 3 帧
+LINE=measured；`material_mix_a1s1` 由覆盖/残差/外观门隔离。目标“大池”未达成，
+失败原样保留。为不丢失独立性证据，后续训练回归将把这 **3 帧新 anchor pool** 作为
+新的独立 engine-verified 臂；结论限定为新池小样本资格回归，不称为大池收益。
