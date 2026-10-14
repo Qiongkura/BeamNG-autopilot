@@ -51,3 +51,4 @@
 - west_coast palette 已确认 API 映射可用（SOLID_LINE/DASHED_LINE存在），但运行证据显示 road-chain mid.z≈144.7、ground/vehicle/camera z≈213.6，约69m高程坐标不一致；ground对齐初修后仍未消除，下一步需场景加载后重建/平移受控道路对象。
 - west_coast 修复后冻结准入已成功（2026-10-13）：干净pytest通过后，修复入口获得 1站/3帧 `engine_verified` LINE/ROAD measured，2站隔离（coverage 0.7308、projection 1.15px），审计3帧trainable、overlap全0、cleanup归零。此前地图全隔离问题已被 `Scenario(map_name)` 硬编码修复解除。见 `T16_LINE_MEASURED_WCU_FINAL_RESULT_20261013.md`。
 - west_coast LINE measured配对训练完成（预注册 aa16cdf，2026-10-13）：W3帧 vs H9帧，5 seeds/10作业0失败/UNKNOWN；W−H IoU −0.1709±0.1497、recall −0.1753±0.1430均0/5正向、inconclusive；precision −0.0590±0.2680、1/5正向，W seed49 collapse。准入链成功不等于收益，模型未晋级。见 `T16_WEST_COAST_CROSSPOOL_RESULT_20261013.md`。
+- west_coast 第二批扩展完成（预注册 6e20299，2026-10-13）：offset3/5 anchors采集，2站/6帧 `engine_verified` LINE/ROAD measured 准入（projection median 0.619/0.488、coverage 1.0、appearance 1.0/0.9048），3站隔离原因保留；审计6帧trainable、overlap全0、cleanup归零。见 `T16_LINE_MEASURED_WCU3_RESULT_20261013.md`。
