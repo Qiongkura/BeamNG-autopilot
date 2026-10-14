@@ -49,3 +49,4 @@
 - west_coast_usa 第五地图尝试（预注册 c59bafe，2026-10-13）：3 known_line站点/9帧全部隔离，coverage/annotation line/appearance均无证据，准入0；启动与清理通过，未降门、未入训练。与E4地图线通道阻断一致，需材质/渲染对齐修复。见 `T16_LINE_MEASURED_WCU2_RESULT_20261013.md`。
 - west_coast 高程对齐修复（88f1bde）已通过纯逻辑/全量 pytest；重采集仍 0 annotation line pixels、3/3隔离，说明高程不是唯一阻断，地图材质/渲染可见性链仍需排查。
 - west_coast palette 已确认 API 映射可用（SOLID_LINE/DASHED_LINE存在），但运行证据显示 road-chain mid.z≈144.7、ground/vehicle/camera z≈213.6，约69m高程坐标不一致；ground对齐初修后仍未消除，下一步需场景加载后重建/平移受控道路对象。
+- west_coast 修复后冻结准入已成功（2026-10-13）：干净pytest通过后，修复入口获得 1站/3帧 `engine_verified` LINE/ROAD measured，2站隔离（coverage 0.7308、projection 1.15px），审计3帧trainable、overlap全0、cleanup归零。此前地图全隔离问题已被 `Scenario(map_name)` 硬编码修复解除。见 `T16_LINE_MEASURED_WCU_FINAL_RESULT_20261013.md`。
