@@ -680,7 +680,8 @@ def assign_scene_types(a_sites: list, types_order: list) -> list[str]:
     return types
 
 
-def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
+def build_scenario(conn, sites: list[dict], *, map_name: str = "italy",
+                   scene_types: list[str],
                    scene_names: list[str]):
     """把全部站点生成进**一个** Scenario（一次加载；扩量后站点分布在多条路段）。
 
@@ -692,7 +693,7 @@ def build_scenario(conn, sites: list[dict], *, scene_types: list[str],
     from beamngpy.scenario.scenario_object import ScenarioObject
     from beamngpy.misc.quat import angle_to_quat
 
-    scen = Scenario("italy", "m5_controlled_scenes")
+    scen = Scenario(str(map_name), "m5_controlled_scenes")
     site_of = {name: sites[k] for k, name in enumerate(scene_names)}
     record: dict = {"sites": {}, "line_instances": [], "vehicles": {}}
     occ_site = next((sites[k] for k, t in enumerate(scene_types)
@@ -1472,7 +1473,8 @@ def main() -> int:
         report["scene_types"] = scene_types
         _align_sites_to_ground(conn, sites, str(args.map))
         report["sites_after_ground_alignment"] = sites
-        scen, rec = build_scenario(conn, sites, scene_types=scene_types,
+        scen, rec = build_scenario(conn, sites, map_name=str(args.map),
+                                   scene_types=scene_types,
                                    scene_names=scene_names)
         report["scenario"] = {"name": scen.name, "level": str(scen.level),
                               "vehicles": rec["vehicles"],
