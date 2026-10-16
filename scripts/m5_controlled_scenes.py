@@ -1489,6 +1489,38 @@ def main() -> int:
             conn.attach_vehicle(already_open=True)
         except Exception:                                    # noqa: BLE001
             pass
+        # west_coast 的 road-network z 在初始 map load 与受控 Scenario load
+        # 之间曾出现约 69m 差异。加载后再测一次；若仍偏离，重建同一 map
+        # 的 Scenario，让 DecalRoad 节点、truth points 和实际地面共享最终 z。
+        if str(args.map) == "west_coast_usa":
+            post_align: list[dict] = []
+            for _site in sites:
+                try:
+                    _gz = conn.ground_z_at(float(_site["mid"][0]),
+                                           float(_site["mid"][1]))
+                except Exception:
+                    _gz = None
+                post_align.append({"road_z": float(_site["mid"][2]),
+                                   "ground_z_after_load": _gz,
+                                   "delta_m": (None if _gz is None else
+                                               float(_gz) - float(_site["mid"][2]))})
+            if any(x["delta_m"] is not None and abs(x["delta_m"]) > 2.0
+                   for x in post_align):
+                _align_sites_to_ground(conn, sites, str(args.map))
+                scen, rec = build_scenario(conn, sites, map_name=str(args.map),
+                                           scene_types=scene_types,
+                                           scene_names=scene_names)
+                report["sites_after_ground_alignment_reload"] = sites
+                report["west_coast_ground_reload"] = post_align
+                with conn.io_lock:
+                    scen.make(conn.bng)
+                    conn.bng.scenario.load(scen)
+                    conn.bng.scenario.start()
+                time.sleep(2.0)
+                try:
+                    conn.attach_vehicle(already_open=True)
+                except Exception:
+                    pass
         for k, name in enumerate(scene_names):
             site = sites[k]
             rec_site = rec["sites"][name]

@@ -649,3 +649,11 @@ def test_build_scenario_uses_requested_map_not_italy_default():
            / "m5_controlled_scenes.py").read_text("utf-8")
     assert 'Scenario(str(map_name), "m5_controlled_scenes")' in src
     assert 'build_scenario(conn, sites, map_name=str(args.map)' in src
+
+
+def test_west_coast_rechecks_ground_after_scenario_load_and_can_reload():
+    src = (Path(__file__).resolve().parents[1] / "scripts"
+           / "m5_controlled_scenes.py").read_text("utf-8")
+    assert "sites_after_ground_alignment_reload" in src
+    assert "west_coast_ground_reload" in src
+    assert "conn.bng.scenario.load(scen)" in src
