@@ -249,13 +249,14 @@ def main() -> int:
     expect("H2 E−H2 正向数", sum(1 for d in h2_iou["deltas"] if d > 0), 2)
     expect("H2 precision UNKNOWN seeds", len(h2["paired"]["prec"].get("unknown_seeds", [])), 5)
 
-    # west_coast 第二地图五批跨池配对（2026-10-13）：3/6/6/9/9 帧池、同初始化/预算/评测
+    # west_coast 第二地图六批跨池配对（2026-10-13）：3/6/6/9/9/3 帧池、同初始化/预算/评测
     wcu_files = [
         ("WCU 3帧", "t16_wcu_crosspool_20261013", "wcu_summary.json", -0.1709),
         ("WCU3 6帧", "t16_wcu3_crosspool_20261013", "wcu3_summary.json", -0.2374),
         ("Wfix 6帧", "t16_wcu_reload_crosspool_20261013", "wfix_summary.json", -0.2211),
         ("WCU4 9帧", "t16_wcu4_crosspool_20261013", "wcu4_summary.json", -0.1072),
         ("WCU5 9帧", "t16_wcu5_crosspool_20261013", "wcu5_summary.json", -0.1345),
+        ("WCU6 3帧", "t16_wcu6_crosspool_20261013", "wcu6_summary.json", 0.1161),
     ]
     n_neg = 0
     n_cb = 0
@@ -270,9 +271,20 @@ def main() -> int:
             n_cb += 1
         if wi["verdict"] == "candidate_better":
             bad.append(f"{tag}: 论文称从未 candidate_better，来源裁决为 {wi['verdict']}")
-    expect("west 五批配对总数", n_pairs, 25)
-    expect("west 五批负向配对数", n_neg, 24)
-    expect("west 五批 champion_better 数", n_cb, 3)
+    expect("west 六批配对总数", n_pairs, 30)
+    expect("west 六批负向配对数", n_neg, 25)
+    expect("west 六批 champion_better 数", n_cb, 3)
+    # WCU6 专项：论文称「首个均值方向为正的池（4/5 正向）、三项均 inconclusive」
+    wcu6 = json.loads((E / "t16_wcu6_crosspool_20261013" /
+                       "wcu6_summary.json").read_text(encoding="utf-8"))
+    for m, mean_want, sd_want in (("iou", 0.1161, 0.1195),
+                                  ("rec", 0.1229, 0.1372),
+                                  ("prec", 0.0195, 0.0467)):
+        p6 = wcu6["paired"][m]
+        expect(f"WCU6 {m} mean", round(p6["mean_delta"], 4), mean_want)
+        expect(f"WCU6 {m} sd", round(p6["sd"], 4), sd_want)
+        expect(f"WCU6 {m} inconclusive", int(p6["verdict"] == "inconclusive"), 1)
+    expect("WCU6 IoU 正向数", sum(1 for x in wcu6["paired"]["iou"]["deltas"] if x > 0), 4)
 
     print(f"=== 数字审计：检查 {checked} 项 ===")
     for b in bad:
