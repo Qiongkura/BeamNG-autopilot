@@ -14,7 +14,7 @@
 - E5 扩展没有产生第二路段合格驾驶证据；unplaceable 不是驾驶失败/安全失败。
 - 大偏移批次的两个 qualified 仍不能与基线做等曝光因果比较（另两项 exposure-invalid）。
 - T18 的 CPU p95 改善不是驾驶安全、执行 ACK 或模型晋级证据。
-- 逐地图 `line-class` 真值通道阻断已解除（west 2026-10-13 准入、east ECA3 2026-10-18 准入），但**地图资格≠学习收益/泛化**：east ECA3 池（2站/6帧）尚未做配对训练，全部跨池结论目前只覆盖 west 池族。
+- 逐地图 `line-class` 真值通道阻断已解除（west 2026-10-13 准入、east ECA3 2026-10-18 准入），但**地图资格≠学习收益/泛化**：east ECA3 池（2站/6帧）首个配对数据点为负（E3−H IoU −0.2684，5/5 负、champion_better，排除 2 个崩坏对后仍 −0.1690），与 west 小池多数方向一致；**来源排序/泛化仍未建立**——三图全部是小池、同初始化单预算对照。
 
 ## 尚待用户决定/专轮
 
@@ -66,3 +66,4 @@
 - east_coast_usa 第三图 LINE=measured 扩展（2026-10-18）：ECA1/ECA2 两批同锚点族均 0/5 全隔离（ECA1 初判"z 埋地 28m"**已撤回**——ECA2 五站 ground 重读 delta 全≈0，54.2 实为 ego 出生点地形读数、与站点分处两地）。诊断（`m5_decal_annotation_probe.py` 5 场景变量分离，诊断输出不进训练池）：z 抬升/renderPriority/插入序/宽度/over_objects 全无效，**根因=annotation pass 的 alpha 测试剔除**——east 线材质 opacityFactor 0.7×bcf alpha 0.8–0.9→最终 alpha≤0.56 对 alphaRef=255 全像素剔（west 线材质无 opacity 缩放所以正常）；唯一可写替代 line_yellow_double（alphaTest=True/alphaRef=0），宽度扫描 0.40m 三门全过（appearance 1.00×2）、0.15m 挂、0.50m 回落。见 `T16_LINE_MEASURED_ECA2_RESULT_20261018.md`、`T16_LINE_MEASURED_ECA1_RESULT_20261018.md`（更正节）。
 - east 线材质/线宽生成器修复入库（863c828）：MAP_PROFILES east 白/黄→line_yellow_double@0.40m（west/italy 合同宽度 0.15m 不变），冻结门一字不改；回归测试含对真实材质资产的 annotation 可写性断言（alphaTest/alphaRef 准入规则）。
 - east_coast 第三批重采完成（预注册 T16_LINE_MEASURED_ECA3_PREREG，2026-10-18）：唯一变更因子=线材质/线宽，同锚点族同门；**2站/6帧 engine_verified 准入（east 首次达标，目标 ≥2站/≥6帧达成）**——a0s0 coverage 0.9889/proj median 0.598px/paint 0.9941，a4s0 1.0/0.587px/0.9941；3站隔离原因逐实例保留（a1 三门全挂、a2 right 实例 coverage 0.4216、a3 paint 0.0536 被标签中毒守门拦截）；审计6帧trainable、overlap全0、cleanup归零。不降门、不消费最终集、模型未晋级；配对训练另行预注册。见 `T16_LINE_MEASURED_ECA3_RESULT_20261018.md`。
+- east_coast 首批 6 帧配对训练完成（预注册 T16_ECA3_CROSSPOOL_PREREG，2026-10-18）：E3（ECA3 池 2站/6帧）vs H（9帧 human），5 seeds/10 作业 0 失败/UNKNOWN=0；IoU −0.2684±0.1617（0/5、champion_better）、recall −0.2846±0.1645（0/5、champion_better）、precision −0.3281±0.5059（3/5、inconclusive）；collapse=2 对（均 E3 臂，seed47 IoU 0.0013、seed49 三项全 0.0 完全退化），排除后 IoU −0.1690/recall −0.1853 仍为负。H 臂跨运行（vs WCU6 同种子）IoU 最大差 0.0190，在 0.0356 噪声下限内。预注册内跨池审计：105 帧 105 唯一内容摘要、0 重复组。**第三图首个学习数据点不支持任何来源优势**；模型未晋级、硬门未改、不消费最终集。见 `T16_ECA3_CROSSPOOL_RESULT_20261018.md`。
