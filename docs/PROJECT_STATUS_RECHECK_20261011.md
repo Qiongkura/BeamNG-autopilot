@@ -14,7 +14,7 @@
 - E5 扩展没有产生第二路段合格驾驶证据；unplaceable 不是驾驶失败/安全失败。
 - 大偏移批次的两个 qualified 仍不能与基线做等曝光因果比较（另两项 exposure-invalid）。
 - T18 的 CPU p95 改善不是驾驶安全、执行 ACK 或模型晋级证据。
-- 第二地图 E4 仍被逐地图 `line-class` 真值通道阻断。
+- 逐地图 `line-class` 真值通道阻断已解除（west 2026-10-13 准入、east ECA3 2026-10-18 准入），但**地图资格≠学习收益/泛化**：east ECA3 池（2站/6帧）尚未做配对训练，全部跨池结论目前只覆盖 west 池族。
 
 ## 尚待用户决定/专轮
 
@@ -63,3 +63,6 @@
 - west_coast 第五批扩展完成（预注册 91739bc，2026-10-13）：offset12/5 anchors采集，批次验收 5/5 合格，冻结 gate 仅 1站/3帧（a2s0）准入，4站隔离（3站投影残差 1.07/1.56/1.60px 边缘超限、1站 annotation 线通道失效 coverage 0.13/0.0）；**采集目标 ≥2站/≥6帧未达成，不降门**；审计3帧trainable、overlap全0、与全部既往导出池+H 跨池零重叠（81帧81唯一）；asset.map 修复生效（全部证据 west_coast_usa）。见 `T16_LINE_MEASURED_WCU6_RESULT_20261013.md`。
 - west_coast 第五批3帧配对训练完成（预注册 WCU6-CROSSPOOL，2026-10-13）：W6 vs H，5 seeds/10作业0失败/UNKNOWN、collapse=0；IoU +0.1161±0.1195（4/5正向）、recall +0.1229±0.1372（4/5）、precision +0.0195±0.0467（3/5），三项均 **inconclusive**——六池中首个均值方向为正，但五种子下不构成 candidate_better。六批聚合 30 配对 25 负、3 champion_better、从未 candidate_better：单池方向可整体翻转，小池/种子/预算交互主导的结论不变。模型未晋级、硬门未改。见 `T16_WCU6_CROSSPOOL_RESULT_20261013.md`。
 - west_coast 聚合池36帧配对完成（预注册 T16_WCU_POOL_PREREG，2026-10-13）：WALL（12站/6批全部已准入帧聚合）vs H，5 seeds/10作业0失败/UNKNOWN；IoU −0.1918±0.0952（0/5、champion_better、1 collapse seed50排除均值 −0.1747）、recall −0.1601±0.1113（0/5）、precision −0.3480±0.1895（0/5），三项全 champion_better——**池扩大到 4 倍没有恢复任何学习优势**。复现性发现：H 臂同种子跨运行非逐位一致（seed48–51 IoU 最大差 0.0356、recall 0.0375、precision 0.0094，GPU 非确定性），跨实验比较带约 0.036 IoU 噪声下限；WCU6 初稿「H 臂完全一致」已撤回更正。模型未晋级、硬门未改。见 `T16_WCU_POOL_RESULT_20261013.md`。
+- east_coast_usa 第三图 LINE=measured 扩展（2026-10-18）：ECA1/ECA2 两批同锚点族均 0/5 全隔离（ECA1 初判"z 埋地 28m"**已撤回**——ECA2 五站 ground 重读 delta 全≈0，54.2 实为 ego 出生点地形读数、与站点分处两地）。诊断（`m5_decal_annotation_probe.py` 5 场景变量分离，诊断输出不进训练池）：z 抬升/renderPriority/插入序/宽度/over_objects 全无效，**根因=annotation pass 的 alpha 测试剔除**——east 线材质 opacityFactor 0.7×bcf alpha 0.8–0.9→最终 alpha≤0.56 对 alphaRef=255 全像素剔（west 线材质无 opacity 缩放所以正常）；唯一可写替代 line_yellow_double（alphaTest=True/alphaRef=0），宽度扫描 0.40m 三门全过（appearance 1.00×2）、0.15m 挂、0.50m 回落。见 `T16_LINE_MEASURED_ECA2_RESULT_20261018.md`、`T16_LINE_MEASURED_ECA1_RESULT_20261018.md`（更正节）。
+- east 线材质/线宽生成器修复入库（863c828）：MAP_PROFILES east 白/黄→line_yellow_double@0.40m（west/italy 合同宽度 0.15m 不变），冻结门一字不改；回归测试含对真实材质资产的 annotation 可写性断言（alphaTest/alphaRef 准入规则）。
+- east_coast 第三批重采完成（预注册 T16_LINE_MEASURED_ECA3_PREREG，2026-10-18）：唯一变更因子=线材质/线宽，同锚点族同门；**2站/6帧 engine_verified 准入（east 首次达标，目标 ≥2站/≥6帧达成）**——a0s0 coverage 0.9889/proj median 0.598px/paint 0.9941，a4s0 1.0/0.587px/0.9941；3站隔离原因逐实例保留（a1 三门全挂、a2 right 实例 coverage 0.4216、a3 paint 0.0536 被标签中毒守门拦截）；审计6帧trainable、overlap全0、cleanup归零。不降门、不消费最终集、模型未晋级；配对训练另行预注册。见 `T16_LINE_MEASURED_ECA3_RESULT_20261018.md`。

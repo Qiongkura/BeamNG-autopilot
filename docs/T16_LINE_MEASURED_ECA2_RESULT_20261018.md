@@ -26,8 +26,11 @@ line_white/line_yellow @0.15 m）。冻结准入一字不改。
 +0.0195 / −0.00016 / −0.00050 / −0.00009 / −0.00043 —— **全部 ≈0**，
 包括 ECA1 引用的 `mid.z=26.07` 站（ground 重读 26.072 m）。ECA1 的
 "26.07 对地形 54.2"读数与同址重读矛盾，**"生成路链整体埋入地下 ~28 m"撤回**
-（详见 `T16_LINE_MEASURED_ECA1_RESULT_20261018.md` 更正节）。对齐后仍 0/5、
-RGB 漆线可见 → annotation 丢失另有机制。
+（详见 `T16_LINE_MEASURED_ECA1_RESULT_20261018.md` 更正节）。54.2 的来源
+已定位：采集启动时初始 ego 出生点的 `ensure_above_ground` 读数
+（`ego at z=-5.0 below ground 54.2; lifting`）——那是出生点的地形，不是
+站点的地形，两处被误并成一个"偏差"。对齐后仍 0/5、RGB 漆线可见 →
+annotation 丢失另有机制。
 
 ## 定因：annotation pass 的 alpha 测试剔除（探针 5 场景变量分离）
 

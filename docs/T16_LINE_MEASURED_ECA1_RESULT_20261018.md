@@ -28,7 +28,9 @@
 1. ECA2 按"地面重对齐"修复重采后 **ground_alignment 五站全 measured、
    delta≈0**（+0.020 / −0.0002 / −0.0005 / −0.0001 / −0.0004 m）——包括
    ECA1 引用的 `mid.z=26.07` 站点，其 ground 重读为 26.072 m。ECA1 的
-   "26.07 对地形 54.2"读数与同址重读矛盾（查询口径错位），28 m 偏差不成立；
+   "26.07 对地形 54.2"读数与同址重读矛盾：54.2 实为**初始 ego 出生点**的
+   `ensure_above_ground` 读数（`ego at z=-5.0 below ground 54.2; lifting`），
+   与站点分处两地、被误并成一个"偏差"，28 m 偏差不成立；
 2. ECA2 对齐后仍 **0/5**（coverage 0.32/0/0/0.07/0），且逐帧 RGB 漆线
    paint-like 沿真值曲线可见——"埋地致线不可见"的推断不成立；
 3. 探针（`scripts/m5_decal_annotation_probe.py`，5 场景变量分离，诊断输出
