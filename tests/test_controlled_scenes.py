@@ -641,6 +641,10 @@ def test_run_scene_metadata_preserves_requested_map_and_palette_source():
     src = (Path(__file__).resolve().parents[1] / "scripts"
            / "m5_controlled_scenes.py").read_text("utf-8")
     assert '"map": str(map_name)' in src
+    # asset 块也要跟请求地图走：这里曾硬编码 "italy"，west_coast 批次的
+    # verification.stats.asset.map 因此误记为 italy（凭证里靠导出侧
+    # --map 才没被污染）。
+    assert '"asset": {"map": str(map_name)' in src
     assert '"annotation_palette": palette' in src
 
 

@@ -1205,7 +1205,7 @@ def run_scene(conn, probe, *, name: str, site: dict, rec: dict, truth_points: li
         "palette": palette,
         "generator": {"name": "m5_controlled_scenes.py",
                       "version": GENERATOR_VERSION},
-        "asset": {"map": "italy", "materials": dict(rec.get("materials") or {})},
+        "asset": {"map": str(map_name), "materials": dict(rec.get("materials") or {})},
         "run": {"id": f"m5_controlled_{name}", "scene_seed": 0,
                 "game_version": "beamng_tech", "renderer": "beamng_tech"},
     }
