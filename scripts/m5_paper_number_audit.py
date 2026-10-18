@@ -418,6 +418,10 @@ def main() -> int:
     expect("ECA3配对 precision 正向数", sum(1 for d in e3pr["deltas"] if d > 0), 3)
     expect("ECA3配对 precision inconclusive",
            int(e3pr["verdict"] == "inconclusive"), 1)
+    expect("ECA3配对 seeds 数", len(e3p["seeds"]), 5)
+    expect("ECA3配对 iou n", e3i["n"], 5)
+    expect("ECA3配对 recall n", e3r["n"], 5)
+    expect("ECA3配对 precision n", e3pr["n"], 5)
     expect("ECA3配对 作业失败数", len(e3p["failures"]), 0)
     st3 = e3p["eval_status"]
     expect("ECA3配对 评测状态条目", len(st3), 10)
