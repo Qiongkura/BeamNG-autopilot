@@ -394,6 +394,44 @@ def main() -> int:
     expect("宽扫 两run appearance 全过宽度数", len(both_pass), 1)
     expect("宽扫 全过即 w040", int(both_pass == ["w040"]), 1)
 
+    # east 首批 6 帧池配对（2026-10-18）：E3 vs H，5 seeds 同协议
+    # 稿件按常规 half-up 显示（0.50585 → 0.5059），故显示值用 floor(x*1e4+.5)/1e4
+    hu = lambda x: math.floor(x * 1e4 + 0.5) / 1e4  # noqa: E731
+    e3p = json.loads((E / "t16_eca3_crosspool_20261018" / "eca3_summary.json")
+                     .read_text(encoding="utf-8"))
+    e3i = e3p["paired"]["iou"]
+    expect("ECA3配对 IoU mean", hu(e3i["mean_delta"]), -0.2684)
+    expect("ECA3配对 IoU sd", hu(e3i["sd"]), 0.1617)
+    expect("ECA3配对 IoU 正向数", sum(1 for d in e3i["deltas"] if d > 0), 0)
+    expect("ECA3配对 IoU champion_better", int(e3i["verdict"] == "champion_better"), 1)
+    expect("ECA3配对 collapse pair 数", e3i["collapse"]["n_pairs_excluded"], 2)
+    expect("ECA3配对 排除collapse mean",
+           hu(e3i["collapse"]["mean_delta_excluding_collapse"]), -0.1690)
+    e3r = e3p["paired"]["rec"]
+    expect("ECA3配对 recall mean", hu(e3r["mean_delta"]), -0.2846)
+    expect("ECA3配对 recall sd", hu(e3r["sd"]), 0.1645)
+    expect("ECA3配对 recall champion_better",
+           int(e3r["verdict"] == "champion_better"), 1)
+    e3pr = e3p["paired"]["prec"]
+    expect("ECA3配对 precision mean", hu(e3pr["mean_delta"]), -0.3281)
+    expect("ECA3配对 precision sd", hu(e3pr["sd"]), 0.5059)
+    expect("ECA3配对 precision 正向数", sum(1 for d in e3pr["deltas"] if d > 0), 3)
+    expect("ECA3配对 precision inconclusive",
+           int(e3pr["verdict"] == "inconclusive"), 1)
+    expect("ECA3配对 作业失败数", len(e3p["failures"]), 0)
+    st3 = e3p["eval_status"]
+    expect("ECA3配对 评测状态条目", len(st3), 10)
+    expect("ECA3配对 异常评测状态",
+           sum(1 for v in st3.values()
+               if v.get("negative_line_status") != "measured"
+               or v.get("unknown_frames") or v.get("unverified_frames")), 0)
+    # H 臂跨运行复现性：同种子 vs WCU6 最大 IoU 差 0.0190（0.0356 噪声下限内）
+    w6 = json.loads((E / "t16_wcu6_crosspool_20261013" / "wcu6_summary.json")
+                    .read_text(encoding="utf-8"))
+    h_max3 = max(abs(e3p["arms"]["H"][s]["iou"] - w6["arms"]["H"][s]["iou"])
+                 for s in ("47", "48", "49", "50", "51"))
+    expect("ECA3 H臂跨运行最大 IoU 差", round(h_max3, 4), 0.0190)
+
     print(f"=== 数字审计：检查 {checked} 项 ===")
     for b in bad:
         print("  ✗", b)
