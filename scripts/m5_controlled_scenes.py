@@ -87,10 +87,19 @@ MAP_PROFILES: dict[str, dict] = {
                        "gravel": "m_dirt_road_gravels", "anchor": None,
                        "note": "第二张地图（审查 E4）：材质为离线扫描所得"},
     "east_coast_usa": {"pave": "AsphaltRoad_variation_two_way",
-                       "white": "line_white", "yellow": "line_yellow",
+                       "white": "line_yellow_double", "yellow": "line_yellow_double",
                        "blue": None, "gravel": "DirtRoad_variation_01",
-                       "anchor": None,
-                       "note": "第三张地图：2026-10-18 全嵌套复扫所得；无蓝色虚线材质"},
+                       "anchor": None, "line_width": 0.40,
+                       "note": "第三张地图：2026-10-18 全嵌套复扫所得；无蓝色虚线材质。"
+                               "线材质/线宽 2026-10-18 换 line_yellow_double@0.40m："
+                               "该图 line_white/line_yellow 家族 opacityFactor 0.7 × "
+                               "baseColorFactor alpha 0.8–0.9 → annotation pass 的 "
+                               "alphaRef=255 alpha 测试全像素剔除（annotation 写不进，"
+                               "ECA1/ECA2 0/5 根因，见 m5_decal_annotation_probe.py）；"
+                               "实测唯一替代：line_yellow_double（alphaTest=True/alphaRef=0）"
+                               "0.40m 冻结门三门全过（appearance 1.00×2 运行），"
+                               "0.15m appearance 0.43–0.67 挂（双条纹亚像素+中心 gap），"
+                               "0.50m 回落（gap 回到真值点）"},
 }
 
 
@@ -101,6 +110,7 @@ def apply_map_profile(map_name: str, *, overrides: dict | None = None) -> dict:
     生成的"线"会用错材质——宁可报错也不要静默生成错东西）。
     """
     global MAT_PAVE, MAT_LINE_WHITE, MAT_LINE_YELLOW, MAT_LINE_BLUE, MAT_GRAVEL, _MAT
+    global LINE_WIDTH_M
     prof = dict(MAP_PROFILES.get(map_name) or {})
     ov = {k: v for k, v in (overrides or {}).items() if v}
     if not prof and not ov:
@@ -114,6 +124,10 @@ def apply_map_profile(map_name: str, *, overrides: dict | None = None) -> dict:
            "gravel": ov.get("gravel") or prof.get("gravel"),
            "anchor": prof.get("anchor"),
            "note": (prof.get("note") or "") + ("（含 CLI 覆盖）" if ov else "")}
+    # 线宽按档案走（east 0.40：见档案 note 的 annotation 可写性实测）；
+    # 档案没声明的保持 0.15 合同宽度。
+    LINE_WIDTH_M = float(ov.get("line_width") or prof.get("line_width") or 0.15)
+    eff["line_width"] = LINE_WIDTH_M
     missing = [k for k in ("pave", "white", "yellow", "gravel") if not eff[k]]
     if missing:
         raise SystemExit(f"地图 {map_name!r} 档案缺材质：{missing}")
@@ -123,6 +137,8 @@ def apply_map_profile(map_name: str, *, overrides: dict | None = None) -> dict:
     _MAT = {"white": MAT_LINE_WHITE, "yellow": MAT_LINE_YELLOW, "blue": MAT_LINE_BLUE}
     return eff
 
+#: 生成线宽（米）：默认合同宽度 0.15；``apply_map_profile`` 会按地图档案
+#: 覆盖（east_coast_usa 0.40——见 MAP_PROFILES note 的 annotation 可写性实测）。
 LINE_WIDTH_M = 0.15
 #: 车道半宽（米）：受控场景里"行驶车道"是生成出来的——线放在 ±LAT_LANE_HALF。
 #: 不用地图路面的外缘：外缘常被边缘贴花覆盖（annotation 里是背景/非路面），
@@ -344,10 +360,18 @@ def _camera_arg_to_world(camera_dir, state) -> np.ndarray:
 
 
 #: 路网 z 与真实地形不一致、需要地面重对齐的地图（实测判据，不是猜测）：
-#: west_coast_usa 差约 69 m（2026-10-11），east_coast_usa 差约 28 m
-#: （2026-10-18 ECA1：road z 26.07 对地形 54.2，生成路链整体埋入地下，
-#: 5/5 站 coverage 0–0.32、外观近零）。italy 实测一致，不进集合——
-#: 进集合必须有该地图的实测 z 偏差证据。
+#: west_coast_usa 差约 69 m（2026-10-11），east_coast_usa 路网 z 对地形差约
+#: 28 m（2026-10-18 ECA1 实测：road z 26.07 对地形 54.2）。italy 实测一致，
+#: 不进集合——进集合必须有该地图的实测 z 偏差证据。
+#:
+#: **更正（2026-10-18，ECA2 + m5_decal_annotation_probe 定因）**：ECA1 时把
+#: 0/5 判成"生成路链整体埋入地下"是**错的**——ECA2 对齐后 ground_alignment
+#: delta≈0、遮挡深度比 1.000，逐帧 RGB 里漆线一直可见，仍然 0/5；探针
+#: 变量分离（z 抬 ≤0.5 m、renderPriority 0/50、宽度、插入序全部无效）定因
+#: 是 annotation pass 的 alpha 测试剔除：east 线材质 opacityFactor 0.7 ×
+#: bcf alpha 0.8–0.9 → 最终 alpha ≤0.56，配 alphaRef=255 全像素剔，annotation
+#: 写不进（west 线材质无 opacity 缩放所以正常）。z 偏差本身是真实测得的、
+#: 重对齐仍然必须做，但它**不是** annotation 丢失的原因。
 GROUND_ALIGN_MAPS = {"west_coast_usa", "east_coast_usa"}
 
 
@@ -1375,6 +1399,8 @@ def main() -> int:
     ap.add_argument("--mat-blue", default=None, help="覆盖蓝线材质名")
     ap.add_argument("--mat-pave", default=None, help="覆盖铺装材质名")
     ap.add_argument("--mat-gravel", default=None, help="覆盖碎石材质名")
+    ap.add_argument("--line-width", type=float, default=None,
+                    help="覆盖生成线宽（米）；默认取地图档案（east 0.40，其余 0.15）")
     ap.add_argument("--scenes", nargs="*", default=list(SCENES),
                     help="要跑的场景（默认全部五类）")
     ap.add_argument("--frames", type=int, default=2,
@@ -1414,9 +1440,11 @@ def main() -> int:
              if LINE_CONVENTION == "measured" else ""), flush=True)
     profile = apply_map_profile(str(args.map), overrides={
         "white": args.mat_white, "yellow": args.mat_yellow, "blue": args.mat_blue,
-        "pave": args.mat_pave, "gravel": args.mat_gravel})
+        "pave": args.mat_pave, "gravel": args.mat_gravel,
+        "line_width": args.line_width})
     print(f"[scenes] 地图档案 {args.map}: 铺装={profile['pave']} 白={profile['white']} "
-          f"黄={profile['yellow']} 蓝={profile['blue']} 碎石={profile['gravel']}",
+          f"黄={profile['yellow']} 蓝={profile['blue']} 碎石={profile['gravel']} "
+          f"线宽={profile['line_width']}m",
           flush=True)
     probe = _load_probe()
     out = Path(args.out) if args.out else (

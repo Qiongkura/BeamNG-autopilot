@@ -670,18 +670,70 @@ def test_west_coast_rechecks_ground_after_scenario_load_and_can_reload():
     assert "conn.bng.scenario.load(scen)" in src
 
 
-def test_east_coast_profile_uses_map_own_materials_from_full_rescan():
+def test_east_coast_profile_uses_annotation_writable_material_and_width():
     m = _load()
     prof = m.MAP_PROFILES["east_coast_usa"]
-    # 2026-10-18 全嵌套 items.level.json 复扫：line_white 72 站、line_yellow 15 站，
-    # 四材质均有 map 级定义（art/road/main.materials.json）
-    assert prof["white"] == "line_white"
-    assert prof["yellow"] == "line_yellow"
+    # 2026-10-18 探针定因后换材质/线宽：east 的 line_white/line_yellow 家族
+    # opacityFactor 0.7 × bcf alpha 0.8–0.9，annotation pass 的 alphaRef=255
+    # alpha 测试全像素剔除（ECA1/ECA2 0/5 根因）；唯一"annotation 写得进 +
+    # 真值点居中"的替代是 line_yellow_double（alphaTest=True/alphaRef=0）。
+    assert prof["white"] == "line_yellow_double"
+    assert prof["yellow"] == "line_yellow_double"
+    assert prof["line_width"] == 0.40  # 0.15 m 双条纹亚像素 appearance 0.43–0.67 挂
     assert prof["pave"] == "AsphaltRoad_variation_two_way"
     assert prof["gravel"] == "DirtRoad_variation_01"
     assert prof["blue"] is None  # 该地图无蓝色虚线材质，material_mix 不可用
     assert prof["anchor"] is None
     eff = m.apply_map_profile("east_coast_usa")
-    assert eff["white"] == "line_white"
+    assert eff["white"] == "line_yellow_double"
+    assert eff["line_width"] == 0.40
     assert m.MAT_PAVE == "AsphaltRoad_variation_two_way"
-    assert m._MAT == {"white": "line_white", "yellow": "line_yellow", "blue": None}
+    assert m.LINE_WIDTH_M == 0.40
+    assert m._MAT == {"white": "line_yellow_double",
+                      "yellow": "line_yellow_double", "blue": None}
+
+
+def test_map_profile_line_width_defaults_to_contract_and_overrides():
+    m = _load()
+    # west/italy 档案没声明 line_width → 合同宽度 0.15 不变
+    eff = m.apply_map_profile("west_coast_usa")
+    assert eff["line_width"] == 0.15
+    assert m.LINE_WIDTH_M == 0.15
+    # CLI 覆盖（--line-width）压过档案
+    eff = m.apply_map_profile("east_coast_usa", overrides={"line_width": 0.25})
+    assert eff["line_width"] == 0.25
+    assert m.LINE_WIDTH_M == 0.25
+    # 无档案地图 + 显式材质时也回落到 0.15
+    eff = m.apply_map_profile("utah", overrides={
+        "white": "line_white", "yellow": "line_yellow",
+        "pave": "road_asphalt", "gravel": "m_dirt_road_gravels"})
+    assert eff["line_width"] == 0.15
+
+
+def test_east_line_material_choice_matches_map_alpha_admission():
+    """档案选材必须满足 annotation 可写性（对真实资产回归）。
+
+    annotation pass 的 alpha 测试语义：alphaTest 缺席时按 alphaRef 阈值
+    剔像素（255 = 最终 alpha<255 全剔）。east 线材质必须 alphaTest=True
+    或 alphaRef=0，否则 annotation 写不进（ECA1/ECA2 0/5 根因）。
+    """
+    zip_path = Path(r"G:\BeamNG.tech.v0.38.5.0\content\levels\east_coast_usa.zip")
+    if not zip_path.exists():
+        pytest.skip("BeamNG 地图 zip 不在本机（G: 盘）")
+    import json as _json
+    import zipfile as _zip
+    with _zip.ZipFile(zip_path) as zf:
+        mats = _json.loads(
+            zf.read("levels/east_coast_usa/art/road/main.materials.json"))
+    m = _load()
+    for kind in ("white", "yellow"):
+        name = m.MAP_PROFILES["east_coast_usa"][kind]
+        d = mats[name]
+        writable = bool(d.get("alphaTest")) or int(d.get("alphaRef", 255)) < 255
+        assert writable, f"{name} annotation 不可写（alphaRef={d.get('alphaRef')})"
+    # 被换下的材质正是反例：alphaRef=255 且 opacity 缩放 → annotation 全剔
+    for name in ("line_white", "line_yellow"):
+        d = mats[name]
+        stage = (d.get("Stages") or [{}])[0]
+        assert int(d.get("alphaRef", 255)) == 255 and not d.get("alphaTest")
+        assert (stage.get("opacityFactor") or 1.0) < 1.0
