@@ -343,16 +343,25 @@ def _camera_arg_to_world(camera_dir, state) -> np.ndarray:
     return _unit(local[0] * fwd + local[1] * left + local[2] * up)
 
 
+#: 路网 z 与真实地形不一致、需要地面重对齐的地图（实测判据，不是猜测）：
+#: west_coast_usa 差约 69 m（2026-10-11），east_coast_usa 差约 28 m
+#: （2026-10-18 ECA1：road z 26.07 对地形 54.2，生成路链整体埋入地下，
+#: 5/5 站 coverage 0–0.32、外观近零）。italy 实测一致，不进集合——
+#: 进集合必须有该地图的实测 z 偏差证据。
+GROUND_ALIGN_MAPS = {"west_coast_usa", "east_coast_usa"}
+
+
 def _align_sites_to_ground(conn, sites: list[dict], map_name: str) -> list[dict]:
     """Align generated road-chain heights to the loaded map surface.
 
-    west_coast_usa's road-network ``middle.z`` was observed about 69 m below
-    the actual terrain at the captured anchor.  Keeping that value made both
-    DecalRoad lines and truth points invisible while the vehicle/camera stood
-    on the real surface.  We only apply the correction to that map and record
-    every delta; a missing ground read is UNKNOWN and never guessed.
+    Maps in ``GROUND_ALIGN_MAPS`` had their road-network ``middle.z`` observed
+    tens of meters below the actual terrain at captured anchors.  Keeping that
+    value made both DecalRoad lines and truth points invisible while the
+    vehicle/camera stood on the real surface.  We only apply the correction to
+    maps with measured evidence and record every delta; a missing ground read
+    is UNKNOWN and never guessed.
     """
-    if str(map_name) != "west_coast_usa":
+    if str(map_name) not in GROUND_ALIGN_MAPS:
         return sites
     for site in sites:
         mid = np.asarray(site.get("mid", []), dtype=float)
@@ -1497,10 +1506,11 @@ def main() -> int:
             conn.attach_vehicle(already_open=True)
         except Exception:                                    # noqa: BLE001
             pass
-        # west_coast 的 road-network z 在初始 map load 与受控 Scenario load
-        # 之间曾出现约 69m 差异。加载后再测一次；若仍偏离，重建同一 map
-        # 的 Scenario，让 DecalRoad 节点、truth points 和实际地面共享最终 z。
-        if str(args.map) == "west_coast_usa":
+        # GROUND_ALIGN_MAPS 的 road-network z 在初始 map load 与受控 Scenario
+        # load 之间曾出现数十米差异（west_coast 约 69m、east_coast 约 28m）。
+        # 加载后再测一次；若仍偏离，重建同一 map 的 Scenario，让 DecalRoad
+        # 节点、truth points 和实际地面共享最终 z。
+        if str(args.map) in GROUND_ALIGN_MAPS:
             post_align: list[dict] = []
             for _site in sites:
                 try:
@@ -1519,7 +1529,7 @@ def main() -> int:
                                            scene_types=scene_types,
                                            scene_names=scene_names)
                 report["sites_after_ground_alignment_reload"] = sites
-                report["west_coast_ground_reload"] = post_align
+                report["post_load_ground_recheck"] = post_align
                 with conn.io_lock:
                     scen.make(conn.bng)
                     conn.bng.scenario.load(scen)

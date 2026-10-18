@@ -621,8 +621,11 @@ def test_capture_records_local_mount_direction_for_replay():
     assert "mount_dir_local" in src
 
 
-def test_west_coast_ground_alignment_shifts_mid_and_z_profile_only_for_that_map():
+def test_ground_alignment_applies_to_measured_z_defect_maps_only():
     m = _load()
+    # 集合只收有实测 z 偏差证据的地图（west_coast ~69m、east_coast ~28m）
+    assert m.GROUND_ALIGN_MAPS == {"west_coast_usa", "east_coast_usa"}
+
     class Conn:
         def ground_z_at(self, x, y):
             return 213.5
@@ -632,6 +635,10 @@ def test_west_coast_ground_alignment_shifts_mid_and_z_profile_only_for_that_map(
     assert sites[0]["mid"][2] == pytest.approx(213.5)
     assert sites[0]["z_profile"] == [[0.0, 213.5], [10.0, 214.5]]
     assert sites[0]["ground_alignment"]["status"] == "measured"
+    eca = [{"mid": [1.0, 2.0, 26.07], "z_profile": [[0.0, 26.07]]}]
+    m._align_sites_to_ground(Conn(), eca, "east_coast_usa")
+    assert eca[0]["mid"][2] == pytest.approx(213.5)
+    assert eca[0]["ground_alignment"]["status"] == "measured"
     other = [{"mid": [1.0, 2.0, 144.5], "z_profile": [[0.0, 144.5]]}]
     m._align_sites_to_ground(Conn(), other, "italy")
     assert "ground_alignment" not in other[0]
@@ -659,7 +666,7 @@ def test_west_coast_rechecks_ground_after_scenario_load_and_can_reload():
     src = (Path(__file__).resolve().parents[1] / "scripts"
            / "m5_controlled_scenes.py").read_text("utf-8")
     assert "sites_after_ground_alignment_reload" in src
-    assert "west_coast_ground_reload" in src
+    assert "post_load_ground_recheck" in src
     assert "conn.bng.scenario.load(scen)" in src
 
 
