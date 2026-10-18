@@ -73,8 +73,11 @@ MAT_GRAVEL = "m_dirt_road_gravels"
 #: west_coast_usa 的材质来自 2026-10-07 对 `content/levels/*.zip` 的离线扫描
 #: （`items.level.json` 里 line_white 3112 次、line_yellow 1470 次、
 #: line_dashed_short 215 次），用于第二张地图的复测（审查 E4）。
-#: 其余地图（gridmap_v2/smallgrid/utah/east_coast_usa/jungle_rock_island）扫描
-#: 未见成规模的白/黄线贴花，故不建档案；要用得先找材质再补档案。
+#: 2026-10-18 全嵌套 `items.level.json` 复扫（初扫只读了首个文件，判
+#: 「未见成规模」不正确）：east_coast_usa 有 line_white 72 站、line_yellow 15 站
+#: DecalRoad 实例，四材质均在 `art/road/main.materials.json` 有 map 级定义
+#: → 补第三张地图档案；无蓝色虚线材质，material_mix 场景不可用。
+#: utah 亦有 line_white 17 站（AsphaltRoad_variation_* 铺装）可后续建档案。
 MAP_PROFILES: dict[str, dict] = {
     "italy": {"pave": MAT_PAVE, "white": MAT_LINE_WHITE, "yellow": MAT_LINE_YELLOW,
               "blue": MAT_LINE_BLUE, "gravel": MAT_GRAVEL,
@@ -83,6 +86,11 @@ MAP_PROFILES: dict[str, dict] = {
                        "yellow": "line_yellow", "blue": "line_dashed_short",
                        "gravel": "m_dirt_road_gravels", "anchor": None,
                        "note": "第二张地图（审查 E4）：材质为离线扫描所得"},
+    "east_coast_usa": {"pave": "AsphaltRoad_variation_two_way",
+                       "white": "line_white", "yellow": "line_yellow",
+                       "blue": None, "gravel": "DirtRoad_variation_01",
+                       "anchor": None,
+                       "note": "第三张地图：2026-10-18 全嵌套复扫所得；无蓝色虚线材质"},
 }
 
 

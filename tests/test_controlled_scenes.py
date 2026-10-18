@@ -661,3 +661,20 @@ def test_west_coast_rechecks_ground_after_scenario_load_and_can_reload():
     assert "sites_after_ground_alignment_reload" in src
     assert "west_coast_ground_reload" in src
     assert "conn.bng.scenario.load(scen)" in src
+
+
+def test_east_coast_profile_uses_map_own_materials_from_full_rescan():
+    m = _load()
+    prof = m.MAP_PROFILES["east_coast_usa"]
+    # 2026-10-18 全嵌套 items.level.json 复扫：line_white 72 站、line_yellow 15 站，
+    # 四材质均有 map 级定义（art/road/main.materials.json）
+    assert prof["white"] == "line_white"
+    assert prof["yellow"] == "line_yellow"
+    assert prof["pave"] == "AsphaltRoad_variation_two_way"
+    assert prof["gravel"] == "DirtRoad_variation_01"
+    assert prof["blue"] is None  # 该地图无蓝色虚线材质，material_mix 不可用
+    assert prof["anchor"] is None
+    eff = m.apply_map_profile("east_coast_usa")
+    assert eff["white"] == "line_white"
+    assert m.MAT_PAVE == "AsphaltRoad_variation_two_way"
+    assert m._MAT == {"white": "line_white", "yellow": "line_yellow", "blue": None}
