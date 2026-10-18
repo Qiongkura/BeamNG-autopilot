@@ -9,6 +9,8 @@
 * 表 V（后处理单因子，来自 e1_c{0..4}_*）
 * 表 VI（等种子剂量，来自 e2_dose0x/4x 与 e1_c4_v8）
 * 正文关键数字：确认集总体、a27、仲裁原因 1383/512、2443 结算帧、范围保留 69%/89%
+* east_coast 第三图资格（2026-10-18）：annotation alpha 定因（地图 zip 材质）、
+  宽度扫描（诊断探针两重复 run）、ECA1/ECA2 0/5 与 ECA3 2站/6帧准入
 
 用法::
 
@@ -313,6 +315,84 @@ def main() -> int:
                               ("t16_wcu_pool_20261013", "wcu_pool_summary.json"))]
         h_max = max(h_max, max(vals) - min(vals))
     expect("H臂跨运行最大 IoU 差", round(h_max, 4), 0.0356)
+
+    # east_coast 第三图资格（2026-10-18）：annotation alpha 定因 + 宽度扫描 + ECA3 准入
+    # 机制：east 船运 line_white/line_yellow = opacityFactor 0.7 × bcf alpha 0.8/0.9
+    # → 最终 alpha 0.56/0.63 < alphaRef 255（全不透明阈值）→ annotation 全剔。
+    import zipfile
+    try:
+        mats = json.loads(zipfile.ZipFile(
+            r"G:\BeamNG.tech.v0.38.5.0\content\levels\east_coast_usa.zip").read(
+            "levels/east_coast_usa/art/road/main.materials.json"))
+    except OSError:
+        mats = {}
+        bad.append("east 材质 alpha 来源缺失（G: 地图 zip 不在本机）")
+    for name, bcf_a, final_a in (("line_white", 0.8, 0.56), ("line_yellow", 0.9, 0.63)):
+        d_m = mats.get(name) or {}
+        st_m = (d_m.get("Stages") or [{}])[0]
+        expect(f"{name} alphaRef", d_m.get("alphaRef"), 255)
+        expect(f"{name} opacityFactor", round(st_m.get("opacityFactor", 0) or 0, 1), 0.7)
+        expect(f"{name} bcf alpha", round((st_m.get("baseColorFactor") or [0, 0, 0, 0])[3], 1), bcf_a)
+        expect(f"{name} 最终 alpha",
+               round((st_m.get("opacityFactor") or 0) * (st_m.get("baseColorFactor") or [0, 0, 0, 0])[3], 2),
+               final_a)
+    expect("line_yellow_double alphaTest",
+           int(bool((mats.get("line_yellow_double") or {}).get("alphaTest"))), 1)
+
+    # ECA1/ECA2 两批 0/5 准入（采集批验收口径）
+    for tag_e in ("eca1", "eca2"):
+        acc = json.loads((ROOT / "logs" / "m5_seg" / f"collect_e5line_{tag_e}_20261018"
+                          / "scene_report.json").read_text(encoding="utf-8"))["acceptance"]
+        expect(f"ECA {tag_e} 合格站数", acc["sites_eligible"], 0)
+        expect(f"ECA {tag_e} 站点总数", acc["sites_total"], 5)
+
+    # ECA3：2站/6帧 engine_verified 准入 + 3站隔离逐实例证据（冻结导出门）
+    e3 = json.loads((E / "t16_linepool_eca3_20261018" / "auto_truth"
+                     / "export_report.json").read_text(encoding="utf-8"))
+    expect("ECA3 导出站数", len(e3["exported"]), 2)
+    expect("ECA3 导出帧数", e3["frames_exported"], 6)
+    expect("ECA3 采集站数", e3["scenes_total"], 5)
+    e3d = {e["scene"]: e for e in e3["exported"]}
+    for scene, cov, med, paint in (("known_line_a0s0", 0.9889, 0.598, 0.9941),
+                                   ("known_line_a4s0", 1.0, 0.587, 0.9941)):
+        e_s = e3d[scene]
+        expect(f"ECA3 {scene} coverage", round(e_s["coverage"], 4), cov)
+        expect(f"ECA3 {scene} 投影median", round(e_s["after_px_median"], 3), med)
+        expect(f"ECA3 {scene} paint", round(e_s["paint_agreement_pooled"], 4), paint)
+    e3i = {e["scene"]: e for e in e3["isolated"]}
+    i1 = e3i["known_line_a1s0"]
+    expect("ECA3 a1 left coverage", round(i1["instance_coverage"]["left"], 4), 0.4166)
+    expect("ECA3 a1 right coverage", round(i1["instance_coverage"]["right"], 4), 0.2151)
+    expect("ECA3 a1 投影", round(i1["after_px"], 2), 10.73, 5e-3)
+    expect("ECA3 a1 paint", round(i1["paint_agreement_pooled"], 3), 0.030)
+    expect("ECA3 a2 right coverage",
+           round(e3i["known_line_a2s0"]["instance_coverage"]["right"], 4), 0.4216)
+    expect("ECA3 a3 paint",
+           round(e3i["known_line_a3s0"]["paint_agreement_pooled"], 4), 0.0536)
+
+    # 宽度扫描（诊断探针两重复 run，paint2px/n 沿链采样点）：仅 0.40m 两 run appearance 全过
+    sweep: dict[str, list[tuple[int, int]]] = {}
+    for run in ("160526", "160701"):
+        pr = json.loads((ROOT / "logs" / "m5_seg"
+                         / f"diag_decal_probe2_east_coast_usa_20261018_{run}"
+                         / "probe_report.json").read_text(encoding="utf-8"))
+        for tag_w, e_w in pr["scenes"]["wide"]["lines"].items():
+            a_w = e_w["all"]
+            sweep.setdefault(tag_w, []).append((a_w["paint2px"], a_w["n"]))
+    want_sweep = {"w020": (2, 28, 1, 28), "w025": (13, 29, 13, 29),
+                  "w030": (22, 30, 23, 30), "w040": (30, 30, 30, 30),
+                  "w050": (20, 30, 19, 30)}
+    for tag_w, (p1, n1, p2, n2) in want_sweep.items():
+        s1, s2 = sweep[tag_w]
+        expect(f"宽扫 {tag_w} run160526 paint比", s1[0] / s1[1], p1 / n1, 1e-9)
+        expect(f"宽扫 {tag_w} run160701 paint比", s2[0] / s2[1], p2 / n2, 1e-9)
+    expect("宽扫 w040 run1 paint比", round(sweep["w040"][0][0] / sweep["w040"][0][1], 2), 1.0)
+    expect("宽扫 w040 run2 paint比", round(sweep["w040"][1][0] / sweep["w040"][1][1], 2), 1.0)
+    expect("宽扫 w050 run1 paint比", round(sweep["w050"][0][0] / sweep["w050"][0][1], 2), 0.67)
+    expect("宽扫 w050 run2 paint比", round(sweep["w050"][1][0] / sweep["w050"][1][1], 2), 0.63)
+    both_pass = sorted(t for t, rr in sweep.items() if all(p / n >= 0.9 for p, n in rr))
+    expect("宽扫 两run appearance 全过宽度数", len(both_pass), 1)
+    expect("宽扫 全过即 w040", int(both_pass == ["w040"]), 1)
 
     print(f"=== 数字审计：检查 {checked} 项 ===")
     for b in bad:
