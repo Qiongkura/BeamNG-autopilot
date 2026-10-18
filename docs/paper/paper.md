@@ -436,6 +436,8 @@ A third, budget-controlled scan kept both pools, the initialization, the five pa
 
 A 240-step independent budget repeat, with the same pools, initialization, seeds and evaluation, made the reversal stronger: engine minus human line-IoU was −0.4106 ± 0.0426, negative in all 5 pairs and `champion_better`; recall was −0.4214 ± 0.0447 in all 5 pairs. Precision was UNKNOWN in all five pairs because no valid positive denominator was present, and was not filled with zero. A third independent human pool (H2) gave a near-zero, inconclusive contrast (engine minus H2 +0.0119 ± 0.0164, positive in 2/5; precision UNKNOWN in 5/5). These results reinforce that pool content, seed and budget interactions dominate this small-pool study; no provenance ordering is established.
 
+A second map was then made admissible by fixing the controlled generator itself: the scenario builder had hardcoded the first map's name into every scenario, the generated road chain sat about 69 m above the terrain, and the camera basis was reconstructed from the wrong direction. After the repair, five controlled collection batches on `west_coast_usa` admitted engine-certified line pools under the same frozen projection, coverage, appearance and provenance gates — 3, 6, 6, 9 and 9 frames across the batches — with every isolated site's reason retained and zero content overlap between batches. Each pool was compared against the same human-revised pool under the identical five-seed protocol (same initialization, 60-step budget, eight development packages): engine minus human line-IoU was −0.1709 ± 0.1497 (3-frame pool), −0.2374 ± 0.1786, −0.2211 ± 0.0614, −0.1072 ± 0.0960 and −0.1345 ± 0.0568 (9-frame pools) — negative in 24 of 25 pairs, `champion_better` in three of the five comparisons, never `candidate_better`. Admission success therefore does not transfer to learning gains: on the second map, as on the first, the contrast is dominated by pool content, seed and budget interactions, and no provenance ordering is established.
+
 The supplement sweeps the lateral
 scope instead: tightening it from 6.0 m to 3.0 m raises identity (dev 0.582 → 0.713; limited-class
 0.581 → 0.758) and removes candidates (477 → 166 and 166 → 127), while role agreement is flat — the
@@ -707,17 +709,20 @@ human-revised, so its numbers are not directly comparable to the human-revised a
 held-out set would strengthen the definitional argument and is left to future work. The programme deliberately added **no
 new manual annotation** during the reported rounds, which bounds both the cost and the coverage.
 
-**Single simulator, single map, and an unqualified second-map attempt.** The reported perception
-results come from one simulator and one map. A controlled `west_coast_usa` batch has zero eligible
-sites: the generator reports three isolated line sites and three not-applicable no-line sites.
-Raw checks record zero line pixels at all sites. ROAD qualifies in 0/6 frames at five sites and
-4/6 at the remaining site; every site's ROAD status is UNKNOWN. Alignment and visibility support
-are also incomplete. A separate native collection there has 803 line-class
+**Single simulator, and a second map qualified late.** The reported perception
+results come from one simulator. The first controlled `west_coast_usa` batch had zero eligible
+sites: the generator reported three isolated line sites and three not-applicable no-line sites,
+with zero raw line pixels at all sites. That failure was later traced to the generator, not to the
+map: the scenario builder hardcoded the first map's name into every scenario, the generated road
+chain sat about 69 m above the terrain, and the camera basis was reconstructed from the wrong
+direction. After these three fixes, five controlled batches admitted engine-certified line pools
+of 3--9 frames each under the same frozen gates as the first map (Section V-C), so the second map
+is no longer unqualified — but its pools are small and its cross-pool comparisons are as
+seed-sensitive as the first map's. A separate native collection there has 803 line-class
 pixels over 30 forward-camera frames (about 27 per frame); the recorded `utah` forward view has
-zero over 77 frames. These observations establish failure of this batch, not an engine-only
-cause or the absence of usable truth across twenty maps. Camera pose, frame acquisition, material
-visibility and class mapping remain competing explanations. The next automatic probe must
-separate them before new data are admitted. The definitional effect's direction, but not its
+zero over 77 frames. Camera pose, frame acquisition, material
+visibility and class mapping remain competing explanations for the maps not yet probed.
+The definitional effect's direction, but not its
 magnitude, is reproduced on a second model (Section V-B). Driving results cover one town link.
 
 **Six seeds, and unequal seed counts.** Acceptance uses six seeds; composition arms are reported with their
@@ -861,12 +866,14 @@ must pass independent channel, alignment and provenance checks, retain UNKNOWN f
 truth, and freeze development and confirmation data separately. No new manual annotation is
 planned; results from different truth rungs must remain separate.
 
-**8. Second map: attempted, with the cause unresolved.** The controlled batch fails road, line
-and alignment qualification; this does not isolate class mapping as the sole cause. The next
-automatic probe should record a visible known material, camera pose, RGB/annotation agreement
-and raw class counts, changing one factor at a time. Only independently qualified data may enter
-learning or a new frozen evaluation. Until then, scope sensitivity remains a one-map finding,
-with its direction reproduced on a second model.
+**8. Second map: qualified after generator repair; cause of the original failure resolved.**
+The first controlled batch failed road, line and alignment qualification; the cause was then
+isolated to the generator (hardcoded map name, ~69 m road-chain/terrain elevation disagreement,
+wrong camera-basis reconstruction), not to class mapping or the map's materials. After the
+repair, controlled batches on the second map pass the same frozen projection, coverage,
+appearance and provenance gates as the first map. The remaining task is scale: the second-map
+pools are 3--9 frames per batch and their paired comparisons are seed-sensitive, so more maps
+and larger independently qualified pools are needed before any cross-map conclusion.
 
 **9. Instance vocabulary for harder geometry.** The counting contract's role vocabulary
 (left/right, near/far) is defined for lane markings on a single carriageway; junctions, 3-D lane
