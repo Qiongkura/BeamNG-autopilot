@@ -249,6 +249,31 @@ def main() -> int:
     expect("H2 E−H2 正向数", sum(1 for d in h2_iou["deltas"] if d > 0), 2)
     expect("H2 precision UNKNOWN seeds", len(h2["paired"]["prec"].get("unknown_seeds", [])), 5)
 
+    # west_coast 第二地图五批跨池配对（2026-10-13）：3/6/6/9/9 帧池、同初始化/预算/评测
+    wcu_files = [
+        ("WCU 3帧", "t16_wcu_crosspool_20261013", "wcu_summary.json", -0.1709),
+        ("WCU3 6帧", "t16_wcu3_crosspool_20261013", "wcu3_summary.json", -0.2374),
+        ("Wfix 6帧", "t16_wcu_reload_crosspool_20261013", "wfix_summary.json", -0.2211),
+        ("WCU4 9帧", "t16_wcu4_crosspool_20261013", "wcu4_summary.json", -0.1072),
+        ("WCU5 9帧", "t16_wcu5_crosspool_20261013", "wcu5_summary.json", -0.1345),
+    ]
+    n_neg = 0
+    n_cb = 0
+    n_pairs = 0
+    for tag, d, fn, mean_want in wcu_files:
+        w = json.loads((E / d / fn).read_text(encoding="utf-8"))
+        wi = w["paired"]["iou"]
+        expect(f"{tag} IoU mean", round(wi["mean_delta"], 4), mean_want)
+        n_pairs += wi["n"]
+        n_neg += sum(1 for x in wi["deltas"] if x < 0)
+        if wi["verdict"] == "champion_better":
+            n_cb += 1
+        if wi["verdict"] == "candidate_better":
+            bad.append(f"{tag}: 论文称从未 candidate_better，来源裁决为 {wi['verdict']}")
+    expect("west 五批配对总数", n_pairs, 25)
+    expect("west 五批负向配对数", n_neg, 24)
+    expect("west 五批 champion_better 数", n_cb, 3)
+
     print(f"=== 数字审计：检查 {checked} 项 ===")
     for b in bad:
         print("  ✗", b)
