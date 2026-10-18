@@ -17,15 +17,37 @@
 * 目标 ≥2站/≥6帧**未达成（0 站）**；不降门、不补采替代；冻结导出门未进入
   （批次验收已全隔离），全部证据保留于 `collect_e5line_eca1_20261018`。
 
-## 根因定位（ECA1 后诊断，证据链）
+## 根因定位（ECA1 后诊断）——**已更正（2026-10-18，ECA2 + 探针定因）**
 
-生成站点 `mid.z = 26.07` 来自 road-network `middle.z`，而实测地形为 z ≈ 54.2
-（`ensure_above_ground` 读数；同锚点 ground 查询一致）——**road-network z 低于
-真实地形约 28 m，生成的 DecalRoad 路链整体埋入地下**：线不可见（外观近零）、
-annotation 全背景、深度射线穿地逸出、投影校验 mismatch。与 west_coast 首批
-失败同根因类（road-chain 高于地形 ~69 m 的镜像变体）。修复前的地面重对齐
-（`_align_sites_to_ground`）只对 west_coast 开启，east_coast 未覆盖。
+> **撤回**：ECA1 后把 0/5 归因为"生成路链整体埋入地下"（road-network z 低于
+> 地形 ~28 m）是**错的**。上面对 0/5 各项测量（coverage/外观/annotation 线像素）
+> 如实保留，只更正因果解释。
 
-修复：`GROUND_ALIGN_MAPS = {west_coast_usa, east_coast_usa}`（进集合需该地图
-实测 z 偏差证据，italy 实测一致不进），初始对齐与 post-load 复测/重建两处
-gate 同步泛化（含回归断言）。ECA2 采集按修复后代码重跑（见预注册）。
+更正依据（证据链）：
+
+1. ECA2 按"地面重对齐"修复重采后 **ground_alignment 五站全 measured、
+   delta≈0**（+0.020 / −0.0002 / −0.0005 / −0.0001 / −0.0004 m）——包括
+   ECA1 引用的 `mid.z=26.07` 站点，其 ground 重读为 26.072 m。ECA1 的
+   "26.07 对地形 54.2"读数与同址重读矛盾（查询口径错位），28 m 偏差不成立；
+2. ECA2 对齐后仍 **0/5**（coverage 0.32/0/0/0.07/0），且逐帧 RGB 漆线
+   paint-like 沿真值曲线可见——"埋地致线不可见"的推断不成立；
+3. 探针（`scripts/m5_decal_annotation_probe.py`，5 场景变量分离，诊断输出
+   仅存 `logs/m5_seg/diag_*`，不进训练池）逐项判决：z 抬升 ≤0.5 m、
+   renderPriority 0/50、插入序、宽度 0.15–0.8 m、over_objects 全部无效；
+   **真正机制是 annotation pass 的 alpha 测试剔除**：east 的
+   line_white/line_yellow 家族 `opacityFactor 0.7 × baseColorFactor alpha
+   0.8–0.9` → 像素最终 alpha ≤ 0.56，配 `alphaRef=255`（alphaTest 缺席时的
+   阈值语义）全像素被 annotation pass 剔除；RGB pass 走 translucent 混合，
+   漆仍可见。west_coast 的 line_white 无 opacity 缩放（核心 alpha=1.0）所以
+   annotation 正常（实测真值像素 19/30 命中）——管线本身是好的；
+4. east 实测可替代材质只有 `line_yellow_double`（alphaTest=True/alphaRef=0，
+   该图自己的车道线就是它）：0.40 m 宽下冻结门三门全过（appearance 1.00、
+   coverage 1.0、投影 mean 0.54/0.63 px，两次运行），0.15 m 下双条纹亚像素
+   appearance 0.43–0.67 挂，0.50 m 回落（条纹间 gap 回到真值点）。
+
+处置：生成器 MAP_PROFILES 按 annotation 可写性重选 east 线材质/线宽
+（line_yellow_double @0.40 m，west/italy 合同宽度 0.15 m 不变），冻结门
+一字不改；`GROUND_ALIGN_MAPS` 保留 east（对齐是实测读数驱动的恒等/微调，
+五站 delta 记录在案），但注释同步更正（z 偏差不再是 0/5 的解释）。ECA3
+按修复后代码重采：`docs/T16_LINE_MEASURED_ECA3_PREREG_20261018.md`。
+诊断全过程见 `docs/T16_LINE_MEASURED_ECA2_RESULT_20261018.md`。
