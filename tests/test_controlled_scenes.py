@@ -693,6 +693,35 @@ def test_east_coast_profile_uses_annotation_writable_material_and_width():
                       "yellow": "line_yellow_double", "blue": None}
 
 
+def test_utah_profile_uses_annotation_writable_material_and_width():
+    m = _load()
+    prof = m.MAP_PROFILES["utah"]
+    # 2026-10-18 Utah.zip 复扫 + 同款探针实测：line_white/line_yellow 同 east
+    # alpha 缺陷（opacityFactor 0.7 × bcf alpha 0.90/1.0，alphaRef=255 全剔）；
+    # line_yellow_double（alphaTest=True/alphaRef=0）实测唯一可写实线（近距
+    # bin solid 4/4 vs 0/3、0/4，2 运行一致）。线宽 0.40m 与 east 同款纹理：
+    # 0.20–0.30m 双条纹亚像素无漆、0.50m 远距回落，0.40m 探针 annotation 全写、
+    # 导出门 paint_like 30/30×2。
+    assert prof["white"] == "line_yellow_double"
+    assert prof["yellow"] == "line_yellow_double"
+    assert prof["line_width"] == 0.40
+    assert prof["pave"] == "AsphaltRoad_variation_01"
+    assert prof["gravel"] == "dirt_road_gravels"
+    assert prof["blue"] is None  # 该地图无蓝色虚线材质，material_mix 不可用
+    assert prof["anchor"] is None
+    eff = m.apply_map_profile("utah")
+    assert eff["white"] == "line_yellow_double"
+    assert eff["line_width"] == 0.40
+    assert m.MAT_PAVE == "AsphaltRoad_variation_01"
+    assert m.MAT_GRAVEL == "dirt_road_gravels"
+    assert m.LINE_WIDTH_M == 0.40
+    assert m._MAT == {"white": "line_yellow_double",
+                      "yellow": "line_yellow_double", "blue": None}
+    # road z 与地形实测一致（探针站点 delta 0.02m，teleport_alignment 记录），
+    # 无 z 埋地证据 → 不进 GROUND_ALIGN_MAPS（与实测 z 缺陷地图区分）
+    assert "utah" not in m.GROUND_ALIGN_MAPS
+
+
 def test_map_profile_line_width_defaults_to_contract_and_overrides():
     m = _load()
     # west/italy 档案没声明 line_width → 合同宽度 0.15 不变
@@ -703,8 +732,9 @@ def test_map_profile_line_width_defaults_to_contract_and_overrides():
     eff = m.apply_map_profile("east_coast_usa", overrides={"line_width": 0.25})
     assert eff["line_width"] == 0.25
     assert m.LINE_WIDTH_M == 0.25
-    # 无档案地图 + 显式材质时也回落到 0.15
-    eff = m.apply_map_profile("utah", overrides={
+    # 无档案地图 + 显式材质时也回落到 0.15（utah 2026-10-18 已建档案 0.40，
+    # 换一个仍未建档案的地图名验证回落语义）
+    eff = m.apply_map_profile("smallgrid", overrides={
         "white": "line_white", "yellow": "line_yellow",
         "pave": "road_asphalt", "gravel": "m_dirt_road_gravels"})
     assert eff["line_width"] == 0.15
@@ -734,6 +764,40 @@ def test_east_line_material_choice_matches_map_alpha_admission():
     # 被换下的材质正是反例：alphaRef=255 且 opacity 缩放 → annotation 全剔
     for name in ("line_white", "line_yellow"):
         d = mats[name]
+        stage = (d.get("Stages") or [{}])[0]
+        assert int(d.get("alphaRef", 255)) == 255 and not d.get("alphaTest")
+        assert (stage.get("opacityFactor") or 1.0) < 1.0
+
+
+def test_utah_line_material_choice_matches_map_alpha_admission():
+    """utah 档案选材同款可写性回归（对真实 Utah.zip 资产）。
+
+    Utah.zip 的 line_white/line_yellow 与 east 同缺陷（opacityFactor 0.7 ×
+    bcf alpha 0.90/1.0，alphaRef=255 → annotation 全剔，探针近距 bin
+    solid 0/3、0/4 实测印证）；line_yellow_double alphaTest=True/alphaRef=0
+    是唯一可写实线（探针近距 bin solid 4/4 ×2 运行）。
+    """
+    zip_path = Path(r"G:\BeamNG.tech.v0.38.5.0\content\levels\Utah.zip")
+    if not zip_path.exists():
+        pytest.skip("BeamNG 地图 zip 不在本机（G: 盘）")
+    import json as _json
+    import zipfile as _zip
+    with _zip.ZipFile(zip_path) as zf:
+        mats = _json.loads(
+            zf.read("levels/Utah/art/road/main.materials.json"))
+    m = _load()
+    for kind in ("white", "yellow"):
+        name = m.MAP_PROFILES["utah"][kind]
+        d = mats[name]
+        if isinstance(d, list):
+            d = d[0]
+        writable = bool(d.get("alphaTest")) or int(d.get("alphaRef", 255)) < 255
+        assert writable, f"{name} annotation 不可写（alphaRef={d.get('alphaRef')})"
+    # 反例同 east：alphaRef=255 且 opacity 缩放 → annotation 全剔
+    for name in ("line_white", "line_yellow"):
+        d = mats[name]
+        if isinstance(d, list):
+            d = d[0]
         stage = (d.get("Stages") or [{}])[0]
         assert int(d.get("alphaRef", 255)) == 255 and not d.get("alphaTest")
         assert (stage.get("opacityFactor") or 1.0) < 1.0

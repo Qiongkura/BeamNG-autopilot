@@ -77,7 +77,7 @@ MAT_GRAVEL = "m_dirt_road_gravels"
 #: 「未见成规模」不正确）：east_coast_usa 有 line_white 72 站、line_yellow 15 站
 #: DecalRoad 实例，四材质均在 `art/road/main.materials.json` 有 map 级定义
 #: → 补第三张地图档案；无蓝色虚线材质，material_mix 场景不可用。
-#: utah 亦有 line_white 17 站（AsphaltRoad_variation_* 铺装）可后续建档案。
+#: utah 2026-10-18 建档：Utah.zip 全嵌套复扫 + 同款探针实测后入库（见下条目）。
 MAP_PROFILES: dict[str, dict] = {
     "italy": {"pave": MAT_PAVE, "white": MAT_LINE_WHITE, "yellow": MAT_LINE_YELLOW,
               "blue": MAT_LINE_BLUE, "gravel": MAT_GRAVEL,
@@ -100,6 +100,21 @@ MAP_PROFILES: dict[str, dict] = {
                                "0.40m 冻结门三门全过（appearance 1.00×2 运行），"
                                "0.15m appearance 0.43–0.67 挂（双条纹亚像素+中心 gap），"
                                "0.50m 回落（gap 回到真值点）"},
+    "utah": {"pave": "AsphaltRoad_variation_01",
+             "white": "line_yellow_double", "yellow": "line_yellow_double",
+             "blue": None, "gravel": "dirt_road_gravels",
+             "anchor": None, "line_width": 0.40,
+             "note": "第四张地图：2026-10-18 Utah.zip 全嵌套复扫 + 同款探针实测；"
+                     "该图 line_white/line_yellow 家族同 east alpha 缺陷"
+                     "（opacityFactor 0.7 × bcf alpha 0.90/1.0，alphaRef=255 全剔）；"
+                     "line_yellow_double（alphaTest=True/alphaRef=0）实测唯一可写实线"
+                     "（近距 bin solid 4/4 vs line_white 0/3、line_yellow 0/4，2 运行一致）；"
+                     "0.40m 探针 annotation 全写、导出门 paint_like 30/30×2，"
+                     "严格外观掩码 0.53–0.87（utah bcf 渲染偏暗贴严格阈值下沿，"
+                     "掩码侧证据保留）；0.20–0.30m 双条纹亚像素无漆，0.50m 远距回落；"
+                     "线宽=场景规格适配非降门（与 east 同 0.40m）；"
+                     "road z 与地形实测一致（探针站点 delta 0.02m），不进 GROUND_ALIGN_MAPS；"
+                     "无蓝色虚线材质，material_mix 不可用"},
 }
 
 
