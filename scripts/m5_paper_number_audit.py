@@ -286,6 +286,34 @@ def main() -> int:
         expect(f"WCU6 {m} inconclusive", int(p6["verdict"] == "inconclusive"), 1)
     expect("WCU6 IoU 正向数", sum(1 for x in wcu6["paired"]["iou"]["deltas"] if x > 0), 4)
 
+    # west_coast 聚合池（2026-10-13）：36 帧聚合 WALL vs H，论文称三项 champion_better、
+    # 0/5 正向、IoU −0.1918±0.0952、排除collapse −0.1747；六小池+聚合池 35 对 30 负
+    wp = json.loads((E / "t16_wcu_pool_20261013" /
+                     "wcu_pool_summary.json").read_text(encoding="utf-8"))
+    wpi = wp["paired"]["iou"]
+    expect("聚合池 IoU mean", round(wpi["mean_delta"], 4), -0.1918)
+    expect("聚合池 IoU sd", round(wpi["sd"], 4), 0.0952)
+    expect("聚合池 IoU 排除collapse mean",
+           round(wpi["collapse"]["mean_delta_excluding_collapse"], 4), -0.1747)
+    expect("聚合池 IoU 正向数", sum(1 for x in wpi["deltas"] if x > 0), 0)
+    expect("聚合池 IoU collapse pair 数", wpi["collapse"]["n_pairs_excluded"], 1)
+    for m in ("iou", "rec", "prec"):
+        expect(f"聚合池 {m} champion_better",
+               int(wp["paired"][m]["verdict"] == "champion_better"), 1)
+    n_pairs += wpi["n"]
+    n_neg += sum(1 for x in wpi["deltas"] if x < 0)
+    expect("west 六小池+聚合池 配对总数", n_pairs, 35)
+    expect("west 六小池+聚合池 负向配对数", n_neg, 30)
+    # 复现性：H 臂同种子跨三次运行最大差 0.0356 IoU（GPU 非确定性）
+    h_max = 0.0
+    for s in ("47", "48", "49", "50", "51"):
+        vals = [json.loads((E / d / fn).read_text(encoding="utf-8"))["arms"]["H"][s]["iou"]
+                for d, fn in (("t16_wcu5_crosspool_20261013", "wcu5_summary.json"),
+                              ("t16_wcu6_crosspool_20261013", "wcu6_summary.json"),
+                              ("t16_wcu_pool_20261013", "wcu_pool_summary.json"))]
+        h_max = max(h_max, max(vals) - min(vals))
+    expect("H臂跨运行最大 IoU 差", round(h_max, 4), 0.0356)
+
     print(f"=== 数字审计：检查 {checked} 项 ===")
     for b in bad:
         print("  ✗", b)
