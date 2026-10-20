@@ -54,7 +54,7 @@
 | 2026-10-13 | 结果 | [T16_LINE_MEASURED_LARGE5_RESULT_20261013.md](T16_LINE_MEASURED_LARGE5_RESULT_20261013.md) | 第五 LINE=measured 独立池族采集结果（2026-10-13） | ↔ T16_LINE_MEASURED_LARGE5_PREREG_20261013 | 1 |
 | 2026-10-13 | 结果 | [T16_LINE_MEASURED_POOL_RESULT_20261013.md](T16_LINE_MEASURED_POOL_RESULT_20261013.md) | LINE=measured 独立真值池与通道掩码训练回归结果（2026-10-13） |  | 1 |
 | 2026-10-13 | 预注册 | [T16_LINE_MEASURED_WCU2_PREREG_20261013.md](T16_LINE_MEASURED_WCU2_PREREG_20261013.md) | 不同地图 LINE=measured 受控采集预注册（2026-10-13） | ↔ T16_LINE_MEASURED_WCU2_RESULT_20261013 | 1 |
-| 2026-10-13 | 结果 | [T16_LINE_MEASURED_WCU2_RESULT_20261013.md](T16_LINE_MEASURED_WCU2_RESULT_20261013.md) | west_coast_usa LINE=measured 采集结果（2026-10-13） | ↔ T16_LINE_MEASURED_WCU2_PREREG_20261013 | 1 |
+| 2026-10-13 | 结果 | [T16_LINE_MEASURED_WCU2_RESULT_20261013.md](T16_LINE_MEASURED_WCU2_RESULT_20261013.md) | west_coast_usa LINE=measured 采集结果（2026-10-13） | ↔ T16_LINE_MEASURED_WCU2_PREREG_20261013 | 3 |
 | 2026-10-13 | 预注册 | [T16_LINE_MEASURED_WCU3_PREREG_20261013.md](T16_LINE_MEASURED_WCU3_PREREG_20261013.md) | west_coast 第二批 LINE=measured 扩展预注册（2026-10-13） | ↔ T16_LINE_MEASURED_WCU3_RESULT_20261013 | 1 |
 | 2026-10-13 | 结果 | [T16_LINE_MEASURED_WCU3_RESULT_20261013.md](T16_LINE_MEASURED_WCU3_RESULT_20261013.md) | west_coast 第二批 LINE=measured 扩展结果（2026-10-13） | ↔ T16_LINE_MEASURED_WCU3_PREREG_20261013 | 1 |
 | 2026-10-13 | 预注册 | [T16_LINE_MEASURED_WCU4_PREREG_20261013.md](T16_LINE_MEASURED_WCU4_PREREG_20261013.md) | west_coast 第三批独立 LINE=measured 采集预注册（2026-10-13） | ↔ T16_LINE_MEASURED_WCU4_RESULT_20261013 | 1 |
@@ -96,7 +96,7 @@
 | 2026-10-11 | 其它 | [T16_SCENE_AND_SEND_GATE_FIX_20261011.md](T16_SCENE_AND_SEND_GATE_FIX_20261011.md) | 驾驶正确性修复：场景选择分离与最终发送时效门（2026-10-11） |  | 3 |
 | 2026-10-11 | 预注册 | [T16_SCENE_SEND_GATE_LIVE_PREREG_20261011.md](T16_SCENE_SEND_GATE_LIVE_PREREG_20261011.md) | 修复后实机验证预注册（2026-10-11） | ↔ T16_SCENE_SEND_GATE_LIVE_RESULT_20261011 | 1 |
 | 2026-10-11 | 结果 | [T16_SCENE_SEND_GATE_LIVE_RESULT_20261011.md](T16_SCENE_SEND_GATE_LIVE_RESULT_20261011.md) | 修复后实机验证结果（2026-10-11） | ↔ T16_SCENE_SEND_GATE_LIVE_PREREG_20261011 | 0 |
-| 2026-10-11 | 结果 | [T16_STALL_ATTRIBUTION_RESULT_20261011.md](T16_STALL_ATTRIBUTION_RESULT_20261011.md) | 停车原因生产输入回放：归因结果（2026-10-11） |  | 1 |
+| 2026-10-11 | 结果 | [T16_STALL_ATTRIBUTION_RESULT_20261011.md](T16_STALL_ATTRIBUTION_RESULT_20261011.md) | 停车原因生产输入回放：归因结果（2026-10-11） |  | 3 |
 | 2026-10-09 | 结果 | [T16_DEVELOPMENT_RESULT_20261009.md](T16_DEVELOPMENT_RESULT_20261009.md) | T16 本轮开发与集中实测记录 |  | 3 |
 | 2026-10-09 | 其它 | [T16_RUNTIME_LEARNING_REPAIR_20261009.md](T16_RUNTIME_LEARNING_REPAIR_20261009.md) | T16：运行可信性与自主学习修复协议 |  | 3 |
 | 2026-10-07 | 结果 | [T16_E4_SECOND_MAP_RESULT_20261007.md](T16_E4_SECOND_MAP_RESULT_20261007.md) | 结果：第二张地图（E4）尝试——被引擎的逐地图标注类阻断 |  | 0 |
@@ -179,7 +179,7 @@
 | — | 其它 | [fsd_realism.md](fsd_realism.md) | FSD 底层拟真要求(FSD Realism Invariants) |  | 2 |
 | — | 其它 | [paper/README.md](paper/README.md) | T16 论文（英文版 + 中文版 + 补充材料 + 投稿源包） |  | 28 |
 | — | 其它 | [paper/paper.md](paper/paper.md) | Abstract |  | 19 |
-| — | 其它 | [paper/paper_zh.md](paper/paper_zh.md) | 摘要 |  | 3 |
+| — | 其它 | [paper/paper_zh.md](paper/paper_zh.md) | 摘要 |  | 5 |
 | — | 其它 | [paper/submission/README.md](paper/submission/README.md) | 投稿源包（T16） |  | 29 |
 | — | 其它 | [paper/supplement.md](paper/supplement.md) | Abstract |  | 4 |
 | — | 其它 | [paper/supplement_zh.md](paper/supplement_zh.md) | 摘要 |  | 3 |
