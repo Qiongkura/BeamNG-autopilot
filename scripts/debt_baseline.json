@@ -344,11 +344,11 @@
    "silent_except": 0
   },
   "beamng_autopilot/fsd_drive.py": {
-   "except_exception": 86,
-   "lines": 5725,
+   "except_exception": 78,
+   "lines": 5727,
    "max_func_lines": 3430,
    "prints": 84,
-   "silent_except": 27
+   "silent_except": 19
   },
   "beamng_autopilot/fsd_realism.py": {
    "except_exception": 0,
@@ -1162,10 +1162,10 @@
   "beamng_autopilot_tech"
  ],
  "totals": {
-  "except_exception": 342,
+  "except_exception": 334,
   "max_func_lines": 3430,
   "prints": 163,
-  "silent_except": 71
+  "silent_except": 63
  },
  "version": 1
 }
