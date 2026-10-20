@@ -177,10 +177,10 @@
 | — | 其它 | [compose/spec/yellow-mask-live.md](compose/spec/yellow-mask-live.md) | Live Yellow-Paint Fusion for Painted-Line Geometry |  | 0 |
 | — | 其它 | [compose/spec/yellow-semantic-head.md](compose/spec/yellow-semantic-head.md) | Yellow Paint in Semantic Head LINE Channel |  | 0 |
 | — | 其它 | [fsd_realism.md](fsd_realism.md) | FSD 底层拟真要求(FSD Realism Invariants) |  | 2 |
-| — | 其它 | [paper/README.md](paper/README.md) | T16 论文（英文版 + 中文版 + 补充材料 + 投稿源包） |  | 28 |
+| — | 其它 | [paper/README.md](paper/README.md) | T16 论文（英文版 + 中文版 + 补充材料 + 投稿源包） |  | 29 |
 | — | 其它 | [paper/paper.md](paper/paper.md) | Abstract |  | 19 |
 | — | 其它 | [paper/paper_zh.md](paper/paper_zh.md) | 摘要 |  | 5 |
-| — | 其它 | [paper/submission/README.md](paper/submission/README.md) | 投稿源包（T16） |  | 29 |
+| — | 其它 | [paper/submission/README.md](paper/submission/README.md) | 投稿源包（T16） |  | 30 |
 | — | 其它 | [paper/supplement.md](paper/supplement.md) | Abstract |  | 4 |
 | — | 其它 | [paper/supplement_zh.md](paper/supplement_zh.md) | 摘要 |  | 3 |
 | 2026-09-18 | 其它 | [paved_edge_reference_20260918.md](paved_edge_reference_20260918.md) | 铺装路面边界横向参考（2026-09-18） |  | 0 |
