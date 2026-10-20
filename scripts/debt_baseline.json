@@ -548,8 +548,8 @@
   },
   "beamng_autopilot/lane/reference.py": {
    "except_exception": 10,
-   "lines": 1243,
-   "max_func_lines": 432,
+   "lines": 1285,
+   "max_func_lines": 419,
    "prints": 0,
    "silent_except": 1
   },
