@@ -976,3 +976,80 @@ def test_bev_fallback_is_off_in_strict_and_needs_enough_points():
     empty = OccupancyGrid(n_rows=60, n_cols=60, res=0.5)   # 无可行驶 cell
     assert _bev_whole_road_center(empty, np.zeros(3), 0.0,
                                   strict_lane=False) is None
+
+
+def test_paved_authority_needs_the_flag_and_a_real_centre():
+    """铺装边界只在"无标线 + 有铺装 + 中心够长"时接手；否则让位给 fail-closed。"""
+    from beamng_autopilot.lane.reference import _paved_boundary_usable
+
+    ref = _PavedRef()
+    assert _paved_boundary_usable(True, ref) is True
+    assert _paved_boundary_usable(False, ref) is False, "默认关，不得自行启用"
+
+    class NoCentre:
+        center = None
+
+    class ShortCentre:
+        center = np.zeros((2, 2))
+
+    assert _paved_boundary_usable(True, None) is False
+    assert _paved_boundary_usable(True, NoCentre()) is False
+    assert _paved_boundary_usable(True, ShortCentre()) is False
+
+
+def test_paved_geometry_is_2d_and_uses_the_measured_span():
+    from beamng_autopilot.lane.reference import _paved_geometry
+
+    center, left, right, width = _paved_geometry(_PavedRef(half_m=3.5))
+    assert center.shape[1] == 2 and left.shape[1] == 2 and right.shape[1] == 2
+    assert abs(width - 7.0) < 1e-9
+    assert left[:, 1].max() > 0 > right[:, 1].min(), "左正右负（+y 为左）"
+
+    class NoSpan:
+        center = np.zeros((5, 3))       # 带 z 的折线
+        left = np.zeros((5, 3))
+        right = np.zeros((5, 3))
+
+    c2, _, _, w2 = _paved_geometry(NoSpan())
+    assert c2.shape == (5, 2), "只取前两列"
+    assert w2 == 0.0
+
+
+def test_divider_lane_finds_the_paint_and_reports_debug():
+    """分隔线兜底：找线 + 右移半车道，并把诊断留在 debug 里。"""
+    from beamng_autopilot.lane.reference import _divider_lane
+
+    dbg = {}
+    divider, dbg = _divider_lane(_divider_marks(-0.37), np.zeros(3), 0.0,
+                                 _route(), _grid_full(), debug=dbg)
+    assert divider is not None, dbg
+    center, left = divider[0], divider[1]
+    assert float(np.median(center[:, 1])) == pytest.approx(
+        -0.37 - LANE_W_M / 2, abs=0.1)
+    assert left is not None
+
+    # 2.5 m 外的那条不是分隔线（会凭空造出一条肩上车道）
+    off, _ = _divider_lane(_divider_marks(-2.5), np.zeros(3), 0.0,
+                           _route(), _grid_full(), debug={})
+    assert off is None
+
+
+def test_divider_lane_never_raises_and_keeps_the_reason(monkeypatch):
+    from beamng_autopilot.lane import reference as ref_mod
+
+    # 没有标记 -> 找不到分隔线，但**不算失败**：debug 原样保留
+    divider, dbg = ref_mod._divider_lane(None, np.zeros(3), 0.0, _route(),
+                                        None, debug={"stale": 1})
+    assert divider is None
+    assert dbg == {"stale": 1}
+
+    # 真的抛异常 -> 不冒泡，debug 被换成只含失败原因的新 dict（与搬移前一致）
+    def boom(*_a, **_k):
+        raise RuntimeError("divider exploded")
+
+    monkeypatch.setattr(ref_mod, "own_lane_beside_divider", boom)
+    divider, dbg = ref_mod._divider_lane(None, np.zeros(3), 0.0, _route(),
+                                        None, debug={"stale": 1})
+    assert divider is None
+    assert "reason" in dbg and "exploded" in dbg["reason"]
+    assert "stale" not in dbg

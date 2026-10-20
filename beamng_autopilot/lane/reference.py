@@ -809,6 +809,61 @@ def _bev_whole_road_center(grid, pos, heading, *, strict_lane: bool):
     return ref
 
 
+def _paved_boundary_usable(paved_fallback: bool, paved_ref) -> bool:
+    """无标线但有铺装时，铺装边界能否当本车道权威（信任顺序第 3 级）。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出。AGENTS.md「驾驶约束」
+    固定了 trust order：**标线 >> 路面边界 = 护墙 = 围栏**，所以这一级排在
+    感知标线之下、任何地图几何之上。
+
+    候选本身已经 abstain 过一次（铺装右缘必须被观测到、跨度是道路量级、
+    铺装沿自车轨迹可见），所以这一层**不能凭空在草地上造车道**；它的边线
+    会作为本 tick 的**硬边界**发布——这正是"禁止将车辆驾驶到土和草上"的
+    执行点。``paved_fallback`` 默认关，开启才考虑。
+    """
+    if not paved_fallback or paved_ref is None:
+        return False
+    center = getattr(paved_ref, "center", None)
+    return center is not None and len(center) >= 3
+
+
+def _paved_geometry(paved_ref) -> tuple:
+    """铺装车道的 ``(center, left, right, width)``；宽度取实测 ``span_m``。
+
+    只取前两列：``PavedLane`` 的中心折线可能带 z，而横向参考是二维几何。
+    宽度缺失(``span_m`` 为 0/None)就按 0 返回，由调用方决定怎么用——
+    这里不替它猜一个合同宽度。
+    """
+    return (np.asarray(paved_ref.center, dtype=float)[:, :2],
+            np.asarray(paved_ref.left, dtype=float)[:, :2],
+            np.asarray(paved_ref.right, dtype=float)[:, :2],
+            float(getattr(paved_ref, "span_m", 0.0) or 0.0))
+
+
+def _divider_lane(markings, pos, heading, route_ref, grid, *,
+                  debug: dict) -> tuple:
+    """把路线上的漆线当**分隔线**，返回它右侧的半个车道 ``(center, left)``。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出。场景：车正压在（或紧贴）
+    道路中心线上，所有整路读法都被侧向门拒绝，strict 车永远离不开它卡住的
+    那条线。一条**在路线上的**长实/虚线就是分隔线——本车道在它右侧半个车道
+    处，且该中心还要自己过侧向门、落在被观测到的铺装上（后两条仍由调用方
+    执行，这里只负责"找分隔线 + 右移"）。
+
+    返回 ``(divider_or_None, debug_dict)``：失败时 debug 被换成
+    ``{"reason": ...}``（与搬移前一致），调用方用它写进 meta 供复核。
+    """
+    dbg: dict = dict(debug)
+    try:
+        divider = own_lane_beside_divider(
+            markings, pos, heading, route_ref, grid,
+            lane_half_m=0.5 * float(LANE_WIDTH_DEFAULT_M),
+            debug=dbg)
+    except Exception as exc:                         # noqa: BLE001
+        return None, {"reason": f"divider check failed: {exc}"}
+    return divider, dbg
+
+
 def select_lane_reference(
     *,
     lane_frame,
@@ -1030,14 +1085,9 @@ def select_lane_reference(
         # pass the side gate and land on observed drivable pavement.
         if not (sensor_paired and lane_ref is not None and len(lane_ref) >= 3) \
                 and not _single_vision:
-            try:
-                _divider = own_lane_beside_divider(
-                    markings, pos, heading, route_ref, grid,
-                    lane_half_m=0.5 * float(LANE_WIDTH_DEFAULT_M),
-                    debug=_divider_dbg)
-            except Exception as exc:
-                _divider = None
-                _divider_dbg = {"reason": f"divider check failed: {exc}"}
+            _divider, _divider_dbg = _divider_lane(
+                markings, pos, heading, route_ref, grid,
+                debug=_divider_dbg)
             if _divider is not None:
                 lane_ref = _divider[0]
                 lane_left = _divider[1]
@@ -1093,22 +1143,14 @@ def select_lane_reference(
         elif _divider is not None:
             lane_src_sel = SRC_SENSOR
             lane_right = None
-        elif (paved_fallback and paved_ref is not None
-              and getattr(paved_ref, "center", None) is not None
-              and len(paved_ref.center) >= 3):
+        elif _paved_boundary_usable(paved_fallback, paved_ref):
             # NO usable marking on a road that IS paved: the pavement
             # boundary is the authority (AGENTS.md「驾驶约束」: 标线 >>
-            # 路面边界 = 护墙 = 围栏).  The candidate already abstained
-            # unless the paved RIGHT edge is observed inside the image,
-            # the span is road-sized and the pavement is observed along
-            # the car's own track, so this branch can not invent a lane on
-            # grass; its edges are published as the tick's HARD
-            # boundaries, which is what keeps the car on the pavement
-            # ("禁止将车辆驾驶到土和草上").
-            lane_ref = np.asarray(paved_ref.center, dtype=float)[:, :2]
-            lane_left = np.asarray(paved_ref.left, dtype=float)[:, :2]
-            lane_right = np.asarray(paved_ref.right, dtype=float)[:, :2]
-            lane_width = float(getattr(paved_ref, "span_m", 0.0) or 0.0)
+            # 路面边界 = 护墙 = 围栏).  Its edges are published as the
+            # tick's HARD boundaries, which is what keeps the car on the
+            # pavement ("禁止将车辆驾驶到土和草上").
+            lane_ref, lane_left, lane_right, lane_width = \
+                _paved_geometry(paved_ref)
             lane_src_sel = SRC_PAVED
         else:
             lane_ref = None
