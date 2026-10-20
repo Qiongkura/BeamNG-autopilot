@@ -42,6 +42,9 @@
 > 5. **横向参考默认已合规**（2026-10-20）：`m5_fsd_drive` / `m5_shadow_drive` 的
 >    `--lane-mode` 默认 `sensor`、`--strict` 默认开；`map`/`auto`/`--no-strict`
 >    必须显式加 `--allow-legacy-map-lane`，且那一轮结果不得用于验收。
+>
+> 全部 224 篇实验报告见 [文档索引](docs/INDEX.md)（脚本生成：系列/类型/
+> 预注册↔结果配对/被引用次数；`scripts/m5_docs_index.py --check` 可做门禁）。
 
 - **分层架构**：清晰的感知、决策、控制模块，便于研究与扩展；
 - **双运行时支持**：兼容 Steam 与 BeamNG.tech，自动检测并适配不同版本；
