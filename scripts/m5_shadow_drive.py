@@ -31,6 +31,7 @@ if str(ROOT) not in sys.path:
 import math
 
 from beamng_autopilot import config
+from beamng_autopilot.fsd_realism import lane_mode_is_fsd_compliant
 from beamng_autopilot.bev_fusion import fuse_front_frame_vector_space
 from beamng_autopilot.connector import BeamNGConnector
 from beamng_autopilot.control import gearbox
@@ -164,7 +165,8 @@ def _curve_speed_mps(route: np.ndarray | None, pos: np.ndarray,
     return 8.0
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """CLI 定义（抽出来是为了让"默认值是否合规"可被单测钉住）。"""
     ap = argparse.ArgumentParser(description="shadow-mode recorder")
     ap.add_argument("--runtime", choices=("auto", "steam", "tech"),
                     default="auto")
@@ -189,19 +191,39 @@ def main() -> int:
     ap.add_argument("--lidar-every", type=int, default=1,
                     help="reuse the last LiDAR scan for N-1 of every N "
                          "frames (range scan is the per-frame bottleneck)")
-    ap.add_argument("--lane-mode", choices=("map", "sensor"), default="map",
-                    help="lane reference for the shadow planner: map "
-                         "(legacy road-graph lane) or sensor (painted-line "
-                         "perception only; the FSD path)")
-    ap.add_argument("--strict", action="store_true",
-                    help="FSD realism mode (docs/fsd_realism.md): with "
-                         "--lane-mode sensor the map lane / nav route may "
-                         "NEVER steer or label a frame; frames without a "
-                         "perceived lane are stopped on and not recorded")
+    ap.add_argument("--lane-mode", choices=("map", "sensor"), default="sensor",
+                    help="lane reference for the shadow planner: sensor "
+                         "(perception only, default = the FSD path) or map "
+                         "(legacy road-graph lane; requires "
+                         "--allow-legacy-map-lane, AGENTS.md forbids it here)")
+    ap.add_argument("--strict", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="FSD realism mode (docs/fsd_realism.md, default ON): "
+                         "the map lane / nav route may NEVER steer or label a "
+                         "frame; frames without a perceived lane are stopped on "
+                         "and not recorded")
+    ap.add_argument("--allow-legacy-map-lane", action="store_true",
+                    help="诊断用逃生口：允许 --lane-mode map 或 --no-strict。"
+                         "AGENTS.md 铁律禁止 FSD 入口用导航线/地图线做横向参考；"
+                         "开了它录出来的帧**不得当作 FSD 合规数据**")
     ap.add_argument("--map", type=str, default=None,
                     help="BeamNG level to load / label (default: live "
                          "session level when attach succeeds, else italy)")
+    return ap
+
+
+def main() -> int:
+    ap = build_parser()
     args = ap.parse_args()
+    if not lane_mode_is_fsd_compliant(args.lane_mode, args.strict):
+        if not args.allow_legacy_map_lane:
+            ap.error(
+                f"--lane-mode {args.lane_mode} / --strict={args.strict} 不是 FSD "
+                "合规路径：AGENTS.md 铁律禁止 FSD 入口用导航线/地图线 + 偏移做横向"
+                "参考。默认已是 sensor+strict；确需录像诊断请显式加 "
+                "--allow-legacy-map-lane（该批数据不得当作 FSD 合规数据）。")
+        print("[warn] 本轮走 legacy 地图横向参考（--allow-legacy-map-lane）："
+              "帧与统计不得用于 FSD 验收", file=sys.stderr)
 
     from beamng_autopilot.fsd_drive import resolve_provenance_env
 
