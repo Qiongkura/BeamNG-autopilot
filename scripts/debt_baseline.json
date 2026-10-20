@@ -43,11 +43,11 @@
    "silent_except": 1
   },
   "beamng_autopilot/connector.py": {
-   "except_exception": 20,
-   "lines": 1064,
+   "except_exception": 19,
+   "lines": 1067,
    "max_func_lines": 72,
    "prints": 0,
-   "silent_except": 2
+   "silent_except": 1
   },
   "beamng_autopilot/control/__init__.py": {
    "except_exception": 0,
@@ -778,11 +778,11 @@
    "silent_except": 0
   },
   "beamng_autopilot/planning/selector.py": {
-   "except_exception": 5,
-   "lines": 227,
-   "max_func_lines": 110,
+   "except_exception": 4,
+   "lines": 232,
+   "max_func_lines": 115,
    "prints": 0,
-   "silent_except": 2
+   "silent_except": 0
   },
   "beamng_autopilot/planning/speed_profile.py": {
    "except_exception": 0,
@@ -862,11 +862,11 @@
    "silent_except": 1
   },
   "beamng_autopilot/run_manifest.py": {
-   "except_exception": 9,
-   "lines": 330,
-   "max_func_lines": 46,
+   "except_exception": 4,
+   "lines": 338,
+   "max_func_lines": 48,
    "prints": 0,
-   "silent_except": 3
+   "silent_except": 0
   },
   "beamng_autopilot/runtime.py": {
    "except_exception": 0,
@@ -1162,10 +1162,10 @@
   "beamng_autopilot_tech"
  ],
  "totals": {
-  "except_exception": 351,
+  "except_exception": 344,
   "max_func_lines": 3430,
   "prints": 163,
-  "silent_except": 79
+  "silent_except": 73
  },
  "version": 1
 }
