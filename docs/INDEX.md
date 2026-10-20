@@ -3,9 +3,9 @@
 > 生成：`.venv\Scripts\python.exe scripts\m5_docs_index.py --write`；校验：`--check`（过期返回 1）。
 > 手改本文件会被 `--check` 判为过期——要加说明请写进对应文档或生成器。
 
-共 **224** 篇：交接 4 / 其它 70 / 协议 3 / 定因 4 / 审计 3 / 报告 13 / 状态 5 / 结果 53 / 计划 12 / 设计 2 / 证据 2 / 评审 8 / 预注册 45；预注册↔结果已配对 **82** 篇；**28** 篇没有被任何文档（含 README/AGENTS）引用。
+共 **224** 篇：交接 4 / 其它 70 / 协议 3 / 定因 4 / 审计 3 / 报告 13 / 状态 5 / 结果 53 / 计划 12 / 设计 2 / 证据 2 / 评审 8 / 预注册 45；预注册↔结果已配对 **82** 篇；**28** 篇没有被任何文档（含 README/AGENTS）引用，集中列在文末「无正文入口」。
 
-「被引用」= 其它文档正文里出现该文件名（不含扩展名）的次数；0 表示没有入口，需要在正文里链上或归档。
+「被引用」= 其它文档正文里出现该文件名（不含扩展名）的次数；0 表示没有正文入口，需要补链或归档。
 
 ## T16（126）
 
@@ -415,3 +415,38 @@
 | 日期 | 类型 | 文件 | 标题 | 配对 | 被引用 |
 | --- | --- | --- | --- | --- | ---: |
 | 2026-09-20 | 其它 | [tech_ab_20260920.md](tech_ab_20260920.md) | Tech 实车基线与开关 A/B（2026-09-20，town 场景） |  | 1 |
+
+## 无正文入口（28）
+
+这些文档没有任何正文引用（不含本索引）。要么在相关报告里补链，要么确认为历史归档；两种处理都不改变文件本身。
+
+| 日期 | 类型 | 文件 | 标题 |
+| --- | --- | --- | --- |
+| — | 其它 | [reviews/2026-09-20_strict_centerline.md](reviews/2026-09-20_strict_centerline.md) | 2026-09-20 strict mode rides the road centre line |
+| 2026-09-20 | 交接 | [HANDOFF_20260920.md](HANDOFF_20260920.md) | 交接：Tech 实车基线与剩余工作（2026-09-20） |
+| 2026-09-06 | 交接 | [HANDOFF_20260906.md](HANDOFF_20260906.md) | 交接文档（2026-09-06，标线识别与居中控制攻坚轮） |
+| 2026-10-10 | 状态 | [PROJECT_STATUS_RECHECK_20261010.md](PROJECT_STATUS_RECHECK_20261010.md) | 当前项目状态复查（2026-10-10，E5 新资格入口之后） |
+| 2026-09-26 | 报告 | [T14_S4_S5_ROUND_REPORT_20260926.md](T14_S4_S5_ROUND_REPORT_20260926.md) | 本轮报告（S4 看板 / S5 有效因子 / T10 / T15 / 审计后重测） |
+| 2026-09-25 | 其它 | [T14_W2_W5_W3_W6_PROGRESS_20260925.md](T14_W2_W5_W3_W6_PROGRESS_20260925.md) | T14 开发方案：W2 / W5 / W3 / W6 执行报告（2026-09-25 第二批） |
+| 2026-09-24 | 其它 | [T14_NEXT_STAGE_20260924.md](T14_NEXT_STAGE_20260924.md) | 下一阶段进展（2026-09-24 起）：可信标线评价 → 真正的后台循环 |
+| 2026-09-24 | 报告 | [T14_PROGRESS_REPORT_20260924.md](T14_PROGRESS_REPORT_20260924.md) | T14 三小时计划执行 + 后续开发报告（2026-09-24） |
+| 2026-10-11 | 结果 | [T16_SCENE_SEND_GATE_LIVE_RESULT_20261011.md](T16_SCENE_SEND_GATE_LIVE_RESULT_20261011.md) | 修复后实机验证结果（2026-10-11） |
+| 2026-10-07 | 结果 | [T16_E4_SECOND_MAP_RESULT_20261007.md](T16_E4_SECOND_MAP_RESULT_20261007.md) | 结果：第二张地图（E4）尝试——被引擎的逐地图标注类阻断 |
+| 2026-10-06 | 其它 | [T16_PAPER_FIGURES_20261006.md](T16_PAPER_FIGURES_20261006.md) | T16 论文图表集（2026-10-06，42 张） |
+| 2026-10-05 | 审计 | [T16_FINAL_SET_AUDIT_20261005.md](T16_FINAL_SET_AUDIT_20261005.md) | T16 最终集封存审计与专用池采集（2026-10-05） |
+| 2026-10-05 | 其它 | [T16_NEXT_FACTOR_DIM_PAINT_DATA_20261005.md](T16_NEXT_FACTOR_DIM_PAINT_DATA_20261005.md) | T16 下一单因子预注册草案：暗漆（阴影下漆线）训练数据（2026-10-05） |
+| 2026-10-05 | 预注册 | [T16_NEXT_FACTOR_SWA_PREREG_20261005.md](T16_NEXT_FACTOR_SWA_PREREG_20261005.md) | T16 单因子预注册：检查点平均（SWA）能否修掉弱 seed（2026-10-05） |
+| 2026-09-28 | 其它 | [T16_AUTOTRUTH_CHAIN_AND_R2_20260928.md](T16_AUTOTRUTH_CHAIN_AND_R2_20260928.md) | T16：自动真值接入链 + 首轮自动真值增量实验（2026-09-28） |
+| 2026-09-27 | 其它 | [T16_ORDER3_SCALE_20260927.md](T16_ORDER3_SCALE_20260927.md) | T16 §4.4 扩量：多路段受控场景批次与逐站点资格（2026-09-27） |
+| 2026-09-27 | 其它 | [T16_ORDER4_DATA_INCREMENT_20260927.md](T16_ORDER4_DATA_INCREMENT_20260927.md) | T16 Order 4（2）：固定 init 下的数据增量实验（2026-09-27） |
+| 2026-10-11 | 状态 | [T18_STATUS_20261011.md](T18_STATUS_20261011.md) | T18 状态（2026-10-11） |
+| — | 其它 | [compose/spec/east-robust-pack.md](compose/spec/east-robust-pack.md) | East Coast Robustness Pack |
+| — | 其它 | [compose/spec/pair-hold-centre.md](compose/spec/pair-hold-centre.md) | Hold Centre-Paint Lanes Across Detection Gaps |
+| — | 其它 | [compose/spec/plc-low-speed.md](compose/spec/plc-low-speed.md) | PLC Low-Speed Engagement |
+| — | 其它 | [compose/spec/s0-shadow-hygiene.md](compose/spec/s0-shadow-hygiene.md) | S0 Shadow Provenance Hygiene |
+| — | 其它 | [compose/spec/yellow-mask-live.md](compose/spec/yellow-mask-live.md) | Live Yellow-Paint Fusion for Painted-Line Geometry |
+| — | 其它 | [compose/spec/yellow-semantic-head.md](compose/spec/yellow-semantic-head.md) | Yellow Paint in Semantic Head LINE Channel |
+| 2026-09-18 | 其它 | [paved_edge_reference_20260918.md](paved_edge_reference_20260918.md) | 铺装路面边界横向参考（2026-09-18） |
+| 2026-09-16 | 状态 | [line_recognition_status_20260916.md](line_recognition_status_20260916.md) | 标线识别现状与问题清单（2026-09-16） |
+| 2026-09-12 | 其它 | [line_detection_optimization_20260912.md](line_detection_optimization_20260912.md) | 标线检测链路优化验证（2026-09-12） |
+| 2026-08-14 | 计划 | [planner_baseline_20260814.md](planner_baseline_20260814.md) | Planner 基线记录（2026-08-14） |
