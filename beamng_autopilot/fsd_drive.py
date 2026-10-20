@@ -543,7 +543,9 @@ def _perception_off_road_m(out, pos, heading) -> float:
                     float(c[0]), float(c[1]), left, None)
                 if cov and float(lat) > worst:
                     worst = float(lat)
-            except Exception:
+            except (TypeError, ValueError, IndexError):
+                # 只吞"几何输入坏了"这一类。这里算的是**越界最差值**：
+                # 吞掉编程错误会让越界读数静默偏小，安全方向正好反了。
                 pass
         if right is not None:
             try:
@@ -551,7 +553,7 @@ def _perception_off_road_m(out, pos, heading) -> float:
                     float(c[0]), float(c[1]), right, None)
                 if cov and -float(lat) > worst:
                     worst = -float(lat)
-            except Exception:
+            except (TypeError, ValueError, IndexError):
                 pass
     return float(worst)
 
@@ -3920,7 +3922,7 @@ class FSDriveSession:
                                 0, len(_rfull) - 1))
                             out.best_speed = float(_sp_raw[_i])
                             out.meta["plan_src"] = "nav_round"
-                    except Exception:
+                    except (TypeError, ValueError, IndexError):  # 静默=限速失效
                         pass
                     # Tight-bend entry governor: the ~1.4 s control tick lets the
                     # car overshoot the profiled corner speed by ~+1 m/s mid-tick
@@ -3979,7 +3981,7 @@ class FSDriveSession:
                             if _pcap < out.best_speed:
                                 out.best_speed = _pcap
                                 out.meta["plan_src"] = "perception-curve"
-                    except Exception:
+                    except (TypeError, ValueError, IndexError):
                         pass
                 # control from the (possibly degraded) target speed, but never
                 # exceed the *planned* speed along the chosen trajectory - the
@@ -4668,7 +4670,7 @@ class FSDriveSession:
                         _ll, _cl = _boundary_lateral(
                             float(pos[0]), float(pos[1]), out.lane_left, fwd_lane)
                         lat_left = round(float(_ll), 3) if _cl else None
-                    except Exception:
+                    except (TypeError, ValueError, IndexError):  # 只吞几何输入坏
                         pass
                 if out.lane_right is not None:
                     try:
@@ -4676,7 +4678,7 @@ class FSDriveSession:
                             float(pos[0]), float(pos[1]), out.lane_right, fwd_lane)
                         _lr = float(_lr)
                         lat_right = round(float(_lr), 3) if _cr else None
-                    except Exception:
+                    except (TypeError, ValueError, IndexError):
                         pass
                 # BODY-aware lateral position: a yawed car crosses the line
                 # with its body while the centre point still reads in-lane
@@ -4707,7 +4709,7 @@ class FSDriveSession:
                                 _fwd)
                             if _cov and _rc < -0.05:
                                 body_cross_r += 1
-                except Exception:
+                except (TypeError, ValueError, IndexError):  # 吞编程错误=少报压线
                     pass
                 # Body overshoot past each DETECTED boundary: the worst of
                 # the four corners, measured straight against the boundary
@@ -4736,7 +4738,7 @@ class FSDriveSession:
                                 _r_lat.append(float(_rc))
                         if _r_lat:
                             body_lat_right = round(min(_r_lat), 3)
-                except Exception:
+                except (TypeError, ValueError, IndexError):
                     pass
                 # Honest off-pavement metrics (MAP used as a METRIC only,
                 # never as a lateral reference): route_dist = distance
