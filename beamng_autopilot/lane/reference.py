@@ -893,6 +893,67 @@ def _enforce_publishable(ref_out: LaneReference) -> LaneReference:
     return ref_out
 
 
+def _apply_geometry_gate(*, enabled: bool, center, lane_frame, lane_src_sel,
+                         grid, corridor, prev_ref, meta: dict) -> tuple:
+    """形状级撤销（plan E4，默认关）：返回 ``(center, src, revoked)``。
+
+    ``select_lane_reference`` 上面那些门都是**逐样本**的静态门；这里拒的是
+    **形状**不对的车道——宽度来回摆、边界比路还弯、车道夹成一条缝、中心离开
+    可行驶证据或离开观测到的 LiDAR 走廊、以及相对上一帧跳变。只作用于
+    **感知来源**（``sensor`` / ``paved``；地图车道的几何不是感知主张），
+    并且**只能撤销、不能放宽**。默认关闭（``LANE_GEOM_ENABLED``）。
+
+    撤销时调用方还要清 ``boundaries`` / ``lane_width`` / ``map_lane``——
+    那三个量属于最终构造，不属于判定，所以留在调用方。
+
+    与搬移前的一处**有意的偏差**：原实现先把车道清空、再去拼接
+    ``"geom:" + ",".join(reasons)``，万一拼接抛异常就会"已经撤销了但记成
+    检查器错误"。这里先拼字符串、后撤销：拼接失败时决策保持不变，
+    只记 ``lane_geom_error``——对 fail-closed 语义更安全，也更可解释。
+    """
+    if not (enabled and center is not None and len(center) >= 4
+            and lane_src_sel in (SRC_SENSOR, SRC_PAVED)):
+        return center, lane_src_sel, False
+    try:
+        from .geometry_check import check_lane_geometry
+        left = getattr(lane_frame, "left", None)
+        right = getattr(lane_frame, "right", None)
+        report = check_lane_geometry(
+            center=center,
+            left=(None if left is None
+                  else np.asarray(left, dtype=float)[:, :2]),
+            right=(None if right is None
+                   else np.asarray(right, dtype=float)[:, :2]),
+            drivable=grid, corridor=corridor, prev_ref=prev_ref)
+        meta["lane_geom"] = report.digest()
+        if report.ok:
+            return center, lane_src_sel, False
+        reason = "geom:" + ",".join(report.reasons)
+    except Exception as exc:                         # noqa: BLE001
+        meta["lane_geom_error"] = str(exc)
+        return center, lane_src_sel, False
+    meta["lane_reject_reason"] = reason
+    meta["lane_src_sel"] = SRC_UNAVAILABLE
+    meta["lane_src"] = _LABEL_BY_SRC.get(SRC_UNAVAILABLE, SRC_BEV_ROUTE)
+    return None, SRC_UNAVAILABLE, True
+
+
+def _publishes_hard_boundaries(lane_frame, lane_src_sel, map_lane,
+                               divider) -> bool:
+    """本 tick 的左右边线能不能当**硬边界**（no-cross 权威）。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出。只有**真的被感知到**的
+    边才算：双侧配对的感知车道、观测到的铺装边（``SRC_PAVED``）、分隔线推出
+    的那条车道（分隔线本身就是检测到的漆线），或者**地图先验自己就是参考**
+    的时候。单边镜像不是物理边——no-cross 规则不能拿一条推出来的线去拦车。
+    """
+    return bool(
+        (lane_frame is not None and getattr(lane_frame, "paired", False))
+        or lane_src_sel == SRC_PAVED
+        or map_lane is not None
+        or (divider is not None and lane_src_sel == SRC_SENSOR))
+
+
 def select_lane_reference(
     *,
     lane_frame,
@@ -1218,55 +1279,28 @@ def select_lane_reference(
     center = (np.asarray(lane_ref, dtype=float)
               if lane_ref is not None else None)
     # Only a REAL sensor detection provides hard lane boundaries: a
-    # two-sided lane pair, the observed pavement edges (SRC_PAVED), or the
-    # map prior when IT is the reference.  A single-edge mirror is not a
-    # physical edge the no-cross rule may enforce.
-    boundaries = bool(
-        (lane_frame is not None and getattr(lane_frame, "paired", False))
-        or lane_src_sel == SRC_PAVED
-        or map_lane is not None
-        # The divider IS a detected painted edge, so the lane it implies
-        # publishes it as a real hard boundary (no-cross authority).
-        or (_divider is not None and lane_src_sel == SRC_SENSOR))
+    # two-sided lane pair, the observed pavement edges (SRC_PAVED), the
+    # divider's own painted edge, or the map prior when IT is the
+    # reference.  A single-edge mirror is not a physical edge the no-cross
+    # rule may enforce (see _publishes_hard_boundaries).
+    boundaries = _publishes_hard_boundaries(
+        lane_frame, lane_src_sel, map_lane, _divider)
     meta = _reference_meta(
         gate_meta, divider_dbg=_divider_dbg, divider=_divider,
         rejected=lane_rejected, reject_reason=reject_reason,
         src_published=src_published, lane_src_sel=lane_src_sel,
         strict_lane=strict_lane)
-    # Geometric consistency (plan E4, opt-in): the static gates above accept
-    # a lane sample by sample; this refuses one whose SHAPE is wrong - a
-    # pair whose width swings, a boundary that bends tighter than a road, a
-    # "lane" that pinches shut, a centre off the drivable evidence or off
-    # the observed LiDAR corridor, or one that jumped since the last frame.
-    # It applies to SENSOR-derived lanes only (a map lane's geometry is not
-    # a perception claim) and it can only withdraw, never relax.
-    if (LANE_GEOM_ENABLED and center is not None and len(center) >= 4
-            and lane_src_sel in (SRC_SENSOR, SRC_PAVED)):
-        try:
-            from .geometry_check import check_lane_geometry
-            _left = getattr(lane_frame, "left", None)
-            _right = getattr(lane_frame, "right", None)
-            _rep = check_lane_geometry(
-                center=center,
-                left=(None if _left is None
-                      else np.asarray(_left, dtype=float)[:, :2]),
-                right=(None if _right is None
-                       else np.asarray(_right, dtype=float)[:, :2]),
-                drivable=grid, corridor=corridor, prev_ref=prev_ref)
-            meta["lane_geom"] = _rep.digest()
-            if not _rep.ok:
-                center = None
-                boundaries = False
-                lane_width = 0.0
-                lane_src_sel = SRC_UNAVAILABLE
-                map_lane = None
-                meta["lane_reject_reason"] = "geom:" + ",".join(
-                    _rep.reasons)
-                meta["lane_src_sel"] = SRC_UNAVAILABLE
-                meta["lane_src"] = _LABEL_BY_SRC.get(SRC_UNAVAILABLE,
-                                                     SRC_BEV_ROUTE)
-        except Exception as exc:
-            meta["lane_geom_error"] = str(exc)
+    # Geometric consistency (plan E4, opt-in): static gates above accept a
+    # lane sample by sample; this refuses one whose SHAPE is wrong.  It can
+    # only withdraw, never relax (see _apply_geometry_gate).
+    center, lane_src_sel, _geom_revoked = _apply_geometry_gate(
+        enabled=LANE_GEOM_ENABLED, center=center, lane_frame=lane_frame,
+        lane_src_sel=lane_src_sel, grid=grid, corridor=corridor,
+        prev_ref=prev_ref, meta=meta)
+    if _geom_revoked:
+        boundaries = False
+        lane_width = 0.0
+        map_lane = None
     ref_out = LaneReference(
         center=center,
         left=lane_left,

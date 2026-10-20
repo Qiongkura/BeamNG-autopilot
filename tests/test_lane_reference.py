@@ -1075,3 +1075,87 @@ def test_fail_closed_backstop_clears_half_a_decision():
                          src=SRC_SENSOR, meta={})
     assert _enforce_publishable(good) is good
     assert good.src == SRC_SENSOR
+
+
+# --------------------------------------------------------------------------
+# geometric consistency gate (plan E4, opt-in; default OFF)
+# --------------------------------------------------------------------------
+def test_geometry_gate_withdraws_a_geometrically_bad_sensor_lane(monkeypatch):
+    """形状不合格 -> 撤销为 unavailable，reason 以 ``geom:`` 开头。
+
+    先钉住"撤销"这条行为，再动它的实现（本轮把它抽成 _apply_geometry_gate）。
+    """
+    from beamng_autopilot.lane import reference as ref_mod
+
+    class BadReport:
+        ok = False
+        reasons = ["vanish"]
+
+        @staticmethod
+        def digest():
+            return {"ok": False}
+
+    monkeypatch.setattr(ref_mod, "LANE_GEOM_ENABLED", True)
+    import beamng_autopilot.lane.geometry_check as gc
+    monkeypatch.setattr(gc, "check_lane_geometry",
+                        lambda **kw: BadReport())
+    ref = select_lane_reference(
+        lane_frame=_sensor_lane(), pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        lane_mode="sensor", strict_sensor=False,
+    )
+    assert ref.src == SRC_UNAVAILABLE
+    assert ref.center is None
+    # 几何撤销写在 meta 里（dataclass 的 reject_reason 只反映三维门），
+    # 这是当前契约——先钉住，抽实现时不许改。
+    reason = str(ref.meta.get("lane_reject_reason"))
+    assert reason.startswith("geom:"), reason
+    assert "vanish" in reason
+    assert ref.meta["lane_src"] != SRC_SENSOR
+
+
+def test_geometry_gate_error_leaves_the_decision_unchanged(monkeypatch):
+    """检查器自己抛异常 -> 只记 lane_geom_error，决策不变（不能因工具坏了就撤）。"""
+    from beamng_autopilot.lane import reference as ref_mod
+
+    def boom(**kw):
+        raise RuntimeError("geometry exploded")
+
+    monkeypatch.setattr(ref_mod, "LANE_GEOM_ENABLED", True)
+    import beamng_autopilot.lane.geometry_check as gc
+    monkeypatch.setattr(gc, "check_lane_geometry", boom)
+    ref = select_lane_reference(
+        lane_frame=_sensor_lane(), pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        lane_mode="sensor", strict_sensor=False,
+    )
+    assert "geometry exploded" in ref.meta.get("lane_geom_error", "")
+    assert ref.center is not None and len(ref.center) >= 3
+
+
+def test_geometry_gate_is_a_no_op_when_disabled():
+    from beamng_autopilot.lane.reference import _apply_geometry_gate
+
+    center = np.column_stack([np.linspace(0, 10, 6), np.full(6, -1.8)])
+    meta = {}
+    out_center, out_src, revoked = _apply_geometry_gate(
+        enabled=False, center=center, lane_frame=None, lane_src_sel=SRC_SENSOR,
+        grid=None, corridor=None, prev_ref=None, meta=meta)
+    assert out_center is center and out_src == SRC_SENSOR and revoked is False
+    assert meta == {}, "默认关时不得写任何 meta 字段"
+
+
+def test_hard_boundaries_need_a_real_perceived_edge():
+    """no-cross 权威只给真被感知到的边：配对、铺装、分隔线、或地图先验本身。"""
+    from beamng_autopilot.lane.reference import _publishes_hard_boundaries
+
+    paired = _sensor_lane(paired=True)
+    single = _sensor_lane(paired=False)
+    assert _publishes_hard_boundaries(paired, SRC_SENSOR, None, None) is True
+    assert _publishes_hard_boundaries(single, SRC_SENSOR, None, None) is False
+    assert _publishes_hard_boundaries(None, SRC_PAVED, None, None) is True
+    assert _publishes_hard_boundaries(None, SRC_MAP, ("mc", "ml", "mr"),
+                                      None) is True
+    assert _publishes_hard_boundaries(None, SRC_SENSOR, None,
+                                      ("center", "left")) is True
+    assert _publishes_hard_boundaries(None, SRC_SENSOR, None, None) is False
