@@ -232,65 +232,101 @@ def test_the_tech_process_name_is_probed_too():
     assert "BeamNG.tech.x64.exe" in GAME_IMAGES, GAME_IMAGES
 
 
-def test_game_probe_treats_unreadable_output_as_not_running(monkeypatch):
-    """中文 Windows 的 tasklist 输出不是 UTF-8；乱码里没有进程名就是没在跑。"""
-    import subprocess as sp
+def test_game_probe_reads_the_process_table_and_never_guesses(monkeypatch):
+    """进程表看清了才敢说在不在跑；看不清就是 None（不是 False）。
 
-    class R:
-        returncode = 0
-        stdout = ("\u4fe1\u606f: \u6ca1\u6709\u8fd0\u884c\u7684\u4efb\u52a1"
-                  "\u5339\u914d\u6307\u5b9a\u7684\u6807\u51c6\u3002")
-
-    monkeypatch.setattr(sp, "run", lambda *a, **k: R())
-    assert game_running_probe() is False
-
-    class R2:
-        returncode = 0
-        stdout = ("BeamNG.drive.x64.exe           1234 Console"
-                  "                    1  1,000,000 K")
-
-    monkeypatch.setattr(sp, "run", lambda *a, **k: R2())
-    assert game_running_probe() is True
-
-    class R3:
-        returncode = 1
-        stdout = ""
-
-    monkeypatch.setattr(sp, "run", lambda *a, **k: R3())
-    assert game_running_probe() is None, "返回码非 0 时不敢说'没在跑'"
-
-
-def test_game_pids_parses_tasklist_and_refuses_to_guess(monkeypatch):
-    """进程列表：看清了才敢给集合，看不清就返 None。
-
-    实测坑：中文 Windows 的 tasklist 输出不是 UTF-8，读空了当成"没进程"
-    会把正在驾驶的会话当成可以杀的对象。
+    2026-10-20 前的实现读 ``tasklist`` 文本；受限令牌下 ``tasklist`` 直接
+    ``Access denied``，探测永远不确定。现在读 ``Get-Process`` 的 pid/名字表，
+    所以这里钉的是**表语义**：命中即 True，表里没有即 False，拿不到表即 None。
     """
+    from beamng_autopilot.experiments import collection as col
+
+    monkeypatch.setattr(col, "_process_table",
+                        lambda: {1: "explorer", 2: "chrome"})
+    assert col.game_running_probe() is False
+
+    monkeypatch.setattr(col, "_process_table",
+                        lambda: {1234: "BeamNG.drive.x64"})
+    assert col.game_running_probe() is True
+
+    monkeypatch.setattr(col, "_process_table",
+                        lambda: {4242: "BeamNG.tech.x64"})
+    assert col.game_running_probe() is True
+
+    monkeypatch.setattr(col, "_process_table", lambda: None)
+    assert col.game_running_probe() is None, "探测失败时不敢说'没在跑'"
+
+
+def test_game_pids_filters_the_table_and_refuses_to_guess(monkeypatch):
+    """进程集合：只收游戏名，探测失败返 None（不能当成空集合去收尾）。"""
+    from beamng_autopilot.experiments import collection as col
+
+    monkeypatch.setattr(col, "_process_table",
+                        lambda: {4242: "BeamNG.tech.x64", 7: "python"})
+    assert col.game_pids() == {4242}
+
+    monkeypatch.setattr(col, "_process_table", lambda: {7: "python"})
+    assert col.game_pids() == set()
+
+    monkeypatch.setattr(col, "_process_table", lambda: None)
+    assert col.game_pids() is None, "探测失败不能当成空集合"
+
+
+def test_process_table_parses_get_process_output(monkeypatch):
+    """``Get-Process`` 的输出形状是 ``pid,name``，乱行跳过，空/失败即 None。"""
     import subprocess as sp
 
     from beamng_autopilot.experiments import collection as col
 
     class R:
         returncode = 0
-        stdout = ("BeamNG.tech.x64.exe        4242 Console"
-                  "                    1  4,400,000 K")
+        stdout = "4242,BeamNG.tech.x64\n7,python\n\nbad,line\n"
+        stderr = ""
 
     monkeypatch.setattr(sp, "run", lambda *a, **k: R())
-    assert col.game_pids() == {4242}
+    assert col._process_table() == {4242: "BeamNG.tech.x64", 7: "python"}
 
-    class RNone:
+    class REmpty:
         returncode = 0
-        stdout = "信息: 没有运行的任务匹配指定的标准。"
+        stdout = ""
+        stderr = ""
 
-    monkeypatch.setattr(sp, "run", lambda *a, **k: RNone())
-    assert col.game_pids() == set()
+    monkeypatch.setattr(sp, "run", lambda *a, **k: REmpty())
+    assert col._process_table() is None, "空表=看不清，不是'没有进程'"
 
-    class RBad:
+    class RFail:
         returncode = 1
         stdout = ""
+        stderr = "Access denied"
 
-    monkeypatch.setattr(sp, "run", lambda *a, **k: RBad())
-    assert col.game_pids() is None, "探测失败不能当成空集合"
+    monkeypatch.setattr(sp, "run", lambda *a, **k: RFail())
+    assert col._process_table() is None
+
+
+def test_process_table_uses_powershell_not_tasklist(monkeypatch):
+    """"进程枚举必须走 ``Get-Process``：``tasklist`` 在受限令牌下会被拒。"""
+    import subprocess as sp
+
+    from beamng_autopilot.experiments import collection as col
+
+    seen = {}
+
+    class R:
+        returncode = 0
+        stdout = "1,BeamNG.drive.x64\n"
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = argv
+        seen["kwargs"] = kwargs
+        return R()
+
+    monkeypatch.setattr(sp, "run", fake_run)
+    assert col._process_table() == {1: "BeamNG.drive.x64"}
+    argv = seen["argv"]
+    assert "tasklist" not in " ".join(argv).lower()
+    assert "get-process" in " ".join(argv).lower()
+    assert seen["kwargs"].get("encoding") == "utf-8"
 
 
 def test_close_started_game_kills_only_the_new_pids(monkeypatch):

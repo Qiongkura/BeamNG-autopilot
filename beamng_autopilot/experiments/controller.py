@@ -575,22 +575,39 @@ class InstanceLock:
 def _alive(pid: int) -> bool:
     """进程是否活着；**任何不确定都按"活着"返回**。
 
-    实测坑：中文 Windows 的 ``tasklist`` 输出不是 UTF-8，``text=True`` 会让
-    读取线程抛 UnicodeDecodeError，stdout 变空 → pid 判定为"已死" → 锁被
-    第二个控制器抢走。所以显式 ``errors="replace"``，并且只有在返回码 0 且
-    输出可信时才敢说"死了"。
+    2026-10-20 实测：受限令牌下 ``tasklist`` 报 ``ERROR: Access denied``
+    （rc=1）。旧逻辑"rc 非 0 就不敢说死了"于是把每条记录都判成活着——
+    **持有者崩溃后单实例锁再也拿不回来**（断电恢复失效，有测试钉着）。
+    现在先用 PowerShell 7 的 ``Get-Process``：拿不到进程就是明确的"已退出"；
+    只有连 PowerShell 都不可用时，才退回 tasklist 的保守语义。
+
+    ``tasklist`` 的历史坑仍然保留：中文 Windows 的它的输出不是 UTF-8，
+    ``text=True`` 会让读取线程抛 ``UnicodeDecodeError``、stdout 变空，
+    把"读失败"当成"进程死了"就会让第二个控制器抢锁。
     """
     if pid <= 0:
         return False
+    shell = shutil.which("pwsh") or shutil.which("powershell")
+    if shell:
+        try:
+            r = subprocess.run(
+                [shell, "-NoProfile", "-Command",
+                 f"if (Get-Process -Id {int(pid)} -ErrorAction SilentlyContinue)"
+                 f" {{ 'alive' }}"],
+                capture_output=True, text=True, encoding="utf-8",
+                errors="replace", timeout=30)
+            if r.returncode == 0:
+                return "alive" in (r.stdout or "")
+        except Exception:                        # noqa: BLE001
+            pass
     try:
-        import subprocess
         out = subprocess.run(["tasklist", "/FI", f"PID eq {pid}"],
                              capture_output=True, text=True,
                              encoding="utf-8", errors="replace", timeout=20)
         if out.returncode != 0:
             return True
         return str(pid) in (out.stdout or "")
-    except Exception:                        # noqa: BLE001
+    except Exception:                            # noqa: BLE001
         return True
 
 
