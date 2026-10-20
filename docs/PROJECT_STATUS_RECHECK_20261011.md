@@ -129,9 +129,12 @@
 - **技术债棘轮**入库并进入 `dev_validate.ps1`：基线 = `except Exception` 351 /
   静默 79 / `print` 163 / 最长函数 3430 行；总量只许减少，`silent_except` 与
   单函数长度逐文件只许减少。读文件用 `utf-8-sig`（仓库里有带 BOM 的源文件）。
-- **`select_lane_reference` 首次拆分**（纯搬移）：三维门（航向/转角/侧向）
-  抽成 `_lane_gate_verdict`，主函数 571 → **488 行**，判定逻辑首次可被单测
-  直接断言（5 项）；阈值与拒绝理由字面量一字未改，基线随之收紧。
+- **`select_lane_reference` 拆分**（四步纯搬移，零语义变更）：信任顺序的关键
+  判据逐块抽成可单测的模块级函数——`_lane_gate_verdict`（航向/转角/侧向三维门，
+  拒绝理由与阈值字面量不变）、`_sensor_lane_within_map`（一致性门，近场点不足
+  时返回 None 而非误判）、`_lane_width_from_map_edges`（最近点距离 + 合同宽度
+  兜底）、`_trusted_single_paint`（单边漆线在 strict 下的信任判据）。
+  主函数 **571 → 445 行**（−126），新增 12 项针对性单测；基线随之逐次收紧。
 - **文档索引**：`docs/INDEX.md` 224 篇，含预注册↔结果配对（82）与「无正文
   入口（28）」小节——孤儿文档至少有一条可达路径；生成器带 `--check` 门禁。
 - **lane 去重**：`fusion.py` 复用 `tracking.py` 的 5 个逐字相同 helper。
