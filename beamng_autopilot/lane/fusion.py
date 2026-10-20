@@ -33,64 +33,15 @@ from .tracking import (
     _mirror_near_ok,
     _mirror_right_ok,
     _fusion_center_unstable,
+    # 2026-10-20：这 5 个 helper 曾是 tracking.py 的逐字复制（AST 比对确认
+    # 函数体完全相同）。同一模块里两份实现，改一份忘一份就会让"融合"和
+    # "跟踪"对同一帧给出不同结论，所以只留 tracking 里的那份。
+    _to_car_frame,
+    _from_car_frame,
+    _resample_rel,
+    _weighted_median,
+    _median_abs_diff,
 )
-
-def _to_car_frame(world: np.ndarray, pos: np.ndarray,
-                  fwd: np.ndarray) -> np.ndarray:
-    left = np.array([-fwd[1], fwd[0]])
-    rel = world[:, :2] - pos
-    return np.column_stack([rel @ fwd, rel @ left])
-
-
-
-def _from_car_frame(rel: np.ndarray, pos: np.ndarray,
-                    fwd: np.ndarray) -> np.ndarray:
-    left = np.array([-fwd[1], fwd[0]])
-    return pos + rel[:, 0][:, None] * fwd + rel[:, 1][:, None] * left
-
-
-
-def _resample_rel(rel_pts: np.ndarray, stations: np.ndarray) -> np.ndarray:
-    if rel_pts is None or len(rel_pts) < 2:
-        return np.full(stations.shape, np.nan)
-    s = rel_pts[:, 0]
-    lat = rel_pts[:, 1]
-    order = np.argsort(s)
-    return np.interp(stations, s[order], lat[order],
-                     left=np.nan, right=np.nan)
-
-
-
-def _weighted_median(values: np.ndarray, weights: np.ndarray) -> float:
-    """Weighted median of a 1D sample, ignoring NaN values."""
-    ok = ~np.isnan(np.asarray(values, dtype=float))
-    if not np.any(ok):
-        return float("nan")
-    v = np.asarray(values, dtype=float)[ok]
-    w = np.asarray(weights, dtype=float)[ok]
-    order = np.argsort(v)
-    v = v[order]
-    w = w[order]
-    total = float(np.sum(w))
-    if total <= 0.0:
-        return float(np.median(v))
-    half = 0.5 * total
-    acc = 0.0
-    for val, wt in zip(v, w):
-        acc += wt
-        if acc >= half:
-            return float(val)
-    return float(v[-1])
-
-
-
-def _median_abs_diff(a: np.ndarray, b: np.ndarray) -> float:
-    """Median absolute lateral difference where both samples are valid."""
-    ok = ~(np.isnan(a) | np.isnan(b))
-    if not np.any(ok):
-        return float("inf")
-    return float(np.median(np.abs(a[ok] - b[ok])))
-
 
 
 def _vision_lidar_agree(vision_frame: LaneFrame, lidar_frame: LaneFrame,

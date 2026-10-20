@@ -202,3 +202,18 @@ def test_explicit_single_painted_edge_is_usable_at_2m_span():
     frame.right_kind = "thin"
     assert not lane_frame_usable(frame)
 
+
+def test_fusion_reuses_the_tracking_helpers_instead_of_copies():
+    """同一模块里不许有两份逐字相同的 helper。
+
+    2026-10-20 实测：fusion.py 复制了 tracking.py 的 _to_car_frame /
+    _from_car_frame / _resample_rel / _weighted_median / _median_abs_diff
+    （AST 比对确认函数体完全相同）。改一份忘一份，就会让"融合"和"跟踪"
+    对同一帧给出不同结论。这里用**对象同一性**钉住：只留 tracking 那份。
+    """
+    from beamng_autopilot.lane import fusion, tracking
+
+    for name in ("_to_car_frame", "_from_car_frame", "_resample_rel",
+                 "_weighted_median", "_median_abs_diff"):
+        assert getattr(fusion, name) is getattr(tracking, name), (
+            f"{name} 在 fusion 里又是一份复制品")
