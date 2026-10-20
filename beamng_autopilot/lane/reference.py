@@ -710,6 +710,35 @@ def _sensor_lane_within_map(lane_ref, map_center, pos, *,
     return bool(float(np.median(gaps)) <= float(max_center_m))
 
 
+def _lane_width_from_map_edges(ml, mr, *, default_m: float,
+                               warn=None) -> float:
+    """地图车道左右**实测**边线宽度；取不到就退回 ``default_m``。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出。用最近点距离而不是
+    逐元素配对：两条边线的弧长参数化可以不同（``map_lane_edges`` 只重采样
+    中心线、保留原始边线间距，圆角插值还会插入额外点），逐元素配对在弯道上
+    会读出偏大的宽度（实测）。
+
+    读失败时**保留原来的两条行为**：记一条 ``lane_width`` 告警，然后退回
+    ``default_m``（``map_lane_width_m``，0 则 ``LANE_WIDTH_DEFAULT_M``）——
+    宽度不是一个可以"猜"的量，但缺失时用合同宽度比用 0 安全。
+    """
+    width = 0.0
+    try:
+        from beamng_autopilot.planning.geometry import (
+            polyline_point_distances)
+        left = np.asarray(ml, dtype=float)[:, :2]
+        right = np.asarray(mr, dtype=float)[:, :2]
+        distances = polyline_point_distances(left, right)
+        finite = distances[np.isfinite(distances)]
+        if finite.size:
+            width = float(np.median(finite))
+    except Exception as exc:                         # noqa: BLE001
+        _warn(warn, "lane_width", f"lane width read failed: {exc}")
+    return width if width > 0.0 else float(
+        default_m or LANE_WIDTH_DEFAULT_M)
+
+
 def select_lane_reference(
     *,
     lane_frame,
@@ -911,28 +940,8 @@ def select_lane_reference(
             # Real road-edge width when the map lane comes from DecalRoad
             # edges (median left-right distance); fall back to the fixed
             # map-prior lane width otherwise.
-            _w = 0.0
-            try:
-                from beamng_autopilot.planning.geometry import (
-                    polyline_point_distances)
-                _ml = np.asarray(ml, dtype=float)[:, :2]
-                _mr = np.asarray(mr, dtype=float)[:, :2]
-                # the left/right polylines can carry DIFFERENT arc
-                # parametrisations (map_lane_edges resamples the
-                # centreline but keeps raw edge spacing, and corner
-                # interpolation inserts extra points) - element-wise
-                # pairing reads an inflated width on any curve.
-                # Nearest-point distances are alignment-robust.
-                _wa = polyline_point_distances(_ml, _mr)
-                _wf = _wa[np.isfinite(_wa)]
-                if _wf.size:
-                    _w = float(np.median(_wf))
-            except Exception as exc:
-                _w = 0.0
-                _warn(warn, "lane_width",
-                      f"lane width read failed: {exc}")
-            lane_width = (_w if _w > 0.0
-                          else float(map_lane_width_m or LANE_WIDTH_DEFAULT_M))
+            lane_width = _lane_width_from_map_edges(
+                ml, mr, default_m=map_lane_width_m, warn=warn)
 
     # FSD realism (strict sensor): the lane-keep reference and hard
     # boundaries must come from PERCEPTION only (docs/fsd_realism.md §4).

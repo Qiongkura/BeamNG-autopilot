@@ -853,3 +853,41 @@ def test_far_sensor_lane_is_downgraded_to_the_map_reference():
         lane_mode="sensor", strict_sensor=False,
     )
     assert ref.src == SRC_MAP, "偏离 3 m 超过 sensor 模式 2.5 m 容忍，必须降级为地图本车道"
+
+
+def test_map_edge_width_uses_nearest_points_not_index_pairing():
+    """两条边线的弧长参数化可以不同；逐元素配对会在弯道上读出偏大宽度。"""
+    from beamng_autopilot.lane.reference import _lane_width_from_map_edges
+
+    xs = np.linspace(0.0, 40.0, 41)
+    left = np.column_stack([xs, np.full_like(xs, 1.75)])
+    right = np.column_stack([xs, np.full_like(xs, -1.75)])
+    assert _lane_width_from_map_edges(left, right, default_m=3.0) == 3.5
+
+    # 右侧边线用两倍密度 + 半格错位：最近点距离仍是 3.5，逐元素会随时间偏移
+    xs2 = np.linspace(0.0, 40.0, 81)
+    right2 = np.column_stack([xs2, np.full_like(xs2, -1.75)])
+    got = _lane_width_from_map_edges(left, right2, default_m=3.0)
+    assert abs(got - 3.5) < 0.05, got
+
+
+def test_map_edge_width_falls_back_to_the_contract_width():
+    from beamng_autopilot.lane.reference import (
+        _lane_width_from_map_edges, LANE_WIDTH_DEFAULT_M)
+
+    assert _lane_width_from_map_edges([], [], default_m=3.2) == 3.2
+    assert _lane_width_from_map_edges([], [], default_m=0.0) == \
+        LANE_WIDTH_DEFAULT_M
+
+
+def test_map_edge_width_warns_and_falls_back_on_a_bad_read():
+    warnings = []
+
+    def warn(key, msg):
+        warnings.append((key, msg))
+
+    from beamng_autopilot.lane.reference import _lane_width_from_map_edges
+
+    got = _lane_width_from_map_edges(None, None, default_m=3.1, warn=warn)
+    assert got == 3.1
+    assert warnings and warnings[0][0] == "lane_width", warnings
