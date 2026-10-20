@@ -811,3 +811,45 @@ def test_corner_gate_only_applies_outside_sensor_mode(monkeypatch):
                         lambda *a, **k: False, raising=True)
     assert _verdict(lane_mode="map")["reason"] == "corner"
     assert _verdict(lane_mode="sensor")["rejected"] is False
+
+
+def test_map_consistency_needs_enough_near_field_points():
+    """近场点不足 3 个时**不下结论**（None），调用方维持原状、不误降级。"""
+    from beamng_autopilot.lane.reference import _sensor_lane_within_map
+
+    short = np.array([[0.2, -1.8], [0.4, -1.8]])
+    assert _sensor_lane_within_map(short, _route(), np.zeros(3),
+                                   max_center_m=1.5) is None
+
+
+def test_map_consistency_compares_the_near_field_median_gap():
+    from beamng_autopilot.lane.reference import _sensor_lane_within_map
+
+    center = _route()                       # 路线中心在 y=0
+    close = np.column_stack([np.linspace(1.0, 8.0, 8),
+                             np.full(8, -0.3)])
+    far = np.column_stack([np.linspace(1.0, 8.0, 8),
+                           np.full(8, -3.0)])
+    assert _sensor_lane_within_map(close, center, np.zeros(3),
+                                   max_center_m=1.5) is True
+    assert _sensor_lane_within_map(far, center, np.zeros(3),
+                                   max_center_m=1.5) is False
+    # sensor 模式的 2.5 m 容忍：3 m 仍算不一致，但 2 m 就算一致
+    assert _sensor_lane_within_map(far, center, np.zeros(3),
+                                   max_center_m=2.5) is False
+    near = np.column_stack([np.linspace(1.0, 8.0, 8), np.full(8, -2.0)])
+    assert _sensor_lane_within_map(near, center, np.zeros(3),
+                                   max_center_m=2.5) is True
+
+
+def test_far_sensor_lane_is_downgraded_to_the_map_reference():
+    """端到端：偏离地图本车道 3 m 的配对车道在 sensor 模式下降级为 map。"""
+    lane = _sensor_lane()
+    lane.center = lane.center.copy()
+    lane.center[:, 1] += -3.0
+    ref = select_lane_reference(
+        lane_frame=lane, pos=np.zeros(3), heading=0.0,
+        route_ref=_route(), has_nav_route=True,
+        lane_mode="sensor", strict_sensor=False,
+    )
+    assert ref.src == SRC_MAP, "偏离 3 m 超过 sensor 模式 2.5 m 容忍，必须降级为地图本车道"

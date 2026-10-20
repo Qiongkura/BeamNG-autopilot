@@ -683,6 +683,33 @@ def _lane_gate_verdict(*, lane_frame, lane_ref, route_ref, pos, heading,
             "corner_bad": corner_bad, "meta": meta}
 
 
+def _sensor_lane_within_map(lane_ref, map_center, pos, *,
+                            max_center_m: float):
+    """近场（0.5–8 m）感知中心与**地图本车道中心**是否足够接近。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出，语义不变：
+
+    * ``True``：一致，感知车道可以领；
+    * ``False``：不一致，调用方降级到地图本车道（并把 src 改回 map）；
+    * ``None``：近场点不足 3 个，**判断不了**——搬移前在这种情况下
+      既不降级也不报警，这里保持"不下结论"，由调用方维持原状。
+
+    距离用点到地图中心折线的最小距离，取中位数再与阈值比；阈值随模式：
+    auto 1.5 m（感知领但要求与地图一致）、sensor 2.5 m（允许过弯时偏离）。
+    计算异常照旧抛给调用方——那里有 ``_warn``，在这里吞掉会丢诊断。
+    """
+    lane_pts = np.asarray(lane_ref[:, :2], dtype=float)
+    center_pts = np.asarray(map_center[:, :2], dtype=float)
+    ego = np.asarray(pos[:2], dtype=float)
+    dist = np.linalg.norm(lane_pts - ego[None, :], axis=1)
+    near = np.flatnonzero((dist >= 0.5) & (dist <= 8.0))
+    if len(near) < 3:
+        return None
+    gaps = np.linalg.norm(
+        lane_pts[near][:, None, :] - center_pts[None, :, :], axis=2).min(axis=1)
+    return bool(float(np.median(gaps)) <= float(max_center_m))
+
+
 def select_lane_reference(
     *,
     lane_frame,
@@ -851,21 +878,14 @@ def select_lane_reference(
                 # = looser 2.5 m gate so the perception lane can lead
                 # through corners.
                 try:
-                    _lr2 = np.asarray(lane_ref[:, :2], dtype=float)
-                    _mc2 = np.asarray(mc[:, :2], dtype=float)
-                    _p2 = np.asarray(pos[:2], dtype=float)
-                    _d2 = np.linalg.norm(_lr2 - _p2[None, :], axis=1)
-                    _sel2 = np.flatnonzero((_d2 >= 0.5) & (_d2 <= 8.0))
-                    if len(_sel2) >= 3:
-                        _dm = np.linalg.norm(
-                            _lr2[_sel2][:, None, :]
-                            - _mc2[None, :, :], axis=2).min(axis=1)
-                        _max_c = (lane_consistency_sensor_m
-                                  if lane_mode == "sensor"
-                                  else lane_consistency_m)
-                        if float(np.median(_dm)) > _max_c:
-                            lane_ref = mc
-                            lane_src_sel = SRC_MAP
+                    within = _sensor_lane_within_map(
+                        lane_ref, mc, pos,
+                        max_center_m=(lane_consistency_sensor_m
+                                      if lane_mode == "sensor"
+                                      else lane_consistency_m))
+                    if within is False:
+                        lane_ref = mc
+                        lane_src_sel = SRC_MAP
                 except Exception as exc:
                     lane_ref = mc
                     lane_src_sel = SRC_MAP
