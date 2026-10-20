@@ -766,6 +766,49 @@ def _trusted_single_paint(lane_frame, lane_ref, *, sensor_paired: bool) -> bool:
                 and lane_ref is not None and len(lane_ref) >= 3)
 
 
+def _reference_meta(gate_meta, *, divider_dbg, divider, rejected,
+                    reject_reason, src_published, lane_src_sel,
+                    strict_lane) -> dict:
+    """``LaneReference.meta`` 的装配：来源标签 + 拒绝原因 + divider 证据。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出，纯字典构造、无副作用
+    （入参 ``gate_meta`` 被复制，调用方后续对 meta 的增改不会回写）。
+
+    ``lane_src`` 是决策的**纯函数**（``_LABEL_BY_SRC``）：遥测里的标签不可能
+    与真正把关的来源不一致；未发布来源时落到 ``bev/route``——那正是"既没有
+    地图车道也没有感知车道、只有 BEV 自由空间中心"的旧标签。
+    """
+    meta: dict = dict(gate_meta)
+    if divider_dbg:
+        meta["lane_divider"] = divider_dbg
+        if divider is not None:
+            meta["lane_from"] = "divider_right_shift"
+    if rejected and reject_reason is not None:
+        meta["lane_reject_reason"] = reject_reason
+    if src_published:
+        meta["lane_src_sel"] = lane_src_sel
+    meta["lane_src"] = _LABEL_BY_SRC.get(lane_src_sel, SRC_BEV_ROUTE)
+    if strict_lane:
+        meta["lane_strict"] = 1
+    return meta
+
+
+def _bev_whole_road_center(grid, pos, heading, *, strict_lane: bool):
+    """没有导航路线时的**整条路**中心（BEV 自由走廊），兜底用。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出。只在**非 strict** 且真
+    有 BEV 网格时给出：整条路中心不是本车道，双向路上它就是中心线，所以
+    strict 绝不用它（这是 "never reach the planner's lateral reference" 那
+    条约束的执行点）。点不足 4 个也算没有——两三个点的折线推不出横向参考。
+    """
+    if strict_lane or grid is None:
+        return None
+    ref = bev_drivable_center(grid, pos, heading)
+    if ref is None or len(ref) < 4:
+        return None
+    return ref
+
+
 def select_lane_reference(
     *,
     lane_frame,
@@ -1096,10 +1139,9 @@ def select_lane_reference(
     # never reaches the planner's lateral reference there.  Strict sensor
     # mode skips it too: the whole-road centre is not the ego lane.
     if lane_ref is None or len(lane_ref) < 4:
-        bev_ref = None
-        if not strict_lane and grid is not None:
-            bev_ref = bev_drivable_center(grid, pos, heading)
-        if bev_ref is not None and len(bev_ref) >= 4:
+        bev_ref = _bev_whole_road_center(grid, pos, heading,
+                                         strict_lane=strict_lane)
+        if bev_ref is not None:
             lane_ref = bev_ref
 
     center = (np.asarray(lane_ref, dtype=float)
@@ -1115,23 +1157,11 @@ def select_lane_reference(
         # The divider IS a detected painted edge, so the lane it implies
         # publishes it as a real hard boundary (no-cross authority).
         or (_divider is not None and lane_src_sel == SRC_SENSOR))
-    meta: dict = dict(gate_meta)
-    if _divider_dbg:
-        meta["lane_divider"] = _divider_dbg
-        if _divider is not None:
-            meta["lane_from"] = "divider_right_shift"
-    if lane_rejected and reject_reason is not None:
-        meta["lane_reject_reason"] = reject_reason
-    if src_published:
-        meta["lane_src_sel"] = lane_src_sel
-    # ``lane_src`` is a pure function of the decision above, so the label
-    # in the telemetry can never disagree with the source that gated the
-    # planning (see _LABEL_BY_SRC).  An unpublished source means no map
-    # lane and no sensor lane were involved - the BEV free-space centre
-    # case - which is exactly the legacy "bev/route" label.
-    meta["lane_src"] = _LABEL_BY_SRC.get(lane_src_sel, SRC_BEV_ROUTE)
-    if strict_lane:
-        meta["lane_strict"] = 1
+    meta = _reference_meta(
+        gate_meta, divider_dbg=_divider_dbg, divider=_divider,
+        rejected=lane_rejected, reject_reason=reject_reason,
+        src_published=src_published, lane_src_sel=lane_src_sel,
+        strict_lane=strict_lane)
     # Geometric consistency (plan E4, opt-in): the static gates above accept
     # a lane sample by sample; this refuses one whose SHAPE is wrong - a
     # pair whose width swings, a boundary that bends tighter than a road, a

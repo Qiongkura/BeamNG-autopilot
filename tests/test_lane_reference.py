@@ -925,3 +925,54 @@ def test_trusted_single_paint_needs_vision_and_a_typed_marking():
                                  sensor_paired=False) is False
     assert _trusted_single_paint(frame, None, sensor_paired=False) is False
     assert _trusted_single_paint(None, ref, sensor_paired=False) is False
+
+
+def test_reference_meta_assembles_labels_and_refusals():
+    from beamng_autopilot.lane.reference import _reference_meta
+
+    gate = {"lane_side_off_m": -1.2}
+    meta = _reference_meta(gate, divider_dbg=None, divider=None,
+                           rejected=False, reject_reason=None,
+                           src_published=True, lane_src_sel=SRC_SENSOR,
+                           strict_lane=True)
+    assert meta["lane_src_sel"] == SRC_SENSOR
+    assert meta["lane_src"] != SRC_BEV_ROUTE, "已发布来源不能落回 bev/route 标签"
+    assert meta["lane_strict"] == 1
+    assert meta["lane_side_off_m"] == -1.2
+    assert gate == {"lane_side_off_m": -1.2}, "入参不得被改写"
+
+    refused = _reference_meta(gate, divider_dbg=None, divider=None,
+                              rejected=True, reject_reason="side",
+                              src_published=True, lane_src_sel=SRC_MAP,
+                              strict_lane=False)
+    assert refused["lane_reject_reason"] == "side"
+    assert "lane_strict" not in refused
+
+    divider = _reference_meta(gate, divider_dbg={"reason": ""},
+                              divider=("center", "left"), rejected=False,
+                              reject_reason=None, src_published=True,
+                              lane_src_sel=SRC_SENSOR, strict_lane=False)
+    assert divider["lane_divider"] == {"reason": ""}
+    assert divider["lane_from"] == "divider_right_shift"
+
+    unpublished = _reference_meta({}, divider_dbg=None, divider=None,
+                                  rejected=False, reject_reason=None,
+                                  src_published=False, lane_src_sel="",
+                                  strict_lane=False)
+    assert "lane_src_sel" not in unpublished
+    assert unpublished["lane_src"] == SRC_BEV_ROUTE
+
+
+def test_bev_fallback_is_off_in_strict_and_needs_enough_points():
+    from beamng_autopilot.lane.reference import _bev_whole_road_center
+
+    grid = _corridor_grid()
+    ref = _bev_whole_road_center(grid, np.zeros(3), 0.0, strict_lane=False)
+    assert ref is not None and len(ref) >= 4
+    assert _bev_whole_road_center(grid, np.zeros(3), 0.0,
+                                  strict_lane=True) is None
+    assert _bev_whole_road_center(None, np.zeros(3), 0.0,
+                                  strict_lane=False) is None
+    empty = OccupancyGrid(n_rows=60, n_cols=60, res=0.5)   # 无可行驶 cell
+    assert _bev_whole_road_center(empty, np.zeros(3), 0.0,
+                                  strict_lane=False) is None
