@@ -73,6 +73,13 @@ def test_index_pairs_counts_citations_and_marks_orphans(tmp_path: Path) -> None:
             "[ZZ_FIXTURE_RESULT_20261013.md](ZZ_FIXTURE_RESULT_20261013.md)") in text
     assert "↔ ZZ_FIXTURE_PREREG_20261012" in text
     assert "## ZZ（4）" in text
+    # 孤儿文档必须至少能从索引的专门小节点到（否则"有索引"仍等于"找不到"）
+    orphans = [e["stem"] for e in entries if not e["cited"]]
+    assert f"## 无正文入口（{len(orphans)}）" in text, orphans
+    orphan_block = text.split("## 无正文入口")[1]
+    for stem in orphans:
+        assert stem in orphan_block
+    assert "ZZ_FIXTURE_RESULT_20261013.md" not in orphan_block
 
 
 def test_render_is_deterministic(tmp_path: Path) -> None:

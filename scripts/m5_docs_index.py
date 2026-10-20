@@ -164,10 +164,10 @@ def render(entries: list[dict]) -> str:
         f"共 **{len(entries)}** 篇："
         + " / ".join(f"{k} {v}" for k, v in sorted(kinds.items()))
         + f"；预注册↔结果已配对 **{paired}** 篇；**{orphan}** 篇没有被任何文档"
-        "（含 README/AGENTS）引用。",
+        "（含 README/AGENTS）引用，集中列在文末「无正文入口」。",
         "",
         "「被引用」= 其它文档正文里出现该文件名（不含扩展名）的次数；"
-        "0 表示没有入口，需要在正文里链上或归档。",
+        "0 表示没有正文入口，需要补链或归档。",
         "",
     ]
     series: dict[str, list[dict]] = {}
@@ -185,6 +185,23 @@ def render(entries: list[dict]) -> str:
             lines.append(
                 f"| {e['date'] or '—'} | {e['kind']} | [{e['rel']}]({e['rel']}) "
                 f"| {title} | {pair} | {e['cited']} |")
+        lines.append("")
+
+    # 无正文入口的文档：索引本身要保证它们**至少有一条可达路径**，否则
+    # "有索引"仍等于"找不到"（2026-10-20 复核：205 个 md 里 28 个零引用）。
+    orphans = [e for e in entries if not e["cited"]]
+    lines.append(f"## 无正文入口（{len(orphans)}）")
+    lines.append("")
+    lines.append("这些文档没有任何正文引用（不含本索引）。要么在相关报告里补链，"
+                 "要么确认为历史归档；两种处理都不改变文件本身。")
+    lines.append("")
+    if orphans:
+        lines.append("| 日期 | 类型 | 文件 | 标题 |")
+        lines.append("| --- | --- | --- | --- |")
+        for e in sorted(orphans, key=_sort_key):
+            title = (e["title"] or "").replace("|", "\\|")
+            lines.append(f"| {e['date'] or '—'} | {e['kind']} | "
+                         f"[{e['rel']}]({e['rel']}) | {title} |")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"
 
