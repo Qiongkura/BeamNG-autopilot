@@ -759,3 +759,55 @@ def test_map_mode_keeps_its_legacy_minus_0p4_tolerance() -> None:
     )
     assert ref_no.rejected is True
     assert ref_no.meta["lane_reject_reason"] == "side"
+
+
+# --------------------------------------------------------------------------
+# the three gates, as one testable verdict (2026-10-20 extraction)
+# --------------------------------------------------------------------------
+def _verdict(**kwargs):
+    from beamng_autopilot.lane.reference import _lane_gate_verdict
+    base = dict(lane_frame=_sensor_lane(), lane_ref=_sensor_lane().center,
+                route_ref=_route(), pos=np.zeros(3), heading=0.0,
+                lane_mode="map", strict_lane=False)
+    base.update(kwargs)
+    return _lane_gate_verdict(**base)
+
+
+def test_gate_verdict_accepts_the_own_lane_and_reports_the_numbers():
+    v = _verdict()
+    assert v["rejected"] is False and v["reason"] is None
+    meta = v["meta"]
+    assert meta["lane_side_limit_m"] == -0.4          # map 模式的来袭侧容差
+    assert meta["pair_paired"] == 1
+    assert meta["pair_width_m"] == 3.6
+    assert isinstance(meta["lane_side_off_m"], float)
+
+
+def test_gate_verdict_rejects_a_wrong_way_lane_on_heading():
+    v = _verdict(lane_frame=_sensor_lane(heading_axis="back"),
+                 lane_ref=_sensor_lane(heading_axis="back").center)
+    assert v["rejected"] is True and v["reason"] == "heading"
+
+
+def test_gate_verdict_rejects_the_oncoming_lane_on_side():
+    oncoming = _sensor_lane(side="oncoming")
+    v = _verdict(lane_frame=oncoming, lane_ref=oncoming.center,
+                 strict_lane=True)
+    assert v["rejected"] is True and v["reason"] == "side"
+    assert v["meta"]["lane_side_limit_m"] == -0.2     # strict 收紧
+
+
+def test_side_limit_follows_the_lane_mode():
+    assert _verdict(lane_mode="sensor")["meta"]["lane_side_limit_m"] == 0.5
+    assert _verdict(lane_mode="auto")["meta"]["lane_side_limit_m"] == 0.5
+    assert _verdict(strict_lane=True)["meta"]["lane_side_limit_m"] == -0.2
+
+
+def test_corner_gate_only_applies_outside_sensor_mode(monkeypatch):
+    """转角门是"地图模式"的保守门；感知主导模式要让车道自己过弯。"""
+    from beamng_autopilot.planning import arbiter
+
+    monkeypatch.setattr(arbiter, "lane_route_turn_ok",
+                        lambda *a, **k: False, raising=True)
+    assert _verdict(lane_mode="map")["reason"] == "corner"
+    assert _verdict(lane_mode="sensor")["rejected"] is False

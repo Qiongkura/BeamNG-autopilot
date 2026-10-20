@@ -612,6 +612,77 @@ class LaneReference:
         return self.center
 
 
+def _lane_gate_verdict(*, lane_frame, lane_ref, route_ref, pos, heading,
+                       lane_mode: str, strict_lane: bool) -> dict:
+    """三维门（航向 / 转角 / 侧向）对**一个候选感知车道**的裁决。
+
+    2026-10-20 从 ``select_lane_reference`` 里原样搬出来的纯判定：不改任何
+    条件顺序、阈值来源或拒绝理由的取值，只是把"哪个门判的、拿什么数判的"
+    变成一个可单测的返回值。
+
+    返回 ``{"rejected", "reason", "side_bad", "corner_bad", "meta"}``：
+
+    * ``rejected``：整条感知车道（中心 + 硬边界）都不可信，调用方必须把
+      它降级，而不是只换中心——边界若留着，no-cross 规则会拿一条错误的
+      边去拦车；
+    * ``reason``：``"heading"`` / ``"corner"`` / ``"side"``，与
+      ``lane_reject_reason`` 遥测字段同字面量；
+    * ``meta``：``lane_side_off_m`` / ``lane_side_limit_m`` / ``pair_*``，
+      让"门说不行"可复核（拒绝时也能看到触发它的那个数）。
+
+    靠 hd 头（``lane_heading_ok`` / ``lane_route_turn_ok`` / ``lane_side_ok``）
+    的异常照旧抛给调用方：那里有 ``_warn``，换成在这里吞掉会丢诊断。
+    """
+    from beamng_autopilot.planning.arbiter import (
+        lane_heading_ok, lane_route_turn_ok, lane_side_ok,
+        lane_side_offset_m)
+
+    side_bad = False
+    corner_bad = False
+    rejected = False
+    try:
+        side_off = lane_side_offset_m(lane_ref, route_ref, pos)
+    except Exception:                                    # noqa: BLE001
+        side_off = None
+    # 侧向门的阈值随模式收紧：strict 要求车道中心至少在路线右侧 0.2 m；
+    # map 模式允许 0.4 m 的来袭侧容差（弯心），auto/sensor 允许 0.5 m。
+    side_limit = (-0.2 if strict_lane
+                  else (-0.4 if lane_mode == "map" else 0.5))
+    meta = {
+        "lane_side_off_m": (None if side_off is None
+                            else round(float(side_off), 3)),
+        "lane_side_limit_m": float(side_limit),
+        # 配对到底产出了什么：车道宽的配对是"一条车道"，路宽的配对是"整条路"。
+        "pair_width_m": (round(float(getattr(lane_frame, "width", 0.0)
+                                     or 0.0), 2)
+                         if lane_frame is not None else None),
+        "pair_span_m": (round(float(getattr(lane_frame, "span_m", 0.0)
+                                    or 0.0), 2)
+                        if lane_frame is not None else None),
+        "pair_conf": (round(float(getattr(lane_frame, "confidence", 0.0)
+                                  or 0.0), 3)
+                      if lane_frame is not None else None),
+        "pair_paired": int(bool(getattr(lane_frame, "paired", False))),
+        "pair_sources": list(getattr(lane_frame, "sources", ()) or ()),
+    }
+    if not lane_heading_ok(route_ref, lane_ref, pos, heading,
+                           max_yaw_deg=LANE_HEADING_MAX_YAW_DEG):
+        rejected = True
+    elif lane_mode != "sensor" and not lane_route_turn_ok(
+            route_ref, pos,
+            look_m=LANE_ROUTE_TURN_LOOK_M,
+            max_turn_deg=LANE_ROUTE_TURN_MAX_DEG):
+        rejected = True
+        corner_bad = True
+    elif not lane_side_ok(lane_ref, route_ref, pos, left_max_m=side_limit):
+        rejected = True
+        side_bad = True
+    reason = ("side" if side_bad
+              else "corner" if corner_bad else "heading") if rejected else None
+    return {"rejected": rejected, "reason": reason, "side_bad": side_bad,
+            "corner_bad": corner_bad, "meta": meta}
+
+
 def select_lane_reference(
     *,
     lane_frame,
@@ -736,99 +807,16 @@ def select_lane_reference(
     _divider_dbg: dict = {}
     if lane_frame is not None and (map_lane is not None or strict_lane):
         try:
-            from beamng_autopilot.planning.arbiter import (
-                lane_heading_ok, lane_route_turn_ok, lane_side_ok,
-                lane_side_offset_m)
-            # Bearing gate: the lane must HEAD the same way as the route
-            # (junction pairing onto a side road is rejected).
-            side_bad = False
-            corner_bad = False
-            # Where the sensor lane centre sits relative to the route, and
-            # the threshold the side gate will apply.  A refusal is only
-            # reviewable with the number that caused it: without it "the
-            # gate said no" cannot be told apart from a pairing error.
-            try:
-                _side_off = lane_side_offset_m(lane_ref, route_ref, pos)
-            except Exception:
-                _side_off = None
-            _side_limit = (-0.2 if strict_lane
-                           else (-0.4 if lane_mode == "map" else 0.5))
-            gate_meta = {
-                "lane_side_off_m": (None if _side_off is None
-                                    else round(float(_side_off), 3)),
-                "lane_side_limit_m": float(_side_limit),
-                # What the pairing actually produced: a lane-width pair is a
-                # lane read, a road-width one is the whole roadway.
-                "pair_width_m": (round(float(getattr(lane_frame, "width", 0.0)
-                                             or 0.0), 2)
-                                 if lane_frame is not None else None),
-                "pair_span_m": (round(float(getattr(lane_frame, "span_m", 0.0)
-                                            or 0.0), 2)
-                                if lane_frame is not None else None),
-                "pair_conf": (round(float(getattr(lane_frame, "confidence", 0.0)
-                                          or 0.0), 3)
-                              if lane_frame is not None else None),
-                "pair_paired": int(bool(getattr(lane_frame, "paired", False))),
-                "pair_sources": list(getattr(lane_frame, "sources", ()) or ()),
-            }
-            if not lane_heading_ok(route_ref, lane_ref, pos, heading,
-                                   max_yaw_deg=LANE_HEADING_MAX_YAW_DEG):
+            verdict = _lane_gate_verdict(
+                lane_frame=lane_frame, lane_ref=lane_ref, route_ref=route_ref,
+                pos=pos, heading=heading, lane_mode=lane_mode,
+                strict_lane=strict_lane)
+            gate_meta = verdict["meta"]
+            if verdict["rejected"]:
                 lane_rejected = True
-            # CORNER gate: at a real turn in the nav route the map-prior
-            # own lane is the authority - the sensor lane reads the
-            # corner wide and steers the car off the line (see
-            # LANE_ROUTE_TURN_MAX_DEG).  The 35 deg heading gate alone
-            # does not catch it: a wide corner read can still be within
-            # 35 deg of the route.  Only the map mode keeps this;
-            # perception-led modes let the sensor lane lead through
-            # corners (the map guard-rail still stops a real crossing).
-            elif lane_mode != "sensor" and not lane_route_turn_ok(
-                    route_ref, pos,
-                    look_m=LANE_ROUTE_TURN_LOOK_M,
-                    max_turn_deg=LANE_ROUTE_TURN_MAX_DEG):
-                lane_rejected = True
-                corner_bad = True
-            # SIDE gate (safety net, NOT a navigator preference): the lane
-            # centre must sit clearly RIGHT of the road centreline
-            # (own lane).  A lane locked onto the ONCOMING lane passes
-            # the bearing gate (same direction) but still steers the car
-            # over the centre line (town runs 2026-08-22: the car rode
-            # the centre/oncoming lane end to end with lane_src=sensor).
-            # A lane sitting ON the centreline is the WHOLE-ROAD free
-            # corridor, not the own lane - trusting it parks the car on
-            # the centre line and the switch to the map-prior own lane
-            # then forces a 2-3 m over-correction that swings it off the
-            # road edge (mountain run 2026-08-27 run_fix31: after the
-            # junction the car rode the centre line, then over-corrected
-            # right and wedged at (741.2,745.7)).
-            #
-            # This gate is ALWAYS on - it is the last wall between an
-            # unpaired sensor centre (often the whole-road corridor on a
-            # two-way road) and the planner.  Strict perception
-            # (``lane_mode=sensor + strict_sensor``) tightens it to
-            # -0.2 m: the lane centre must sit at least 0.2 m RIGHT of
-            # the route (own side only).  ``off=0`` (lane sitting on the
-            # road centre line) is rejected - that is the whole-road
-            # corridor, not the ego lane, and it is exactly the failure
-            # mode the live town run 2026-09-20 exposed (see below).
-            # Without strict perception we allow a small oncoming-side
-            # read for corner apex (perception-led modes) or the legacy
-            # map-prior tolerance (map mode); both still keep the map
-            # centreline as the hard no-cross boundary downstream.
-            #
-            # Regression: live town run 2026-09-20 --strict kept this
-            # gate bypassed and the car sat on the road centre line at
-            # mean=+1.18 m painted-line lateral (p50=+1.04 m), straddle
-            # the divider for 75 of 166 frames and stall on the way to
-            # the goal.  See gate_on_3.log and the screenshot in
-            # docs/reviews/2026-09-20_strict_centerline.md.
-            elif not lane_side_ok(
-                    lane_ref, route_ref, pos, left_max_m=_side_limit):
-                lane_rejected = True
-                side_bad = True
-            if lane_rejected:
-                reject_reason = ("side" if side_bad
-                                 else "corner" if corner_bad else "heading")
+                reject_reason = str(verdict["reason"])
+                # 整条感知车道都不可信：中心与（可能错误的）硬边界一起丢弃，
+                # 否则 no-cross 规则会拿一条错边去拦车。
                 sensor_paired = False
                 lane_ref = None
                 lane_left = None
