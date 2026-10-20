@@ -837,3 +837,37 @@ def test_the_tick_publishes_the_reference_stability_verdict() -> None:
                 "ref_flip"):
         assert key in out.meta, key
     assert out.meta["ref_authority"] in ("full", "limited")
+
+
+def test_published_lane_reference_tags_geometry_and_evidence():
+    """发布层：几何身份 + 三个证据位必须来自**被接受的那一帧**。
+
+    ``lane_ref_geom_id`` 是"同一参考几何"的版本号（plan §3.3-4）；空参考
+    必须**不带** id——两个都不存在的参考不能看起来像"两个匹配的几何"
+    （2026-09-22 实测 20 帧里 16 帧带过不存在的 id）。
+    """
+    from types import SimpleNamespace
+
+    from beamng_autopilot.fsd_stack import _publish_lane_reference
+    from beamng_autopilot.lane import LaneReference
+
+    ref = LaneReference(
+        center=np.column_stack([np.linspace(0.0, 10.0, 6),
+                                np.full(6, -1.8)]),
+        src="sensor", two_sided=True, fresh_obs=True, inferred=False,
+        meta={"lane_src": "sensor", "lane_side_off_m": -1.8})
+    out = SimpleNamespace(meta={})
+    _publish_lane_reference(out, ref)
+    assert out.lane_ref is ref.center
+    assert out.meta["lane_src"] == "sensor"
+    assert out.meta["lane_ref_geom_id"] == ref.geom_id
+    assert out.meta["lane_ref_two_sided"] == 1
+    assert out.meta["lane_ref_fresh_obs"] == 1
+    assert out.meta["lane_ref_inferred"] == 0
+
+    empty = LaneReference(center=None, src="perception-unavailable")
+    out2 = SimpleNamespace(meta={})
+    _publish_lane_reference(out2, empty)
+    assert out2.meta["lane_ref_geom_id"] is None, "空参考不能带几何 id"
+    assert out2.meta["lane_ref_two_sided"] == 0
+    assert out2.lane_ref is None

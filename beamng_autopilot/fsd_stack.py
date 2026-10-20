@@ -608,6 +608,55 @@ class FSDTick:
         self.path_forward_clearance: float = float("inf")
 
 
+def _pose_and_ground(st) -> tuple:
+    """本 tick 的位姿与**唯一地面平面**：``(pos, heading, rotation, ground_z,
+    meta)``。
+
+    2026-10-20 从 ``FSDStack.tick`` 原样搬出（T05）。把实测姿态（四元数）与
+    地面平面一起发布，是为了让"这个数字由哪套几何算出来"能从运行记录回答，
+    而不是回头读源码；``rotation`` 与 ``ground_z`` 还会被 BEV 投影和占用层
+    直接使用，所以一起返回而不是只放进 meta。
+
+    ``POSE_ROTATION_ENABLED`` 关闭时**显式**把姿态置 None（不是"忘传"），
+    ``pose_label`` 会据此写出标签。
+    """
+    pos = np.asarray(st.pos, dtype=float)
+    heading = float(st.heading)
+    rotation = getattr(st, "rotation", None)
+    if not geometry.POSE_ROTATION_ENABLED:
+        rotation = None
+    ground_z = geometry.projection_ground_z(pos)
+    meta = {
+        "pose_label": geometry.pose_label(
+            rotation, enabled=geometry.POSE_ROTATION_ENABLED),
+        "ground_model": geometry.GROUND_MODEL_FLAT,
+        "ground_z": round(float(ground_z), 4),
+        "ego_ground_gap_m": float(geometry.EGO_GROUND_GAP_M),
+    }
+    return pos, heading, rotation, ground_z, meta
+
+
+def _publish_lane_reference(out, lane_ref_out) -> None:
+    """把选源结果发布进 tick 输出：meta + 几何身份 + 三个证据位。
+
+    2026-10-20 从 ``FSDStack.tick`` 原样搬出。``lane_ref_geom_id`` 是"同一
+    参考几何"的版本号：控制器消费的那条参考与规划 Scene 用的那条必须每 tick
+    对得上（plan §3.3-4），比对而不是假设。``two_sided`` / ``fresh_obs`` /
+    ``inferred`` 是"这条参考有多硬"的证据位，取自真正被接受的那一帧——
+    ``paired`` 单独不够（画线中心会 set 它，而右边界只是宽度先验）。
+
+    空参考必须**不带** id：两个都不存在的参考看起来像"两个匹配的几何"
+    （2026-09-22 一次实车 20 帧里有 16 帧带着不存在的 id），这是
+    ``_reference_geometry_id`` 返回 None 的原因。
+    """
+    out.meta.update(lane_ref_out.meta)
+    out.lane_ref = lane_ref_out.center
+    out.meta["lane_ref_geom_id"] = _reference_geometry_id(lane_ref_out)
+    out.meta["lane_ref_two_sided"] = int(bool(lane_ref_out.two_sided))
+    out.meta["lane_ref_fresh_obs"] = int(bool(lane_ref_out.fresh_obs))
+    out.meta["lane_ref_inferred"] = int(bool(lane_ref_out.inferred))
+
+
 class FSDStack:
     """Integrated FSD-style perception + planning pipeline."""
 
@@ -876,21 +925,10 @@ class FSDStack:
         out = FSDTick()
         if st is None:
             st = self.conn.get_state()
-        pos = np.asarray(st.pos, dtype=float)
-        heading = float(st.heading)
         # T05: the MEASURED attitude (quaternion) and the ONE ground plane
-        # every consumer uses this tick.  Publishing both makes "which
-        # geometry produced this number" answerable from the run record
-        # instead of from the source.
-        _rotation = getattr(st, "rotation", None)
-        if not geometry.POSE_ROTATION_ENABLED:
-            _rotation = None
-        _ground_z = geometry.projection_ground_z(pos)
-        out.meta["pose_label"] = geometry.pose_label(
-            _rotation, enabled=geometry.POSE_ROTATION_ENABLED)
-        out.meta["ground_model"] = geometry.GROUND_MODEL_FLAT
-        out.meta["ground_z"] = round(float(_ground_z), 4)
-        out.meta["ego_ground_gap_m"] = float(geometry.EGO_GROUND_GAP_M)
+        # every consumer uses this tick (see _pose_and_ground).
+        pos, heading, _rotation, _ground_z, _pose_meta = _pose_and_ground(st)
+        out.meta.update(_pose_meta)
         _tw = time.time()
         _times: dict[str, float] = {}
         _tick_cost0 = time.time()
@@ -1869,16 +1907,11 @@ class FSDStack:
         lane_rejected = lane_ref_out.rejected
         lane_src_sel = lane_ref_out.src
         strict_lane = lane_ref_out.strict
-        out.meta.update(lane_ref_out.meta)
-        out.lane_ref = lane_ref
         # Version tags for the one-reference contract: the accepted object
         # the controller consumes, and the geometry the planner Scene was
         # built from.  They must match every tick; a live run or a test can
         # check that instead of assuming it (plan §3.3-4).
-        out.meta["lane_ref_geom_id"] = _reference_geometry_id(lane_ref_out)
-        out.meta["lane_ref_two_sided"] = int(bool(lane_ref_out.two_sided))
-        out.meta["lane_ref_fresh_obs"] = int(bool(lane_ref_out.fresh_obs))
-        out.meta["lane_ref_inferred"] = int(bool(lane_ref_out.inferred))
+        _publish_lane_reference(out, lane_ref_out)
         # How much of the ACCEPTED reference's own geometry is current
         # evidence vs only remembered history (plan T03: "选中边界 current
         # 支持与 history-only 支持"), plus the per-band local ages that a
