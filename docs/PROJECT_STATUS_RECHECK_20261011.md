@@ -7,7 +7,7 @@
 - T18 传感器回放正确性：首轮无效保留、同协议重试合格、48 次同源输出一致、CPU p95 对比完成；定向/全量测试通过。
 - E5 基线 3×3 资格入口：9/9 尝试，1 completed、8 unplaceable；生产放置偏差与 exposure qualification 均记录。
 - E5 扩展：先前 `production_alignment` 批次 2 qualified/2 exposure-invalid；随后用 `fixed_actual_pose` 契约重跑，Italy 更大偏移 4/4 在曝光前因 2.57–3.08m 漂移被拒（rc=4），mountain 第二路段 4/4 放置截止（rc=3）；结果见 `docs/T16_E5_EXTENSION_RESULT_20261011.md`。
-- 收尾后游戏进程为 0；纸面数字审计最新批次 129 项通过（2026-10-11 扩展，含 E5 起点A/B 回查；早先批次为 115 项）、图 QA 0、LaTeX 静态 0。
+- 收尾后游戏进程为 0；纸面数字审计最新批次 **261 项通过**（2026-10-18 扩展，含 ECA3 资格与配对；批次演进 115 → 129（10-11）→ 240 → 257 → 261）、图 QA 0、LaTeX 静态 0。审计计数目前只存在于提交信息与本文档，尚无落盘产物。
 
 ## 当前不能声称
 
@@ -70,3 +70,37 @@
 - utah 资格采集第一批（预注册 T16_LINE_MEASURED_UTAH_PREREG，2026-10-18）：annotation 可写性修复生效（5 站全写入线类像素 3434/799/2948/1350/5425，line_yellow_double@0.40m），但冻结导出门 **0/5 全隔离、0 帧**（目标 ≥2站/≥6帧未达成）——a0s0 left 实例 paint 0/85（annotation 写进、beauty 全程无漆的站点局部遮挡案例，RGB 均值 ~(106,98,74) 对 right 条纹色 (185,161,124)）、a1/a2 投影 2.70/1.66px 挂、a3 right coverage 0+14.35px、a4 right 0.5472+4.27px（逐帧 1.6→6.6px 随步进漂移，需原地 vs 步进对照定因）；首次启动挂起（游戏 t=4.85s 卡死、collector 阻塞 MapLoaded ack）杀进程同命令重试成功，attempt1 日志保留；不降门、无帧入池、模型未晋级。见 `T16_LINE_MEASURED_UTAH_RESULT_20261018.md`。
 - utah a0s0 left 线无漆定因完成（2026-10-18，纯离线已采集帧）：**无几何遮挡物**——世界系直线阴影边界浅斜穿过走廊、左线整段处于阴影，annotation 无光照直写调色板照常写线、beauty 同几何阴影渲染 0.56–0.66×（仅环境光，(106,98,74)=(185,161,124) 阴影化）；`paint_like` 绝对亮度判据对阴影不具照度不变性故 left 0/85。已排除覆盖贴花（footprint 逐行等宽）、近距遮挡物（depth 同）、ego 阴影/视角 mip（暗区世界系固定且随步进退去）、条纹材质差异（路面同倍率变暗、条纹亮暗随边界相对位置逐帧变化）。门不改、a0s0 维持隔离。见 `T16_UTAH_A0S0_OCCLUSION_ATTRIB_20261018.md`。
 - utah 投影残差两项定因完成（2026-10-18，纯离线已采集帧）：**a4s0 步进漂移**=我方两贴花渲染范围世界固定止于 stn≈15（链 4→33），stn 16–33 真值点为假残差、服务像素随步进由地图自有车道漆续线切换到中带/邻带（f0 0.3–6.9px → f1 8.9–12.2 → f2 15.7–17.9），left 全程 ~1px 自证；位姿链（2.00m/≤21mm/≤1°）、相机标定、链-贴花横移、埋地（表面 z−链 z ±0.12m）、mip 截断（截断站位不随步进平移）、阴影型写入失败均排除。**a3s0 14px**=右贴花对象级双 pass 全缺（annotation R=0 像素、beauty 土色 (151–163,113–124,93–103)），右链真值点全程量到左带 12–96px 假残差，pooled 14px≈(left ~1px+right ~27px)/2；paint 84/84 为松黄色判据在红土 (170,134,107, r−b=63≥60) 假阳性。projection 与 coverage 两门失败同根因，门未改、0 帧入池、模型未晋级。见 `T16_UTAH_PROJECTION_ATTRIB_20261018.md`。
+
+## 工程整改（2026-10-20，评审后的 P0）
+
+本轮没有跑 Tech、没有训练、没有改任何驾驶行为；只解掉两个**会挡住后续实测**的
+工程问题，并按模块分三个提交入库（`scripts` / `tests` / `experiments`）。
+
+1. **磁盘解封（资源门恢复）**。实测 I: 盘 free 16.14 GB < `min_free_disk_gb=20`
+   （`experiments/collection.py`），所有 Tech 采集会在前置检查被拒。
+   新增 `scripts/m5_logs_retention.py`（默认 dry-run、manifest 先落盘、路径越界
+   整批拒绝、只删 `.pt/.pth/.ckpt`）：保留 `seg_model*` 部署目录、`best*`、
+   含 `final_set_seal.json` 的封存子树、以及文档点名当 `--init`/交付候选/
+   确认集的三个目录（`t14_e1_promotable_20260927`、`t16_negdose6x_20261001`、
+   `t14_e0_20260925`）。实测 `--apply --min-free-gb 30` 删 3301 个 / 13.86 GB，
+   **free 16.14 → 30.07 GB**；受保护权重逐个复核仍在。9 项单测。
+2. **进程探测（`tasklist` 在本机被拒）**。实测 `tasklist` 返回
+   `ERROR: Access denied`（rc=1），导致：单实例锁断电恢复永不生效（`_alive`
+   把已退出进程判成活着）、采集前置检查永远"不确定"、采集收尾所有权证明永远
+   给不出（测试里的 `owned game cleanup unproven` 就是这个）。改用 PowerShell 7
+   的 `Get-Process`：`collection._process_table()` 一张表喂
+   `game_running_probe`/`game_pids`，`controller._alive` 用
+   `Get-Process -Id` 明确判定"已退出"，仅当连 PowerShell 都不可用时才退回
+   tasklist 的保守语义。实测 `_alive(self)=True`、子进程 terminate 后
+   `_alive=False`、`_process_table()` 枚举 365 个进程。
+3. **测试可复现性**。同一份代码：普通 PowerShell 下 `pytest tests/` 7 失败，
+   设 `PYTHONUTF8=1` 后 0 失败——根因是控制台代码页（子进程 GBK 打印 "↔" 直接
+   UnicodeEncodeError；父进程 `text=True` 按 GBK 解码）。`tests/conftest.py`
+   统一 UTF-8（环境变量 + Popen 文本模式默认编码）；同一缺陷还让
+   `scripts/check_commit_scope.py` 遇中文提交标题崩在 `.strip()`（**推送前
+   自查实际从未跑通**），四处 git 调用统一 `encoding="utf-8"` 并补 5 项链路测试。
+
+**实测门**：`pytest tests/` = **3448 passed / 0 failed**（510 s，含本轮新增 17 项）；
+`scripts/m5_offline_validate.py` = ALL PASS；`check_commit_scope.py --last 3` = OK。
+**未验证**：Tech 实机、GPU 训练、冻结评审门、PDF 重编译——本轮一项都没跑。
+
