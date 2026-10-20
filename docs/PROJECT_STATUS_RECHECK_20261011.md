@@ -153,4 +153,28 @@
 **未验证**：LaTeX 实际编译（本机无 TeX）、补充材料 PDF（源未改）、Tech 实机、
 GPU 训练。
 
+## 评审整改收口（2026-10-20）
+
+**P0 四项全部完成**（每项都有实测证据，见上文）：① 磁盘解封（free 16.14 → 30.07 GB，
+资源门恢复）；② pytest 在默认 shell 与 `PYTHONUTF8=1` 下都可复现（3448 → 3503 passed，
+0 failed）；③ README 验收口径 + 论文四处修正 + 主张清单补录；④ FSD 入口默认
+`sensor`+`strict`，旧地图参考需显式 `--allow-legacy-map-lane`
+且该轮结果不得用于验收。
+
+**P1 结构项完成的**：`select_lane_reference` **571 → 374 行**（11 个可测判据）、
+`FSDStack.tick` 首切片 1394 → 1378、技术债棘轮入库并进 `dev_validate`（静默异常
+**79 → 59**、`except Exception` **351 → 332**）、`docs/INDEX.md`（224 篇 / 28 无正文入口）、
+论文源包与 CLAIMS 同步、`lane/fusion` 去重。
+
+**刻意不做（有理由，不是遗漏）**：
+1. `FSDriveSession.run`（3430 行）**不拆**——它是顺序编排，60+ 语句共享十几个局部量，
+   抽纯函数要传 10+ 参数、返回 5+ 值；无人值守下改错的风险高于可读性收益。
+2. `FSDStack.tick` 不再继续硬拆，同样原因（已在上一节记录）。
+3. `fsd_drive` 剩余 19 处静默点**保留**：despawn / watchdog 心跳 / e2e reset /
+   stack.close 等纯诊断与清理路径，吞掉不会让安全读数变松。
+4. `autopilot.py` 的 18 处（legacy 规则栈）不动：按 AGENTS 它只是兼容兜底。
+
+**待你决定**：C11「四次运行未观察到压线」的口径（10-11 后另有 5 次合格运行，
+压线帧计数 UNKNOWN）、Zenodo/ORCID/目标期刊、以及**分支 ahead 84 未推送**。
+
 
