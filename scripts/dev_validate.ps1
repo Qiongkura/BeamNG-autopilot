@@ -49,11 +49,18 @@ try {
     & $py 'scripts\m5_offline_validate.py' 2>&1 | Select-Object -Last 12
     $offRc = $LASTEXITCODE
 
-    Write-Host ("RESULT: pytest={0} offline_validate={1}" -f `
+    # 技术债棘轮：只许减少、不许增加（静默 except / print / god-function 行数）。
+    # 它不是"风格检查"：静默吞异常会把"传感器没数据"变成一条正常的空结果。
+    Write-Host "=== 技术债棘轮（scripts/m5_debt_meter.py --check）===" -ForegroundColor Cyan
+    & $py 'scripts\m5_debt_meter.py' '--check' 2>&1 | Select-Object -Last 8
+    $debtRc = $LASTEXITCODE
+
+    Write-Host ("RESULT: pytest={0} offline_validate={1} debt={2}" -f `
         $(if ($pytestRc -eq 0) { 'PASS' } else { 'FAIL' }),
-        $(if ($offRc -eq 0) { 'PASS' } else { 'FAIL' })) -ForegroundColor `
-        $(if (($pytestRc -eq 0) -and ($offRc -eq 0)) { 'Green' } else { 'Red' })
-    exit ([int]($pytestRc -ne 0) -bor ([int]($offRc -ne 0)))
+        $(if ($offRc -eq 0) { 'PASS' } else { 'FAIL' }),
+        $(if ($debtRc -eq 0) { 'PASS' } else { 'FAIL' })) -ForegroundColor `
+        $(if (($pytestRc -eq 0) -and ($offRc -eq 0) -and ($debtRc -eq 0)) { 'Green' } else { 'Red' })
+    exit ([int]($pytestRc -ne 0) -bor ([int]($offRc -ne 0)) -bor ([int]($debtRc -ne 0)))
 }
 finally {
     $env:PYTHONUTF8 = $savedPythonUtf8
