@@ -758,7 +758,9 @@ def painted_line_markings(sem, cam_model, pos, heading,
                 y = yellow_line_mask(rgb)
                 if y.shape == mask.shape:
                     mask = np.maximum(mask, y.astype(np.uint8) * 255)
-            except Exception:
+            except (ImportError, ValueError, TypeError):
+                # 黄色掩码是**附加**增强：模块缺失或颜色空间不匹配时保留
+                # 基础白线掩码即可。只吞这两类；别的错误说明掩码链坏了。
                 pass
         return _mask_to_markings(mask, "white", cam_model, pos, heading,
                                  ground_z=ground_z)
