@@ -864,6 +864,35 @@ def _divider_lane(markings, pos, heading, route_ref, grid, *,
     return divider, dbg
 
 
+def _enforce_publishable(ref_out: LaneReference) -> LaneReference:
+    """末道 fail-closed：``sensor`` 标签但没有可用中心 → 报告 unavailable。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出。它**独立于哪条分支**
+    造成了不一致（plan §3.3-1）：一个带 ``sensor`` 标签却没有几何的决策，
+    必须报成 unavailable 而不是"带标签的空决策"；几何字段一起清掉，任何
+    消费者都不能拿半个决定去转向。
+
+    注意它**不**授权"存在但已被撤销的中心"——撤销的那一步已经把几何清了，
+    两者不可能互相矛盾（``LaneReference.publishable_sensor`` 的注释）。
+    """
+    if ref_out.publishable_sensor:
+        return ref_out
+    meta = ref_out.meta
+    meta["lane_ref_invariant"] = (
+        "sensor source with empty/invalid centre -> unavailable")
+    ref_out.src = SRC_UNAVAILABLE
+    ref_out.src_published = True
+    ref_out.map_lane = None
+    ref_out.center = None
+    ref_out.left = None
+    ref_out.right = None
+    ref_out.width = 0.0
+    ref_out.boundaries = False
+    meta["lane_src_sel"] = SRC_UNAVAILABLE
+    meta["lane_src"] = _LABEL_BY_SRC.get(SRC_UNAVAILABLE, SRC_BEV_ROUTE)
+    return ref_out
+
+
 def select_lane_reference(
     *,
     lane_frame,
@@ -1264,22 +1293,4 @@ def select_lane_reference(
                       and getattr(lane_frame, "inferred", False)),
         meta=meta,
     )
-    if not ref_out.publishable_sensor:
-        # Fail-closed backstop, independent of which branch produced the
-        # inconsistency: a ``sensor`` label without usable centre geometry
-        # is reported unavailable instead of steering anything (plan
-        # §3.3-1).  The geometry fields are cleared with it so no consumer
-        # can act on half a decision.
-        meta["lane_ref_invariant"] = (
-            "sensor source with empty/invalid centre -> unavailable")
-        ref_out.src = SRC_UNAVAILABLE
-        ref_out.src_published = True
-        ref_out.map_lane = None
-        ref_out.center = None
-        ref_out.left = None
-        ref_out.right = None
-        ref_out.width = 0.0
-        ref_out.boundaries = False
-        meta["lane_src_sel"] = SRC_UNAVAILABLE
-        meta["lane_src"] = _LABEL_BY_SRC.get(SRC_UNAVAILABLE, SRC_BEV_ROUTE)
-    return ref_out
+    return _enforce_publishable(ref_out)

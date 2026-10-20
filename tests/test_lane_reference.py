@@ -1053,3 +1053,25 @@ def test_divider_lane_never_raises_and_keeps_the_reason(monkeypatch):
     assert divider is None
     assert "reason" in dbg and "exploded" in dbg["reason"]
     assert "stale" not in dbg
+
+
+def test_fail_closed_backstop_clears_half_a_decision():
+    """末道闸：sensor 标签 + 无几何 -> unavailable，且几何一起清掉。"""
+    from beamng_autopilot.fsd_realism import SRC_UNAVAILABLE as UNAVAIL
+    from beamng_autopilot.lane.reference import _enforce_publishable
+
+    bad = LaneReference(center=None, src=SRC_SENSOR, src_published=True,
+                        left=np.zeros((3, 2)), right=np.zeros((3, 2)),
+                        width=3.5, boundaries=True, meta={"lane_src": "sensor"})
+    out = _enforce_publishable(bad)
+    assert out.src == UNAVAIL
+    assert out.center is None and out.left is None and out.right is None
+    assert out.width == 0.0 and out.boundaries is False
+    assert out.meta["lane_ref_invariant"].startswith("sensor source")
+    assert out.meta["lane_src"] != "sensor"
+
+    good = LaneReference(center=np.column_stack([np.linspace(0, 10, 6),
+                                                 np.full(6, -1.8)]),
+                         src=SRC_SENSOR, meta={})
+    assert _enforce_publishable(good) is good
+    assert good.src == SRC_SENSOR
