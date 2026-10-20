@@ -82,7 +82,7 @@
    "lines": 216,
    "max_func_lines": 94,
    "prints": 0,
-   "silent_except": 1
+   "silent_except": 0
   },
   "beamng_autopilot/control/pid.py": {
    "except_exception": 0,
@@ -967,11 +967,11 @@
    "silent_except": 0
   },
   "beamng_autopilot/vision/heads/semantic.py": {
-   "except_exception": 13,
-   "lines": 440,
-   "max_func_lines": 348,
+   "except_exception": 12,
+   "lines": 442,
+   "max_func_lines": 350,
    "prints": 0,
-   "silent_except": 1
+   "silent_except": 0
   },
   "beamng_autopilot/vision/heads/topology.py": {
    "except_exception": 0,
@@ -1002,11 +1002,11 @@
    "silent_except": 0
   },
   "beamng_autopilot/vision/lanes.py": {
-   "except_exception": 6,
-   "lines": 1555,
+   "except_exception": 5,
+   "lines": 1557,
    "max_func_lines": 188,
    "prints": 0,
-   "silent_except": 1
+   "silent_except": 0
   },
   "beamng_autopilot/vision/line_evidence.py": {
    "except_exception": 0,
@@ -1122,10 +1122,10 @@
   },
   "beamng_autopilot/watchdog.py": {
    "except_exception": 2,
-   "lines": 176,
+   "lines": 177,
    "max_func_lines": 17,
    "prints": 0,
-   "silent_except": 1
+   "silent_except": 0
   },
   "beamng_autopilot/workers.py": {
    "except_exception": 1,
@@ -1162,10 +1162,10 @@
   "beamng_autopilot_tech"
  ],
  "totals": {
-  "except_exception": 334,
+  "except_exception": 332,
   "max_func_lines": 3430,
   "prints": 163,
-  "silent_except": 63
+  "silent_except": 59
  },
  "version": 1
 }
