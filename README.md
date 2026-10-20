@@ -39,6 +39,9 @@
 >    文中 v8 / v12 / v13b 是 9 月的历史选型，不是当前默认。
 > 4. **学习收益未建立**：10 月跨池配对 30 组 25 负、从未 `candidate_better`；合格线帧
 >    总量 ≈42 帧，唯一封存 held-out 已于 10-06 一次性消费。
+> 5. **横向参考默认已合规**（2026-10-20）：`m5_fsd_drive` / `m5_shadow_drive` 的
+>    `--lane-mode` 默认 `sensor`、`--strict` 默认开；`map`/`auto`/`--no-strict`
+>    必须显式加 `--allow-legacy-map-lane`，且那一轮结果不得用于验收。
 
 - **分层架构**：清晰的感知、决策、控制模块，便于研究与扩展；
 - **双运行时支持**：兼容 Steam 与 BeamNG.tech，自动检测并适配不同版本；
@@ -356,6 +359,9 @@ BEV/向量空间 → 占用 → 规划 → 安全 → 影子数据闭环**。现
 .venv\Scripts\python.exe scripts\m5_planning_probe.py --runtime tech --attach
 
 # 4) 真实驾驶（FSD 模式，带安全监控 + 仲裁 + 反向防护）
+#    2026-10-20 起 --lane-mode 默认 sensor、--strict 默认开（铁律）：
+#    感知拿不到车道就降级停车，不再回退地图车道。要诊断旧行为必须显式
+#    加 --allow-legacy-map-lane，那一轮的结果不得用于验收。
 .venv\Scripts\python.exe scripts\m5_fsd_drive.py --runtime tech --attach `
     --seconds 30 --speed 6 --teleport 729.6 763.9 45
 
