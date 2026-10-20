@@ -739,6 +739,33 @@ def _lane_width_from_map_edges(ml, mr, *, default_m: float,
         default_m or LANE_WIDTH_DEFAULT_M)
 
 
+def _trusted_single_paint(lane_frame, lane_ref, *, sensor_paired: bool) -> bool:
+    """剩**一条**感知漆线时，它是否可信到能推出本车道（strict 模式）。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出。配对/融合几何已经拒掉
+    了远距、错侧与未知标线，所以这里只回答"这条单边够不够格"：
+
+    * 必须来自 **vision**（LiDAR 单边推不出车道）；
+    * 不能是已配对的车道（配对有自己的路径）；
+    * 明确画线类型（solid/dashed/thin）门槛 0.35——短视场里保住 strict 控制；
+      其余类型仍要 0.50；
+    * 必须有至少 3 个点的中心折线可推。
+
+    返回 False 时调用方不得从缓存里"复活"单边（见 ``_single_vision`` 的撤销）。
+    """
+    if lane_frame is None or sensor_paired:
+        return False
+    sources = tuple(getattr(lane_frame, "sources", ()) or ())
+    if "vision" not in sources:
+        return False
+    kinds = {getattr(lane_frame, "left_kind", None),
+             getattr(lane_frame, "right_kind", None)}
+    min_conf = 0.35 if kinds & {"solid", "dashed", "thin"} else 0.50
+    confidence = float(getattr(lane_frame, "confidence", 0.0) or 0.0)
+    return bool(confidence >= min_conf
+                and lane_ref is not None and len(lane_ref) >= 3)
+
+
 def select_lane_reference(
     *,
     lane_frame,
@@ -950,24 +977,8 @@ def select_lane_reference(
     # from the painted-line lane-width contract, never from the map.
     # Ambiguous/no-vision reads still stop.
     if strict_lane:
-        _single_conf = float(getattr(lane_frame, "confidence", 0.0) or 0.0) \
-            if lane_frame is not None else 0.0
-        _single_kinds = {
-            getattr(lane_frame, "left_kind", None),
-            getattr(lane_frame, "right_kind", None),
-        } if lane_frame is not None else set()
-        # The pairing/fusion geometry already rejects far, wrong-side and
-        # unknown markings.  A near explicit painted edge at 0.35 is enough
-        # to keep strict control alive on the short US view; retain 0.50 for
-        # generic single-edge frames.
-        _single_min_conf = (0.35 if _single_kinds & {"solid", "dashed", "thin"}
-                            else 0.50)
-        _single_vision = bool(
-            lane_frame is not None
-            and not sensor_paired
-            and "vision" in tuple(getattr(lane_frame, "sources", ()) or ())
-            and _single_conf >= _single_min_conf
-            and lane_ref is not None and len(lane_ref) >= 3)
+        _single_vision = _trusted_single_paint(
+            lane_frame, lane_ref, sensor_paired=sensor_paired)
         # Painted-divider fallback: the car stands on (or beside) the road
         # centreline, so every whole-road read is refused by the side gate
         # and a strict car could never leave the line it is stuck on.  A

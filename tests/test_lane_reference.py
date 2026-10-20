@@ -891,3 +891,37 @@ def test_map_edge_width_warns_and_falls_back_on_a_bad_read():
     got = _lane_width_from_map_edges(None, None, default_m=3.1, warn=warn)
     assert got == 3.1
     assert warnings and warnings[0][0] == "lane_width", warnings
+
+
+def test_trusted_single_paint_needs_vision_and_a_typed_marking():
+    from beamng_autopilot.lane.reference import _trusted_single_paint
+
+    frame = _sensor_lane(paired=False, confidence=0.8)
+    frame.right_kind = "solid"
+    ref = frame.center
+    assert _trusted_single_paint(frame, ref, sensor_paired=False) is True
+
+    # 明确画线类型门槛 0.35：0.36 过、0.34 不过
+    frame.confidence = 0.36
+    assert _trusted_single_paint(frame, ref, sensor_paired=False) is True
+    frame.confidence = 0.34
+    assert _trusted_single_paint(frame, ref, sensor_paired=False) is False
+
+    # 未知类型要 0.50
+    frame.right_kind = "unknown"
+    frame.confidence = 0.45
+    assert _trusted_single_paint(frame, ref, sensor_paired=False) is False
+    frame.confidence = 0.55
+    assert _trusted_single_paint(frame, ref, sensor_paired=False) is True
+
+    # 已配对的车道走自己的路径；LiDAR 单边推不出车道；没有中心折线
+    paired = _sensor_lane(paired=True, confidence=0.9)
+    assert _trusted_single_paint(paired, paired.center,
+                                 sensor_paired=True) is False
+    lidar = _sensor_lane(paired=False, confidence=0.9,
+                         sources=("lidar",))
+    lidar.right_kind = "solid"
+    assert _trusted_single_paint(lidar, lidar.center,
+                                 sensor_paired=False) is False
+    assert _trusted_single_paint(frame, None, sensor_paired=False) is False
+    assert _trusted_single_paint(None, ref, sensor_paired=False) is False
