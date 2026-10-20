@@ -134,7 +134,7 @@
   拒绝理由与阈值字面量不变）、`_sensor_lane_within_map`（一致性门，近场点不足
   时返回 None 而非误判）、`_lane_width_from_map_edges`（最近点距离 + 合同宽度
   兜底）、`_trusted_single_paint`（单边漆线在 strict 下的信任判据）。
-  主函数 **571 → 445 行**（−126），新增 12 项针对性单测；基线随之逐次收紧。
+  主函数 **571 → 432 行**（−139，截至本轮；拆分仍在继续），另有 `_reference_meta`（meta 装配）与 `_bev_whole_road_center`（整路中心兜底）两个纯函数；新增 14 项针对性单测，基线逐次收紧。
 - **文档索引**：`docs/INDEX.md` 224 篇，含预注册↔结果配对（82）与「无正文
   入口（28）」小节——孤儿文档至少有一条可达路径；生成器带 `--check` 门禁。
 - **lane 去重**：`fusion.py` 复用 `tracking.py` 的 5 个逐字相同 helper。
