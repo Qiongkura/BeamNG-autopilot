@@ -260,11 +260,11 @@
    "silent_except": 1
   },
   "beamng_autopilot/experiments/metrics.py": {
-   "except_exception": 11,
-   "lines": 503,
-   "max_func_lines": 73,
+   "except_exception": 9,
+   "lines": 507,
+   "max_func_lines": 75,
    "prints": 0,
-   "silent_except": 3
+   "silent_except": 1
   },
   "beamng_autopilot/experiments/monitor_server.py": {
    "except_exception": 0,
@@ -1162,10 +1162,10 @@
   "beamng_autopilot_tech"
  ],
  "totals": {
-  "except_exception": 344,
+  "except_exception": 342,
   "max_func_lines": 3430,
   "prints": 163,
-  "silent_except": 73
+  "silent_except": 71
  },
  "version": 1
 }
