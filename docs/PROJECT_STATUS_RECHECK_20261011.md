@@ -126,9 +126,14 @@
 
 **结构收敛**：
 
-- **技术债棘轮**入库并进入 `dev_validate.ps1`：基线 = `except Exception` 351 /
-  静默 79 / `print` 163 / 最长函数 3430 行；总量只许减少，`silent_except` 与
-  单函数长度逐文件只许减少。读文件用 `utf-8-sig`（仓库里有带 BOM 的源文件）。
+- **技术债棘轮**入库并进入 `dev_validate.ps1`：当前基线 = `except Exception`
+  **342** / 静默 **71** / `print` 163 / 最长函数 3430 行；总量只许减少，
+  `silent_except` 与单函数长度逐文件只许减少。读文件用 `utf-8-sig`（仓库里有
+  带 BOM 的源文件）。**已开始还债**（79 → 71）：`run_manifest` 收窄 5 处
+  （父链/进程表；坏掉的 psutil 现在会冒出去，不再让"第二控制器"证据悄悄失效）、
+  `planning/selector` 一处收窄 + 纵向剖面失败改写入 `meta["speed_profile_error"]`、
+  `connector` 只吞 `ImportError`、`experiments/metrics` 两处收窄。
+  **未动**的静默点（`fsd_drive` 27 处等）都在热路径里，需逐处读上下文，留待专轮。
 - **`select_lane_reference` 拆分**（四步纯搬移，零语义变更）：信任顺序的关键
   判据逐块抽成可单测的模块级函数——`_lane_gate_verdict`（航向/转角/侧向三维门，
   拒绝理由与阈值字面量不变）、`_sensor_lane_within_map`（一致性门，近场点不足
