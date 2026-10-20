@@ -2222,6 +2222,7 @@ def _git_dirty_paths(limit: int = 20) -> list:
     try:
         out = subprocess.run(["git", "status", "--porcelain"],
                              cwd=str(ROOT), capture_output=True, text=True,
+                             encoding="utf-8", errors="replace",
                              timeout=30)
     except Exception:                          # noqa: BLE001
         return []

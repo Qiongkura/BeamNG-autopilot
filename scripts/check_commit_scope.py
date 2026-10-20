@@ -45,8 +45,16 @@ def _module_of(path: str) -> str:
 
 
 def _git(*args: str) -> str:
+    """跑 git 并解码为文本。
+
+    2026-10-20 实测：``text=True`` 用 locale(GBK) 解码，遇到中文提交标题
+    （本仓库全是）直接 ``UnicodeDecodeError`` → stdout 变 None →
+    ``check_commit`` 崩在 ``.strip()``。这个检查是推送前必跑的门，坏了就
+    等于没有门，所以显式 UTF-8 解码。
+    """
     out = subprocess.run(["git", *args], cwd=str(ROOT), capture_output=True,
-                         text=True, check=True)
+                         text=True, encoding="utf-8", errors="replace",
+                         check=True)
     return out.stdout
 
 
