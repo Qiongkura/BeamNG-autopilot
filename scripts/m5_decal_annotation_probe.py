@@ -212,7 +212,8 @@ def _analyze(frame: dict, site: dict, truth: list[dict]) -> dict:
 
 def _build_scenario(conn, *, map_name: str, site: dict,
                     z_specs: list, prio_specs: list,
-                    mat_specs: list | None = None) -> tuple:
+                    mat_specs: list | None = None,
+                    material: str = "line_white") -> tuple:
     from beamngpy import Scenario, Vehicle
     from beamngpy.misc.quat import angle_to_quat
     from beamngpy.scenario.road import Road
@@ -227,26 +228,26 @@ def _build_scenario(conn, *, map_name: str, site: dict,
         if lift:
             nodes = [[p[0], p[1], float(p[2]) + float(lift)] for p in nodes]
         truth = m._line_truth(nodes, tag)
-        road = Road(material="line_white", rid=f"probe_{tag}", interpolate=False,
+        road = Road(material=str(material), rid=f"probe_{tag}", interpolate=False,
                     default_width=float(width), over_objects=True,
                     render_priority=1000)   # 场景 A 不看优先级：保持中性
         road.add_nodes(*[tuple(nd) for nd in nodes])
         scen.add_road(road)
         specs.append({"tag": tag, "lat": lat_c, "width": width,
                       "z_lift_m": lift, "render_priority": None,
-                      "material": "line_white", "truth": truth})
+                      "material": str(material), "truth": truth})
     for tag, lat, prio in prio_specs:
         lat_c = max(-(half - 0.3), min(half - 0.3, float(lat)))
         nodes = m._line_nodes(site, lat_c)
         truth = m._line_truth(nodes, tag)
-        road = Road(material="line_white", rid=f"probe_{tag}", interpolate=False,
+        road = Road(material=str(material), rid=f"probe_{tag}", interpolate=False,
                     default_width=0.40, over_objects=True,
                     render_priority=int(prio))
         road.add_nodes(*[tuple(nd) for nd in nodes])
         scen.add_road(road)
         specs.append({"tag": tag, "lat": lat_c, "width": 0.40, "z_lift_m": 0.0,
                       "render_priority": int(prio),
-                      "material": "line_white", "truth": truth})
+                      "material": str(material), "truth": truth})
     for tag, lat, width, material in (mat_specs or []):
         lat_c = max(-(half - 0.3), min(half - 0.3, float(lat)))
         nodes = m._line_nodes(site, lat_c)
@@ -313,11 +314,15 @@ def main() -> int:
     ap.add_argument("--map", default="east_coast_usa")
     ap.add_argument("--attach", action="store_true")
     ap.add_argument("--site-report", required=True)
+    ap.add_argument("--site-index", type=int, default=0,
+                    help="site-report.sites 的站点下标（utah a3s0=3 / a4s0=4）")
+    ap.add_argument("--material", default="line_white",
+                    help="z/prio 变体路的材质（utah/east 用 line_yellow_double）")
     ap.add_argument("--width", type=int, default=192)
     ap.add_argument("--height", type=int, default=144)
     ap.add_argument("--out", default=None)
     ap.add_argument("--scenes", nargs="*", default=["z", "mat", "mat2", "wide", "prio"],
-                    choices=("z", "prio", "mat", "mat2", "wide"),
+                    choices=("z", "prio", "mat", "mat2", "wide", "utah"),
                     help="跑哪些场景（默认全部）")
     args = ap.parse_args()
 
@@ -325,9 +330,12 @@ def main() -> int:
     sites = rep.get("sites_after_ground_alignment") or rep.get("sites") or []
     if not sites:
         raise SystemExit(f"site-report 里没有站点：{args.site_report}")
-    site = dict(sites[0])
-    print(f"[decal-probe2] 地图={args.map} 站点 mid={site['mid']} "
-          f"half_width={site['half_width_m']}", flush=True)
+    if not (0 <= int(args.site_index) < len(sites)):
+        raise SystemExit(f"--site-index {args.site_index} 越界（0..{len(sites) - 1}）")
+    site = dict(sites[int(args.site_index)])
+    print(f"[decal-probe2] 地图={args.map} 站点[{args.site_index}] mid={site['mid']} "
+          f"half_width={site['half_width_m']} lat_l={site.get('lat_left')} "
+          f"lat_r={site.get('lat_right')}", flush=True)
 
     out = Path(args.out) if args.out else (
         config.LOGS_DIR / "m5_seg"
@@ -345,6 +353,7 @@ def main() -> int:
     result: dict = {"probe": "m5_decal_annotation_probe/2", "map": str(args.map),
                     "site": {"mid": site["mid"], "dir": site["dir"],
                              "half_width_m": site["half_width_m"]},
+                    "site_index": int(args.site_index),
                     "site_report": str(args.site_report),
                     "bins": [list(b) for b in S_BINS], "scenes": {},
                     "errors": []}
@@ -387,6 +396,39 @@ def main() -> int:
                              width=int(args.width), height=int(args.height))
             result["scenes"]["wide"] = res
             _print_scene("wide", res)
+        if "utah" in args.scenes:
+            # utah 截断定因（T16_UTAH_DECAL_EXTENT_PROBE_PREREG_20261029）：
+            # lift000 基线 = 批次的 render_priority=idx 行为（先跑，不补丁）；
+            # lift 序列看 z 竞争；补丁后 prio 序列看优先级战争。
+            # 材质必须用该图 annotation 可写的 line_yellow_double。
+            _mat = str(args.material)
+            _lat_r = float(site.get("lat_right") or -1.8)
+            _lat_l = float(site.get("lat_left") or 1.8)
+            _z_specs = [("ut_r_lift000", _lat_r, 0.40, 0.0),
+                        ("ut_r_lift010", _lat_r, 0.40, 0.10),
+                        ("ut_r_lift020", _lat_r, 0.40, 0.20),
+                        ("ut_r_lift035", _lat_r, 0.40, 0.35),
+                        ("ut_l_lift000", _lat_l, 0.40, 0.0),
+                        ("ut_l_lift020", _lat_l, 0.40, 0.20)]
+            scen, specs = _build_scenario(
+                conn, map_name=args.map, site=site,
+                z_specs=_z_specs, prio_specs=[], material=_mat)
+            res = _run_scene(conn, probe, scen=scen, specs=specs, site=site,
+                             out_dir=out, tag="scenU_utah_z",
+                             width=int(args.width), height=int(args.height))
+            result["scenes"]["utah_z"] = res
+            _print_scene("utah_z", res)
+            _restore_render_priority()
+            _prio_specs = [("ut_r_p030", _lat_r, 30), ("ut_r_p060", _lat_r, 60),
+                           ("ut_l_p060", _lat_l, 60)]
+            scen, specs = _build_scenario(
+                conn, map_name=args.map, site=site,
+                z_specs=[], prio_specs=_prio_specs, material=_mat)
+            res = _run_scene(conn, probe, scen=scen, specs=specs, site=site,
+                             out_dir=out, tag="scenU_utah_prio",
+                             width=int(args.width), height=int(args.height))
+            result["scenes"]["utah_prio"] = res
+            _print_scene("utah_prio", res)
         if "prio" in args.scenes:
             _restore_render_priority()
             scen, specs = _build_scenario(
