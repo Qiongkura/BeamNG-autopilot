@@ -301,15 +301,29 @@ class SegUNet(nn.Module):
     """
 
     def __init__(self, in_channels: int = 3, n_classes: int = N_CLASSES,
-                 width: float = 1.0):
+                 width: float = 1.0, arch: str = "plain"):
         super().__init__()
         self.width = float(width)
+        self.arch = str(arch or "plain")
+        if self.arch not in ("plain", "strip"):
+            raise ValueError(f"未知 SegUNet arch: {self.arch!r}")
 
         def _c(base: int) -> int:
             # 通道数必须是整数：取整后下限 8，避免小宽度把通道压到 0
             return max(8, int(round(base * self.width)))
 
         def _blk(cin, cout):
+            if self.arch == "strip":
+                # 条带先验（轻量版）：3×3 后接 1×k / k×1 非对称卷积，
+                # 沿行/列方向聚合细长结构（车道线/护栏），感受野各向异性
+                # 且参数只多 ~6%（9+5+5 vs 9+9 个权重/通道对）。
+                return nn.Sequential(
+                    nn.Conv2d(cin, cout, 3, padding=1), nn.BatchNorm2d(cout),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(cout, cout, (1, 5), padding=(0, 2)),
+                    nn.BatchNorm2d(cout), nn.ReLU(inplace=True),
+                    nn.Conv2d(cout, cout, (5, 1), padding=(2, 0)),
+                    nn.BatchNorm2d(cout), nn.ReLU(inplace=True))
             return nn.Sequential(
                 nn.Conv2d(cin, cout, 3, padding=1), nn.BatchNorm2d(cout),
                 nn.ReLU(inplace=True),
@@ -638,9 +652,12 @@ class Segmenter:
         # 与老 checkpoint 逐位一致。
         arch_args = (ckpt.get("train_args") or {}).get("arch_args") or {}
         self.width = float(arch_args.get("width") or 1.0)
+        # 架构变体同样从 checkpoint 读（strip 臂的键与 plain 不同，按默认
+        # 架构建模型会 size mismatch；缺字段时按 plain 处理，老 checkpoint 不变）。
+        self.arch = str(arch_args.get("arch") or "plain")
         self.model = SegUNet(
             n_classes=int(ckpt.get("n_classes", N_CLASSES)),
-            width=self.width)
+            width=self.width, arch=self.arch)
         got = self.model.load_state_dict(ckpt["state_dict"])
         if got.missing_keys or got.unexpected_keys:
             raise RuntimeError(
