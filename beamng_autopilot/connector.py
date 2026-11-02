@@ -84,7 +84,10 @@ class BeamNGConnector:
         try:
             from beamng_autopilot.vision.segmentation import set_active_map
             set_active_map(map_name)
-        except Exception:
+        except ImportError:
+            # 分割模块依赖 torch/cv2：没装时**不阻塞连接**——"按地图选专家
+            # checkpoint"只是可选优化，回退基础模型即可。别的异常说明登记
+            # 本身坏了，应当冒出去，而不是静默失效。
             pass
 
     def __enter__(self):
