@@ -43,9 +43,9 @@ class _AutoEncoder(nn.Module):
     （max(8, round(base*width))）。
     """
 
-    def __init__(self, width: float = 1.0):
+    def __init__(self, width: float = 1.0, arch: str = "plain"):
         super().__init__()
-        seg = SegUNet(width=float(width))
+        seg = SegUNet(width=float(width), arch=str(arch))
         c32 = max(8, int(round(32 * float(width))))
         c64 = max(8, int(round(64 * float(width))))
         c128 = max(8, int(round(128 * float(width))))
@@ -121,6 +121,8 @@ def main() -> int:
                     help="去噪输入噪声标准差（扫描臂）")
     ap.add_argument("--width", type=float, default=1.0,
                     help="编码器容量宽度（需与后续微调的 --width 一致）")
+    ap.add_argument("--arch", choices=("plain", "strip"), default="plain",
+                    help="编码器架构变体（需与后续微调的 --arch 一致）")
     args = ap.parse_args()
     torch.manual_seed(int(args.seed))
 
@@ -131,7 +133,7 @@ def main() -> int:
     n = x.shape[0]
     print(f"[ssl] frames={n} device={dev} epochs={args.epochs}", flush=True)
 
-    ae = _AutoEncoder(width=float(args.width)).to(dev)
+    ae = _AutoEncoder(width=float(args.width), arch=str(args.arch)).to(dev)
     opt = torch.optim.Adam(ae.parameters(), lr=args.lr)
     g = torch.Generator().manual_seed(int(args.seed))
     t0 = time.time()
@@ -154,7 +156,7 @@ def main() -> int:
         print(f"[ssl] ep {ep} L1={tot / max(1, cnt):.5f} ({time.time() - t0:.0f}s)", flush=True)
 
     # 组装可被 --init 严格加载的 SegUNet state_dict：编码器来自 SSL，其余随机
-    seg = SegUNet(width=float(args.width))
+    seg = SegUNet(width=float(args.width), arch=str(args.arch))
     sd = seg.state_dict()
     enc = ae.state_dict()
     for k in list(sd.keys()):

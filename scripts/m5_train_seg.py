@@ -1134,6 +1134,9 @@ def main() -> None:
                          "use_deterministic_algorithms + CUBLAS workspace）："
                          "T14 要求『中断续训≈未中断』可验证；默认关闭，因为"
                          "它会让训练变慢，且部分算子没有确定性实现会直接报错")
+    ap.add_argument("--arch", choices=("plain", "strip"), default="plain",
+                    help="SegUNet 架构变体：plain=原版；strip=条带先验"
+                         "（非对称 1×k/k×1 卷积，细长结构感受野各向异性）")
     ap.add_argument("--width", type=float, default=1.0,
                     help="模型通道宽度倍数（容量对照用）：1.0 = 原版（与原"
                          "checkpoint 逐位一致），2.0 = 通道翻倍（参数约 4 倍）。"
@@ -1451,7 +1454,7 @@ def main() -> None:
     # --- init v1 谱系（T16 §3.3）：只加载权重（优化器从头）-----------------
     # 没给 --init 时也是显式记录：随机初始化本身就是完整谱系的根。
     init_block = random_init_block()
-    model = SegUNet(width=float(args.width)).to(device)
+    model = SegUNet(width=float(args.width), arch=str(args.arch)).to(device)
     if args.init:
         # 先做架构/谱系核对再加载：不一致就不该有任何权重被读进来
         init_ckpt = torch.load(args.init, map_location=device,
@@ -2052,7 +2055,8 @@ def main() -> None:
                 "run_weights": dict(run_weights),
                 # ---- 迭代深度学习的关键超参（复现/解释一轮训练必需）----
                 "arch": type(model).__name__,
-                "arch_args": {"width": float(getattr(model, "width", 1.0))},
+                "arch_args": {"width": float(getattr(model, "width", 1.0)),
+                                  "arch": str(getattr(model, "arch", "plain"))},
                 "input_size": [536, 403],
                 "n_params": int(sum(_p.numel() for _p in model.parameters())),
                 "scheduler": {
