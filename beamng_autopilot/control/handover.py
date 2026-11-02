@@ -210,7 +210,7 @@ def handover_vehicle(conn, saved_gearbox: str | None,
             conn.control(throttle=0.0, brake=0.0, steering=0.0,
                          parkingbrake=1.0)
             conn.step(3)
-        except Exception:
-            # NOTE: bare except kept — best-effort parking attempt
-            # during error recovery; nothing more we can do.
-            pass
+        except Exception as park_exc:              # noqa: BLE001
+            # 交接失败**并且**拉手刹也失败＝车还在动。这时至少必须留痕：
+            # 原来这里是 pass，事后完全看不出"车有没有被停住"。
+            logger.error("[handover] parking attempt also failed: %s", park_exc)
