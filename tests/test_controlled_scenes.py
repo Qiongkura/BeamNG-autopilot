@@ -912,3 +912,16 @@ def test_segunet_strip_arch_forward_and_segmenter_reads_arch():
     assert 'ap.add_argument("--arch"' in train_src
     ssl_src = (root / "scripts" / "m5_ssl_pretrain.py").read_text("utf-8")
     assert '--arch' in ssl_src and 'arch=str(args.arch)' in ssl_src
+
+
+def test_fsd_drive_tod_weather_wiring():
+    # 2026-11-02 条件矩阵接线：入口 --tod/--weather-preset 必须到会话层，
+    # 经 EnvironmentApi 应用并写入运行记录（失败也不静默）。
+    root = Path(__file__).resolve().parents[1]
+    entry = (root / "scripts" / "m5_fsd_drive.py").read_text("utf-8")
+    assert 'ap.add_argument("--tod"' in entry
+    assert 'ap.add_argument("--weather-preset"' in entry
+    sess = (root / "beamng_autopilot" / "fsd_drive.py").read_text("utf-8")
+    assert "conn.bng.env.set_tod(" in sess
+    assert "conn.bng.env.set_weather_preset(" in sess
+    assert '_run_record["environment"]' in sess
