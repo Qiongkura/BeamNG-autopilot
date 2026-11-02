@@ -1,4 +1,43 @@
-# 提交索引（2026-10-18 ～ 2026-11-02，160 个提交）
+# 提交索引（2026-10-18 ～ 2026-11-02）
+
+> **2026-11-02 历史重写说明**：161 个细粒度提交已按「日×模块」squash 为
+> 27 个单模块汇总提交（内容逐字节一致，`git diff` 为空）。
+> 细粒度历史经 annotated tag **`history/pre-squash-20261102`** 完整可达——
+> 文档里的旧哈希引用仍可 `git show <hash>` 查验。下表为 squash 后的新导航。
+
+## squash 后的 27 个汇总提交
+
+- `104b93c` 2026-11-02 — day-2026-10-18 docs: 汇总 20 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `af2cfa0` 2026-11-02 — day-2026-10-18 scripts: 汇总 12 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `c292b1c` 2026-11-02 — day-2026-10-18 tests: 汇总 5 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `fd8e62c` 2026-11-02 — day-2026-10-20 scripts: 汇总 19 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `7f4f37f` 2026-11-02 — day-2026-10-20 tests: 汇总 23 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `233a008` 2026-11-02 — day-2026-10-20 experiments: 汇总 2 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `fef5dec` 2026-11-02 — day-2026-10-20 docs: 汇总 14 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `1c860c4` 2026-11-02 — day-2026-10-20 README: 汇总 3 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `685a6d9` 2026-11-02 — day-2026-10-20 fsd_realism: 汇总 1 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `ea3329c` 2026-11-02 — day-2026-10-20 lane: 汇总 9 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `c659501` 2026-11-02 — day-2026-10-20 fsd_stack: 汇总 1 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `5470866` 2026-11-02 — day-2026-10-20 autopilot_root: 汇总 2 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `e45fdfa` 2026-11-02 — day-2026-10-20 planning: 汇总 1 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `9c13c1e` 2026-11-02 — day-2026-10-20 connector: 汇总 1 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `5cce826` 2026-11-02 — day-2026-10-20 fsd_drive: 汇总 1 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `81eda3f` 2026-11-02 — day-2026-10-20 control: 汇总 1 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `f2001c9` 2026-11-02 — day-2026-10-20 vision: 汇总 1 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `f53f586` 2026-11-02 — day-2026-10-29 scripts: 汇总 3 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `536eee8` 2026-11-02 — day-2026-10-29 docs: 汇总 3 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `4b132b6` 2026-11-02 — day-2026-10-29 tests: 汇总 1 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `9b3faa6` 2026-11-02 — day-2026-11-01 scripts: 汇总 1 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `a811bb9` 2026-11-02 — day-2026-11-01 docs: 汇总 2 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `3ad5b86` 2026-11-02 — day-2026-11-02 docs: 汇总 48 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `e1d6fad` 2026-11-02 — day-2026-11-02 scripts: 汇总 10 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `b87e5aa` 2026-11-02 — day-2026-11-02 tests: 汇总 6 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `e905d0a` 2026-11-02 — day-2026-11-02 vision: 汇总 1 个提交（squash，旧粒度见 history/pre-squash-20261102）
+- `9dfe609` 2026-11-02 — day-2026-11-02 fsd_drive: 汇总 1 个提交（squash，旧粒度见 history/pre-squash-20261102）
+
+---
+
+## 附录：squash 前的细粒度索引（哈希经 `history/pre-squash-20261102` 可达）
 
 本索引为**可读导航**：提交历史不重写（一模块一提交，文档哈希引用保持有效）。
 每日本节末给出当日最后一个提交（annotated tag `day-<日期>` 指向它）。
