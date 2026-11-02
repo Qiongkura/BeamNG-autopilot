@@ -148,7 +148,9 @@ def select_trajectory(scene, candidate_set, constraints, *,
     # Fresh tally per tick so the published reasons describe THIS tick.
     try:
         constraints.reject_counts = {}
-    except Exception:
+    except AttributeError:
+        # 只读实现（property 无 setter / slots）没有这个可写字段：保留旧计数即可，
+        # 下面的 getattr 会兜底。别的异常说明计数器实现坏了，应当冒出去。
         pass
     for cand in candidate_set.candidates:
         cost, ok = constraints.score(scene, cand)
@@ -222,6 +224,9 @@ def select_trajectory(scene, candidate_set, constraints, *,
             sp = speed_profile_for_path(best.path, scene, target_speed=target)
             best.speed_profile = sp
             meta["speed_profile"] = sp
-        except Exception:
-            pass
+        except Exception as exc:               # noqa: BLE001
+            # 纵向剖面是**可选增强**（没有它规划器仍按 target 走），所以这里
+            # 不能因为剖面算不出来就把整条轨迹丢掉。但也不能静默：把原因写进
+            # meta，让"这帧为什么没有剖面"能从运行记录回答。
+            meta["speed_profile_error"] = f"{type(exc).__name__}: {exc}"
     return best.path, meta
