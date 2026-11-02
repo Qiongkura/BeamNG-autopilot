@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 import subprocess
 import sys
 import time
@@ -72,29 +73,57 @@ class CollectSpec:
         return blob
 
 
+def _shell() -> str | None:
+    """PowerShell 7 优先，其次 Windows PowerShell；都没有返回 ``None``。"""
+    return shutil.which("pwsh") or shutil.which("powershell")
+
+
+def _process_table() -> dict | None:
+    """``{pid: 进程名}``；探测失败返回 ``None``（不确定 ≠ 没在跑）。
+
+    为什么不再用 ``tasklist``（2026-10-20 本机实测）：受限令牌下
+    ``tasklist`` 直接 ``ERROR: Access denied``（rc=1），于是"游戏是否在跑"
+    永远判成不确定，采集收尾的所有权证明永远给不出——**闸门是对的，工具
+    自己瘸了**。``Get-Process`` 走 .NET 进程枚举，不需要额外权限。
+    """
+    shell = _shell()
+    if not shell:
+        return None
+    try:
+        r = subprocess.run(
+            [shell, "-NoProfile", "-Command",
+             "Get-Process | ForEach-Object { $_.Id.ToString() + ',' + "
+             "$_.ProcessName }"],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=30)
+    except Exception:                            # noqa: BLE001
+        return None
+    if r.returncode != 0:
+        return None
+    table: dict = {}
+    for line in (r.stdout or "").splitlines():
+        pid_s, _, name = line.strip().partition(",")
+        if pid_s.isdigit() and name.strip():
+            table[int(pid_s)] = name.strip()
+    return table or None
+
+
+def _image_stems(images: tuple) -> set:
+    """``Get-Process`` 的 ``ProcessName`` 不带 ``.exe``；比较前统一去后缀。"""
+    return {str(img).lower().removesuffix(".exe") for img in images}
+
+
 def game_running_probe(images: tuple = GAME_IMAGES) -> bool | None:
     """游戏是否在运行：``True`` / ``False`` / ``None``（探测不确定）。
 
-    ``None`` 不是 ``False``：中文 Windows 的 ``tasklist`` 输出不是 UTF-8，
-    读取失败会让输出变空，把"输出为空"当成"没在跑"就会去踩正在驾驶的会话
-    （``controller._alive`` 上踩过同一个坑）。所以显式 ``errors="replace"``，
-    并且**只有**返回码 0 且能看清输出时才敢说 ``False``。
+    ``None`` 不是 ``False``：探测工具自己失败时（例如进程枚举被权限拒绝）
+    把"看不清"当成"没在跑"，就会去踩正在驾驶的会话。
     """
-    for img in images:
-        try:
-            out = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {img}",
-                                  "/NH"],
-                                 capture_output=True, text=True,
-                                 encoding="utf-8", errors="replace",
-                                 timeout=20)
-        except Exception:                        # noqa: BLE001
-            return None
-        if out.returncode != 0:
-            return None
-        stdout = (out.stdout or "")
-        if img.lower() in stdout.lower():
-            return True
-    return False
+    table = _process_table()
+    if table is None:
+        return None
+    wanted = _image_stems(images)
+    return any(str(name).lower() in wanted for name in table.values())
 
 
 def collector_python(root: str | Path, *, configured: str = "") -> tuple:
@@ -182,26 +211,13 @@ def _created_unix(ticks) -> float | None:
 
 
 def game_pids(images: tuple = GAME_IMAGES) -> set | None:
-    out: set = set()
-    for img in images:
-        try:
-            r = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {img}",
-                                "/NH"],
-                               capture_output=True, text=True,
-                               encoding="utf-8", errors="replace",
-                               timeout=20)
-        except Exception:                            # noqa: BLE001
-            return None
-        if r.returncode != 0:
-            return None
-        for line in (r.stdout or "").splitlines():
-            low = line.lower()
-            if img.lower() not in low:
-                continue
-            parts = line.split()
-            if len(parts) >= 2 and parts[1].isdigit():
-                out.add(int(parts[1]))
-    return out
+    """游戏进程 pid 集合；探测失败返回 ``None``（不猜、不乱杀）。"""
+    table = _process_table()
+    if table is None:
+        return None
+    wanted = _image_stems(images)
+    return {int(pid) for pid, name in table.items()
+            if str(name).lower() in wanted}
 
 
 def close_started_game(pids_before, *, images: tuple = GAME_IMAGES,

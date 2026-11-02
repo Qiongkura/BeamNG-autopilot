@@ -123,7 +123,9 @@ class MetricsStore:
                 continue
             try:
                 seq = max(seq, int(json.loads(line).get("seq") or 0))
-            except Exception:                # noqa: BLE001
+            except (ValueError, TypeError, AttributeError):
+                # 半截/非对象/字段不是数字：日志尾部扫描跳过这行是预期行为。
+                # 只吞这三类——别的异常说明日志格式或读取逻辑坏了。
                 continue
         return seq
 
@@ -297,7 +299,9 @@ def gpu_probe(devices: list | None = None) -> tuple[list, dict]:
             per_device.append(item)
         try:
             pynvml.nvmlShutdown()
-        except Exception:                    # noqa: BLE001
+        except pynvml.NVMLError:
+            # 收尾失败不影响已经读到的读数；只吞 NVML 自己的错误，
+            # 别的异常（例如模块被卸载）应当冒出去。
             pass
         return per_device, unavailable
     except Exception as exc:                 # noqa: BLE001
