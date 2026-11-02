@@ -7,7 +7,7 @@
 - T18 传感器回放正确性：首轮无效保留、同协议重试合格、48 次同源输出一致、CPU p95 对比完成；定向/全量测试通过。
 - E5 基线 3×3 资格入口：9/9 尝试，1 completed、8 unplaceable；生产放置偏差与 exposure qualification 均记录。
 - E5 扩展：先前 `production_alignment` 批次 2 qualified/2 exposure-invalid；随后用 `fixed_actual_pose` 契约重跑，Italy 更大偏移 4/4 在曝光前因 2.57–3.08m 漂移被拒（rc=4），mountain 第二路段 4/4 放置截止（rc=3）；结果见 `docs/T16_E5_EXTENSION_RESULT_20261011.md`。
-- 收尾后游戏进程为 0；纸面数字审计最新批次 129 项通过（2026-10-11 扩展，含 E5 起点A/B 回查；早先批次为 115 项）、图 QA 0、LaTeX 静态 0。
+- 收尾后游戏进程为 0；纸面数字审计最新批次 **261 项通过**（2026-10-18 扩展，含 ECA3 资格与配对；批次演进 115 → 129（10-11）→ 240 → 257 → 261）、图 QA 0、LaTeX 静态 0。审计计数目前只存在于提交信息与本文档，尚无落盘产物。
 
 ## 当前不能声称
 
@@ -70,3 +70,111 @@
 - utah 资格采集第一批（预注册 T16_LINE_MEASURED_UTAH_PREREG，2026-10-18）：annotation 可写性修复生效（5 站全写入线类像素 3434/799/2948/1350/5425，line_yellow_double@0.40m），但冻结导出门 **0/5 全隔离、0 帧**（目标 ≥2站/≥6帧未达成）——a0s0 left 实例 paint 0/85（annotation 写进、beauty 全程无漆的站点局部遮挡案例，RGB 均值 ~(106,98,74) 对 right 条纹色 (185,161,124)）、a1/a2 投影 2.70/1.66px 挂、a3 right coverage 0+14.35px、a4 right 0.5472+4.27px（逐帧 1.6→6.6px 随步进漂移，需原地 vs 步进对照定因）；首次启动挂起（游戏 t=4.85s 卡死、collector 阻塞 MapLoaded ack）杀进程同命令重试成功，attempt1 日志保留；不降门、无帧入池、模型未晋级。见 `T16_LINE_MEASURED_UTAH_RESULT_20261018.md`。
 - utah a0s0 left 线无漆定因完成（2026-10-18，纯离线已采集帧）：**无几何遮挡物**——世界系直线阴影边界浅斜穿过走廊、左线整段处于阴影，annotation 无光照直写调色板照常写线、beauty 同几何阴影渲染 0.56–0.66×（仅环境光，(106,98,74)=(185,161,124) 阴影化）；`paint_like` 绝对亮度判据对阴影不具照度不变性故 left 0/85。已排除覆盖贴花（footprint 逐行等宽）、近距遮挡物（depth 同）、ego 阴影/视角 mip（暗区世界系固定且随步进退去）、条纹材质差异（路面同倍率变暗、条纹亮暗随边界相对位置逐帧变化）。门不改、a0s0 维持隔离。见 `T16_UTAH_A0S0_OCCLUSION_ATTRIB_20261018.md`。
 - utah 投影残差两项定因完成（2026-10-18，纯离线已采集帧）：**a4s0 步进漂移**=我方两贴花渲染范围世界固定止于 stn≈15（链 4→33），stn 16–33 真值点为假残差、服务像素随步进由地图自有车道漆续线切换到中带/邻带（f0 0.3–6.9px → f1 8.9–12.2 → f2 15.7–17.9），left 全程 ~1px 自证；位姿链（2.00m/≤21mm/≤1°）、相机标定、链-贴花横移、埋地（表面 z−链 z ±0.12m）、mip 截断（截断站位不随步进平移）、阴影型写入失败均排除。**a3s0 14px**=右贴花对象级双 pass 全缺（annotation R=0 像素、beauty 土色 (151–163,113–124,93–103)），右链真值点全程量到左带 12–96px 假残差，pooled 14px≈(left ~1px+right ~27px)/2；paint 84/84 为松黄色判据在红土 (170,134,107, r−b=63≥60) 假阳性。projection 与 coverage 两门失败同根因，门未改、0 帧入池、模型未晋级。见 `T16_UTAH_PROJECTION_ATTRIB_20261018.md`。
+
+## 工程整改（2026-10-20，评审后的 P0）
+
+本轮没有跑 Tech、没有训练、没有改任何驾驶行为；只解掉两个**会挡住后续实测**的
+工程问题，并按模块分三个提交入库（`scripts` / `tests` / `experiments`）。
+
+1. **磁盘解封（资源门恢复）**。实测 I: 盘 free 16.14 GB < `min_free_disk_gb=20`
+   （`experiments/collection.py`），所有 Tech 采集会在前置检查被拒。
+   新增 `scripts/m5_logs_retention.py`（默认 dry-run、manifest 先落盘、路径越界
+   整批拒绝、只删 `.pt/.pth/.ckpt`）：保留 `seg_model*` 部署目录、`best*`、
+   含 `final_set_seal.json` 的封存子树、以及文档点名当 `--init`/交付候选/
+   确认集的三个目录（`t14_e1_promotable_20260927`、`t16_negdose6x_20261001`、
+   `t14_e0_20260925`）。实测 `--apply --min-free-gb 30` 删 3301 个 / 13.86 GB，
+   **free 16.14 → 30.07 GB**；受保护权重逐个复核仍在。9 项单测。
+2. **进程探测（`tasklist` 在本机被拒）**。实测 `tasklist` 返回
+   `ERROR: Access denied`（rc=1），导致：单实例锁断电恢复永不生效（`_alive`
+   把已退出进程判成活着）、采集前置检查永远"不确定"、采集收尾所有权证明永远
+   给不出（测试里的 `owned game cleanup unproven` 就是这个）。改用 PowerShell 7
+   的 `Get-Process`：`collection._process_table()` 一张表喂
+   `game_running_probe`/`game_pids`，`controller._alive` 用
+   `Get-Process -Id` 明确判定"已退出"，仅当连 PowerShell 都不可用时才退回
+   tasklist 的保守语义。实测 `_alive(self)=True`、子进程 terminate 后
+   `_alive=False`、`_process_table()` 枚举 365 个进程。
+3. **测试可复现性**。同一份代码：普通 PowerShell 下 `pytest tests/` 7 失败，
+   设 `PYTHONUTF8=1` 后 0 失败——根因是控制台代码页（子进程 GBK 打印 "↔" 直接
+   UnicodeEncodeError；父进程 `text=True` 按 GBK 解码）。`tests/conftest.py`
+   统一 UTF-8（环境变量 + Popen 文本模式默认编码）；同一缺陷还让
+   `scripts/check_commit_scope.py` 遇中文提交标题崩在 `.strip()`（**推送前
+   自查实际从未跑通**），四处 git 调用统一 `encoding="utf-8"` 并补 5 项链路测试。
+
+**实测门**：`pytest tests/` = **3448 passed / 0 failed**（510 s，含本轮新增 17 项）；
+`scripts/m5_offline_validate.py` = ALL PASS；`check_commit_scope.py --last 3` = OK。
+**未验证**：Tech 实机、GPU 训练、冻结评审门、PDF 重编译——本轮一项都没跑。
+
+## 论文补正与结构收敛（2026-10-20 续）
+
+**论文（docs/paper）**：四处只改表述、不改数字的修正 + 主张清单补录，
+依据全部来自 10-11～10-18 的新证据。
+
+1. **69 m 方向写反**：正文 V-C 与局限原写「道路链高于地形约 69 m」，实测
+   `mid.z`=144.678 对地面/相机 z≈213.6 → 链在**下方**。中英文源同改，四份
+   生成物（`main.tex`/`main_zh.tex`）重建，正文 PDF 重出（英文 20 页、中文
+   18 页，较原 19/17 各 +1）。
+2. **归因收缩**：原「三处修复后六批准入」→「地图名传播修复解除隔离；高程
+   不一致本身未消除（仅对齐重采仍隔离 3/3 站）」。
+3. **utah 段更新**：不再是「未探测地图」；五站 annotation 均可写（3,434/799/
+   2,948/1,350/5,425），0/5 原因为对象级贴花缺失 + 渲染范围止于 stn≈15 +
+   阴影敏感判据。
+4. **C5 谓词限定**：补实测——阴影中真漆 (106,98,74) 被同一判据剔除、干红土
+   r−b=63 被判作漆，故结论只能是「不满足*这个*谓词」。
+5. **CLAIMS 补录 C19–C39**（21 条，状态一律「未复算」），并加「C7 与 C19
+   不同轴」「C5 语义限定」两条口径；`submission/` 源包重建 + CLAIMS 同步。
+   新增 5 项结构性守卫（编号连续/六列/状态口径/副本逐字节一致/69 m 符号回归）。
+
+**结构收敛**：
+
+- **技术债棘轮**入库并进入 `dev_validate.ps1`：当前基线 = `except Exception`
+  **334** / 静默 **63** / `print` 163 / 最长函数 3430 行；总量只许减少，
+  `silent_except` 与单函数长度逐文件只许减少。读文件用 `utf-8-sig`（仓库里有
+  带 BOM 的源文件）。**已开始还债**（79 → 63）：`run_manifest` 收窄 5 处
+  （父链/进程表；坏掉的 psutil 现在会冒出去，不再让"第二控制器"证据悄悄失效）、
+  `planning/selector` 一处收窄 + 纵向剖面失败改写入 `meta["speed_profile_error"]`、
+  `connector` 只吞 `ImportError`、`experiments/metrics` 两处收窄；`fsd_drive` 8 处**安全相关**静默点收窄为 `(TypeError, ValueError, IndexError)`（越界最差值、逐帧 `line_lat`、车身越线计数、弯道速度帽），纯诊断/清理的 19 处不动。
+  **未动**的静默点（`fsd_drive` 27 处等）都在热路径里，需逐处读上下文，留待专轮。
+- **`select_lane_reference` 拆分**（四步纯搬移，零语义变更）：信任顺序的关键
+  判据逐块抽成可单测的模块级函数——`_lane_gate_verdict`（航向/转角/侧向三维门，
+  拒绝理由与阈值字面量不变）、`_sensor_lane_within_map`（一致性门，近场点不足
+  时返回 None 而非误判）、`_lane_width_from_map_edges`（最近点距离 + 合同宽度
+  兜底）、`_trusted_single_paint`（单边漆线在 strict 下的信任判据）。
+  主函数 **571 → 374 行**（−197，−35%），信任顺序的每一级都有独立可测函数：三维门、一致性门、边线宽度、单边漆线、铺装判据/几何、分隔线兜底、几何形状门、硬边界判据、meta 装配、BEV 整路中心、末道 fail-closed；新增 23 项单测，基线逐次收紧。**剩余未拆**：最终 `LaneReference` 构造（声明式，13 个字段）与 map-lane 构建，二者共享多个本地量，收益低于风险。
+- **`FSDStack.tick` 首切片**（2026-10-20 起）：位姿/地面（`_pose_and_ground`）
+  与参考发布（`_publish_lane_reference`）抽出，**1394 → 1378 行**；同时用 AST
+  打出 tick 的 60+ 条顶层语句骨架（行号 + 首行），后续切片按它定位，不必重读
+  1400 行。tick 的其余部分以长编排为主、共享局部量多，抽取收益低于 lane。- **文档索引**：`docs/INDEX.md` 224 篇，含预注册↔结果配对（82）与「无正文
+  入口（28）」小节——孤儿文档至少有一条可达路径；生成器带 `--check` 门禁。
+- **lane 去重**：`fusion.py` 复用 `tracking.py` 的 5 个逐字相同 helper。
+
+**门**：`pytest tests/` = **3480 passed / 0 failed**；深度离线 ALL PASS；
+`check_commit_scope` OK；`m5_paper_texcheck` 4/4 OK；`m5_paper_number_audit`
+261 项 OK；`m5_docs_index --check` OK。
+**未验证**：LaTeX 实际编译（本机无 TeX）、补充材料 PDF（源未改）、Tech 实机、
+GPU 训练。
+
+## 评审整改收口（2026-10-20）
+
+**P0 四项全部完成**（每项都有实测证据，见上文）：① 磁盘解封（free 16.14 → 30.07 GB，
+资源门恢复）；② pytest 在默认 shell 与 `PYTHONUTF8=1` 下都可复现（3448 → 3503 passed，
+0 failed）；③ README 验收口径 + 论文四处修正 + 主张清单补录；④ FSD 入口默认
+`sensor`+`strict`，旧地图参考需显式 `--allow-legacy-map-lane`
+且该轮结果不得用于验收。
+
+**P1 结构项完成的**：`select_lane_reference` **571 → 374 行**（11 个可测判据）、
+`FSDStack.tick` 首切片 1394 → 1378、技术债棘轮入库并进 `dev_validate`（静默异常
+**79 → 59**、`except Exception` **351 → 332**）、`docs/INDEX.md`（224 篇 / 28 无正文入口）、
+论文源包与 CLAIMS 同步、`lane/fusion` 去重。
+
+**刻意不做（有理由，不是遗漏）**：
+1. `FSDriveSession.run`（3430 行）**不拆**——它是顺序编排，60+ 语句共享十几个局部量，
+   抽纯函数要传 10+ 参数、返回 5+ 值；无人值守下改错的风险高于可读性收益。
+2. `FSDStack.tick` 不再继续硬拆，同样原因（已在上一节记录）。
+3. `fsd_drive` 剩余 19 处静默点**保留**：despawn / watchdog 心跳 / e2e reset /
+   stack.close 等纯诊断与清理路径，吞掉不会让安全读数变松。
+4. `autopilot.py` 的 18 处（legacy 规则栈）不动：按 AGENTS 它只是兼容兜底。
+
+**待你决定**：C11「四次运行未观察到压线」的口径（10-11 后另有 5 次合格运行，
+压线帧计数 UNKNOWN）、Zenodo/ORCID/目标期刊、以及**分支 ahead 84 未推送**。
+
+

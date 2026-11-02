@@ -4,8 +4,8 @@
 
 | 文件 | 说明 |
 |---|---|
-| `T16_paper.pdf` | 英文版成品（**19 页**，双栏 IEEE 式；正文 **7 张满栏单图**，图内文字按原尺寸可读） |
-| `T16_paper_zh.pdf` | 中文版成品（**17 页**，图内文字中文） |
+| `T16_paper.pdf` | 英文版成品（**20 页**，双栏 IEEE 式；正文 **7 张满栏单图**，图内文字按原尺寸可读） |
+| `T16_paper_zh.pdf` | 中文版成品（**18 页**，图内文字中文） |
 | `T16_supplement.pdf` | 补充材料（**21 页**，42 张满栏图：S1–S16 补充图 + S17–S42 历史排版的独立诊断／示意图） |
 | `T16_supplement_zh.pdf` | 补充材料中文版（**22 页**） |
 | `submission/` | **投稿源包**：四份 `.tex` + `figures/` + `figures_zh/` + `references.bib` + README（**未编译**：本机无 LaTeX 引擎） |
@@ -44,10 +44,14 @@
 .venv\Scripts\python.exe scripts\m5_figures_i18n.py
 
 # 1) 四个 Markdown 源 -> LaTeX + HTML
-.venv\Scripts\python.exe docs\paper\build_paper.py --figs-src logs\paper_composites
+#    注意 --figs-src 是 nargs="+"：正文同时引用基础图（fig1..fig30，在
+#    logs\paper_figures）与组合图（figc1..figc7，在 logs\paper_composites），
+#    只给组合图目录会报 missing figure: fig30_counting_contract.png。
+.venv\Scripts\python.exe docs\paper\build_paper.py --figs-src logs\paper_figures logs\paper_composites
 .venv\Scripts\python.exe docs\paper\build_paper.py --md docs\paper\paper_zh.md `
     --tex docs\paper\main_zh.tex --html logs\paper_build\paper_zh.html --lang zh `
-    --figs logs\paper_build\figures_zh --img-dir figures_zh --figs-src logs\paper_composites_zh
+    --figs logs\paper_build\figures_zh --img-dir figures_zh `
+    --figs-src logs\paper_figures_zh logs\paper_composites_zh
 .venv\Scripts\python.exe docs\paper\build_paper.py --md docs\paper\supplement.md `
     --tex docs\paper\supplement.tex --html logs\paper_build\supplement.html --fig-prefix S `
     --figs-src logs\paper_figures --wide-all
@@ -106,3 +110,16 @@ pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/m5_paper_export.ps1 -Inclu
 fig21 固定六次 R3 短训练，fig22 固定 32 对历史运行输入，清单为 `figure_inputs_20261009.json`。前者不证明收敛或模型晋级，后者不追认驾驶资格。正文表格修复英文长文件名换行；图内中文翻译补齐整图图例，补充材料撤回“可用率失败所以安全通过”等过度结论。最新页数对应 2026-10-09 重新导出的四份 PDF；本地修改尚未提交／发布。
 
 本次限定证据包为 `logs/paper_release/T16_evidence_20261009_195827.zip`：930 个输入文件，缺项与摘要违规均 0，逐成员字节核验通过；不包含模型与原始训练帧，不代表公开完整复现。最终测试、源码身份、PDF 摘要及八项测量审计见 `../T16_DEVELOPMENT_RESULT_20261009.md`。
+
+## 2026-10-20 补正（正文与主张清单）
+
+四处只改表述、不改数字的修正，依据均为 10-11～10-18 的新证据（详见 `CLAIMS_20261007.md`
+第四节末尾）：① 「道路链高于地形约 69 m」方向写反（实测链在地面下方，`mid.z` 144.7 对
+213.6），中英文源同改；② 「三处修复后六批准入」收缩为「地图名传播修复解除隔离，高程
+不一致本身未消除」；③ utah 不再是「未探测地图」：五站 annotation 均可写，0/5 定因为
+对象级贴花缺失 + 渲染范围止于 stn≈15 + 阴影敏感判据；④ 外观谓词补「对光照/材质不具
+不变性」的实测限定。
+
+同时补录 `CLAIMS` C19–C39（21 条，状态一律「未复算」）、重建投稿源包（`main.tex`
+87,736→95,283 B）、正文 PDF 重出（英文 **20 页**、中文 **18 页**，较原各 +1 页）。
+`T16_supplement*.pdf` 本次**未重出**（补充材料源未改）。LaTeX 实际编译仍未验证。
