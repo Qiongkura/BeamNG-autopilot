@@ -36,24 +36,33 @@ from beamng_autopilot.vision.segmentation import SegUNet  # noqa: E402
 
 
 class _AutoEncoder(nn.Module):
-    """SegUNet 编码器 + 轻量转置卷积解码器（只训练编码器部分有用）。"""
+    """SegUNet 编码器 + 轻量转置卷积解码器（只训练编码器部分有用）。
 
-    def __init__(self):
+    ``width`` 必须与后续微调模型的容量一致（checkpoint 的编码器键要与
+    SegUNet(width) 严格对齐）。通道宽度按 SegUNet 的取整规则推导
+    （max(8, round(base*width))）。
+    """
+
+    def __init__(self, width: float = 1.0):
         super().__init__()
-        seg = SegUNet(width=1.0)
+        seg = SegUNet(width=float(width))
+        c32 = max(8, int(round(32 * float(width))))
+        c64 = max(8, int(round(64 * float(width))))
+        c128 = max(8, int(round(128 * float(width))))
+        c16 = max(8, int(round(16 * float(width))))
         self.e1 = seg.e1
         self.e2 = seg.e2
         self.e3 = seg.e3
         self.mid = seg.mid
         self.pool = seg.pool
-        self.u2 = nn.ConvTranspose2d(128, 64, 2, stride=2)
-        self.d2 = nn.Sequential(nn.Conv2d(64, 64, 3, padding=1),
-                                nn.BatchNorm2d(64), nn.ReLU(inplace=True))
-        self.u1 = nn.ConvTranspose2d(64, 32, 2, stride=2)
-        self.d1 = nn.Sequential(nn.Conv2d(32, 32, 3, padding=1),
-                                nn.BatchNorm2d(32), nn.ReLU(inplace=True))
-        self.u0 = nn.ConvTranspose2d(32, 16, 2, stride=2)
-        self.d0 = nn.Sequential(nn.Conv2d(16, 3, 3, padding=1),
+        self.u2 = nn.ConvTranspose2d(c128, c64, 2, stride=2)
+        self.d2 = nn.Sequential(nn.Conv2d(c64, c64, 3, padding=1),
+                                nn.BatchNorm2d(c64), nn.ReLU(inplace=True))
+        self.u1 = nn.ConvTranspose2d(c64, c32, 2, stride=2)
+        self.d1 = nn.Sequential(nn.Conv2d(c32, c32, 3, padding=1),
+                                nn.BatchNorm2d(c32), nn.ReLU(inplace=True))
+        self.u0 = nn.ConvTranspose2d(c32, c16, 2, stride=2)
+        self.d0 = nn.Sequential(nn.Conv2d(c16, 3, 3, padding=1),
                                 nn.ReLU(inplace=True))
 
     def encode(self, x):
@@ -110,6 +119,8 @@ def main() -> int:
                     help="SSL 自身随机种子（重复复核时换种子）")
     ap.add_argument("--noise", type=float, default=0.05,
                     help="去噪输入噪声标准差（扫描臂）")
+    ap.add_argument("--width", type=float, default=1.0,
+                    help="编码器容量宽度（需与后续微调的 --width 一致）")
     args = ap.parse_args()
     torch.manual_seed(int(args.seed))
 
@@ -120,7 +131,7 @@ def main() -> int:
     n = x.shape[0]
     print(f"[ssl] frames={n} device={dev} epochs={args.epochs}", flush=True)
 
-    ae = _AutoEncoder().to(dev)
+    ae = _AutoEncoder(width=float(args.width)).to(dev)
     opt = torch.optim.Adam(ae.parameters(), lr=args.lr)
     g = torch.Generator().manual_seed(int(args.seed))
     t0 = time.time()
@@ -143,7 +154,7 @@ def main() -> int:
         print(f"[ssl] ep {ep} L1={tot / max(1, cnt):.5f} ({time.time() - t0:.0f}s)", flush=True)
 
     # 组装可被 --init 严格加载的 SegUNet state_dict：编码器来自 SSL，其余随机
-    seg = SegUNet(width=1.0)
+    seg = SegUNet(width=float(args.width))
     sd = seg.state_dict()
     enc = ae.state_dict()
     for k in list(sd.keys()):

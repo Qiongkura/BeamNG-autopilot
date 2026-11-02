@@ -865,3 +865,15 @@ def test_aug_scale_jitter_preserves_shape_and_label_domain():
     c_off, l_off = m._augment((colour, label), np.random.default_rng(7),
                               scale_jitter=0.0)[:2]
     assert c_off.shape == colour.shape and l_off.shape == label.shape
+
+
+def test_ssl_pretrain_width_threads_into_encoder_keys():
+    # 2026-11-02 容量臂：SSL 预训练必须支持 --width 且编码器键与
+    # SegUNet(width) 严格一致（否则 --init 加载会 size mismatch）。
+    src = (Path(__file__).resolve().parents[1] / "scripts"
+           / "m5_ssl_pretrain.py").read_text("utf-8")
+    assert '_AutoEncoder(width=float(args.width))' in src
+    assert 'SegUNet(width=float(args.width))' in src
+    assert 'ap.add_argument("--width"' in src
+    # 通道数按 SegUNet 取整规则推导
+    assert 'max(8, int(round(128 * float(width))))' in src
