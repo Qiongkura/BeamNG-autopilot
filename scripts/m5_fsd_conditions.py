@@ -263,8 +263,31 @@ def aggregate(rows: list[dict]) -> dict:
     return table
 
 
+def expected_cells(manifest: dict | None) -> list[tuple[str, int]]:
+    """从 batch_manifest 播种期望格（cell, repeat）。
+
+    放置失败的格只有 session 审计没有遥测文件——如果只按遥测 glob 聚合，
+    这些格会从表里静默消失（违反不丢证据）。以预注册的 manifest 为准。
+    """
+    out: list[tuple[str, int]] = []
+    for c in (manifest or {}).get("cells", []):
+        try:
+            out.append((str(c["cell"]), int(c["repeat"])))
+        except (KeyError, TypeError, ValueError):
+            continue
+    return out
+
+
 def score_dir(out_dir: Path) -> int:
+    manifest = None
+    mf = out_dir / "batch_manifest.json"
+    if mf.exists():
+        try:
+            manifest = json.loads(mf.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            manifest = None
     rows: list[dict] = []
+    seen: set[str] = set()
     for path in sorted(out_dir.glob("*.json")):
         name = path.name
         if name.endswith(".session.json") or name.endswith(".vis_index.json") \
@@ -287,9 +310,30 @@ def score_dir(out_dir: Path) -> int:
         row = {"file": name, "cell": cell or stem, "repeat": rep,
                **score_one(hist, session)}
         rows.append(row)
+        seen.add(name)
         print(f"[score] {name}: status={row['status']} "
               f"sensor={row['lane_sensor_rate']} placed={row['placed']} "
               f"env={row['env_applied']}", flush=True)
+    # 放置失败/缺文件的格：session 审计存在 -> 用空遥测补 UNKNOWN 行；
+    # 连 session 都没有 -> 也补一行 missing（表里绝不静默缺格）。
+    for cell, rep in expected_cells(manifest):
+        stem = f"{cell}_r{rep}"
+        if f"{stem}.json" in seen:
+            continue
+        session_p = out_dir / f"{stem}.json.session.json"
+        session = None
+        note = "missing_session"
+        if session_p.exists():
+            try:
+                session = json.loads(session_p.read_text(encoding="utf-8"))
+                note = "no_telemetry_placement_failure"
+            except (OSError, ValueError):
+                session = None
+        row = {"file": f"{stem}.json", "cell": cell, "repeat": str(rep),
+               "note": note, **score_one([], session)}
+        rows.append(row)
+        print(f"[score] {stem}: status={row['status']} ({note}) "
+              f"placement_rc={row['placement_rc']}", flush=True)
     table = aggregate(rows)
     result = {
         "schema": "fsd-conditions-table-v1",

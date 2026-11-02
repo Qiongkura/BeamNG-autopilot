@@ -1079,3 +1079,23 @@ def test_fsd_conditions_aggregate_failclosed():
     table = mod.aggregate([row("dusk_fog", "PASS"),
                            row("dusk_fog", "FAIL")])
     assert table["dusk_fog"]["status"] == "FAIL"
+
+
+def test_fsd_conditions_expected_cells_from_manifest():
+    mod = _load_conditions()
+    cells = mod.plan_cells("rainy", "foggy_morning")
+    manifest = {"cells": cells}
+    exp = mod.expected_cells(manifest)
+    assert len(exp) == 20
+    assert ("night_fog", 1) in exp and ("noon_clear", 0) in exp
+    # 损坏的 manifest 条目跳过，不崩
+    assert mod.expected_cells({"cells": [{"cell": "x"}, {}, None]}) == []
+    assert mod.expected_cells(None) == []
+    # score_one 对「无遥测」的格给 UNKNOWN（fail-closed），且带 env 证据
+    from beamng_autopilot.eval import STATUS_UNKNOWN
+    r = mod.score_one([], {"placed": False, "placement_rc": 3,
+                           "environment": {"applied": True,
+                                           "tod_after": "06:29:59"},
+                           "config": {"tod": "06:30"}})
+    assert r["status"] == STATUS_UNKNOWN
+    assert r["frames"] == 0 and r["placement_rc"] == 3
