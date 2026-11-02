@@ -872,8 +872,43 @@ def test_ssl_pretrain_width_threads_into_encoder_keys():
     # SegUNet(width) 严格一致（否则 --init 加载会 size mismatch）。
     src = (Path(__file__).resolve().parents[1] / "scripts"
            / "m5_ssl_pretrain.py").read_text("utf-8")
-    assert '_AutoEncoder(width=float(args.width))' in src
-    assert 'SegUNet(width=float(args.width))' in src
+    assert '_AutoEncoder(width=float(args.width), arch=str(args.arch))' in src
+    assert 'SegUNet(width=float(args.width), arch=str(args.arch))' in src
     assert 'ap.add_argument("--width"' in src
     # 通道数按 SegUNet 取整规则推导
     assert 'max(8, int(round(128 * float(width))))' in src
+
+
+def test_segunet_strip_arch_forward_and_segmenter_reads_arch():
+    # 2026-11-02 条带架构臂：strip 变体前向形状正确、参数键与 plain 不同、
+    # Segmenter 必须从 checkpoint 的 arch_args.arch 建模型（否则 size mismatch）。
+    import importlib.util
+    import sys as _sys
+    import numpy as np
+    import torch
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "seg_mod_arch", root / "beamng_autopilot" / "vision" / "segmentation.py")
+    m = importlib.util.module_from_spec(spec)
+    _sys.modules["seg_mod_arch"] = m
+    spec.loader.exec_module(m)
+
+    x = torch.zeros(2, 3, 32, 48)
+    plain = m.SegUNet(width=1.0, arch="plain")
+    strip = m.SegUNet(width=1.0, arch="strip")
+    assert plain(x).shape == (2, m.N_CLASSES, 32, 48)
+    assert strip(x).shape == (2, m.N_CLASSES, 32, 48)
+    assert set(plain.state_dict()) != set(strip.state_dict())
+    # strip 块含 1×5 与 5×1 非对称核
+    shapes = {tuple(v.shape[-2:]) for k, v in strip.state_dict().items()
+              if k.startswith("e1.") and v.dim() == 4}
+    assert (1, 5) in shapes and (5, 1) in shapes
+    # 架构字段从 checkpoint 读出（源码断言：Segmenter 用 arch_args.arch 建模型）
+    src = (root / "beamng_autopilot" / "vision" / "segmentation.py").read_text("utf-8")
+    assert 'self.arch = str(arch_args.get("arch") or "plain")' in src
+    train_src = (root / "scripts" / "m5_train_seg.py").read_text("utf-8")
+    assert '"arch": str(getattr(model, "arch", "plain"))' in train_src
+    assert 'ap.add_argument("--arch"' in train_src
+    ssl_src = (root / "scripts" / "m5_ssl_pretrain.py").read_text("utf-8")
+    assert '--arch' in ssl_src and 'arch=str(args.arch)' in ssl_src
