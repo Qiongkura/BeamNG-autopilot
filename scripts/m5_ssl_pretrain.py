@@ -100,6 +100,8 @@ def main() -> int:
     ap.add_argument("--device", default=None)
     ap.add_argument("--seed", type=int, default=0,
                     help="SSL 自身随机种子（重复复核时换种子）")
+    ap.add_argument("--noise", type=float, default=0.05,
+                    help="去噪输入噪声标准差（扫描臂）")
     args = ap.parse_args()
     torch.manual_seed(int(args.seed))
 
@@ -120,7 +122,7 @@ def main() -> int:
             idx = perm[i:i + args.batch]
             xb = x[idx].to(dev)
             # 去噪：输入加噪声，目标原图
-            xb_noisy = (xb + 0.05 * torch.randn_like(xb)).clamp(0, 1)
+            xb_noisy = (xb + float(args.noise) * torch.randn_like(xb)).clamp(0, 1)
             rec = ae(xb_noisy)
             loss = F.l1_loss(rec, xb)
             opt.zero_grad()
