@@ -859,7 +859,7 @@ def _write_train_hist(out_dir, hist: dict) -> None:
 
 
 def _augment(frame, rng: np.random.Generator,
-            line_morph: bool = False):
+            line_morph: bool = False, scale_jitter: float = 0.0):
     """在线数据增强（colour/label 同步变换），提升路段泛化。
 
     关键：色相/饱和度扰动 + 模糊，逼模型学"标线结构"而不是记住
@@ -898,6 +898,32 @@ def _augment(frame, rng: np.random.Generator,
     if rng.random() < 0.35:                     # 模糊（模拟行驶运动模糊）
         k = int(rng.integers(3, 8)) | 1
         colour = cv2.GaussianBlur(colour, (k, k), 0)
+    if scale_jitter > 0 and rng.random() < 0.5:
+        # 多尺度抖动（2026-11-02 代码臂）：模拟相机高度/焦距与目标距离差异。
+        # colour 线性缩放、label 最近邻（类号不变），再随机裁剪或边缘复制
+        # 补齐回原尺寸（不引入 255 ignore 语义，label 值域保持 0/1/2）。
+        s = 1.0 + float(rng.uniform(-scale_jitter, scale_jitter))
+        oh, ow = colour.shape[:2]
+        nh = max(16, int(round(oh * s)))
+        nw = max(16, int(round(ow * s)))
+        colour = cv2.resize(colour, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        label = cv2.resize(label, (nw, nh), interpolation=cv2.INTER_NEAREST)
+        if nh >= oh:
+            y0 = int(rng.integers(0, nh - oh + 1))
+            colour, label = colour[y0:y0 + oh], label[y0:y0 + oh]
+        else:
+            py_t = (oh - nh) // 2
+            pad = (py_t, oh - nh - py_t)
+            colour = np.pad(colour, (pad, (0, 0), (0, 0)), mode="edge")
+            label = np.pad(label, (pad,), mode="edge")
+        if nw >= ow:
+            x0 = int(rng.integers(0, nw - ow + 1))
+            colour, label = colour[:, x0:x0 + ow], label[:, x0:x0 + ow]
+        else:
+            px_t = (ow - nw) // 2
+            pad = (px_t, ow - nw - px_t)
+            colour = np.pad(colour, ((0, 0), pad, (0, 0)), mode="edge")
+            label = np.pad(label, ((0, 0), pad), mode="edge")
     if rng.random() < 0.7:                      # 随机裁剪后缩放回原尺寸
         h, w = colour.shape[:2]
         ch, cw = int(h * 0.85), int(w * 0.85)
@@ -1053,6 +1079,9 @@ def main() -> None:
                     help="best_task.pt 的准入门槛：成对率再高，若该轮的 in-lane "
                          "低于 F 也不选（可用率与横向正确性在 epoch 间互相交换，"
                          "只按成对率会选中「配对多但中心错」的权重，默认 0.20）")
+    ap.add_argument("--aug-scale", type=float, default=0.0, metavar="S",
+                    help="多尺度抖动幅度（0.15=±15%% 缩放；0 关闭，默认）。"
+                         "colour 线性/label 最近邻，随机裁或边缘复制回原尺寸")
     ap.add_argument("--line-morph", action="store_true",
                     help="enable line morphology augmentation (default "
                          "off: v7 ablation showed it hurts line IoU)")
@@ -1105,6 +1134,9 @@ def main() -> None:
                          "use_deterministic_algorithms + CUBLAS workspace）："
                          "T14 要求『中断续训≈未中断』可验证；默认关闭，因为"
                          "它会让训练变慢，且部分算子没有确定性实现会直接报错")
+    ap.add_argument("--arch", choices=("plain", "strip"), default="plain",
+                    help="SegUNet 架构变体：plain=原版；strip=条带先验"
+                         "（非对称 1×k/k×1 卷积，细长结构感受野各向异性）")
     ap.add_argument("--width", type=float, default=1.0,
                     help="模型通道宽度倍数（容量对照用）：1.0 = 原版（与原"
                          "checkpoint 逐位一致），2.0 = 通道翻倍（参数约 4 倍）。"
@@ -1318,9 +1350,12 @@ def main() -> None:
     # 弱线增补（--weak-line-oversample）追加的重复帧：按内容身份自然继承来源
     # （见 build_sampler_pool），这里不再单独记录位置
     if args.weak_line_oversample > 0 and train_frames:
+        # 帧元组可能是 2 元（colour,label）或 3 元（+annotation_raw）——
+        # 按索引取 label，不做定长解包（2026-11-02 实测 3 元帧在
+        # --weak-line-oversample 下 ValueError: too many values to unpack）。
         _refs = [FrameRef(index=i, run="", t=float(i),
-                          line_frac=float((lb == 2).mean()))
-                 for i, (_img, lb) in enumerate(train_frames)]
+                          line_frac=float((frame[1] == 2).mean()))
+                 for i, frame in enumerate(train_frames)]
         _weak = select_weak_lines(_refs, low=args.weak_line_low,
                                   high=args.weak_line_high)
         if _weak:
@@ -1419,7 +1454,7 @@ def main() -> None:
     # --- init v1 谱系（T16 §3.3）：只加载权重（优化器从头）-----------------
     # 没给 --init 时也是显式记录：随机初始化本身就是完整谱系的根。
     init_block = random_init_block()
-    model = SegUNet(width=float(args.width)).to(device)
+    model = SegUNet(width=float(args.width), arch=str(args.arch)).to(device)
     if args.init:
         # 先做架构/谱系核对再加载：不一致就不该有任何权重被读进来
         init_ckpt = torch.load(args.init, map_location=device,
@@ -1579,7 +1614,8 @@ def main() -> None:
                         [int(args.seed), 0x5EED, int(step_base) + steps])
                 else:
                     _arng = rng
-                batch = [_augment(f, _arng, line_morph=args.line_morph)
+                batch = [_augment(f, _arng, line_morph=args.line_morph,
+                                    scale_jitter=float(args.aug_scale))
                          for f in batch]
             xs = torch.stack([to_tensor(f, device)[0] for f in batch])
             ys = torch.stack([to_tensor(f, device)[1] for f in batch])
@@ -2019,7 +2055,8 @@ def main() -> None:
                 "run_weights": dict(run_weights),
                 # ---- 迭代深度学习的关键超参（复现/解释一轮训练必需）----
                 "arch": type(model).__name__,
-                "arch_args": {"width": float(getattr(model, "width", 1.0))},
+                "arch_args": {"width": float(getattr(model, "width", 1.0)),
+                                  "arch": str(getattr(model, "arch", "plain"))},
                 "input_size": [536, 403],
                 "n_params": int(sum(_p.numel() for _p in model.parameters())),
                 "scheduler": {
