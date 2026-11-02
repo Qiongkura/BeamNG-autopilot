@@ -2377,6 +2377,13 @@ class FSDriveSession:
                     # "调用没抛异常"）。
                     if _wx:
                         conn.bng.env.set_weather_preset(_wx)
+                        if _tod_s:
+                            # 预设过渡是动画（set_weather_preset 的 time 秒内
+                            # 逐帧插值回写）：立即设 TOD 会被动画下一帧覆盖
+                            # （2026-11-02/03 矩阵实测：dawn_rain 请求 06:30、
+                            # 读回 09:56——rainy 预设的插值中间值）。等过渡
+                            # 结束再设显式时刻；读回仍留作最终存证。
+                            time.sleep(2.0)
                     if _tod_s:
                         _parts = _tod_s.split(":")
                         _hms = (f"{int(_parts[0]):02d}:"

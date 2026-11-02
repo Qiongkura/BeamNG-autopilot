@@ -931,6 +931,11 @@ def test_fsd_drive_tod_weather_wiring():
     wx_i = sess.index("conn.bng.env.set_weather_preset(")
     tod_i = sess.index("conn.bng.env.set_tod(")
     assert wx_i < tod_i, "必须先应用天气预设再设显式 TOD"
+    # 预设过渡是动画（time 秒内逐帧插值回写）：立刻设 TOD 会被动画下一帧
+    # 覆盖（矩阵 dawn_rain 实测请求 06:30 读回 09:56）。两者同时请求时必须
+    # 等过渡结束再设时刻；get_tod 读回仍留作最终存证。
+    assert "time.sleep(" in sess[wx_i:tod_i], \
+        "天气->时刻之间必须等待过渡动画结束"
     assert '"order": "weather_then_tod"' in sess
     assert '"tod_after"' in sess and "get_tod()" in sess
     # 环境应用失败必须不静默且不崩溃：捕获要放宽到 Exception（预设名不
