@@ -659,7 +659,10 @@ def test_build_scenario_uses_requested_map_not_italy_default():
     src = (Path(__file__).resolve().parents[1] / "scripts"
            / "m5_controlled_scenes.py").read_text("utf-8")
     assert 'Scenario(str(map_name), "m5_controlled_scenes")' in src
-    assert 'build_scenario(conn, sites, map_name=str(args.map)' in src
+    # 2026-11-02 起每站 Scenario：参数表单从 (conn, sites, ...) 变为
+    # (conn, [site], ...)，但地图仍必须显式穿传 args.map（不得回落 italy）。
+    assert "map_name=str(args.map)" in src
+    assert "build_scenario(" in src
 
 
 def test_west_coast_rechecks_ground_after_scenario_load_and_can_reload():
@@ -667,7 +670,8 @@ def test_west_coast_rechecks_ground_after_scenario_load_and_can_reload():
            / "m5_controlled_scenes.py").read_text("utf-8")
     assert "sites_after_ground_alignment_reload" in src
     assert "post_load_ground_recheck" in src
-    assert "conn.bng.scenario.load(scen)" in src
+    # 每站 Scenario 重载的变量名是 scen_k（重检下沉到每站循环后）。
+    assert "conn.bng.scenario.load(scen_k)" in src
 
 
 def test_east_coast_profile_uses_annotation_writable_material_and_width():
@@ -803,13 +807,121 @@ def test_utah_line_material_choice_matches_map_alpha_admission():
         assert (stage.get("opacityFactor") or 1.0) < 1.0
 
 
-def test_per_site_scenario_mode_excludes_ground_align_maps():
+def test_per_site_scenario_mode_covers_all_maps_after_east_migration():
     m = _load()
     # 2026-10-29 utah 探针判决：单 Scenario 10 条贴花路会让后创建的路渲染
     # 截断（idx9 的 22-34m bin annotation 全灭）；单站 2 路全跨渲染。
-    # 非 GROUND_ALIGN_MAPS 地图改每站一个 Scenario；GROUND_ALIGN_MAPS
-    # （加载后 ground 重检依赖全量 Scenario）保持原流程。
-    assert m.per_site_scenario_mode("utah") is True
-    assert m.per_site_scenario_mode("italy") is True
-    assert m.per_site_scenario_mode("west_coast_usa") is False
-    assert m.per_site_scenario_mode("east_coast_usa") is False
+    # 2026-11-02 起全图统一每站 Scenario（east 的 a2 right 0.4216 同签名），
+    # GROUND_ALIGN_MAPS 的加载后 ground 重检下沉到每站循环。
+    for name in ("utah", "italy", "west_coast_usa", "east_coast_usa"):
+        assert m.per_site_scenario_mode(name) is True
+    src = Path(m.__file__).read_text(encoding="utf-8")
+    assert "post_load_ground_recheck" in src
+    assert "sites_after_ground_alignment_reload" in src
+
+
+def test_weak_line_oversample_unpacks_frame_by_index():
+    # 2026-11-02 实测：3 元帧（colour,label,annotation_raw）在
+    # --weak-line-oversample 下触发 "too many values to unpack"（定长解包）。
+    # 修复=按索引取 label（frame[1]），2/3 元帧都要能跑。
+    src = (Path(__file__).resolve().parents[1] / "scripts"
+           / "m5_train_seg.py").read_text("utf-8")
+    assert "for i, (_img, lb) in enumerate(train_frames)" not in src
+    assert "for i, frame in enumerate(train_frames)" in src
+
+
+def test_aug_scale_jitter_preserves_shape_and_label_domain():
+    # 2026-11-02 多尺度增广代码臂（--aug-scale）：colour 线性/label 最近邻缩放，
+    # 随机裁或边缘复制回原尺寸；label 值域必须保持 {0,1,2}（不能引入 255），
+    # 形状、dtype 与三通道透传都必须稳定。
+    import importlib.util
+    import numpy as np
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_train_seg_aug", root / "scripts" / "m5_train_seg.py")
+    m = importlib.util.module_from_spec(spec)
+    import sys as _sys
+    _sys.modules["m5_train_seg_aug"] = m
+    spec.loader.exec_module(m)
+
+    rng = np.random.default_rng(0)
+    colour = rng.integers(0, 256, size=(32, 48, 3), dtype=np.uint8)
+    label = np.zeros((32, 48), np.uint8)
+    label[14:18, :] = 2          # 一条水平线
+    label[18:, :] = 1            # 下半路面
+    annot = np.zeros((32, 48, 3), np.uint8)
+
+    for _ in range(20):
+        c2, l2, a2 = m._augment((colour, label, annot),
+                                np.random.default_rng(1), scale_jitter=0.3)
+        assert c2.shape == colour.shape and c2.dtype == np.uint8
+        assert l2.shape == label.shape and l2.dtype == np.uint8
+        assert set(np.unique(l2)).issubset({0, 1, 2})
+        assert a2 is annot
+
+    # 抖动确实改变内容（与关闭时相比）；关闭时保持原样（rng=0 仍会走其它增广，
+    # 但 scale_jitter=0 不得进入缩放分支）。
+    c_off, l_off = m._augment((colour, label), np.random.default_rng(7),
+                              scale_jitter=0.0)[:2]
+    assert c_off.shape == colour.shape and l_off.shape == label.shape
+
+
+def test_ssl_pretrain_width_threads_into_encoder_keys():
+    # 2026-11-02 容量臂：SSL 预训练必须支持 --width 且编码器键与
+    # SegUNet(width) 严格一致（否则 --init 加载会 size mismatch）。
+    src = (Path(__file__).resolve().parents[1] / "scripts"
+           / "m5_ssl_pretrain.py").read_text("utf-8")
+    assert '_AutoEncoder(width=float(args.width), arch=str(args.arch))' in src
+    assert 'SegUNet(width=float(args.width), arch=str(args.arch))' in src
+    assert 'ap.add_argument("--width"' in src
+    # 通道数按 SegUNet 取整规则推导
+    assert 'max(8, int(round(128 * float(width))))' in src
+
+
+def test_segunet_strip_arch_forward_and_segmenter_reads_arch():
+    # 2026-11-02 条带架构臂：strip 变体前向形状正确、参数键与 plain 不同、
+    # Segmenter 必须从 checkpoint 的 arch_args.arch 建模型（否则 size mismatch）。
+    import importlib.util
+    import sys as _sys
+    import numpy as np
+    import torch
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "seg_mod_arch", root / "beamng_autopilot" / "vision" / "segmentation.py")
+    m = importlib.util.module_from_spec(spec)
+    _sys.modules["seg_mod_arch"] = m
+    spec.loader.exec_module(m)
+
+    x = torch.zeros(2, 3, 32, 48)
+    plain = m.SegUNet(width=1.0, arch="plain")
+    strip = m.SegUNet(width=1.0, arch="strip")
+    assert plain(x).shape == (2, m.N_CLASSES, 32, 48)
+    assert strip(x).shape == (2, m.N_CLASSES, 32, 48)
+    assert set(plain.state_dict()) != set(strip.state_dict())
+    # strip 块含 1×5 与 5×1 非对称核
+    shapes = {tuple(v.shape[-2:]) for k, v in strip.state_dict().items()
+              if k.startswith("e1.") and v.dim() == 4}
+    assert (1, 5) in shapes and (5, 1) in shapes
+    # 架构字段从 checkpoint 读出（源码断言：Segmenter 用 arch_args.arch 建模型）
+    src = (root / "beamng_autopilot" / "vision" / "segmentation.py").read_text("utf-8")
+    assert 'self.arch = str(arch_args.get("arch") or "plain")' in src
+    train_src = (root / "scripts" / "m5_train_seg.py").read_text("utf-8")
+    assert '"arch": str(getattr(model, "arch", "plain"))' in train_src
+    assert 'ap.add_argument("--arch"' in train_src
+    ssl_src = (root / "scripts" / "m5_ssl_pretrain.py").read_text("utf-8")
+    assert '--arch' in ssl_src and 'arch=str(args.arch)' in ssl_src
+
+
+def test_fsd_drive_tod_weather_wiring():
+    # 2026-11-02 条件矩阵接线：入口 --tod/--weather-preset 必须到会话层，
+    # 经 EnvironmentApi 应用并写入运行记录（失败也不静默）。
+    root = Path(__file__).resolve().parents[1]
+    entry = (root / "scripts" / "m5_fsd_drive.py").read_text("utf-8")
+    assert 'ap.add_argument("--tod"' in entry
+    assert 'ap.add_argument("--weather-preset"' in entry
+    sess = (root / "beamng_autopilot" / "fsd_drive.py").read_text("utf-8")
+    assert "conn.bng.env.set_tod(" in sess
+    assert "conn.bng.env.set_weather_preset(" in sess
+    assert '_run_record["environment"]' in sess
