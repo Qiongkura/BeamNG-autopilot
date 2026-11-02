@@ -390,6 +390,19 @@ def _camera_arg_to_world(camera_dir, state) -> np.ndarray:
 GROUND_ALIGN_MAPS = {"west_coast_usa", "east_coast_usa"}
 
 
+def per_site_scenario_mode(map_name: str) -> bool:
+    """该地图是否用**每站一个 Scenario**采集（2026-10-29 utah 探针判决）。
+
+    单 Scenario 里 10 条贴花路会让**后创建的路渲染截断**（探针实测：单站
+    2 路全跨渲染 22-34m，同几何放进批次 10 路结构后 idx9 的 22-34 bin
+    annotation 全灭、beauty 同步塌陷；线位/坡度/节点 z 提升/优先级/多站
+    资源均被变量分离排除）。非 GROUND_ALIGN_MAPS 地图改为每站 2 路加载；
+    GROUND_ALIGN_MAPS 的加载后 ground 重检依赖全量 Scenario 已加载，保持
+    原流程，另行迁移。
+    """
+    return str(map_name) not in GROUND_ALIGN_MAPS
+
+
 def _align_sites_to_ground(conn, sites: list[dict], map_name: str) -> list[dict]:
     """Align generated road-chain heights to the loaded map surface.
 
@@ -1533,22 +1546,29 @@ def main() -> int:
         report["scene_types"] = scene_types
         _align_sites_to_ground(conn, sites, str(args.map))
         report["sites_after_ground_alignment"] = sites
-        scen, rec = build_scenario(conn, sites, map_name=str(args.map),
-                                   scene_types=scene_types,
-                                   scene_names=scene_names)
-        report["scenario"] = {"name": scen.name, "level": str(scen.level),
-                              "vehicles": rec["vehicles"],
-                              "materials": {n: rec["sites"][n]["materials"]
-                                            for n in rec["sites"]}}
-        with conn.io_lock:
-            scen.make(conn.bng)
-            conn.bng.scenario.load(scen)
-            conn.bng.scenario.start()
-        time.sleep(2.0)
-        try:
-            conn.attach_vehicle(already_open=True)
-        except Exception:                                    # noqa: BLE001
-            pass
+        _per_site = per_site_scenario_mode(str(args.map))
+        scen, rec = None, None
+        if _per_site:
+            report["scenario"] = {"mode": "per_site", "level": str(args.map),
+                                  "why": "单 Scenario 多路对象会让后建贴花路渲染截断"
+                                         "（utah 探针 2026-10-29：每站 2 路实测全跨）"}
+        else:
+            scen, rec = build_scenario(conn, sites, map_name=str(args.map),
+                                       scene_types=scene_types,
+                                       scene_names=scene_names)
+            report["scenario"] = {"name": scen.name, "level": str(scen.level),
+                                  "vehicles": rec["vehicles"],
+                                  "materials": {n: rec["sites"][n]["materials"]
+                                                for n in rec["sites"]}}
+            with conn.io_lock:
+                scen.make(conn.bng)
+                conn.bng.scenario.load(scen)
+                conn.bng.scenario.start()
+            time.sleep(2.0)
+            try:
+                conn.attach_vehicle(already_open=True)
+            except Exception:                                    # noqa: BLE001
+                pass
         # GROUND_ALIGN_MAPS 的 road-network z 在初始 map load 与受控 Scenario
         # load 之间曾出现数十米差异（west_coast 约 69m、east_coast 约 28m）。
         # 加载后再测一次；若仍偏离，重建同一 map 的 Scenario，让 DecalRoad
@@ -1584,7 +1604,26 @@ def main() -> int:
                     pass
         for k, name in enumerate(scene_names):
             site = sites[k]
-            rec_site = rec["sites"][name]
+            if _per_site:
+                # 每站一个 Scenario（2 条线）——探针实测该结构全跨渲染
+                scen_k, rec_k = build_scenario(
+                    conn, [site], map_name=str(args.map),
+                    scene_types=[scene_types[k]], scene_names=[name])
+                with conn.io_lock:
+                    scen_k.make(conn.bng)
+                    conn.bng.scenario.load(scen_k)
+                    conn.bng.scenario.start()
+                time.sleep(2.0)
+                try:
+                    conn.attach_vehicle(already_open=True)
+                except Exception:                                # noqa: BLE001
+                    pass
+                rec_site = rec_k["sites"][name]
+                report.setdefault("scenarios", []).append(
+                    {"name": name, "scenario": scen_k.name,
+                     "materials": rec_site["materials"]})
+            else:
+                rec_site = rec["sites"][name]
             truth: list[dict] = []
             for inst in rec_site["lines"]:
                 truth += inst["truth_points"]
