@@ -76,14 +76,20 @@ class _AutoEncoder(nn.Module):
         return self.d0(u0)
 
 
-def _load_frames(runs: list[str]) -> torch.Tensor:
-    """读取 run 目录下全部 npz 的 colour（无标签，自监督用）。"""
+def _load_frames(runs: list[str] | None, frames_file: str | None) -> torch.Tensor:
+    """读取无标签帧的 colour：--runs（run 目录）或 --frames-file（逐帧列表）。"""
+    paths: list[str] = []
+    if frames_file:
+        paths = [ln.strip() for ln in Path(frames_file).read_text(encoding="utf-8").splitlines()
+                 if ln.strip()]
+    else:
+        for r in (runs or []):
+            paths.extend(sorted(glob.glob(str(Path(r) / "frame_*.npz"))))
     imgs = []
-    for r in runs:
-        for f in sorted(glob.glob(str(Path(r) / "frame_*.npz"))):
-            z = np.load(f)
-            c = z["colour"] if "colour" in z else z["rgb"]
-            imgs.append(torch.from_numpy(np.ascontiguousarray(c)).permute(2, 0, 1).float() / 255.0)
+    for f in paths:
+        z = np.load(f)
+        c = z["colour"] if "colour" in z else z["rgb"]
+        imgs.append(torch.from_numpy(np.ascontiguousarray(c)).permute(2, 0, 1).float() / 255.0)
     if not imgs:
         raise SystemExit("没有可用的帧")
     return torch.stack(imgs)
@@ -92,7 +98,9 @@ def _load_frames(runs: list[str]) -> torch.Tensor:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--runs", nargs="+", required=True, help="无标签帧的 run 目录")
+    ap.add_argument("--runs", nargs="+", default=None, help="无标签帧的 run 目录")
+    ap.add_argument("--frames-file", default=None,
+                    help="逐帧列表文件（一行一个 npz 路径；与 --runs 二选一）")
     ap.add_argument("--out", required=True, help="SSL checkpoint 路径（.pt）")
     ap.add_argument("--epochs", type=int, default=20)
     ap.add_argument("--batch", type=int, default=8)
@@ -106,7 +114,9 @@ def main() -> int:
     torch.manual_seed(int(args.seed))
 
     dev = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
-    x = _load_frames(args.runs)
+    if not args.runs and not args.frames_file:
+        raise SystemExit("需要 --runs 或 --frames-file")
+    x = _load_frames(args.runs, args.frames_file)
     n = x.shape[0]
     print(f"[ssl] frames={n} device={dev} epochs={args.epochs}", flush=True)
 
@@ -157,7 +167,7 @@ def main() -> int:
                 "epochs": args.epochs,
                 "batch": args.batch,
                 "lr": args.lr,
-                "runs": list(args.runs),
+                "runs": list(args.runs or []), "frames_file": args.frames_file,
                 "encoder_keys": ["e1", "e2", "e3", "mid"],
             },
             "epochs": args.epochs,
