@@ -9,6 +9,8 @@
 * 表 V（后处理单因子，来自 e1_c{0..4}_*）
 * 表 VI（等种子剂量，来自 e2_dose0x/4x 与 e1_c4_v8）
 * 正文关键数字：确认集总体、a27、仲裁原因 1383/512、2443 结算帧、范围保留 69%/89%
+* east_coast 第三图资格（2026-10-18）：annotation alpha 定因（地图 zip 材质）、
+  宽度扫描（诊断探针两重复 run）、ECA1/ECA2 0/5 与 ECA3 2站/6帧准入
 
 用法::
 
@@ -248,6 +250,191 @@ def main() -> int:
     expect("H2 E−H2 mean", round(h2_iou["mean_delta"], 4), 0.0119)
     expect("H2 E−H2 正向数", sum(1 for d in h2_iou["deltas"] if d > 0), 2)
     expect("H2 precision UNKNOWN seeds", len(h2["paired"]["prec"].get("unknown_seeds", [])), 5)
+
+    # west_coast 第二地图六批跨池配对（2026-10-13）：3/6/6/9/9/3 帧池、同初始化/预算/评测
+    wcu_files = [
+        ("WCU 3帧", "t16_wcu_crosspool_20261013", "wcu_summary.json", -0.1709),
+        ("WCU3 6帧", "t16_wcu3_crosspool_20261013", "wcu3_summary.json", -0.2374),
+        ("Wfix 6帧", "t16_wcu_reload_crosspool_20261013", "wfix_summary.json", -0.2211),
+        ("WCU4 9帧", "t16_wcu4_crosspool_20261013", "wcu4_summary.json", -0.1072),
+        ("WCU5 9帧", "t16_wcu5_crosspool_20261013", "wcu5_summary.json", -0.1345),
+        ("WCU6 3帧", "t16_wcu6_crosspool_20261013", "wcu6_summary.json", 0.1161),
+    ]
+    n_neg = 0
+    n_cb = 0
+    n_pairs = 0
+    for tag, d, fn, mean_want in wcu_files:
+        w = json.loads((E / d / fn).read_text(encoding="utf-8"))
+        wi = w["paired"]["iou"]
+        expect(f"{tag} IoU mean", round(wi["mean_delta"], 4), mean_want)
+        n_pairs += wi["n"]
+        n_neg += sum(1 for x in wi["deltas"] if x < 0)
+        if wi["verdict"] == "champion_better":
+            n_cb += 1
+        if wi["verdict"] == "candidate_better":
+            bad.append(f"{tag}: 论文称从未 candidate_better，来源裁决为 {wi['verdict']}")
+    expect("west 六批配对总数", n_pairs, 30)
+    expect("west 六批负向配对数", n_neg, 25)
+    expect("west 六批 champion_better 数", n_cb, 3)
+    # WCU6 专项：论文称「首个均值方向为正的池（4/5 正向）、三项均 inconclusive」
+    wcu6 = json.loads((E / "t16_wcu6_crosspool_20261013" /
+                       "wcu6_summary.json").read_text(encoding="utf-8"))
+    for m, mean_want, sd_want in (("iou", 0.1161, 0.1195),
+                                  ("rec", 0.1229, 0.1372),
+                                  ("prec", 0.0195, 0.0467)):
+        p6 = wcu6["paired"][m]
+        expect(f"WCU6 {m} mean", round(p6["mean_delta"], 4), mean_want)
+        expect(f"WCU6 {m} sd", round(p6["sd"], 4), sd_want)
+        expect(f"WCU6 {m} inconclusive", int(p6["verdict"] == "inconclusive"), 1)
+    expect("WCU6 IoU 正向数", sum(1 for x in wcu6["paired"]["iou"]["deltas"] if x > 0), 4)
+
+    # west_coast 聚合池（2026-10-13）：36 帧聚合 WALL vs H，论文称三项 champion_better、
+    # 0/5 正向、IoU −0.1918±0.0952、排除collapse −0.1747；六小池+聚合池 35 对 30 负
+    wp = json.loads((E / "t16_wcu_pool_20261013" /
+                     "wcu_pool_summary.json").read_text(encoding="utf-8"))
+    wpi = wp["paired"]["iou"]
+    expect("聚合池 IoU mean", round(wpi["mean_delta"], 4), -0.1918)
+    expect("聚合池 IoU sd", round(wpi["sd"], 4), 0.0952)
+    expect("聚合池 IoU 排除collapse mean",
+           round(wpi["collapse"]["mean_delta_excluding_collapse"], 4), -0.1747)
+    expect("聚合池 IoU 正向数", sum(1 for x in wpi["deltas"] if x > 0), 0)
+    expect("聚合池 IoU collapse pair 数", wpi["collapse"]["n_pairs_excluded"], 1)
+    for m in ("iou", "rec", "prec"):
+        expect(f"聚合池 {m} champion_better",
+               int(wp["paired"][m]["verdict"] == "champion_better"), 1)
+    n_pairs += wpi["n"]
+    n_neg += sum(1 for x in wpi["deltas"] if x < 0)
+    expect("west 六小池+聚合池 配对总数", n_pairs, 35)
+    expect("west 六小池+聚合池 负向配对数", n_neg, 30)
+    # 复现性：H 臂同种子跨三次运行最大差 0.0356 IoU（GPU 非确定性）
+    h_max = 0.0
+    for s in ("47", "48", "49", "50", "51"):
+        vals = [json.loads((E / d / fn).read_text(encoding="utf-8"))["arms"]["H"][s]["iou"]
+                for d, fn in (("t16_wcu5_crosspool_20261013", "wcu5_summary.json"),
+                              ("t16_wcu6_crosspool_20261013", "wcu6_summary.json"),
+                              ("t16_wcu_pool_20261013", "wcu_pool_summary.json"))]
+        h_max = max(h_max, max(vals) - min(vals))
+    expect("H臂跨运行最大 IoU 差", round(h_max, 4), 0.0356)
+
+    # east_coast 第三图资格（2026-10-18）：annotation alpha 定因 + 宽度扫描 + ECA3 准入
+    # 机制：east 船运 line_white/line_yellow = opacityFactor 0.7 × bcf alpha 0.8/0.9
+    # → 最终 alpha 0.56/0.63 < alphaRef 255（全不透明阈值）→ annotation 全剔。
+    import zipfile
+    try:
+        mats = json.loads(zipfile.ZipFile(
+            r"G:\BeamNG.tech.v0.38.5.0\content\levels\east_coast_usa.zip").read(
+            "levels/east_coast_usa/art/road/main.materials.json"))
+    except OSError:
+        mats = {}
+        bad.append("east 材质 alpha 来源缺失（G: 地图 zip 不在本机）")
+    for name, bcf_a, final_a in (("line_white", 0.8, 0.56), ("line_yellow", 0.9, 0.63)):
+        d_m = mats.get(name) or {}
+        st_m = (d_m.get("Stages") or [{}])[0]
+        expect(f"{name} alphaRef", d_m.get("alphaRef"), 255)
+        expect(f"{name} opacityFactor", round(st_m.get("opacityFactor", 0) or 0, 1), 0.7)
+        expect(f"{name} bcf alpha", round((st_m.get("baseColorFactor") or [0, 0, 0, 0])[3], 1), bcf_a)
+        expect(f"{name} 最终 alpha",
+               round((st_m.get("opacityFactor") or 0) * (st_m.get("baseColorFactor") or [0, 0, 0, 0])[3], 2),
+               final_a)
+    expect("line_yellow_double alphaTest",
+           int(bool((mats.get("line_yellow_double") or {}).get("alphaTest"))), 1)
+
+    # ECA1/ECA2 两批 0/5 准入（采集批验收口径）
+    for tag_e in ("eca1", "eca2"):
+        acc = json.loads((ROOT / "logs" / "m5_seg" / f"collect_e5line_{tag_e}_20261018"
+                          / "scene_report.json").read_text(encoding="utf-8"))["acceptance"]
+        expect(f"ECA {tag_e} 合格站数", acc["sites_eligible"], 0)
+        expect(f"ECA {tag_e} 站点总数", acc["sites_total"], 5)
+
+    # ECA3：2站/6帧 engine_verified 准入 + 3站隔离逐实例证据（冻结导出门）
+    e3 = json.loads((E / "t16_linepool_eca3_20261018" / "auto_truth"
+                     / "export_report.json").read_text(encoding="utf-8"))
+    expect("ECA3 导出站数", len(e3["exported"]), 2)
+    expect("ECA3 导出帧数", e3["frames_exported"], 6)
+    expect("ECA3 采集站数", e3["scenes_total"], 5)
+    e3d = {e["scene"]: e for e in e3["exported"]}
+    for scene, cov, med, paint in (("known_line_a0s0", 0.9889, 0.598, 0.9941),
+                                   ("known_line_a4s0", 1.0, 0.587, 0.9941)):
+        e_s = e3d[scene]
+        expect(f"ECA3 {scene} coverage", round(e_s["coverage"], 4), cov)
+        expect(f"ECA3 {scene} 投影median", round(e_s["after_px_median"], 3), med)
+        expect(f"ECA3 {scene} paint", round(e_s["paint_agreement_pooled"], 4), paint)
+    e3i = {e["scene"]: e for e in e3["isolated"]}
+    i1 = e3i["known_line_a1s0"]
+    expect("ECA3 a1 left coverage", round(i1["instance_coverage"]["left"], 4), 0.4166)
+    expect("ECA3 a1 right coverage", round(i1["instance_coverage"]["right"], 4), 0.2151)
+    expect("ECA3 a1 投影", round(i1["after_px"], 2), 10.73, 5e-3)
+    expect("ECA3 a1 paint", round(i1["paint_agreement_pooled"], 3), 0.030)
+    expect("ECA3 a2 right coverage",
+           round(e3i["known_line_a2s0"]["instance_coverage"]["right"], 4), 0.4216)
+    expect("ECA3 a3 paint",
+           round(e3i["known_line_a3s0"]["paint_agreement_pooled"], 4), 0.0536)
+
+    # 宽度扫描（诊断探针两重复 run，paint2px/n 沿链采样点）：仅 0.40m 两 run appearance 全过
+    sweep: dict[str, list[tuple[int, int]]] = {}
+    for run in ("160526", "160701"):
+        pr = json.loads((ROOT / "logs" / "m5_seg"
+                         / f"diag_decal_probe2_east_coast_usa_20261018_{run}"
+                         / "probe_report.json").read_text(encoding="utf-8"))
+        for tag_w, e_w in pr["scenes"]["wide"]["lines"].items():
+            a_w = e_w["all"]
+            sweep.setdefault(tag_w, []).append((a_w["paint2px"], a_w["n"]))
+    want_sweep = {"w020": (2, 28, 1, 28), "w025": (13, 29, 13, 29),
+                  "w030": (22, 30, 23, 30), "w040": (30, 30, 30, 30),
+                  "w050": (20, 30, 19, 30)}
+    for tag_w, (p1, n1, p2, n2) in want_sweep.items():
+        s1, s2 = sweep[tag_w]
+        expect(f"宽扫 {tag_w} run160526 paint比", s1[0] / s1[1], p1 / n1, 1e-9)
+        expect(f"宽扫 {tag_w} run160701 paint比", s2[0] / s2[1], p2 / n2, 1e-9)
+    expect("宽扫 w040 run1 paint比", round(sweep["w040"][0][0] / sweep["w040"][0][1], 2), 1.0)
+    expect("宽扫 w040 run2 paint比", round(sweep["w040"][1][0] / sweep["w040"][1][1], 2), 1.0)
+    expect("宽扫 w050 run1 paint比", round(sweep["w050"][0][0] / sweep["w050"][0][1], 2), 0.67)
+    expect("宽扫 w050 run2 paint比", round(sweep["w050"][1][0] / sweep["w050"][1][1], 2), 0.63)
+    both_pass = sorted(t for t, rr in sweep.items() if all(p / n >= 0.9 for p, n in rr))
+    expect("宽扫 两run appearance 全过宽度数", len(both_pass), 1)
+    expect("宽扫 全过即 w040", int(both_pass == ["w040"]), 1)
+
+    # east 首批 6 帧池配对（2026-10-18）：E3 vs H，5 seeds 同协议
+    # 稿件按常规 half-up 显示（0.50585 → 0.5059），故显示值用 floor(x*1e4+.5)/1e4
+    hu = lambda x: math.floor(x * 1e4 + 0.5) / 1e4  # noqa: E731
+    e3p = json.loads((E / "t16_eca3_crosspool_20261018" / "eca3_summary.json")
+                     .read_text(encoding="utf-8"))
+    e3i = e3p["paired"]["iou"]
+    expect("ECA3配对 IoU mean", hu(e3i["mean_delta"]), -0.2684)
+    expect("ECA3配对 IoU sd", hu(e3i["sd"]), 0.1617)
+    expect("ECA3配对 IoU 正向数", sum(1 for d in e3i["deltas"] if d > 0), 0)
+    expect("ECA3配对 IoU champion_better", int(e3i["verdict"] == "champion_better"), 1)
+    expect("ECA3配对 collapse pair 数", e3i["collapse"]["n_pairs_excluded"], 2)
+    expect("ECA3配对 排除collapse mean",
+           hu(e3i["collapse"]["mean_delta_excluding_collapse"]), -0.1690)
+    e3r = e3p["paired"]["rec"]
+    expect("ECA3配对 recall mean", hu(e3r["mean_delta"]), -0.2846)
+    expect("ECA3配对 recall sd", hu(e3r["sd"]), 0.1645)
+    expect("ECA3配对 recall champion_better",
+           int(e3r["verdict"] == "champion_better"), 1)
+    e3pr = e3p["paired"]["prec"]
+    expect("ECA3配对 precision mean", hu(e3pr["mean_delta"]), -0.3281)
+    expect("ECA3配对 precision sd", hu(e3pr["sd"]), 0.5059)
+    expect("ECA3配对 precision 正向数", sum(1 for d in e3pr["deltas"] if d > 0), 3)
+    expect("ECA3配对 precision inconclusive",
+           int(e3pr["verdict"] == "inconclusive"), 1)
+    expect("ECA3配对 seeds 数", len(e3p["seeds"]), 5)
+    expect("ECA3配对 iou n", e3i["n"], 5)
+    expect("ECA3配对 recall n", e3r["n"], 5)
+    expect("ECA3配对 precision n", e3pr["n"], 5)
+    expect("ECA3配对 作业失败数", len(e3p["failures"]), 0)
+    st3 = e3p["eval_status"]
+    expect("ECA3配对 评测状态条目", len(st3), 10)
+    expect("ECA3配对 异常评测状态",
+           sum(1 for v in st3.values()
+               if v.get("negative_line_status") != "measured"
+               or v.get("unknown_frames") or v.get("unverified_frames")), 0)
+    # H 臂跨运行复现性：同种子 vs WCU6 最大 IoU 差 0.0190（0.0356 噪声下限内）
+    w6 = json.loads((E / "t16_wcu6_crosspool_20261013" / "wcu6_summary.json")
+                    .read_text(encoding="utf-8"))
+    h_max3 = max(abs(e3p["arms"]["H"][s]["iou"] - w6["arms"]["H"][s]["iou"])
+                 for s in ("47", "48", "49", "50", "51"))
+    expect("ECA3 H臂跨运行最大 IoU 差", round(h_max3, 4), 0.0190)
 
     print(f"=== 数字审计：检查 {checked} 项 ===")
     for b in bad:

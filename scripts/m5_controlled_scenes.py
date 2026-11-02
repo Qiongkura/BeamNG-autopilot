@@ -73,8 +73,11 @@ MAT_GRAVEL = "m_dirt_road_gravels"
 #: west_coast_usa 的材质来自 2026-10-07 对 `content/levels/*.zip` 的离线扫描
 #: （`items.level.json` 里 line_white 3112 次、line_yellow 1470 次、
 #: line_dashed_short 215 次），用于第二张地图的复测（审查 E4）。
-#: 其余地图（gridmap_v2/smallgrid/utah/east_coast_usa/jungle_rock_island）扫描
-#: 未见成规模的白/黄线贴花，故不建档案；要用得先找材质再补档案。
+#: 2026-10-18 全嵌套 `items.level.json` 复扫（初扫只读了首个文件，判
+#: 「未见成规模」不正确）：east_coast_usa 有 line_white 72 站、line_yellow 15 站
+#: DecalRoad 实例，四材质均在 `art/road/main.materials.json` 有 map 级定义
+#: → 补第三张地图档案；无蓝色虚线材质，material_mix 场景不可用。
+#: utah 2026-10-18 建档：Utah.zip 全嵌套复扫 + 同款探针实测后入库（见下条目）。
 MAP_PROFILES: dict[str, dict] = {
     "italy": {"pave": MAT_PAVE, "white": MAT_LINE_WHITE, "yellow": MAT_LINE_YELLOW,
               "blue": MAT_LINE_BLUE, "gravel": MAT_GRAVEL,
@@ -83,6 +86,35 @@ MAP_PROFILES: dict[str, dict] = {
                        "yellow": "line_yellow", "blue": "line_dashed_short",
                        "gravel": "m_dirt_road_gravels", "anchor": None,
                        "note": "第二张地图（审查 E4）：材质为离线扫描所得"},
+    "east_coast_usa": {"pave": "AsphaltRoad_variation_two_way",
+                       "white": "line_yellow_double", "yellow": "line_yellow_double",
+                       "blue": None, "gravel": "DirtRoad_variation_01",
+                       "anchor": None, "line_width": 0.40,
+                       "note": "第三张地图：2026-10-18 全嵌套复扫所得；无蓝色虚线材质。"
+                               "线材质/线宽 2026-10-18 换 line_yellow_double@0.40m："
+                               "该图 line_white/line_yellow 家族 opacityFactor 0.7 × "
+                               "baseColorFactor alpha 0.8–0.9 → annotation pass 的 "
+                               "alphaRef=255 alpha 测试全像素剔除（annotation 写不进，"
+                               "ECA1/ECA2 0/5 根因，见 m5_decal_annotation_probe.py）；"
+                               "实测唯一替代：line_yellow_double（alphaTest=True/alphaRef=0）"
+                               "0.40m 冻结门三门全过（appearance 1.00×2 运行），"
+                               "0.15m appearance 0.43–0.67 挂（双条纹亚像素+中心 gap），"
+                               "0.50m 回落（gap 回到真值点）"},
+    "utah": {"pave": "AsphaltRoad_variation_01",
+             "white": "line_yellow_double", "yellow": "line_yellow_double",
+             "blue": None, "gravel": "dirt_road_gravels",
+             "anchor": None, "line_width": 0.40,
+             "note": "第四张地图：2026-10-18 Utah.zip 全嵌套复扫 + 同款探针实测；"
+                     "该图 line_white/line_yellow 家族同 east alpha 缺陷"
+                     "（opacityFactor 0.7 × bcf alpha 0.90/1.0，alphaRef=255 全剔）；"
+                     "line_yellow_double（alphaTest=True/alphaRef=0）实测唯一可写实线"
+                     "（近距 bin solid 4/4 vs line_white 0/3、line_yellow 0/4，2 运行一致）；"
+                     "0.40m 探针 annotation 全写、导出门 paint_like 30/30×2，"
+                     "严格外观掩码 0.53–0.87（utah bcf 渲染偏暗贴严格阈值下沿，"
+                     "掩码侧证据保留）；0.20–0.30m 双条纹亚像素无漆，0.50m 远距回落；"
+                     "线宽=场景规格适配非降门（与 east 同 0.40m）；"
+                     "road z 与地形实测一致（探针站点 delta 0.02m），不进 GROUND_ALIGN_MAPS；"
+                     "无蓝色虚线材质，material_mix 不可用"},
 }
 
 
@@ -93,6 +125,7 @@ def apply_map_profile(map_name: str, *, overrides: dict | None = None) -> dict:
     生成的"线"会用错材质——宁可报错也不要静默生成错东西）。
     """
     global MAT_PAVE, MAT_LINE_WHITE, MAT_LINE_YELLOW, MAT_LINE_BLUE, MAT_GRAVEL, _MAT
+    global LINE_WIDTH_M
     prof = dict(MAP_PROFILES.get(map_name) or {})
     ov = {k: v for k, v in (overrides or {}).items() if v}
     if not prof and not ov:
@@ -106,6 +139,10 @@ def apply_map_profile(map_name: str, *, overrides: dict | None = None) -> dict:
            "gravel": ov.get("gravel") or prof.get("gravel"),
            "anchor": prof.get("anchor"),
            "note": (prof.get("note") or "") + ("（含 CLI 覆盖）" if ov else "")}
+    # 线宽按档案走（east 0.40：见档案 note 的 annotation 可写性实测）；
+    # 档案没声明的保持 0.15 合同宽度。
+    LINE_WIDTH_M = float(ov.get("line_width") or prof.get("line_width") or 0.15)
+    eff["line_width"] = LINE_WIDTH_M
     missing = [k for k in ("pave", "white", "yellow", "gravel") if not eff[k]]
     if missing:
         raise SystemExit(f"地图 {map_name!r} 档案缺材质：{missing}")
@@ -115,6 +152,8 @@ def apply_map_profile(map_name: str, *, overrides: dict | None = None) -> dict:
     _MAT = {"white": MAT_LINE_WHITE, "yellow": MAT_LINE_YELLOW, "blue": MAT_LINE_BLUE}
     return eff
 
+#: 生成线宽（米）：默认合同宽度 0.15；``apply_map_profile`` 会按地图档案
+#: 覆盖（east_coast_usa 0.40——见 MAP_PROFILES note 的 annotation 可写性实测）。
 LINE_WIDTH_M = 0.15
 #: 车道半宽（米）：受控场景里"行驶车道"是生成出来的——线放在 ±LAT_LANE_HALF。
 #: 不用地图路面的外缘：外缘常被边缘贴花覆盖（annotation 里是背景/非路面），
@@ -335,16 +374,33 @@ def _camera_arg_to_world(camera_dir, state) -> np.ndarray:
     return _unit(local[0] * fwd + local[1] * left + local[2] * up)
 
 
+#: 路网 z 与真实地形不一致、需要地面重对齐的地图（实测判据，不是猜测）：
+#: west_coast_usa 差约 69 m（2026-10-11），east_coast_usa 路网 z 对地形差约
+#: 28 m（2026-10-18 ECA1 实测：road z 26.07 对地形 54.2）。italy 实测一致，
+#: 不进集合——进集合必须有该地图的实测 z 偏差证据。
+#:
+#: **更正（2026-10-18，ECA2 + m5_decal_annotation_probe 定因）**：ECA1 时把
+#: 0/5 判成"生成路链整体埋入地下"是**错的**——ECA2 对齐后 ground_alignment
+#: delta≈0、遮挡深度比 1.000，逐帧 RGB 里漆线一直可见，仍然 0/5；探针
+#: 变量分离（z 抬 ≤0.5 m、renderPriority 0/50、宽度、插入序全部无效）定因
+#: 是 annotation pass 的 alpha 测试剔除：east 线材质 opacityFactor 0.7 ×
+#: bcf alpha 0.8–0.9 → 最终 alpha ≤0.56，配 alphaRef=255 全像素剔，annotation
+#: 写不进（west 线材质无 opacity 缩放所以正常）。z 偏差本身是真实测得的、
+#: 重对齐仍然必须做，但它**不是** annotation 丢失的原因。
+GROUND_ALIGN_MAPS = {"west_coast_usa", "east_coast_usa"}
+
+
 def _align_sites_to_ground(conn, sites: list[dict], map_name: str) -> list[dict]:
     """Align generated road-chain heights to the loaded map surface.
 
-    west_coast_usa's road-network ``middle.z`` was observed about 69 m below
-    the actual terrain at the captured anchor.  Keeping that value made both
-    DecalRoad lines and truth points invisible while the vehicle/camera stood
-    on the real surface.  We only apply the correction to that map and record
-    every delta; a missing ground read is UNKNOWN and never guessed.
+    Maps in ``GROUND_ALIGN_MAPS`` had their road-network ``middle.z`` observed
+    tens of meters below the actual terrain at captured anchors.  Keeping that
+    value made both DecalRoad lines and truth points invisible while the
+    vehicle/camera stood on the real surface.  We only apply the correction to
+    maps with measured evidence and record every delta; a missing ground read
+    is UNKNOWN and never guessed.
     """
-    if str(map_name) != "west_coast_usa":
+    if str(map_name) not in GROUND_ALIGN_MAPS:
         return sites
     for site in sites:
         mid = np.asarray(site.get("mid", []), dtype=float)
@@ -1205,7 +1261,7 @@ def run_scene(conn, probe, *, name: str, site: dict, rec: dict, truth_points: li
         "palette": palette,
         "generator": {"name": "m5_controlled_scenes.py",
                       "version": GENERATOR_VERSION},
-        "asset": {"map": "italy", "materials": dict(rec.get("materials") or {})},
+        "asset": {"map": str(map_name), "materials": dict(rec.get("materials") or {})},
         "run": {"id": f"m5_controlled_{name}", "scene_seed": 0,
                 "game_version": "beamng_tech", "renderer": "beamng_tech"},
     }
@@ -1358,6 +1414,8 @@ def main() -> int:
     ap.add_argument("--mat-blue", default=None, help="覆盖蓝线材质名")
     ap.add_argument("--mat-pave", default=None, help="覆盖铺装材质名")
     ap.add_argument("--mat-gravel", default=None, help="覆盖碎石材质名")
+    ap.add_argument("--line-width", type=float, default=None,
+                    help="覆盖生成线宽（米）；默认取地图档案（east 0.40，其余 0.15）")
     ap.add_argument("--scenes", nargs="*", default=list(SCENES),
                     help="要跑的场景（默认全部五类）")
     ap.add_argument("--frames", type=int, default=2,
@@ -1397,9 +1455,11 @@ def main() -> int:
              if LINE_CONVENTION == "measured" else ""), flush=True)
     profile = apply_map_profile(str(args.map), overrides={
         "white": args.mat_white, "yellow": args.mat_yellow, "blue": args.mat_blue,
-        "pave": args.mat_pave, "gravel": args.mat_gravel})
+        "pave": args.mat_pave, "gravel": args.mat_gravel,
+        "line_width": args.line_width})
     print(f"[scenes] 地图档案 {args.map}: 铺装={profile['pave']} 白={profile['white']} "
-          f"黄={profile['yellow']} 蓝={profile['blue']} 碎石={profile['gravel']}",
+          f"黄={profile['yellow']} 蓝={profile['blue']} 碎石={profile['gravel']} "
+          f"线宽={profile['line_width']}m",
           flush=True)
     probe = _load_probe()
     out = Path(args.out) if args.out else (
@@ -1489,10 +1549,11 @@ def main() -> int:
             conn.attach_vehicle(already_open=True)
         except Exception:                                    # noqa: BLE001
             pass
-        # west_coast 的 road-network z 在初始 map load 与受控 Scenario load
-        # 之间曾出现约 69m 差异。加载后再测一次；若仍偏离，重建同一 map
-        # 的 Scenario，让 DecalRoad 节点、truth points 和实际地面共享最终 z。
-        if str(args.map) == "west_coast_usa":
+        # GROUND_ALIGN_MAPS 的 road-network z 在初始 map load 与受控 Scenario
+        # load 之间曾出现数十米差异（west_coast 约 69m、east_coast 约 28m）。
+        # 加载后再测一次；若仍偏离，重建同一 map 的 Scenario，让 DecalRoad
+        # 节点、truth points 和实际地面共享最终 z。
+        if str(args.map) in GROUND_ALIGN_MAPS:
             post_align: list[dict] = []
             for _site in sites:
                 try:
@@ -1511,7 +1572,7 @@ def main() -> int:
                                            scene_types=scene_types,
                                            scene_names=scene_names)
                 report["sites_after_ground_alignment_reload"] = sites
-                report["west_coast_ground_reload"] = post_align
+                report["post_load_ground_recheck"] = post_align
                 with conn.io_lock:
                     scen.make(conn.bng)
                     conn.bng.scenario.load(scen)
