@@ -213,6 +213,27 @@ def test_two_controllers_cannot_run_at_once(tmp_path) -> None:
         "acquired"] is True, "持有者死后必须能接管（断电恢复）"
 
 
+def test_alive_tells_a_dead_process_from_a_live_one() -> None:
+    """活性探测必须能说"死了"：否则崩溃后单实例锁永远拿不回来。
+
+    2026-10-20 实测：旧实现只读 ``tasklist``，受限令牌下它直接
+    ``ERROR: Access denied``，而"rc 非 0 → 按活着"就把断电恢复变成了死代码。
+    """
+    import os
+
+    from beamng_autopilot.experiments.controller import _alive
+
+    assert _alive(os.getpid()) is True
+    holder = subprocess.Popen([sys.executable, "-c",
+                               "import time; time.sleep(30)"])
+    try:
+        assert _alive(holder.pid) is True
+    finally:
+        holder.terminate()
+        holder.wait(timeout=15)
+    assert _alive(holder.pid) is False, "已退出的进程不能判成活着"
+
+
 def test_the_resource_gate_blocks_on_budget_and_vram() -> None:
     from beamng_autopilot.experiments.controller import (
         LoopConfig, ResourceState, resource_gate)

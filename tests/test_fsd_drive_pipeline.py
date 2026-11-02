@@ -669,3 +669,36 @@ def test_other_reasons_are_not_annotated(monkeypatch, tmp_path):
                          meta_extra={"plan_blocked": "no_perception_lane"})
     assert frames[0]["reason"] == "obstacle very close"
     assert frames[0]["no_path_mechanism"] is None
+
+
+def test_perception_off_road_tolerates_bad_geometry_but_not_bugs(monkeypatch):
+    """越界读数只许吞"几何输入坏了"，不许吞编程错误。
+
+    2026-10-20：这里原是 ``except Exception: pass``。越界读数是压线判定的
+    数据源，吞掉编程错误会让它静默偏小——安全方向正好反了。
+    """
+    from types import SimpleNamespace
+
+    import numpy as np
+    import pytest
+
+    from beamng_autopilot import fsd_drive as fd
+
+    out = SimpleNamespace(
+        lane_left=np.column_stack([np.linspace(0.0, 20.0, 11),
+                                   np.full(11, 1.75)]),
+        lane_right=np.column_stack([np.linspace(0.0, 20.0, 11),
+                                    np.full(11, -1.75)]))
+    pos = np.array([5.0, 0.0, 0.0])
+
+    # 可容忍：几何输入坏（TypeError）-> 读数按 0 处理，不抛
+    monkeypatch.setattr(fd, "_boundary_lateral",
+                        lambda *a, **k: (_ for _ in ()).throw(TypeError("bad")))
+    assert fd._perception_off_road_m(out, pos, 0.0) == 0.0
+
+    # 不可容忍：编程错误（RuntimeError）-> 必须冒出去
+    monkeypatch.setattr(fd, "_boundary_lateral",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            RuntimeError("bug")))
+    with pytest.raises(RuntimeError):
+        fd._perception_off_road_m(out, pos, 0.0)

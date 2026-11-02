@@ -154,3 +154,26 @@ class TestRejectionAttribution:
                                        cons)
         assert best is not None
         assert not meta.get("rejects")
+
+
+def test_missing_speed_profile_is_recorded_not_swallowed(monkeypatch):
+    """纵向剖面是可选增强：算不出来不能丢轨迹，但也不能静默。
+
+    2026-10-20：这里原来是 ``except Exception: pass``，于是"这帧为什么没有
+    剖面"在遥测里完全不可见。现在把原因写进 meta。
+    """
+    import beamng_autopilot.planning.speed_profile as sp_mod
+
+    scene, candidates = _scene()
+    scene.grid.drivable[:] = 1.0
+    scene.target_speed = 6.0
+    for cand in candidates.candidates:
+        cand.speed_profile = None
+
+    def boom(*_a, **_k):
+        raise RuntimeError("profile exploded")
+
+    monkeypatch.setattr(sp_mod, "speed_profile_for_path", boom)
+    path, meta = select_trajectory(scene, candidates, Constraints())
+    assert path is not None, "剖面失败不能把轨迹一起丢掉"
+    assert "profile exploded" in meta.get("speed_profile_error", ""), meta

@@ -345,3 +345,30 @@ class TestOwnLineageIsNotAnotherController:
     def test_lineage_includes_self_even_without_psutil(self):
         # An injected pid may not exist; the set must still contain it.
         assert 4242 in own_process_lineage(4242)
+
+
+def test_lineage_tolerates_a_pid_that_does_not_exist():
+    """父链读不到（进程不存在）是预期内的事：返回自己，不抛。"""
+    from beamng_autopilot.run_manifest import own_process_lineage
+
+    assert own_process_lineage(pid=999999999) == {999999999}
+
+
+def test_lineage_does_not_swallow_unexpected_errors(monkeypatch):
+    """收窄后：psutil 自己坏了必须冒出来，而不是被当成"没有父进程"。
+
+    2026-10-20 之前是 ``except Exception: pass``——一个坏掉的 psutil 会让
+    "第二控制器"检查悄悄失效，而那正是 P0-2 要的证据。
+    """
+    import psutil
+
+    from beamng_autopilot import run_manifest
+
+    class Boom:
+        def __init__(self, *_a, **_k):
+            raise RuntimeError("psutil broke")
+
+    monkeypatch.setattr(psutil, "Process", Boom)
+    import pytest
+    with pytest.raises(RuntimeError):
+        run_manifest.own_process_lineage(pid=1234)

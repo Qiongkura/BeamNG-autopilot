@@ -16,8 +16,22 @@ from beamng_autopilot.fsd_realism import (
     assert_realistic_lane,
     check_fail_closed_consumers,
     check_no_map_imports,
+    lane_mode_is_fsd_compliant,
     lane_source_ok,
 )
+
+
+def test_only_sensor_plus_strict_counts_as_the_fsd_path() -> None:
+    """合规 = 感知主导 + strict；map/auto 或 strict=False 都不算。
+
+    2026-10-20：FSD 入口默认曾是 ``lane_mode=map``/``strict=False``，等于每次
+    不带参数的运行都在用 AGENTS.md 禁止的地图横向参考。
+    """
+    assert lane_mode_is_fsd_compliant("sensor", True)
+    assert not lane_mode_is_fsd_compliant("map", True)
+    assert not lane_mode_is_fsd_compliant("auto", True)
+    assert not lane_mode_is_fsd_compliant("sensor", False)
+    assert not lane_mode_is_fsd_compliant(None, True)
 
 
 def test_lane_source_ok_permissive() -> None:
