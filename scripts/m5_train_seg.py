@@ -859,7 +859,7 @@ def _write_train_hist(out_dir, hist: dict) -> None:
 
 
 def _augment(frame, rng: np.random.Generator,
-            line_morph: bool = False):
+            line_morph: bool = False, scale_jitter: float = 0.0):
     """在线数据增强（colour/label 同步变换），提升路段泛化。
 
     关键：色相/饱和度扰动 + 模糊，逼模型学"标线结构"而不是记住
@@ -898,6 +898,32 @@ def _augment(frame, rng: np.random.Generator,
     if rng.random() < 0.35:                     # 模糊（模拟行驶运动模糊）
         k = int(rng.integers(3, 8)) | 1
         colour = cv2.GaussianBlur(colour, (k, k), 0)
+    if scale_jitter > 0 and rng.random() < 0.5:
+        # 多尺度抖动（2026-11-02 代码臂）：模拟相机高度/焦距与目标距离差异。
+        # colour 线性缩放、label 最近邻（类号不变），再随机裁剪或边缘复制
+        # 补齐回原尺寸（不引入 255 ignore 语义，label 值域保持 0/1/2）。
+        s = 1.0 + float(rng.uniform(-scale_jitter, scale_jitter))
+        oh, ow = colour.shape[:2]
+        nh = max(16, int(round(oh * s)))
+        nw = max(16, int(round(ow * s)))
+        colour = cv2.resize(colour, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        label = cv2.resize(label, (nw, nh), interpolation=cv2.INTER_NEAREST)
+        if nh >= oh:
+            y0 = int(rng.integers(0, nh - oh + 1))
+            colour, label = colour[y0:y0 + oh], label[y0:y0 + oh]
+        else:
+            py_t = (oh - nh) // 2
+            pad = (py_t, oh - nh - py_t)
+            colour = np.pad(colour, (pad, (0, 0), (0, 0)), mode="edge")
+            label = np.pad(label, (pad,), mode="edge")
+        if nw >= ow:
+            x0 = int(rng.integers(0, nw - ow + 1))
+            colour, label = colour[:, x0:x0 + ow], label[:, x0:x0 + ow]
+        else:
+            px_t = (ow - nw) // 2
+            pad = (px_t, ow - nw - px_t)
+            colour = np.pad(colour, ((0, 0), pad, (0, 0)), mode="edge")
+            label = np.pad(label, ((0, 0), pad), mode="edge")
     if rng.random() < 0.7:                      # 随机裁剪后缩放回原尺寸
         h, w = colour.shape[:2]
         ch, cw = int(h * 0.85), int(w * 0.85)
@@ -1053,6 +1079,9 @@ def main() -> None:
                     help="best_task.pt 的准入门槛：成对率再高，若该轮的 in-lane "
                          "低于 F 也不选（可用率与横向正确性在 epoch 间互相交换，"
                          "只按成对率会选中「配对多但中心错」的权重，默认 0.20）")
+    ap.add_argument("--aug-scale", type=float, default=0.0, metavar="S",
+                    help="多尺度抖动幅度（0.15=±15%% 缩放；0 关闭，默认）。"
+                         "colour 线性/label 最近邻，随机裁或边缘复制回原尺寸")
     ap.add_argument("--line-morph", action="store_true",
                     help="enable line morphology augmentation (default "
                          "off: v7 ablation showed it hurts line IoU)")
@@ -1582,7 +1611,8 @@ def main() -> None:
                         [int(args.seed), 0x5EED, int(step_base) + steps])
                 else:
                     _arng = rng
-                batch = [_augment(f, _arng, line_morph=args.line_morph)
+                batch = [_augment(f, _arng, line_morph=args.line_morph,
+                                    scale_jitter=float(args.aug_scale))
                          for f in batch]
             xs = torch.stack([to_tensor(f, device)[0] for f in batch])
             ys = torch.stack([to_tensor(f, device)[1] for f in batch])

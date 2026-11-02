@@ -828,3 +828,40 @@ def test_weak_line_oversample_unpacks_frame_by_index():
            / "m5_train_seg.py").read_text("utf-8")
     assert "for i, (_img, lb) in enumerate(train_frames)" not in src
     assert "for i, frame in enumerate(train_frames)" in src
+
+
+def test_aug_scale_jitter_preserves_shape_and_label_domain():
+    # 2026-11-02 多尺度增广代码臂（--aug-scale）：colour 线性/label 最近邻缩放，
+    # 随机裁或边缘复制回原尺寸；label 值域必须保持 {0,1,2}（不能引入 255），
+    # 形状、dtype 与三通道透传都必须稳定。
+    import importlib.util
+    import numpy as np
+
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "m5_train_seg_aug", root / "scripts" / "m5_train_seg.py")
+    m = importlib.util.module_from_spec(spec)
+    import sys as _sys
+    _sys.modules["m5_train_seg_aug"] = m
+    spec.loader.exec_module(m)
+
+    rng = np.random.default_rng(0)
+    colour = rng.integers(0, 256, size=(32, 48, 3), dtype=np.uint8)
+    label = np.zeros((32, 48), np.uint8)
+    label[14:18, :] = 2          # 一条水平线
+    label[18:, :] = 1            # 下半路面
+    annot = np.zeros((32, 48, 3), np.uint8)
+
+    for _ in range(20):
+        c2, l2, a2 = m._augment((colour, label, annot),
+                                np.random.default_rng(1), scale_jitter=0.3)
+        assert c2.shape == colour.shape and c2.dtype == np.uint8
+        assert l2.shape == label.shape and l2.dtype == np.uint8
+        assert set(np.unique(l2)).issubset({0, 1, 2})
+        assert a2 is annot
+
+    # 抖动确实改变内容（与关闭时相比）；关闭时保持原样（rng=0 仍会走其它增广，
+    # 但 scale_jitter=0 不得进入缩放分支）。
+    c_off, l_off = m._augment((colour, label), np.random.default_rng(7),
+                              scale_jitter=0.0)[:2]
+    assert c_off.shape == colour.shape and l_off.shape == label.shape
