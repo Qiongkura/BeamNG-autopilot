@@ -612,6 +612,348 @@ class LaneReference:
         return self.center
 
 
+def _lane_gate_verdict(*, lane_frame, lane_ref, route_ref, pos, heading,
+                       lane_mode: str, strict_lane: bool) -> dict:
+    """三维门（航向 / 转角 / 侧向）对**一个候选感知车道**的裁决。
+
+    2026-10-20 从 ``select_lane_reference`` 里原样搬出来的纯判定：不改任何
+    条件顺序、阈值来源或拒绝理由的取值，只是把"哪个门判的、拿什么数判的"
+    变成一个可单测的返回值。
+
+    返回 ``{"rejected", "reason", "side_bad", "corner_bad", "meta"}``：
+
+    * ``rejected``：整条感知车道（中心 + 硬边界）都不可信，调用方必须把
+      它降级，而不是只换中心——边界若留着，no-cross 规则会拿一条错误的
+      边去拦车；
+    * ``reason``：``"heading"`` / ``"corner"`` / ``"side"``，与
+      ``lane_reject_reason`` 遥测字段同字面量；
+    * ``meta``：``lane_side_off_m`` / ``lane_side_limit_m`` / ``pair_*``，
+      让"门说不行"可复核（拒绝时也能看到触发它的那个数）。
+
+    靠 hd 头（``lane_heading_ok`` / ``lane_route_turn_ok`` / ``lane_side_ok``）
+    的异常照旧抛给调用方：那里有 ``_warn``，换成在这里吞掉会丢诊断。
+    """
+    from beamng_autopilot.planning.arbiter import (
+        lane_heading_ok, lane_route_turn_ok, lane_side_ok,
+        lane_side_offset_m)
+
+    side_bad = False
+    corner_bad = False
+    rejected = False
+    try:
+        side_off = lane_side_offset_m(lane_ref, route_ref, pos)
+    except Exception:                                    # noqa: BLE001
+        side_off = None
+    # 侧向门的阈值随模式收紧：strict 要求车道中心至少在路线右侧 0.2 m；
+    # map 模式允许 0.4 m 的来袭侧容差（弯心），auto/sensor 允许 0.5 m。
+    side_limit = (-0.2 if strict_lane
+                  else (-0.4 if lane_mode == "map" else 0.5))
+    meta = {
+        "lane_side_off_m": (None if side_off is None
+                            else round(float(side_off), 3)),
+        "lane_side_limit_m": float(side_limit),
+        # 配对到底产出了什么：车道宽的配对是"一条车道"，路宽的配对是"整条路"。
+        "pair_width_m": (round(float(getattr(lane_frame, "width", 0.0)
+                                     or 0.0), 2)
+                         if lane_frame is not None else None),
+        "pair_span_m": (round(float(getattr(lane_frame, "span_m", 0.0)
+                                    or 0.0), 2)
+                        if lane_frame is not None else None),
+        "pair_conf": (round(float(getattr(lane_frame, "confidence", 0.0)
+                                  or 0.0), 3)
+                      if lane_frame is not None else None),
+        "pair_paired": int(bool(getattr(lane_frame, "paired", False))),
+        "pair_sources": list(getattr(lane_frame, "sources", ()) or ()),
+    }
+    if not lane_heading_ok(route_ref, lane_ref, pos, heading,
+                           max_yaw_deg=LANE_HEADING_MAX_YAW_DEG):
+        rejected = True
+    elif lane_mode != "sensor" and not lane_route_turn_ok(
+            route_ref, pos,
+            look_m=LANE_ROUTE_TURN_LOOK_M,
+            max_turn_deg=LANE_ROUTE_TURN_MAX_DEG):
+        rejected = True
+        corner_bad = True
+    elif not lane_side_ok(lane_ref, route_ref, pos, left_max_m=side_limit):
+        rejected = True
+        side_bad = True
+    reason = ("side" if side_bad
+              else "corner" if corner_bad else "heading") if rejected else None
+    return {"rejected": rejected, "reason": reason, "side_bad": side_bad,
+            "corner_bad": corner_bad, "meta": meta}
+
+
+def _sensor_lane_within_map(lane_ref, map_center, pos, *,
+                            max_center_m: float):
+    """近场（0.5–8 m）感知中心与**地图本车道中心**是否足够接近。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出，语义不变：
+
+    * ``True``：一致，感知车道可以领；
+    * ``False``：不一致，调用方降级到地图本车道（并把 src 改回 map）；
+    * ``None``：近场点不足 3 个，**判断不了**——搬移前在这种情况下
+      既不降级也不报警，这里保持"不下结论"，由调用方维持原状。
+
+    距离用点到地图中心折线的最小距离，取中位数再与阈值比；阈值随模式：
+    auto 1.5 m（感知领但要求与地图一致）、sensor 2.5 m（允许过弯时偏离）。
+    计算异常照旧抛给调用方——那里有 ``_warn``，在这里吞掉会丢诊断。
+    """
+    lane_pts = np.asarray(lane_ref[:, :2], dtype=float)
+    center_pts = np.asarray(map_center[:, :2], dtype=float)
+    ego = np.asarray(pos[:2], dtype=float)
+    dist = np.linalg.norm(lane_pts - ego[None, :], axis=1)
+    near = np.flatnonzero((dist >= 0.5) & (dist <= 8.0))
+    if len(near) < 3:
+        return None
+    gaps = np.linalg.norm(
+        lane_pts[near][:, None, :] - center_pts[None, :, :], axis=2).min(axis=1)
+    return bool(float(np.median(gaps)) <= float(max_center_m))
+
+
+def _lane_width_from_map_edges(ml, mr, *, default_m: float,
+                               warn=None) -> float:
+    """地图车道左右**实测**边线宽度；取不到就退回 ``default_m``。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出。用最近点距离而不是
+    逐元素配对：两条边线的弧长参数化可以不同（``map_lane_edges`` 只重采样
+    中心线、保留原始边线间距，圆角插值还会插入额外点），逐元素配对在弯道上
+    会读出偏大的宽度（实测）。
+
+    读失败时**保留原来的两条行为**：记一条 ``lane_width`` 告警，然后退回
+    ``default_m``（``map_lane_width_m``，0 则 ``LANE_WIDTH_DEFAULT_M``）——
+    宽度不是一个可以"猜"的量，但缺失时用合同宽度比用 0 安全。
+    """
+    width = 0.0
+    try:
+        from beamng_autopilot.planning.geometry import (
+            polyline_point_distances)
+        left = np.asarray(ml, dtype=float)[:, :2]
+        right = np.asarray(mr, dtype=float)[:, :2]
+        distances = polyline_point_distances(left, right)
+        finite = distances[np.isfinite(distances)]
+        if finite.size:
+            width = float(np.median(finite))
+    except Exception as exc:                         # noqa: BLE001
+        _warn(warn, "lane_width", f"lane width read failed: {exc}")
+    return width if width > 0.0 else float(
+        default_m or LANE_WIDTH_DEFAULT_M)
+
+
+def _trusted_single_paint(lane_frame, lane_ref, *, sensor_paired: bool) -> bool:
+    """剩**一条**感知漆线时，它是否可信到能推出本车道（strict 模式）。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出。配对/融合几何已经拒掉
+    了远距、错侧与未知标线，所以这里只回答"这条单边够不够格"：
+
+    * 必须来自 **vision**（LiDAR 单边推不出车道）；
+    * 不能是已配对的车道（配对有自己的路径）；
+    * 明确画线类型（solid/dashed/thin）门槛 0.35——短视场里保住 strict 控制；
+      其余类型仍要 0.50；
+    * 必须有至少 3 个点的中心折线可推。
+
+    返回 False 时调用方不得从缓存里"复活"单边（见 ``_single_vision`` 的撤销）。
+    """
+    if lane_frame is None or sensor_paired:
+        return False
+    sources = tuple(getattr(lane_frame, "sources", ()) or ())
+    if "vision" not in sources:
+        return False
+    kinds = {getattr(lane_frame, "left_kind", None),
+             getattr(lane_frame, "right_kind", None)}
+    min_conf = 0.35 if kinds & {"solid", "dashed", "thin"} else 0.50
+    confidence = float(getattr(lane_frame, "confidence", 0.0) or 0.0)
+    return bool(confidence >= min_conf
+                and lane_ref is not None and len(lane_ref) >= 3)
+
+
+def _reference_meta(gate_meta, *, divider_dbg, divider, rejected,
+                    reject_reason, src_published, lane_src_sel,
+                    strict_lane) -> dict:
+    """``LaneReference.meta`` 的装配：来源标签 + 拒绝原因 + divider 证据。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出，纯字典构造、无副作用
+    （入参 ``gate_meta`` 被复制，调用方后续对 meta 的增改不会回写）。
+
+    ``lane_src`` 是决策的**纯函数**（``_LABEL_BY_SRC``）：遥测里的标签不可能
+    与真正把关的来源不一致；未发布来源时落到 ``bev/route``——那正是"既没有
+    地图车道也没有感知车道、只有 BEV 自由空间中心"的旧标签。
+    """
+    meta: dict = dict(gate_meta)
+    if divider_dbg:
+        meta["lane_divider"] = divider_dbg
+        if divider is not None:
+            meta["lane_from"] = "divider_right_shift"
+    if rejected and reject_reason is not None:
+        meta["lane_reject_reason"] = reject_reason
+    if src_published:
+        meta["lane_src_sel"] = lane_src_sel
+    meta["lane_src"] = _LABEL_BY_SRC.get(lane_src_sel, SRC_BEV_ROUTE)
+    if strict_lane:
+        meta["lane_strict"] = 1
+    return meta
+
+
+def _bev_whole_road_center(grid, pos, heading, *, strict_lane: bool):
+    """没有导航路线时的**整条路**中心（BEV 自由走廊），兜底用。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出。只在**非 strict** 且真
+    有 BEV 网格时给出：整条路中心不是本车道，双向路上它就是中心线，所以
+    strict 绝不用它（这是 "never reach the planner's lateral reference" 那
+    条约束的执行点）。点不足 4 个也算没有——两三个点的折线推不出横向参考。
+    """
+    if strict_lane or grid is None:
+        return None
+    ref = bev_drivable_center(grid, pos, heading)
+    if ref is None or len(ref) < 4:
+        return None
+    return ref
+
+
+def _paved_boundary_usable(paved_fallback: bool, paved_ref) -> bool:
+    """无标线但有铺装时，铺装边界能否当本车道权威（信任顺序第 3 级）。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出。AGENTS.md「驾驶约束」
+    固定了 trust order：**标线 >> 路面边界 = 护墙 = 围栏**，所以这一级排在
+    感知标线之下、任何地图几何之上。
+
+    候选本身已经 abstain 过一次（铺装右缘必须被观测到、跨度是道路量级、
+    铺装沿自车轨迹可见），所以这一层**不能凭空在草地上造车道**；它的边线
+    会作为本 tick 的**硬边界**发布——这正是"禁止将车辆驾驶到土和草上"的
+    执行点。``paved_fallback`` 默认关，开启才考虑。
+    """
+    if not paved_fallback or paved_ref is None:
+        return False
+    center = getattr(paved_ref, "center", None)
+    return center is not None and len(center) >= 3
+
+
+def _paved_geometry(paved_ref) -> tuple:
+    """铺装车道的 ``(center, left, right, width)``；宽度取实测 ``span_m``。
+
+    只取前两列：``PavedLane`` 的中心折线可能带 z，而横向参考是二维几何。
+    宽度缺失(``span_m`` 为 0/None)就按 0 返回，由调用方决定怎么用——
+    这里不替它猜一个合同宽度。
+    """
+    return (np.asarray(paved_ref.center, dtype=float)[:, :2],
+            np.asarray(paved_ref.left, dtype=float)[:, :2],
+            np.asarray(paved_ref.right, dtype=float)[:, :2],
+            float(getattr(paved_ref, "span_m", 0.0) or 0.0))
+
+
+def _divider_lane(markings, pos, heading, route_ref, grid, *,
+                  debug: dict) -> tuple:
+    """把路线上的漆线当**分隔线**，返回它右侧的半个车道 ``(center, left)``。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出。场景：车正压在（或紧贴）
+    道路中心线上，所有整路读法都被侧向门拒绝，strict 车永远离不开它卡住的
+    那条线。一条**在路线上的**长实/虚线就是分隔线——本车道在它右侧半个车道
+    处，且该中心还要自己过侧向门、落在被观测到的铺装上（后两条仍由调用方
+    执行，这里只负责"找分隔线 + 右移"）。
+
+    返回 ``(divider_or_None, debug_dict)``：失败时 debug 被换成
+    ``{"reason": ...}``（与搬移前一致），调用方用它写进 meta 供复核。
+    """
+    dbg: dict = dict(debug)
+    try:
+        divider = own_lane_beside_divider(
+            markings, pos, heading, route_ref, grid,
+            lane_half_m=0.5 * float(LANE_WIDTH_DEFAULT_M),
+            debug=dbg)
+    except Exception as exc:                         # noqa: BLE001
+        return None, {"reason": f"divider check failed: {exc}"}
+    return divider, dbg
+
+
+def _enforce_publishable(ref_out: LaneReference) -> LaneReference:
+    """末道 fail-closed：``sensor`` 标签但没有可用中心 → 报告 unavailable。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出。它**独立于哪条分支**
+    造成了不一致（plan §3.3-1）：一个带 ``sensor`` 标签却没有几何的决策，
+    必须报成 unavailable 而不是"带标签的空决策"；几何字段一起清掉，任何
+    消费者都不能拿半个决定去转向。
+
+    注意它**不**授权"存在但已被撤销的中心"——撤销的那一步已经把几何清了，
+    两者不可能互相矛盾（``LaneReference.publishable_sensor`` 的注释）。
+    """
+    if ref_out.publishable_sensor:
+        return ref_out
+    meta = ref_out.meta
+    meta["lane_ref_invariant"] = (
+        "sensor source with empty/invalid centre -> unavailable")
+    ref_out.src = SRC_UNAVAILABLE
+    ref_out.src_published = True
+    ref_out.map_lane = None
+    ref_out.center = None
+    ref_out.left = None
+    ref_out.right = None
+    ref_out.width = 0.0
+    ref_out.boundaries = False
+    meta["lane_src_sel"] = SRC_UNAVAILABLE
+    meta["lane_src"] = _LABEL_BY_SRC.get(SRC_UNAVAILABLE, SRC_BEV_ROUTE)
+    return ref_out
+
+
+def _apply_geometry_gate(*, enabled: bool, center, lane_frame, lane_src_sel,
+                         grid, corridor, prev_ref, meta: dict) -> tuple:
+    """形状级撤销（plan E4，默认关）：返回 ``(center, src, revoked)``。
+
+    ``select_lane_reference`` 上面那些门都是**逐样本**的静态门；这里拒的是
+    **形状**不对的车道——宽度来回摆、边界比路还弯、车道夹成一条缝、中心离开
+    可行驶证据或离开观测到的 LiDAR 走廊、以及相对上一帧跳变。只作用于
+    **感知来源**（``sensor`` / ``paved``；地图车道的几何不是感知主张），
+    并且**只能撤销、不能放宽**。默认关闭（``LANE_GEOM_ENABLED``）。
+
+    撤销时调用方还要清 ``boundaries`` / ``lane_width`` / ``map_lane``——
+    那三个量属于最终构造，不属于判定，所以留在调用方。
+
+    与搬移前的一处**有意的偏差**：原实现先把车道清空、再去拼接
+    ``"geom:" + ",".join(reasons)``，万一拼接抛异常就会"已经撤销了但记成
+    检查器错误"。这里先拼字符串、后撤销：拼接失败时决策保持不变，
+    只记 ``lane_geom_error``——对 fail-closed 语义更安全，也更可解释。
+    """
+    if not (enabled and center is not None and len(center) >= 4
+            and lane_src_sel in (SRC_SENSOR, SRC_PAVED)):
+        return center, lane_src_sel, False
+    try:
+        from .geometry_check import check_lane_geometry
+        left = getattr(lane_frame, "left", None)
+        right = getattr(lane_frame, "right", None)
+        report = check_lane_geometry(
+            center=center,
+            left=(None if left is None
+                  else np.asarray(left, dtype=float)[:, :2]),
+            right=(None if right is None
+                   else np.asarray(right, dtype=float)[:, :2]),
+            drivable=grid, corridor=corridor, prev_ref=prev_ref)
+        meta["lane_geom"] = report.digest()
+        if report.ok:
+            return center, lane_src_sel, False
+        reason = "geom:" + ",".join(report.reasons)
+    except Exception as exc:                         # noqa: BLE001
+        meta["lane_geom_error"] = str(exc)
+        return center, lane_src_sel, False
+    meta["lane_reject_reason"] = reason
+    meta["lane_src_sel"] = SRC_UNAVAILABLE
+    meta["lane_src"] = _LABEL_BY_SRC.get(SRC_UNAVAILABLE, SRC_BEV_ROUTE)
+    return None, SRC_UNAVAILABLE, True
+
+
+def _publishes_hard_boundaries(lane_frame, lane_src_sel, map_lane,
+                               divider) -> bool:
+    """本 tick 的左右边线能不能当**硬边界**（no-cross 权威）。
+
+    2026-10-20 从 ``select_lane_reference`` 原样搬出。只有**真的被感知到**的
+    边才算：双侧配对的感知车道、观测到的铺装边（``SRC_PAVED``）、分隔线推出
+    的那条车道（分隔线本身就是检测到的漆线），或者**地图先验自己就是参考**
+    的时候。单边镜像不是物理边——no-cross 规则不能拿一条推出来的线去拦车。
+    """
+    return bool(
+        (lane_frame is not None and getattr(lane_frame, "paired", False))
+        or lane_src_sel == SRC_PAVED
+        or map_lane is not None
+        or (divider is not None and lane_src_sel == SRC_SENSOR))
+
+
 def select_lane_reference(
     *,
     lane_frame,
@@ -736,99 +1078,16 @@ def select_lane_reference(
     _divider_dbg: dict = {}
     if lane_frame is not None and (map_lane is not None or strict_lane):
         try:
-            from beamng_autopilot.planning.arbiter import (
-                lane_heading_ok, lane_route_turn_ok, lane_side_ok,
-                lane_side_offset_m)
-            # Bearing gate: the lane must HEAD the same way as the route
-            # (junction pairing onto a side road is rejected).
-            side_bad = False
-            corner_bad = False
-            # Where the sensor lane centre sits relative to the route, and
-            # the threshold the side gate will apply.  A refusal is only
-            # reviewable with the number that caused it: without it "the
-            # gate said no" cannot be told apart from a pairing error.
-            try:
-                _side_off = lane_side_offset_m(lane_ref, route_ref, pos)
-            except Exception:
-                _side_off = None
-            _side_limit = (-0.2 if strict_lane
-                           else (-0.4 if lane_mode == "map" else 0.5))
-            gate_meta = {
-                "lane_side_off_m": (None if _side_off is None
-                                    else round(float(_side_off), 3)),
-                "lane_side_limit_m": float(_side_limit),
-                # What the pairing actually produced: a lane-width pair is a
-                # lane read, a road-width one is the whole roadway.
-                "pair_width_m": (round(float(getattr(lane_frame, "width", 0.0)
-                                             or 0.0), 2)
-                                 if lane_frame is not None else None),
-                "pair_span_m": (round(float(getattr(lane_frame, "span_m", 0.0)
-                                            or 0.0), 2)
-                                if lane_frame is not None else None),
-                "pair_conf": (round(float(getattr(lane_frame, "confidence", 0.0)
-                                          or 0.0), 3)
-                              if lane_frame is not None else None),
-                "pair_paired": int(bool(getattr(lane_frame, "paired", False))),
-                "pair_sources": list(getattr(lane_frame, "sources", ()) or ()),
-            }
-            if not lane_heading_ok(route_ref, lane_ref, pos, heading,
-                                   max_yaw_deg=LANE_HEADING_MAX_YAW_DEG):
+            verdict = _lane_gate_verdict(
+                lane_frame=lane_frame, lane_ref=lane_ref, route_ref=route_ref,
+                pos=pos, heading=heading, lane_mode=lane_mode,
+                strict_lane=strict_lane)
+            gate_meta = verdict["meta"]
+            if verdict["rejected"]:
                 lane_rejected = True
-            # CORNER gate: at a real turn in the nav route the map-prior
-            # own lane is the authority - the sensor lane reads the
-            # corner wide and steers the car off the line (see
-            # LANE_ROUTE_TURN_MAX_DEG).  The 35 deg heading gate alone
-            # does not catch it: a wide corner read can still be within
-            # 35 deg of the route.  Only the map mode keeps this;
-            # perception-led modes let the sensor lane lead through
-            # corners (the map guard-rail still stops a real crossing).
-            elif lane_mode != "sensor" and not lane_route_turn_ok(
-                    route_ref, pos,
-                    look_m=LANE_ROUTE_TURN_LOOK_M,
-                    max_turn_deg=LANE_ROUTE_TURN_MAX_DEG):
-                lane_rejected = True
-                corner_bad = True
-            # SIDE gate (safety net, NOT a navigator preference): the lane
-            # centre must sit clearly RIGHT of the road centreline
-            # (own lane).  A lane locked onto the ONCOMING lane passes
-            # the bearing gate (same direction) but still steers the car
-            # over the centre line (town runs 2026-08-22: the car rode
-            # the centre/oncoming lane end to end with lane_src=sensor).
-            # A lane sitting ON the centreline is the WHOLE-ROAD free
-            # corridor, not the own lane - trusting it parks the car on
-            # the centre line and the switch to the map-prior own lane
-            # then forces a 2-3 m over-correction that swings it off the
-            # road edge (mountain run 2026-08-27 run_fix31: after the
-            # junction the car rode the centre line, then over-corrected
-            # right and wedged at (741.2,745.7)).
-            #
-            # This gate is ALWAYS on - it is the last wall between an
-            # unpaired sensor centre (often the whole-road corridor on a
-            # two-way road) and the planner.  Strict perception
-            # (``lane_mode=sensor + strict_sensor``) tightens it to
-            # -0.2 m: the lane centre must sit at least 0.2 m RIGHT of
-            # the route (own side only).  ``off=0`` (lane sitting on the
-            # road centre line) is rejected - that is the whole-road
-            # corridor, not the ego lane, and it is exactly the failure
-            # mode the live town run 2026-09-20 exposed (see below).
-            # Without strict perception we allow a small oncoming-side
-            # read for corner apex (perception-led modes) or the legacy
-            # map-prior tolerance (map mode); both still keep the map
-            # centreline as the hard no-cross boundary downstream.
-            #
-            # Regression: live town run 2026-09-20 --strict kept this
-            # gate bypassed and the car sat on the road centre line at
-            # mean=+1.18 m painted-line lateral (p50=+1.04 m), straddle
-            # the divider for 75 of 166 frames and stall on the way to
-            # the goal.  See gate_on_3.log and the screenshot in
-            # docs/reviews/2026-09-20_strict_centerline.md.
-            elif not lane_side_ok(
-                    lane_ref, route_ref, pos, left_max_m=_side_limit):
-                lane_rejected = True
-                side_bad = True
-            if lane_rejected:
-                reject_reason = ("side" if side_bad
-                                 else "corner" if corner_bad else "heading")
+                reject_reason = str(verdict["reason"])
+                # 整条感知车道都不可信：中心与（可能错误的）硬边界一起丢弃，
+                # 否则 no-cross 规则会拿一条错边去拦车。
                 sensor_paired = False
                 lane_ref = None
                 lane_left = None
@@ -863,21 +1122,14 @@ def select_lane_reference(
                 # = looser 2.5 m gate so the perception lane can lead
                 # through corners.
                 try:
-                    _lr2 = np.asarray(lane_ref[:, :2], dtype=float)
-                    _mc2 = np.asarray(mc[:, :2], dtype=float)
-                    _p2 = np.asarray(pos[:2], dtype=float)
-                    _d2 = np.linalg.norm(_lr2 - _p2[None, :], axis=1)
-                    _sel2 = np.flatnonzero((_d2 >= 0.5) & (_d2 <= 8.0))
-                    if len(_sel2) >= 3:
-                        _dm = np.linalg.norm(
-                            _lr2[_sel2][:, None, :]
-                            - _mc2[None, :, :], axis=2).min(axis=1)
-                        _max_c = (lane_consistency_sensor_m
-                                  if lane_mode == "sensor"
-                                  else lane_consistency_m)
-                        if float(np.median(_dm)) > _max_c:
-                            lane_ref = mc
-                            lane_src_sel = SRC_MAP
+                    within = _sensor_lane_within_map(
+                        lane_ref, mc, pos,
+                        max_center_m=(lane_consistency_sensor_m
+                                      if lane_mode == "sensor"
+                                      else lane_consistency_m))
+                    if within is False:
+                        lane_ref = mc
+                        lane_src_sel = SRC_MAP
                 except Exception as exc:
                     lane_ref = mc
                     lane_src_sel = SRC_MAP
@@ -903,28 +1155,8 @@ def select_lane_reference(
             # Real road-edge width when the map lane comes from DecalRoad
             # edges (median left-right distance); fall back to the fixed
             # map-prior lane width otherwise.
-            _w = 0.0
-            try:
-                from beamng_autopilot.planning.geometry import (
-                    polyline_point_distances)
-                _ml = np.asarray(ml, dtype=float)[:, :2]
-                _mr = np.asarray(mr, dtype=float)[:, :2]
-                # the left/right polylines can carry DIFFERENT arc
-                # parametrisations (map_lane_edges resamples the
-                # centreline but keeps raw edge spacing, and corner
-                # interpolation inserts extra points) - element-wise
-                # pairing reads an inflated width on any curve.
-                # Nearest-point distances are alignment-robust.
-                _wa = polyline_point_distances(_ml, _mr)
-                _wf = _wa[np.isfinite(_wa)]
-                if _wf.size:
-                    _w = float(np.median(_wf))
-            except Exception as exc:
-                _w = 0.0
-                _warn(warn, "lane_width",
-                      f"lane width read failed: {exc}")
-            lane_width = (_w if _w > 0.0
-                          else float(map_lane_width_m or LANE_WIDTH_DEFAULT_M))
+            lane_width = _lane_width_from_map_edges(
+                ml, mr, default_m=map_lane_width_m, warn=warn)
 
     # FSD realism (strict sensor): the lane-keep reference and hard
     # boundaries must come from PERCEPTION only (docs/fsd_realism.md §4).
@@ -933,24 +1165,8 @@ def select_lane_reference(
     # from the painted-line lane-width contract, never from the map.
     # Ambiguous/no-vision reads still stop.
     if strict_lane:
-        _single_conf = float(getattr(lane_frame, "confidence", 0.0) or 0.0) \
-            if lane_frame is not None else 0.0
-        _single_kinds = {
-            getattr(lane_frame, "left_kind", None),
-            getattr(lane_frame, "right_kind", None),
-        } if lane_frame is not None else set()
-        # The pairing/fusion geometry already rejects far, wrong-side and
-        # unknown markings.  A near explicit painted edge at 0.35 is enough
-        # to keep strict control alive on the short US view; retain 0.50 for
-        # generic single-edge frames.
-        _single_min_conf = (0.35 if _single_kinds & {"solid", "dashed", "thin"}
-                            else 0.50)
-        _single_vision = bool(
-            lane_frame is not None
-            and not sensor_paired
-            and "vision" in tuple(getattr(lane_frame, "sources", ()) or ())
-            and _single_conf >= _single_min_conf
-            and lane_ref is not None and len(lane_ref) >= 3)
+        _single_vision = _trusted_single_paint(
+            lane_frame, lane_ref, sensor_paired=sensor_paired)
         # Painted-divider fallback: the car stands on (or beside) the road
         # centreline, so every whole-road read is refused by the side gate
         # and a strict car could never leave the line it is stuck on.  A
@@ -959,14 +1175,9 @@ def select_lane_reference(
         # pass the side gate and land on observed drivable pavement.
         if not (sensor_paired and lane_ref is not None and len(lane_ref) >= 3) \
                 and not _single_vision:
-            try:
-                _divider = own_lane_beside_divider(
-                    markings, pos, heading, route_ref, grid,
-                    lane_half_m=0.5 * float(LANE_WIDTH_DEFAULT_M),
-                    debug=_divider_dbg)
-            except Exception as exc:
-                _divider = None
-                _divider_dbg = {"reason": f"divider check failed: {exc}"}
+            _divider, _divider_dbg = _divider_lane(
+                markings, pos, heading, route_ref, grid,
+                debug=_divider_dbg)
             if _divider is not None:
                 lane_ref = _divider[0]
                 lane_left = _divider[1]
@@ -1022,22 +1233,14 @@ def select_lane_reference(
         elif _divider is not None:
             lane_src_sel = SRC_SENSOR
             lane_right = None
-        elif (paved_fallback and paved_ref is not None
-              and getattr(paved_ref, "center", None) is not None
-              and len(paved_ref.center) >= 3):
+        elif _paved_boundary_usable(paved_fallback, paved_ref):
             # NO usable marking on a road that IS paved: the pavement
             # boundary is the authority (AGENTS.md「驾驶约束」: 标线 >>
-            # 路面边界 = 护墙 = 围栏).  The candidate already abstained
-            # unless the paved RIGHT edge is observed inside the image,
-            # the span is road-sized and the pavement is observed along
-            # the car's own track, so this branch can not invent a lane on
-            # grass; its edges are published as the tick's HARD
-            # boundaries, which is what keeps the car on the pavement
-            # ("禁止将车辆驾驶到土和草上").
-            lane_ref = np.asarray(paved_ref.center, dtype=float)[:, :2]
-            lane_left = np.asarray(paved_ref.left, dtype=float)[:, :2]
-            lane_right = np.asarray(paved_ref.right, dtype=float)[:, :2]
-            lane_width = float(getattr(paved_ref, "span_m", 0.0) or 0.0)
+            # 路面边界 = 护墙 = 围栏).  Its edges are published as the
+            # tick's HARD boundaries, which is what keeps the car on the
+            # pavement ("禁止将车辆驾驶到土和草上").
+            lane_ref, lane_left, lane_right, lane_width = \
+                _paved_geometry(paved_ref)
             lane_src_sel = SRC_PAVED
         else:
             lane_ref = None
@@ -1068,76 +1271,36 @@ def select_lane_reference(
     # never reaches the planner's lateral reference there.  Strict sensor
     # mode skips it too: the whole-road centre is not the ego lane.
     if lane_ref is None or len(lane_ref) < 4:
-        bev_ref = None
-        if not strict_lane and grid is not None:
-            bev_ref = bev_drivable_center(grid, pos, heading)
-        if bev_ref is not None and len(bev_ref) >= 4:
+        bev_ref = _bev_whole_road_center(grid, pos, heading,
+                                         strict_lane=strict_lane)
+        if bev_ref is not None:
             lane_ref = bev_ref
 
     center = (np.asarray(lane_ref, dtype=float)
               if lane_ref is not None else None)
     # Only a REAL sensor detection provides hard lane boundaries: a
-    # two-sided lane pair, the observed pavement edges (SRC_PAVED), or the
-    # map prior when IT is the reference.  A single-edge mirror is not a
-    # physical edge the no-cross rule may enforce.
-    boundaries = bool(
-        (lane_frame is not None and getattr(lane_frame, "paired", False))
-        or lane_src_sel == SRC_PAVED
-        or map_lane is not None
-        # The divider IS a detected painted edge, so the lane it implies
-        # publishes it as a real hard boundary (no-cross authority).
-        or (_divider is not None and lane_src_sel == SRC_SENSOR))
-    meta: dict = dict(gate_meta)
-    if _divider_dbg:
-        meta["lane_divider"] = _divider_dbg
-        if _divider is not None:
-            meta["lane_from"] = "divider_right_shift"
-    if lane_rejected and reject_reason is not None:
-        meta["lane_reject_reason"] = reject_reason
-    if src_published:
-        meta["lane_src_sel"] = lane_src_sel
-    # ``lane_src`` is a pure function of the decision above, so the label
-    # in the telemetry can never disagree with the source that gated the
-    # planning (see _LABEL_BY_SRC).  An unpublished source means no map
-    # lane and no sensor lane were involved - the BEV free-space centre
-    # case - which is exactly the legacy "bev/route" label.
-    meta["lane_src"] = _LABEL_BY_SRC.get(lane_src_sel, SRC_BEV_ROUTE)
-    if strict_lane:
-        meta["lane_strict"] = 1
-    # Geometric consistency (plan E4, opt-in): the static gates above accept
-    # a lane sample by sample; this refuses one whose SHAPE is wrong - a
-    # pair whose width swings, a boundary that bends tighter than a road, a
-    # "lane" that pinches shut, a centre off the drivable evidence or off
-    # the observed LiDAR corridor, or one that jumped since the last frame.
-    # It applies to SENSOR-derived lanes only (a map lane's geometry is not
-    # a perception claim) and it can only withdraw, never relax.
-    if (LANE_GEOM_ENABLED and center is not None and len(center) >= 4
-            and lane_src_sel in (SRC_SENSOR, SRC_PAVED)):
-        try:
-            from .geometry_check import check_lane_geometry
-            _left = getattr(lane_frame, "left", None)
-            _right = getattr(lane_frame, "right", None)
-            _rep = check_lane_geometry(
-                center=center,
-                left=(None if _left is None
-                      else np.asarray(_left, dtype=float)[:, :2]),
-                right=(None if _right is None
-                       else np.asarray(_right, dtype=float)[:, :2]),
-                drivable=grid, corridor=corridor, prev_ref=prev_ref)
-            meta["lane_geom"] = _rep.digest()
-            if not _rep.ok:
-                center = None
-                boundaries = False
-                lane_width = 0.0
-                lane_src_sel = SRC_UNAVAILABLE
-                map_lane = None
-                meta["lane_reject_reason"] = "geom:" + ",".join(
-                    _rep.reasons)
-                meta["lane_src_sel"] = SRC_UNAVAILABLE
-                meta["lane_src"] = _LABEL_BY_SRC.get(SRC_UNAVAILABLE,
-                                                     SRC_BEV_ROUTE)
-        except Exception as exc:
-            meta["lane_geom_error"] = str(exc)
+    # two-sided lane pair, the observed pavement edges (SRC_PAVED), the
+    # divider's own painted edge, or the map prior when IT is the
+    # reference.  A single-edge mirror is not a physical edge the no-cross
+    # rule may enforce (see _publishes_hard_boundaries).
+    boundaries = _publishes_hard_boundaries(
+        lane_frame, lane_src_sel, map_lane, _divider)
+    meta = _reference_meta(
+        gate_meta, divider_dbg=_divider_dbg, divider=_divider,
+        rejected=lane_rejected, reject_reason=reject_reason,
+        src_published=src_published, lane_src_sel=lane_src_sel,
+        strict_lane=strict_lane)
+    # Geometric consistency (plan E4, opt-in): static gates above accept a
+    # lane sample by sample; this refuses one whose SHAPE is wrong.  It can
+    # only withdraw, never relax (see _apply_geometry_gate).
+    center, lane_src_sel, _geom_revoked = _apply_geometry_gate(
+        enabled=LANE_GEOM_ENABLED, center=center, lane_frame=lane_frame,
+        lane_src_sel=lane_src_sel, grid=grid, corridor=corridor,
+        prev_ref=prev_ref, meta=meta)
+    if _geom_revoked:
+        boundaries = False
+        lane_width = 0.0
+        map_lane = None
     ref_out = LaneReference(
         center=center,
         left=lane_left,
@@ -1164,22 +1327,4 @@ def select_lane_reference(
                       and getattr(lane_frame, "inferred", False)),
         meta=meta,
     )
-    if not ref_out.publishable_sensor:
-        # Fail-closed backstop, independent of which branch produced the
-        # inconsistency: a ``sensor`` label without usable centre geometry
-        # is reported unavailable instead of steering anything (plan
-        # §3.3-1).  The geometry fields are cleared with it so no consumer
-        # can act on half a decision.
-        meta["lane_ref_invariant"] = (
-            "sensor source with empty/invalid centre -> unavailable")
-        ref_out.src = SRC_UNAVAILABLE
-        ref_out.src_published = True
-        ref_out.map_lane = None
-        ref_out.center = None
-        ref_out.left = None
-        ref_out.right = None
-        ref_out.width = 0.0
-        ref_out.boundaries = False
-        meta["lane_src_sel"] = SRC_UNAVAILABLE
-        meta["lane_src"] = _LABEL_BY_SRC.get(SRC_UNAVAILABLE, SRC_BEV_ROUTE)
-    return ref_out
+    return _enforce_publishable(ref_out)
