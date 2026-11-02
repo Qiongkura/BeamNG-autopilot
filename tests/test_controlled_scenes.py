@@ -621,8 +621,11 @@ def test_capture_records_local_mount_direction_for_replay():
     assert "mount_dir_local" in src
 
 
-def test_west_coast_ground_alignment_shifts_mid_and_z_profile_only_for_that_map():
+def test_ground_alignment_applies_to_measured_z_defect_maps_only():
     m = _load()
+    # 集合只收有实测 z 偏差证据的地图（west_coast ~69m、east_coast ~28m）
+    assert m.GROUND_ALIGN_MAPS == {"west_coast_usa", "east_coast_usa"}
+
     class Conn:
         def ground_z_at(self, x, y):
             return 213.5
@@ -632,6 +635,10 @@ def test_west_coast_ground_alignment_shifts_mid_and_z_profile_only_for_that_map(
     assert sites[0]["mid"][2] == pytest.approx(213.5)
     assert sites[0]["z_profile"] == [[0.0, 213.5], [10.0, 214.5]]
     assert sites[0]["ground_alignment"]["status"] == "measured"
+    eca = [{"mid": [1.0, 2.0, 26.07], "z_profile": [[0.0, 26.07]]}]
+    m._align_sites_to_ground(Conn(), eca, "east_coast_usa")
+    assert eca[0]["mid"][2] == pytest.approx(213.5)
+    assert eca[0]["ground_alignment"]["status"] == "measured"
     other = [{"mid": [1.0, 2.0, 144.5], "z_profile": [[0.0, 144.5]]}]
     m._align_sites_to_ground(Conn(), other, "italy")
     assert "ground_alignment" not in other[0]
@@ -641,6 +648,10 @@ def test_run_scene_metadata_preserves_requested_map_and_palette_source():
     src = (Path(__file__).resolve().parents[1] / "scripts"
            / "m5_controlled_scenes.py").read_text("utf-8")
     assert '"map": str(map_name)' in src
+    # asset 块也要跟请求地图走：这里曾硬编码 "italy"，west_coast 批次的
+    # verification.stats.asset.map 因此误记为 italy（凭证里靠导出侧
+    # --map 才没被污染）。
+    assert '"asset": {"map": str(map_name)' in src
     assert '"annotation_palette": palette' in src
 
 
@@ -655,5 +666,138 @@ def test_west_coast_rechecks_ground_after_scenario_load_and_can_reload():
     src = (Path(__file__).resolve().parents[1] / "scripts"
            / "m5_controlled_scenes.py").read_text("utf-8")
     assert "sites_after_ground_alignment_reload" in src
-    assert "west_coast_ground_reload" in src
+    assert "post_load_ground_recheck" in src
     assert "conn.bng.scenario.load(scen)" in src
+
+
+def test_east_coast_profile_uses_annotation_writable_material_and_width():
+    m = _load()
+    prof = m.MAP_PROFILES["east_coast_usa"]
+    # 2026-10-18 探针定因后换材质/线宽：east 的 line_white/line_yellow 家族
+    # opacityFactor 0.7 × bcf alpha 0.8–0.9，annotation pass 的 alphaRef=255
+    # alpha 测试全像素剔除（ECA1/ECA2 0/5 根因）；唯一"annotation 写得进 +
+    # 真值点居中"的替代是 line_yellow_double（alphaTest=True/alphaRef=0）。
+    assert prof["white"] == "line_yellow_double"
+    assert prof["yellow"] == "line_yellow_double"
+    assert prof["line_width"] == 0.40  # 0.15 m 双条纹亚像素 appearance 0.43–0.67 挂
+    assert prof["pave"] == "AsphaltRoad_variation_two_way"
+    assert prof["gravel"] == "DirtRoad_variation_01"
+    assert prof["blue"] is None  # 该地图无蓝色虚线材质，material_mix 不可用
+    assert prof["anchor"] is None
+    eff = m.apply_map_profile("east_coast_usa")
+    assert eff["white"] == "line_yellow_double"
+    assert eff["line_width"] == 0.40
+    assert m.MAT_PAVE == "AsphaltRoad_variation_two_way"
+    assert m.LINE_WIDTH_M == 0.40
+    assert m._MAT == {"white": "line_yellow_double",
+                      "yellow": "line_yellow_double", "blue": None}
+
+
+def test_utah_profile_uses_annotation_writable_material_and_width():
+    m = _load()
+    prof = m.MAP_PROFILES["utah"]
+    # 2026-10-18 Utah.zip 复扫 + 同款探针实测：line_white/line_yellow 同 east
+    # alpha 缺陷（opacityFactor 0.7 × bcf alpha 0.90/1.0，alphaRef=255 全剔）；
+    # line_yellow_double（alphaTest=True/alphaRef=0）实测唯一可写实线（近距
+    # bin solid 4/4 vs 0/3、0/4，2 运行一致）。线宽 0.40m 与 east 同款纹理：
+    # 0.20–0.30m 双条纹亚像素无漆、0.50m 远距回落，0.40m 探针 annotation 全写、
+    # 导出门 paint_like 30/30×2。
+    assert prof["white"] == "line_yellow_double"
+    assert prof["yellow"] == "line_yellow_double"
+    assert prof["line_width"] == 0.40
+    assert prof["pave"] == "AsphaltRoad_variation_01"
+    assert prof["gravel"] == "dirt_road_gravels"
+    assert prof["blue"] is None  # 该地图无蓝色虚线材质，material_mix 不可用
+    assert prof["anchor"] is None
+    eff = m.apply_map_profile("utah")
+    assert eff["white"] == "line_yellow_double"
+    assert eff["line_width"] == 0.40
+    assert m.MAT_PAVE == "AsphaltRoad_variation_01"
+    assert m.MAT_GRAVEL == "dirt_road_gravels"
+    assert m.LINE_WIDTH_M == 0.40
+    assert m._MAT == {"white": "line_yellow_double",
+                      "yellow": "line_yellow_double", "blue": None}
+    # road z 与地形实测一致（探针站点 delta 0.02m，teleport_alignment 记录），
+    # 无 z 埋地证据 → 不进 GROUND_ALIGN_MAPS（与实测 z 缺陷地图区分）
+    assert "utah" not in m.GROUND_ALIGN_MAPS
+
+
+def test_map_profile_line_width_defaults_to_contract_and_overrides():
+    m = _load()
+    # west/italy 档案没声明 line_width → 合同宽度 0.15 不变
+    eff = m.apply_map_profile("west_coast_usa")
+    assert eff["line_width"] == 0.15
+    assert m.LINE_WIDTH_M == 0.15
+    # CLI 覆盖（--line-width）压过档案
+    eff = m.apply_map_profile("east_coast_usa", overrides={"line_width": 0.25})
+    assert eff["line_width"] == 0.25
+    assert m.LINE_WIDTH_M == 0.25
+    # 无档案地图 + 显式材质时也回落到 0.15（utah 2026-10-18 已建档案 0.40，
+    # 换一个仍未建档案的地图名验证回落语义）
+    eff = m.apply_map_profile("smallgrid", overrides={
+        "white": "line_white", "yellow": "line_yellow",
+        "pave": "road_asphalt", "gravel": "m_dirt_road_gravels"})
+    assert eff["line_width"] == 0.15
+
+
+def test_east_line_material_choice_matches_map_alpha_admission():
+    """档案选材必须满足 annotation 可写性（对真实资产回归）。
+
+    annotation pass 的 alpha 测试语义：alphaTest 缺席时按 alphaRef 阈值
+    剔像素（255 = 最终 alpha<255 全剔）。east 线材质必须 alphaTest=True
+    或 alphaRef=0，否则 annotation 写不进（ECA1/ECA2 0/5 根因）。
+    """
+    zip_path = Path(r"G:\BeamNG.tech.v0.38.5.0\content\levels\east_coast_usa.zip")
+    if not zip_path.exists():
+        pytest.skip("BeamNG 地图 zip 不在本机（G: 盘）")
+    import json as _json
+    import zipfile as _zip
+    with _zip.ZipFile(zip_path) as zf:
+        mats = _json.loads(
+            zf.read("levels/east_coast_usa/art/road/main.materials.json"))
+    m = _load()
+    for kind in ("white", "yellow"):
+        name = m.MAP_PROFILES["east_coast_usa"][kind]
+        d = mats[name]
+        writable = bool(d.get("alphaTest")) or int(d.get("alphaRef", 255)) < 255
+        assert writable, f"{name} annotation 不可写（alphaRef={d.get('alphaRef')})"
+    # 被换下的材质正是反例：alphaRef=255 且 opacity 缩放 → annotation 全剔
+    for name in ("line_white", "line_yellow"):
+        d = mats[name]
+        stage = (d.get("Stages") or [{}])[0]
+        assert int(d.get("alphaRef", 255)) == 255 and not d.get("alphaTest")
+        assert (stage.get("opacityFactor") or 1.0) < 1.0
+
+
+def test_utah_line_material_choice_matches_map_alpha_admission():
+    """utah 档案选材同款可写性回归（对真实 Utah.zip 资产）。
+
+    Utah.zip 的 line_white/line_yellow 与 east 同缺陷（opacityFactor 0.7 ×
+    bcf alpha 0.90/1.0，alphaRef=255 → annotation 全剔，探针近距 bin
+    solid 0/3、0/4 实测印证）；line_yellow_double alphaTest=True/alphaRef=0
+    是唯一可写实线（探针近距 bin solid 4/4 ×2 运行）。
+    """
+    zip_path = Path(r"G:\BeamNG.tech.v0.38.5.0\content\levels\Utah.zip")
+    if not zip_path.exists():
+        pytest.skip("BeamNG 地图 zip 不在本机（G: 盘）")
+    import json as _json
+    import zipfile as _zip
+    with _zip.ZipFile(zip_path) as zf:
+        mats = _json.loads(
+            zf.read("levels/Utah/art/road/main.materials.json"))
+    m = _load()
+    for kind in ("white", "yellow"):
+        name = m.MAP_PROFILES["utah"][kind]
+        d = mats[name]
+        if isinstance(d, list):
+            d = d[0]
+        writable = bool(d.get("alphaTest")) or int(d.get("alphaRef", 255)) < 255
+        assert writable, f"{name} annotation 不可写（alphaRef={d.get('alphaRef')})"
+    # 反例同 east：alphaRef=255 且 opacity 缩放 → annotation 全剔
+    for name in ("line_white", "line_yellow"):
+        d = mats[name]
+        if isinstance(d, list):
+            d = d[0]
+        stage = (d.get("Stages") or [{}])[0]
+        assert int(d.get("alphaRef", 255)) == 255 and not d.get("alphaTest")
+        assert (stage.get("opacityFactor") or 1.0) < 1.0
