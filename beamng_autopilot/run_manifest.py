@@ -224,10 +224,16 @@ def own_process_lineage(pid: int | None = None) -> set:
     kin = {me}
     try:
         import psutil
+    except ImportError:                        # 没装 psutil：只保护自己
+        return kin
+    try:
         for parent in psutil.Process(me).parents():
             kin.add(parent.pid)
-    except Exception:
-        pass                       # no psutil, or an injected pid
+    except psutil.Error:
+        # 父链读不到是**预期内**的（权限受限 / 进程已退出 / 注入的假 pid）。
+        # 这里只收窄到 psutil 自己的异常：别的错误说明这段代码坏了，
+        # 应当冒出去，而不是被静默当成"没有父进程"。
+        pass
     return kin
 
 
@@ -249,21 +255,23 @@ def other_controller_processes(pid: int | None = None,
     if procs is None:
         try:
             import psutil
-        except Exception:
+        except ImportError:
             return found
         try:
             procs = list(psutil.process_iter(
                 attrs=["pid", "name", "cmdline", "create_time"]))
-        except Exception:
+        except psutil.Error:
             return found
     for p in procs or ():
         try:
             info = p.info if hasattr(p, "info") else dict(p)
-        except Exception:
+        except (AttributeError, TypeError, ValueError):
+            # 注入的假进程可能不是映射；跳过它是预期行为，
+            # 但别的异常说明这里真的坏了，不该再被吞掉。
             continue
         try:
             ppid = int(info.get("pid"))
-        except Exception:
+        except (TypeError, ValueError):
             continue
         if ppid in kin:
             continue

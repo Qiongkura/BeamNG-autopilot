@@ -171,6 +171,7 @@ def disarm(conn) -> None:
     """Disarm the watchdog (safe to call when never armed)."""
     try:
         _cmd(conn, f"autopilot_watchdog.disarm(); return 1")
-    except Exception:
-        # NOTE: bare except kept — disarm is best-effort; ignore any error.
-        pass
+    except Exception as exc:                       # noqa: BLE001
+        # 收尾阶段不能因为 disarm 失败而崩，但**必须留痕**：watchdog 还挂着
+        # 意味着后续那条连接可能被它按自己的规则刹车，事后要能查到这里。
+        logger.warning("[watchdog] disarm failed: %s", exc)
