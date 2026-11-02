@@ -98,7 +98,10 @@ def main() -> int:
     ap.add_argument("--batch", type=int, default=8)
     ap.add_argument("--lr", type=float, default=1e-3)
     ap.add_argument("--device", default=None)
+    ap.add_argument("--seed", type=int, default=0,
+                    help="SSL 自身随机种子（重复复核时换种子）")
     args = ap.parse_args()
+    torch.manual_seed(int(args.seed))
 
     dev = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
     x = _load_frames(args.runs)
@@ -107,7 +110,7 @@ def main() -> int:
 
     ae = _AutoEncoder().to(dev)
     opt = torch.optim.Adam(ae.parameters(), lr=args.lr)
-    g = torch.Generator().manual_seed(0)
+    g = torch.Generator().manual_seed(int(args.seed))
     t0 = time.time()
     for ep in range(args.epochs):
         perm = torch.randperm(n, generator=g)
