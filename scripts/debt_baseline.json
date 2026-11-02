@@ -1,0 +1,1171 @@
+{
+ "files": {
+  "beamng_autopilot/__init__.py": {
+   "except_exception": 0,
+   "lines": 3,
+   "max_func_lines": 0,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/autopilot.py": {
+   "except_exception": 50,
+   "lines": 2803,
+   "max_func_lines": 1192,
+   "prints": 61,
+   "silent_except": 18
+  },
+  "beamng_autopilot/bc.py": {
+   "except_exception": 0,
+   "lines": 56,
+   "max_func_lines": 15,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/bev_fusion.py": {
+   "except_exception": 0,
+   "lines": 299,
+   "max_func_lines": 48,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/bridge.py": {
+   "except_exception": 0,
+   "lines": 95,
+   "max_func_lines": 14,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/config.py": {
+   "except_exception": 1,
+   "lines": 191,
+   "max_func_lines": 33,
+   "prints": 1,
+   "silent_except": 1
+  },
+  "beamng_autopilot/connector.py": {
+   "except_exception": 19,
+   "lines": 1067,
+   "max_func_lines": 72,
+   "prints": 0,
+   "silent_except": 1
+  },
+  "beamng_autopilot/control/__init__.py": {
+   "except_exception": 0,
+   "lines": 1,
+   "max_func_lines": 0,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/control/blend.py": {
+   "except_exception": 0,
+   "lines": 137,
+   "max_func_lines": 39,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/control/drive_mode.py": {
+   "except_exception": 0,
+   "lines": 179,
+   "max_func_lines": 47,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/control/gearbox.py": {
+   "except_exception": 5,
+   "lines": 177,
+   "max_func_lines": 52,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/control/handover.py": {
+   "except_exception": 4,
+   "lines": 216,
+   "max_func_lines": 94,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/control/pid.py": {
+   "except_exception": 0,
+   "lines": 38,
+   "max_func_lines": 16,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/control/pure_pursuit.py": {
+   "except_exception": 0,
+   "lines": 77,
+   "max_func_lines": 29,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/control/reverse_guard.py": {
+   "except_exception": 0,
+   "lines": 84,
+   "max_func_lines": 35,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/control/reverse_maneuver.py": {
+   "except_exception": 0,
+   "lines": 219,
+   "max_func_lines": 93,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/control/speed.py": {
+   "except_exception": 0,
+   "lines": 155,
+   "max_func_lines": 59,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/control/steering.py": {
+   "except_exception": 0,
+   "lines": 211,
+   "max_func_lines": 98,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/control/substep.py": {
+   "except_exception": 0,
+   "lines": 86,
+   "max_func_lines": 32,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/damage.py": {
+   "except_exception": 0,
+   "lines": 83,
+   "max_func_lines": 29,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/data_contract.py": {
+   "except_exception": 4,
+   "lines": 285,
+   "max_func_lines": 73,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/eval.py": {
+   "except_exception": 1,
+   "lines": 878,
+   "max_func_lines": 284,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/auto_truth.py": {
+   "except_exception": 3,
+   "lines": 2270,
+   "max_func_lines": 260,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/autonomous_data.py": {
+   "except_exception": 1,
+   "lines": 310,
+   "max_func_lines": 97,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/candidate_metrics.py": {
+   "except_exception": 0,
+   "lines": 228,
+   "max_func_lines": 41,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/checkpoint.py": {
+   "except_exception": 1,
+   "lines": 187,
+   "max_func_lines": 22,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/collection.py": {
+   "except_exception": 5,
+   "lines": 501,
+   "max_func_lines": 80,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/controller.py": {
+   "except_exception": 9,
+   "lines": 782,
+   "max_func_lines": 72,
+   "prints": 0,
+   "silent_except": 1
+  },
+  "beamng_autopilot/experiments/credentials.py": {
+   "except_exception": 1,
+   "lines": 128,
+   "max_func_lines": 41,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/events.py": {
+   "except_exception": 2,
+   "lines": 231,
+   "max_func_lines": 32,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/evidence_archive.py": {
+   "except_exception": 0,
+   "lines": 37,
+   "max_func_lines": 27,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/final_set.py": {
+   "except_exception": 3,
+   "lines": 260,
+   "max_func_lines": 35,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/gates.py": {
+   "except_exception": 1,
+   "lines": 878,
+   "max_func_lines": 112,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/labels.py": {
+   "except_exception": 0,
+   "lines": 375,
+   "max_func_lines": 107,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/learning_status.py": {
+   "except_exception": 0,
+   "lines": 73,
+   "max_func_lines": 63,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/lineage.py": {
+   "except_exception": 2,
+   "lines": 277,
+   "max_func_lines": 88,
+   "prints": 0,
+   "silent_except": 1
+  },
+  "beamng_autopilot/experiments/manifest.py": {
+   "except_exception": 1,
+   "lines": 898,
+   "max_func_lines": 158,
+   "prints": 0,
+   "silent_except": 1
+  },
+  "beamng_autopilot/experiments/metrics.py": {
+   "except_exception": 9,
+   "lines": 507,
+   "max_func_lines": 75,
+   "prints": 0,
+   "silent_except": 1
+  },
+  "beamng_autopilot/experiments/monitor_server.py": {
+   "except_exception": 0,
+   "lines": 235,
+   "max_func_lines": 38,
+   "prints": 1,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/monitor_ui.py": {
+   "except_exception": 0,
+   "lines": 602,
+   "max_func_lines": 19,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/negative_scenes.py": {
+   "except_exception": 0,
+   "lines": 298,
+   "max_func_lines": 72,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/paper_inputs.py": {
+   "except_exception": 0,
+   "lines": 49,
+   "max_func_lines": 30,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/pose_sweep.py": {
+   "except_exception": 2,
+   "lines": 398,
+   "max_func_lines": 171,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/proposer.py": {
+   "except_exception": 0,
+   "lines": 411,
+   "max_func_lines": 115,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/protocol.py": {
+   "except_exception": 1,
+   "lines": 478,
+   "max_func_lines": 37,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/range_replay.py": {
+   "except_exception": 0,
+   "lines": 222,
+   "max_func_lines": 64,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/reproducibility.py": {
+   "except_exception": 0,
+   "lines": 82,
+   "max_func_lines": 28,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/selection.py": {
+   "except_exception": 1,
+   "lines": 269,
+   "max_func_lines": 127,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/experiments/spatial.py": {
+   "except_exception": 0,
+   "lines": 204,
+   "max_func_lines": 73,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/fsd_drive.py": {
+   "except_exception": 78,
+   "lines": 5727,
+   "max_func_lines": 3430,
+   "prints": 84,
+   "silent_except": 19
+  },
+  "beamng_autopilot/fsd_realism.py": {
+   "except_exception": 0,
+   "lines": 251,
+   "max_func_lines": 35,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/fsd_stack.py": {
+   "except_exception": 32,
+   "lines": 2593,
+   "max_func_lines": 1378,
+   "prints": 1,
+   "silent_except": 8
+  },
+  "beamng_autopilot/geometry.py": {
+   "except_exception": 1,
+   "lines": 187,
+   "max_func_lines": 36,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/geometry_probe.py": {
+   "except_exception": 0,
+   "lines": 274,
+   "max_func_lines": 90,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/hotkeys.py": {
+   "except_exception": 1,
+   "lines": 248,
+   "max_func_lines": 40,
+   "prints": 2,
+   "silent_except": 0
+  },
+  "beamng_autopilot/hud.py": {
+   "except_exception": 0,
+   "lines": 175,
+   "max_func_lines": 66,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/labeling/__init__.py": {
+   "except_exception": 0,
+   "lines": 1,
+   "max_func_lines": 0,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/labeling/annotate_session.py": {
+   "except_exception": 0,
+   "lines": 753,
+   "max_func_lines": 72,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/labeling/annotate_tools.py": {
+   "except_exception": 1,
+   "lines": 459,
+   "max_func_lines": 28,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/labeling/curve_schema.py": {
+   "except_exception": 0,
+   "lines": 287,
+   "max_func_lines": 64,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/labeling/grid_labeler.py": {
+   "except_exception": 0,
+   "lines": 341,
+   "max_func_lines": 52,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/labeling/presence.py": {
+   "except_exception": 0,
+   "lines": 138,
+   "max_func_lines": 36,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/labeling/presence_model.py": {
+   "except_exception": 0,
+   "lines": 261,
+   "max_func_lines": 53,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/labeling/tech_annotation.py": {
+   "except_exception": 0,
+   "lines": 82,
+   "max_func_lines": 48,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/lane/__init__.py": {
+   "except_exception": 0,
+   "lines": 78,
+   "max_func_lines": 0,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/lane/boundary_evidence.py": {
+   "except_exception": 1,
+   "lines": 587,
+   "max_func_lines": 130,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/lane/constants.py": {
+   "except_exception": 0,
+   "lines": 107,
+   "max_func_lines": 0,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/lane/envelope.py": {
+   "except_exception": 0,
+   "lines": 79,
+   "max_func_lines": 22,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/lane/fusion.py": {
+   "except_exception": 1,
+   "lines": 458,
+   "max_func_lines": 168,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/lane/geometry_check.py": {
+   "except_exception": 0,
+   "lines": 325,
+   "max_func_lines": 84,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/lane/lateral_risk.py": {
+   "except_exception": 0,
+   "lines": 218,
+   "max_func_lines": 58,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/lane/lidar.py": {
+   "except_exception": 0,
+   "lines": 235,
+   "max_func_lines": 128,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/lane/map_association.py": {
+   "except_exception": 0,
+   "lines": 448,
+   "max_func_lines": 104,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/lane/marking_class.py": {
+   "except_exception": 1,
+   "lines": 236,
+   "max_func_lines": 118,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/lane/metrics.py": {
+   "except_exception": 0,
+   "lines": 271,
+   "max_func_lines": 67,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/lane/pairing.py": {
+   "except_exception": 0,
+   "lines": 1209,
+   "max_func_lines": 207,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/lane/pavement.py": {
+   "except_exception": 1,
+   "lines": 541,
+   "max_func_lines": 219,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/lane/perception_guard.py": {
+   "except_exception": 0,
+   "lines": 229,
+   "max_func_lines": 60,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/lane/reference.py": {
+   "except_exception": 10,
+   "lines": 1330,
+   "max_func_lines": 374,
+   "prints": 0,
+   "silent_except": 1
+  },
+  "beamng_autopilot/lane/shadow_state.py": {
+   "except_exception": 0,
+   "lines": 392,
+   "max_func_lines": 91,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/lane/stability.py": {
+   "except_exception": 0,
+   "lines": 171,
+   "max_func_lines": 49,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/lane/tracking.py": {
+   "except_exception": 0,
+   "lines": 482,
+   "max_func_lines": 157,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/neural/__init__.py": {
+   "except_exception": 0,
+   "lines": 119,
+   "max_func_lines": 25,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/neural/bc_runtime.py": {
+   "except_exception": 1,
+   "lines": 128,
+   "max_func_lines": 38,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/neural/dataset.py": {
+   "except_exception": 1,
+   "lines": 336,
+   "max_func_lines": 86,
+   "prints": 0,
+   "silent_except": 1
+  },
+  "beamng_autopilot/neural/e2e_runtime.py": {
+   "except_exception": 1,
+   "lines": 285,
+   "max_func_lines": 57,
+   "prints": 0,
+   "silent_except": 1
+  },
+  "beamng_autopilot/neural/e2e_torch.py": {
+   "except_exception": 0,
+   "lines": 187,
+   "max_func_lines": 55,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/obstacle_risk.py": {
+   "except_exception": 2,
+   "lines": 529,
+   "max_func_lines": 219,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/occupancy.py": {
+   "except_exception": 0,
+   "lines": 587,
+   "max_func_lines": 92,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/perception.py": {
+   "except_exception": 3,
+   "lines": 1197,
+   "max_func_lines": 147,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/perception_snapshot.py": {
+   "except_exception": 0,
+   "lines": 112,
+   "max_func_lines": 26,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planner/__init__.py": {
+   "except_exception": 0,
+   "lines": 74,
+   "max_func_lines": 0,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planner/constants.py": {
+   "except_exception": 0,
+   "lines": 198,
+   "max_func_lines": 6,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planner/core.py": {
+   "except_exception": 0,
+   "lines": 2001,
+   "max_func_lines": 646,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planner/geometry.py": {
+   "except_exception": 0,
+   "lines": 440,
+   "max_func_lines": 50,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planner/obstacles.py": {
+   "except_exception": 0,
+   "lines": 503,
+   "max_func_lines": 54,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planner/solid.py": {
+   "except_exception": 0,
+   "lines": 403,
+   "max_func_lines": 175,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planning/__init__.py": {
+   "except_exception": 0,
+   "lines": 110,
+   "max_func_lines": 0,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planning/arbiter.py": {
+   "except_exception": 0,
+   "lines": 438,
+   "max_func_lines": 50,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planning/clearance_guard.py": {
+   "except_exception": 0,
+   "lines": 256,
+   "max_func_lines": 88,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planning/constraints.py": {
+   "except_exception": 1,
+   "lines": 1023,
+   "max_func_lines": 135,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planning/corridor_feasibility.py": {
+   "except_exception": 0,
+   "lines": 403,
+   "max_func_lines": 217,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planning/geometry.py": {
+   "except_exception": 0,
+   "lines": 39,
+   "max_func_lines": 23,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planning/hold_audit.py": {
+   "except_exception": 0,
+   "lines": 171,
+   "max_func_lines": 61,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planning/hysteresis.py": {
+   "except_exception": 0,
+   "lines": 179,
+   "max_func_lines": 55,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planning/intent.py": {
+   "except_exception": 0,
+   "lines": 113,
+   "max_func_lines": 57,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planning/lateral_ref.py": {
+   "except_exception": 0,
+   "lines": 169,
+   "max_func_lines": 34,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planning/local_route.py": {
+   "except_exception": 0,
+   "lines": 883,
+   "max_func_lines": 182,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planning/longitudinal.py": {
+   "except_exception": 0,
+   "lines": 163,
+   "max_func_lines": 33,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planning/path_validation.py": {
+   "except_exception": 0,
+   "lines": 124,
+   "max_func_lines": 75,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planning/scene.py": {
+   "except_exception": 0,
+   "lines": 63,
+   "max_func_lines": 6,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planning/selector.py": {
+   "except_exception": 4,
+   "lines": 232,
+   "max_func_lines": 115,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planning/speed_profile.py": {
+   "except_exception": 0,
+   "lines": 221,
+   "max_func_lines": 83,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/planning/trajectory.py": {
+   "except_exception": 0,
+   "lines": 152,
+   "max_func_lines": 41,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/prediction.py": {
+   "except_exception": 0,
+   "lines": 203,
+   "max_func_lines": 47,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/recording.py": {
+   "except_exception": 2,
+   "lines": 345,
+   "max_func_lines": 116,
+   "prints": 1,
+   "silent_except": 0
+  },
+  "beamng_autopilot/rl/__init__.py": {
+   "except_exception": 0,
+   "lines": 21,
+   "max_func_lines": 0,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/rl/dqn_runtime.py": {
+   "except_exception": 2,
+   "lines": 199,
+   "max_func_lines": 93,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/rl/env.py": {
+   "except_exception": 5,
+   "lines": 280,
+   "max_func_lines": 94,
+   "prints": 0,
+   "silent_except": 1
+  },
+  "beamng_autopilot/rl/lateral_env.py": {
+   "except_exception": 0,
+   "lines": 116,
+   "max_func_lines": 20,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/rl/lateral_runtime.py": {
+   "except_exception": 2,
+   "lines": 128,
+   "max_func_lines": 36,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/rl/obs.py": {
+   "except_exception": 0,
+   "lines": 62,
+   "max_func_lines": 24,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/roadnet.py": {
+   "except_exception": 5,
+   "lines": 488,
+   "max_func_lines": 113,
+   "prints": 0,
+   "silent_except": 1
+  },
+  "beamng_autopilot/run_manifest.py": {
+   "except_exception": 4,
+   "lines": 338,
+   "max_func_lines": 48,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/runtime.py": {
+   "except_exception": 0,
+   "lines": 181,
+   "max_func_lines": 20,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/safety_monitor.py": {
+   "except_exception": 5,
+   "lines": 1521,
+   "max_func_lines": 332,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/telemetry.py": {
+   "except_exception": 0,
+   "lines": 159,
+   "max_func_lines": 40,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/telemetry_chart.py": {
+   "except_exception": 0,
+   "lines": 52,
+   "max_func_lines": 41,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/telemetry_contract.py": {
+   "except_exception": 0,
+   "lines": 423,
+   "max_func_lines": 40,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/temporal.py": {
+   "except_exception": 0,
+   "lines": 170,
+   "max_func_lines": 54,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/track.py": {
+   "except_exception": 0,
+   "lines": 135,
+   "max_func_lines": 37,
+   "prints": 1,
+   "silent_except": 0
+  },
+  "beamng_autopilot/traffic.py": {
+   "except_exception": 0,
+   "lines": 808,
+   "max_func_lines": 56,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vehicle_body.py": {
+   "except_exception": 0,
+   "lines": 352,
+   "max_func_lines": 63,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/band.py": {
+   "except_exception": 0,
+   "lines": 117,
+   "max_func_lines": 77,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/dataset_split.py": {
+   "except_exception": 1,
+   "lines": 578,
+   "max_func_lines": 63,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/detection.py": {
+   "except_exception": 1,
+   "lines": 224,
+   "max_func_lines": 76,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/heads/__init__.py": {
+   "except_exception": 0,
+   "lines": 29,
+   "max_func_lines": 0,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/heads/object.py": {
+   "except_exception": 1,
+   "lines": 43,
+   "max_func_lines": 14,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/heads/semantic.py": {
+   "except_exception": 12,
+   "lines": 442,
+   "max_func_lines": 350,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/heads/topology.py": {
+   "except_exception": 0,
+   "lines": 167,
+   "max_func_lines": 60,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/heads/traffic.py": {
+   "except_exception": 0,
+   "lines": 164,
+   "max_func_lines": 53,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/hydra.py": {
+   "except_exception": 1,
+   "lines": 129,
+   "max_func_lines": 10,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/lane_overlay.py": {
+   "except_exception": 1,
+   "lines": 811,
+   "max_func_lines": 134,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/lanes.py": {
+   "except_exception": 5,
+   "lines": 1557,
+   "max_func_lines": 188,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/line_evidence.py": {
+   "except_exception": 0,
+   "lines": 465,
+   "max_func_lines": 99,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/line_scope.py": {
+   "except_exception": 0,
+   "lines": 79,
+   "max_func_lines": 14,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/live_vis.py": {
+   "except_exception": 0,
+   "lines": 188,
+   "max_func_lines": 70,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/paint_appearance.py": {
+   "except_exception": 0,
+   "lines": 60,
+   "max_func_lines": 21,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/projection.py": {
+   "except_exception": 0,
+   "lines": 163,
+   "max_func_lines": 53,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/ring.py": {
+   "except_exception": 0,
+   "lines": 156,
+   "max_func_lines": 14,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/sampling.py": {
+   "except_exception": 1,
+   "lines": 423,
+   "max_func_lines": 49,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/seg_losses.py": {
+   "except_exception": 0,
+   "lines": 204,
+   "max_func_lines": 52,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/seg_probs.py": {
+   "except_exception": 0,
+   "lines": 299,
+   "max_func_lines": 62,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/seg_zones.py": {
+   "except_exception": 0,
+   "lines": 206,
+   "max_func_lines": 71,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/segmentation.py": {
+   "except_exception": 0,
+   "lines": 1096,
+   "max_func_lines": 173,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/spawn_gate.py": {
+   "except_exception": 0,
+   "lines": 87,
+   "max_func_lines": 41,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/tracking.py": {
+   "except_exception": 0,
+   "lines": 122,
+   "max_func_lines": 81,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/veg_mask.py": {
+   "except_exception": 0,
+   "lines": 23,
+   "max_func_lines": 5,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/vision/yellow_line_mask.py": {
+   "except_exception": 0,
+   "lines": 43,
+   "max_func_lines": 21,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/visionview.py": {
+   "except_exception": 8,
+   "lines": 479,
+   "max_func_lines": 88,
+   "prints": 0,
+   "silent_except": 3
+  },
+  "beamng_autopilot/watchdog.py": {
+   "except_exception": 2,
+   "lines": 177,
+   "max_func_lines": 17,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot/workers.py": {
+   "except_exception": 1,
+   "lines": 188,
+   "max_func_lines": 21,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot_tech/__init__.py": {
+   "except_exception": 0,
+   "lines": 5,
+   "max_func_lines": 0,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot_tech/annotations.py": {
+   "except_exception": 0,
+   "lines": 130,
+   "max_func_lines": 32,
+   "prints": 0,
+   "silent_except": 0
+  },
+  "beamng_autopilot_tech/providers.py": {
+   "except_exception": 7,
+   "lines": 726,
+   "max_func_lines": 117,
+   "prints": 11,
+   "silent_except": 0
+  }
+ },
+ "generated": "m5_debt_meter.py --write",
+ "scope": [
+  "beamng_autopilot",
+  "beamng_autopilot_tech"
+ ],
+ "totals": {
+  "except_exception": 332,
+  "max_func_lines": 3430,
+  "prints": 163,
+  "silent_except": 59
+ },
+ "version": 1
+}

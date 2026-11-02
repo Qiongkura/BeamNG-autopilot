@@ -53,7 +53,8 @@ def _code_state() -> dict:
     def _git(*args):
         try:
             out = subprocess.run(["git", *args], cwd=str(ROOT),
-                                 capture_output=True, text=True)
+                                 capture_output=True, text=True,
+                                 encoding="utf-8", errors="replace")
             return out.stdout.strip()
         except Exception:
             return ""

@@ -113,8 +113,11 @@ _DRIVE_ARG_DEFAULTS = {
     "line_seg_model": None,
     "teleport": None,
     "out": None,
-    "lane_mode": "map",
-    "strict": False,
+    # 2026-10-20：与 scripts/m5_fsd_drive.py 的默认值对齐（sensor + strict）。
+    # 旧默认 map/False 等于每次不带参数的运行都在用 AGENTS.md 禁止的地图横向
+    # 参考；"free" 场景没有自己的 pin，就吃这两个默认值。
+    "lane_mode": "sensor",
+    "strict": True,
     "e2e_model": None,
     "no_e2e": False,
     "bc_model": None,
@@ -237,6 +240,16 @@ def write_manifest(out_dir: Path, ts: int, names: list[str], base: dict,
                 "lane_mode", "strict", "goal", "seg_model", "line_seg_model",
                 "runtime", "attach", "traffic", "no_signal", "corridor_lane",
                 "no_e2e", "no_bc", "no_dqn", "seconds", "speed")}
+            # 合规与否是**逐场景**的：town 的"铁律"写在注册表里，free 吃默认值。
+            # 记下来，免得以后又从 manifest 里读出"看起来合规"的配置。
+            try:
+                from beamng_autopilot.fsd_realism import (
+                    lane_mode_is_fsd_compliant,
+                )
+                _eff[n]["fsd_compliant"] = lane_mode_is_fsd_compliant(
+                    _eff[n].get("lane_mode"), _eff[n].get("strict"))
+            except Exception:                   # pragma: no cover - import guard
+                _eff[n]["fsd_compliant"] = None
         run["effective"] = _eff
     except Exception as exc:                    # pragma: no cover - never fatal
         run["effective"] = {"error": f"{type(exc).__name__}: {exc}"}

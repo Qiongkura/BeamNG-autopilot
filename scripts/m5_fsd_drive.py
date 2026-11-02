@@ -25,9 +25,17 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from beamng_autopilot.fsd_drive import run
+from beamng_autopilot.fsd_realism import lane_mode_is_fsd_compliant
 
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """CLI 定义（抽出来是为了让"默认值是否合规"可被单测钉住）。
+
+    2026-10-20：``--lane-mode`` 默认从 ``map`` 改成 ``sensor``、``--strict``
+    默认开启。理由见 AGENTS.md 铁律——**FSD 入口不得用导航线/地图线 + 偏移做
+    横向参考**；旧默认等于每个不带参数的 FSD 运行都在用被禁的参考。需要诊断
+    旧行为时显式加 ``--allow-legacy-map-lane``，那一轮不算 FSD 合规运行。
+    """
     ap = argparse.ArgumentParser(description="FSD-mode live driving")
     ap.add_argument("--runtime", choices=("auto", "steam", "tech"),
                     default="auto")
@@ -70,15 +78,23 @@ def main() -> int:
                     help="record exact sensor boundaries, candidates, control path and grid; "
                          "diagnostic overhead is reported separately")
     ap.add_argument("--lane-mode", choices=("map", "auto", "sensor"),
-                    default="map",
-                    help="lane-keep reference policy: map (rule-stable "
-                         "default), auto (sensor leads only when it agrees "
-                         "with the map lane), sensor (perception-led; map "
-                         "prior stays the hard guard-rail)")
-    ap.add_argument("--strict", action="store_true",
-                    help="FSD realism mode (docs/fsd_realism.md): with "
-                         "--lane-mode sensor the map lane may NEVER lead; "
-                         "no paired perception lane -> no-lane degradation")
+                    default="sensor",
+                    help="lane-keep reference policy: sensor = perception-led "
+                         "(default, the only FSD-compliant mode), auto/map = "
+                         "legacy map-prior lane (requires "
+                         "--allow-legacy-map-lane; AGENTS.md forbids it on FSD "
+                         "entries)")
+    ap.add_argument("--strict", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="FSD realism mode (docs/fsd_realism.md, default ON): "
+                         "the map lane may NEVER steer or label a frame; no "
+                         "paired perception lane -> no-lane degradation. "
+                         "--no-strict re-enables the legacy rule stack and "
+                         "needs --allow-legacy-map-lane")
+    ap.add_argument("--allow-legacy-map-lane", action="store_true",
+                    help="诊断用逃生口：允许 --lane-mode map/auto 或 --no-strict。"
+                         "AGENTS.md 铁律禁止 FSD 入口用导航线/地图线做横向参考；"
+                         "开了它这一轮**不算 FSD 合规运行**，结果不得用于验收")
     ap.add_argument("--allow-unplaced", action="store_true",
                     help="collection mode: on cross-map lane-placement "
                          "failure keep driving unplaced instead of aborting")
@@ -152,7 +168,21 @@ def main() -> int:
                     help="disable shadow-episode recording during the drive")
     ap.add_argument("--capture-range-replay", action="store_true",
                     help="Tech-only: save one raw range input during warmup; requires --out")
+    return ap
+
+
+def main() -> int:
+    ap = build_parser()
     args = ap.parse_args()
+    if not lane_mode_is_fsd_compliant(args.lane_mode, args.strict):
+        if not args.allow_legacy_map_lane:
+            ap.error(
+                f"--lane-mode {args.lane_mode} / --strict={args.strict} 不是 FSD "
+                "合规路径：AGENTS.md 铁律禁止 FSD 入口用导航线/地图线 + 偏移做横向"
+                "参考。默认已是 sensor+strict；确需诊断旧行为请显式加 "
+                "--allow-legacy-map-lane（那一轮不得用于验收）。")
+        print("[warn] 本轮走 legacy 地图横向参考（--allow-legacy-map-lane）："
+              "结果不得用于 FSD 验收", file=sys.stderr)
     if args.capture_range_replay and (args.runtime != "tech" or not args.out):
         ap.error("--capture-range-replay requires --runtime tech and --out")
 

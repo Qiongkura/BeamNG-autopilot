@@ -52,7 +52,8 @@ KEEP_SUFFIXES = (".json", ".jsonl", ".log")
 def _git(*args: str) -> str:
     try:
         out = subprocess.run(["git", *args], cwd=str(ROOT), capture_output=True,
-                             text=True, timeout=30)
+                             text=True, encoding="utf-8", errors="replace",
+                             timeout=30)
         return out.stdout.strip()
     except Exception:                                     # noqa: BLE001
         return ""
