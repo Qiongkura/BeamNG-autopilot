@@ -391,7 +391,9 @@ class SemanticHead:
                     try:
                         _mk.mark_class = _cls.mark_class
                         _mk.mark_class_reasons = list(_cls.reasons)
-                    except Exception:
+                    except AttributeError:
+                        # 标记对象可能是只读/带 slots：贴不上分类标签是预期内的
+                        # （统计仍走 _counts）。别的异常说明分类对象接口变了。
                         pass
                     _counts[_cls.mark_class] = _counts.get(_cls.mark_class, 0) + 1
                     if _cls.mark_class == MARK_ROADSIDE_ARTIFACT:
