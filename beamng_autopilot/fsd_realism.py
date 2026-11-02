@@ -181,6 +181,18 @@ def assert_realistic_lane(src: str | None, strict: bool = False) -> None:
             "(docs/fsd_realism.md §4)")
 
 
+def lane_mode_is_fsd_compliant(lane_mode: str | None, strict: bool) -> bool:
+    """这一轮配置是否属于 FSD 合规路径：**感知主导 + strict**。
+
+    2026-10-20 起 ``scripts/m5_fsd_drive.py`` / ``m5_shadow_drive.py`` 的默认
+    是 ``--lane-mode sensor --strict``；任何 ``map`` / ``auto`` 或
+    ``strict=False`` 的运行都必须在命令行显式走逃生口，且**其结果不得用于
+    验收**（AGENTS.md 铁律：FSD 栈及其入口不得用导航线/地图线 + 偏移做横向
+    参考）。这里把"合规"变成一个可断言函数，避免每个入口各写一套判断。
+    """
+    return bool(strict) and str(lane_mode or "") == SRC_SENSOR
+
+
 def check_no_map_imports() -> list[str]:
     """List guarded files that (accidentally) use road-graph/map code.
 
