@@ -74,13 +74,21 @@ PROTECTED_NAME_PREFIXES = ("best",)
 #:   * ``t16_negdose6x_20261001``：唯一在封存最终集上确认过的研究臂；
 #:   * ``t14_e0_20260925``：身份标定与候选门校准点名的候选；
 #:   * ``seg_model*``：部署/交付目录；
-#:   * ``best*``：脚本按开发集选出的权重，体积小、语义独立。
+#:   * ``best*``：脚本按开发集选出的权重，体积小、语义独立；
+#:   * ``t16_scenes_*`` / ``collect_e5line_*`` / ``t16_*_export_*``：
+#:     engine_verified 采集批次与导出池（2026-11-01 外部删除事件后点名——
+#:     历史池已不可再生，见 T16_LINE_MEASURED_UTAH2_RESULT_20261101.md）；
+#:   * ``evidence_archives``：哈希清单证据档。
 DEFAULT_KEEP_GLOBS = (
     "**/seg_model*/**",
     "**/best*.pt",
     "**/t14_e1_promotable_*/**",
     "**/t16_negdose6x_20261001/**",
     "**/t14_e0_20260925/**",
+    "**/t16_scenes_*/**",
+    "**/collect_e5line_*/**",
+    "**/t16_*_export_*/**",
+    "**/evidence_archives/**",
 )
 
 #: 可选的额外保留清单文件（相对 logs 根），一行一个 glob，``#`` 注释。
