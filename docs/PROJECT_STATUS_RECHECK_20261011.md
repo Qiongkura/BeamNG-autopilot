@@ -200,3 +200,37 @@ GPU 训练。
 压线帧计数 UNKNOWN）、Zenodo/ORCID/目标期刊、以及**分支 ahead 84 未推送**。
 
 
+
+## ③ 整车主线：条件矩阵战役（2026-11-02 深夜–11-03 凌晨）
+
+- **git 历史 squash（2026-11-02）**：161 个细粒度提交按「日×模块」squash 为
+  27 个单模块汇总提交 + 1 个索引更新（96ca452），最终树逐字节不变，
+  `--force-with-lease` 推送完成；旧哈希经 annotated tag
+  `history/pre-squash-20261102` 完整可达（`git rev-list --count HEAD`=831）。
+- **环境接线两处引擎侧实锤 + 修复**：① `core_weather.lua` 证据：天气预设
+  diff 表可携带 timeOfDay，先设时刻再上天气会被覆盖——接线固定为
+  **weather→tod** 并加 `get_tod()` 读回存证（条件格=引擎侧可验证）；
+  ② 矩阵实测（dawn_rain 请求 06:30 读回 09:56）：预设过渡是**动画**
+  （time 秒内逐帧插值回写），紧跟的 set_tod 被插值覆盖——应用后等过渡
+  结束再设时刻。两处均有单测钉住（52 测试通过）。
+- **环境探测（看门狗版，75 s）**：天气预设库存 7 个（sunny_evening/sunny/
+  cloudy_evening/sunny_noon/rainy/foggy_night/foggy_morning）；矩阵映射
+  rain→rainy、fog→foggy_morning、clear→引擎默认。教训入库：beamngpy
+  套接字无超时（RPC 必须看门狗）；引擎子进程持有 stdout 管道（输出必须
+  落文件，绝不过管道）。
+- **seg_model pin 修订（预注册修订案 A1）**：benchmark 的 v8_backup 与
+  部署默认 seg_model/best.pt 均在 2026-10-29~11-01 外部删除事件中灭失；
+  改 pin **seg_model_v28_sslA**（SSL +7.5% 水位、fold A 训练集含 italy），
+  20 格单一固定 pin；无模型的首轮 dawn_clear 记 VOID 轮。
+- **条件矩阵部分轮（中断于收尾，可断点续跑）**：dawn 三格全部
+  **fail-close 于放置**（06:30 黑暗→感知零线像素→刹车保持→UNKNOWN，
+  与 east 阴影定因同族的照度门机制）；dawn_fog 被中断（missing_session）。
+  聚合器验证端到端：12 格全 UNKNOWN、行级证据完整（placement_rc=3 +
+  tod_after 读回），**放置失败格不再静默消失**（从 batch_manifest 播种）。
+  部分证据已哈希归档
+  `logs/evidence_archives/t16_fsd_conditions_partial_20261103.zip`
+  （complete: True）。
+- **明日续跑**：`--run` 断点续跑剩余 17 格（dawn_fog 起），noon/dusk/night
+  才是矩阵的决定性格（noon_clear 隔离"模型 vs 光照"变量）；矩阵表出来后
+  进 250 s 长跑 + 车道穿越计数 UNKNOWN 清零。全部提交按模块过
+  check_commit_scope 并已推送（tip a03a94c 后续 3 提交）。
