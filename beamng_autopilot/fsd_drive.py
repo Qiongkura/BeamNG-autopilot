@@ -2363,6 +2363,28 @@ class FSDriveSession:
                         conn.load_scenario()
                 except Exception:
                     conn.load_scenario()
+            # 环境条件（TOD/天气，2026-11-02）：条件矩阵的接线点。真实车必须
+            # 面对夜间/黄昏/雨天；只应用一次并进运行记录（可回溯证据）。
+            if getattr(args, "tod", None) or getattr(args, "weather_preset", None):
+                _tod_s = str(getattr(args, "tod", "") or "")
+                _wx = str(getattr(args, "weather_preset", "") or "")
+                try:
+                    if _tod_s:
+                        _parts = _tod_s.split(":")
+                        _hms = (f"{int(_parts[0]):02d}:"
+                                f"{int(_parts[1]) if len(_parts) > 1 else 0:02d}:00")
+                        conn.bng.env.set_tod(tod=_hms)
+                    if _wx:
+                        conn.bng.env.set_weather_preset(_wx)
+                    _run_record["environment"] = {"tod": _tod_s, "weather_preset": _wx,
+                                                  "applied": True}
+                    print(f"[fsd-drive] environment -> tod={_tod_s or '-'} "
+                          f"weather={_wx or '-'}", flush=True)
+                except (TypeError, ValueError, AttributeError) as exc:
+                    # 环境应用失败不静默：记录并继续（条件矩阵会标 UNKNOWN）
+                    _run_record["environment"] = {"tod": _tod_s, "weather_preset": _wx,
+                                                  "applied": False, "error": type(exc).__name__}
+                    print(f"[fsd-drive] environment 应用失败（继续运行）：{exc}", flush=True)
             if args.teleport is not None:
                 x, y, yaw = args.teleport
                 # Ground-safe teleport: the connector measures the real surface
