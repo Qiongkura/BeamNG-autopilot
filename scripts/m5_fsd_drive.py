@@ -44,6 +44,10 @@ def build_parser() -> argparse.ArgumentParser:
                     help="BeamNG map/level to drive on (default italy; "
                          "with --attach this forces a scenario load to "
                          "switch the running instance to the map)")
+    ap.add_argument("--tod", type=str, default=None, metavar="HH:MM",
+                    help="时刻（条件矩阵用）：夜间/黄昏鲁棒性；EnvironmentApi.set_tod")
+    ap.add_argument("--weather-preset", type=str, default=None,
+                    help="天气预设名（art/weather/defaults.json 中的名字）")
     ap.add_argument("--seconds", type=float, default=20.0)
     ap.add_argument("--max-wall-s", type=float, default=None,
                     help="整轮墙钟上限（秒）：放置阶段超限即放弃并正常收尾；默认 None=不限"
