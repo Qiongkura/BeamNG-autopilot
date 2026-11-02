@@ -59,6 +59,23 @@ speed 6.0，`--max-wall-s 300`。每格一个独立引擎会话（自启自关�
   报告并标方差（引擎侧天气/交通随机性）。
 - 不因结果调整门限、不删格、不换场景、不换模型（v8 pin 全程不动）。
 
+## 预注册修订案 A1（2026-11-02，任何有效格跑出之前）
+
+- **seg_model pin 变更**：原 pin（benchmark 的 `seg_model_v8_backup`）在
+  2026-10-29~11-01 的 `logs/m5_seg` 外部删除事件中灭失（部署默认
+  `seg_model/best.pt` 同灭，见 `PROJECT_STATUS_RECHECK` 删除事件记录）。
+  改 pin **`seg_model_v28_sslA/best.pt`**（SSL +7.5% 水位模型、种子 42；
+  fold A 留出=早期 utah，**训练集含 italy**——矩阵场景在 italy）。
+  20 格全程单一固定 pin，不换模型。首轮 dawn_clear_r0（无分割模型放置
+  失败刹车保持）记为 **VOID 轮**，证据保留，不计入矩阵。
+- **预设名解析结果**（引擎探测 `logs/probe_weather_run.log`）：
+  库存 7 个（sunny_evening/sunny/cloudy_evening/sunny_noon/rainy/
+  foggy_night/foggy_morning）；映射 rain→`rainy`、fog→`foggy_morning`
+  （单一 fog 预设保证天气维与时刻维独立）、clear→引擎默认。
+- **顺序问题的引擎证据**：7 预设中 6 个携带 timeOfDay 并覆盖显式 TOD
+  （after_preset 实测 22:48/17:57/06:08…），weather→tod 顺序修复被
+  实测验证（after_tod_again 全部回到请求值）；矩阵按修订后接线跑。
+
 ## 纪束
 
 产物只落 `logs/fsd_conditions/`（遥测 + session 审计 + batch_manifest +
