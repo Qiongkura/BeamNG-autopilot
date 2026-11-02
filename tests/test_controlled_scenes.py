@@ -659,7 +659,10 @@ def test_build_scenario_uses_requested_map_not_italy_default():
     src = (Path(__file__).resolve().parents[1] / "scripts"
            / "m5_controlled_scenes.py").read_text("utf-8")
     assert 'Scenario(str(map_name), "m5_controlled_scenes")' in src
-    assert 'build_scenario(conn, sites, map_name=str(args.map)' in src
+    # 2026-11-02 起每站 Scenario：参数表单从 (conn, sites, ...) 变为
+    # (conn, [site], ...)，但地图仍必须显式穿传 args.map（不得回落 italy）。
+    assert "map_name=str(args.map)" in src
+    assert "build_scenario(" in src
 
 
 def test_west_coast_rechecks_ground_after_scenario_load_and_can_reload():
@@ -667,7 +670,8 @@ def test_west_coast_rechecks_ground_after_scenario_load_and_can_reload():
            / "m5_controlled_scenes.py").read_text("utf-8")
     assert "sites_after_ground_alignment_reload" in src
     assert "post_load_ground_recheck" in src
-    assert "conn.bng.scenario.load(scen)" in src
+    # 每站 Scenario 重载的变量名是 scen_k（重检下沉到每站循环后）。
+    assert "conn.bng.scenario.load(scen_k)" in src
 
 
 def test_east_coast_profile_uses_annotation_writable_material_and_width():
@@ -803,13 +807,14 @@ def test_utah_line_material_choice_matches_map_alpha_admission():
         assert (stage.get("opacityFactor") or 1.0) < 1.0
 
 
-def test_per_site_scenario_mode_excludes_ground_align_maps():
+def test_per_site_scenario_mode_covers_all_maps_after_east_migration():
     m = _load()
     # 2026-10-29 utah 探针判决：单 Scenario 10 条贴花路会让后创建的路渲染
     # 截断（idx9 的 22-34m bin annotation 全灭）；单站 2 路全跨渲染。
-    # 非 GROUND_ALIGN_MAPS 地图改每站一个 Scenario；GROUND_ALIGN_MAPS
-    # （加载后 ground 重检依赖全量 Scenario）保持原流程。
-    assert m.per_site_scenario_mode("utah") is True
-    assert m.per_site_scenario_mode("italy") is True
-    assert m.per_site_scenario_mode("west_coast_usa") is False
-    assert m.per_site_scenario_mode("east_coast_usa") is False
+    # 2026-11-02 起全图统一每站 Scenario（east 的 a2 right 0.4216 同签名），
+    # GROUND_ALIGN_MAPS 的加载后 ground 重检下沉到每站循环。
+    for name in ("utah", "italy", "west_coast_usa", "east_coast_usa"):
+        assert m.per_site_scenario_mode(name) is True
+    src = Path(m.__file__).read_text(encoding="utf-8")
+    assert "post_load_ground_recheck" in src
+    assert "sites_after_ground_alignment_reload" in src

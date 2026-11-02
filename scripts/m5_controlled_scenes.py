@@ -391,16 +391,16 @@ GROUND_ALIGN_MAPS = {"west_coast_usa", "east_coast_usa"}
 
 
 def per_site_scenario_mode(map_name: str) -> bool:
-    """该地图是否用**每站一个 Scenario**采集（2026-10-29 utah 探针判决）。
+    """该地图是否用**每站一个 Scenario**采集（2026-10-29 utah 探针判决，
+    2026-11-02 起全图统一；保留本函数做兼容断言）。
 
     单 Scenario 里 10 条贴花路会让**后创建的路渲染截断**（探针实测：单站
     2 路全跨渲染 22-34m，同几何放进批次 10 路结构后 idx9 的 22-34 bin
     annotation 全灭、beauty 同步塌陷；线位/坡度/节点 z 提升/优先级/多站
-    资源均被变量分离排除）。非 GROUND_ALIGN_MAPS 地图改为每站 2 路加载；
-    GROUND_ALIGN_MAPS 的加载后 ground 重检依赖全量 Scenario 已加载，保持
-    原流程，另行迁移。
+    资源均被变量分离排除）。GROUND_ALIGN_MAPS 的加载后 ground 重检已下沉
+    到每站循环（加载→重测→偏离 >2 m 时重对齐并重建该站 Scenario）。
     """
-    return str(map_name) not in GROUND_ALIGN_MAPS
+    return True
 
 
 def _align_sites_to_ground(conn, sites: list[dict], map_name: str) -> list[dict]:
@@ -1546,84 +1546,64 @@ def main() -> int:
         report["scene_types"] = scene_types
         _align_sites_to_ground(conn, sites, str(args.map))
         report["sites_after_ground_alignment"] = sites
-        _per_site = per_site_scenario_mode(str(args.map))
-        scen, rec = None, None
-        if _per_site:
-            report["scenario"] = {"mode": "per_site", "level": str(args.map),
-                                  "why": "单 Scenario 多路对象会让后建贴花路渲染截断"
-                                         "（utah 探针 2026-10-29：每站 2 路实测全跨）"}
-        else:
-            scen, rec = build_scenario(conn, sites, map_name=str(args.map),
-                                       scene_types=scene_types,
-                                       scene_names=scene_names)
-            report["scenario"] = {"name": scen.name, "level": str(scen.level),
-                                  "vehicles": rec["vehicles"],
-                                  "materials": {n: rec["sites"][n]["materials"]
-                                                for n in rec["sites"]}}
+        # 2026-11-02 起全部地图走每站 Scenario：单 Scenario 多路对象会让后建
+        # 贴花路渲染截断（utah 探针 2026-10-29 判决；east 的 a2 right 0.4216
+        # 同签名）。GROUND_ALIGN_MAPS 的加载后 ground 重检下沉到每站循环。
+        report["scenario"] = {"mode": "per_site", "level": str(args.map),
+                              "why": "单 Scenario 多路对象会让后建贴花路渲染截断"
+                                     "（utah 探针 2026-10-29：每站 2 路实测全跨）"}
+        for k, name in enumerate(scene_names):
+            site = sites[k]
+            # 每站一个 Scenario（2 条线）——探针实测该结构全跨渲染
+            scen_k, rec_k = build_scenario(
+                conn, [site], map_name=str(args.map),
+                scene_types=[scene_types[k]], scene_names=[name])
             with conn.io_lock:
-                scen.make(conn.bng)
-                conn.bng.scenario.load(scen)
+                scen_k.make(conn.bng)
+                conn.bng.scenario.load(scen_k)
                 conn.bng.scenario.start()
             time.sleep(2.0)
             try:
                 conn.attach_vehicle(already_open=True)
             except Exception:                                    # noqa: BLE001
                 pass
-        # GROUND_ALIGN_MAPS 的 road-network z 在初始 map load 与受控 Scenario
-        # load 之间曾出现数十米差异（west_coast 约 69m、east_coast 约 28m）。
-        # 加载后再测一次；若仍偏离，重建同一 map 的 Scenario，让 DecalRoad
-        # 节点、truth points 和实际地面共享最终 z。
-        if str(args.map) in GROUND_ALIGN_MAPS:
-            post_align: list[dict] = []
-            for _site in sites:
+            rec_site = rec_k["sites"][name]
+            # GROUND_ALIGN_MAPS 的 road-network z 在初始 map load 与受控
+            # Scenario load 之间曾出现数十米差异（west_coast ~69m、east ~28m）。
+            # 每站加载后重测该站 ground；偏离 >2 m 则重对齐该站并重建/重载，
+            # 让节点、truth points 与实际地面共享最终 z。
+            if str(args.map) in GROUND_ALIGN_MAPS:
                 try:
-                    _gz = conn.ground_z_at(float(_site["mid"][0]),
-                                           float(_site["mid"][1]))
-                except Exception:
-                    _gz = None
-                post_align.append({"road_z": float(_site["mid"][2]),
-                                   "ground_z_after_load": _gz,
-                                   "delta_m": (None if _gz is None else
-                                               float(_gz) - float(_site["mid"][2]))})
-            if any(x["delta_m"] is not None and abs(x["delta_m"]) > 2.0
-                   for x in post_align):
-                _align_sites_to_ground(conn, sites, str(args.map))
-                scen, rec = build_scenario(conn, sites, map_name=str(args.map),
-                                           scene_types=scene_types,
-                                           scene_names=scene_names)
-                report["sites_after_ground_alignment_reload"] = sites
-                report["post_load_ground_recheck"] = post_align
-                with conn.io_lock:
-                    scen.make(conn.bng)
-                    conn.bng.scenario.load(scen)
-                    conn.bng.scenario.start()
-                time.sleep(2.0)
-                try:
-                    conn.attach_vehicle(already_open=True)
-                except Exception:
-                    pass
-        for k, name in enumerate(scene_names):
-            site = sites[k]
-            if _per_site:
-                # 每站一个 Scenario（2 条线）——探针实测该结构全跨渲染
-                scen_k, rec_k = build_scenario(
-                    conn, [site], map_name=str(args.map),
-                    scene_types=[scene_types[k]], scene_names=[name])
-                with conn.io_lock:
-                    scen_k.make(conn.bng)
-                    conn.bng.scenario.load(scen_k)
-                    conn.bng.scenario.start()
-                time.sleep(2.0)
-                try:
-                    conn.attach_vehicle(already_open=True)
+                    _gz = conn.ground_z_at(float(site["mid"][0]),
+                                           float(site["mid"][1]))
                 except Exception:                                # noqa: BLE001
-                    pass
-                rec_site = rec_k["sites"][name]
-                report.setdefault("scenarios", []).append(
-                    {"name": name, "scenario": scen_k.name,
-                     "materials": rec_site["materials"]})
-            else:
-                rec_site = rec["sites"][name]
+                    _gz = None
+                _delta = (None if _gz is None else
+                          float(_gz) - float(site["mid"][2]))
+                report.setdefault("post_load_ground_recheck", []).append(
+                    {"scene": name, "road_z": float(site["mid"][2]),
+                     "ground_z_after_load": _gz, "delta_m": _delta})
+                if _delta is not None and abs(_delta) > 2.0:
+                    _align_sites_to_ground(conn, [site], str(args.map))
+                    scen_k, rec_k = build_scenario(
+                        conn, [site], map_name=str(args.map),
+                        scene_types=[scene_types[k]], scene_names=[name])
+                    with conn.io_lock:
+                        scen_k.make(conn.bng)
+                        conn.bng.scenario.load(scen_k)
+                        conn.bng.scenario.start()
+                    time.sleep(2.0)
+                    try:
+                        conn.attach_vehicle(already_open=True)
+                    except Exception:                            # noqa: BLE001
+                        pass
+                    rec_site = rec_k["sites"][name]
+                    report.setdefault(
+                        "sites_after_ground_alignment_reload", []).append(
+                            {"scene": name, "mid_z": float(site["mid"][2])})
+            report.setdefault("scenarios", []).append(
+                {"name": name, "scenario": scen_k.name,
+                 "materials": rec_site["materials"]})
             truth: list[dict] = []
             for inst in rec_site["lines"]:
                 truth += inst["truth_points"]
