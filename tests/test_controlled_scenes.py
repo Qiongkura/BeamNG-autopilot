@@ -801,3 +801,15 @@ def test_utah_line_material_choice_matches_map_alpha_admission():
         stage = (d.get("Stages") or [{}])[0]
         assert int(d.get("alphaRef", 255)) == 255 and not d.get("alphaTest")
         assert (stage.get("opacityFactor") or 1.0) < 1.0
+
+
+def test_per_site_scenario_mode_excludes_ground_align_maps():
+    m = _load()
+    # 2026-10-29 utah 探针判决：单 Scenario 10 条贴花路会让后创建的路渲染
+    # 截断（idx9 的 22-34m bin annotation 全灭）；单站 2 路全跨渲染。
+    # 非 GROUND_ALIGN_MAPS 地图改每站一个 Scenario；GROUND_ALIGN_MAPS
+    # （加载后 ground 重检依赖全量 Scenario）保持原流程。
+    assert m.per_site_scenario_mode("utah") is True
+    assert m.per_site_scenario_mode("italy") is True
+    assert m.per_site_scenario_mode("west_coast_usa") is False
+    assert m.per_site_scenario_mode("east_coast_usa") is False
