@@ -47,7 +47,12 @@ SCENARIO = {
     "goal": (616.2, 894.5),
     "seconds": 60.0,
     "speed": 6.0,
-    "seg_model": "logs/m5_seg/seg_model_v8_backup/best.pt",
+    # 2026-11-02 预注册修订案：原 pin（benchmark 的 seg_model_v8_backup）
+    # 在 2026-10-29~11-01 的 logs/m5_seg 外部删除事件中灭失，部署默认
+    # seg_model/best.pt 同灭。改 pin seg_model_v28_sslA（SSL +7.5% 水位
+    # 模型、种子 42；fold A 留出=早期 utah，训练集含 italy——矩阵场景在
+    # italy）。20 格全程单一固定 pin，不做格间换模型。
+    "seg_model": "logs/m5_seg/seg_model_v28_sslA/best.pt",
 }
 
 # 时刻维度：黎明/正午/黄昏/夜间（EnvironmentApi.set_tod，"HH:MM"）。
@@ -148,7 +153,7 @@ def run_matrix(out_dir: Path, preset_rain: str | None,
         "preset_rain": preset_rain or "", "preset_fog": preset_fog or "",
         "cells": [{k: v for k, v in c.items()} for c in cells],
         "config_hash": hashlib.sha256(json.dumps(
-            sorted(vars(template).items(), key=lambda kv: kv[0], default=str),
+            sorted(vars(template).items(), key=lambda kv: kv[0]),
             sort_keys=True, default=str).encode()).hexdigest(),
         "cells_runnable": sum(1 for c in cells if c["runnable"]),
     }
