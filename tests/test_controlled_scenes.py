@@ -925,3 +925,157 @@ def test_fsd_drive_tod_weather_wiring():
     assert "conn.bng.env.set_tod(" in sess
     assert "conn.bng.env.set_weather_preset(" in sess
     assert '_run_record["environment"]' in sess
+    # 顺序契约（2026-11-02 修订）：weather preset 的 diff 表可携带 timeOfDay，
+    # 先设时刻再上天气会被预设覆盖——必须 weather -> tod，且应用后读回
+    # get_tod 存证（条件格=引擎侧可验证）。
+    wx_i = sess.index("conn.bng.env.set_weather_preset(")
+    tod_i = sess.index("conn.bng.env.set_tod(")
+    assert wx_i < tod_i, "必须先应用天气预设再设显式 TOD"
+    assert '"order": "weather_then_tod"' in sess
+    assert '"tod_after"' in sess and "get_tod()" in sess
+    # 环境应用失败必须不静默且不崩溃：捕获要放宽到 Exception（预设名不
+    # 存在时 beamngpy 等 ack 抛 TimeoutError，窄化 except 会崩掉整轮）。
+    env_i = sess.index('_run_record["environment"] = {"tod": _tod_s')
+    fail_i = sess.index('_run_record["environment"] = {"tod": _tod_s', env_i + 1)
+    assert 'applied": False' in sess[fail_i:fail_i + 300]
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-02 条件矩阵（③ 整车主线）：m5_fsd_conditions.py 的纯逻辑测试
+# ---------------------------------------------------------------------------
+
+def _load_conditions():
+    spec = importlib.util.spec_from_file_location(
+        "m5_fsd_conditions", ROOT / "scripts" / "m5_fsd_conditions.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["m5_fsd_conditions"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_fsd_conditions_matrix_plan_shape():
+    mod = _load_conditions()
+    cells = mod.plan_cells(None, None)
+    # 12 格 + 8 个严酷格重复 = 20 轮（预注册口径）
+    assert len(cells) == 20
+    # 预设名缺失时 rain/fog 全部不可跑且仍出现在计划里（不静默消失）
+    runnable = [c for c in cells if c["runnable"]]
+    assert {c["weather"] for c in runnable} == {"clear"}
+    assert len(runnable) == 5          # 4 个 clear r0 + night_clear r1
+    missing = [c for c in cells if not c["runnable"]]
+    assert {c["weather"] for c in missing} == {"rain", "fog"}
+    # 预设名解析后，rain/fog 格变为可跑
+    cells2 = mod.plan_cells("rainy", "foggy")
+    assert all(c["runnable"] for c in cells2)
+    assert len(cells2) == 20
+    # 严酷格 2 轮、其余 1 轮（预注册口径）
+    from collections import Counter
+    cnt = Counter((c["tod_name"], c["weather"]) for c in cells2)
+    for key, n in cnt.items():
+        assert n == (2 if key in mod.REPEAT_CELLS else 1)
+    assert all(c["repeat"] in (0, 1) for c in cells2)
+
+
+def test_fsd_conditions_build_run_args_threads_condition():
+    mod = _load_conditions()
+    cell = {"cell": "night_rain", "tod_name": "night", "tod": "21:30",
+            "weather": "rain", "weather_preset": "rainy", "repeat": 0,
+            "runnable": True}
+    args = mod.build_run_args(cell, ROOT / "logs" / "x.json")
+    assert args.tod == "21:30" and args.weather_preset == "rainy"
+    assert args.map == mod.SCENARIO["map"]
+    assert args.teleport == list(mod.SCENARIO["teleport"])
+    assert args.goal == list(mod.SCENARIO["goal"])
+    assert args.seconds == mod.SCENARIO["seconds"]
+    assert args.seg_model == mod.SCENARIO["seg_model"]
+    # FSD 合规路径由默认 namespace 保证（不许手抄漂移）
+    assert args.lane_mode == "sensor" and args.strict is True
+    assert not args.allow_legacy_map_lane
+
+
+def _synth_hist(n=12, t_step=1.0):
+    """合成遥测：感知线常在、无越线/冲出/倒车/急停，edge_over=0。"""
+    hist = []
+    for i in range(n):
+        hist.append({
+            "t": i * t_step, "speed": 4.0, "lane_sel": "sensor",
+            "lane_src": "sensor_lane", "lane_paired": 1,
+            "lat_left": 0.6, "lat_right": 1.2,
+            "heading": 45.0, "route_bear": 45.0,
+            "edge_over": 0.0, "reversing": 0, "stuck": 0,
+            "emergency": 0, "level": "safe", "pos": [0.0, 0.0, 0.0],
+        })
+    return hist
+
+
+_GOOD_SESSION = {
+    "placed": True, "placement_rc": 0,
+    "environment": {"tod": "21:30", "weather_preset": "rainy",
+                    "applied": True, "order": "weather_then_tod",
+                    "tod_after": "21:30:00"},
+    "config": {"tod": "21:30", "weather_preset": "rainy"},
+    "exit_code": 0,
+}
+
+
+def test_fsd_conditions_score_one_failclosed():
+    from beamng_autopilot.eval import STATUS_UNKNOWN, assess_run, score_run
+    mod = _load_conditions()
+    hist = _synth_hist()
+    row = mod.score_one(hist, dict(_GOOD_SESSION))
+    # 无 fail-closed 触发时，状态必须等于直接评测的判定（不篡改）
+    verdict = score_run(assess_run(hist, goal=tuple(mod.SCENARIO["goal"]),
+                                   settle_s=8.0), require_goal=False)
+    assert row["status"] == verdict["status"]
+    assert row["placed"] and row["env_applied"]
+    assert row["tod_after"] == "21:30:00"
+    # 没放上车 -> UNKNOWN（fail-closed）
+    s2 = dict(_GOOD_SESSION, placed=False)
+    assert mod.score_one(hist, s2)["status"] == STATUS_UNKNOWN
+    # 环境没应用上 -> UNKNOWN
+    s3 = {"placed": True, "placement_rc": 0,
+          "environment": {"applied": False, "error": "TimeoutError"},
+          "config": dict(_GOOD_SESSION["config"])}
+    r3 = mod.score_one(hist, s3)
+    assert r3["status"] == STATUS_UNKNOWN and r3["env_error"] == "TimeoutError"
+    # 引擎读回的时刻与请求不一致 -> UNKNOWN
+    s4 = {"placed": True, "placement_rc": 0,
+          "environment": {"applied": True, "tod_after": "10:00:00"},
+          "config": dict(_GOOD_SESSION["config"])}
+    assert mod.score_one(hist, s4)["status"] == STATUS_UNKNOWN
+    # 空遥测 -> UNKNOWN
+    assert mod.score_one([], dict(_GOOD_SESSION))["status"] == STATUS_UNKNOWN
+
+
+def test_fsd_conditions_aggregate_failclosed():
+    from beamng_autopilot.eval import STATUS_UNKNOWN
+    mod = _load_conditions()
+
+    def row(cell, status, sensor=0.8):
+        return {"cell": cell, "status": status, "lane_sensor_rate": sensor,
+                "lane_paired_rate": sensor - 0.1, "cross_centre_frames": 0,
+                "off_road_frames": 0, "stuck_frames": 0}
+
+    # 非重复格 1 轮 PASS -> PASS；最差口径取 min
+    table = mod.aggregate([row("noon_clear", "PASS", 0.9)])
+    assert table["noon_clear"]["status"] == "PASS"
+    assert table["noon_clear"]["expected_runs"] == 1
+    assert table["noon_clear"]["lane_sensor_rate_min"] == 0.9
+    # 重复格只跑 1 轮 -> 轮次不全 -> UNKNOWN（不降门）
+    table = mod.aggregate([row("night_clear", "PASS")])
+    assert table["night_clear"]["status"] == STATUS_UNKNOWN
+    assert table["night_clear"]["expected_runs"] == 2
+    # 重复格 2 轮 PASS -> PASS
+    table = mod.aggregate([row("night_clear", "PASS", 0.7),
+                           row("night_clear", "PASS", 0.5)])
+    assert table["night_clear"]["status"] == "PASS"
+    assert table["night_clear"]["lane_sensor_rate_min"] == 0.5
+    # 任一轮 UNKNOWN -> 整格 UNKNOWN
+    table = mod.aggregate([row("night_rain", "PASS"),
+                           row("night_rain", STATUS_UNKNOWN)])
+    assert table["night_rain"]["status"] == STATUS_UNKNOWN
+    assert table["night_rain"]["unknown_runs"] == 1
+    # 任一轮 FAIL（其余 PASS）-> FAIL
+    table = mod.aggregate([row("dusk_fog", "PASS"),
+                           row("dusk_fog", "FAIL")])
+    assert table["dusk_fog"]["status"] == "FAIL"

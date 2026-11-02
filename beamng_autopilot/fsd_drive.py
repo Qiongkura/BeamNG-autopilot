@@ -2369,19 +2369,35 @@ class FSDriveSession:
                 _tod_s = str(getattr(args, "tod", "") or "")
                 _wx = str(getattr(args, "weather_preset", "") or "")
                 try:
+                    # 顺序敏感（2026-11-02，core_weather.lua 证据）：weather
+                    # preset 的 diff 表可携带 timeOfDay——先 set_tod 再上天气
+                    # 会把显式时刻覆盖回预设值，条件矩阵的「时刻×天气」格就
+                    # 不成立。固定 weather -> tod 让显式 TOD 最终生效；应用后
+                    # 读回一次 get_tod 存证（条件格=引擎侧可验证，而不是只信
+                    # "调用没抛异常"）。
+                    if _wx:
+                        conn.bng.env.set_weather_preset(_wx)
                     if _tod_s:
                         _parts = _tod_s.split(":")
                         _hms = (f"{int(_parts[0]):02d}:"
                                 f"{int(_parts[1]) if len(_parts) > 1 else 0:02d}:00")
                         conn.bng.env.set_tod(tod=_hms)
-                    if _wx:
-                        conn.bng.env.set_weather_preset(_wx)
+                    try:
+                        _tod_after = str(
+                            (conn.bng.env.get_tod() or {}).get("timeStr") or "")
+                    except Exception:  # noqa: BLE001 — 读回失败不影响驾驶
+                        _tod_after = None
                     _run_record["environment"] = {"tod": _tod_s, "weather_preset": _wx,
-                                                  "applied": True}
+                                                  "applied": True,
+                                                  "order": "weather_then_tod",
+                                                  "tod_after": _tod_after}
                     print(f"[fsd-drive] environment -> tod={_tod_s or '-'} "
-                          f"weather={_wx or '-'}", flush=True)
-                except (TypeError, ValueError, AttributeError) as exc:
-                    # 环境应用失败不静默：记录并继续（条件矩阵会标 UNKNOWN）
+                          f"weather={_wx or '-'} applied_tod={_tod_after or '?'}",
+                          flush=True)
+                except Exception as exc:  # noqa: BLE001 — 环境应用失败不静默：
+                    # 记录并继续（矩阵按 applied=False 标 UNKNOWN 格）。预设名
+                    # 不存在时 beamngpy 等 ack 抛 TimeoutError，窄化 except 会
+                    # 让整轮驾驶崩掉——条件矩阵要的是 UNKNOWN 格，不是崩溃。
                     _run_record["environment"] = {"tod": _tod_s, "weather_preset": _wx,
                                                   "applied": False, "error": type(exc).__name__}
                     print(f"[fsd-drive] environment 应用失败（继续运行）：{exc}", flush=True)
