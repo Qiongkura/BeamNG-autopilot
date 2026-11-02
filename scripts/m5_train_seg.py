@@ -1318,9 +1318,12 @@ def main() -> None:
     # 弱线增补（--weak-line-oversample）追加的重复帧：按内容身份自然继承来源
     # （见 build_sampler_pool），这里不再单独记录位置
     if args.weak_line_oversample > 0 and train_frames:
+        # 帧元组可能是 2 元（colour,label）或 3 元（+annotation_raw）——
+        # 按索引取 label，不做定长解包（2026-11-02 实测 3 元帧在
+        # --weak-line-oversample 下 ValueError: too many values to unpack）。
         _refs = [FrameRef(index=i, run="", t=float(i),
-                          line_frac=float((lb == 2).mean()))
-                 for i, (_img, lb) in enumerate(train_frames)]
+                          line_frac=float((frame[1] == 2).mean()))
+                 for i, frame in enumerate(train_frames)]
         _weak = select_weak_lines(_refs, low=args.weak_line_low,
                                   high=args.weak_line_high)
         if _weak:

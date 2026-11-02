@@ -818,3 +818,13 @@ def test_per_site_scenario_mode_covers_all_maps_after_east_migration():
     src = Path(m.__file__).read_text(encoding="utf-8")
     assert "post_load_ground_recheck" in src
     assert "sites_after_ground_alignment_reload" in src
+
+
+def test_weak_line_oversample_unpacks_frame_by_index():
+    # 2026-11-02 实测：3 元帧（colour,label,annotation_raw）在
+    # --weak-line-oversample 下触发 "too many values to unpack"（定长解包）。
+    # 修复=按索引取 label（frame[1]），2/3 元帧都要能跑。
+    src = (Path(__file__).resolve().parents[1] / "scripts"
+           / "m5_train_seg.py").read_text("utf-8")
+    assert "for i, (_img, lb) in enumerate(train_frames)" not in src
+    assert "for i, frame in enumerate(train_frames)" in src
