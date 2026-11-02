@@ -23,6 +23,29 @@
 
 > **2026-10-11 复核与驾驶正确性修复**：传感器同源回放（T18）、E5 起点位姿预注册 A/B 已完成并如实收口；项目遍历复核复现两个 P0 缺陷并已修复——只读诊断不再改变安全场景选择，最终发送前新增时效重判（过期控制按既有硬停契约收尾，发送年龄以下界记录）。可靠驾驶与自主学习收益仍未成立；完整判断见 [复核与下一阶段方案](docs/PROJECT_NEXT_DEVELOPMENT_REVIEW_20261011.md)、[E5 A/B 结果](docs/T16_E5_AB_RESULT_20261011.md) 和 [修复记录](docs/T16_SCENE_AND_SEND_GATE_FIX_20261011.md)。
 
+> **2026-10-20 验收口径（先读这条，再看下面的历史记录）**
+>
+> 1. **驾驶验收门未通过**：strict 闭环验收 4 次 **0/4**（stall 0.93–1.00，120 s 只走
+>    0.9–14.5 m，见 [论文](docs/paper/paper.md) §V-A）；三次合格的 E5 运行静止/低速
+>    占比 **92.6%**（[状态复核](docs/PROJECT_STATUS_RECHECK_20261011.md)）。下文 8–9 月的
+>    「PASS / 0 压线 / 0 上草」是 `m5_fsd_benchmark.py` 的 **scorecard 口径**
+>    （单场景、非 strict 验收门），不能读成 strict 自动驾驶可靠。
+> 2. **感知车道可用率有四个不同口径**（11% / 23.5% / 45.1% / 78–93%），分别来自
+>    不同 checkpoint 与不同日期；引用时必须带 `--seg-model` 与日期，见 2026-09-10 节的
+>    IMPORTANT 注。
+> 3. **部署模型**：代码默认 `logs/m5_seg/seg_model/best.pt`（2026-09-13，长期 champion）。
+>    `default_model_path()` 的「按地图专家」分支 `seg_model/by_map/<map>/best.pt`
+>    **目录不存在**，永远回退 base。10 月的 t16 系列候选**全部未晋级、未部署**；
+>    文中 v8 / v12 / v13b 是 9 月的历史选型，不是当前默认。
+> 4. **学习收益未建立**：10 月跨池配对 30 组 25 负、从未 `candidate_better`；合格线帧
+>    总量 ≈42 帧，唯一封存 held-out 已于 10-06 一次性消费。
+> 5. **横向参考默认已合规**（2026-10-20）：`m5_fsd_drive` / `m5_shadow_drive` 的
+>    `--lane-mode` 默认 `sensor`、`--strict` 默认开；`map`/`auto`/`--no-strict`
+>    必须显式加 `--allow-legacy-map-lane`，且那一轮结果不得用于验收。
+>
+> 全部 224 篇实验报告见 [文档索引](docs/INDEX.md)（脚本生成：系列/类型/
+> 预注册↔结果配对/被引用次数；`scripts/m5_docs_index.py --check` 可做门禁）。
+
 - **分层架构**：清晰的感知、决策、控制模块，便于研究与扩展；
 - **双运行时支持**：兼容 Steam 与 BeamNG.tech，自动检测并适配不同版本；
 - **视觉感知与避障**：集成 YOLO 实时目标检测与 BEV 地面反投影，实现视觉避障。
@@ -281,7 +304,8 @@ BEV/向量空间 → 占用 → 规划 → 安全 → 影子数据闭环**。现
 - 横向残差强化学习接进驾驶回路：`rl/lateral_runtime.py` + `BEAMNG_LATERAL_RL=1`
   （默认关；残差 ±0.5 m、衰减、每次移位后由安全监控复核，被拒即放弃）。
 - **仍未解决**：`no_stall` 失败（停车帧 83–88%）、横向测量覆盖率、E2E 候选全部被拒。
-  详见第五轮报告的完成度审计。
+  2026-10 复测（三次合格 E5 运行）为静止/低速 **92.6%**，见
+  [状态复核](docs/PROJECT_STATUS_RECHECK_20261011.md)。详见第五轮报告的完成度审计。
 
 ### 6) 真实驾驶闭环（`fsd_stack.py`、`scripts/m5_fsd_drive.py`）
 
@@ -338,6 +362,9 @@ BEV/向量空间 → 占用 → 规划 → 安全 → 影子数据闭环**。现
 .venv\Scripts\python.exe scripts\m5_planning_probe.py --runtime tech --attach
 
 # 4) 真实驾驶（FSD 模式，带安全监控 + 仲裁 + 反向防护）
+#    2026-10-20 起 --lane-mode 默认 sensor、--strict 默认开（铁律）：
+#    感知拿不到车道就降级停车，不再回退地图车道。要诊断旧行为必须显式
+#    加 --allow-legacy-map-lane，那一轮的结果不得用于验收。
 .venv\Scripts\python.exe scripts\m5_fsd_drive.py --runtime tech --attach `
     --seconds 30 --speed 6 --teleport 729.6 763.9 45
 
@@ -632,6 +659,9 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
 
 ### FSD 结构栈现状
 
+> 下表记录的是**单个缺陷是否在该次实车运行中复现**（修复证据），**不是整体验收
+> 状态**。整体 strict 验收在 2026-10 仍是 0/4（见文首「验收口径」）。
+
 | 问题 | 影响 | 优先级 | 状态 |
 | --- | --- | --- | --- |
 | **第一发卡弯入弯偏晚（此前最大表现缺口）** | 先直行冲到弯心外侧，再靠倒车+重规划回路线 | 高 | ✅ 已解决（确定性控制时序 + 首帧转向 + 弯前 governor，fix56 实车干净通过） |
@@ -646,8 +676,8 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
 | **起步/重启油门冲击** | 重规划后 0→0.8 油门一步给满，速度每帧跳 >1.5 m/s | 高 | ✅ 已解决（`rate_limit_pedal` 对最终踏板限幅 0.8-1.2/s，安全分支绕过，opt24 实车确认：跳变 13→4 帧） |
 | **路口/终点 plan 速度跳变（卡死-重启）** | LiDAR 杂波使 plan 在 1.0↔6.0 逐帧跳，急刹后全油门重启，路口卡死 | 高 | ✅ 已解决（plan 限幅 + 弧长投影 + corridor-open 障碍下限，opt23 实车 0 卡死） |
 | **速度节流轻微振荡** | 加速→轻刹→再加速，不影响安全但观感差 | 中 | ✅ 已缓解（目标速度 ramp + 滞回 + 下坡 governor 提前柔介入，opt14 实车 0 刹停、速度 3.8~6.9 m/s） |
-| **FSD tick 慢** | 感知规划 tick 曾 1.4~7s，实车一顿一顿 | 中 | ✅ 已缓解（实时模式 ~2Hz 连续控制、无暂停卡顿；warm-up + 只抓前视 + LiDAR 每 3 tick 轮询 + 扫描范围 120→80m / 聚类半径 40→30m + 向量化 + 密度 12→8 / 点数 6000→4500，opt24 实车确认：total p90 364ms / >300ms 42 帧） |
-| **长测覆盖** | 山地 284m 完整路线 + 城镇 118.6m 连续道路 | 中 | ✅ 均 0 压线 / 0 上草 / 0 倒车（opt26）；多场景长测继续 |
+| **FSD tick 慢** | 感知规划 tick 曾 1.4~7s，实车一顿一顿 | 中 | ✅ 已缓解（实时模式 ~2Hz 连续控制、无暂停卡顿；warm-up + 只抓前视 + LiDAR 每 3 tick 轮询 + 扫描范围 120→80m / 聚类半径 40→30m + 向量化 + 密度 12→8 / 点数 6000→4500，opt24 实车确认：total p90 364ms / >300ms 42 帧）；2026-10 复测 tick **377–432ms**、跨感知 deadline 违反仍在（T17/T18） |
+| **长测覆盖** | 山地 284m 完整路线 + 城镇 118.6m 连续道路 | 中 | ⚠️ 口径限定：opt26 的「0 压线 / 0 上草 / 0 倒车」是 scorecard 口径；strict 验收门 4 次 **0/4**、stall 92.6%（2026-10），多场景长测继续 |
 | **端到端已训练（影子数据）** | temporal 多模态 CNN（RGB+分割+BEV+速度 → 轨迹+动作） | 中 | ✅ val 0.0599（`best_temporal.pt`），批量回放报告 + 最差帧截图可查；实车闭环后续 |
 
 
@@ -656,7 +686,8 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
 城镇场景最近几轮的安全指标（`crossC`/`crossR`/`off_road`/`reversing`/`stuck`）
 **全为 0**，但这是靠**失败关闭蠕行**换来的（速度中位数 0.57 m/s、stall 47–79 帧），
 不是真正的车道保持。根因是感知车道连续性：strict 模式下只有约 **11%** 的帧拿到
-感知车道（`lane_sel=sensor`）。
+感知车道（`lane_sel=sensor`；这是 **2026-09-10 口径**，checkpoint 见下节，
+2026-09-21 在 v13b 上同一指标为 23.5%）。
 
 > [!IMPORTANT]
 > **本节数字必须标明用的是哪个 checkpoint。** 城镇场景在
@@ -837,6 +868,9 @@ runs 42/47/52 把车拽偏的原因（`m5_offline_validate.py` 的 `lane-guard` 
 是当前行车所必需），**部署默认仍为 v12 未提升为 v8**——因为任务指标显示 v8 的配对率只有 5.3%，
 全局提升会让未 pin 的场景可行驶性骤降。两处 pin 及理由均已写进各自的场景注册表注释。
 
+> **2026-10-20 更正**：上面这段是 **2026-09-10 的选型记录**。当前代码的默认权重是
+> `logs/m5_seg/seg_model/best.pt`（2026-09-13），不是 v12 也不是 v8；见文首「验收口径」第 3 条。
+
 
 
 ### 车身包络权威（2026-09-10）
@@ -871,10 +905,10 @@ runs 42/47/52 把车拽偏的原因（`m5_offline_validate.py` 的 `lane-guard` 
   驱动走 `beamng_autopilot.fsd_drive.run`，产出
   `logs/fsd_benchmark/scorecard_*.json`；`--score` 可离线重判。判分带
   `settle_s=3.0` 起步收敛窗（teleport 后语义头预热 + 感知落位不算驾驶）。
-  **首个 PASS**：mountain 场景 184.2m，0 压中线 / 0 上路外 / 0 倒车 /
+  **首个 PASS（scorecard 口径，非 strict 验收门）**：mountain 场景 184.2m，0 压中线 / 0 上路外 / 0 倒车 /
   0 卡死，终点保持距 goal 5.1m；`line_lat` 均值 +0.23m（全程本车道）；
   tick p50 123ms / p90 271ms（相机环收缩为 front_main 后）。
-  **多场景 PASS（2026-09-05）**：mountain 184.2m + town 89.1m 双场景
+  **多场景 PASS（2026-09-05，scorecard 口径）**：mountain 184.2m + town 89.1m 双场景
   全零违规（0 压线 / 0 上草 / 0 倒车 / 0 卡死），town 终点保持距 goal
   5.1m。**M4 DQN 决策层落地（2026-09-05）**：`beamng_autopilot/rl/`——
   gym 风格 `DecisionSpeedEnv`（离散 cruise/ease/slow 目标速度决策，
@@ -963,9 +997,9 @@ runs 42/47/52 把车拽偏的原因（`m5_offline_validate.py` 的 `lane-guard` 
   实时日志改进、`torch.amp.GradScaler` API 清理弃用告警。
 - 分割模型 v8 真实泛化（2026-09-04）：在 **7 个从未参与训练的 run**
   （3832 帧，山区/沿海同域）上 held-out line IoU **0.5396**（近场 0.5626，
-  各 run 0.27-0.74）——部署中的 v8 泛化其实是健康的；此前"v8 只有
+  各 run 0.27-0.74）——v8 的泛化其实是健康的；此前"v8 只有
   0.2218"是对它**训练见过**的 run_bridge/run_navroute_town 的误读，
-  不是 held-out。
+  不是 held-out。（2026-10-20 更正：当前部署默认**不是** v8，见文首验收口径。）
 - 分割模型 v9 退步原因（2026-09-04）：v9（10 run / 6532 帧全量混合）在
   完全未见的城镇+桥上 held-out（925 帧）上 line IoU 仅 **0.110**，且对
   同域 run 也系统性低于 v8——**混入大量标线稀疏 run（line 像素占比
@@ -977,7 +1011,7 @@ runs 42/47/52 把车拽偏的原因（`m5_offline_validate.py` 的 `lane-guard` 
   过滤方向收益有限，**域外（小镇/桥上）泛化瓶颈在数据域不够，不在过滤**；
   （本轮训练在 ep 26 提前停止，val mIoU **0.8084** 为当时最优，held-out
   结论以 ep 18 检查为准）。下一步把小镇数据纳入训练、另行采集真正全新
-  held-out，部署目录继续保 v8。
+  held-out。部署目录保的是 `seg_model/best.pt`（2026-09-13），不是 v8。
 - 评估工具（2026-09-04）：`m5_eval_seg.py` 按 run 分组输出 line IoU /
   近场 / 标线像素占比，`m5_train_seg.py` 新增 `--min-line-frac` 帧过滤与
   `--split per-run` 验证划分（避免稀疏 run 主导验证集），均有单测。
