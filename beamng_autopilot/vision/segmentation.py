@@ -1106,6 +1106,15 @@ class Segmenter:
         ym = yellow_line_mask(frame_rgb)
         cv_yellow = cv_yellow | ym
         cv_white = cv_white & ~ym
+        # 研究臂（默认 "1"=现行为）：关掉经典亮度臂的白漆恢复。
+        # GridMap 试车场（浅色/纹理地面）上，该臂把地面纹理当白漆，与学习
+        # 掩码里两条完整的 30m 实线并成无效大块/碎段（2026-11-04 根因：
+        # 纯学习掩码 -> 2 条 30m solid；并上 cv_white -> 0 marking）。
+        # 关闭后候选只来自学习掩码（+ 黄色臂），用于受控场地诊断；生产
+        # 默认不变，必须显式 BEAMNG_CV_WHITE=0 才生效。
+        _cv_white_off = os.environ.get("BEAMNG_CV_WHITE", "1") == "0"
+        if _cv_white_off:
+            cv_white = np.zeros_like(cv_white)
         # 只读仪器（预注册 H1/H2 判据）：掩码级像素计数，供按 kind 归因
         if debug is not None:
             try:
@@ -1117,6 +1126,7 @@ class Segmenter:
                     "yellow_prior_px": int(np.count_nonzero(ym)),
                     "yellow_gate_rel": bool(_yrel),
                     "clahe": bool(os.environ.get("BEAMNG_CAND_CLAHE", "0") == "1"),
+                    "cv_white_off": bool(_cv_white_off),
                 }
             except Exception:  # noqa: BLE001 — 仪器失败不影响提取
                 pass
