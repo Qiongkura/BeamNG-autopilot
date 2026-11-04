@@ -81,6 +81,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--probe-geometry", action="store_true",
                     help="record exact sensor boundaries, candidates, control path and grid; "
                          "diagnostic overhead is reported separately")
+    ap.add_argument("--seg-post-norm-width", type=int, default=None,
+                    help="研究开关（默认 None=现行行为）：后处理在固定宽度"
+                         "（如 192）运行再放大，修复 536 输入下细黄线被像素核"
+                         "删除；见 T16_POST_NORM_RESULT_20261104")
     ap.add_argument("--pairing-research", choices=("off", "far_thin",
                                                    "thin_near"),
                     default="off",

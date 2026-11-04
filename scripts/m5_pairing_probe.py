@@ -383,6 +383,8 @@ def collect(args) -> int:
                "--out", str(out.with_suffix(".telemetry.json"))]
         if not args.no_goal:
             cmd += ["--goal", f"{gx:.3f}", f"{gy:.3f}"]
+        if getattr(args, "post_norm_width", None):
+            cmd += ["--seg-post-norm-width", str(int(args.post_norm_width))]
         if str(args.arm) in ("far_thin", "thin_near"):
             cmd += ["--pairing-research", str(args.arm)]
         env = _arm_env(str(args.arm))
@@ -423,6 +425,7 @@ def collect(args) -> int:
         "tod": args.tod,
         "weather_preset": args.weather_preset,
         "goal": [gx, gy],
+        "post_norm_width": getattr(args, "post_norm_width", None),
         "policy": _arm_policy(args.arm).as_dict(),
         "policy_is_default": _arm_policy(args.arm).is_default(),
         "arm": str(args.arm),
@@ -487,6 +490,8 @@ def main() -> int:
                     default="baseline",
                     help="研究臂：far_thin/thin_near 走 --pairing-research；"
                          "yellow/span/clahe 走环境变量（Y1/S1/I1）")
+    ap.add_argument("--post-norm-width", type=int, default=None,
+                    help="研究开关：透传 drive 的 --seg-post-norm-width")
     ap.add_argument("--edge-margin-m", type=float, default=0.6,
                     help="right_lane 约定下右线距铺装边的余量（米）")
     ap.add_argument("--line-convention", default="right_lane",
