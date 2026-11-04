@@ -52,6 +52,9 @@ def main() -> None:
                     help="second checkpoint for --tta ens (same-fold "
                          "different-seed model; probabilities are averaged "
                          "before argmax)")
+    ap.add_argument("--ensemble-deploy", action="store_true",
+                    help="部署路径：用 EnsembleSegmenter(model, model2) 做概率"
+                         "平均（需要 --model2），与 --tta ens 同一数学")
     ap.add_argument("--tta", choices=("none", "hflip", "ens"), default="none",
                     help="test-time augmentation: hflip averages the "
                          "probabilities of the frame and its mirror; ens "
@@ -84,10 +87,18 @@ def main() -> None:
         raise SystemExit(f"没有找到数据: {args.runs}")
     print(f"[eval] 数据 {len(files)} 帧")
 
-    seg = Segmenter(model_path=args.model, device=args.device,
-                    temporal_smooth=args.temporal)
-    print(f"[eval] 模型加载完成: {args.model} "
-          f"(temporal_smooth={args.temporal})")
+    if args.ensemble_deploy:
+        if not args.model2:
+            raise SystemExit("--ensemble-deploy 需要 --model2")
+        from beamng_autopilot.vision.segmentation import EnsembleSegmenter
+        seg = EnsembleSegmenter(model_paths=[args.model, args.model2],
+                                device=args.device)
+        print(f"[eval] 部署集成加载: {seg.model_path}")
+    else:
+        seg = Segmenter(model_path=args.model, device=args.device,
+                        temporal_smooth=args.temporal)
+        print(f"[eval] 模型加载完成: {args.model} "
+              f"(temporal_smooth={args.temporal})")
     seg2 = None
     if args.tta == "ens":
         if not args.model2:
