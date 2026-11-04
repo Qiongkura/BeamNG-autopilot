@@ -1167,3 +1167,10 @@ def test_conditions_skip_cells_with_only_session_evidence():
     root = Path(__file__).resolve().parents[1]
     src = (root / "scripts" / "m5_fsd_conditions.py").read_text("utf-8")
     assert 'Path(str(out_path) + ".session.json").exists()' in src
+
+
+def test_conditions_score_ignores_own_output_and_non_list():
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "scripts" / "m5_fsd_conditions.py").read_text("utf-8")
+    assert '"conditions_table.json"' in src
+    assert "if not isinstance(hist, list):" in src

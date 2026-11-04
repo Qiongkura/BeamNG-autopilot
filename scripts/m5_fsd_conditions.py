@@ -187,6 +187,9 @@ def run_matrix(out_dir: Path, preset_rain: str | None,
 
 def score_one(hist: list[dict], session: dict | None) -> dict:
     """一轮遥测 -> 该格的指标行（含 UNKNOWN 传播，绝不静默丢证据）。"""
+    if not isinstance(hist, list):
+        # 误把聚合表/审计当遥测传入时按空遥测处理，绝不崩
+        hist = []
     assessed = assess_run(hist, goal=tuple(SCENARIO["goal"]), settle_s=8.0)
     verdict = score_run(assessed, require_goal=False)
     env = (session or {}).get("environment") or {}
@@ -294,7 +297,7 @@ def score_dir(out_dir: Path) -> int:
     for path in sorted(out_dir.glob("*.json")):
         name = path.name
         if name.endswith(".session.json") or name.endswith(".vis_index.json") \
-                or name == "batch_manifest.json":
+                or name in ("batch_manifest.json", "conditions_table.json"):
             continue
         try:
             hist = json.loads(path.read_text(encoding="utf-8"))
