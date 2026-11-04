@@ -2459,9 +2459,13 @@ class FSDriveSession:
                     _prof = _mcs.apply_map_profile(
                         str(args.map or "gridmap_v2"), overrides=_ov or None)
                     _sname = Path(args.scenario_json).stem
+                    # 场景类型由 JSON 声明（默认 known_line）。proving_lane
+                    # 会先铺深色铺装 decal（GridMap 浅色地面会被经典亮度臂
+                    # 误当白漆，2026-11-04 根因），其他场景行为不变。
+                    _scene_type = str(_doc.get("scene_type") or "known_line")
                     _scen, _ = _mcs.build_scenario(
                         conn, [_site], map_name=str(args.map or "gridmap_v2"),
-                        scene_types=["known_line"], scene_names=[_sname],
+                        scene_types=[_scene_type], scene_names=[_sname],
                         line_convention=str(getattr(
                             args, "scenario_line_convention", "right_lane")),
                         edge_margin_m=float(getattr(
