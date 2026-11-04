@@ -320,3 +320,12 @@ GPU 训练。
   后处理固定像素核在 536 输入下删除细黄线，缩到 192 跑后处理再放大即可
   恢复。下一步：live 接线（默认 None，加 `--seg-post-norm-width`）复测右线
   候选/true_rate + 时延与安全审计。见 `T16_POST_NORM_RESULT_20261104.md`。
+- **post-norm live 复测（2026-11-04）**：`--seg-post-norm-width` 接线完成
+  （默认 None），east 难场景开/关 × 2 重复。**L1 失败**（右候选召回
+  0.00→0.15，目标 0.6）；L2 失败（true_rate 双稳态干扰，off 0.83/0.05、
+  on 0.28/0.17，phantom 上升）；**L3 通过**（无崩溃、未放置保持刹车
+  rc=3、安全门语义不变）；**L4 通过**（p50 18.9→8.0ms，−10.9ms）。
+  结论：离线 post 恢复（0.103→0.688）不迁移到 live——剩余丢失点在
+  mask→marking 提取或 live 536 原生域；开关不接部署。下一步：live 帧
+  回放 detect_lines（探针加 --save-frames）。见
+  `T16_POST_NORM_LIVE_RESULT_20261104.md`。
