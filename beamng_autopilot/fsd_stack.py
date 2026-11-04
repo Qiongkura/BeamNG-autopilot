@@ -2487,8 +2487,9 @@ class FSDStack:
             if not markings:
                 debug["mode"] = "no_markings"
                 return None
-            frame = pair_lane_markings(markings, pos, heading,
-                                       debug=debug)
+            frame = pair_lane_markings(
+                markings, pos, heading, debug=debug,
+                research=getattr(self, "pairing_research", None))
             debug["result"] = (None if frame is None else {
                 "paired": bool(frame.paired),
                 "confidence": round(float(frame.confidence), 3),
