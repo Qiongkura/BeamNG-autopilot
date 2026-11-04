@@ -1255,7 +1255,8 @@ class EnsembleSegmenter:
 
     def __init__(self, model_paths: list[str] | None = None, *,
                  segmenters: list | None = None, device=None,
-                 use_half: bool = True, post_norm_width: int | None = None):
+                 use_half: bool = True, post_norm_width: int | None = None,
+                 weights: list[float] | None = None):
         if segmenters is None:
             if not model_paths or len(model_paths) < 2:
                 raise ValueError("EnsembleSegmenter 需要至少两个模型")
@@ -1266,6 +1267,18 @@ class EnsembleSegmenter:
         self.segmenters = list(segmenters)
         if len(self.segmenters) < 2:
             raise ValueError("EnsembleSegmenter 需要至少两个成员")
+        # 等权是默认；加权仅用于预注册实验（T16_ENSEMBLE_WEIGHTED），
+        # 权重和归一化，非法输入直接拒绝（不静默兜底）。
+        if weights is None:
+            _w = [1.0] * len(self.segmenters)
+        else:
+            _w = [float(x) for x in weights]
+            if len(_w) != len(self.segmenters):
+                raise ValueError("weights 数量必须与成员数一致")
+            if any(x < 0 for x in _w) or sum(_w) <= 0:
+                raise ValueError("weights 必须非负且和 >0")
+        _tot = sum(_w)
+        self.weights = [x / _tot for x in _w]
         names = "+".join(str(getattr(s, "model_path", "?"))
                          for s in self.segmenters)
         self.model_path = f"ensemble[{names}]"
@@ -1279,11 +1292,10 @@ class EnsembleSegmenter:
 
     def predict(self, frame_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         probs = None
-        for seg in self.segmenters:
+        for w, seg in zip(self.weights, self.segmenters):
             p = np.asarray(seg.probability_maps_small(frame_rgb),
-                           dtype=np.float32)
+                           dtype=np.float32) * float(w)
             probs = p if probs is None else probs + p
-        probs = probs / float(len(self.segmenters))
         return self.segmenters[0].masks_from_model_probs(frame_rgb, probs)
 
     def detect_lines(self, frame_rgb, cam_model, pos, heading,

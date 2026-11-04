@@ -1689,3 +1689,35 @@ def test_eval_model3_wiring():
     ev = (root / "scripts" / "m5_eval_seg.py").read_text("utf-8")
     assert '"--model3"' in ev
     assert "_paths.append(args.model3)" in ev
+
+
+def test_ensemble_weights_and_defaults():
+    import numpy as np
+    from beamng_autopilot.vision.segmentation import EnsembleSegmenter
+
+    class Fake:
+        def __init__(self, probs):
+            self.probs = probs; self.model_path = "fake"; self.device = "cpu"
+            self.last = None
+        def probability_maps_small(self, frame): return self.probs
+        def masks_from_model_probs(self, frame, probs):
+            self.last = probs; return (np.zeros((1, 1), bool), np.ones((1, 1), bool))
+        def reset(self): pass
+        def detect_lines(self, *a, **k): return []
+
+    a = Fake(np.zeros((3, 1, 1), np.float32))
+    b = Fake(np.ones((3, 1, 1), np.float32))
+    ens = EnsembleSegmenter(segmenters=[a, b], weights=[3, 1])
+    ens.predict(np.zeros((2, 2, 3), np.uint8))
+    assert abs(float(a.last.mean()) - 0.25) < 1e-6
+    # 默认等权
+    ens2 = EnsembleSegmenter(segmenters=[a, b])
+    assert ens2.weights == [0.5, 0.5]
+    # 非法权重拒绝
+    for bad in ([1.0], [-1, 2], [0, 0]):
+        try:
+            EnsembleSegmenter(segmenters=[a, b], weights=bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"weights={bad} 必须拒绝")
