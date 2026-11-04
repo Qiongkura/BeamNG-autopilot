@@ -372,9 +372,37 @@ def collect(args) -> int:
                 conn.bng.scenario.start()
             time.sleep(2.0)
             conn.attach_vehicle(already_open=True)
+            # GROUND_ALIGN（与采集器一致）：east/west 的地图路面 z 与 roadnet
+            # 的中间 z 可差数十米；不对齐会让贴花埋在真实地面下（live 帧在
+            # GT 位置只有沥青灰），ego 却被 ensure_above_ground 抬起。
+            _ga = {"applied": False}
+            if str(args.map) in getattr(collector, "GROUND_ALIGN_MAPS", set()):
+                try:
+                    _gz = conn.ground_z_at(float(site["mid"][0]),
+                                           float(site["mid"][1]))
+                except Exception:  # noqa: BLE001
+                    _gz = None
+                _delta = (None if _gz is None
+                          else float(_gz) - float(site["mid"][2]))
+                _ga = {"applied": False, "ground_z": _gz,
+                       "road_z": float(site["mid"][2]), "delta_m": _delta}
+                if _delta is not None and abs(_delta) > 2.0:
+                    collector._align_sites_to_ground(conn, [site], str(args.map))
+                    scen, _rec = collector.build_scenario(
+                        conn, [site], map_name=args.map,
+                        scene_types=["known_line"], scene_names=[scene_name],
+                        line_convention=str(args.line_convention),
+                        edge_margin_m=float(args.edge_margin_m))
+                    with conn.io_lock:
+                        scen.make(conn.bng)
+                        conn.bng.scenario.load(scen)
+                        conn.bng.scenario.start()
+                    time.sleep(2.0)
+                    conn.attach_vehicle(already_open=True)
+                    _ga["applied"] = True
             print(f"[pairing-probe] scenario loaded: {scen.name} "
-                  f"(lines={len(site and scene_doc['scene'].get('lines') or [])})",
-                  flush=True)
+                  f"(lines={len(site and scene_doc['scene'].get('lines') or [])}) "
+                  f"ground_align={_ga}", flush=True)
         cmd = [sys.executable, str(ROOT / "scripts" / "m5_fsd_drive.py"),
                "--runtime", args.runtime, "--attach",
                "--seconds", "1", "--max-wall-s", f"{wall_s:.1f}",

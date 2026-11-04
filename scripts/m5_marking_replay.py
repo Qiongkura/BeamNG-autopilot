@@ -162,6 +162,10 @@ def main() -> int:
         pair = pair_lane_markings(markings, pos, heading, debug=dbg2)
         g_lat = gt_right_lat(scene_doc, args.edge_margin, pos, heading)
         gt_pts = right_line_world(scene_doc, args.edge_margin)
+        # 地面重对齐后贴花在 ego 所处地面 z；投影用 ego z（局部近平面近似），
+        # 避免 scene JSON 的旧 road z 把 GT 投到画面上方/下方。
+        gt_pts = np.asarray(gt_pts, dtype=float)
+        gt_pts[:, 2] = float(pos[2])
         u, v, valid = cam.project(gt_pts, pos, heading)
         near_mask = False
         if np.any(valid):
