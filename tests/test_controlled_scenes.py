@@ -1104,3 +1104,58 @@ def test_fsd_conditions_expected_cells_from_manifest():
                            "config": {"tod": "06:30"}})
     assert r["status"] == STATUS_UNKNOWN
     assert r["frames"] == 0 and r["placement_rc"] == 3
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-04 推理侧杠杆：水平翻转 TTA（概率平均）
+# ---------------------------------------------------------------------------
+
+def test_tta_flip_average_and_wiring():
+    from beamng_autopilot.vision.segmentation import tta_flip_average
+    import numpy as np
+
+    a = np.zeros((3, 4, 5), dtype=np.float32)
+    b = np.ones((3, 4, 5), dtype=np.float32)
+    m = tta_flip_average(a, b)
+    assert m.shape == a.shape and np.allclose(m, 0.5)
+    # 形状不一致必须报错，不做静默广播
+    try:
+        tta_flip_average(a, np.zeros((3, 4, 6), dtype=np.float32))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("形状不一致必须 ValueError")
+
+    # Segmenter 接线：predict_tta 存在、概率平均后走与 predict 相同的后处理
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "beamng_autopilot" / "vision" / "segmentation.py").read_text("utf-8")
+    assert "def predict_tta(" in src
+    body = src[src.index("def predict_tta("):]
+    body = body[:body.index("\n    def ")]
+    assert "tta_flip_average(" in body
+    assert "self._postprocess(frame_rgb, road, line)" in body
+    assert "self._infer_logits(" in body
+
+    # 评测入口：--tta + 调用 predict_tta
+    ev = (root / "scripts" / "m5_eval_seg.py").read_text("utf-8")
+    assert 'ap.add_argument("--tta"' in ev
+    assert "seg.predict_tta(colour)" in ev
+
+
+def test_ensemble_wiring_two_models():
+    # 同折两种子集成：eval 入口支持 --model2 + --tta ens；Segmenter 提供
+    # 概率图与"平均概率 -> 同一后处理"入口。
+    root = Path(__file__).resolve().parents[1]
+    ev = (root / "scripts" / "m5_eval_seg.py").read_text("utf-8")
+    assert 'ap.add_argument("--model2"' in ev
+    assert '"ens"' in ev and "prob_average(p1, p2)" in ev
+    src = (root / "beamng_autopilot" / "vision" / "segmentation.py").read_text("utf-8")
+    assert "def probability_maps_small(" in src
+    assert "def masks_from_model_probs(" in src
+    assert "def prob_average(" in src
+    from beamng_autopilot.vision.segmentation import prob_average, tta_flip_average
+    import numpy as np
+    a = np.zeros((3, 2, 2), dtype=np.float32)
+    b = np.ones((3, 2, 2), dtype=np.float32)
+    assert np.allclose(prob_average(a, b), 0.5)
+    assert np.allclose(tta_flip_average(a, b), 0.5)

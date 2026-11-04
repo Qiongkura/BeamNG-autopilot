@@ -122,6 +122,25 @@ def iou_from_accum(inter: np.ndarray, union: np.ndarray) -> np.ndarray:
     return ious
 
 
+def prob_average(prob_a: np.ndarray, prob_b: np.ndarray) -> np.ndarray:
+    """两路同形状概率图的平均（TTA / 同折多种子集成的公共算子）。
+
+    概率在 softmax 之后平均、再 argmax，避免把两路的硬掩码做多数投票
+    （硬投票会丢掉置信度，且在细线上放大量化误差）。形状不一致直接
+    报错，不做静默广播。
+    """
+    a = np.asarray(prob_a, dtype=np.float32)
+    b = np.asarray(prob_b, dtype=np.float32)
+    if a.shape != b.shape:
+        raise ValueError(f"概率图形状不一致: {a.shape} vs {b.shape}")
+    return 0.5 * (a + b)
+
+
+def tta_flip_average(prob_a: np.ndarray, prob_b: np.ndarray) -> np.ndarray:
+    """水平翻转 TTA 的概率平均（同上算子的具名入口，保留兼容）。"""
+    return prob_average(prob_a, prob_b)
+
+
 def fill_interior_holes(mask: np.ndarray) -> np.ndarray:
     """Fill every background region fully enclosed by ``mask``.
 
@@ -716,9 +735,60 @@ class Segmenter:
         pred = cv2.resize(pred, (w, h), interpolation=cv2.INTER_NEAREST)
         return pred == self._road_idx, pred == self._line_idx
 
+    def probability_maps_small(self, frame_rgb: np.ndarray) -> np.ndarray:
+        """Softmax 概率图（模型推理分辨率，未 resize、未后处理）。
+
+        供 TTA / 多种子集成在**同一分辨率**上做概率平均：先平均再 argmax，
+        避免两路各自 resize 后硬掩码投票的信息损失。
+        """
+        logits = self._infer_logits(frame_rgb)
+        return torch.softmax(logits.float(), dim=1)[0].cpu().numpy()
+
+    def masks_from_model_probs(self, frame_rgb: np.ndarray,
+                               probs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """模型分辨率的（可能已平均的）概率 -> 与 predict 相同的后处理管线。
+
+        argmax 在模型分辨率进行、最近邻放大到帧分辨率——与
+        ``_argmax_masks`` 完全一致；随后走 ``_postprocess``，保证集成/TTA
+        与单模型路径的差异只来自概率本身。
+        """
+        pred = np.asarray(probs).argmax(axis=0).astype(np.uint8)
+        h, w = frame_rgb.shape[:2]
+        pred = cv2.resize(pred, (w, h), interpolation=cv2.INTER_NEAREST)
+        road = pred == self._road_idx
+        line = pred == self._line_idx
+        return self._postprocess(frame_rgb, road, line)
+
     def predict(self, frame_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         """Return (road_mask, line_mask) at the input frame resolution."""
         road, line, _ = self._predict_timed(frame_rgb, with_probs=False)
+        return road, line
+
+    def predict_tta(self, frame_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """水平翻转 TTA：两路概率平均后再 argmax，其余管线与 predict 相同。
+
+        动机：标线识别在阴影/逆光/单侧标线下存在左右不对称的失败模式
+        （east 右线阴影定因），镜像视图能让模型从另一侧的纹理证据补票。
+        概率在 softmax 之后平均（不是硬掩码投票），argmax 之后走与
+        ``predict`` 完全相同的后处理（形态学、路面约束、外观门），所以
+        两种入口的差异只来自概率平均本身。
+
+        成本 = 2 次前向（约 2× 推理时延）。是否进部署链由固定 4 折的
+        配对评测决定，本方法默认不改变 ``predict`` 的行为。
+        """
+        logits = self._infer_logits(frame_rgb)
+        prob_a = torch.softmax(logits.float(), dim=1)[0].cpu().numpy()
+        mirrored = np.ascontiguousarray(frame_rgb[:, ::-1])
+        logits_f = self._infer_logits(mirrored)
+        prob_b = torch.softmax(logits_f.float(), dim=1)[0].cpu().numpy()
+        prob_b = prob_b[:, :, ::-1]          # 翻转回原方向
+        probs = tta_flip_average(prob_a, prob_b)
+        pred = probs.argmax(axis=0).astype(np.uint8)
+        h, w = frame_rgb.shape[:2]
+        pred = cv2.resize(pred, (w, h), interpolation=cv2.INTER_NEAREST)
+        road = pred == self._road_idx
+        line = pred == self._line_idx
+        road, line = self._postprocess(frame_rgb, road, line)
         return road, line
 
     def _predict_timed(self, frame_rgb: np.ndarray, *, with_probs: bool):
