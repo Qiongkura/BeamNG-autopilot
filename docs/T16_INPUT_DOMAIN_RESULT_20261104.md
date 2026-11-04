@@ -52,3 +52,22 @@ post-norm L1 右召回 0.15、配对右候选≈0）都**不能归因于感知**
 `logs/m5_seg/input_domain_east.json`、`marking_replay_east_ga_r0.*`（GROUND_ALIGN
 版帧）、`marking_replay_east_sym_r0.*`、`_east_ga_frame5_marks.png`（GT 投影
 叠加图）。
+
+## 追加：材质修复、渲染校验门与 A/B 判定（同日）
+
+1. **材质修复已实现**：探针此前漏调 `apply_map_profile(map)`，east/west 的
+   贴花仍用 italy 默认材质（引擎日志 `ptSetMaterial failed to find
+   italy_road_markings_line_thin`）。修复后 profile 正确记录
+   （east `line_yellow_double@0.40`、west `line_white/line_yellow@0.15`），
+   GT 投影点邻域确实有漆色像素（paint_ratio=1.0）。
+2. **但 A/B 证明这些漆不是贴花**：同一站点分别构建 `known_line` 与
+   `known_no_line`（无任何生成线），GT 左右两侧的 paint_ratio **都是 1.0**
+   —— 画面里的漆全部来自地图自带标线，合成贴花在 live 帧中不可区分。
+3. **渲染校验门**已实现（`paint_ratio` + `INVALID_GT` 标签），但通用"漆色"
+   判据无法区分贴花与地图线；需要贴花特异判据（唯一材质色/渲染 A/B 差分），
+   或改到**无地图标线的路段**。
+4. **结论**：east a0s0 / west a3s0 这类站点上，live 的"合成贴花 GT"与地图
+   标线在 6px 内重合/被覆盖，**live 右线指标仍不可归因**。正确做法是换到
+   地图本身无标线的路段（或唯一材质色的专用站点）再测；这不是感知问题，
+   是场景设计问题。
+5. 已实现 `--scene-type known_no_line` 供 A/B；材质档案修复与渲染门代码保留。
