@@ -124,7 +124,9 @@ def test_five_scene_classes_are_specified():
     m = _load()
     assert set(m.SCENES) == {"known_line", "known_no_line", "occluded_line",
                              "slope_curve", "material_mix",
-                             "structure_negative"}
+                             "structure_negative",
+                             # 2026-11-04：试车场（先铺装、再画线）
+                             "proving_lane"}
     assert m.SCENES["known_no_line"]["lines"] == []
     assert m.SCENES["occluded_line"].get("occluder") is True
     assert m.SCENES["material_mix"].get("gravel") is True

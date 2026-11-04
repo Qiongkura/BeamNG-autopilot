@@ -262,6 +262,12 @@ OCCLUDER_AHEAD_M = 8.0
 #: 米数"给：车道宽的一半即车道分界。
 SCENES: dict[str, dict] = {
     "known_line": {"lines": [("white", +1, "left"), ("yellow", -1, "right")]},
+    # 试车场（GridMap 等无标线地图）：先铺一条**深色铺装** decal 再画线。
+    # GridMap 地面是浅色混凝土：经典亮度臂把整片地面当白漆，与学习掩码里
+    # 两条完整线并成一个无效大块 → 只剩经典黄色臂 1m 碎段（2026-11-04
+    # 根因诊断）。深色铺装让线成为画面里唯一的亮细结构。
+    "proving_lane": {"lines": [("white", +1, "left"), ("yellow", -1, "right")],
+                     "pave_width_m": 20.0, "line_z_offset_m": 0.02},
     "known_no_line": {"lines": []},
     "occluded_line": {"lines": [("white", +1, "left")], "occluder": True},
     "slope_curve": {"lines": [("white", +1, "left"), ("yellow", -1, "right")]},
@@ -830,7 +836,21 @@ def build_scenario(conn, sites: list[dict], *, map_name: str = "italy",
             _specs = [("yellow" if rn.endswith("_left") else "white",
                        1 if float(LINE_ROLE_LATERAL_M[rn]) >= 0 else -1, rn)
                       for rn in _roles]
+        # 试车场铺装：先铺深色路面 decal，线画在它上面（优先级低于线）。
+        # 仅 proving_lane 场景声明 pave_width_m；其他场景保持"线直接画在
+        # 地图自带路面上"的历史行为不变。
+        if spec.get("pave_width_m"):
+            _pw = float(spec["pave_width_m"])
+            _pnodes = _line_nodes(site, 0.0)
+            _prid = f"m5_pave_{name}"
+            _add_road(MAT_PAVE, _prid, _pnodes, _pw, 10 + k)
+            rec["pavement"] = {"id": _prid, "material": MAT_PAVE,
+                               "width_m": _pw, "nodes": _pnodes}
+            record["line_instances"].append(
+                {"scene": name, "id": _prid, "role": "pave",
+                 "material": MAT_PAVE, "width_m": _pw, "nodes": _pnodes})
         for kind, sign, role in _specs:
+            _lz = float(spec.get("line_z_offset_m") or 0.0)
             if _lc in ("devdist", "pairfar"):
                 # 声明线位直接用；仍夹在铺装内（|lat| <= half-0.3），
                 # **夹紧量记进实例**（`lat_clamped_m`）——远线在窄路上被夹回
@@ -866,6 +886,12 @@ def build_scenario(conn, sites: list[dict], *, map_name: str = "italy",
             else:
                 lat = sign * LAT_LANE_HALF
             nodes = _line_nodes(site, lat)
+            if _lz:
+                # 线贴花抬到铺装之上（默认 0）：与铺装 decal 共面会 z-fighting，
+                # 画面里线被切成规则/不规则的虚线（2026-11-04 实测），候选
+                # span 从 30m 掉到 3–9m。GT 用同一组节点，抬升自洽。
+                nodes = [[float(x), float(y), float(z) + _lz]
+                         for x, y, z in nodes]
             rid = f"m5_line_{name}_{role}"
             _add_road(_MAT[kind], rid, nodes, LINE_WIDTH_M, 30 + k)
             rec["materials"][rid] = _MAT[kind]
