@@ -43,6 +43,33 @@ from .constants import (
 from beamng_autopilot.vision.lanes import LaneMarking
 
 
+@dataclass(frozen=True)
+class PairingResearchPolicy:
+    """研究臂开关（预注册 T16_LANE_PAIRING_ROBUSTNESS_PREREG_20261104）。
+
+    默认全部 False = **现行行为**，生产路径与安全检查语义不变。放行逻辑
+    只在研究臂实验中接线；在此之前它们仅作为探针的运行记录（policy
+    provenance），不改变任何配对决策。
+    """
+
+    far_thin_allow: bool = False         # H1: 远场 thin+thin 对按几何自洽放行
+    thin_near_relax: bool = False        # H2: 细线近场站点计数放宽
+    mirror_road_center_ok: bool = False  # H3: 镜像中心与路面中心一致时放行
+
+    def as_dict(self) -> dict:
+        return {
+            "far_thin_allow": bool(self.far_thin_allow),
+            "thin_near_relax": bool(self.thin_near_relax),
+            "mirror_road_center_ok": bool(self.mirror_road_center_ok),
+        }
+
+    def is_default(self) -> bool:
+        return not any(self.as_dict().values())
+
+
+DEFAULT_PAIRING_RESEARCH = PairingResearchPolicy()
+
+
 @dataclass
 class LaneFrame:
     """A local lane reference in world coordinates.
