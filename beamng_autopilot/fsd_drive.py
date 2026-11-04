@@ -2432,6 +2432,56 @@ class FSDriveSession:
                         conn.load_scenario()
                 except Exception:
                     conn.load_scenario()
+            # 场景构建（Phase 2 试车场，2026-11-04）：--scenario-json 时在放置
+            # 前用采集器构建 decal 车道场景（GridMap 等无标线场地）。
+            if getattr(args, "scenario_json", None):
+                try:
+                    import importlib.util as _ilu
+                    _sp = _ilu.spec_from_file_location(
+                        "m5_controlled_scenes_drive",
+                        str(Path(__file__).resolve().parents[1]
+                            / "scripts" / "m5_controlled_scenes.py"))
+                    _mcs = _ilu.module_from_spec(_sp)
+                    _sp.loader.exec_module(_mcs)
+                    _doc = json.loads(Path(args.scenario_json).read_text(
+                        encoding="utf-8"))
+                    _sc = _doc["scene"]
+                    _site = {"station_m": float(_sc.get("station_m", 0.0)),
+                             "road_id": str(_sc.get("road_id", "")),
+                             "mid": [float(x) for x in _sc["mid"]],
+                             "dir": [float(x) for x in _sc["dir"]],
+                             "half_width_m": float(_sc.get("half_width_m", 3.5)),
+                             "slope_pct": float(_sc.get("slope_pct", 0.0)),
+                             "curve_deg": float(_sc.get("curve_deg", 0.0))}
+                    _ov = {k: getattr(args, f"mat_{k}", None)
+                           for k in ("white", "yellow", "pave", "gravel")}
+                    _ov = {k: v for k, v in _ov.items() if v}
+                    _prof = _mcs.apply_map_profile(
+                        str(args.map or "gridmap_v2"), overrides=_ov or None)
+                    _sname = Path(args.scenario_json).stem
+                    _scen, _ = _mcs.build_scenario(
+                        conn, [_site], map_name=str(args.map or "gridmap_v2"),
+                        scene_types=["known_line"], scene_names=[_sname],
+                        line_convention=str(getattr(
+                            args, "scenario_line_convention", "right_lane")),
+                        edge_margin_m=float(getattr(
+                            args, "scenario_edge_margin", 0.6)))
+                    with conn.io_lock:
+                        _scen.make(conn.bng)
+                        conn.bng.scenario.load(_scen)
+                        conn.bng.scenario.start()
+                    time.sleep(2.0)
+                    try:
+                        conn.attach_vehicle(already_open=True)
+                    except Exception:  # noqa: BLE001
+                        pass
+                    print(f"[fsd-drive] scenario-json loaded: {_sname} "
+                          f"profile={_prof.get('white')}/"
+                          f"{_prof.get('yellow')}", flush=True)
+                except Exception as _sc_e:  # noqa: BLE001 — 构建失败=感知/场景
+                    # 不可用；继续走原有放置路径（会 fail-closed）
+                    print(f"[fsd-drive] scenario-json build failed: "
+                          f"{type(_sc_e).__name__}: {_sc_e}", flush=True)
             # 环境条件（TOD/天气，2026-11-02）：条件矩阵的接线点。真实车必须
             # 面对夜间/黄昏/雨天；只应用一次并进运行记录（可回溯证据）。
             if getattr(args, "tod", None) or getattr(args, "weather_preset", None):

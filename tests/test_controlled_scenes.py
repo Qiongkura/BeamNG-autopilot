@@ -1721,3 +1721,15 @@ def test_ensemble_weights_and_defaults():
             pass
         else:
             raise AssertionError(f"weights={bad} 必须拒绝")
+
+
+def test_drive_scenario_json_wiring():
+    root = Path(__file__).resolve().parents[1]
+    drv = (root / "beamng_autopilot" / "fsd_drive.py").read_text("utf-8")
+    assert "scenario_json" in drv
+    assert "build_scenario(" in drv
+    assert "apply_map_profile(" in drv
+    cli = (root / "scripts" / "m5_fsd_drive.py").read_text("utf-8")
+    assert '"--scenario-json"' in cli
+    assert '"--scenario-edge-margin"' in cli
+    assert '"--mat-white"' in cli
