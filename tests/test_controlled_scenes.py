@@ -1174,3 +1174,91 @@ def test_conditions_score_ignores_own_output_and_non_list():
     src = (root / "scripts" / "m5_fsd_conditions.py").read_text("utf-8")
     assert '"conditions_table.json"' in src
     assert "if not isinstance(hist, list):" in src
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-04 配对鲁棒性研究臂：探针工具（真值插值/真幻影判据/开关默认）
+# ---------------------------------------------------------------------------
+
+def _load_pairing_probe():
+    spec = importlib.util.spec_from_file_location(
+        "m5_pairing_probe", ROOT / "scripts" / "m5_pairing_probe.py")
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["m5_pairing_probe"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _probe_scene():
+    return {"scene": {
+        "mid": [0.0, 0.0, 0.0], "dir": [1.0, 0.0, 0.0],
+        "lines": [
+            {"role": "left", "nodes": [[-10, 1.8, 0], [10, 1.8, 0]]},
+            {"role": "right", "nodes": [[-10, -1.8, 0], [10, -1.8, 0]]},
+        ],
+    }}
+
+
+def test_pairing_probe_truth_and_classification():
+    import numpy as np
+    m = _load_pairing_probe()
+    scene = _probe_scene()
+    x, y, yaw = m.scene_pose(scene)
+    assert (x, y) == (0.0, 0.0) and abs(yaw) < 1e-9
+    gx, gy = m.scene_goal(scene, ahead_m=60)
+    assert abs(gx - 60.0) < 1e-9 and abs(gy) < 1e-9
+    # 左正约定：left 线在 +1.8，right 线在 -1.8 -> 中心 0、宽 3.6
+    gt = m.gt_lane(scene, [0.0, 0.0], 0.0)
+    assert gt is not None
+    assert abs(gt[0]) < 1e-9 and abs(gt[1] - 3.6) < 1e-9
+    assert abs(m.lateral_of([0.0, 1.8], [0.0, 0.0], 0.0) - 1.8) < 1e-9
+    # 判据：真 / 幻影 / 模糊
+    assert m.classify_pair(0.0, 3.6, gt[0], gt[1])["label"] == "true"
+    assert m.classify_pair(2.0, 3.6, gt[0], gt[1])["label"] == "phantom"
+    assert m.classify_pair(0.0, 4.6, gt[0], gt[1])["label"] == "ambiguous"
+    # 换 ego 位姿后真值仍正确（中心线在 y=0 时，ego 偏向 +0.5 -> 中心 -0.5）
+    gt2 = m.gt_lane(scene, [0.0, 0.5], 0.0)
+    assert abs(gt2[0] + 0.5) < 1e-9 and abs(gt2[1] - 3.6) < 1e-9
+
+
+def test_pairing_probe_summary_and_defaults():
+    m = _load_pairing_probe()
+    scene = _probe_scene()
+    recs = [
+        {"t": 0.0, "pos": [0, 0, 0], "heading": 0.0,
+         "pair": {"marking_count": 2, "mode": "paired", "rejects": {},
+                  "result": {"center_xy": [0.0, 0.0], "width_m": 3.6}}},
+        {"t": 0.5, "pos": [0, 0, 0], "heading": 0.0,
+         "pair": {"marking_count": 2, "mode": "paired", "rejects": {},
+                  "result": {"center_xy": [0.0, 2.0], "width_m": 3.6}}},
+        {"t": 1.0, "pos": [0, 0, 0], "heading": 0.0,
+         "pair": {"marking_count": 1, "mode": "none",
+                  "rejects": {"far_kind": 3}}},
+    ]
+    s = m.summarize(recs, scene)
+    assert s["ticks"] == 3 and s["ticks_with_candidates"] == 3
+    assert s["accepted_pairs"] == 2
+    assert s["true_pairs"] == 1 and s["phantom_pairs"] == 1
+    assert abs(s["pair_rate_of_candidates"] - 2 / 3) < 1e-4
+    assert s["rejects"] == {"far_kind": 3}
+
+    # 研究开关默认等于现行行为：全部 False
+    from beamng_autopilot.lane.pairing import (
+        DEFAULT_PAIRING_RESEARCH, PairingResearchPolicy)
+    assert DEFAULT_PAIRING_RESEARCH.is_default()
+    assert DEFAULT_PAIRING_RESEARCH.as_dict() == {
+        "far_thin_allow": False, "thin_near_relax": False,
+        "mirror_road_center_ok": False}
+    assert PairingResearchPolicy().is_default()
+
+
+def test_pairing_probe_wiring():
+    root = Path(__file__).resolve().parents[1]
+    drv = (root / "scripts" / "m5_fsd_drive.py").read_text("utf-8")
+    assert '"--pairing-probe-out"' in drv
+    sess = (root / "beamng_autopilot" / "fsd_drive.py").read_text("utf-8")
+    assert "pairing_probe_out" in sess and '"pair"' in sess
+    stack = (root / "beamng_autopilot" / "fsd_stack.py").read_text("utf-8")
+    assert '"width_m"' in stack and '"center_xy"' in stack
+    probe = (root / "scripts" / "m5_pairing_probe.py").read_text("utf-8")
+    assert "--analyze" in probe and "DEFAULT_PAIRING_RESEARCH" in probe

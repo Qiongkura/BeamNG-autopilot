@@ -267,6 +267,24 @@ OBJECT_KEEPALIVE_S = 2.0
 SCHED_KEEPALIVE_ENABLED = os.environ.get("BEAMNG_SCHED_KEEPALIVE", "0") == "1"
 
 
+def _nearest_center_xy(frame, pos) -> list[float] | None:
+    """中心线上离 ego 最近的点（世界 2D）；无有效点返回 None。
+
+    配对探针（研究臂）的只读几何记录：不参与配对/控制决策。
+    """
+    try:
+        c = np.asarray(frame.center, dtype=float)
+        c = c[np.isfinite(c).all(axis=1)]
+        if len(c) == 0:
+            return None
+        p = np.asarray(pos[:2], dtype=float)
+        d = np.linalg.norm(c[:, :2] - p, axis=1)
+        q = c[int(np.argmin(d))][:2]
+        return [round(float(q[0]), 3), round(float(q[1]), 3)]
+    except Exception:  # noqa: BLE001 — 探针记录失败不影响主流程
+        return None
+
+
 def _keepalive_s(name: str) -> float | None:
     """Scheduler keep-alive bound for a modality (None = no floor)."""
     if not SCHED_KEEPALIVE_ENABLED:
@@ -2475,6 +2493,13 @@ class FSDStack:
                 "paired": bool(frame.paired),
                 "confidence": round(float(frame.confidence), 3),
                 "span_m": round(float(frame.span_m), 2),
+                # 配对探针（研究臂）需要的几何：中心线上离 ego 最近的点 +
+                # 车道宽 + 是否镜像推断 + 两侧 kind。只做记录，不参与决策。
+                "width_m": round(float(frame.width), 3),
+                "center_xy": _nearest_center_xy(frame, pos),
+                "inferred": bool(getattr(frame, "inferred", False)),
+                "left_kind": getattr(frame, "left_kind", None),
+                "right_kind": getattr(frame, "right_kind", None),
             })
             return frame
         except Exception as exc:
