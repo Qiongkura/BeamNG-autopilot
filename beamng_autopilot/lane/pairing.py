@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import math
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -272,7 +273,12 @@ def _collect_candidates(markings, pos: np.ndarray, fwd: np.ndarray,
             _drop(mk, "proj")
             continue
         span = float(proj[-1, 0] - proj[0, 0])
-        if span < _boundary_min_span(mk, min_span):
+        # 研究臂 S1（默认关）：thin 的最小跨度 1.5m -> 1.0m
+        _span_need = _boundary_min_span(mk, min_span)
+        if (os.environ.get("BEAMNG_THIN_SPAN", "abs") == "relax"
+                and getattr(mk, "kind", "") == "thin"):
+            _span_need = min(_span_need, 1.0)
+        if span < _span_need:
             _drop(mk, "span", span=span, align=align)
             continue
         med_lat = float(np.median(proj[:, 1]))
