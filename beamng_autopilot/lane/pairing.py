@@ -618,7 +618,8 @@ def _best_vision_pair(cands: list[_LineCandidate],
                       axes: list[_LineCandidate],
                       pos: np.ndarray, fwd: np.ndarray,
                       station_step: float, max_stations: int,
-                      debug: dict | None = None):
+                      debug: dict | None = None,
+                      research: "PairingResearchPolicy | None" = None):
     """Choose the most plausible single-lane boundary pair.
 
     Every left/right candidate combination is checked for a lane-like
@@ -642,6 +643,7 @@ def _best_vision_pair(cands: list[_LineCandidate],
     road station in world space (``_pair_world_geometry``) so it follows
     the bend, otherwise the car-frame straight reconstruction is used.
     """
+    pol = research or DEFAULT_PAIRING_RESEARCH
     left_pool = [c for c in cands if _cand_side(c) > 0.08]
     left_pool += [a for a in axes if _cand_side(a) >= 0.0]
     right_pool = [c for c in cands if _cand_side(c) < -0.08]
@@ -1102,7 +1104,6 @@ def pair_lane_markings(
     """
     if not markings:
         return None
-    pol = research or DEFAULT_PAIRING_RESEARCH
     pos = np.asarray(pos, dtype=float)[:2]
     fwd = _unit_fwd(pos, heading, fwd)
     cands = _collect_candidates(markings, pos, fwd, min_span, debug=debug)
@@ -1131,7 +1132,8 @@ def pair_lane_markings(
         debug["cands"] = [_cand_summary(c) for c in cands]
         debug["axes"] = [_cand_summary(a) for a in axes]
     pair = _best_vision_pair(cands, axes, pos, fwd,
-                             station_step, max_stations, debug=debug)
+                             station_step, max_stations, debug=debug,
+                             research=research)
     if pair is not None:
         l, r, stations, valid, width, center, span, avg_conf, _, geom = pair
         left_lat = _interp_lat(l.proj, stations)
