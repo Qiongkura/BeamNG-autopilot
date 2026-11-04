@@ -1537,3 +1537,20 @@ def test_seg_post_norm_live_wiring():
     assert '"--post-norm-width"' in probe
     assert '"--seg-post-norm-width"' in probe
     assert '"post_norm_width"' in probe
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-04 回放诊断：--save-frames（默认关）
+# ---------------------------------------------------------------------------
+
+def test_pairing_probe_save_frames_wiring():
+    root = Path(__file__).resolve().parents[1]
+    drv = (root / "beamng_autopilot" / "fsd_drive.py").read_text("utf-8")
+    assert "pairing_probe_frames_dir" in drv
+    assert "np.savez_compressed(" in drv
+    cli = (root / "scripts" / "m5_fsd_drive.py").read_text("utf-8")
+    assert '"--pairing-probe-frames-dir"' in cli
+    probe = (root / "scripts" / "m5_pairing_probe.py").read_text("utf-8")
+    assert '"--save-frames"' in probe
+    assert '"--pairing-probe-frames-dir"' in probe
+    assert '"_frames_dir' in probe or "frames_dir" in probe

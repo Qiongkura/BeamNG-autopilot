@@ -2053,6 +2053,27 @@ class FSDriveSession:
             _pw_ticks = 0
             _pw_teleported = False
             while True:
+                # 回放诊断（预注册 T16_MARKING_REPLAY）：保存 live 原始帧 + 位姿
+                # + 相机模型，供离线 detect_lines 回放。只读，不影响放置。
+                _pf_dir = getattr(getattr(self, "args", None),
+                                  "pairing_probe_frames_dir", None)
+                if _pf_dir and _pw_out is not None and _pw_out.frame is not None:
+                    try:
+                        _fp = (Path(str(_pf_dir))
+                               / f"frame_{int(_pw_ticks):05d}.npz")
+                        _fp.parent.mkdir(parents=True, exist_ok=True)
+                        np.savez_compressed(
+                            _fp,
+                            frame=np.asarray(_pw_out.frame, dtype=np.uint8),
+                            pos=np.asarray(_pw_state.pos, dtype=float),
+                            heading=float(_pw_state.heading),
+                            cam=np.array([_pw_out.cam], dtype=object),
+                            t=float(time.time() - _pw_t0))
+                    except Exception as _pfe:  # noqa: BLE001
+                        if not globals().get("_PAIR_FRAME_WARNED"):
+                            print(f"[fsd-drive] probe frames save failed: "
+                                  f"{type(_pfe).__name__}: {_pfe}", flush=True)
+                            globals()["_PAIR_FRAME_WARNED"] = True
                 if _wall_hit():
                     print("[fsd-drive] 墙钟上限到达（放置阶段）：未获得放置",
                           flush=True)
