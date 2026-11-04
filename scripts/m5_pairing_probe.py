@@ -421,6 +421,8 @@ def collect(args) -> int:
             cmd += ["--goal", f"{gx:.3f}", f"{gy:.3f}"]
         if getattr(args, "post_norm_width", None):
             cmd += ["--seg-post-norm-width", str(int(args.post_norm_width))]
+        if getattr(args, "model2", None):
+            cmd += ["--seg-model2", str(args.model2)]
         _frames_dir = None
         if getattr(args, "save_frames", False):
             _frames_dir = str(out.with_suffix(".frames"))
@@ -463,6 +465,7 @@ def collect(args) -> int:
         "scenario_mode": not args.no_scenario,
         "material_profile": (_profile if not args.no_scenario else None),
         "model": args.model,
+        "model2": getattr(args, "model2", None),
         "tod": args.tod,
         "weather_preset": args.weather_preset,
         "goal": [gx, gy],
@@ -518,6 +521,8 @@ def main() -> int:
     ap.add_argument("--map", default="italy")
     ap.add_argument("--runtime", default="tech", choices=("tech", "steam", "auto"))
     ap.add_argument("--model", default="logs/m5_seg/seg_model_v28_sslA/best.pt")
+    ap.add_argument("--model2", default=None,
+                    help="部署集成的第二模型（与 --model 组成 EnsembleSegmenter）")
     ap.add_argument("--tod", default=None)
     ap.add_argument("--weather-preset", default=None)
     ap.add_argument("--frames", type=int, default=40,

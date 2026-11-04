@@ -61,6 +61,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--cam-h", type=int, default=403)
     ap.add_argument("--seg-model", type=str, default=None,
                     help="segmentation checkpoint override (default deployed model)")
+    ap.add_argument("--seg-model2", type=str, default=None,
+                    help="部署集成（研究候选，默认关）：与 --seg-model 组成"
+                         "EnsembleSegmenter（概率平均）；只给 --seg-model "
+                         "时行为与现行完全一致")
     ap.add_argument("--line-seg-model", type=str, default=None,
                     help="optional separate painted-line checkpoint; road mask "
                          "still comes from --seg-model, while line extraction "
