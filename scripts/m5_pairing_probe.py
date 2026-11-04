@@ -385,6 +385,10 @@ def collect(args) -> int:
             cmd += ["--goal", f"{gx:.3f}", f"{gy:.3f}"]
         if getattr(args, "post_norm_width", None):
             cmd += ["--seg-post-norm-width", str(int(args.post_norm_width))]
+        _frames_dir = None
+        if getattr(args, "save_frames", False):
+            _frames_dir = str(out.with_suffix(".frames"))
+            cmd += ["--pairing-probe-frames-dir", _frames_dir]
         if str(args.arm) in ("far_thin", "thin_near"):
             cmd += ["--pairing-research", str(args.arm)]
         env = _arm_env(str(args.arm))
@@ -426,6 +430,8 @@ def collect(args) -> int:
         "weather_preset": args.weather_preset,
         "goal": [gx, gy],
         "post_norm_width": getattr(args, "post_norm_width", None),
+        "frames_dir": (_frames_dir if getattr(args, "save_frames", False)
+                       else None),
         "policy": _arm_policy(args.arm).as_dict(),
         "policy_is_default": _arm_policy(args.arm).is_default(),
         "arm": str(args.arm),
@@ -490,6 +496,8 @@ def main() -> int:
                     default="baseline",
                     help="研究臂：far_thin/thin_near 走 --pairing-research；"
                          "yellow/span/clahe 走环境变量（Y1/S1/I1）")
+    ap.add_argument("--save-frames", action="store_true",
+                    help="回放诊断：逐 tick 保存 live 帧+位姿+相机模型")
     ap.add_argument("--post-norm-width", type=int, default=None,
                     help="研究开关：透传 drive 的 --seg-post-norm-width")
     ap.add_argument("--edge-margin-m", type=float, default=0.6,

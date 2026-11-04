@@ -91,6 +91,9 @@ def build_parser() -> argparse.ArgumentParser:
                     help="研究臂开关（默认 off = 现行行为）：far_thin 放行"
                          "几何自洽的远场薄线对；thin_near 放宽薄线近场计数。"
                          "仅用于预注册实验，不改变默认门限")
+    ap.add_argument("--pairing-probe-frames-dir", type=str, default=None,
+                    help="回放诊断（默认关闭）：放置阶段逐 tick 保存 live 帧"
+                         "+位姿+相机模型到该目录（npz），供离线 detect_lines 回放")
     ap.add_argument("--pairing-probe-out", type=str, default=None,
                     help="研究探针（默认关闭）：放置阶段逐 tick 把配对决策、"
                          "拒绝计数、ego 位姿写入 JSONL；只读记录，不参与控制。"
