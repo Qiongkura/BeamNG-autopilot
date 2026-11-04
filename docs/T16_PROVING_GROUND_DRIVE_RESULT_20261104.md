@@ -1,5 +1,10 @@
 # T16 试车场接 drive 首测：场景可加载，严格放置仍失败（2026-11-04）
 
+> **修订（同日，见 `T16_PROVING_GROUND_GROUNDTRUTH_RESULT_20261104.md`）**：
+> 根因已定位为经典白漆臂污染（浅色地面），不是右线碎段/取景。关闭白漆臂
+> 后双侧 pair 12/12；铺装版本已实现 placed=True。开车仍缺可行驶参考，
+> 条件矩阵暂不启动。本文保留首测证据，结论以修订文为准。
+
 ## 执行
 
 `m5_fsd_drive --scenario-json logs/m5_seg/gridmap_scene.json --map gridmap_v2`
