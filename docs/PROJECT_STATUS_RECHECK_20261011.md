@@ -354,3 +354,10 @@ GPU 训练。
   资源）；本环境内标线识别的 live 路径到此为止，可继续的有效工作为
   离线 SSL 集成部署化评估与整车主线条件矩阵。见
   `T16_MARKING_FREE_REF_RESULT_20261104.md`。
+- **SSL 双种子集成部署化评估（2026-11-04）**：新增部署组件
+  `EnsembleSegmenter`（概率平均→同一后处理；fail-closed）与评测入口
+  `--ensemble-deploy`。固定 4 折逐折**精确复现**既有记录（A 0.5048/B 0.6897/
+  C 0.4232/W 0.4312），宏平均 **0.539246**（对 0.5392 差 +0.00005，R-Repro
+  通过）。时延 p50 18.76→29.00ms（**1.55×**，后处理只跑一次）；S-FailClosed/
+  S-Post/S-Default 单测全过。组件未接 drive（需单独接线预注册）；模型不晋级。
+  见 `T16_ENSEMBLE_DEPLOY_RESULT_20261104.md`。
