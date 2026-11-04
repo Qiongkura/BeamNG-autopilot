@@ -1847,11 +1847,22 @@ class FSDriveSession:
         _seg = None
         if getattr(args, "seg_model", None):
             try:
-                from beamng_autopilot.vision.segmentation import Segmenter
-                _seg = Segmenter(model_path=args.seg_model,
-                                 post_norm_width=_post_norm)
-                print(f"[fsd-drive] segmentation model: {args.seg_model}")
+                _seg2 = getattr(args, "seg_model2", None)
+                if _seg2:
+                    from beamng_autopilot.vision.segmentation import (
+                        EnsembleSegmenter)
+                    _seg = EnsembleSegmenter(
+                        model_paths=[args.seg_model, _seg2],
+                        post_norm_width=_post_norm)
+                    print(f"[fsd-drive] segmentation ensemble: "
+                          f"{_seg.model_path}")
+                else:
+                    from beamng_autopilot.vision.segmentation import Segmenter
+                    _seg = Segmenter(model_path=args.seg_model,
+                                     post_norm_width=_post_norm)
+                    print(f"[fsd-drive] segmentation model: {args.seg_model}")
             except Exception as _seg_e:
+                # fail-closed：集成构建失败 = 感知禁用（不静默退单模型）
                 print(f"[fsd-drive] segmentation model disabled: {_seg_e}")
         else:
             # No pin means the run uses whatever is deployed, and until it

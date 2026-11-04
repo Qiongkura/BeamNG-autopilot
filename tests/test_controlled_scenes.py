@@ -1662,3 +1662,23 @@ def test_ensemble_segmenter_average_and_failclosed():
         pass
     else:
         raise AssertionError("单成员必须拒绝")
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-04 集成接 drive：--seg-model2（默认关，fail-closed）
+# ---------------------------------------------------------------------------
+
+def test_ensemble_drive_wiring():
+    root = Path(__file__).resolve().parents[1]
+    drv = (root / "beamng_autopilot" / "fsd_drive.py").read_text("utf-8")
+    assert "seg_model2" in drv
+    assert "EnsembleSegmenter(" in drv
+    # fail-closed：构建失败走 disabled（不静默退单模型）
+    assert "segmentation model disabled" in drv
+    cli = (root / "scripts" / "m5_fsd_drive.py").read_text("utf-8")
+    assert '"--seg-model2"' in cli
+    probe = (root / "scripts" / "m5_pairing_probe.py").read_text("utf-8")
+    assert '"--seg-model2"' in probe and '"--model2"' in probe
+    assert '"model2"' in probe
+    # 默认路径仍是单模型（条件分支存在）
+    assert "if _seg2:" in drv
