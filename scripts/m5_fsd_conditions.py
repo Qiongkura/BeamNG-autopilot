@@ -168,8 +168,11 @@ def run_matrix(out_dir: Path, preset_rain: str | None,
             print(f"[conditions] SKIP {c['cell']}_r{c['repeat']} "
                   f"(weather preset 名未解析)", flush=True)
             continue
-        if out_path.exists():
-            print(f"[conditions] SKIP {out_path.name} (已存在，断点续跑)",
+        if out_path.exists() or Path(str(out_path) + ".session.json").exists():
+            # 有 session 审计即视为该格已完成（放置失败格没有遥测文件，
+            # 但 session 里的 placement_rc/环境读回就是它的证据；重跑等于
+            # 为了出表反复尝试，违反预注册的"至多一次协议重试"）。
+            print(f"[conditions] SKIP {out_path.name} (已存在证据，断点续跑)",
                   flush=True)
             continue
         print(f"[conditions] RUN {c['cell']}_r{c['repeat']} "

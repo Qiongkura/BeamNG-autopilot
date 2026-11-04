@@ -1159,3 +1159,11 @@ def test_ensemble_wiring_two_models():
     b = np.ones((3, 2, 2), dtype=np.float32)
     assert np.allclose(prob_average(a, b), 0.5)
     assert np.allclose(tta_flip_average(a, b), 0.5)
+
+
+def test_conditions_skip_cells_with_only_session_evidence():
+    # 放置失败的格只有 session.json；断点续跑必须把它当"已完成证据"跳过，
+    # 否则会反复重跑（违反预注册"至多一次协议重试"）。
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "scripts" / "m5_fsd_conditions.py").read_text("utf-8")
+    assert 'Path(str(out_path) + ".session.json").exists()' in src
