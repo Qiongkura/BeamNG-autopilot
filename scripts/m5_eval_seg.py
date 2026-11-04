@@ -48,6 +48,8 @@ def main() -> None:
                     help="enable Segmenter temporal line-mask smoothing "
                          "(component hysteresis; ablation: slightly "
                          "negative on pixel line IoU)")
+    ap.add_argument("--model3", default=None,
+                    help="third checkpoint for --ensemble-deploy (optional)")
     ap.add_argument("--model2", default=None,
                     help="second checkpoint for --tta ens (same-fold "
                          "different-seed model; probabilities are averaged "
@@ -91,8 +93,10 @@ def main() -> None:
         if not args.model2:
             raise SystemExit("--ensemble-deploy 需要 --model2")
         from beamng_autopilot.vision.segmentation import EnsembleSegmenter
-        seg = EnsembleSegmenter(model_paths=[args.model, args.model2],
-                                device=args.device)
+        _paths = [args.model, args.model2]
+        if getattr(args, "model3", None):
+            _paths.append(args.model3)
+        seg = EnsembleSegmenter(model_paths=_paths, device=args.device)
         print(f"[eval] 部署集成加载: {seg.model_path}")
     else:
         seg = Segmenter(model_path=args.model, device=args.device,
@@ -242,6 +246,7 @@ def main() -> None:
         Path(args.json).write_text(json.dumps({
             "model": str(args.model),
             "model2": str(args.model2) if args.model2 else None,
+            "model3": str(args.model3) if getattr(args, "model3", None) else None,
             "runs": [str(x) for x in args.runs],
             "tta": str(args.tta),
             "frames": int(n_frames),

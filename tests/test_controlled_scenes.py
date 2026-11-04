@@ -1682,3 +1682,10 @@ def test_ensemble_drive_wiring():
     assert '"model2"' in probe
     # 默认路径仍是单模型（条件分支存在）
     assert "if _seg2:" in drv
+
+
+def test_eval_model3_wiring():
+    root = Path(__file__).resolve().parents[1]
+    ev = (root / "scripts" / "m5_eval_seg.py").read_text("utf-8")
+    assert '"--model3"' in ev
+    assert "_paths.append(args.model3)" in ev
