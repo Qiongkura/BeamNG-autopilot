@@ -212,13 +212,8 @@ def summarize(records: list[dict], scene_doc: dict) -> dict:
             per_frame.append({"t": rec.get("t"), "label": "no_gt"})
             continue
         cl = lateral_of(res["center_xy"], rec["pos"], float(rec["heading"]))
-        if abs(float(gt[0])) > REF_OFFSET_TOL_M:
-            # ego 不在认证贴花车道上（例如配对按道路语义选了相邻真实车道）：
-            # 该帧的 true/phantom 判据不成立，单独计数，不冤枉配对器。
-            n_off += 1
-            per_frame.append({"t": rec.get("t"), "label": "off_reference",
-                              "gt_center_lat": round(float(gt[0]), 3)})
-            continue
+        # 直接按配对中心 vs 认证车道中心判：right_lane 场景里自车可能被
+        # nav 路由拉回道路中线（认证车道合法偏 1.7m），不应因此拒判。
         cls = classify_pair(cl, float(res["width_m"]), gt[0], gt[1])
         per_frame.append({"t": rec.get("t"), **cls})
         if cls["label"] == "true":
@@ -265,13 +260,44 @@ def read_jsonl(path: Path) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# 采集（engine）：复用 drive 的严格感知放置回路
+# 采集（engine）：自带引擎 -> 构建并加载贴花 Scenario -> drive --attach
 # ---------------------------------------------------------------------------
+def _load_collector():
+    """复用采集器的场景构建器（同一脚本模块，避免复制场景定义）。"""
+    import importlib.util
+    entry = ROOT / "scripts" / "m5_controlled_scenes.py"
+    spec = importlib.util.spec_from_file_location("m5_controlled_scenes", entry)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["m5_controlled_scenes"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _site_from_scene(scene_doc: dict) -> dict:
+    s = scene_doc["scene"]
+    return {
+        "station_m": float(s.get("station_m", 0.0)),
+        "road_id": str(s.get("road_id", "")),
+        "mid": [float(x) for x in s["mid"]],
+        "dir": [float(x) for x in s["dir"]],
+        "half_width_m": float(s.get("half_width_m", 2.5)),
+        "slope_pct": float(s.get("slope_pct", 0.0)),
+        "curve_deg": float(s.get("curve_deg", 0.0)),
+    }
+
+
 def collect(args) -> int:
+    import time
+
+    from beamng_autopilot import config
+    from beamng_autopilot.connector import BeamNGConnector
+    from beamng_autopilot.experiments.collection import (
+        close_started_game, game_pids)
+
     scene_doc = load_scene(Path(args.scene))
-    x, y, yaw = scene_pose(scene_doc)
-    if args.teleport:
-        x, y, yaw = args.teleport
+    scene_name = Path(args.scene).stem
+    if scene_name.startswith("scene_"):
+        scene_name = scene_name[len("scene_"):]
     gx, gy = scene_goal(scene_doc, ahead_m=float(args.goal_ahead_m))
     if args.goal:
         gx, gy = args.goal
@@ -282,41 +308,83 @@ def collect(args) -> int:
     if jsonl.exists():
         jsonl.unlink()
 
-    # 墙钟含引擎 setup（模型/路线预热 ~50-70s）：预算必须把 setup
-    # 排除在放置重试之外，否则首 tick 前就超时、探针零记录。
-    wall_s = 75.0 + float(args.frames) * 0.8 + 30.0
-    cmd = [sys.executable, str(ROOT / "scripts" / "m5_fsd_drive.py"),
-           "--runtime", args.runtime, "--map", args.map,
-           "--teleport", f"{x:.3f}", f"{y:.3f}", f"{yaw:.3f}",
-           "--goal", f"{gx:.3f}", f"{gy:.3f}",
-           "--seconds", "1", "--max-wall-s", f"{wall_s:.1f}",
-           "--seg-model", args.model,
-           "--pairing-probe-out", str(jsonl),
-           "--out", str(out.with_suffix(".telemetry.json"))]
-    if args.tod:
-        cmd += ["--tod", str(args.tod)]
-    if args.weather_preset:
-        cmd += ["--weather-preset", str(args.weather_preset)]
-    print(f"[pairing-probe] scene={Path(args.scene).name} pose=({x:.2f},{y:.2f},"
-          f"{yaw:.2f}) frames<={args.frames}", flush=True)
-    log = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True,
-                         encoding="utf-8", errors="replace", timeout=wall_s + 180)
-    (out.with_suffix(".run.log")).write_text(
-        (log.stdout or "") + "\n--- stderr ---\n" + (log.stderr or ""),
-        encoding="utf-8")
+    wall_s = 90.0 + float(args.frames) * 0.8 + 30.0
+    pids_before = game_pids()
+    conn = BeamNGConnector(args.map, "etk800",
+                           port=config.runtime_port(args.runtime),
+                           home=config.runtime_home(args.runtime))
+    try:
+        conn.open(launch=True)
+        conn.load_scenario()
+        if not args.no_scenario:
+            collector = _load_collector()
+            site = _site_from_scene(scene_doc)
+            scen, _rec = collector.build_scenario(
+                conn, [site], map_name=args.map,
+                scene_types=["known_line"], scene_names=[scene_name],
+                line_convention=str(args.line_convention))
+            _built_lines = (_rec.get("sites", {}).get(scene_name, {})
+                            .get("lines") or [])
+            if _built_lines:
+                # GT 用构建记录里的真实节点（right_lane 约定下与规格不同）
+                scene_doc = dict(scene_doc)
+                scene_doc["scene"] = dict(scene_doc["scene"])
+                scene_doc["scene"]["lines"] = [
+                    {"role": ln.get("role"), "nodes": ln.get("nodes")}
+                    for ln in _built_lines]
+            with conn.io_lock:
+                scen.make(conn.bng)
+                conn.bng.scenario.load(scen)
+                conn.bng.scenario.start()
+            time.sleep(2.0)
+            conn.attach_vehicle(already_open=True)
+            print(f"[pairing-probe] scenario loaded: {scen.name} "
+                  f"(lines={len(site and scene_doc['scene'].get('lines') or [])})",
+                  flush=True)
+        cmd = [sys.executable, str(ROOT / "scripts" / "m5_fsd_drive.py"),
+               "--runtime", args.runtime, "--attach",
+               "--goal", f"{gx:.3f}", f"{gy:.3f}",
+               "--seconds", "1", "--max-wall-s", f"{wall_s:.1f}",
+               "--seg-model", args.model,
+               "--pairing-probe-out", str(jsonl),
+               "--out", str(out.with_suffix(".telemetry.json"))]
+        if args.tod:
+            cmd += ["--tod", str(args.tod)]
+        if args.weather_preset:
+            cmd += ["--weather-preset", str(args.weather_preset)]
+        print(f"[pairing-probe] scene={Path(args.scene).name} "
+              f"scenario_mode={not args.no_scenario} frames<={args.frames}",
+              flush=True)
+        log = subprocess.run(cmd, cwd=str(ROOT), capture_output=True,
+                             text=True, encoding="utf-8", errors="replace",
+                             timeout=wall_s + 180)
+        (out.with_suffix(".run.log")).write_text(
+            (log.stdout or "") + "\n--- stderr ---\n" + (log.stderr or ""),
+            encoding="utf-8")
+    finally:
+        try:
+            conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            close_started_game(pids_before)
+        except Exception:  # noqa: BLE001
+            pass
+
     if not jsonl.exists():
         print("[pairing-probe] 探针 JSONL 未生成；见 "
               f"{out.with_suffix('.run.log')}", flush=True)
         return 2
     records = read_jsonl(jsonl)[: int(args.frames)]
     report = {
-        "schema": "pairing-probe-v1",
+        "schema": "pairing-probe-v2",
         "scene": str(args.scene),
         "map": args.map,
+        "scenario_mode": not args.no_scenario,
         "model": args.model,
         "tod": args.tod,
         "weather_preset": args.weather_preset,
-        "requested_pose": [x, y, yaw],
+        "goal": [gx, gy],
         "policy": DEFAULT_PAIRING_RESEARCH.as_dict(),
         "policy_is_default": DEFAULT_PAIRING_RESEARCH.is_default(),
         "summary": summarize(records, scene_doc),
@@ -327,6 +395,7 @@ def collect(args) -> int:
     print(f"[pairing-probe] ticks={s['ticks']} cand={s['ticks_with_candidates']} "
           f"pairs={s['accepted_pairs']} true={s['true_pairs']} "
           f"phantom={s['phantom_pairs']} amb={s['ambiguous_pairs']} "
+          f"cert_both={s['cert_line_recall']['both_hit_rate']} "
           f"rejects={s['rejects']}", flush=True)
     print(f"[pairing-probe] -> {out}", flush=True)
     return 0
@@ -369,6 +438,11 @@ def main() -> int:
     ap.add_argument("--frames", type=int, default=40,
                     help="最多分析的 tick 数（采集时按此估算墙钟）")
     ap.add_argument("--goal-ahead-m", type=float, default=60.0)
+    ap.add_argument("--line-convention", default="right_lane",
+                    help="贴花横向约定：right_lane=贴右侧铺装边（配对专用）；"
+                         "symmetric=原认证约定")
+    ap.add_argument("--no-scenario", action="store_true",
+                    help="不构建贴花 Scenario（仅调试；认证线召回必然为 0）")
     ap.add_argument("--teleport", nargs=3, type=float, default=None,
                     metavar=("X", "Y", "YAW_DEG"))
     ap.add_argument("--goal", nargs=2, type=float, default=None,

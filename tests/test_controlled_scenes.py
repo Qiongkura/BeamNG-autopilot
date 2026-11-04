@@ -1286,10 +1286,11 @@ def test_pairing_probe_collect_drops_and_cert_recall():
     assert rec["both_hit_rate"] == 0.5
 
 
-def test_pairing_probe_off_reference_guard():
+def test_pairing_probe_no_off_reference_guard():
+    # off_reference 守卫已移除：right_lane 场景里自车可能被 nav 路由拉回
+    # 道路中线，认证车道合法偏移；此时按中心/宽度误差直接判。
     m = _load_pairing_probe()
     scene = _probe_scene()
-    # ego 在 y=2.0（离认证车道中心 2m）时，配对的"自身中心"不应被误判为幻影
     recs = [{"t": 0.0, "pos": [0.0, 2.0, 0.0], "heading": 0.0,
              "pair": {"marking_count": 2, "collect_drops": {},
                       "cands": [{"med_lat": -0.25}, {"med_lat": -3.7}],
@@ -1297,5 +1298,40 @@ def test_pairing_probe_off_reference_guard():
                       "result": {"center_xy": [0.0, 2.0], "width_m": 3.6}}}]
     s = m.summarize(recs, scene)
     assert s["accepted_pairs"] == 1
-    assert s["off_reference_pairs"] == 1
-    assert s["true_pairs"] == 0 and s["phantom_pairs"] == 0
+    assert s["off_reference_pairs"] == 0
+    # 配对中心在 ego 处，GT 车道中心偏 -2m -> 判幻影（参考系差 2m）
+    assert s["phantom_pairs"] == 1 and s["true_pairs"] == 0
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-04 配对专用场景：right_lane 约定（贴右侧铺装边）+ 探针场景模式
+# ---------------------------------------------------------------------------
+
+def test_right_lane_convention_geometry():
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "scripts" / "m5_controlled_scenes.py").read_text("utf-8")
+    assert "def right_lane_lats(" in src
+    spec = importlib.util.spec_from_file_location(
+        "m5_controlled_scenes_rl", root / "scripts" / "m5_controlled_scenes.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["m5_controlled_scenes_rl"] = m
+    spec.loader.exec_module(m)
+    left, right = m.right_lane_lats(3.483)
+    assert abs(right - (-3.433)) < 1e-6
+    assert abs(left - 0.167) < 1e-6
+    # 车道中心在右侧车道内、且在铺装内（±half）
+    center = 0.5 * (left + right)
+    assert abs(center - (-1.633)) < 1e-6
+    assert abs(left) <= 3.483 and abs(right) <= 3.483
+    # 窄路（半宽 2.5）：车道仍完全在铺装内
+    l2, r2 = m.right_lane_lats(2.5)
+    assert abs(r2) <= 2.5 and abs(l2) <= 2.5
+
+
+def test_pairing_probe_scenario_mode_wiring():
+    root = Path(__file__).resolve().parents[1]
+    probe = (root / "scripts" / "m5_pairing_probe.py").read_text("utf-8")
+    assert "build_scenario(" in probe
+    assert '"--line-convention"' in probe and "right_lane" in probe
+    assert "scenario_mode" in probe
+    assert "conn.open(launch=True)" in probe

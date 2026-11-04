@@ -699,6 +699,19 @@ def _z_at(site: dict, s_m: float) -> float:
     return float(prof[-1][1])
 
 
+def right_lane_lats(half_width_m: float,
+                    lane_half_m: float = LAT_LANE_HALF) -> tuple[float, float]:
+    """配对专用场景的双线横向位置（左正）：(left_lat, right_lat)。
+
+    右线贴右侧铺装边（半宽 - 0.05 m），左线 = 右线 + 2*lane_half，
+    使车道中心落在右侧可行驶车道内、与道路语义一致。
+    """
+    half = float(half_width_m)
+    right_lat = -(half - 0.05)
+    left_lat = right_lat + 2.0 * float(lane_half_m)
+    return left_lat, right_lat
+
+
 def _line_nodes(site: dict, lat_m: float, *, span_m: float = 34.0,
                 step_m: float = 1.0) -> list[list[float]]:
     """一条线/铺装的节点链：沿站点方向按 ``step_m`` 前推，横向 ``lat_m``，
@@ -751,7 +764,8 @@ def assign_scene_types(a_sites: list, types_order: list) -> list[str]:
 
 def build_scenario(conn, sites: list[dict], *, map_name: str = "italy",
                    scene_types: list[str],
-                   scene_names: list[str]):
+                   scene_names: list[str],
+                   line_convention: str | None = None):
     """把全部站点生成进**一个** Scenario（一次加载；扩量后站点分布在多条路段）。
 
     ``scene_types`` 是五类规格的键（决定生成什么），``scene_names`` 是每条站点的
@@ -762,6 +776,7 @@ def build_scenario(conn, sites: list[dict], *, map_name: str = "italy",
     from beamngpy.scenario.scenario_object import ScenarioObject
     from beamngpy.misc.quat import angle_to_quat
 
+    _lc = line_convention or LINE_CONVENTION
     scen = Scenario(str(map_name), "m5_controlled_scenes")
     site_of = {name: sites[k] for k, name in enumerate(scene_names)}
     record: dict = {"sites": {}, "line_instances": [], "vehicles": {}}
@@ -791,30 +806,30 @@ def build_scenario(conn, sites: list[dict], *, map_name: str = "italy",
         # 车道边界（真值几何：铺装边界 = 路面边缘；线在车道分界上）
         _specs = spec["lines"]
         _devlat: dict | None = None      # devdist/pairfar：按声明横向放线（见下）
-        if LINE_CONVENTION in ("devdist", "pairfar") and spec["lines"]:
+        if _lc in ("devdist", "pairfar") and spec["lines"]:
             # **开发集线位分布驱动 / 同侧成对扩量**：每站取循环里的 (role, lat) 对
             # （角色与探针 assign_roles 同规则，测试用探针自己校验）。
-            _cyc = (LINE_PAIRFAR_CYCLE if LINE_CONVENTION == "pairfar"
+            _cyc = (LINE_PAIRFAR_CYCLE if _lc == "pairfar"
                     else LINE_DEVDIST_CYCLE)
             _pair = _cyc[k % len(_cyc)]
             _devlat = {rn: float(lat) for rn, lat in _pair}
             _specs = [("yellow" if rn.endswith("_left") else "white",
                        1 if float(lat) >= 0 else -1, rn)
                       for rn, lat in _pair]
-        elif LINE_CONVENTION in ("measured", "relative", "tiers") and spec["lines"]:
+        elif _lc in ("measured", "relative", "tiers") and spec["lines"]:
             # 按参考词表放线：位置来自 LINE_ROLE_TARGETS，夹在铺装内
             # （|lat| > half-0.3 的线会落在铺装外、annotation 不覆盖 ->
             # 资格门必失败），并去掉彼此 <1 m 的重复线。
             # 混合密度：按站点序号取一组角色（多数站 2 条，少数 straddled）
             _roles = MIXED_DENSITY_CYCLE[k % len(MIXED_DENSITY_CYCLE)]
-            if LINE_CONVENTION == "tiers":
+            if _lc == "tiers":
                 # 多档线位：档位也按站点轮换（角色不变），横向在下面按档位算
                 _tier = float(LINE_TIER_M[k % len(LINE_TIER_M)])
             _specs = [("yellow" if rn.endswith("_left") else "white",
                        1 if float(LINE_ROLE_LATERAL_M[rn]) >= 0 else -1, rn)
                       for rn in _roles]
         for kind, sign, role in _specs:
-            if LINE_CONVENTION in ("devdist", "pairfar"):
+            if _lc in ("devdist", "pairfar"):
                 # 声明线位直接用；仍夹在铺装内（|lat| <= half-0.3），
                 # **夹紧量记进实例**（`lat_clamped_m`）——远线在窄路上被夹回
                 # 近线带时，报告里必须能看出来，否则"生成了 far_*"是假的。
@@ -823,20 +838,25 @@ def build_scenario(conn, sites: list[dict], *, map_name: str = "italy",
                 _clamped = max(-(half - 0.3), min(half - 0.3, lat))
                 _lat_clamp = round(_clamped - lat, 3)
                 lat = _clamped
-            elif LINE_CONVENTION == "tiers":
+            elif _lc == "tiers":
                 half = float(site["half_width_m"])
                 if role == "straddled":
                     lat = -0.4
                 else:
                     lat = (_tier if role == "near_left" else -_tier)
                 lat = max(-(half - 0.3), min(half - 0.3, lat))
-            elif LINE_CONVENTION == "relative":
+            elif _lc == "right_lane":
+                # 配对专用场景：双线整体贴到右侧铺装边，车道宽 3.6m，
+                # 使贴花车道中心与道路右侧可行驶车道对齐。
+                _ll, _rl = right_lane_lats(site["half_width_m"])
+                lat = _ll if role == "left" else _rl
+            elif _lc == "relative":
                 half = float(site["half_width_m"])
                 lat = float(LINE_RELATIVE_FRAC.get(role, -0.10)) * half
                 lat = max(-(half - 0.3), min(half - 0.3, lat))
                 if role == "straddled":
                     lat = max(-0.45, min(0.45, lat))
-            elif LINE_CONVENTION == "measured":
+            elif _lc == "measured":
                 lat = float(LINE_ROLE_LATERAL_M.get(role, -0.4))
                 lat = max(-(float(site["half_width_m"]) - 0.3),
                           min(float(site["half_width_m"]) - 0.3, lat))
@@ -849,7 +869,7 @@ def build_scenario(conn, sites: list[dict], *, map_name: str = "italy",
             inst = {"id": rid, "role": role, "material": _MAT[kind],
                     "width_m": LINE_WIDTH_M, "lateral_m": round(lat, 3),
                     "nodes": nodes, "truth_points": _line_truth(nodes, role)}
-            if LINE_CONVENTION in ("devdist", "pairfar"):
+            if _lc in ("devdist", "pairfar"):
                 # 声明线位 vs 实际线位：窄路上远线被夹回近线带时必须可见
                 inst["declared_lateral_m"] = round(
                     float((_devlat or {}).get(role, lat)), 3)
@@ -865,22 +885,35 @@ def build_scenario(conn, sites: list[dict], *, map_name: str = "italy",
                              "width_m": GRAVEL_WIDTH_M, "nodes": nodes}
         record["sites"][name] = rec
 
-    # ego：停在第一个站点，朝站点方向
+    # ego：停在第一个站点，朝站点方向；right_lane 约定下同时移到车道中心
     site0 = sites[0]
     yaw_deg = -math.degrees(math.atan2(site0["dir"][1], site0["dir"][0])) - 90.0
+    ego_pos = [float(v) for v in site0["mid"]]
+    ego_lat = 0.0
+    if _lc == "right_lane":
+        _ll0, _rl0 = right_lane_lats(site0["half_width_m"])
+        ego_lat = 0.5 * (_ll0 + _rl0)
+        d0 = _unit(site0["dir"])
+        left0 = np.array([-d0[1], d0[0]])
+        ego_pos = [ego_pos[0] + float(left0[0]) * ego_lat,
+                   ego_pos[1] + float(left0[1]) * ego_lat,
+                   ego_pos[2]]
     ego = Vehicle("ego", model="etk800", color="Red")
-    scen.add_vehicle(ego, pos=tuple(site0["mid"]), rot_quat=angle_to_quat(
+    scen.add_vehicle(ego, pos=tuple(ego_pos), rot_quat=angle_to_quat(
         (0.0, 0.0, yaw_deg)), cling=True)
-    record["vehicles"]["ego"] = {"pos": site0["mid"], "yaw_deg": yaw_deg}
+    record["vehicles"]["ego"] = {"pos": ego_pos, "yaw_deg": yaw_deg,
+                                 "lane_lat_m": round(ego_lat, 3)}
 
     # 遮挡车：只在第一个 occluded_line 站点前方（真车模型，真实遮挡）
     if occ_site is not None:
         mid = np.asarray(occ_site["mid"], dtype=float)
         d = _unit(occ_site["dir"])
         left2d = np.array([-d[1], d[0]])
-        if LINE_CONVENTION in ("relative", "tiers"):
+        if _lc == "right_lane":
+            _occ_lat = -(float(occ_site["half_width_m"]) - 0.05)
+        elif _lc in ("relative", "tiers"):
             _occ_lat = -0.4
-        elif LINE_CONVENTION == "measured":
+        elif _lc == "measured":
             _occ_lat = LINE_ROLE_LATERAL_M["straddled"]
         else:
             _occ_lat = LAT_LANE_HALF
