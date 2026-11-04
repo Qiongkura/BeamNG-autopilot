@@ -1446,3 +1446,30 @@ def test_probe_arm_env_mapping_and_by_kind():
         assert k not in base
     assert m._by_kind({"thin:span": 3, "thin:side": 1, "solid:align": 2}) == {
         "thin": {"span": 3, "side": 1}, "solid": {"align": 2}}
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-04 掩码侧右线诊断：GT 拆分/召回/碎段统计（离线纯函数）
+# ---------------------------------------------------------------------------
+
+def test_mask_diag_gt_split_and_recall():
+    import numpy as np
+    spec = importlib.util.spec_from_file_location(
+        "m5_mask_diag", ROOT / "scripts" / "m5_mask_diag.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["m5_mask_diag"] = m
+    spec.loader.exec_module(m)
+
+    colour = np.zeros((10, 10, 3), dtype=np.uint8)
+    label = np.zeros((10, 10), dtype=np.uint8)
+    colour[0:2, 0:2] = (200, 200, 50)      # 黄漆
+    label[0:2, 0:2] = 2
+    colour[2:4, 0:2] = (255, 255, 255)     # 白漆
+    label[2:4, 0:2] = 2
+    y, w = m.split_line_gt(colour, label)
+    assert int(y.sum()) == 4 and int(w.sum()) == 4
+    assert m.recall(y, y) == 1.0 and m.recall(w, y) == 0.0
+    assert np.isnan(m.recall(y, np.zeros_like(y)))
+    cs = m.component_stats(np.ones((3, 3), dtype=bool))
+    assert cs["count"] == 1 and cs["max_span_px"] == 3
+    assert m.component_stats(np.zeros((3, 3), dtype=bool))["count"] == 0
