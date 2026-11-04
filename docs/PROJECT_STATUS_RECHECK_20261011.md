@@ -337,3 +337,12 @@ GPU 训练。
   下一步：输入域匹配臂（live 先缩 144 再送模型），离线用已保存帧验证
   east H-M0 ≤0.3、ok ≥0.5，west ok 不降 >10pp。见
   `T16_MARKING_REPLAY_RESULT_20261104.md`。
+- **输入域匹配臂结果 + 场景渲染发现（2026-11-04）**：east `--input-width 192`
+  回放 P-In1/P-In2 失败（H-M0 17/19、ok 5.3%，与 native 无差别）→ H-In 证伪。
+  逐帧像素核查发现 **live 帧右黄线 GT 位置是沥青灰（左线橙漆可见）**，
+  ground delta=0，引擎日志报 east 场景引用不存在的 italy 线材质
+  （`ptSetMaterial failed`）——**右侧参考贴花很可能未渲染**。因此此前的
+  live 右线指标（H-M0、post-norm L1、右候选≈0）不能归因于感知；需先做
+  场景渲染校验门（GT 投影点附近必须有漆色像素）再谈感知结论。离线池域
+  结论（mask diag/resample/post-norm P1/P2）不受影响。见
+  `T16_INPUT_DOMAIN_RESULT_20261104.md`。
