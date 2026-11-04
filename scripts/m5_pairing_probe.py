@@ -239,6 +239,10 @@ def summarize(records: list[dict], scene_doc: dict) -> dict:
         "rejects": dict(sorted(rejects.items())),
         "modes": dict(sorted(modes.items())),
         "collect_drops": dict(sorted(collect_drops.items())),
+        "collect_by_kind": _by_kind(collect_drops),
+        "thin_span_drops": int(collect_drops.get("thin:span", 0)),
+        "thin_span_drop_rate_of_ticks": round(
+            collect_drops.get("thin:span", 0) / max(1, n), 4),
         "thin_side_drops": thin_side,
         "thin_side_drop_rate_of_ticks": round(thin_side / max(1, n), 4),
         "cert_line_recall": cert_line_recall(records, scene_doc),
@@ -246,11 +250,33 @@ def summarize(records: list[dict], scene_doc: dict) -> dict:
     }
 
 
+def _arm_env(arm: str) -> dict:
+    """研究臂 -> 只读环境开关（默认不改任何生产阈值）。"""
+    import os
+    env = os.environ.copy()
+    if arm == "yellow":
+        env["BEAMNG_YELLOW_GATE"] = "rel"
+    elif arm == "span":
+        env["BEAMNG_THIN_SPAN"] = "relax"
+    elif arm == "clahe":
+        env["BEAMNG_CAND_CLAHE"] = "1"
+    return env
+
+
 def _arm_policy(arm: str):
     from beamng_autopilot.lane.pairing import PairingResearchPolicy
     return PairingResearchPolicy(
         far_thin_allow=(str(arm) == "far_thin"),
         thin_near_relax=(str(arm) == "thin_near"))
+
+
+def _by_kind(drops: dict[str, int]) -> dict[str, dict[str, int]]:
+    """{"thin:span": 3, ...} -> {"thin": {"span": 3}, ...}（只读归因）。"""
+    out: dict[str, dict[str, int]] = {}
+    for key, val in (drops or {}).items():
+        kind, _, reason = str(key).partition(":")
+        out.setdefault(kind or "?", {})[reason or "?"] = int(val)
+    return out
 
 
 def read_jsonl(path: Path) -> list[dict]:
@@ -357,8 +383,9 @@ def collect(args) -> int:
                "--out", str(out.with_suffix(".telemetry.json"))]
         if not args.no_goal:
             cmd += ["--goal", f"{gx:.3f}", f"{gy:.3f}"]
-        if getattr(args, "arm", "baseline") != "baseline":
+        if str(args.arm) in ("far_thin", "thin_near"):
             cmd += ["--pairing-research", str(args.arm)]
+        env = _arm_env(str(args.arm))
         if args.tod:
             cmd += ["--tod", str(args.tod)]
         if args.weather_preset:
@@ -368,7 +395,7 @@ def collect(args) -> int:
               flush=True)
         log = subprocess.run(cmd, cwd=str(ROOT), capture_output=True,
                              text=True, encoding="utf-8", errors="replace",
-                             timeout=wall_s + 180)
+                             timeout=wall_s + 180, env=env)
         (out.with_suffix(".run.log")).write_text(
             (log.stdout or "") + "\n--- stderr ---\n" + (log.stderr or ""),
             encoding="utf-8")
@@ -454,9 +481,12 @@ def main() -> int:
                     default=True,
                     help="不建导航路线（避免 route snap 把自车从车道中心拉回"
                          "道路中线；配对探针默认用它）")
-    ap.add_argument("--arm", choices=("baseline", "far_thin", "thin_near"),
-                    default="baseline", help="研究臂：传给 drive 的 "
-                         "--pairing-research（baseline=不开）")
+    ap.add_argument("--arm",
+                    choices=("baseline", "far_thin", "thin_near",
+                             "yellow", "span", "clahe"),
+                    default="baseline",
+                    help="研究臂：far_thin/thin_near 走 --pairing-research；"
+                         "yellow/span/clahe 走环境变量（Y1/S1/I1）")
     ap.add_argument("--edge-margin-m", type=float, default=0.6,
                     help="right_lane 约定下右线距铺装边的余量（米）")
     ap.add_argument("--line-convention", default="right_lane",
