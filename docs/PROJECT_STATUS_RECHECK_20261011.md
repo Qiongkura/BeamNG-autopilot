@@ -391,3 +391,10 @@ GPU 训练。
   宏增益未达 +0.010 门槛 → R1/R2 未过，**不采用**；参考水位仍为双模型
   **0.539246**，模型不晋级、默认不变。见
   `T16_ENSEMBLE_WEIGHTED_RESULT_20261104.md`。
+- **GridMap 无标线试车场首测（2026-11-04）**：GridMap (500,500) + decal 车道
+  （7m 宽、双线 right_lane、材质覆盖 line_yellow_double）→ 贴花确实渲染、
+  无地图标线污染；默认 span 门 0 配对（薄线碎成 0.92–1.09m），S1（span→1.0）
+  下 **20/20 配对、20/20 true、0 phantom**（模式 mirror_left：右线仍在画面
+  右下角被裁切/碎段，right recall 0）。这是本环境首个 live 参考可归因的
+  场地；下一步把场景构建接进 drive（--scenario-json）即可在无标线场地跑
+  条件矩阵。见 `T16_PROVING_GROUND_RESULT_20261104.md`。
