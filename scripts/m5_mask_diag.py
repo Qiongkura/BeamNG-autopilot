@@ -62,6 +62,38 @@ def component_stats(mask: np.ndarray) -> dict:
             "mean_span_px": round(float(np.mean(spans)), 2) if spans else 0.0}
 
 
+RESAMPLE_MODES = ("native", "cubic", "lanczos", "roundtrip")
+_INFER_W, _INFER_H = 536, 403
+
+
+def prepare_input(frame: np.ndarray, mode: str):
+    """按条件构造输入，返回 (frame_in, pred_resolution_is_infer)。"""
+    f = np.asarray(frame)
+    if mode == "native":
+        return f, False
+    if mode == "cubic":
+        return cv2.resize(f, (_INFER_W, _INFER_H),
+                          interpolation=cv2.INTER_CUBIC), True
+    if mode == "lanczos":
+        return cv2.resize(f, (_INFER_W, _INFER_H),
+                          interpolation=cv2.INTER_LANCZOS4), True
+    if mode == "roundtrip":
+        up = cv2.resize(f, (_INFER_W, _INFER_H),
+                        interpolation=cv2.INTER_CUBIC)
+        return cv2.resize(up, (f.shape[1], f.shape[0]),
+                          interpolation=cv2.INTER_AREA), False
+    raise ValueError(f"未知重采样条件: {mode}")
+
+
+def upscale_mask(mask: np.ndarray, width: int, height: int) -> np.ndarray:
+    """最近邻放大 bool 掩码（GT 对齐用，不插值、不扩边）。"""
+    m = np.asarray(mask, dtype=np.uint8)
+    if m.shape[1] == width and m.shape[0] == height:
+        return m.astype(bool)
+    return cv2.resize(m, (width, height),
+                      interpolation=cv2.INTER_NEAREST).astype(bool)
+
+
 def _frames(runs: list[str]) -> list[Path]:
     out: list[Path] = []
     for r in runs:
@@ -78,6 +110,8 @@ def main() -> int:
     ap.add_argument("--model", required=True)
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--compare-resample", action="store_true",
+                    help="同一帧按 native/cubic/lanczos/roundtrip 四种输入对照")
     args = ap.parse_args()
 
     from beamng_autopilot.vision.segmentation import Segmenter
@@ -89,6 +123,31 @@ def main() -> int:
         colour = d["colour"]
         label = d["label"]
         yellow_gt, white_gt = split_line_gt(colour, label)
+        if args.compare_resample:
+            for mode in RESAMPLE_MODES:
+                frame_in, _ = prepare_input(colour, mode)
+                _maps, _raw_road, raw_line = seg.predict_proba(frame_in)
+                _road, post_line = seg.predict(frame_in)
+                ph, pw = np.asarray(raw_line).shape[:2]
+                y_g = upscale_mask(yellow_gt, pw, ph)
+                w_g = upscale_mask(white_gt, pw, ph)
+                raw_r = recall(raw_line, y_g)
+                post_r = recall(post_line, y_g)
+                rows.append({
+                    "file": str(f), "mode": mode,
+                    "gt_yellow_px": int(y_g.sum()),
+                    "gt_white_px": int(w_g.sum()),
+                    "raw_yellow_recall": raw_r,
+                    "post_yellow_recall": post_r,
+                    "raw_white_recall": recall(raw_line, w_g),
+                    "post_white_recall": recall(post_line, w_g),
+                    "raw_line_px": int(np.asarray(raw_line).sum()),
+                    "post_line_px": int(np.asarray(post_line).sum()),
+                    "drop_frac_yellow": (round(1.0 - post_r / raw_r, 3)
+                                         if np.isfinite(raw_r) and raw_r > 0
+                                         else None),
+                })
+            continue
         _maps, _raw_road, raw_line = seg.predict_proba(colour)
         _road, post_line = seg.predict(colour)
         rec = {
@@ -117,6 +176,53 @@ def main() -> int:
                 if isinstance(r.get(key), (int, float)) and np.isfinite(r[key])]
         return round(float(np.mean(vals)), 4) if vals else None
 
+    if args.compare_resample:
+        by_mode = {}
+        for mode in RESAMPLE_MODES:
+            rs = [r for r in rows if r["mode"] == mode]
+            if not rs:
+                continue
+            def m2(key):
+                vals = [r[key] for r in rs
+                        if isinstance(r.get(key), (int, float))
+                        and np.isfinite(r[key])]
+                return round(float(np.mean(vals)), 4) if vals else None
+            by_mode[mode] = {
+                "frames": len(rs),
+                "raw_yellow_recall": m2("raw_yellow_recall"),
+                "post_yellow_recall": m2("post_yellow_recall"),
+                "raw_white_recall": m2("raw_white_recall"),
+                "post_white_recall": m2("post_white_recall"),
+                "drop_frac_yellow": m2("drop_frac_yellow"),
+                "raw_line_px": m2("raw_line_px"),
+                "post_line_px": m2("post_line_px"),
+            }
+        base = by_mode.get("native") or {}
+        deltas = {}
+        for mode, mrow in by_mode.items():
+            if mode == "native":
+                continue
+            deltas[mode] = {
+                "raw_yellow_delta_pp": round(100 * (
+                    (mrow["raw_yellow_recall"] or 0)
+                    - (base.get("raw_yellow_recall") or 0)), 2),
+                "post_yellow_delta_pp": round(100 * (
+                    (mrow["post_yellow_recall"] or 0)
+                    - (base.get("post_yellow_recall") or 0)), 2),
+            }
+        summary = {"by_mode": by_mode, "deltas_vs_native": deltas,
+                   "frames": len(rows) // max(1, len(RESAMPLE_MODES))}
+        out = {"schema": "resample-diag-v1", "model": str(args.model),
+               "runs": [str(x) for x in args.runs], "summary": summary,
+               "frames": rows}
+        text = json.dumps(out, ensure_ascii=False, indent=1,
+                          default=lambda o: None)
+        if args.out:
+            Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+            Path(args.out).write_text(text, encoding="utf-8")
+            print(f"[mask-diag] -> {args.out}", flush=True)
+        print(json.dumps(summary, ensure_ascii=False, indent=1), flush=True)
+        return 0
     summary = {k: mean(k) for k in (
         "gt_yellow_px", "gt_white_px",
         "raw_yellow_recall", "post_yellow_recall",

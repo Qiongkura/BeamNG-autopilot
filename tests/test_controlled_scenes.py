@@ -1473,3 +1473,32 @@ def test_mask_diag_gt_split_and_recall():
     cs = m.component_stats(np.ones((3, 3), dtype=bool))
     assert cs["count"] == 1 and cs["max_span_px"] == 3
     assert m.component_stats(np.zeros((3, 3), dtype=bool))["count"] == 0
+
+
+def test_mask_diag_resample_modes():
+    import numpy as np
+    spec = importlib.util.spec_from_file_location(
+        "m5_mask_diag2", ROOT / "scripts" / "m5_mask_diag.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["m5_mask_diag2"] = m
+    spec.loader.exec_module(m)
+    frame = np.zeros((144, 192, 3), dtype=np.uint8)
+    for mode in ("native", "roundtrip"):
+        out, pred_infer = m.prepare_input(frame, mode)
+        assert out.shape == frame.shape and pred_infer is False
+    for mode in ("cubic", "lanczos"):
+        out, pred_infer = m.prepare_input(frame, mode)
+        assert out.shape == (403, 536, 3) and pred_infer is True
+    try:
+        m.prepare_input(frame, "bogus")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("未知条件必须报错")
+    mask = np.zeros((10, 10), dtype=bool)
+    mask[0:2, 0:2] = True
+    up = m.upscale_mask(mask, 40, 30)
+    assert up.shape == (30, 40) and up.dtype == bool
+    assert up.sum() > mask.sum()
+    same = m.upscale_mask(mask, 10, 10)
+    assert same.shape == mask.shape
