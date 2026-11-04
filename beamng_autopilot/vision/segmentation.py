@@ -641,7 +641,8 @@ class Segmenter:
 
     def __init__(self, model_path=None, device=None, use_half: bool = True,
                  temporal_smooth: bool = False, line_road_keep_frac=None,
-                 line_road_elongated_frac=None, line_road_ksize=None):
+                 line_road_elongated_frac=None, line_road_ksize=None,
+                 post_norm_width: int | None = None):
         path = Path(model_path) if model_path else default_model_path()
         if path is None:
             raise FileNotFoundError(
@@ -658,6 +659,10 @@ class Segmenter:
             else float(line_road_elongated_frac))
         self.line_road_ksize = (None if line_road_ksize is None
                                 else int(line_road_ksize))
+        # 研究臂 P1（预注册 T16_POST_NORM_PREREG，默认 None = 现行行为）：
+        # 后处理在固定宽度上运行，核大小不再随输入分辨率漂移。
+        self.post_norm_width = (None if post_norm_width is None
+                                else int(post_norm_width))
         # Which checkpoint is loaded decides how every map behaves, so it
         # is kept on the instance: an unpinned run must be attributable
         # instead of silently using whatever happens to be deployed.
@@ -832,6 +837,33 @@ class Segmenter:
             timing["total"] = (time.perf_counter() - started) * 1000.0
 
     def _postprocess(self, frame_rgb: np.ndarray, road, line):
+        """后处理入口：可选分辨率归一（研究臂 P1，默认 None=现行行为）。
+
+        536 原生输入下，后处理的像素固定核会把细黄线删掉（重采样域对照
+        实测 post 黄召回 0.10 vs 池域 0.73）。``post_norm_width`` 指定时，
+        先把掩码与帧缩到该宽度跑同一套后处理，再把结果放大回原分辨率；
+        核大小与阈值语义因此不随输入分辨率变化。
+        """
+        target = getattr(self, "post_norm_width", None)
+        h, w = frame_rgb.shape[:2]
+        if not target or int(target) <= 0 or int(target) == int(w):
+            return self._postprocess_core(frame_rgb, road, line)
+        tw = int(target)
+        th = max(1, int(round(h * (tw / float(w)))))
+        frame_s = cv2.resize(frame_rgb, (tw, th),
+                             interpolation=cv2.INTER_AREA)
+        road_s = cv2.resize(road.astype(np.uint8), (tw, th),
+                            interpolation=cv2.INTER_NEAREST).astype(bool)
+        line_s = cv2.resize(line.astype(np.uint8), (tw, th),
+                            interpolation=cv2.INTER_NEAREST).astype(bool)
+        road_s, line_s = self._postprocess_core(frame_s, road_s, line_s)
+        road_o = cv2.resize(road_s.astype(np.uint8), (w, h),
+                            interpolation=cv2.INTER_NEAREST).astype(bool)
+        line_o = cv2.resize(line_s.astype(np.uint8), (w, h),
+                            interpolation=cv2.INTER_NEAREST).astype(bool)
+        return road_o, line_o
+
+    def _postprocess_core(self, frame_rgb: np.ndarray, road, line):
         """The existing mask pipeline: soil, morphology, hysteresis, gates."""
         # 铺装路面约束：模型会把铺装路两侧的土肩也判成路面（实测最坏一帧
         # 掩码里 24.8% 是土、单块 1.4 万像素且与主路面连通）。车必须待在

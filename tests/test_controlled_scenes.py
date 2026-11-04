@@ -1502,3 +1502,21 @@ def test_mask_diag_resample_modes():
     assert up.sum() > mask.sum()
     same = m.upscale_mask(mask, 10, 10)
     assert same.shape == mask.shape
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-04 后处理分辨率归研究臂 P1（默认 None=现行行为）
+# ---------------------------------------------------------------------------
+
+def test_post_norm_width_switch_and_wiring():
+    root = Path(__file__).resolve().parents[1]
+    seg = (root / "beamng_autopilot" / "vision" / "segmentation.py").read_text("utf-8")
+    assert "post_norm_width: int | None = None" in seg
+    assert "self.post_norm_width" in seg
+    assert "def _postprocess_core(" in seg
+    assert "def _postprocess(" in seg
+    diag = (root / "scripts" / "m5_mask_diag.py").read_text("utf-8")
+    assert '"--post-norm-width"' in diag
+    assert "post_norm_width=args.post_norm_width" in diag
+    # 默认值语义：None=不归一（现行行为）
+    assert "if not target or int(target) <= 0" in seg
