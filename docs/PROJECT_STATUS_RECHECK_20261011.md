@@ -249,3 +249,10 @@ GPU 训练。
   删除事件中灭失，现存 71 族池模型 town 配对率 0%——**部署域感知回归**被
   定位。按预注册纪束矩阵标 12/12 UNKNOWN（不降门、不改场景凑指标），
   解阻见 `T16_FSD_CONDITIONS_BLOCKED_20261104.md`。
+- **配对鲁棒性研究臂预注册（2026-11-04）**：条件矩阵阻断后，针对
+  `far_kind` / `thin_near` / `mirror` 三个拒绝门冻结可证伪假设（H1 far
+  thin 几何自洽、H2 细线近场稀疏、H3 镜像与路面中心一致）；四臂（F1/F2/
+  M1 + 条件组合 C1）全部研究开关**默认等于现行行为**，先离线探针
+  （认证场景真值：true_pair_rate/phantom_rate），判据写死：true_pair
+  ≥+10pp 且 phantom 增幅 ≤+2pp（复现 ≥1 场景），否则证伪。不降门、不晋级、
+  不新增标注。见 `T16_LANE_PAIRING_ROBUSTNESS_PREREG_20261104.md`。
