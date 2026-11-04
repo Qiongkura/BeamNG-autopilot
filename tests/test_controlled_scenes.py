@@ -1608,3 +1608,57 @@ def test_marking_replay_input_width():
     # 默认 None 时行为不变（由 main 分支保证，源检查）
     src = (ROOT / "scripts" / "m5_marking_replay.py").read_text("utf-8")
     assert '"--input-width"' in src and "pre_scale(frame" in src
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-04 EnsembleSegmenter（部署路径）：平均/fail-closed/委托
+# ---------------------------------------------------------------------------
+
+def test_ensemble_segmenter_average_and_failclosed():
+    import numpy as np
+    from beamng_autopilot.vision.segmentation import EnsembleSegmenter
+
+    class Fake:
+        def __init__(self, probs, boom=False):
+            self.probs = probs; self.boom = boom
+            self.model_path = "fake"; self.device = "cpu"
+            self.reset_called = False; self.last_probs = None
+        def probability_maps_small(self, frame):
+            if self.boom:
+                raise RuntimeError("member failed")
+            return self.probs
+        def masks_from_model_probs(self, frame, probs):
+            self.last_probs = probs
+            return (np.zeros((2, 2), bool), np.ones((2, 2), bool))
+        def detect_lines(self, frame, cam, pos, heading, ground_z=None, **kw):
+            self.kw = kw
+            return ["mk"]
+        def reset(self):
+            self.reset_called = True
+
+    a = Fake(np.zeros((3, 2, 2), np.float32))
+    b = Fake(np.ones((3, 2, 2), np.float32))
+    ens = EnsembleSegmenter(segmenters=[a, b])
+    road, line = ens.predict(np.zeros((4, 4, 3), np.uint8))
+    assert np.allclose(a.last_probs, 0.5)
+    assert road.shape == (2, 2) and line.all()
+    # detect_lines 委托第一个成员并传入集成掩码
+    out = ens.detect_lines(np.zeros((4, 4, 3), np.uint8), None, [0, 0, 0], 0.0)
+    assert out == ["mk"] and "line_mask" in a.kw
+    ens.reset(); assert a.reset_called and b.reset_called
+    # fail-closed：任一成员抛 -> 整体抛
+    bad = Fake(np.zeros((3, 2, 2), np.float32), boom=True)
+    ens2 = EnsembleSegmenter(segmenters=[a, bad])
+    try:
+        ens2.predict(np.zeros((4, 4, 3), np.uint8))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("成员异常必须向上抛出（fail-closed）")
+    # 少于两个成员 -> ValueError
+    try:
+        EnsembleSegmenter(segmenters=[a])
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("单成员必须拒绝")

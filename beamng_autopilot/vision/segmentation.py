@@ -1240,3 +1240,77 @@ class Segmenter:
         """True where the frame is NOT asphalt (feeds edge extraction)."""
         road, _ = self.predict(frame_rgb)
         return ~road
+
+
+class EnsembleSegmenter:
+    """双模型概率集成（部署候选，默认不启用；预注册 T16_ENSEMBLE_DEPLOY）。
+
+    与 :class:`Segmenter` 同一接口子集（predict / detect_lines / reset /
+    model_path）。概率在模型分辨率平均后 argmax，再走与单模型**完全相同**的
+    后处理（``masks_from_model_probs``），因此唯一差异是概率本身。
+
+    fail-closed：任一成员抛异常则整体抛出（由调用方转 perception-unavailable
+    → 刹停），绝不"一个成功就用一个"地静默降级。
+    """
+
+    def __init__(self, model_paths: list[str] | None = None, *,
+                 segmenters: list | None = None, device=None,
+                 use_half: bool = True, post_norm_width: int | None = None):
+        if segmenters is None:
+            if not model_paths or len(model_paths) < 2:
+                raise ValueError("EnsembleSegmenter 需要至少两个模型")
+            segmenters = [
+                Segmenter(model_path=p, device=device, use_half=use_half,
+                          post_norm_width=post_norm_width)
+                for p in model_paths]
+        self.segmenters = list(segmenters)
+        if len(self.segmenters) < 2:
+            raise ValueError("EnsembleSegmenter 需要至少两个成员")
+        names = "+".join(str(getattr(s, "model_path", "?"))
+                         for s in self.segmenters)
+        self.model_path = f"ensemble[{names}]"
+        self.device = getattr(self.segmenters[0], "device", None)
+        self.temporal_smooth = bool(
+            getattr(self.segmenters[0], "temporal_smooth", False))
+        self.post_norm_width = getattr(
+            self.segmenters[0], "post_norm_width", None)
+        self.last_timing_ms: dict = {}
+        self.route_is_dirt = False
+
+    def predict(self, frame_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        probs = None
+        for seg in self.segmenters:
+            p = np.asarray(seg.probability_maps_small(frame_rgb),
+                           dtype=np.float32)
+            probs = p if probs is None else probs + p
+        probs = probs / float(len(self.segmenters))
+        return self.segmenters[0].masks_from_model_probs(frame_rgb, probs)
+
+    def detect_lines(self, frame_rgb, cam_model, pos, heading,
+                     ground_z: float | None = None, *,
+                     line_mask: np.ndarray | None = None,
+                     road_mask: np.ndarray | None = None,
+                     rotation=None, debug: dict | None = None):
+        if line_mask is None or road_mask is None:
+            road, line = self.predict(frame_rgb)
+            road_mask = road if road_mask is None else road_mask
+            line_mask = line if line_mask is None else line_mask
+        return self.segmenters[0].detect_lines(
+            frame_rgb, cam_model, pos, heading, ground_z,
+            line_mask=line_mask, road_mask=road_mask,
+            rotation=rotation, debug=debug)
+
+    def predict_proba(self, frame_rgb, *, _logits=None):
+        raise NotImplementedError(
+            "EnsembleSegmenter 不提供概率图 API；请用 predict()/detect_lines()")
+
+    def predict_with_probs(self, frame_rgb):
+        raise NotImplementedError(
+            "EnsembleSegmenter 不提供概率图 API；请用 predict()/detect_lines()")
+
+    def reset(self) -> None:
+        for seg in self.segmenters:
+            try:
+                seg.reset()
+            except Exception:  # noqa: BLE001 — 重置失败不阻断后续
+                pass
