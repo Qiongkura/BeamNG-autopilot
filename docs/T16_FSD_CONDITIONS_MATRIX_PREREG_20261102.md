@@ -107,3 +107,11 @@ a3s0 站点**（地图自带标线；live 探针配对率 1.00、放置 1/2 成�
   这是场景可用性事实，不得为出表重跑到通过；
 - mountain 的 12 格 UNKNOWN 证据保留在 `logs/fsd_conditions/`；新批落
   `logs/fsd_conditions_west/`。
+
+## 预注册修订案 A4：矩阵收口（2026-11-04）
+
+A3 的 west 站点在带路线的驾驶链路下 dawn 4 格 + noon_clear 全部 rc=3
+（12 格 UNKNOWN）；无路线探针的 1/2 成功不可迁移到矩阵链路。加上
+mountain（无标线）与 town（单侧，含集成），**三场景均无法产出驾驶格**。
+矩阵按预注册记 UNKNOWN 收口，不重跑、不降门；解阻需部署域感知数据或
+不依赖合成贴花的新场景（见 `T16_FSD_CONDITIONS_CLOSED_20261104.md`）。

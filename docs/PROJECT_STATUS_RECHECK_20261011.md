@@ -368,3 +368,9 @@ GPU 训练。
   放置可用性 paired 率 1.00 vs 1.00、placed 1/2 vs 1/2（同分，站点本身双稳态）。
   集成仍非默认；live 贴花 GT 环境阻塞未变。见
   `T16_ENSEMBLE_DRIVE_RESULT_20261104.md`。
+- **条件矩阵收口（2026-11-04）**：修订案 A3 改 west a3s0 后，dawn 4 格 +
+  noon_clear 全部 rc=3（12 格 UNKNOWN）——无路线探针的 1/2 成功不迁移到
+  带路线驾驶链路；加上 mountain（无标线）与 town（单侧，单模型+集成均
+  失败），**三场景均无法产出驾驶格**。矩阵按预注册 UNKNOWN 收口，不重跑
+  凑表；解阻需部署域感知数据或新场景（外部）。见
+  `T16_FSD_CONDITIONS_CLOSED_20261104.md`。
