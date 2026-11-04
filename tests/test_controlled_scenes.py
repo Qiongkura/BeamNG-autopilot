@@ -1554,3 +1554,46 @@ def test_pairing_probe_save_frames_wiring():
     assert '"--save-frames"' in probe
     assert '"--pairing-probe-frames-dir"' in probe
     assert '"_frames_dir' in probe or "frames_dir" in probe
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-04 回放诊断：H-M0..M3 分类与 GT 几何（纯函数）
+# ---------------------------------------------------------------------------
+
+def _load_replay():
+    spec = importlib.util.spec_from_file_location(
+        "m5_marking_replay", ROOT / "scripts" / "m5_marking_replay.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["m5_marking_replay"] = m
+    spec.loader.exec_module(m)
+    return m
+
+
+def test_marking_replay_classification():
+    m = _load_replay()
+    gt = -1.8
+    assert m.classify_frame(gt, [], [], False, False) == "H-M0"
+    assert m.classify_frame(gt, [], [], True, False) == "H-M1"
+    assert m.classify_frame(gt, [-1.7], [], False, False) == "H-M2"
+    assert m.classify_frame(gt, [-1.7], [-1.75], False, False) == "H-M3"
+    assert m.classify_frame(gt, [-1.7], [-1.75], False, True) == "ok"
+    # 远处 marking 不算命中
+    assert m.classify_frame(gt, [-4.2], [], True, False) == "H-M1"
+
+
+def test_marking_replay_gt_geometry():
+    import numpy as np
+    from types import SimpleNamespace
+    m = _load_replay()
+    scene = {"scene": {"mid": [0.0, 0.0, 0.0], "dir": [1.0, 0.0, 0.0],
+                       "half_width_m": 3.483, "slope_pct": 0.0}}
+    # ego 在道路中线、朝 +x：right_lane(margin 1.0) 右线在 -2.483，
+    # 相对 ego 的横向 = -2.483（左正）
+    lat = m.gt_right_lat(scene, 1.0, [0, 0, 0], 0.0)
+    assert abs(lat - (-2.483)) < 1e-6
+    # 把 ego 右移 1m：相对横向 -1.483
+    lat2 = m.gt_right_lat(scene, 1.0, [0, -1.0, 0], 0.0)
+    assert abs(lat2 - (-1.483)) < 1e-6
+    mk = SimpleNamespace(world=np.array([[10.0, -2.483, 0.0],
+                                         [12.0, -2.483, 0.0]]))
+    assert abs(m.marking_near_lat(mk, [0, 0, 0], 0.0) - (-2.483)) < 1e-6
