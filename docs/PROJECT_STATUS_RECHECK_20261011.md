@@ -305,3 +305,11 @@ GPU 训练。
   结论：live 右线候选召回≈0 发生在**掩码之后**（mask→marking 或 live 536×403
   域差异）。下一步二选一：live 帧回放 detect_lines，或 144 原生 vs 536 上采样
   域对照（均需新预注册）。见 `T16_MASK_SIDE_DIAG_RESULT_20261104.md`。
+- **重采样域对照（2026-11-04）**：同一池帧按 native/cubic/lanczos/roundtrip
+  输入比较。east 触发 D2：raw 黄召回 0.97 但 **post 从 0.727 掉到 0.103
+  （−62.5pp）**；west 变化 ≤5pp。机制=后处理在输入分辨率上跑、核大小像素
+  固定——池域 native 后处理在 144、live/预上采样在 536，细黄线在 536 被
+  删掉。**live 右线候选≈0 的直接机制找到**（场景相关，west 不回归）。
+  下一步：后处理分辨率归研究臂（先把掩码缩到规范分辨率跑后处理再放大），
+  离线验证 post 黄召回 0.10→≥0.6 后再谈 live。见
+  `T16_RESAMPLE_DIAG_RESULT_20261104.md`。
