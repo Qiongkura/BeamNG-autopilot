@@ -361,3 +361,10 @@ GPU 训练。
   通过）。时延 p50 18.76→29.00ms（**1.55×**，后处理只跑一次）；S-FailClosed/
   S-Post/S-Default 单测全过。组件未接 drive（需单独接线预注册）；模型不晋级。
   见 `T16_ENSEMBLE_DEPLOY_RESULT_20261104.md`。
+- **集成接 drive 部署接线（2026-11-04）**：`--seg-model2` → `EnsembleSegmenter`
+  （默认单模型不变）。D1–D4 全过：时延 p50 18.76→29.00ms（1.55×），live 4 轮
+  无 watchdog/timeout；显存单 1.7MB/集成 3.4MB（≪200MB）；fail-closed 负面
+  注入（坏 checkpoint）→ 感知 disabled → perception-unavailable → 刹停；
+  放置可用性 paired 率 1.00 vs 1.00、placed 1/2 vs 1/2（同分，站点本身双稳态）。
+  集成仍非默认；live 贴花 GT 环境阻塞未变。见
+  `T16_ENSEMBLE_DRIVE_RESULT_20261104.md`。
