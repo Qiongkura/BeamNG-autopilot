@@ -2012,6 +2012,15 @@ class FSDriveSession:
                 print(f"[fsd-drive] DQN policy disabled: {_dqn_e}")
                 dqn_rt = None
         stack.probe_geometry = bool(getattr(args, "probe_geometry", False))
+        # 研究臂（预注册 T16_PAIRING_ROBUSTNESS_PREREG）：默认 off，行为不变
+        try:
+            from beamng_autopilot.lane.pairing import PairingResearchPolicy
+            _arm = str(getattr(args, "pairing_research", "off") or "off")
+            stack.pairing_research = PairingResearchPolicy(
+                far_thin_allow=(_arm == "far_thin"),
+                thin_near_relax=(_arm == "thin_near"))
+        except Exception:  # noqa: BLE001 — 研究开关失败不影响生产路径
+            stack.pairing_research = None
         if getattr(args, "capture_range_replay", False):
             if stack.mode != "tech" or not args.out:
                 raise ValueError("range replay capture requires Tech and --out")
