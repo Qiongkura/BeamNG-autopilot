@@ -398,3 +398,9 @@ GPU 训练。
   右下角被裁切/碎段，right recall 0）。这是本环境首个 live 参考可归因的
   场地；下一步把场景构建接进 drive（--scenario-json）即可在无标线场地跑
   条件矩阵。见 `T16_PROVING_GROUND_RESULT_20261104.md`。
+- **试车场接 drive 首测（2026-11-04）**：`--scenario-json` 接线完成——GridMap
+  场景/材质/自车位姿（501.10,500.00,100.14，车道中心）全部正确；但严格+
+  sensor 放置仍 **rc=3**（pair_mode=none，S1 下最好 mirror_left），镜像单侧
+  不被放置确认接受。**矩阵暂不能在试车场启动**；下一步：右线取景/几何调整
+  或候选共线碎段合并（均无需外部数据）。见
+  `T16_PROVING_GROUND_DRIVE_RESULT_20261104.md`。
