@@ -1843,11 +1843,13 @@ class FSDriveSession:
         # path), so the FSD drive never stops dead at a hairpin apex or
         # full-locks across a kinked map-prior lane.
         rule_planner = LocalPlanner()
+        _post_norm = getattr(args, "seg_post_norm_width", None)
         _seg = None
         if getattr(args, "seg_model", None):
             try:
                 from beamng_autopilot.vision.segmentation import Segmenter
-                _seg = Segmenter(model_path=args.seg_model)
+                _seg = Segmenter(model_path=args.seg_model,
+                                 post_norm_width=_post_norm)
                 print(f"[fsd-drive] segmentation model: {args.seg_model}")
             except Exception as _seg_e:
                 print(f"[fsd-drive] segmentation model disabled: {_seg_e}")
@@ -1860,7 +1862,7 @@ class FSDriveSession:
             # the path actually used, not a second lookup.
             try:
                 from beamng_autopilot.vision.segmentation import Segmenter
-                _seg = Segmenter()
+                _seg = Segmenter(post_norm_width=_post_norm)
                 print("[fsd-drive] segmentation model (UNPINNED default): "
                       f"{_seg.model_path}")
             except Exception as _seg_e:
@@ -1870,7 +1872,8 @@ class FSDriveSession:
         if _line_seg_path:
             try:
                 from beamng_autopilot.vision.segmentation import Segmenter
-                _line_seg = Segmenter(model_path=_line_seg_path)
+                _line_seg = Segmenter(model_path=_line_seg_path,
+                                      post_norm_width=_post_norm)
                 print(f"[fsd-drive] painted-line model: {_line_seg_path}")
             except Exception as _line_seg_e:
                 print(f"[fsd-drive] painted-line model disabled: {_line_seg_e}")

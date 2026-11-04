@@ -1520,3 +1520,20 @@ def test_post_norm_width_switch_and_wiring():
     assert "post_norm_width=args.post_norm_width" in diag
     # 默认值语义：None=不归一（现行行为）
     assert "if not target or int(target) <= 0" in seg
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-04 live 接线：--seg-post-norm-width（默认 None）
+# ---------------------------------------------------------------------------
+
+def test_seg_post_norm_live_wiring():
+    root = Path(__file__).resolve().parents[1]
+    drv = (root / "beamng_autopilot" / "fsd_drive.py").read_text("utf-8")
+    assert "seg_post_norm_width" in drv
+    assert "post_norm_width=_post_norm" in drv
+    cli = (root / "scripts" / "m5_fsd_drive.py").read_text("utf-8")
+    assert '"--seg-post-norm-width"' in cli
+    probe = (root / "scripts" / "m5_pairing_probe.py").read_text("utf-8")
+    assert '"--post-norm-width"' in probe
+    assert '"--seg-post-norm-width"' in probe
+    assert '"post_norm_width"' in probe
