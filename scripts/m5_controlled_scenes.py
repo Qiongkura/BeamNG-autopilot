@@ -766,7 +766,8 @@ def assign_scene_types(a_sites: list, types_order: list) -> list[str]:
 def build_scenario(conn, sites: list[dict], *, map_name: str = "italy",
                    scene_types: list[str],
                    scene_names: list[str],
-                   line_convention: str | None = None):
+                   line_convention: str | None = None,
+                   edge_margin_m: float = 0.6):
     """把全部站点生成进**一个** Scenario（一次加载；扩量后站点分布在多条路段）。
 
     ``scene_types`` 是五类规格的键（决定生成什么），``scene_names`` 是每条站点的
@@ -849,7 +850,8 @@ def build_scenario(conn, sites: list[dict], *, map_name: str = "italy",
             elif _lc == "right_lane":
                 # 配对专用场景：双线整体贴到右侧铺装边，车道宽 3.6m，
                 # 使贴花车道中心与道路右侧可行驶车道对齐。
-                _ll, _rl = right_lane_lats(site["half_width_m"])
+                _ll, _rl = right_lane_lats(site["half_width_m"],
+                                           edge_margin_m=edge_margin_m)
                 lat = _ll if role == "left" else _rl
             elif _lc == "relative":
                 half = float(site["half_width_m"])
@@ -892,7 +894,8 @@ def build_scenario(conn, sites: list[dict], *, map_name: str = "italy",
     ego_pos = [float(v) for v in site0["mid"]]
     ego_lat = 0.0
     if _lc == "right_lane":
-        _ll0, _rl0 = right_lane_lats(site0["half_width_m"])
+        _ll0, _rl0 = right_lane_lats(site0["half_width_m"],
+                                     edge_margin_m=edge_margin_m)
         ego_lat = 0.5 * (_ll0 + _rl0)
         d0 = _unit(site0["dir"])
         left0 = np.array([-d0[1], d0[0]])

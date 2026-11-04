@@ -329,7 +329,8 @@ def collect(args) -> int:
             scen, _rec = collector.build_scenario(
                 conn, [site], map_name=args.map,
                 scene_types=["known_line"], scene_names=[scene_name],
-                line_convention=str(args.line_convention))
+                line_convention=str(args.line_convention),
+                edge_margin_m=float(args.edge_margin_m))
             _built_lines = (_rec.get("sites", {}).get(scene_name, {})
                             .get("lines") or [])
             if _built_lines:
@@ -456,6 +457,8 @@ def main() -> int:
     ap.add_argument("--arm", choices=("baseline", "far_thin", "thin_near"),
                     default="baseline", help="研究臂：传给 drive 的 "
                          "--pairing-research（baseline=不开）")
+    ap.add_argument("--edge-margin-m", type=float, default=0.6,
+                    help="right_lane 约定下右线距铺装边的余量（米）")
     ap.add_argument("--line-convention", default="right_lane",
                     help="贴花横向约定：right_lane=贴右侧铺装边（配对专用）；"
                          "symmetric=原认证约定")

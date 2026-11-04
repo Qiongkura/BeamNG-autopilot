@@ -1392,3 +1392,21 @@ def test_pairing_arm_policy_plumbing():
     # 默认全 False
     from beamng_autopilot.lane.pairing import PairingResearchPolicy
     assert PairingResearchPolicy().is_default()
+
+
+def test_edge_margin_plumbing():
+    root = Path(__file__).resolve().parents[1]
+    coll = (root / "scripts" / "m5_controlled_scenes.py").read_text("utf-8")
+    assert "edge_margin_m: float = 0.6" in coll
+    assert "edge_margin_m=edge_margin_m" in coll
+    probe = (root / "scripts" / "m5_pairing_probe.py").read_text("utf-8")
+    assert '"--edge-margin-m"' in probe
+    assert "edge_margin_m=float(args.edge_margin_m)" in probe
+    # 余量 1.0m 的几何：hw3.483 -> 右 -2.483、左 1.117、中心 -0.683
+    spec = importlib.util.spec_from_file_location(
+        "mcs_margin", root / "scripts" / "m5_controlled_scenes.py")
+    m = importlib.util.module_from_spec(spec)
+    sys.modules["mcs_margin"] = m
+    spec.loader.exec_module(m)
+    l, r = m.right_lane_lats(3.483, edge_margin_m=1.0)
+    assert abs(r - (-2.483)) < 1e-6 and abs(l - 1.117) < 1e-6
