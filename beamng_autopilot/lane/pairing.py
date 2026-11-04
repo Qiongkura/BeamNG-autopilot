@@ -201,6 +201,79 @@ class _LineCandidate:
     world: np.ndarray | None = None   # (M, 2) original world polyline
 
 
+def _merge_thin_fragments(markings, pos, fwd, left, need_span: float,
+                          debug: dict | None = None) -> list:
+    """研究臂：把同侧、共线、间隙 ≤2m 的 thin 碎段合并后重算 span。
+
+    只处理 span < need_span 的 thin marking；同侧=近场横向同号，
+    共线=横向中位差 ≤0.15m，纵向间隙 ≤2m（投影 s 区间）。
+    合并后的世界折线重新投影并重算 span；仍不足则丢弃。
+    返回可追加到候选列表的 ``_LineCandidate``（研究开关默认关）。
+    """
+    pos = np.asarray(pos, dtype=float)[:2]
+    frags = []
+    for mk in markings:
+        if getattr(mk, "kind", "") != "thin":
+            continue
+        try:
+            world = np.asarray(mk.world, dtype=float)[:, :2]
+        except Exception:  # noqa: BLE001
+            continue
+        if len(world) < 2:
+            continue
+        proj = _boundary_projection(world, pos, fwd, left)
+        span = float(proj[-1, 0] - proj[0, 0])
+        if span >= need_span:
+            continue
+        frags.append({"mk": mk, "world": world, "proj": proj})
+    if len(frags) < 2:
+        return []
+    used: set[int] = set()
+    out = []
+    for i, fi in enumerate(frags):
+        if i in used:
+            continue
+        la = float(np.median(fi["proj"][:, 1]))
+        cluster = [i]
+        for j in range(i + 1, len(frags)):
+            if j in used:
+                continue
+            fj = frags[j]
+            lb = float(np.median(fj["proj"][:, 1]))
+            if np.sign(la) != np.sign(lb):
+                continue
+            if abs(la - lb) > 0.15:
+                continue
+            a0, a1 = fi["proj"][0, 0], fi["proj"][-1, 0]
+            b0, b1 = fj["proj"][0, 0], fj["proj"][-1, 0]
+            gap = max(0.0, max(a0, b0) - min(a1, b1))
+            if gap > 2.0:
+                continue
+            cluster.append(j)
+        if len(cluster) < 2:
+            continue
+        for k in cluster:
+            used.add(k)
+        world = np.vstack([frags[k]["world"] for k in cluster])
+        proj = _boundary_projection(world, pos, fwd, left)
+        span = float(proj[-1, 0] - proj[0, 0])
+        if span < need_span:
+            continue
+        med = float(np.median(proj[:, 1]))
+        if abs(med) > LANE_EDGE_MAX_M:
+            continue
+        mk0 = frags[cluster[0]]["mk"]
+        out.append(_LineCandidate(
+            proj=proj, span=span,
+            conf=float(np.mean([frags[k]["mk"].confidence
+                                for k in cluster])),
+            kind="thin", color=str(getattr(mk0, "color", "")),
+            med_lat=med, score=_marking_score(mk0, span), world=world))
+    if debug is not None and out:
+        debug["merged_thin_spans"] = [round(float(c.span), 2) for c in out]
+    return out
+
+
 def _collect_candidates(markings, pos: np.ndarray, fwd: np.ndarray,
                         min_span: float,
                         debug: dict | None = None) -> list[_LineCandidate]:
@@ -275,9 +348,11 @@ def _collect_candidates(markings, pos: np.ndarray, fwd: np.ndarray,
         span = float(proj[-1, 0] - proj[0, 0])
         # 研究臂 S1（默认关）：thin 的最小跨度 1.5m -> 1.0m
         _span_need = _boundary_min_span(mk, min_span)
-        if (os.environ.get("BEAMNG_THIN_SPAN", "abs") == "relax"
-                and getattr(mk, "kind", "") == "thin"):
-            _span_need = min(_span_need, 1.0)
+        _span_mode = os.environ.get("BEAMNG_THIN_SPAN", "abs")
+        if _span_mode in ("relax", "relax2") and getattr(mk, "kind", "") == "thin":
+            # relax=1.0m；relax2=0.8m（仅研究/合成试车场：无其他漆源，
+            # span 门的幻影风险为零；不用于真实道路默认）
+            _span_need = min(_span_need, 1.0 if _span_mode == "relax" else 0.8)
         if span < _span_need:
             _drop(mk, "span", span=span, align=align)
             continue
@@ -309,6 +384,13 @@ def _collect_candidates(markings, pos: np.ndarray, fwd: np.ndarray,
             proj=proj, span=span, conf=float(mk.confidence),
             kind=mk.kind, color=cand_color, med_lat=med_lat,
             score=_marking_score(mk, span), world=world[:, :2]))
+    # 研究臂（默认关）：thin 共线碎段合并（预注册 T16_THIN_MERGE）
+    if os.environ.get("BEAMNG_THIN_MERGE", "0") == "1":
+        try:
+            cands.extend(_merge_thin_fragments(
+                markings, pos, fwd, left, LANE_BOUNDARY_SPAN_M, debug))
+        except Exception:  # noqa: BLE001 — 研究臂失败不影响默认行为
+            pass
     return cands
 
 

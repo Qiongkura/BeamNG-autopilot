@@ -1733,3 +1733,49 @@ def test_drive_scenario_json_wiring():
     assert '"--scenario-json"' in cli
     assert '"--scenario-edge-margin"' in cli
     assert '"--mat-white"' in cli
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-04 thin 共线碎段合并（研究开关 BEAMNG_THIN_MERGE，默认关）
+# ---------------------------------------------------------------------------
+
+def test_thin_fragment_merge_geometry():
+    import numpy as np
+    from types import SimpleNamespace
+    from beamng_autopilot.lane.pairing import _merge_thin_fragments
+
+    pos = np.array([0.0, 0.0, 0.0])
+    fwd = np.array([1.0, 0.0])
+    left = np.array([0.0, 1.0])
+
+    def mk(x0, x1, lat):
+        return SimpleNamespace(
+            world=np.array([[x0, lat, 0.0], [x1, lat, 0.0]]),
+            kind="thin", confidence=0.6, color="white")
+
+    # 两段共线、间隙 1m -> 合并后 span=3m >= 1.5
+    merged = _merge_thin_fragments([mk(0, 1, 1.8), mk(2, 3, 1.8)],
+                                   pos, fwd, left, 1.5)
+    assert len(merged) == 1 and merged[0].span >= 1.5
+    # 横向差 0.5m -> 不合并
+    assert _merge_thin_fragments([mk(0, 1, 1.8), mk(2, 3, 1.3)],
+                                 pos, fwd, left, 1.5) == []
+    # 间隙 5m -> 不合并
+    assert _merge_thin_fragments([mk(0, 1, 1.8), mk(6, 7, 1.8)],
+                                 pos, fwd, left, 1.5) == []
+    # 单段 -> 不合并
+    assert _merge_thin_fragments([mk(0, 1, 1.8)], pos, fwd, left, 1.5) == []
+
+
+def test_thin_merge_env_gating_default_off():
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "beamng_autopilot" / "lane" / "pairing.py").read_text("utf-8")
+    assert 'BEAMNG_THIN_MERGE", "0"' in src
+    assert "_merge_thin_fragments(" in src
+
+
+def test_thin_span_relax2_scope():
+    root = Path(__file__).resolve().parents[1]
+    src = (root / "beamng_autopilot" / "lane" / "pairing.py").read_text("utf-8")
+    assert '"relax", "relax2"' in src
+    assert "1.0 if _span_mode == \"relax\" else 0.8" in src
