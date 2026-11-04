@@ -61,6 +61,15 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--cam-h", type=int, default=403)
     ap.add_argument("--seg-model", type=str, default=None,
                     help="segmentation checkpoint override (default deployed model)")
+    ap.add_argument("--scenario-json", type=str, default=None,
+                    help="Phase 2 试车场：放置前用采集器构建 decal 车道场景"
+                         "（试车场场景规格 JSON；默认关）")
+    ap.add_argument("--scenario-line-convention", default="right_lane")
+    ap.add_argument("--scenario-edge-margin", type=float, default=0.6)
+    ap.add_argument("--mat-white", default=None)
+    ap.add_argument("--mat-yellow", default=None)
+    ap.add_argument("--mat-pave", default=None)
+    ap.add_argument("--mat-gravel", default=None)
     ap.add_argument("--seg-model2", type=str, default=None,
                     help="部署集成（研究候选，默认关）：与 --seg-model 组成"
                          "EnsembleSegmenter（概率平均）；只给 --seg-model "
