@@ -329,3 +329,11 @@ GPU 训练。
   mask→marking 提取或 live 536 原生域；开关不接部署。下一步：live 帧
   回放 detect_lines（探针加 --save-frames）。见
   `T16_POST_NORM_LIVE_RESULT_20261104.md`。
+- **live 帧回放结果（2026-11-04）**：`--save-frames` 采集 + `m5_marking_replay`
+  回放（east 19 帧/west 24 帧）。east **H-M0 18/19（掩码缺右黄线）**，
+  投影距离验证左线 2.7–6.8px、右线 16–50px（非投影假象）；west **ok 14/24、
+  H-M1 10/24（掩码有、无 marking）**。两场景失败层不同：east 在语义掩码
+  （live 536 原生域 vs 训练 144 上采样域），west 在 mask→marking。
+  下一步：输入域匹配臂（live 先缩 144 再送模型），离线用已保存帧验证
+  east H-M0 ≤0.3、ok ≥0.5，west ok 不降 >10pp。见
+  `T16_MARKING_REPLAY_RESULT_20261104.md`。
