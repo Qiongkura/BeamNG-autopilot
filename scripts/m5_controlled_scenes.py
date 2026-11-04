@@ -262,12 +262,13 @@ OCCLUDER_AHEAD_M = 8.0
 #: 米数"给：车道宽的一半即车道分界。
 SCENES: dict[str, dict] = {
     "known_line": {"lines": [("white", +1, "left"), ("yellow", -1, "right")]},
-    # 试车场（GridMap 等无标线地图）：先铺一条**深色铺装** decal 再画线。
-    # GridMap 地面是浅色混凝土：经典亮度臂把整片地面当白漆，与学习掩码里
-    # 两条完整线并成一个无效大块 → 只剩经典黄色臂 1m 碎段（2026-11-04
-    # 根因诊断）。深色铺装让线成为画面里唯一的亮细结构。
-    "proving_lane": {"lines": [("white", +1, "left"), ("yellow", -1, "right")],
-                     "pave_width_m": 20.0, "line_z_offset_m": 0.02},
+    # 试车场（GridMap 等无标线地图）：只有两条线，不铺装。
+    # 2026-11-04 实测：铺 20m 深色沥青 decal 会让画面更"像路"，但同时把
+    # 纹理亮度带进经典白漆臂与学习掩码（线被切成 3–9m 碎段，pair 6/12）；
+    # 纯 GridMap 浅色地面 + BEAMNG_CV_WHITE=0 反而给出两条 30m+ solid、
+    # 12/12 双侧 pair。`pave_width_m` 仍保留为可选（默认不设），但默认
+    # 试车场不铺装；需要时由场景规格显式打开。
+    "proving_lane": {"lines": [("white", +1, "left"), ("yellow", -1, "right")]},
     "known_no_line": {"lines": []},
     "occluded_line": {"lines": [("white", +1, "left")], "occluder": True},
     "slope_curve": {"lines": [("white", +1, "left"), ("yellow", -1, "right")]},
