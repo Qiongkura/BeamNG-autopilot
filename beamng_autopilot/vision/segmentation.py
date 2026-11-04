@@ -1044,14 +1044,27 @@ class Segmenter:
         sat = hsv[:, :, 1]
         hue = hsv[:, :, 0]
         val = hsv[:, :, 2]
+        # 研究臂 I1（预注册 T16_YELLOW_LINE_SPAN，默认关）：候选提取前做
+        # CLAHE 局部对比归一（只影响本函数输入，不改任何默认阈值）。
+        if os.environ.get("BEAMNG_CAND_CLAHE", "0") == "1":
+            _cl = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            gray = _cl.apply(gray)
+            val = _cl.apply(val)
         local = cv2.blur(gray, (9, 9))
         bright = gray > local + 12
+        # 研究臂 Y1（默认关）：黄线相对阈值（白线阈值保持不变）
+        _yrel = os.environ.get("BEAMNG_YELLOW_GATE", "abs") == "rel"
+        _ybright = gray > local + (8 if _yrel else 12)
         # White paint: brighter than the neighbourhood and low saturation.
         cv_white = bright & (sat <= WHITE_SAT_MAX)
         # Yellow paint (left edge / centre line): yellowish hue, not too
         # saturated (sun-bleached paint reads as low-sat yellow).
-        cv_yellow = ((hue >= 12) & (hue <= 45) & (sat >= 30)
-                     & (val >= 100) & bright)
+        if _yrel:
+            cv_yellow = ((hue >= 12) & (hue <= 45) & (sat >= 22)
+                         & (val >= 85) & _ybright)
+        else:
+            cv_yellow = ((hue >= 12) & (hue <= 45) & (sat >= 30)
+                         & (val >= 100) & _ybright)
         # The HSV yellow prior (looser than cv_yellow - it catches the
         # bleached centre paint the learned mask absorbed).  Its pixels
         # must NOT stay in the white mask, or the centre paint is
@@ -1061,6 +1074,20 @@ class Segmenter:
         ym = yellow_line_mask(frame_rgb)
         cv_yellow = cv_yellow | ym
         cv_white = cv_white & ~ym
+        # 只读仪器（预注册 H1/H2 判据）：掩码级像素计数，供按 kind 归因
+        if debug is not None:
+            try:
+                debug["mask_counts"] = {
+                    "line_px": int(np.count_nonzero(line)),
+                    "bright_px": int(np.count_nonzero(bright)),
+                    "cv_white_px": int(np.count_nonzero(cv_white)),
+                    "cv_yellow_px": int(np.count_nonzero(cv_yellow)),
+                    "yellow_prior_px": int(np.count_nonzero(ym)),
+                    "yellow_gate_rel": bool(_yrel),
+                    "clahe": bool(os.environ.get("BEAMNG_CAND_CLAHE", "0") == "1"),
+                }
+            except Exception:  # noqa: BLE001 — 仪器失败不影响提取
+                pass
         # Optional appearance refinement of the mask the CANDIDATES are
         # built from (T11/T08).  Default OFF: measured on dev scenes the
         # polarity-agnostic outlier test is a clean win on one scene

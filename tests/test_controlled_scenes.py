@@ -1410,3 +1410,39 @@ def test_edge_margin_plumbing():
     spec.loader.exec_module(m)
     l, r = m.right_lane_lats(3.483, edge_margin_m=1.0)
     assert abs(r - (-2.483)) < 1e-6 and abs(l - 1.117) < 1e-6
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-04 黄线/span/CLAHE 候选层研究臂（Y1/S1/I1，默认关）+ 仪器
+# ---------------------------------------------------------------------------
+
+def test_yellow_span_clahe_switches_and_instrumentation():
+    root = Path(__file__).resolve().parents[1]
+    seg = (root / "beamng_autopilot" / "vision" / "segmentation.py").read_text("utf-8")
+    assert 'BEAMNG_YELLOW_GATE", "abs"' in seg
+    assert 'BEAMNG_CAND_CLAHE", "0"' in seg
+    assert '"mask_counts"' in seg and '"cv_yellow_px"' in seg
+    # 默认分支保持原阈值（sat 30 / val 100 / 亮 +12）
+    assert "sat >= 30" in seg and "val >= 100" in seg
+    pair = (root / "beamng_autopilot" / "lane" / "pairing.py").read_text("utf-8")
+    assert 'BEAMNG_THIN_SPAN", "abs"' in pair
+    probe = (root / "scripts" / "m5_pairing_probe.py").read_text("utf-8")
+    assert "def _arm_env(" in probe
+    assert '"yellow"' in probe and '"span"' in probe and '"clahe"' in probe
+    assert '"thin_span_drops"' in probe and '"collect_by_kind"' in probe
+
+
+def test_probe_arm_env_mapping_and_by_kind():
+    m = _load_pairing_probe()
+    env = m._arm_env("yellow")
+    assert env.get("BEAMNG_YELLOW_GATE") == "rel"
+    assert "BEAMNG_THIN_SPAN" not in env or env.get("BEAMNG_THIN_SPAN") != "relax"
+    env2 = m._arm_env("span")
+    assert env2.get("BEAMNG_THIN_SPAN") == "relax"
+    env3 = m._arm_env("clahe")
+    assert env3.get("BEAMNG_CAND_CLAHE") == "1"
+    base = m._arm_env("baseline")
+    for k in ("BEAMNG_YELLOW_GATE", "BEAMNG_THIN_SPAN", "BEAMNG_CAND_CLAHE"):
+        assert k not in base
+    assert m._by_kind({"thin:span": 3, "thin:side": 1, "solid:align": 2}) == {
+        "thin": {"span": 3, "side": 1}, "solid": {"align": 2}}
