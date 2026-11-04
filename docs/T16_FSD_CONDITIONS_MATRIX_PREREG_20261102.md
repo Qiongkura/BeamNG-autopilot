@@ -93,3 +93,17 @@ mountain 无配对标线（line_px=0）、town 仅单侧（mirror_right/mirror_l
 路径"的纪束：**矩阵在本资产下不可执行**，全部格以 UNKNOWN 归档，不重跑、
 不改门、不改场景凑指标。详细证据与解阻路径见
 `T16_FSD_CONDITIONS_BLOCKED_20261104.md`。
+
+## 预注册修订案 A3：场景改为 west a3s0 站点（2026-11-04，重跑前冻结）
+
+A2 之后矩阵仍无驾驶格：mountain 无标线；town 单模型与**双种子集成**都
+只有单侧（mirror_left）→ 放置失败。整改现场证据后，改用 **west_coast_usa
+a3s0 站点**（地图自带标线；live 探针配对率 1.00、放置 1/2 成功）：
+- map=west_coast_usa；teleport (−488.26, −258.82, yaw −2.28°)；
+  goal (−485.87, −318.77)（沿站点方向 60m）；
+- 模型 pin 仍为 `seg_model_v28_sslA`（单模型，矩阵基线）；
+- 12 格 + 8 重复、60s、指标与判据全部不变；
+- 已知限制：该站点放置双稳态（1/2 成功），failed 格按 UNKNOWN 记录；
+  这是场景可用性事实，不得为出表重跑到通过；
+- mountain 的 12 格 UNKNOWN 证据保留在 `logs/fsd_conditions/`；新批落
+  `logs/fsd_conditions_west/`。
