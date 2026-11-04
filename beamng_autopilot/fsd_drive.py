@@ -2059,6 +2059,31 @@ class FSDriveSession:
                     _pw_ticks += 1
                 except Exception:
                     _pw_out = None
+                # 配对探针（研究臂，2026-11-04 预注册 T16_LANE_PAIRING_
+                # ROBUSTNESS_PREREG）：逐 tick 只读记录配对决策与拒绝计数，
+                # 不参与控制。默认关闭；路径由 --pairing-probe-out 指定。
+                _pp_out = getattr(getattr(self, "args", None),
+                                  "pairing_probe_out", None)
+                if _pp_out and _pw_out is not None:
+                    try:
+                        _ppdbg = _pw_out.meta.get("lane_pair_debug") or {}
+                        _prec = {
+                            "t": round(time.time() - _pw_t0, 3),
+                            "pos": [round(float(x), 3) for x in _pw_state.pos],
+                            "heading": round(float(_pw_state.heading), 4),
+                            "src": _pw_out.meta.get("lane_src_sel"),
+                            "paired": bool(getattr(_pw_out, "lane_paired", False)),
+                            "lane_dev_m": _pw_out.meta.get("lane_dev_m"),
+                            "pair": _ppdbg,
+                        }
+                        with open(str(_pp_out), "a",
+                                  encoding="utf-8") as _pf:
+                            _pf.write(json.dumps(_prec, ensure_ascii=False, default=str) + "\n")
+                    except Exception as _ppe:  # noqa: BLE001 — 探针失败不影响放置
+                        if not globals().get("_PAIR_PROBE_WARNED"):
+                            print(f"[fsd-drive] pairing probe write failed: "
+                                  f"{type(_ppe).__name__}: {_ppe}", flush=True)
+                            globals()["_PAIR_PROBE_WARNED"] = True
                 if _wall_hit():
                     print("[fsd-drive] 墙钟上限到达（放置阶段）：未获得放置",
                           flush=True)
