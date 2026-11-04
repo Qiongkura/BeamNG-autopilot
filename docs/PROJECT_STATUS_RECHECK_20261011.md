@@ -242,3 +242,10 @@ GPU 训练。
   0.4288，也高于逐折 oracle 0.5335）；基线对集成对照无 fold A 跳升
   （0.2802），排除"普通种子多样性"解释。代价 2× 推理；模型不晋级，部署
   接线需单独预注册。见 `T16_LINE_SEG_ENSEMBLE_RESULT_20261104.md`。
+- **条件矩阵执行阻断（2026-11-04）**：断点续跑首轮即被放置阶段阻断——dawn
+  四格 + noon_clear 全 `rc=3`；三场景探测定因：mountain 无标线（line_px=0）、
+  town 仅单侧（mirror_right/mirror_left 被严格门拒）、italy 认证站 0.15m 细线
+  远场拒绝（far_kind）。历史 town 配对率 43–60% 依赖的 `seg_model_hand` 已在
+  删除事件中灭失，现存 71 族池模型 town 配对率 0%——**部署域感知回归**被
+  定位。按预注册纪束矩阵标 12/12 UNKNOWN（不降门、不改场景凑指标），
+  解阻见 `T16_FSD_CONDITIONS_BLOCKED_20261104.md`。
