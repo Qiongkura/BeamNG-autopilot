@@ -48,6 +48,8 @@ def main() -> None:
                     help="enable Segmenter temporal line-mask smoothing "
                          "(component hysteresis; ablation: slightly "
                          "negative on pixel line IoU)")
+    ap.add_argument("--ensemble-weights", default=None,
+                    help="逗号分隔的集成权重（需与成员数一致；默认等权）")
     ap.add_argument("--model3", default=None,
                     help="third checkpoint for --ensemble-deploy (optional)")
     ap.add_argument("--model2", default=None,
@@ -96,7 +98,12 @@ def main() -> None:
         _paths = [args.model, args.model2]
         if getattr(args, "model3", None):
             _paths.append(args.model3)
-        seg = EnsembleSegmenter(model_paths=_paths, device=args.device)
+        _w = None
+        if getattr(args, "ensemble_weights", None):
+            _w = [float(x) for x in str(args.ensemble_weights).split(",")
+                  if x.strip()]
+        seg = EnsembleSegmenter(model_paths=_paths, device=args.device,
+                                weights=_w)
         print(f"[eval] 部署集成加载: {seg.model_path}")
     else:
         seg = Segmenter(model_path=args.model, device=args.device,
