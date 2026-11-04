@@ -110,13 +110,16 @@ def main() -> int:
     ap.add_argument("--model", required=True)
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default=None)
+    ap.add_argument("--post-norm-width", type=int, default=None,
+                    help="研究臂 P1：后处理在固定宽度上运行（None=现行行为）")
     ap.add_argument("--compare-resample", action="store_true",
                     help="同一帧按 native/cubic/lanczos/roundtrip 四种输入对照")
     args = ap.parse_args()
 
     from beamng_autopilot.vision.segmentation import Segmenter
 
-    seg = Segmenter(model_path=args.model, device=args.device)
+    seg = Segmenter(model_path=args.model, device=args.device,
+                    post_norm_width=args.post_norm_width)
     rows = []
     for f in _frames(args.runs):
         d = np.load(f)
