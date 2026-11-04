@@ -1262,3 +1262,40 @@ def test_pairing_probe_wiring():
     assert '"width_m"' in stack and '"center_xy"' in stack
     probe = (root / "scripts" / "m5_pairing_probe.py").read_text("utf-8")
     assert "--analyze" in probe and "DEFAULT_PAIRING_RESEARCH" in probe
+
+
+def test_pairing_probe_collect_drops_and_cert_recall():
+    m = _load_pairing_probe()
+    scene = _probe_scene()
+    recs = [
+        {"t": 0.0, "pos": [0, 0, 0], "heading": 0.0,
+         "pair": {"marking_count": 2, "collect_drops": {"thin:side": 1},
+                  "cands": [{"med_lat": 1.75}, {"med_lat": -1.85}],
+                  "rejects": {}, "result": None}},
+        {"t": 0.5, "pos": [0, 0, 0], "heading": 0.0,
+         "pair": {"marking_count": 2, "collect_drops": {},
+                  "cands": [{"med_lat": 4.2}, {"med_lat": -4.3}],
+                  "rejects": {"far_kind": 2}, "result": None}},
+    ]
+    s = m.summarize(recs, scene)
+    assert s["thin_side_drops"] == 1
+    assert s["collect_drops"] == {"thin:side": 1}
+    rec = s["cert_line_recall"]
+    assert rec["ticks_with_gt"] == 2
+    assert rec["left_hit_rate"] == 0.5 and rec["right_hit_rate"] == 0.5
+    assert rec["both_hit_rate"] == 0.5
+
+
+def test_pairing_probe_off_reference_guard():
+    m = _load_pairing_probe()
+    scene = _probe_scene()
+    # ego 在 y=2.0（离认证车道中心 2m）时，配对的"自身中心"不应被误判为幻影
+    recs = [{"t": 0.0, "pos": [0.0, 2.0, 0.0], "heading": 0.0,
+             "pair": {"marking_count": 2, "collect_drops": {},
+                      "cands": [{"med_lat": -0.25}, {"med_lat": -3.7}],
+                      "rejects": {},
+                      "result": {"center_xy": [0.0, 2.0], "width_m": 3.6}}}]
+    s = m.summarize(recs, scene)
+    assert s["accepted_pairs"] == 1
+    assert s["off_reference_pairs"] == 1
+    assert s["true_pairs"] == 0 and s["phantom_pairs"] == 0

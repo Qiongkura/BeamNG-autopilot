@@ -41,6 +41,7 @@ from beamng_autopilot.lane.pairing import DEFAULT_PAIRING_RESEARCH  # noqa: E402
 
 CENTER_TOL_M = 0.75
 PHANTOM_TOL_M = 1.5
+REF_OFFSET_TOL_M = 1.0  # ego 距认证车道中心超过此值 -> 参考系无效
 
 
 # ---------------------------------------------------------------------------
@@ -131,6 +132,51 @@ def classify_pair(center_lat: float, width: float,
             "label": label}
 
 
+def gt_side_lats(scene_doc: dict, ego_xy, heading: float):
+    """-> (left_lat, right_lat) 或 None（左正约定）。"""
+    lines = scene_lines(scene_doc)
+    if "left" not in lines or "right" not in lines:
+        return None
+    ego = np.asarray(ego_xy, dtype=float)[:2]
+    fwd = np.array([math.cos(heading), math.sin(heading)])
+    left = np.array([-fwd[1], fwd[0]])
+    ll = _side_lat(lines["left"], ego, fwd, left)
+    rl = _side_lat(lines["right"], ego, fwd, left)
+    if ll is None or rl is None:
+        return None
+    return (ll, rl)
+
+
+def cert_line_recall(records: list[dict], scene_doc: dict,
+                     tol_m: float = 0.6) -> dict:
+    """认证线召回：候选横向坐标是否落在 GT 左右线 ±tol 内。
+
+    这是比配对门更上游的指标：薄线若根本没成为候选，F1/F2/M1 都无从生效。
+    """
+    ticks = 0
+    left_ok = right_ok = both_ok = 0
+    for rec in records:
+        pair = rec.get("pair") or {}
+        cands = pair.get("cands") or []
+        gt = gt_side_lats(scene_doc, rec.get("pos"), float(rec.get("heading")))
+        if gt is None:
+            continue
+        ticks += 1
+        lats = [float(c["med_lat"]) for c in cands
+                if c.get("med_lat") is not None]
+        l = any(abs(x - gt[0]) <= tol_m for x in lats)
+        r = any(abs(x - gt[1]) <= tol_m for x in lats)
+        left_ok += int(l)
+        right_ok += int(r)
+        both_ok += int(l and r)
+    return {
+        "ticks_with_gt": ticks,
+        "left_hit_rate": round(left_ok / max(1, ticks), 4),
+        "right_hit_rate": round(right_ok / max(1, ticks), 4),
+        "both_hit_rate": round(both_ok / max(1, ticks), 4),
+    }
+
+
 def summarize(records: list[dict], scene_doc: dict) -> dict:
     """逐 tick 记录 -> 配对/真配对/幻影率与拒绝直方图。"""
     n = len(records)
@@ -139,8 +185,11 @@ def summarize(records: list[dict], scene_doc: dict) -> dict:
     n_true = 0
     n_phantom = 0
     n_amb = 0
+    n_off = 0
     rejects: dict[str, int] = {}
     modes: dict[str, int] = {}
+    collect_drops: dict[str, int] = {}
+    thin_side = 0
     per_frame = []
     for rec in records:
         pair = rec.get("pair") or {}
@@ -150,6 +199,9 @@ def summarize(records: list[dict], scene_doc: dict) -> dict:
         modes[mode] = modes.get(mode, 0) + 1
         for k, v in (pair.get("rejects") or {}).items():
             rejects[k] = rejects.get(k, 0) + int(v)
+        for k, v in (pair.get("collect_drops") or {}).items():
+            collect_drops[k] = collect_drops.get(k, 0) + int(v)
+        thin_side += int((pair.get("collect_drops") or {}).get("thin:side", 0))
         res = pair.get("result")
         if not res or res.get("center_xy") is None or res.get("width_m") is None:
             per_frame.append({"t": rec.get("t"), "label": "unpaired"})
@@ -160,6 +212,13 @@ def summarize(records: list[dict], scene_doc: dict) -> dict:
             per_frame.append({"t": rec.get("t"), "label": "no_gt"})
             continue
         cl = lateral_of(res["center_xy"], rec["pos"], float(rec["heading"]))
+        if abs(float(gt[0])) > REF_OFFSET_TOL_M:
+            # ego 不在认证贴花车道上（例如配对按道路语义选了相邻真实车道）：
+            # 该帧的 true/phantom 判据不成立，单独计数，不冤枉配对器。
+            n_off += 1
+            per_frame.append({"t": rec.get("t"), "label": "off_reference",
+                              "gt_center_lat": round(float(gt[0]), 3)})
+            continue
         cls = classify_pair(cl, float(res["width_m"]), gt[0], gt[1])
         per_frame.append({"t": rec.get("t"), **cls})
         if cls["label"] == "true":
@@ -176,12 +235,18 @@ def summarize(records: list[dict], scene_doc: dict) -> dict:
         "true_pairs": n_true,
         "phantom_pairs": n_phantom,
         "ambiguous_pairs": n_amb,
+        "off_reference_pairs": n_off,
+        "off_reference_rate_of_pairs": round(n_off / max(1, n_pairs), 4),
         "true_pair_rate_of_pairs": round(n_true / max(1, n_pairs), 4),
         "phantom_rate_of_pairs": round(n_phantom / max(1, n_pairs), 4),
         "true_pair_rate_of_candidates": round(n_true / max(1, n_mark), 4),
         "phantom_rate_of_candidates": round(n_phantom / max(1, n_mark), 4),
         "rejects": dict(sorted(rejects.items())),
         "modes": dict(sorted(modes.items())),
+        "collect_drops": dict(sorted(collect_drops.items())),
+        "thin_side_drops": thin_side,
+        "thin_side_drop_rate_of_ticks": round(thin_side / max(1, n), 4),
+        "cert_line_recall": cert_line_recall(records, scene_doc),
         "per_frame": per_frame,
     }
 
@@ -269,7 +334,8 @@ def collect(args) -> int:
 
 def analyze(args) -> int:
     scene_doc = load_scene(Path(args.scene))
-    records = read_jsonl(Path(args.analyze))
+    # 与采集口径对齐：只分析前 --frames 个 tick
+    records = read_jsonl(Path(args.analyze))[: int(args.frames)]
     report = {
         "schema": "pairing-probe-v1",
         "scene": str(args.scene),
