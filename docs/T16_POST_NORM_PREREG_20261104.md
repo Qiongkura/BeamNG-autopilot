@@ -54,3 +54,16 @@ P1（归一宽度 144）结果：east cubic post 黄召回 0.103→**0.629（R1 
 其余完全相同；判据 R1/R2/R3 不变（east cubic ≥0.6、west cubic ≥0.84、
 raw 不变）。预期：native 无操作（192==192），cubic/lanczos 的后处理回到
 训练域尺度，east 恢复、west 不回归。P1 的失败如实记录，不删除。
+
+## 预注册补充 A2：live 接线判据（在读取任何 live 结果之前冻结）
+
+接线：`--seg-post-norm-width`（默认 None）透传 drive/stack；probe
+`--post-norm-width`。live 复测场景：east a0s0、贴边余量 1.0（难场景）、
+开/关 × 2 重复 × 20 tick。
+
+- **L1**：开启后右线候选召回 ≥0.6（基线见历史 ~0.03–0.1）。
+- **L2**：true_rate ≥0.8（同一批关臂为对照），phantom 不增加。
+- **L3 fail-closed 审计**：无异常/崩溃；放置失败仍刹车保持（rc=3）；
+  开关只影响后处理尺度，不改变安全门语义。
+- **L4 时延**：p50 不劣化（允许 +2ms 以内；离线微基准已测 −10.9ms）。
+- 任一不达 → 不接部署，记录为未通过。
