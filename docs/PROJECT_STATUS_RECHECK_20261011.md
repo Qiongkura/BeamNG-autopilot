@@ -270,3 +270,9 @@ GPU 训练。
   16/20 为 centre_line_own_lane；italy 召回 0.375。**A2 硬门未过 → 三臂
   不执行**；修订案 A1 将场景集改为宽路子集（west 2.5/6.0/7.5m 半宽），
   判据不变。见 `T16_PAIRING_SCENE_BASELINE_20261104.md`。
+- **配对三臂执行结果（2026-11-04）**：F1/F2 在 right_lane 的 east/west 场景
+  完成 3 重复（18 轮）。基线 true_rate=1.000（饱和），F1 east −7.5pp、
+  F2 east −2.2pp、west 0pp，phantom 0——**S1 不适用（天花板）**，三臂无增益、
+  不晋级；入选场景排除了目标失效模式（单侧/跨中心线/far-thin），不能外推。
+  M1 未实现（缺路面中心输入）。下一步需难场景或转"薄线检测召回"上游课题。
+  见 `T16_LANE_PAIRING_ROBUSTNESS_RESULT_20261104.md`。
