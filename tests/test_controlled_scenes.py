@@ -1597,3 +1597,14 @@ def test_marking_replay_gt_geometry():
     mk = SimpleNamespace(world=np.array([[10.0, -2.483, 0.0],
                                          [12.0, -2.483, 0.0]]))
     assert abs(m.marking_near_lat(mk, [0, 0, 0], 0.0) - (-2.483)) < 1e-6
+
+
+def test_marking_replay_input_width():
+    import numpy as np
+    m = _load_replay()
+    frame = np.zeros((403, 536, 3), dtype=np.uint8)
+    small = m.pre_scale(frame, 192)
+    assert small.shape == (144, 192, 3)
+    # 默认 None 时行为不变（由 main 分支保证，源检查）
+    src = (ROOT / "scripts" / "m5_marking_replay.py").read_text("utf-8")
+    assert '"--input-width"' in src and "pre_scale(frame" in src

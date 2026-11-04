@@ -32,6 +32,14 @@ MASK_RADIUS_PX = 5    # 掩码在 GT 投影点附近的检查半径
 STATION_M = 8.0       # GT 取距 ego 8m 的横向
 
 
+def pre_scale(frame: np.ndarray, width: int) -> np.ndarray:
+    """输入域匹配：按目标宽度做 INTER_AREA 缩小（训练域预处理）。"""
+    tw = int(width)
+    th = max(1, int(round(frame.shape[0] * tw / float(frame.shape[1]))))
+    return cv2.resize(np.asarray(frame), (tw, th),
+                      interpolation=cv2.INTER_AREA)
+
+
 def _unit(v):
     v = np.asarray(v, dtype=float)
     n = float(np.linalg.norm(v))
@@ -115,6 +123,9 @@ def main() -> int:
     ap.add_argument("--scene", required=True)
     ap.add_argument("--edge-margin", type=float, default=0.6)
     ap.add_argument("--model", required=True)
+    ap.add_argument("--input-width", type=int, default=None,
+                    help="输入域匹配（默认 None）：先把帧缩到该宽度再送模型，"
+                         "掩码放大回原尺寸继续")
     ap.add_argument("--device", default=None)
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
@@ -131,7 +142,18 @@ def main() -> int:
         pos = d["pos"]
         heading = float(d["heading"])
         cam = d["cam"][0]
-        road, line = seg.predict(frame)
+        frame_in = frame
+        pre = bool(args.input_width)
+        if pre:
+            frame_in = pre_scale(frame, int(args.input_width))
+        road, line = seg.predict(frame_in)
+        if pre:
+            road = cv2.resize(road.astype(np.uint8),
+                              (frame.shape[1], frame.shape[0]),
+                              interpolation=cv2.INTER_NEAREST).astype(bool)
+            line = cv2.resize(line.astype(np.uint8),
+                              (frame.shape[1], frame.shape[0]),
+                              interpolation=cv2.INTER_NEAREST).astype(bool)
         dbg: dict = {}
         markings = seg.detect_lines(frame, cam, pos, heading,
                                     line_mask=line, road_mask=road,
@@ -175,6 +197,7 @@ def main() -> int:
                "ok_rate": round(counts.get("ok", 0) / max(1, len(rows)), 4)}
     out = {"schema": "marking-replay-v1", "scene": args.scene,
            "edge_margin": args.edge_margin, "model": args.model,
+           "input_width": args.input_width,
            "summary": summary, "frames": rows}
     if args.out:
         Path(args.out).parent.mkdir(parents=True, exist_ok=True)
