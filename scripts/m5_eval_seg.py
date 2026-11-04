@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from beamng_autopilot import config
 from beamng_autopilot.vision.segmentation import (
-    Segmenter, N_CLASSES, CLASS_NAMES, iou_from_accum,
+    Segmenter, N_CLASSES, CLASS_NAMES, iou_from_accum, prob_average,
 )
 from beamng_autopilot.vision.dataset_split import (
     FrameRef, select_hard_negatives,
@@ -48,6 +48,15 @@ def main() -> None:
                     help="enable Segmenter temporal line-mask smoothing "
                          "(component hysteresis; ablation: slightly "
                          "negative on pixel line IoU)")
+    ap.add_argument("--model2", default=None,
+                    help="second checkpoint for --tta ens (same-fold "
+                         "different-seed model; probabilities are averaged "
+                         "before argmax)")
+    ap.add_argument("--tta", choices=("none", "hflip", "ens"), default="none",
+                    help="test-time augmentation: hflip averages the "
+                         "probabilities of the frame and its mirror; ens "
+                         "averages this model with --model2 (2x inference; "
+                         "same post-processing)")
     ap.add_argument("--save", action="store_true",
                     help="保存可视化对比帧")
     ap.add_argument("--hard-neg-out", type=str, default=None,
@@ -79,6 +88,13 @@ def main() -> None:
                     temporal_smooth=args.temporal)
     print(f"[eval] 模型加载完成: {args.model} "
           f"(temporal_smooth={args.temporal})")
+    seg2 = None
+    if args.tta == "ens":
+        if not args.model2:
+            raise SystemExit("--tta ens 需要 --model2")
+        seg2 = Segmenter(model_path=args.model2, device=args.device,
+                         temporal_smooth=args.temporal)
+        print(f"[eval] 集成第二模型: {args.model2}")
 
     save_dir = config.LOGS_DIR / "m5_seg" / "eval"
     if args.save:
@@ -100,7 +116,15 @@ def main() -> None:
         d = np.load(f)
         colour, label = d["colour"], d["label"]
         known = np.asarray(label) != 255
-        road, line = seg.predict(colour)
+        if args.tta == "hflip":
+            road, line = seg.predict_tta(colour)
+        elif args.tta == "ens" and seg2 is not None:
+            p1 = seg.probability_maps_small(colour)
+            p2 = seg2.probability_maps_small(colour)
+            road, line = seg.masks_from_model_probs(
+                colour, prob_average(p1, p2))
+        else:
+            road, line = seg.predict(colour)
         pred = np.zeros(label.shape, dtype=np.uint8)
         pred[line] = 2
         pred[road] = 1
@@ -206,7 +230,9 @@ def main() -> None:
         Path(args.json).parent.mkdir(parents=True, exist_ok=True)
         Path(args.json).write_text(json.dumps({
             "model": str(args.model),
+            "model2": str(args.model2) if args.model2 else None,
             "runs": [str(x) for x in args.runs],
+            "tta": str(args.tta),
             "frames": int(n_frames),
             "ignore_value": 255,
             "iou": [float(x) for x in ious],
