@@ -81,6 +81,10 @@ def build_parser() -> argparse.ArgumentParser:
     ap.add_argument("--probe-geometry", action="store_true",
                     help="record exact sensor boundaries, candidates, control path and grid; "
                          "diagnostic overhead is reported separately")
+    ap.add_argument("--pairing-probe-out", type=str, default=None,
+                    help="研究探针（默认关闭）：放置阶段逐 tick 把配对决策、"
+                         "拒绝计数、ego 位姿写入 JSONL；只读记录，不参与控制。"
+                         "供 scripts/m5_pairing_probe.py 使用")
     ap.add_argument("--lane-mode", choices=("map", "auto", "sensor"),
                     default="sensor",
                     help="lane-keep reference policy: sensor = perception-led "

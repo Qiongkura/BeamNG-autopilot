@@ -1,0 +1,317 @@
+"""配对鲁棒性研究臂探针（预注册 T16_LANE_PAIRING_ROBUSTNESS_PREREG_20261104）。
+
+两种用法：
+
+1) 采集（需要 BeamNG.tech；只放置、不驾驶）：
+   .venv\\Scripts\\python.exe scripts\\m5_pairing_probe.py \\
+       --scene logs\\experiments\\t16_scenes_20261102_181708\\scene_known_line_a1s0.json \\
+       --map italy --model logs\\m5_seg\\seg_model_v28_sslA\\best.pt \\
+       --tod 12:00 --frames 40 --out logs\\m5_seg\\pairing_probe_italy_a1s0.json
+
+   工具按场景的站心/方向生成 teleport 位姿，复用 `m5_fsd_drive.py` 的
+   严格感知放置回路（`--pairing-probe-out` 只读 JSONL），逐 tick 记录
+   配对决策与拒绝计数；放置不会成功也没关系——本工具只看配对，不驾驶。
+
+2) 离线重算（无引擎）：
+   ... --analyze logs\\m5_seg\\pairing_probe_italy_a1s0.jsonl \\
+       --scene <scene.json> --out <report.json>
+
+真值：认证场景 `scene.lines` 的左右线节点（engine_verified 几何），按每条
+记录的 ego 位姿投影到车体系插值出车道中心与宽度；配对结果用
+`pair.result.center_xy` + `width_m` 做同样的投影。判据（预注册）：
+中心/宽度误差 ≤0.75m = true；中心 >1.5m 或宽度 >1.5m = phantom；其余
+ambiguous。研究开关默认全部 False（= 现行行为），只记录不生效。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import math
+import subprocess
+import sys
+from pathlib import Path
+
+import numpy as np
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from beamng_autopilot.lane.pairing import DEFAULT_PAIRING_RESEARCH  # noqa: E402
+
+CENTER_TOL_M = 0.75
+PHANTOM_TOL_M = 1.5
+
+
+# ---------------------------------------------------------------------------
+# 纯函数（单测覆盖）
+# ---------------------------------------------------------------------------
+def load_scene(path: Path) -> dict:
+    d = json.loads(Path(path).read_text(encoding="utf-8"))
+    scene = d.get("scene") or {}
+    if "mid" not in scene or "dir" not in scene:
+        raise ValueError(f"场景缺少 mid/dir: {path}")
+    return d
+
+
+def scene_pose(scene_doc: dict) -> tuple[float, float, float]:
+    """场景站心 + 方向 -> (x, y, yaw_deg)。yaw 供 teleport 使用；真值
+    计算只依赖实际位姿（JSONL 里的 pos/heading），不依赖该 yaw。"""
+    s = scene_doc["scene"]
+    x, y = float(s["mid"][0]), float(s["mid"][1])
+    dx, dy = float(s["dir"][0]), float(s["dir"][1])
+    return x, y, math.degrees(math.atan2(dy, dx))
+
+
+def scene_goal(scene_doc: dict, ahead_m: float = 60.0) -> tuple[float, float]:
+    s = scene_doc["scene"]
+    return (float(s["mid"][0]) + float(s["dir"][0]) * ahead_m,
+            float(s["mid"][1]) + float(s["dir"][1]) * ahead_m)
+
+
+def scene_lines(scene_doc: dict) -> dict[str, np.ndarray]:
+    """从场景规格取左右线节点（世界 2D）。"""
+    out: dict[str, np.ndarray] = {}
+    for ln in (scene_doc.get("scene") or {}).get("lines") or []:
+        role = str(ln.get("role") or "")
+        nodes = ln.get("nodes") or []
+        if role in ("left", "right") and len(nodes) >= 2:
+            out[role] = np.asarray(nodes, dtype=float)[:, :2]
+    return out
+
+
+def _side_lat(nodes: np.ndarray, ego: np.ndarray, fwd: np.ndarray,
+              left: np.ndarray) -> float | None:
+    """线节点在 ego 体系里 s=0 处的横向坐标（左正）。"""
+    if nodes is None or len(nodes) == 0:
+        return None
+    rel = nodes - ego
+    s = rel @ fwd
+    lat = rel @ left
+    order = np.argsort(s)
+    s, lat = s[order], lat[order]
+    if len(s) >= 2 and s[0] <= 0.0 <= s[-1]:
+        return float(np.interp(0.0, s, lat))
+    return float(lat[int(np.argmin(np.abs(s)))])
+
+
+def gt_lane(scene_doc: dict, ego_xy, heading: float):
+    """-> (center_lat, width) 或 None（缺左右真值）。"""
+    lines = scene_lines(scene_doc)
+    if "left" not in lines or "right" not in lines:
+        return None
+    ego = np.asarray(ego_xy, dtype=float)[:2]
+    fwd = np.array([math.cos(heading), math.sin(heading)])
+    left = np.array([-fwd[1], fwd[0]])
+    ll = _side_lat(lines["left"], ego, fwd, left)
+    rl = _side_lat(lines["right"], ego, fwd, left)
+    if ll is None or rl is None:
+        return None
+    return (0.5 * (ll + rl), abs(ll - rl))
+
+
+def lateral_of(xy, ego_xy, heading: float) -> float:
+    ego = np.asarray(ego_xy, dtype=float)[:2]
+    fwd = np.array([math.cos(heading), math.sin(heading)])
+    left = np.array([-fwd[1], fwd[0]])
+    return float((np.asarray(xy, dtype=float)[:2] - ego) @ left)
+
+
+def classify_pair(center_lat: float, width: float,
+                  gt_center: float, gt_width: float) -> dict:
+    ce = abs(float(center_lat) - float(gt_center))
+    we = abs(float(width) - float(gt_width))
+    if ce <= CENTER_TOL_M and we <= CENTER_TOL_M:
+        label = "true"
+    elif ce > PHANTOM_TOL_M or we > PHANTOM_TOL_M:
+        label = "phantom"
+    else:
+        label = "ambiguous"
+    return {"center_err_m": round(ce, 3), "width_err_m": round(we, 3),
+            "label": label}
+
+
+def summarize(records: list[dict], scene_doc: dict) -> dict:
+    """逐 tick 记录 -> 配对/真配对/幻影率与拒绝直方图。"""
+    n = len(records)
+    n_mark = 0
+    n_pairs = 0
+    n_true = 0
+    n_phantom = 0
+    n_amb = 0
+    rejects: dict[str, int] = {}
+    modes: dict[str, int] = {}
+    per_frame = []
+    for rec in records:
+        pair = rec.get("pair") or {}
+        if int(pair.get("marking_count") or 0) > 0:
+            n_mark += 1
+        mode = pair.get("mode") or "none"
+        modes[mode] = modes.get(mode, 0) + 1
+        for k, v in (pair.get("rejects") or {}).items():
+            rejects[k] = rejects.get(k, 0) + int(v)
+        res = pair.get("result")
+        if not res or res.get("center_xy") is None or res.get("width_m") is None:
+            per_frame.append({"t": rec.get("t"), "label": "unpaired"})
+            continue
+        n_pairs += 1
+        gt = gt_lane(scene_doc, rec["pos"], float(rec["heading"]))
+        if gt is None:
+            per_frame.append({"t": rec.get("t"), "label": "no_gt"})
+            continue
+        cl = lateral_of(res["center_xy"], rec["pos"], float(rec["heading"]))
+        cls = classify_pair(cl, float(res["width_m"]), gt[0], gt[1])
+        per_frame.append({"t": rec.get("t"), **cls})
+        if cls["label"] == "true":
+            n_true += 1
+        elif cls["label"] == "phantom":
+            n_phantom += 1
+        else:
+            n_amb += 1
+    return {
+        "ticks": n,
+        "ticks_with_candidates": n_mark,
+        "accepted_pairs": n_pairs,
+        "pair_rate_of_candidates": round(n_pairs / max(1, n_mark), 4),
+        "true_pairs": n_true,
+        "phantom_pairs": n_phantom,
+        "ambiguous_pairs": n_amb,
+        "true_pair_rate_of_pairs": round(n_true / max(1, n_pairs), 4),
+        "phantom_rate_of_pairs": round(n_phantom / max(1, n_pairs), 4),
+        "true_pair_rate_of_candidates": round(n_true / max(1, n_mark), 4),
+        "phantom_rate_of_candidates": round(n_phantom / max(1, n_mark), 4),
+        "rejects": dict(sorted(rejects.items())),
+        "modes": dict(sorted(modes.items())),
+        "per_frame": per_frame,
+    }
+
+
+def read_jsonl(path: Path) -> list[dict]:
+    recs = []
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            recs.append(json.loads(line))
+        except ValueError:
+            continue
+    return recs
+
+
+# ---------------------------------------------------------------------------
+# 采集（engine）：复用 drive 的严格感知放置回路
+# ---------------------------------------------------------------------------
+def collect(args) -> int:
+    scene_doc = load_scene(Path(args.scene))
+    x, y, yaw = scene_pose(scene_doc)
+    if args.teleport:
+        x, y, yaw = args.teleport
+    gx, gy = scene_goal(scene_doc, ahead_m=float(args.goal_ahead_m))
+    if args.goal:
+        gx, gy = args.goal
+
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    jsonl = Path(args.jsonl) if args.jsonl else out.with_suffix(".jsonl")
+    if jsonl.exists():
+        jsonl.unlink()
+
+    # 墙钟含引擎 setup（模型/路线预热 ~50-70s）：预算必须把 setup
+    # 排除在放置重试之外，否则首 tick 前就超时、探针零记录。
+    wall_s = 75.0 + float(args.frames) * 0.8 + 30.0
+    cmd = [sys.executable, str(ROOT / "scripts" / "m5_fsd_drive.py"),
+           "--runtime", args.runtime, "--map", args.map,
+           "--teleport", f"{x:.3f}", f"{y:.3f}", f"{yaw:.3f}",
+           "--goal", f"{gx:.3f}", f"{gy:.3f}",
+           "--seconds", "1", "--max-wall-s", f"{wall_s:.1f}",
+           "--seg-model", args.model,
+           "--pairing-probe-out", str(jsonl),
+           "--out", str(out.with_suffix(".telemetry.json"))]
+    if args.tod:
+        cmd += ["--tod", str(args.tod)]
+    if args.weather_preset:
+        cmd += ["--weather-preset", str(args.weather_preset)]
+    print(f"[pairing-probe] scene={Path(args.scene).name} pose=({x:.2f},{y:.2f},"
+          f"{yaw:.2f}) frames<={args.frames}", flush=True)
+    log = subprocess.run(cmd, cwd=str(ROOT), capture_output=True, text=True,
+                         encoding="utf-8", errors="replace", timeout=wall_s + 180)
+    (out.with_suffix(".run.log")).write_text(
+        (log.stdout or "") + "\n--- stderr ---\n" + (log.stderr or ""),
+        encoding="utf-8")
+    if not jsonl.exists():
+        print("[pairing-probe] 探针 JSONL 未生成；见 "
+              f"{out.with_suffix('.run.log')}", flush=True)
+        return 2
+    records = read_jsonl(jsonl)[: int(args.frames)]
+    report = {
+        "schema": "pairing-probe-v1",
+        "scene": str(args.scene),
+        "map": args.map,
+        "model": args.model,
+        "tod": args.tod,
+        "weather_preset": args.weather_preset,
+        "requested_pose": [x, y, yaw],
+        "policy": DEFAULT_PAIRING_RESEARCH.as_dict(),
+        "policy_is_default": DEFAULT_PAIRING_RESEARCH.is_default(),
+        "summary": summarize(records, scene_doc),
+    }
+    out.write_text(json.dumps(report, ensure_ascii=False, indent=1),
+                   encoding="utf-8")
+    s = report["summary"]
+    print(f"[pairing-probe] ticks={s['ticks']} cand={s['ticks_with_candidates']} "
+          f"pairs={s['accepted_pairs']} true={s['true_pairs']} "
+          f"phantom={s['phantom_pairs']} amb={s['ambiguous_pairs']} "
+          f"rejects={s['rejects']}", flush=True)
+    print(f"[pairing-probe] -> {out}", flush=True)
+    return 0
+
+
+def analyze(args) -> int:
+    scene_doc = load_scene(Path(args.scene))
+    records = read_jsonl(Path(args.analyze))
+    report = {
+        "schema": "pairing-probe-v1",
+        "scene": str(args.scene),
+        "jsonl": str(args.analyze),
+        "policy": DEFAULT_PAIRING_RESEARCH.as_dict(),
+        "policy_is_default": DEFAULT_PAIRING_RESEARCH.is_default(),
+        "summary": summarize(records, scene_doc),
+    }
+    out = Path(args.out)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(report, ensure_ascii=False, indent=1),
+                   encoding="utf-8")
+    print(json.dumps(report["summary"], ensure_ascii=False, indent=1))
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--scene", required=True, help="认证场景 scene_*.json")
+    ap.add_argument("--analyze", default=None,
+                    help="离线重算已采集的 JSONL（不需要引擎）")
+    ap.add_argument("--jsonl", default=None,
+                    help="采集时的 JSONL 路径（默认与 --out 同名 .jsonl）")
+    ap.add_argument("--out", required=True, help="报告 JSON 路径")
+    ap.add_argument("--map", default="italy")
+    ap.add_argument("--runtime", default="tech", choices=("tech", "steam", "auto"))
+    ap.add_argument("--model", default="logs/m5_seg/seg_model_v28_sslA/best.pt")
+    ap.add_argument("--tod", default=None)
+    ap.add_argument("--weather-preset", default=None)
+    ap.add_argument("--frames", type=int, default=40,
+                    help="最多分析的 tick 数（采集时按此估算墙钟）")
+    ap.add_argument("--goal-ahead-m", type=float, default=60.0)
+    ap.add_argument("--teleport", nargs=3, type=float, default=None,
+                    metavar=("X", "Y", "YAW_DEG"))
+    ap.add_argument("--goal", nargs=2, type=float, default=None,
+                    metavar=("X", "Y"))
+    args = ap.parse_args()
+    if args.analyze:
+        return analyze(args)
+    return collect(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
