@@ -42,9 +42,11 @@ from beamng_autopilot.eval import STATUS_UNKNOWN, assess_run, score_run
 # 记录可比）：italy hairpin 起点 + 沿路图 ~200 m 的 goal；分割模型沿用
 # benchmark 的 v8 pin（山道域客观指标最好的模型）。
 SCENARIO = {
-    "map": "italy",
-    "teleport": (729.6, 763.9, 45.0),
-    "goal": (616.2, 894.5),
+    # 2026-11-04 预注册修订案 A3：mountain 无标线、town 单侧（含集成），
+    # 改用 west a3s0 站点（地图自带标线、live 配对率 1.00、放置 1/2）。
+    "map": "west_coast_usa",
+    "teleport": (-488.26, -258.82, -2.28),
+    "goal": (-485.87, -318.77),
     "seconds": 60.0,
     "speed": 6.0,
     # 2026-11-02 预注册修订案：原 pin（benchmark 的 seg_model_v8_backup）
