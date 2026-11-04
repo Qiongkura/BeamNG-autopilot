@@ -343,11 +343,12 @@ def collect(args) -> int:
                   flush=True)
         cmd = [sys.executable, str(ROOT / "scripts" / "m5_fsd_drive.py"),
                "--runtime", args.runtime, "--attach",
-               "--goal", f"{gx:.3f}", f"{gy:.3f}",
                "--seconds", "1", "--max-wall-s", f"{wall_s:.1f}",
                "--seg-model", args.model,
                "--pairing-probe-out", str(jsonl),
                "--out", str(out.with_suffix(".telemetry.json"))]
+        if not args.no_goal:
+            cmd += ["--goal", f"{gx:.3f}", f"{gy:.3f}"]
         if args.tod:
             cmd += ["--tod", str(args.tod)]
         if args.weather_preset:
@@ -438,6 +439,10 @@ def main() -> int:
     ap.add_argument("--frames", type=int, default=40,
                     help="最多分析的 tick 数（采集时按此估算墙钟）")
     ap.add_argument("--goal-ahead-m", type=float, default=60.0)
+    ap.add_argument("--no-goal", action=argparse.BooleanOptionalAction,
+                    default=True,
+                    help="不建导航路线（避免 route snap 把自车从车道中心拉回"
+                         "道路中线；配对探针默认用它）")
     ap.add_argument("--line-convention", default="right_lane",
                     help="贴花横向约定：right_lane=贴右侧铺装边（配对专用）；"
                          "symmetric=原认证约定")

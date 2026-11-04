@@ -1335,3 +1335,12 @@ def test_pairing_probe_scenario_mode_wiring():
     assert '"--line-convention"' in probe and "right_lane" in probe
     assert "scenario_mode" in probe
     assert "conn.open(launch=True)" in probe
+
+
+def test_pairing_probe_no_goal_default():
+    # 配对探针默认不建导航路线：route snap 会把自车从车道中心拉回道路中线
+    root = Path(__file__).resolve().parents[1]
+    probe = (root / "scripts" / "m5_pairing_probe.py").read_text("utf-8")
+    assert '"--no-goal"' in probe
+    assert 'default=True' in probe
+    assert 'if not args.no_goal:' in probe
