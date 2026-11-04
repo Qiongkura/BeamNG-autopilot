@@ -351,10 +351,17 @@ def collect(args) -> int:
         conn.load_scenario()
         if not args.no_scenario:
             collector = _load_collector()
+            # 关键：按地图切换材质档案（采集器在入口做；探针此前漏了，
+            # east/west 的贴花因此用 italy 材质 → 引擎找不到 → 贴花不可见）。
+            _profile = collector.apply_map_profile(str(args.map))
+            print(f"[pairing-probe] material profile: "
+                  f"white={_profile.get('white')} "
+                  f"yellow={_profile.get('yellow')} "
+                  f"width={_profile.get('line_width')}", flush=True)
             site = _site_from_scene(scene_doc)
             scen, _rec = collector.build_scenario(
                 conn, [site], map_name=args.map,
-                scene_types=["known_line"], scene_names=[scene_name],
+                scene_types=[str(args.scene_type)], scene_names=[scene_name],
                 line_convention=str(args.line_convention),
                 edge_margin_m=float(args.edge_margin_m))
             _built_lines = (_rec.get("sites", {}).get(scene_name, {})
@@ -390,7 +397,8 @@ def collect(args) -> int:
                     collector._align_sites_to_ground(conn, [site], str(args.map))
                     scen, _rec = collector.build_scenario(
                         conn, [site], map_name=args.map,
-                        scene_types=["known_line"], scene_names=[scene_name],
+                        scene_types=[str(args.scene_type)],
+                        scene_names=[scene_name],
                         line_convention=str(args.line_convention),
                         edge_margin_m=float(args.edge_margin_m))
                     with conn.io_lock:
@@ -453,6 +461,7 @@ def collect(args) -> int:
         "scene": str(args.scene),
         "map": args.map,
         "scenario_mode": not args.no_scenario,
+        "material_profile": (_profile if not args.no_scenario else None),
         "model": args.model,
         "tod": args.tod,
         "weather_preset": args.weather_preset,
@@ -528,6 +537,8 @@ def main() -> int:
                     help="回放诊断：逐 tick 保存 live 帧+位姿+相机模型")
     ap.add_argument("--post-norm-width", type=int, default=None,
                     help="研究开关：透传 drive 的 --seg-post-norm-width")
+    ap.add_argument("--scene-type", default="known_line",
+                    help="场景类型（known_line / known_no_line）——A/B 渲染校验用")
     ap.add_argument("--edge-margin-m", type=float, default=0.6,
                     help="right_lane 约定下右线距铺装边的余量（米）")
     ap.add_argument("--line-convention", default="right_lane",

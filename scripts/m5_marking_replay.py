@@ -102,6 +102,26 @@ def marking_near_lat(mk, pos, heading: float) -> float | None:
         return None
 
 
+def paint_ratio(frame: np.ndarray, u, v, valid, radius: int = 6) -> float:
+    """GT 投影点附近（半径内）漆色像素占比（黄/白/橙皆算漆）。"""
+    hsv = cv2.cvtColor(np.asarray(frame, dtype=np.uint8), cv2.COLOR_RGB2HSV)
+    hch, sch, vch = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    paint = (((hch >= 5) & (hch <= 45) & (sch >= 40) & (vch >= 90))
+             | ((sch <= 55) & (vch >= 120)))
+    n = good = 0
+    for uu, vv, ok in zip(u, v, valid):
+        if not ok:
+            continue
+        x0, x1 = max(0, int(uu) - radius), int(uu) + radius + 1
+        y0, y1 = max(0, int(vv) - radius), int(vv) + radius + 1
+        if x1 <= x0 or y1 <= y0:
+            continue
+        n += 1
+        if paint[y0:y1, x0:x1].mean() >= 0.15:
+            good += 1
+    return (good / n) if n else 0.0
+
+
 def classify_frame(gt_lat: float, marking_lats: list[float],
                    cand_lats: list[float], mask_near: bool,
                    paired: bool) -> str:
@@ -161,6 +181,14 @@ def main() -> int:
         dbg2: dict = {}
         pair = pair_lane_markings(markings, pos, heading, debug=dbg2)
         g_lat = gt_right_lat(scene_doc, args.edge_margin, pos, heading)
+        # 渲染校验门：GT 右线投影点附近必须有漆（否则该帧参考无效）
+        gt_probe = right_line_world(scene_doc, args.edge_margin,
+                                    stations=(6.0, 10.0, 14.0))
+        gt_probe = np.asarray(gt_probe, dtype=float)
+        gt_probe[:, 2] = float(pos[2])
+        pu, pv, pvalid = cam.project(gt_probe, pos, heading)
+        _pr = paint_ratio(frame, pu, pv, pvalid)
+        render_ok = _pr >= 0.5
         gt_pts = right_line_world(scene_doc, args.edge_margin)
         # 地面重对齐后贴花在 ego 所处地面 z；投影用 ego z（局部近平面近似），
         # 避免 scene JSON 的旧 road z 把 GT 投到画面上方/下方。
@@ -183,6 +211,8 @@ def main() -> int:
                   if c.get("med_lat") is not None]
         label = classify_frame(g_lat, m_lats, c_lats, near_mask,
                                pair is not None)
+        if not render_ok:
+            label = "INVALID_GT"
         rows.append({
             "file": Path(fp).name,
             "gt_right_lat": round(g_lat, 3),
@@ -190,6 +220,8 @@ def main() -> int:
             "marking_lats": [round(x, 3) for x in m_lats],
             "cand_lats": [round(x, 3) for x in c_lats],
             "mask_near_gt": bool(near_mask),
+            "gt_paint_ratio": round(float(_pr), 3),
+            "render_ok": bool(render_ok),
             "pair": pair is not None,
             "collect_drops": dbg2.get("collect_drops") or {},
             "label": label,
