@@ -353,7 +353,12 @@ def collect(args) -> int:
             collector = _load_collector()
             # 关键：按地图切换材质档案（采集器在入口做；探针此前漏了，
             # east/west 的贴花因此用 italy 材质 → 引擎找不到 → 贴花不可见）。
-            _profile = collector.apply_map_profile(str(args.map))
+            _ov = {}
+            for k in ("white", "yellow", "pave", "gravel"):
+                v = getattr(args, f"mat_{k}", None)
+                if v:
+                    _ov[k] = v
+            _profile = collector.apply_map_profile(str(args.map), overrides=_ov or None)
             print(f"[pairing-probe] material profile: "
                   f"white={_profile.get('white')} "
                   f"yellow={_profile.get('yellow')} "
@@ -542,6 +547,10 @@ def main() -> int:
                     help="回放诊断：逐 tick 保存 live 帧+位姿+相机模型")
     ap.add_argument("--post-norm-width", type=int, default=None,
                     help="研究开关：透传 drive 的 --seg-post-norm-width")
+    ap.add_argument("--mat-white", default=None)
+    ap.add_argument("--mat-yellow", default=None)
+    ap.add_argument("--mat-pave", default=None)
+    ap.add_argument("--mat-gravel", default=None)
     ap.add_argument("--scene-type", default="known_line",
                     help="场景类型（known_line / known_no_line）——A/B 渲染校验用")
     ap.add_argument("--edge-margin-m", type=float, default=0.6,

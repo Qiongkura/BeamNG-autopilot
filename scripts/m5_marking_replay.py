@@ -102,12 +102,18 @@ def marking_near_lat(mk, pos, heading: float) -> float | None:
         return None
 
 
-def paint_ratio(frame: np.ndarray, u, v, valid, radius: int = 6) -> float:
-    """GT 投影点附近（半径内）漆色像素占比（黄/白/橙皆算漆）。"""
+def paint_ratio(frame: np.ndarray, u, v, valid, radius: int = 6,
+                mode: str = "any") -> float:
+    """GT 投影点附近（半径内）漆色像素占比。
+
+    mode="any"：黄/橙/白皆算漆（普通道路）；
+    mode="line"：只算高饱和黄/橙（GridMap 地面近白，白色判据会误算）。
+    """
     hsv = cv2.cvtColor(np.asarray(frame, dtype=np.uint8), cv2.COLOR_RGB2HSV)
     hch, sch, vch = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
-    paint = (((hch >= 5) & (hch <= 45) & (sch >= 40) & (vch >= 90))
-             | ((sch <= 55) & (vch >= 120)))
+    yellow = (hch >= 5) & (hch <= 45) & (sch >= 40) & (vch >= 90)
+    white = (sch <= 55) & (vch >= 120)
+    paint = yellow if mode == "line" else (yellow | white)
     n = good = 0
     for uu, vv, ok in zip(u, v, valid):
         if not ok:
@@ -143,6 +149,8 @@ def main() -> int:
     ap.add_argument("--scene", required=True)
     ap.add_argument("--edge-margin", type=float, default=0.6)
     ap.add_argument("--model", required=True)
+    ap.add_argument("--paint-mode", choices=("any", "line"), default="any",
+                    help="渲染门的漆色判据：any=黄/白/橙；line=只算黄/橙")
     ap.add_argument("--input-width", type=int, default=None,
                     help="输入域匹配（默认 None）：先把帧缩到该宽度再送模型，"
                          "掩码放大回原尺寸继续")
@@ -187,7 +195,8 @@ def main() -> int:
         gt_probe = np.asarray(gt_probe, dtype=float)
         gt_probe[:, 2] = float(pos[2])
         pu, pv, pvalid = cam.project(gt_probe, pos, heading)
-        _pr = paint_ratio(frame, pu, pv, pvalid)
+        _pr = paint_ratio(frame, pu, pv, pvalid,
+                          mode=str(getattr(args, "paint_mode", "any")))
         render_ok = _pr >= 0.5
         gt_pts = right_line_world(scene_doc, args.edge_margin)
         # 地面重对齐后贴花在 ego 所处地面 z；投影用 ego z（局部近平面近似），
