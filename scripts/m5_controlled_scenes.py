@@ -700,14 +700,15 @@ def _z_at(site: dict, s_m: float) -> float:
 
 
 def right_lane_lats(half_width_m: float,
-                    lane_half_m: float = LAT_LANE_HALF) -> tuple[float, float]:
+                    lane_half_m: float = LAT_LANE_HALF,
+                    edge_margin_m: float = 0.6) -> tuple[float, float]:
     """配对专用场景的双线横向位置（左正）：(left_lat, right_lat)。
 
-    右线贴右侧铺装边（半宽 - 0.05 m），左线 = 右线 + 2*lane_half，
-    使车道中心落在右侧可行驶车道内、与道路语义一致。
+    右线距右侧铺装边保持 ``edge_margin_m`` 余量（默认 0.6 m：贴边会让
+    右线与路缘漆在感知里合并，配对宽度被拉宽）；左线 = 右线 + 2*lane_half。
     """
     half = float(half_width_m)
-    right_lat = -(half - 0.05)
+    right_lat = -(half - float(edge_margin_m))
     left_lat = right_lat + 2.0 * float(lane_half_m)
     return left_lat, right_lat
 
