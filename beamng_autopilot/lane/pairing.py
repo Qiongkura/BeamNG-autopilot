@@ -497,6 +497,44 @@ def _cand_side(c: _LineCandidate) -> float:
     return float(c.med_lat)
 
 
+def _thin_near_ok(c: "_LineCandidate") -> bool:
+    """H2：thin 线在 0–8m 窗口至少 1 个可信站点即视为“有近场”。"""
+    try:
+        proj = np.asarray(c.proj, dtype=float)
+        near = proj[(proj[:, 0] >= -1.0)
+                    & (proj[:, 0] <= LANE_SINGLE_NEAR_REQUIRE_M)]
+        return bool(len(near) >= 1 and np.isfinite(near[:, 1]).any())
+    except Exception:  # noqa: BLE001 — 研究分支失败按不放行处理
+        return False
+
+
+def _far_thin_pair_ok(l: "_LineCandidate", r: "_LineCandidate") -> bool:
+    """H1：双侧远场 thin 对按几何自洽放行。
+
+    条件（预注册）：重叠 ≥4m、隐含车道宽 2.5–4.5m、间距标准差 ≤0.35m。
+    """
+    try:
+        p1 = np.asarray(l.proj, dtype=float)
+        p2 = np.asarray(r.proj, dtype=float)
+        if len(p1) < 2 or len(p2) < 2:
+            return False
+        lo = max(float(p1[0, 0]), float(p2[0, 0]))
+        hi = min(float(p1[-1, 0]), float(p2[-1, 0]))
+        if hi - lo < 4.0:
+            return False
+        stations = np.linspace(lo, hi, 24)
+        a = _interp_lat(p1, stations)
+        b = _interp_lat(p2, stations)
+        ok = np.isfinite(a) & np.isfinite(b)
+        if int(ok.sum()) < 8:
+            return False
+        w = a[ok] - b[ok]          # left - right（左正）
+        width = float(np.median(w))
+        return 2.5 <= width <= 4.5 and float(np.std(w)) <= 0.35
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def _near_stats(c: _LineCandidate) -> tuple[int, float | None]:
     """Number of valid near points and their median lateral offset.
 
@@ -627,13 +665,20 @@ def _best_vision_pair(cands: list[_LineCandidate],
         ln, _ = left_near[id(l)]
         for r in right_pool:
             rn, _ = right_near[id(r)]
+            if pol.thin_near_relax:
+                # H2：thin 线近场像素稀疏时按“≥1 站点”计有近场
+                if ln < 2 and l.kind == "thin" and _thin_near_ok(l):
+                    ln = 2
+                if rn < 2 and r.kind == "thin" and _thin_near_ok(r):
+                    rn = 2
             if ln < 2 and rn < 2:
                 # Two far thin lines are usually roadside / pavement
                 # fragments, not a real lane pair: pairing them gives a
                 # phantom centre that can drag the car across the road.
                 if l.kind == "thin" and r.kind == "thin":
-                    rejects['near_combo'] = rejects.get('near_combo', 0) + 1
-                    continue
+                    if not (pol.far_thin_allow and _far_thin_pair_ok(l, r)):
+                        rejects['near_combo'] = rejects.get('near_combo', 0) + 1
+                        continue
                 # A wide lane whose centre line and right edge only become
                 # visible ahead is still a real two-sided lane.  Without
                 # this, run 84 mirrored the right edge and steered beside
@@ -1037,6 +1082,7 @@ def pair_lane_markings(
     station_step: float = 1.5,
     max_stations: int = 18,
     debug: dict | None = None,
+    research: "PairingResearchPolicy | None" = None,
 ) -> LaneFrame | None:
     """Pair detected markings into a lane frame and return its centre.
 
@@ -1056,6 +1102,7 @@ def pair_lane_markings(
     """
     if not markings:
         return None
+    pol = research or DEFAULT_PAIRING_RESEARCH
     pos = np.asarray(pos, dtype=float)[:2]
     fwd = _unit_fwd(pos, heading, fwd)
     cands = _collect_candidates(markings, pos, fwd, min_span, debug=debug)

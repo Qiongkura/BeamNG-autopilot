@@ -1316,12 +1316,12 @@ def test_right_lane_convention_geometry():
     m = importlib.util.module_from_spec(spec)
     sys.modules["m5_controlled_scenes_rl"] = m
     spec.loader.exec_module(m)
-    left, right = m.right_lane_lats(3.483)
-    assert abs(right - (-3.433)) < 1e-6
-    assert abs(left - 0.167) < 1e-6
+    left, right = m.right_lane_lats(3.483)   # 默认边缘余量 0.6m
+    assert abs(right - (-2.883)) < 1e-6
+    assert abs(left - 0.717) < 1e-6
     # 车道中心在右侧车道内、且在铺装内（±half）
     center = 0.5 * (left + right)
-    assert abs(center - (-1.633)) < 1e-6
+    assert abs(center - (-1.083)) < 1e-6
     assert abs(left) <= 3.483 and abs(right) <= 3.483
     # 窄路（半宽 2.5）：车道仍完全在铺装内
     l2, r2 = m.right_lane_lats(2.5)
@@ -1344,3 +1344,51 @@ def test_pairing_probe_no_goal_default():
     assert '"--no-goal"' in probe
     assert 'default=True' in probe
     assert 'if not args.no_goal:' in probe
+
+
+# ---------------------------------------------------------------------------
+# 2026-11-04 配对研究臂 F1/F2：几何判据 + 策略贯通（默认关）
+# ---------------------------------------------------------------------------
+
+def test_pairing_arm_geometry_helpers():
+    from types import SimpleNamespace
+    from beamng_autopilot.lane.pairing import (
+        _far_thin_pair_ok, _thin_near_ok)
+
+    def cand(lat, s0=0.0, s1=10.0, step=1.0):
+        proj = np.array([[s, lat] for s in np.arange(s0, s1 + 1e-9, step)],
+                        dtype=float)
+        return SimpleNamespace(proj=proj, kind="thin")
+
+    # 宽 3.6m、间距恒定、重叠 10m -> 允许
+    assert _far_thin_pair_ok(cand(1.8), cand(-1.8))
+    # 宽 1.0m（过窄）-> 拒绝
+    assert not _far_thin_pair_ok(cand(0.5), cand(-0.5))
+    # 重叠只有 2m -> 拒绝
+    assert not _far_thin_pair_ok(cand(1.8, 0, 2), cand(-1.8, 0, 2))
+    # 间距漂移 >0.35m -> 拒绝
+    drift = SimpleNamespace(
+        proj=np.array([[0, 1.8], [5, 2.9], [10, 4.0]], dtype=float), kind="thin")
+    assert not _far_thin_pair_ok(drift, cand(-1.8))
+    # 近场判据：0–8m 有 ≥1 站点
+    assert _thin_near_ok(cand(1.8, 4, 20))
+    assert not _thin_near_ok(cand(1.8, 10, 20))
+
+
+def test_pairing_arm_policy_plumbing():
+    root = Path(__file__).resolve().parents[1]
+    pair = (root / "beamng_autopilot" / "lane" / "pairing.py").read_text("utf-8")
+    assert "research: \"PairingResearchPolicy | None\" = None" in pair
+    assert "pol.far_thin_allow and _far_thin_pair_ok(l, r)" in pair
+    assert "pol.thin_near_relax" in pair
+    stack = (root / "beamng_autopilot" / "fsd_stack.py").read_text("utf-8")
+    assert "research=getattr(self, \"pairing_research\", None)" in stack
+    drv = (root / "beamng_autopilot" / "fsd_drive.py").read_text("utf-8")
+    assert "stack.pairing_research = PairingResearchPolicy(" in drv
+    cli = (root / "scripts" / "m5_fsd_drive.py").read_text("utf-8")
+    assert '"--pairing-research"' in cli and '"far_thin"' in cli
+    probe = (root / "scripts" / "m5_pairing_probe.py").read_text("utf-8")
+    assert '"--arm"' in probe and "_arm_policy(" in probe
+    # 默认全 False
+    from beamng_autopilot.lane.pairing import PairingResearchPolicy
+    assert PairingResearchPolicy().is_default()
