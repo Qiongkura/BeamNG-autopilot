@@ -246,6 +246,13 @@ def summarize(records: list[dict], scene_doc: dict) -> dict:
     }
 
 
+def _arm_policy(arm: str):
+    from beamng_autopilot.lane.pairing import PairingResearchPolicy
+    return PairingResearchPolicy(
+        far_thin_allow=(str(arm) == "far_thin"),
+        thin_near_relax=(str(arm) == "thin_near"))
+
+
 def read_jsonl(path: Path) -> list[dict]:
     recs = []
     for line in Path(path).read_text(encoding="utf-8").splitlines():
@@ -349,6 +356,8 @@ def collect(args) -> int:
                "--out", str(out.with_suffix(".telemetry.json"))]
         if not args.no_goal:
             cmd += ["--goal", f"{gx:.3f}", f"{gy:.3f}"]
+        if getattr(args, "arm", "baseline") != "baseline":
+            cmd += ["--pairing-research", str(args.arm)]
         if args.tod:
             cmd += ["--tod", str(args.tod)]
         if args.weather_preset:
@@ -386,8 +395,9 @@ def collect(args) -> int:
         "tod": args.tod,
         "weather_preset": args.weather_preset,
         "goal": [gx, gy],
-        "policy": DEFAULT_PAIRING_RESEARCH.as_dict(),
-        "policy_is_default": DEFAULT_PAIRING_RESEARCH.is_default(),
+        "policy": _arm_policy(args.arm).as_dict(),
+        "policy_is_default": _arm_policy(args.arm).is_default(),
+        "arm": str(args.arm),
         "summary": summarize(records, scene_doc),
     }
     out.write_text(json.dumps(report, ensure_ascii=False, indent=1),
@@ -443,6 +453,9 @@ def main() -> int:
                     default=True,
                     help="不建导航路线（避免 route snap 把自车从车道中心拉回"
                          "道路中线；配对探针默认用它）")
+    ap.add_argument("--arm", choices=("baseline", "far_thin", "thin_near"),
+                    default="baseline", help="研究臂：传给 drive 的 "
+                         "--pairing-research（baseline=不开）")
     ap.add_argument("--line-convention", default="right_lane",
                     help="贴花横向约定：right_lane=贴右侧铺装边（配对专用）；"
                          "symmetric=原认证约定")
