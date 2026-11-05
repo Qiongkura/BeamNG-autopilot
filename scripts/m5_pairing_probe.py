@@ -371,6 +371,15 @@ def collect(args) -> int:
                 edge_margin_m=float(args.edge_margin_m))
             _built_lines = (_rec.get("sites", {}).get(scene_name, {})
                             .get("lines") or [])
+            try:
+                # 构建记录落盘：导出侧必须用**实际生成的节点**做真值，不能
+                # 重新推算（否则 right_lane 的边距/材质差异不可追）。
+                (out.parent / (out.stem + ".built.json")).write_text(
+                    json.dumps({"scene": scene_name, "lines": _built_lines},
+                               ensure_ascii=False, indent=1),
+                    encoding="utf-8")
+            except (OSError, ValueError, TypeError):
+                pass
             if _built_lines:
                 # GT 用构建记录里的真实节点（right_lane 约定下与规格不同）
                 scene_doc = dict(scene_doc)
