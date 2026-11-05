@@ -22,6 +22,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -127,6 +128,16 @@ def _kill_new_game_pids(before: set[int]) -> None:
         _kill_tree(pid)
 
 
+def _wait_engine_gone(timeout_s: float = 30.0) -> bool:
+    """等上一格残留引擎退出（taskkill 返回是异步的，端口未释放会让下一格挂死）。"""
+    deadline = time.time() + float(timeout_s)
+    while time.time() < deadline:
+        if not _game_pids():
+            return True
+        time.sleep(1.0)
+    return not _game_pids()
+
+
 def _run_cell_process(cmd: list[str], *, timeout_s: float):
     """跑一格；超时杀掉**整棵进程树**和本次新起的引擎。
 
@@ -166,6 +177,8 @@ def run(preset_filter: str | None = None, *,
             print(f"[skip] {out.name} 已存在")
             continue
         print(f"[run] {out.name} tod={tod} weather={preset or '-'}", flush=True)
+        if not _wait_engine_gone():
+            print(f"[warn] {out.name}: 上一格引擎未在 30s 内退出，仍尝试启动")
         rc, stdout, stderr, timed_out = _run_cell_process(
             _cell_cmd(tod, preset, out), timeout_s=float(cell_timeout_s))
         # 注意：探针自己会写 <out>.run.log（内含 drive 的 environment 读回）；

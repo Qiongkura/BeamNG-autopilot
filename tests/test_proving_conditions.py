@@ -144,3 +144,23 @@ def test_kill_tree_decodes_native_taskkill_output(monkeypatch):
     m._kill_tree(1234)
     assert calls and calls[0][1].get("encoding") == "utf-8"
     assert calls[0][1].get("errors") == "replace"
+
+
+def test_wait_engine_gone_returns_when_clean(monkeypatch):
+    m = _mod()
+    monkeypatch.setattr(m, "_game_pids", lambda: set())
+    assert m._wait_engine_gone(0.1) is True
+
+
+def test_wait_engine_gone_times_out(monkeypatch):
+    m = _mod()
+    monkeypatch.setattr(m, "_game_pids", lambda: {1})
+    monkeypatch.setattr(m.time, "sleep", lambda s: None)
+    t = [0.0]
+
+    def _fake_time():
+        t[0] += 1.0
+        return t[0]
+
+    monkeypatch.setattr(m.time, "time", _fake_time)
+    assert m._wait_engine_gone(3.0) is False
