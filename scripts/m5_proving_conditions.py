@@ -107,8 +107,12 @@ def _kill_tree(pid: int) -> None:
     """杀一个进程及其全部子进程（Windows: taskkill /T；POSIX: killpg）。"""
     if os.name == "nt":
         try:
+            # taskkill 的本地化输出是 GBK；不显式 decode 时在 UTF-8 模式下
+            # 读取会抛 UnicodeDecodeError（2026-11-05 批跑实测，超时清理
+            # 路径出现）。杀进程本身不受影响，但异常会盖住清理成功的日志。
             subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=30)
         except (OSError, subprocess.SubprocessError):
             pass
         return

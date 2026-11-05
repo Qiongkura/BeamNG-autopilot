@@ -132,3 +132,15 @@ def test_timeout_path_kills_whole_process_tree(monkeypatch):
     assert killed == [4242]
 
 
+
+
+def test_kill_tree_decodes_native_taskkill_output(monkeypatch):
+    """taskkill 的 GBK 输出必须 replace 解码，不能抛 UnicodeDecodeError。"""
+    m = _mod()
+    calls = []
+    monkeypatch.setattr(m.os, "name", "nt")
+    monkeypatch.setattr(m.subprocess, "run",
+                        lambda *a, **k: calls.append((a, k)))
+    m._kill_tree(1234)
+    assert calls and calls[0][1].get("encoding") == "utf-8"
+    assert calls[0][1].get("errors") == "replace"
