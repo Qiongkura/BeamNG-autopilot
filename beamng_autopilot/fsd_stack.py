@@ -281,7 +281,7 @@ def _nearest_center_xy(frame, pos) -> list[float] | None:
         d = np.linalg.norm(c[:, :2] - p, axis=1)
         q = c[int(np.argmin(d))][:2]
         return [round(float(q[0]), 3), round(float(q[1]), 3)]
-    except Exception:  # noqa: BLE001 — 探针记录失败不影响主流程
+    except (TypeError, ValueError, IndexError, AttributeError):
         return None
 
 
