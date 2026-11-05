@@ -13,6 +13,10 @@ LANE_FUSION_WIDTH_MAX_M = 6.5
 LANE_MIN_SPAN_M = 4.0
 LANE_BOUNDARY_SPAN_M = 1.5
 LANE_PAIR_OVERLAP_M = 1.5
+# 世界系配对宽度取近场的上限（米）。远场回投误差随距离放大：试车场
+# 40m 实线在 s>25m 的宽度读到 5.1-6.7m（GT 3.8m），全线中位数被带偏。
+# 10m 仍属"车旁"，且保证有 >=3 个站点可算中位数（2026-11-05 实测）。
+LANE_PAIR_WIDTH_NEAR_M = 10.0
 # Two road edges should be locally parallel in the fixed camera view and
 # may only meet at a far vanishing point.  A pair whose fitted rays meet
 # in front of the car is a near crossing (wrong edge/roadside combination),

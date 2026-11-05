@@ -28,6 +28,7 @@ from .constants import (
     LANE_PAIR_NEAR_MAX_M,
     LANE_PAIR_OVERLAP_M,
     LANE_PAIR_WIDTH_MIN_M,
+    LANE_PAIR_WIDTH_NEAR_M,
     LANE_RIDING_LINE_MAX_M,
     LANE_SINGLE_MIRROR_MAX_M,
     LANE_SINGLE_MED_MIN_M,
@@ -885,7 +886,7 @@ def _best_vision_pair(cands: list[_LineCandidate],
                     geom = _pair_world_geometry(
                         l, r, pos, fwd, station_step, max_stations)
                     if geom is not None:
-                        _, cw, lw, rw, vg = geom
+                        gs, cw, lw, rw, vg = geom
                         if int(np.sum(vg)) < 3:
                             # Too little overlapping arc (e.g. run 84's
                             # short far centre line): keep the car-frame
@@ -897,7 +898,37 @@ def _best_vision_pair(cands: list[_LineCandidate],
                             # painted pair); the car-frame lateral read
                             # widens on a bend and must not leak out.
                             dw = np.linalg.norm(lw - rw, axis=1)
-                            width = float(np.median(dw[vg]))
+                            # 研究开关（默认关）：世界宽度也只取近场。远场回投
+                            # 误差随距离放大（40m 处几像素≈数米），全线中位数
+                            # 会把宽度带偏（试车场 2026-11-05 实测：s<10m
+                            # 3.80-3.84m、s>25m 5.1-6.7m、全线中位 4.95m）。
+                            # 代码自己的策略本来就是"宽度/中心在车旁读"。
+                            _near_w = os.environ.get(
+                                "BEAMNG_PAIR_WIDTH_NEAR", "0") == "1"
+                            _nm = vg & (np.asarray(gs, dtype=float)
+                                        <= LANE_PAIR_WIDTH_NEAR_M)
+                            if _near_w:
+                                _idx = np.flatnonzero(_nm)
+                                if len(_idx) < 3:
+                                    # 粗站点步长时 10m 内可能只有 1-2 个站点：
+                                    # 退化为"最近的 3 个有效站"，仍是近场口径
+                                    # （绝不回到全线中位数）。
+                                    _vidx = np.flatnonzero(vg)
+                                    if len(_vidx) >= 3:
+                                        _order = np.argsort(
+                                            np.asarray(gs, dtype=float)[_vidx])
+                                        _idx = _vidx[_order[:3]]
+                                if len(_idx) >= 3:
+                                    width = float(np.median(dw[_idx]))
+                                    if debug is not None:
+                                        debug["pair_width_near_m"] = round(
+                                            float(width), 3)
+                                        debug["pair_width_near_n"] = int(
+                                            len(_idx))
+                                else:
+                                    width = float(np.median(dw[vg]))
+                            else:
+                                width = float(np.median(dw[vg]))
                 best = (l, r, stations, valid, width, center, span,
                         avg_conf, score, geom)
     if debug is not None:
