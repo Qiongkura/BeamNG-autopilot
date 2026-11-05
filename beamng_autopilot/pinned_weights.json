@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "updated": "2026-09-14",
+  "updated": "2026-11-05",
   "note": "Pin inventory only; weight binaries stay out of git.",
   "pins": {
     "town_seg": {
@@ -12,7 +12,7 @@
       "role": "italy mountain segmentation pin"
     },
     "joint_default": {
-      "path": "logs/m5_seg/seg_model/best.pt",
+      "path": "logs/m5_seg/seg_model_v28_sslA/best.pt",
       "role": "multi-map joint fallback (current deployed default)"
     }
   }
