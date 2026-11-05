@@ -395,17 +395,19 @@ def set_active_map(name: str | None) -> None:
 
 
 def default_model_path() -> Path | None:
-    """按地图专家模型优先（by_map/<map>/best.pt），回退基础 best.pt 或 v28_sslA。"""
+    """按地图专家模型优先（by_map/<map>/best.pt），回退基础 best.pt。
+
+    不静默回退到任何研究 checkpoint：部署权重缺失必须 fail-closed
+    （Segmenter 抛 FileNotFoundError → 感知禁用），否则一次文件丢失就会
+    让全部默认路径悄悄换成一个未过晋级门的模型（2026-11-05 复核）。
+    """
     base = config.LOGS_DIR / "m5_seg" / "seg_model"
     if _ACTIVE_MAP:
         by_map = base / "by_map" / _ACTIVE_MAP / "best.pt"
         if by_map.is_file():
             return by_map
     p = base / "best.pt"
-    if p.is_file():
-        return p
-    ssl_fallback = config.LOGS_DIR / "m5_seg" / "seg_model_v28_sslA" / "best.pt"
-    return ssl_fallback if ssl_fallback.is_file() else None
+    return p if p.is_file() else None
 
 
 def merge_close_candidates(markings, *, pos=None, heading=None,
@@ -1289,6 +1291,7 @@ class EnsembleSegmenter:
         self.post_norm_width = getattr(
             self.segmenters[0], "post_norm_width", None)
         self.last_timing_ms: dict = {}
+        self.last_reset_errors: list[str] = []
         self.route_is_dirt = False
 
     def predict(self, frame_rgb: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -1322,5 +1325,13 @@ class EnsembleSegmenter:
             "EnsembleSegmenter 不提供概率图 API；请用 predict()/detect_lines()")
 
     def reset(self) -> None:
+        # reset 发生在 tick 出错后的恢复路径上：一个成员失败不得阻断其余
+        # 成员，也不能静默吞掉——把失败记在实例上供诊断（2026-11-05 复核）。
+        self.last_reset_errors: list[str] = []
         for seg in self.segmenters:
-            seg.reset()
+            try:
+                seg.reset()
+            except (OSError, RuntimeError, ValueError, TypeError,
+                    AttributeError, AssertionError) as exc:
+                self.last_reset_errors.append(
+                    f"{type(seg).__name__}: {type(exc).__name__}: {exc}")

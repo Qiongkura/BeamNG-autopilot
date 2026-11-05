@@ -1648,6 +1648,16 @@ def test_ensemble_segmenter_average_and_failclosed():
     out = ens.detect_lines(np.zeros((4, 4, 3), np.uint8), None, [0, 0, 0], 0.0)
     assert out == ["mk"] and "line_mask" in a.kw
     ens.reset(); assert a.reset_called and b.reset_called
+    # 单个成员 reset 失败不得阻断其余成员（恢复路径必须尽力回到可用状态）
+    bad_reset = Fake(np.zeros((3, 2, 2), np.float32))
+    def _boom():
+        raise RuntimeError("reset failed")
+    bad_reset.reset = _boom
+    good_reset = Fake(np.zeros((3, 2, 2), np.float32))
+    ens_bad = EnsembleSegmenter(segmenters=[bad_reset, good_reset])
+    ens_bad.reset()
+    assert good_reset.reset_called
+    assert ens_bad.last_reset_errors and "reset failed" in ens_bad.last_reset_errors[0]
     # fail-closed：任一成员抛 -> 整体抛
     bad = Fake(np.zeros((3, 2, 2), np.float32), boom=True)
     ens2 = EnsembleSegmenter(segmenters=[a, bad])

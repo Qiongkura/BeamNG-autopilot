@@ -17,7 +17,8 @@ def test_default_model_routes_by_map(tmp_path, monkeypatch):
     ssl_dir = tmp_path / "m5_seg" / "seg_model_v28_sslA"
     ssl_dir.mkdir(parents=True)
     (ssl_dir / "best.pt").write_bytes(b"ssl")
-    assert segmentation.default_model_path() == ssl_dir / "best.pt"
+    # 研究 checkpoint 不是部署默认：缺部署权重必须 fail-closed，不得静默替换
+    assert segmentation.default_model_path() is None
 
     base.mkdir(parents=True)
     (base / "best.pt").write_bytes(b"base")
