@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -93,12 +94,60 @@ def _cell_cmd(tod: str, preset: str | None, out: Path) -> list[str]:
     return cmd
 
 
-def _text_or_empty(val) -> str:
-    if val is None:
-        return ""
-    if isinstance(val, bytes):
-        return val.decode("utf-8", errors="replace")
-    return str(val)
+def _game_pids() -> set[int]:
+    """引擎 PID 快照（用于超时后清理探针直接子进程之外的残留引擎）。"""
+    try:
+        from beamng_autopilot.experiments.collection import game_pids
+        return {int(p) for p in game_pids()}
+    except Exception:  # noqa: BLE001 — 清理是 best-effort，不能反过来阻断批跑
+        return set()
+
+
+def _kill_tree(pid: int) -> None:
+    """杀一个进程及其全部子进程（Windows: taskkill /T；POSIX: killpg）。"""
+    if os.name == "nt":
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True, text=True, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return
+    try:
+        os.killpg(os.getpgid(pid), signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _kill_new_game_pids(before: set[int]) -> None:
+    for pid in _game_pids() - before:
+        _kill_tree(pid)
+
+
+def _run_cell_process(cmd: list[str], *, timeout_s: float):
+    """跑一格；超时杀掉**整棵进程树**和本次新起的引擎。
+
+    `subprocess.run(timeout=...)` 只杀直接子进程：探针拉起的 drive 与
+    BeamNG 会继续占用 RPC 端口，下一格连接直接失败（2026-11-05 实测）。
+    返回 ``(rc, stdout, stderr, timed_out)``。
+    """
+    pids_before = _game_pids()
+    extra: dict = ({"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+                   if os.name == "nt" else {"start_new_session": True})
+    proc = subprocess.Popen(
+        cmd, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, encoding="utf-8", errors="replace", env=_run_env(), **extra)
+    try:
+        stdout, stderr = proc.communicate(timeout=float(timeout_s))
+        return proc.returncode, stdout or "", stderr or "", False
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc.pid)
+        _kill_new_game_pids(pids_before)
+        try:
+            stdout, stderr = proc.communicate(timeout=30)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            stdout, stderr = "", ""
+        return -9, stdout or "", stderr or "", True
 
 
 def run(preset_filter: str | None = None, *,
@@ -113,28 +162,19 @@ def run(preset_filter: str | None = None, *,
             print(f"[skip] {out.name} 已存在")
             continue
         print(f"[run] {out.name} tod={tod} weather={preset or '-'}", flush=True)
-        try:
-            proc = subprocess.run(_cell_cmd(tod, preset, out), cwd=str(ROOT),
-                                  capture_output=True, text=True,
-                                  encoding="utf-8", errors="replace",
-                                  env=_run_env(),
-                                  timeout=float(cell_timeout_s))
-            # 注意：探针自己会写 <out>.run.log（内含 drive 的 environment 读回）；
-            # runner 的 stdout 必须另存，否则会把环境证据覆盖掉（2026-11-05 踩过）。
-            (OUT_DIR / (out.stem + ".probe.log")).write_text(
-                (proc.stdout or "") + "\n--- stderr ---\n" + (proc.stderr or ""),
-                encoding="utf-8")
-            rows.append({"cell": out.stem, "rc": proc.returncode,
-                         "out": str(out)})
-        except subprocess.TimeoutExpired as exc:
-            (OUT_DIR / (out.stem + ".probe.log")).write_text(
-                _text_or_empty(exc.stdout)
-                + "\n--- stderr ---\n"
-                + _text_or_empty(exc.stderr)
-                + f"\n--- timeout ({float(cell_timeout_s):.1f}s) ---\n",
-                encoding="utf-8")
-            rows.append({"cell": out.stem, "rc": -9, "timeout": True,
-                         "out": str(out)})
+        rc, stdout, stderr, timed_out = _run_cell_process(
+            _cell_cmd(tod, preset, out), timeout_s=float(cell_timeout_s))
+        # 注意：探针自己会写 <out>.run.log（内含 drive 的 environment 读回）；
+        # runner 的 stdout 必须另存，否则会把环境证据覆盖掉（2026-11-05 踩过）。
+        (OUT_DIR / (out.stem + ".probe.log")).write_text(
+            stdout + "\n--- stderr ---\n" + stderr
+            + (f"\n--- timeout ({float(cell_timeout_s):.1f}s) ---\n"
+               if timed_out else ""),
+            encoding="utf-8")
+        row = {"cell": out.stem, "rc": rc, "out": str(out)}
+        if timed_out:
+            row["timeout"] = True
+        rows.append(row)
     print(json.dumps(rows, ensure_ascii=False, indent=1))
     return 0
 

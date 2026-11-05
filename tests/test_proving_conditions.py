@@ -74,24 +74,20 @@ def test_runner_keeps_drive_log_for_env_readback():
 
 
 def test_run_handles_cell_timeout_and_continues(tmp_path, monkeypatch, capsys):
-    """单格挂死触发 TimeoutExpired 时，写 .probe.log、记录 rc=-9 并继续下一格。"""
+    """单格挂死→整树清理、写 .probe.log、rc=-9，并继续下一格。"""
     import json
-    import subprocess
-    from types import SimpleNamespace
 
     m = _mod()
     monkeypatch.setattr(m, "OUT_DIR", tmp_path)
     calls = []
 
-    def fake_run(cmd, **kw):
-        calls.append((cmd, kw.get("timeout")))
+    def fake_cell(cmd, *, timeout_s):
+        calls.append((cmd, timeout_s))
         if len(calls) == 1:
-            raise subprocess.TimeoutExpired(
-                cmd=cmd, timeout=kw.get("timeout", 1.0),
-                output="partial stdout", stderr="partial stderr")
-        return SimpleNamespace(returncode=0, stdout="ok out", stderr="")
+            return -9, "partial stdout", "partial stderr", True
+        return 0, "ok out", "", False
 
-    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    monkeypatch.setattr(m, "_run_cell_process", fake_cell)
     assert m.run("clear", cell_timeout_s=12.5) == 0
     assert len(calls) == 4  # dawn/noon/dusk/night × clear 全部跑完，未被第 1 格卡死
     assert all(t == 12.5 for _, t in calls)
@@ -105,4 +101,34 @@ def test_run_handles_cell_timeout_and_continues(tmp_path, monkeypatch, capsys):
     assert rows[0]["cell"] == "gridmap_dawn_clear"
     assert rows[0]["rc"] == -9 and rows[0]["timeout"] is True
     assert rows[1]["rc"] == 0
+
+
+def test_timeout_path_kills_whole_process_tree(monkeypatch):
+    """超时必须杀进程树（taskkill /T），否则 drive/引擎残留占端口。"""
+    import subprocess
+    from types import SimpleNamespace
+
+    m = _mod()
+    killed = []
+
+    class FakeProc:
+        pid = 4242
+        returncode = None
+
+        def communicate(self, timeout=None):
+            if timeout is not None and not killed:
+                raise subprocess.TimeoutExpired(cmd="x", timeout=timeout)
+            return "partial", "err"
+
+        def kill(self):
+            pass
+
+    monkeypatch.setattr(m.subprocess, "Popen", lambda *a, **k: FakeProc())
+    monkeypatch.setattr(m, "_game_pids", lambda: set())
+    monkeypatch.setattr(m, "_kill_tree", lambda pid: killed.append(pid))
+    monkeypatch.setattr(m, "_kill_new_game_pids", lambda before: None)
+    rc, _out, _err, timed_out = m._run_cell_process(["x"], timeout_s=0.01)
+    assert timed_out is True and rc == -9
+    assert killed == [4242]
+
 
