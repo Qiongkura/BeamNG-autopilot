@@ -374,9 +374,15 @@ class TestCandidateIdentity:
         import json as _json
         import numpy as np
         p = self._probe()
-        meta = _json.loads((ROOT / "logs" / "m5_seg" /
-                            "ident_probe_straight_20260923" /
-                            "meta.json").read_text(encoding="utf-8"))
+        meta_path = (ROOT / "logs" / "m5_seg" /
+                     "ident_probe_straight_20260923" / "meta.json")
+        if meta_path.is_file():
+            meta = _json.loads(meta_path.read_text(encoding="utf-8"))
+        else:
+            meta = {"cameras": {"front_main": {
+                "width": 536, "height": 403, "fov_deg": 65.0,
+                "offset": [0.0, 0.35, 1.38], "fwd": [0.0, 1.0, -0.08],
+                "up": [0.0, 0.0, 1.0]}}}
         cam = p.camera_from_meta(meta, "front_main")
         if cam is None:
             pytest.skip("no recorded camera model")

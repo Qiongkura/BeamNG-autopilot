@@ -142,7 +142,9 @@ class TestSelectionAndManifest:
         run = tmp_path / "exp"
         _frame(tmp_path, "coll_a", line_px=4)
         _frame(tmp_path, "coll_b", line_px=20, base=120)
-        mf = tool.build(run, Path("logs/m5_seg/seg_model/best.pt"),
+        model = tmp_path / "best.pt"
+        model.write_bytes(b"fake_ckpt")
+        mf = tool.build(run, model,
                         runs=[tmp_path / "coll_a" / "front_main",
                               tmp_path / "coll_b" / "front_main"],
                         max_frames=2, seg=_FakeSeg(), stages=False)
@@ -165,7 +167,8 @@ class TestSelectionAndManifest:
         _frame(tmp_path, "coll_b", line_px=20, base=120)
         runs = [tmp_path / "coll_a" / "front_main",
                 tmp_path / "coll_b" / "front_main"]
-        model = Path("logs/m5_seg/seg_model/best.pt")
+        model = tmp_path / "best.pt"
+        model.write_bytes(b"fake_ckpt")
         first = tool.build(run, model, runs=runs, max_frames=2,
                            seg=_FakeSeg(), stages=False)
         d = run / "probes" / first["checkpoint_id"]
@@ -263,7 +266,9 @@ class TestPostprocessStages:
         tool = _tool()
         run = tmp_path / "exp"
         _frame(tmp_path, "coll_a", line_px=8)
-        mf = tool.build(run, Path("logs/m5_seg/seg_model/best.pt"),
+        model = tmp_path / "best.pt"
+        model.write_bytes(b"fake_ckpt")
+        mf = tool.build(run, model,
                         runs=[tmp_path / "coll_a" / "front_main"],
                         max_frames=1, seg=_StageSeg())
         entry = mf["frames"][0]

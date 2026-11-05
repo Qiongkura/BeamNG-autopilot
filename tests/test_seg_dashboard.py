@@ -787,9 +787,30 @@ def test_every_table_header_carries_its_meaning(tmp_path):
     **所有**表头都有含义（含「运行」这种行键列），新增表时忘写含义会红。
     """
     hists = _write_t13_hists(tmp_path / "hists")
+    runs_root = tmp_path / "experiments"
+    rm = runs_root / "run_m"
+    log = EventLog(rm)
+    log.append(Event(run_id="run_m", candidate_id="c", dataset_id="d",
+                     config_hash="h", seed=42, phase="queued", status="ok"))
+    (rm / "metrics.jsonl").write_text(
+        json.dumps({"kind": "task", "run_id": "run_m", "status": "done"}) + chr(10),
+        encoding="utf-8")
+    (rm / "collect_20260925_121718.json").write_text(
+        json.dumps({"ok": True, "rc": 0, "stamp": "20260925_121718",
+                    "map_name": "italy", "roles": {"front_main": 10},
+                    "frames_total": 10}),
+        encoding="utf-8")
+    (rm / "decision_r0.json").write_text(
+        json.dumps({"round_index": 0, "candidate_id": "cand-r0",
+                    "champion_arm": "baseline", "candidate_arm": "candidate",
+                    "decision": {"decision": "rejected", "reasons": ["x"]}}),
+        encoding="utf-8")
     out = tmp_path / "m.html"
-    assert dash.main(["render", "--t13-import", str(hists), "--out",
-                      str(out), "--all-runs"]) == 0
+    assert dash.main(["render", "--events", str(log.path),
+                      "--t13-import", str(hists), "--out",
+                      str(out), "--all-runs",
+                      "--runs-root", str(runs_root),
+                      "--include-all"]) == 0
     html = out.read_text(encoding="utf-8")
     ths = re.findall(r"<th>(.*?)</th>", html, re.S)
     assert len(ths) >= 20, f"表头太少，渲染不完整：{len(ths)}"

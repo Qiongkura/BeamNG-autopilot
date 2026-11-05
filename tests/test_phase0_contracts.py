@@ -33,10 +33,15 @@ def test_seg_eval_ignores_255_in_metrics(tmp_path, capsys):
     # JSON report and ignore semantics are tested together.
     mod = _load("m5_eval_seg_contract", ROOT / "scripts" / "m5_eval_seg.py")
     import sys
+    import torch
+    from beamng_autopilot.vision.segmentation import SegUNet, CLASS_NAMES
+    ckpt_path = tmp_path / "model.pt"
+    torch.save({"state_dict": SegUNet().state_dict(),
+                "n_classes": 3, "class_names": list(CLASS_NAMES)}, ckpt_path)
     old = sys.argv
     out = tmp_path / "report.json"
     sys.argv = ["m5_eval_seg.py", "--runs", str(p), "--model",
-                str(ROOT / "logs/m5_seg/seg_model_v8_backup/best.pt"),
+                str(ckpt_path),
                 "--device", "cpu", "--json", str(out)]
     try:
         mod.main()
