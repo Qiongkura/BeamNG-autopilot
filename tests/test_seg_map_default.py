@@ -14,6 +14,11 @@ def test_default_model_routes_by_map(tmp_path, monkeypatch):
     base = tmp_path / "m5_seg" / "seg_model"
     assert segmentation.default_model_path() is None     # 什么都没有
 
+    ssl_dir = tmp_path / "m5_seg" / "seg_model_v28_sslA"
+    ssl_dir.mkdir(parents=True)
+    (ssl_dir / "best.pt").write_bytes(b"ssl")
+    assert segmentation.default_model_path() == ssl_dir / "best.pt"
+
     base.mkdir(parents=True)
     (base / "best.pt").write_bytes(b"base")
     assert segmentation.default_model_path() == base / "best.pt"

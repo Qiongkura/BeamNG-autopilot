@@ -395,14 +395,17 @@ def set_active_map(name: str | None) -> None:
 
 
 def default_model_path() -> Path | None:
-    """按地图专家模型优先（by_map/<map>/best.pt），回退基础 best.pt。"""
+    """按地图专家模型优先（by_map/<map>/best.pt），回退基础 best.pt 或 v28_sslA。"""
     base = config.LOGS_DIR / "m5_seg" / "seg_model"
     if _ACTIVE_MAP:
         by_map = base / "by_map" / _ACTIVE_MAP / "best.pt"
         if by_map.is_file():
             return by_map
     p = base / "best.pt"
-    return p if p.is_file() else None
+    if p.is_file():
+        return p
+    ssl_fallback = config.LOGS_DIR / "m5_seg" / "seg_model_v28_sslA" / "best.pt"
+    return ssl_fallback if ssl_fallback.is_file() else None
 
 
 def merge_close_candidates(markings, *, pos=None, heading=None,
@@ -1066,70 +1069,8 @@ class Segmenter:
             road_mask = np.asarray(road_mask, dtype=bool)
             if road_mask.shape != frame_rgb.shape[:2]:
                 raise ValueError("road_mask shape must match image shape")
-        # Classic-CV bright-stroke recovery, contrast-based: on a light
-        # concrete road the absolute brightness of the paint and the
-        # pavement are both high, so a global threshold fires on the whole
-        # frame.  The paint is still BRIGHTER than the pavement around it,
-        # so compare each pixel against its local neighbourhood mean.
-        gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
-        hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
-        sat = hsv[:, :, 1]
-        hue = hsv[:, :, 0]
-        val = hsv[:, :, 2]
-        # 研究臂 I1（预注册 T16_YELLOW_LINE_SPAN，默认关）：候选提取前做
-        # CLAHE 局部对比归一（只影响本函数输入，不改任何默认阈值）。
-        if os.environ.get("BEAMNG_CAND_CLAHE", "0") == "1":
-            _cl = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-            gray = _cl.apply(gray)
-            val = _cl.apply(val)
-        local = cv2.blur(gray, (9, 9))
-        bright = gray > local + 12
-        # 研究臂 Y1（默认关）：黄线相对阈值（白线阈值保持不变）
-        _yrel = os.environ.get("BEAMNG_YELLOW_GATE", "abs") == "rel"
-        _ybright = gray > local + (8 if _yrel else 12)
-        # White paint: brighter than the neighbourhood and low saturation.
-        cv_white = bright & (sat <= WHITE_SAT_MAX)
-        # Yellow paint (left edge / centre line): yellowish hue, not too
-        # saturated (sun-bleached paint reads as low-sat yellow).
-        if _yrel:
-            cv_yellow = ((hue >= 12) & (hue <= 45) & (sat >= 22)
-                         & (val >= 85) & _ybright)
-        else:
-            cv_yellow = ((hue >= 12) & (hue <= 45) & (sat >= 30)
-                         & (val >= 100) & _ybright)
-        # The HSV yellow prior (looser than cv_yellow - it catches the
-        # bleached centre paint the learned mask absorbed).  Its pixels
-        # must NOT stay in the white mask, or the centre paint is
-        # re-labelled white and the RHT centre-line policy never fires
-        # (live east_coast 2026-09-19: 'dashed/white' centre, mirror won).
-        from beamng_autopilot.vision.yellow_line_mask import yellow_line_mask
-        ym = yellow_line_mask(frame_rgb)
-        cv_yellow = cv_yellow | ym
-        cv_white = cv_white & ~ym
-        # 研究臂（默认 "1"=现行为）：关掉经典亮度臂的白漆恢复。
-        # GridMap 试车场（浅色/纹理地面）上，该臂把地面纹理当白漆，与学习
-        # 掩码里两条完整的 30m 实线并成无效大块/碎段（2026-11-04 根因：
-        # 纯学习掩码 -> 2 条 30m solid；并上 cv_white -> 0 marking）。
-        # 关闭后候选只来自学习掩码（+ 黄色臂），用于受控场地诊断；生产
-        # 默认不变，必须显式 BEAMNG_CV_WHITE=0 才生效。
-        _cv_white_off = os.environ.get("BEAMNG_CV_WHITE", "1") == "0"
-        if _cv_white_off:
-            cv_white = np.zeros_like(cv_white)
-        # 只读仪器（预注册 H1/H2 判据）：掩码级像素计数，供按 kind 归因
-        if debug is not None:
-            try:
-                debug["mask_counts"] = {
-                    "line_px": int(np.count_nonzero(line)),
-                    "bright_px": int(np.count_nonzero(bright)),
-                    "cv_white_px": int(np.count_nonzero(cv_white)),
-                    "cv_yellow_px": int(np.count_nonzero(cv_yellow)),
-                    "yellow_prior_px": int(np.count_nonzero(ym)),
-                    "yellow_gate_rel": bool(_yrel),
-                    "clahe": bool(os.environ.get("BEAMNG_CAND_CLAHE", "0") == "1"),
-                    "cv_white_off": bool(_cv_white_off),
-                }
-            except Exception:  # noqa: BLE001 — 仪器失败不影响提取
-                pass
+        cv_white, cv_yellow, ym = self._classic_cv_line_masks(
+            frame_rgb, line, WHITE_SAT_MAX, debug=debug)
         # Optional appearance refinement of the mask the CANDIDATES are
         # built from (T11/T08).  Default OFF: measured on dev scenes the
         # polarity-agnostic outlier test is a clean win on one scene
@@ -1246,6 +1187,56 @@ class Segmenter:
             out, pos=pos, heading=heading, debug=debug)
         return _merged
 
+    @staticmethod
+    def _classic_cv_line_masks(frame_rgb: np.ndarray, line: np.ndarray,
+                               white_sat_max: int, *,
+                               debug: dict | None = None):
+        """Classic-CV bright-stroke recovery (white & yellow paint masks)."""
+        from beamng_autopilot.vision.yellow_line_mask import yellow_line_mask
+        gray = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2GRAY)
+        hsv = cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2HSV)
+        sat = hsv[:, :, 1]
+        hue = hsv[:, :, 0]
+        val = hsv[:, :, 2]
+        # 研究臂 I1（预注册 T16_YELLOW_LINE_SPAN，默认关）：候选提取前做
+        # CLAHE 局部对比归一（只影响本函数输入，不改任何默认阈值）。
+        _clahe_on = os.environ.get("BEAMNG_CAND_CLAHE", "0") == "1"
+        if _clahe_on:
+            _cl = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            gray = _cl.apply(gray)
+            val = _cl.apply(val)
+        local = cv2.blur(gray, (9, 9))
+        bright = gray > local + 12
+        # 研究臂 Y1（默认关）：黄线相对阈值（白线阈值保持不变）
+        _yrel = os.environ.get("BEAMNG_YELLOW_GATE", "abs") == "rel"
+        _ybright = gray > local + (8 if _yrel else 12)
+        cv_white = bright & (sat <= white_sat_max)
+        if _yrel:
+            cv_yellow = ((hue >= 12) & (hue <= 45) & (sat >= 22)
+                         & (val >= 85) & _ybright)
+        else:
+            cv_yellow = ((hue >= 12) & (hue <= 45) & (sat >= 30)
+                         & (val >= 100) & _ybright)
+        ym = yellow_line_mask(frame_rgb)
+        cv_yellow = cv_yellow | ym
+        cv_white = cv_white & ~ym
+        # 研究臂（默认 "1"=现行为）：关掉经典亮度臂的白漆恢复（BEAMNG_CV_WHITE=0）。
+        _cv_white_off = os.environ.get("BEAMNG_CV_WHITE", "1") == "0"
+        if _cv_white_off:
+            cv_white = np.zeros_like(cv_white)
+        if debug is not None:
+            debug["mask_counts"] = {
+                "line_px": int(np.count_nonzero(line)),
+                "bright_px": int(np.count_nonzero(bright)),
+                "cv_white_px": int(np.count_nonzero(cv_white)),
+                "cv_yellow_px": int(np.count_nonzero(cv_yellow)),
+                "yellow_prior_px": int(np.count_nonzero(ym)),
+                "yellow_gate_rel": bool(_yrel),
+                "clahe": bool(_clahe_on),
+                "cv_white_off": bool(_cv_white_off),
+            }
+        return cv_white, cv_yellow, ym
+
     def offroad_mask(self, frame_rgb: np.ndarray) -> np.ndarray:
         """True where the frame is NOT asphalt (feeds edge extraction)."""
         road, _ = self.predict(frame_rgb)
@@ -1332,7 +1323,4 @@ class EnsembleSegmenter:
 
     def reset(self) -> None:
         for seg in self.segmenters:
-            try:
-                seg.reset()
-            except Exception:  # noqa: BLE001 — 重置失败不阻断后续
-                pass
+            seg.reset()
