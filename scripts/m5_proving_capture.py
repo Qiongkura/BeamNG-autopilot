@@ -1,0 +1,227 @@
+# -*- coding: utf-8 -*-
+"""试车场低照度/雨天采集扩池（T16_PROVING_CAPTURE_PREREG_20261105）。
+
+模式::
+
+    python scripts/m5_proving_capture.py --plan
+    python scripts/m5_proving_capture.py --build-sites
+    python scripts/m5_proving_capture.py --capture --site S1 --cell noon_rain
+
+采集通过既有 ``m5_pairing_probe.py``（场景模式 + ``--save-frames``）完成：
+RGB 帧、位姿、相机模型逐 tick 落盘；环境读回与探针汇总一起写进
+``capture.json``。本脚本不生成标签（导出/门禁见预注册 §3.3，pilot 下一步）。
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+SITES_DIR = ROOT / "logs" / "m5_seg" / "proving_sites"
+CAP_DIR = ROOT / "logs" / "m5_seg" / "proving_capture"
+MODEL = "logs/m5_seg/seg_model_v28_sslA/best.pt"
+
+#: 评测试车场 (500,500) 不参与采集；S1-S3 训练，P 留出（预注册 §2.1）
+SITES = {
+    "S1": {"mid": [300.0, 700.0, 100.0], "dir": [0.0, 1.0, 0.0],
+           "edge_margin_m": 0.8, "split": "train"},
+    "S2": {"mid": [700.0, 300.0, 100.0], "dir": [1.0, 0.0, 0.0],
+           "edge_margin_m": 1.0, "split": "train"},
+    "S3": {"mid": [500.0, 900.0, 100.0], "dir": [0.0, -1.0, 0.0],
+           "edge_margin_m": 1.2, "split": "train"},
+    "P": {"mid": [600.0, 800.0, 100.0], "dir": [0.0, 1.0, 0.0],
+          "edge_margin_m": 0.6, "split": "holdout"},
+}
+
+TODS = {"dawn": "06:30", "noon": "12:00", "dusk": "18:30", "night": "21:30"}
+WEATHERS = {"clear": None, "rain": "rainy", "fog": "foggy_morning"}
+
+PROVING_ENV = {
+    "BEAMNG_CV_WHITE": "0",
+    "BEAMNG_LINE_MERGE": "0",
+    "BEAMNG_PAIR_WIDTH_NEAR": "1",
+}
+
+
+def cells() -> list[str]:
+    return [f"{t}_{w}" for t in TODS for w in WEATHERS]
+
+
+def site_doc(site: str) -> dict:
+    """站点 -> 探针可读的场景 JSON（right_lane 由 CLI 约定给定）。"""
+    s = SITES[site]
+    return {
+        "asset": {"map": "gridmap_v2"},
+        "scene_type": "proving_lane",
+        "scene": {
+            "station_m": 0.0,
+            "road_id": f"proving_{site}",
+            "mid": [float(x) for x in s["mid"]],
+            "dir": [float(x) for x in s["dir"]],
+            "half_width_m": 3.5,
+            "slope_pct": 0.0,
+            "curve_deg": 0.0,
+            "lines": [{"role": "left", "nodes": []},
+                      {"role": "right", "nodes": []}],
+        },
+        "capture": {"site": site, "split": s["split"],
+                    "edge_margin_m": float(s["edge_margin_m"])},
+    }
+
+
+def build_sites() -> int:
+    SITES_DIR.mkdir(parents=True, exist_ok=True)
+    for name in SITES:
+        p = SITES_DIR / f"{name}.json"
+        p.write_text(json.dumps(site_doc(name), ensure_ascii=False, indent=1),
+                     encoding="utf-8")
+        print(f"[site] {p}")
+    return 0
+
+
+def cell_args(cell: str) -> tuple[str, str | None]:
+    """``dawn_rain`` -> ("06:30", "rainy")；未知格 ValueError。"""
+    tod, _, wx = str(cell).partition("_")
+    if tod not in TODS or wx not in WEATHERS:
+        raise ValueError(f"未知条件格 {cell!r}（可选 {cells()}）")
+    return TODS[tod], WEATHERS[wx]
+
+
+def capture_cmd(site: str, cell: str, out: Path, *, frames: int) -> list[str]:
+    tod, preset = cell_args(cell)
+    scene = SITES_DIR / f"{site}.json"
+    if not scene.is_file():
+        raise FileNotFoundError(f"缺站点场景 {scene}（先跑 --build-sites）")
+    cmd = [
+        sys.executable, str(ROOT / "scripts" / "m5_pairing_probe.py"),
+        "--map", "gridmap_v2", "--scene", str(scene),
+        "--scene-type", "proving_lane",
+        "--line-convention", "right_lane",
+        "--edge-margin-m", str(float(SITES[site]["edge_margin_m"])),
+        "--mat-white", "line_yellow_double",
+        "--mat-yellow", "line_yellow_double",
+        "--mat-pave", "m_road_asphalt_rough_01",
+        "--mat-gravel", "m_dirt_road_gravels",
+        "--model", MODEL,
+        "--frames", str(int(frames)), "--save-frames",
+        "--tod", tod,
+        "--out", str(out),
+    ]
+    if preset:
+        cmd += ["--weather-preset", preset]
+    return cmd
+
+
+def _run_env() -> dict:
+    env = dict(os.environ)
+    env.update(PROVING_ENV)
+    return env
+
+
+def _env_evidence(run_log: Path) -> dict:
+    """采集的 drive 日志里的环境读回（applied_tod / weather）。"""
+    info = {"tod_after": None, "weather": None, "line": None}
+    if not run_log.exists():
+        return info
+    for line in run_log.read_text(encoding="utf-8",
+                                   errors="replace").splitlines():
+        if "environment ->" in line:
+            info["line"] = line.strip()
+            for part in line.split():
+                if part.startswith("applied_tod="):
+                    v = part.split("=", 1)[1]
+                    info["tod_after"] = None if v in ("", "?") else v
+                elif part.startswith("weather="):
+                    info["weather"] = part.split("=", 1)[1] or None
+    return info
+
+
+def capture(site: str, cell: str, *, frames: int = 30) -> int:
+    if site not in SITES:
+        raise SystemExit(f"未知站点 {site!r}（可选 {sorted(SITES)}）")
+    tod, preset = cell_args(cell)
+    out_dir = CAP_DIR / site / cell
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / "probe.json"
+    if out.exists():
+        print(f"[skip] {out} 已存在")
+        return 0
+    print(f"[capture] site={site} cell={cell} tod={tod} "
+          f"weather={preset or '-'} frames={frames}", flush=True)
+    proc = subprocess.run(capture_cmd(site, cell, out, frames=frames),
+                          cwd=str(ROOT), capture_output=True, text=True,
+                          encoding="utf-8", errors="replace",
+                          env=_run_env(), timeout=1200)
+    (out_dir / "probe.log").write_text(
+        (proc.stdout or "") + "\n--- stderr ---\n" + (proc.stderr or ""),
+        encoding="utf-8")
+    report = {}
+    if out.exists():
+        try:
+            report = json.loads(out.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            report = {}
+    env = _env_evidence(out_dir / "probe.run.log")
+    n_frames = len(list((out_dir / "probe.frames").glob("frame_*.npz")))
+    manifest = {
+        "schema": "proving_capture_v1",
+        "site": site,
+        "cell": cell,
+        "tod": tod,
+        "weather_preset": preset,
+        "split": SITES[site]["split"],
+        "edge_margin_m": float(SITES[site]["edge_margin_m"]),
+        "env": env,
+        "probe_rc": proc.returncode,
+        "probe_summary": report.get("summary"),
+        "frames_saved": n_frames,
+        "status": ("ok" if proc.returncode == 0 and n_frames >= 20
+                   and env.get("tod_after") else "INCOMPLETE"),
+    }
+    (out_dir / "capture.json").write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
+    print(json.dumps({k: manifest[k] for k in
+                      ("site", "cell", "status", "frames_saved", "env")},
+                     ensure_ascii=False))
+    return 0
+
+
+def plan() -> int:
+    print(f"{'site':5s} {'split':8s} {'cell':12s} frames_dir")
+    for name in SITES:
+        for cell in cells():
+            print(f"{name:5s} {SITES[name]['split']:8s} {cell:12s} "
+                  f"{CAP_DIR / name / cell}")
+    print(f"{len(SITES) * len(cells())} cells; env={PROVING_ENV}")
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    g = ap.add_mutually_exclusive_group(required=True)
+    g.add_argument("--plan", action="store_true")
+    g.add_argument("--build-sites", action="store_true")
+    g.add_argument("--capture", action="store_true")
+    ap.add_argument("--site", choices=tuple(SITES), default=None)
+    ap.add_argument("--cell", default=None, help="例如 dawn_rain")
+    ap.add_argument("--frames", type=int, default=30)
+    args = ap.parse_args()
+    if args.plan:
+        return plan()
+    if args.build_sites:
+        return build_sites()
+    if not args.site or not args.cell:
+        raise SystemExit("--capture 需要 --site 和 --cell")
+    return capture(args.site, args.cell, frames=args.frames)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
