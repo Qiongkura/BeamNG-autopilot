@@ -120,3 +120,11 @@ def test_wait_engine_gone_clean(monkeypatch):
     m = _mod()
     monkeypatch.setattr(m, "_game_pids", lambda: set())
     assert m.wait_engine_gone(0.1) is True
+
+
+def test_run_all_covers_36_cells(monkeypatch):
+    m = _mod()
+    order = []
+    monkeypatch.setattr(m, "run_site", lambda site: order.append(site))
+    m.run_all()
+    assert order == ["S1", "S2", "S3", "P"]

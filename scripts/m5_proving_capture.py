@@ -273,6 +273,12 @@ def run_site(site: str, only: tuple[str, ...] | None = None) -> int:
     return 0
 
 
+def run_all() -> int:
+    for site in ("S1", "S2", "S3", "P"):
+        run_site(site)
+    return 0
+
+
 def plan() -> int:
     print(f"{'site':5s} {'split':8s} {'cell':12s} frames_dir")
     for name in SITES:
@@ -292,6 +298,8 @@ def main() -> int:
     g.add_argument("--capture", action="store_true")
     g.add_argument("--run-site", action="store_true",
                    help="顺序采一个站点全部条件格（P 站只采 4 个留出格）")
+    g.add_argument("--run-all", action="store_true",
+                   help="S1/S2/S3 各 12 格 + P 4 格，共 36 格顺序采集")
     ap.add_argument("--site", choices=tuple(SITES), default=None)
     ap.add_argument("--cell", default=None, help="例如 dawn_rain")
     ap.add_argument("--frames", type=int, default=60,
@@ -301,6 +309,8 @@ def main() -> int:
         return plan()
     if args.build_sites:
         return build_sites()
+    if args.run_all:
+        return run_all()
     if args.run_site:
         if not args.site:
             raise SystemExit("--run-site 需要 --site")
