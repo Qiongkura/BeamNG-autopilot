@@ -344,11 +344,11 @@
    "silent_except": 0
   },
   "beamng_autopilot/fsd_drive.py": {
-   "except_exception": 78,
-   "lines": 5727,
-   "max_func_lines": 3430,
-   "prints": 84,
-   "silent_except": 19
+   "except_exception": 77,
+   "lines": 5896,
+   "max_func_lines": 3427,
+   "prints": 90,
+   "silent_except": 18
   },
   "beamng_autopilot/fsd_realism.py": {
    "except_exception": 0,
@@ -359,7 +359,7 @@
   },
   "beamng_autopilot/fsd_stack.py": {
    "except_exception": 32,
-   "lines": 2593,
+   "lines": 2619,
    "max_func_lines": 1378,
    "prints": 1,
    "silent_except": 8
@@ -464,7 +464,7 @@
   },
   "beamng_autopilot/lane/constants.py": {
    "except_exception": 0,
-   "lines": 107,
+   "lines": 111,
    "max_func_lines": 0,
    "prints": 0,
    "silent_except": 0
@@ -527,8 +527,8 @@
   },
   "beamng_autopilot/lane/pairing.py": {
    "except_exception": 0,
-   "lines": 1209,
-   "max_func_lines": 207,
+   "lines": 1394,
+   "max_func_lines": 194,
    "prints": 0,
    "silent_except": 0
   },
@@ -1080,8 +1080,8 @@
   },
   "beamng_autopilot/vision/segmentation.py": {
    "except_exception": 0,
-   "lines": 1096,
-   "max_func_lines": 173,
+   "lines": 1337,
+   "max_func_lines": 148,
    "prints": 0,
    "silent_except": 0
   },
@@ -1162,10 +1162,10 @@
   "beamng_autopilot_tech"
  ],
  "totals": {
-  "except_exception": 332,
-  "max_func_lines": 3430,
-  "prints": 163,
-  "silent_except": 59
+  "except_exception": 331,
+  "max_func_lines": 3427,
+  "prints": 169,
+  "silent_except": 58
  },
  "version": 1
 }
