@@ -218,7 +218,7 @@ def _merge_thin_fragments(markings, pos, fwd, left, need_span: float,
             continue
         try:
             world = np.asarray(mk.world, dtype=float)[:, :2]
-        except Exception:  # noqa: BLE001
+        except (TypeError, ValueError, IndexError):
             continue
         if len(world) < 2:
             continue
@@ -387,11 +387,8 @@ def _collect_candidates(markings, pos: np.ndarray, fwd: np.ndarray,
             score=_marking_score(mk, span), world=world[:, :2]))
     # 研究臂（默认关）：thin 共线碎段合并（预注册 T16_THIN_MERGE）
     if os.environ.get("BEAMNG_THIN_MERGE", "0") == "1":
-        try:
-            cands.extend(_merge_thin_fragments(
-                markings, pos, fwd, left, LANE_BOUNDARY_SPAN_M, debug))
-        except Exception:  # noqa: BLE001 — 研究臂失败不影响默认行为
-            pass
+        cands.extend(_merge_thin_fragments(
+            markings, pos, fwd, left, LANE_BOUNDARY_SPAN_M, debug))
     return cands
 
 
@@ -593,7 +590,7 @@ def _thin_near_ok(c: "_LineCandidate") -> bool:
         near = proj[(proj[:, 0] >= -1.0)
                     & (proj[:, 0] <= LANE_SINGLE_NEAR_REQUIRE_M)]
         return bool(len(near) >= 1 and np.isfinite(near[:, 1]).any())
-    except Exception:  # noqa: BLE001 — 研究分支失败按不放行处理
+    except (TypeError, ValueError, IndexError):
         return False
 
 
@@ -620,7 +617,7 @@ def _far_thin_pair_ok(l: "_LineCandidate", r: "_LineCandidate") -> bool:
         w = a[ok] - b[ok]          # left - right（左正）
         width = float(np.median(w))
         return 2.5 <= width <= 4.5 and float(np.std(w)) <= 0.35
-    except Exception:  # noqa: BLE001
+    except (TypeError, ValueError, IndexError):
         return False
 
 
@@ -701,6 +698,39 @@ def _pair_perspective_valid(left_proj: np.ndarray,
     if 0.0 < cross_s < float(min_convergence_m):
         return False, "near_perspective_crossing"
     return True, "ok"
+
+
+def _resolve_pair_world_geometry(l: _LineCandidate, r: _LineCandidate,
+                                 pos: np.ndarray, fwd: np.ndarray,
+                                 station_step: float, max_stations: int,
+                                 default_width: float, *,
+                                 debug: dict | None = None):
+    """Build world-space pair geometry and refine width when valid."""
+    if not (l.world is not None and r.world is not None
+            and len(l.world) >= 2 and len(r.world) >= 2):
+        return None, default_width
+    geom = _pair_world_geometry(l, r, pos, fwd, station_step, max_stations)
+    if geom is None:
+        return None, default_width
+    gs, _cw, lw, rw, vg = geom
+    if int(np.sum(vg)) < 3:
+        return None, default_width
+    dw = np.linalg.norm(lw - rw, axis=1)
+    if os.environ.get("BEAMNG_PAIR_WIDTH_NEAR", "0") == "1":
+        _nm = vg & (np.asarray(gs, dtype=float) <= LANE_PAIR_WIDTH_NEAR_M)
+        _idx = np.flatnonzero(_nm)
+        if len(_idx) < 3:
+            _vidx = np.flatnonzero(vg)
+            if len(_vidx) >= 3:
+                _order = np.argsort(np.asarray(gs, dtype=float)[_vidx])
+                _idx = _vidx[_order[:3]]
+        if len(_idx) >= 3:
+            width = float(np.median(dw[_idx]))
+            if debug is not None:
+                debug["pair_width_near_m"] = round(float(width), 3)
+                debug["pair_width_near_n"] = int(len(_idx))
+            return geom, width
+    return geom, float(np.median(dw[vg]))
 
 
 def _best_vision_pair(cands: list[_LineCandidate],
@@ -880,55 +910,9 @@ def _best_vision_pair(cands: list[_LineCandidate],
             if score > best_score:
                 best_score = score
                 best_spread = _wspread
-                geom = None
-                if (l.world is not None and r.world is not None
-                        and len(l.world) >= 2 and len(r.world) >= 2):
-                    geom = _pair_world_geometry(
-                        l, r, pos, fwd, station_step, max_stations)
-                    if geom is not None:
-                        gs, cw, lw, rw, vg = geom
-                        if int(np.sum(vg)) < 3:
-                            # Too little overlapping arc (e.g. run 84's
-                            # short far centre line): keep the car-frame
-                            # reconstruction that the old code produced.
-                            geom = None
-                        else:
-                            # The frame width is the physical distance
-                            # between the matched boundaries (3.5 m for a
-                            # painted pair); the car-frame lateral read
-                            # widens on a bend and must not leak out.
-                            dw = np.linalg.norm(lw - rw, axis=1)
-                            # 研究开关（默认关）：世界宽度也只取近场。远场回投
-                            # 误差随距离放大（40m 处几像素≈数米），全线中位数
-                            # 会把宽度带偏（试车场 2026-11-05 实测：s<10m
-                            # 3.80-3.84m、s>25m 5.1-6.7m、全线中位 4.95m）。
-                            # 代码自己的策略本来就是"宽度/中心在车旁读"。
-                            _near_w = os.environ.get(
-                                "BEAMNG_PAIR_WIDTH_NEAR", "0") == "1"
-                            _nm = vg & (np.asarray(gs, dtype=float)
-                                        <= LANE_PAIR_WIDTH_NEAR_M)
-                            if _near_w:
-                                _idx = np.flatnonzero(_nm)
-                                if len(_idx) < 3:
-                                    # 粗站点步长时 10m 内可能只有 1-2 个站点：
-                                    # 退化为"最近的 3 个有效站"，仍是近场口径
-                                    # （绝不回到全线中位数）。
-                                    _vidx = np.flatnonzero(vg)
-                                    if len(_vidx) >= 3:
-                                        _order = np.argsort(
-                                            np.asarray(gs, dtype=float)[_vidx])
-                                        _idx = _vidx[_order[:3]]
-                                if len(_idx) >= 3:
-                                    width = float(np.median(dw[_idx]))
-                                    if debug is not None:
-                                        debug["pair_width_near_m"] = round(
-                                            float(width), 3)
-                                        debug["pair_width_near_n"] = int(
-                                            len(_idx))
-                                else:
-                                    width = float(np.median(dw[vg]))
-                            else:
-                                width = float(np.median(dw[vg]))
+                geom, width = _resolve_pair_world_geometry(
+                    l, r, pos, fwd, station_step, max_stations, width,
+                    debug=debug)
                 best = (l, r, stations, valid, width, center, span,
                         avg_conf, score, geom)
     if debug is not None:
@@ -1193,6 +1177,22 @@ def _centre_line_own_lane(cand, pos, fwd, lane_width: float,
                      inferred=True)
 
 
+def _cand_summary(c: _LineCandidate) -> dict:
+    near = c.proj[c.proj[:, 0] <= 6.0]
+    return {
+        "med_lat": round(float(c.med_lat), 2),
+        "span": round(float(c.span), 1),
+        "conf": round(float(c.conf), 2),
+        "kind": c.kind,
+        "color": c.color,
+        "score": round(float(c.score), 3),
+        "start_s": round(float(c.proj[0, 0]), 1),
+        "near_n": int(len(near)),
+        "near_med": (round(float(np.median(near[:, 1])), 2)
+                     if len(near) else None),
+    }
+
+
 def pair_lane_markings(
     markings,
     pos,
@@ -1233,21 +1233,6 @@ def pair_lane_markings(
     axes = _axis_candidates(cands, station_step, max_stations,
                             debug=debug)
     if debug is not None:
-        def _cand_summary(c) -> dict:
-            near = c.proj[c.proj[:, 0] <= 6.0]
-            return {
-                "med_lat": round(float(c.med_lat), 2),
-                "span": round(float(c.span), 1),
-                "conf": round(float(c.conf), 2),
-                "kind": c.kind,
-                "color": c.color,
-                "score": round(float(c.score), 3),
-                "start_s": round(float(c.proj[0, 0]), 1),
-                "near_n": int(len(near)),
-                "near_med": (round(float(np.median(near[:, 1])), 2)
-                             if len(near) else None),
-            }
-
         debug["cands"] = [_cand_summary(c) for c in cands]
         debug["axes"] = [_cand_summary(a) for a in axes]
     pair = _best_vision_pair(cands, axes, pos, fwd,
