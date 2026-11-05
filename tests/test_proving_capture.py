@@ -78,3 +78,45 @@ def test_capture_cmd_has_drive_window(tmp_path, monkeypatch):
     (tmp_path / "S1.json").write_text("{}", encoding="utf-8")
     cmd = m.capture_cmd("S1", "noon_rain", tmp_path / "probe.json", frames=60)
     assert cmd[cmd.index("--drive-seconds") + 1] == "20"
+
+
+def test_p_site_has_four_holdout_cells():
+    m = _mod()
+    assert len(m.P_CELLS) == 4
+    assert set(m.P_CELLS) == {"noon_clear", "noon_rain",
+                              "dusk_clear", "night_clear"}
+
+
+def test_run_site_skips_ok_and_continues(tmp_path, monkeypatch):
+    m = _mod()
+    monkeypatch.setattr(m, "CAP_DIR", tmp_path)
+    monkeypatch.setattr(m, "wait_engine_gone", lambda *a, **k: True)
+    called = []
+    monkeypatch.setattr(m, "capture", lambda site, cell, **k: called.append(cell))
+    ok = tmp_path / "P" / "noon_clear"
+    ok.mkdir(parents=True)
+    (ok / "capture.json").write_text('{"status": "ok"}', encoding="utf-8")
+    m.run_site("P")
+    assert called == ["noon_rain", "dusk_clear", "night_clear"]
+
+
+def test_run_site_records_failure(tmp_path, monkeypatch):
+    m = _mod()
+    monkeypatch.setattr(m, "CAP_DIR", tmp_path)
+    monkeypatch.setattr(m, "wait_engine_gone", lambda *a, **k: True)
+
+    def boom(site, cell, **k):
+        raise RuntimeError("probe died")
+
+    monkeypatch.setattr(m, "capture", boom)
+    m.run_site("P")
+    man = tmp_path / "P" / "noon_clear" / "capture.json"
+    data = __import__("json").loads(man.read_text(encoding="utf-8"))
+    assert data["status"] == "INCOMPLETE"
+    assert "probe died" in data["error"]
+
+
+def test_wait_engine_gone_clean(monkeypatch):
+    m = _mod()
+    monkeypatch.setattr(m, "_game_pids", lambda: set())
+    assert m.wait_engine_gone(0.1) is True

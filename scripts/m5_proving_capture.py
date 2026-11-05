@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,6 +53,11 @@ PROVING_ENV = {
 
 def cells() -> list[str]:
     return [f"{t}_{w}" for t in TODS for w in WEATHERS]
+
+#: P 留出站只采预注册 §2.1 的 4 格
+P_CELLS = ("noon_clear", "noon_rain", "dusk_clear", "night_clear")
+
+CELLS_PER_SITE = 12
 
 
 def site_doc(site: str) -> dict:
@@ -145,6 +151,33 @@ def _env_evidence(run_log: Path) -> dict:
     return info
 
 
+def _game_pids() -> set[int]:
+    try:
+        from beamng_autopilot.experiments.collection import game_pids
+        return {int(p) for p in game_pids()}
+    except Exception:  # noqa: BLE001 — 清理是 best-effort
+        return set()
+
+
+def _kill_games() -> None:
+    for pid in _game_pids():
+        try:
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
+
+
+def wait_engine_gone(timeout_s: float = 30.0) -> bool:
+    deadline = time.time() + float(timeout_s)
+    while time.time() < deadline:
+        if not _game_pids():
+            return True
+        time.sleep(1.0)
+    return not _game_pids()
+
+
 def capture(site: str, cell: str, *, frames: int = 60) -> int:
     if site not in SITES:
         raise SystemExit(f"未知站点 {site!r}（可选 {sorted(SITES)}）")
@@ -157,12 +190,25 @@ def capture(site: str, cell: str, *, frames: int = 60) -> int:
         return 0
     print(f"[capture] site={site} cell={cell} tod={tod} "
           f"weather={preset or '-'} frames={frames}", flush=True)
-    proc = subprocess.run(capture_cmd(site, cell, out, frames=frames),
-                          cwd=str(ROOT), capture_output=True, text=True,
-                          encoding="utf-8", errors="replace",
-                          env=_run_env(), timeout=1200)
+    timed_out = False
+    stdout = stderr = ""
+    rc = -1
+    try:
+        proc = subprocess.run(capture_cmd(site, cell, out, frames=frames),
+                              cwd=str(ROOT), capture_output=True, text=True,
+                              encoding="utf-8", errors="replace",
+                              env=_run_env(), timeout=1200)
+        stdout, stderr, rc = proc.stdout or "", proc.stderr or "", proc.returncode
+    except subprocess.TimeoutExpired:
+        # 探针超时只杀直接子进程；引擎/采集进程树要显式清理，否则下一格
+        # 会撞上残留 RPC 端口（2026-11-05 条件批跑教训）。
+        timed_out = True
+        rc = -9
+        _kill_games()
+        wait_engine_gone()
     (out_dir / "probe.log").write_text(
-        (proc.stdout or "") + "\n--- stderr ---\n" + (proc.stderr or ""),
+        stdout + "\n--- stderr ---\n" + stderr
+        + ("\n--- timeout (1200s) ---\n" if timed_out else ""),
         encoding="utf-8")
     report = {}
     if out.exists():
@@ -181,10 +227,11 @@ def capture(site: str, cell: str, *, frames: int = 60) -> int:
         "split": SITES[site]["split"],
         "edge_margin_m": float(SITES[site]["edge_margin_m"]),
         "env": env,
-        "probe_rc": proc.returncode,
+        "probe_rc": rc,
+        "timeout": timed_out,
         "probe_summary": report.get("summary"),
         "frames_saved": n_frames,
-        "status": ("ok" if proc.returncode == 0 and n_frames >= 20
+        "status": ("ok" if rc == 0 and n_frames >= 20
                    and env.get("tod_after") else "INCOMPLETE"),
     }
     (out_dir / "capture.json").write_text(
@@ -192,6 +239,37 @@ def capture(site: str, cell: str, *, frames: int = 60) -> int:
     print(json.dumps({k: manifest[k] for k in
                       ("site", "cell", "status", "frames_saved", "env")},
                      ensure_ascii=False))
+    return 0
+
+
+def run_site(site: str, only: tuple[str, ...] | None = None) -> int:
+    """顺序采一个站点的全部条件格（P 站默认只采 4 个留出格）。"""
+    if site not in SITES:
+        raise SystemExit(f"未知站点 {site!r}（可选 {sorted(SITES)}）")
+    todo = only or (P_CELLS if site == "P" else tuple(cells()))
+    for cell in todo:
+        man = CAP_DIR / site / cell / "capture.json"
+        if man.exists():
+            try:
+                if json.loads(man.read_text(encoding="utf-8")).get(
+                        "status") == "ok":
+                    print(f"[skip] {site}/{cell} already ok")
+                    continue
+            except (OSError, ValueError):
+                pass
+        wait_engine_gone()
+        try:
+            capture(site, cell)
+        except Exception as exc:  # noqa: BLE001 — 单格失败不阻断整站
+            d = CAP_DIR / site / cell
+            d.mkdir(parents=True, exist_ok=True)
+            (d / "capture.json").write_text(json.dumps({
+                "schema": "proving_capture_v1", "site": site, "cell": cell,
+                "status": "INCOMPLETE", "error": f"{type(exc).__name__}: {exc}",
+            }, ensure_ascii=False, indent=1), encoding="utf-8")
+            print(f"[FAIL] {site}/{cell}: {type(exc).__name__}: {exc}",
+                  flush=True)
+        time.sleep(1.0)
     return 0
 
 
@@ -212,6 +290,8 @@ def main() -> int:
     g.add_argument("--plan", action="store_true")
     g.add_argument("--build-sites", action="store_true")
     g.add_argument("--capture", action="store_true")
+    g.add_argument("--run-site", action="store_true",
+                   help="顺序采一个站点全部条件格（P 站只采 4 个留出格）")
     ap.add_argument("--site", choices=tuple(SITES), default=None)
     ap.add_argument("--cell", default=None, help="例如 dawn_rain")
     ap.add_argument("--frames", type=int, default=60,
@@ -221,6 +301,10 @@ def main() -> int:
         return plan()
     if args.build_sites:
         return build_sites()
+    if args.run_site:
+        if not args.site:
+            raise SystemExit("--run-site 需要 --site")
+        return run_site(args.site)
     if not args.site or not args.cell:
         raise SystemExit("--capture 需要 --site 和 --cell")
     return capture(args.site, args.cell, frames=args.frames)
