@@ -164,6 +164,35 @@ def _color_masks(frame_rgb):
     return [("white", white), ("yellow", yellow)]
 
 
+def _component_fill_ok(labels, label_id: int, x: int, y: int, w: int, h: int,
+                       area: int, *, roi: bool) -> bool:
+    """组件是否致密到可以当作漆线笔画（bbox 填充率的斜线修正）。
+
+    轴对齐 bbox 的填充率会把**斜向细长线**误判成稀疏噪声：一条斜线在自己
+    的 bbox 里只占很小比例，运动/透视变化就可能把 9.4% 压到 10% 门以下
+    （2026-11-05 GridMap 运动后右线整条被 `too_sparse` 丢弃的根因）。
+    先用 bbox 快速判定；可疑时改用**最小外接旋转矩形**再算一次填充率：
+    线状组件在旋转矩形里是致密的，真正的散点/团块仍然稀疏。
+    """
+    import cv2
+
+    if w <= 0 or h <= 0:
+        return False
+    if area / float(w * h) >= 0.10:
+        return True
+    if roi:
+        yy, xx = np.where(labels[y:y + h, x:x + w] == label_id)
+    else:
+        yy, xx = np.where(labels == label_id)
+    if len(xx) < 3:
+        return False
+    pts = np.column_stack([xx, yy]).astype(np.float32)
+    (_cx, _cy), (rw, rh), _ang = cv2.minAreaRect(pts)
+    if rw <= 0 or rh <= 0:
+        return False
+    return area / float(rw * rh) >= 0.10
+
+
 def _mask_to_markings(mask0, color, cam_model, pos, heading,
                       ground_z: float | None = None,
                       min_area: int | None = None, min_height: int | None = None,
@@ -260,7 +289,8 @@ def _mask_to_markings(mask0, color, cam_model, pos, heading,
         if w > max(8, h * 2.5):
             _drop(x, w, "too_wide", h, area, i)
             continue
-        if w * h <= 0 or area / (w * h) < 0.10:
+        if not _component_fill_ok(labels, i, x, y, w, h, area,
+                                  roi=component_roi):
             _drop(x, w, "too_sparse", h, area, i)
             continue
         if component_roi:
