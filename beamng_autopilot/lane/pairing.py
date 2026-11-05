@@ -387,8 +387,13 @@ def _collect_candidates(markings, pos: np.ndarray, fwd: np.ndarray,
             score=_marking_score(mk, span), world=world[:, :2]))
     # 研究臂（默认关）：thin 共线碎段合并（预注册 T16_THIN_MERGE）
     if os.environ.get("BEAMNG_THIN_MERGE", "0") == "1":
-        cands.extend(_merge_thin_fragments(
-            markings, pos, fwd, left, LANE_BOUNDARY_SPAN_M, debug))
+        try:
+            cands.extend(_merge_thin_fragments(
+                markings, pos, fwd, left, LANE_BOUNDARY_SPAN_M, debug))
+        except (TypeError, ValueError, IndexError, AttributeError) as _exc:
+            # 研究臂失败不影响默认行为；失败原因留在 debug 里（不静默）。
+            if debug is not None:
+                debug["thin_merge_error"] = f"{type(_exc).__name__}: {_exc}"
     return cands
 
 
