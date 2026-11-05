@@ -627,3 +627,24 @@ def test_hard_pedal_bypasses_the_ramp_when_no_path_remains():
     assert fsd_drive._needs_hard_pedal(
         has_path=True, force_stop=False, stuck=False, climb=False,
         reverse_active=False, reversing=False, rem_end=1.0)
+
+
+def test_stuck_timer_ignores_brake_release_pedal_overlap() -> None:
+    """When rate_limit_pedal is still releasing brake (brk > 0.05), thr > 0
+    is a launch pedal overlap, not a stuck spin (gridmap_plain_drive fix)."""
+    assert not fsd_drive._counts_as_stuck(
+        has_path=True, force_stop=False, v=0.0, thr=0.25, brk=0.60,
+        plan_speed=2.8, near_obs_m=999.0, rem_end=None)
+    assert fsd_drive._counts_as_stuck(
+        has_path=True, force_stop=False, v=0.0, thr=0.25, brk=0.0,
+        plan_speed=2.8, near_obs_m=999.0, rem_end=None)
+
+
+def test_climb_clearance_ok_accepts_infinite_clearance() -> None:
+    """path_grid_clearance_m returns +inf on an obstacle-free road; climb
+    must treat +inf as clear (> 3.0) rather than rejecting via isfinite."""
+    assert fsd_drive._climb_clearance_ok(float("inf"))
+    assert fsd_drive._climb_clearance_ok(8.5)
+    assert not fsd_drive._climb_clearance_ok(2.5)
+    assert not fsd_drive._climb_clearance_ok(float("nan"))
+

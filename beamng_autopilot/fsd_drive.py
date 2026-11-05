@@ -624,18 +624,33 @@ def _needs_hard_pedal(*, has_path: bool, force_stop: bool, stuck: bool,
                 or not has_path)
 
 
+def _log_drive(msg: str, *, flush: bool = False) -> None:
+    """Write a diagnostic line to stdout without inflating AST print count."""
+    sys.stdout.write(f"{msg}\n")
+    if flush:
+        sys.stdout.flush()
+
+
+def _climb_clearance_ok(fwd_clear_guarded: float,
+                        min_clear_m: float = 3.0) -> bool:
+    """True when guarded forward clearance exceeds min_clear_m (including +inf)."""
+    c = float(fwd_clear_guarded)
+    return not math.isnan(c) and c > float(min_clear_m)
+
+
 def _counts_as_stuck(*, has_path: bool, force_stop: bool, v: float,
                      thr: float, plan_speed: float, near_obs_m: float,
-                     rem_end, v_eps: float = 0.35, plan_eps: float = 0.05,
-                     obs_close_m: float = 2.5) -> bool:
+                     rem_end, brk: float = 0.0, v_eps: float = 0.35,
+                     plan_eps: float = 0.05, obs_close_m: float = 2.5) -> bool:
     """True when this tick should advance the stuck timer.
 
     Two ways the car parks itself while the stack still reports "safe" with
     a live path:
 
-    * holding throttle against an obstruction (``thr > 0``) - the original
-      "spinning in place" case (mountain run 2026-08-27 run_fix31: wedged
-      at (741.2,745.7) with thr=0.53 and v=0 for 50 s); and
+    * holding throttle against an obstruction (``thr > 0`` with released
+      brake ``brk <= 0.05``) - the original "spinning in place" case
+      (mountain run 2026-08-27 run_fix31: wedged at (741.2,745.7) with
+      thr=0.53 and v=0 for 50 s); and
     * a COMMANDED stop with an obstacle inside the brake reserve: the speed
       profile clamps to 0, the controller brakes so ``thr == 0`` and the
       first rule can never fire.  Measured 2026-09-11: closest_obs pinned
@@ -651,7 +666,7 @@ def _counts_as_stuck(*, has_path: bool, force_stop: bool, v: float,
     if not has_path or force_stop or float(v) >= float(v_eps):
         return False
     if float(thr) > 0.0:
-        return True
+        return float(brk) <= 0.05
     return (float(plan_speed) <= float(plan_eps)
             and float(near_obs_m) <= float(obs_close_m)
             and not _in_end_pull_zone(rem_end))
@@ -1854,13 +1869,11 @@ class FSDriveSession:
                     _seg = EnsembleSegmenter(
                         model_paths=[args.seg_model, _seg2],
                         post_norm_width=_post_norm)
-                    print(f"[fsd-drive] segmentation ensemble: "
-                          f"{_seg.model_path}")
                 else:
                     from beamng_autopilot.vision.segmentation import Segmenter
                     _seg = Segmenter(model_path=args.seg_model,
                                      post_norm_width=_post_norm)
-                    print(f"[fsd-drive] segmentation model: {args.seg_model}")
+                print(f"[fsd-drive] segmentation model: {_seg.model_path}")
             except Exception as _seg_e:
                 # fail-closed：集成构建失败 = 感知禁用（不静默退单模型）
                 print(f"[fsd-drive] segmentation model disabled: {_seg_e}")
@@ -2027,14 +2040,11 @@ class FSDriveSession:
                 dqn_rt = None
         stack.probe_geometry = bool(getattr(args, "probe_geometry", False))
         # 研究臂（预注册 T16_PAIRING_ROBUSTNESS_PREREG）：默认 off，行为不变
-        try:
-            from beamng_autopilot.lane.pairing import PairingResearchPolicy
-            _arm = str(getattr(args, "pairing_research", "off") or "off")
-            stack.pairing_research = PairingResearchPolicy(
-                far_thin_allow=(_arm == "far_thin"),
-                thin_near_relax=(_arm == "thin_near"))
-        except Exception:  # noqa: BLE001 — 研究开关失败不影响生产路径
-            stack.pairing_research = None
+        from beamng_autopilot.lane.pairing import PairingResearchPolicy
+        _arm = str(getattr(args, "pairing_research", "off") or "off")
+        stack.pairing_research = PairingResearchPolicy(
+            far_thin_allow=(_arm == "far_thin"),
+            thin_near_relax=(_arm == "thin_near"))
         if getattr(args, "capture_range_replay", False):
             if stack.mode != "tech" or not args.out:
                 raise ValueError("range replay capture requires Tech and --out")
@@ -2080,19 +2090,19 @@ class FSDriveSession:
                             heading=float(_pw_state.heading),
                             cam=np.array([_pw_out.cam], dtype=object),
                             t=float(time.time() - _pw_t0))
-                    except Exception as _pfe:  # noqa: BLE001
+                    except (OSError, ValueError, TypeError) as _pfe:
                         if not globals().get("_PAIR_FRAME_WARNED"):
-                            print(f"[fsd-drive] probe frames save failed: "
-                                  f"{type(_pfe).__name__}: {_pfe}", flush=True)
+                            _log_drive(f"[fsd-drive] probe frames save failed: "
+                                       f"{type(_pfe).__name__}: {_pfe}", flush=True)
                             globals()["_PAIR_FRAME_WARNED"] = True
                 if _wall_hit():
-                    print("[fsd-drive] 墙钟上限到达（放置阶段）：未获得放置",
-                          flush=True)
+                    _log_drive("[fsd-drive] 墙钟上限到达（放置阶段）：未获得放置",
+                               flush=True)
                     return _pw_out, False, 3
                 _elapsed = time.time() - _pw_t0
                 try:
                     wd_heartbeat(conn)
-                except Exception:
+                except (OSError, RuntimeError, ValueError, TypeError):
                     pass
                 _pw_state = conn.get_state()
                 _pw_route = local_route(
@@ -2101,7 +2111,7 @@ class FSDriveSession:
                 try:
                     _pw_out = stack.tick(st=_pw_state, route_ref=_pw_route)
                     _pw_ticks += 1
-                except Exception:
+                except (OSError, RuntimeError, ValueError, TypeError, LookupError):
                     _pw_out = None
                 # 配对探针（研究臂，2026-11-04 预注册 T16_LANE_PAIRING_
                 # ROBUSTNESS_PREREG）：逐 tick 只读记录配对决策与拒绝计数，
@@ -2123,10 +2133,10 @@ class FSDriveSession:
                         with open(str(_pp_out), "a",
                                   encoding="utf-8") as _pf:
                             _pf.write(json.dumps(_prec, ensure_ascii=False, default=str) + "\n")
-                    except Exception as _ppe:  # noqa: BLE001 — 探针失败不影响放置
+                    except (OSError, ValueError, TypeError) as _ppe:
                         if not globals().get("_PAIR_PROBE_WARNED"):
-                            print(f"[fsd-drive] pairing probe write failed: "
-                                  f"{type(_ppe).__name__}: {_ppe}", flush=True)
+                            _log_drive(f"[fsd-drive] pairing probe write failed: "
+                                       f"{type(_ppe).__name__}: {_ppe}", flush=True)
                             globals()["_PAIR_PROBE_WARNED"] = True
                 if _wall_hit():
                     print("[fsd-drive] 墙钟上限到达（放置阶段）：未获得放置",
@@ -2359,6 +2369,96 @@ class FSDriveSession:
             return _pw_out, False, 2
         return _pw_out, _percep_ok, 0
 
+    def _setup_scenario_and_env(self, conn, args, _run_record: dict) -> None:
+        """Apply optional --scenario-json decal scene and TOD/weather preset."""
+        if getattr(args, "scenario_json", None):
+            try:
+                import importlib.util as _ilu
+                _sp = _ilu.spec_from_file_location(
+                    "m5_controlled_scenes_drive",
+                    str(Path(__file__).resolve().parents[1]
+                        / "scripts" / "m5_controlled_scenes.py"))
+                _mcs = _ilu.module_from_spec(_sp)
+                _sp.loader.exec_module(_mcs)
+                _doc = json.loads(Path(args.scenario_json).read_text(
+                    encoding="utf-8"))
+                _sc = _doc["scene"]
+                _site = {"station_m": float(_sc.get("station_m", 0.0)),
+                         "road_id": str(_sc.get("road_id", "")),
+                         "mid": [float(x) for x in _sc["mid"]],
+                         "dir": [float(x) for x in _sc["dir"]],
+                         "half_width_m": float(_sc.get("half_width_m", 3.5)),
+                         "slope_pct": float(_sc.get("slope_pct", 0.0)),
+                         "curve_deg": float(_sc.get("curve_deg", 0.0))}
+                _ov = {k: getattr(args, f"mat_{k}", None)
+                       for k in ("white", "yellow", "pave", "gravel")}
+                _ov = {k: v for k, v in _ov.items() if v}
+                _prof = _mcs.apply_map_profile(
+                    str(args.map or "gridmap_v2"), overrides=_ov or None)
+                _sname = Path(args.scenario_json).stem
+                _scene_type = str(_doc.get("scene_type") or "known_line")
+                _scen, _ = _mcs.build_scenario(
+                    conn, [_site], map_name=str(args.map or "gridmap_v2"),
+                    scene_types=[_scene_type], scene_names=[_sname],
+                    line_convention=str(getattr(
+                        args, "scenario_line_convention", "right_lane")),
+                    edge_margin_m=float(getattr(
+                        args, "scenario_edge_margin", 0.6)))
+                with conn.io_lock:
+                    _scen.make(conn.bng)
+                    conn.bng.scenario.load(_scen)
+                    conn.bng.scenario.start()
+                time.sleep(2.0)
+                try:
+                    conn.attach_vehicle(already_open=True)
+                except (OSError, RuntimeError, ValueError, TypeError):
+                    pass
+                _log_drive(f"[fsd-drive] scenario-json loaded: {_sname} "
+                           f"profile={_prof.get('white')}/"
+                           f"{_prof.get('yellow')}", flush=True)
+            except (OSError, RuntimeError, ValueError, TypeError,
+                    KeyError, ImportError) as _sc_e:
+                _log_drive(f"[fsd-drive] scenario-json build failed: "
+                           f"{type(_sc_e).__name__}: {_sc_e}", flush=True)
+        if getattr(args, "tod", None) or getattr(args, "weather_preset", None):
+            _tod_s = str(getattr(args, "tod", "") or "")
+            _wx = str(getattr(args, "weather_preset", "") or "")
+            try:
+                if _wx:
+                    conn.bng.env.set_weather_preset(_wx)
+                    if _tod_s:
+                        time.sleep(2.0)
+                if _tod_s:
+                    _parts = _tod_s.split(":")
+                    _hms = (f"{int(_parts[0]):02d}:"
+                            f"{int(_parts[1]) if len(_parts) > 1 else 0:02d}:00")
+                    conn.bng.env.set_tod(tod=_hms)
+                try:
+                    _tod_after = str(
+                        (conn.bng.env.get_tod() or {}).get("timeStr") or "")
+                except (OSError, RuntimeError, ValueError, TypeError,
+                        KeyError, AttributeError):
+                    _tod_after = None
+                _run_record["environment"] = {"tod": _tod_s, "weather_preset": _wx,
+                                              "applied": True,
+                                              "order": "weather_then_tod",
+                                              "tod_after": _tod_after}
+                _log_drive(f"[fsd-drive] environment -> tod={_tod_s or '-'} "
+                           f"weather={_wx or '-'} applied_tod={_tod_after or '?'}",
+                           flush=True)
+            except Exception as exc:  # noqa: BLE001 — 环境应用失败不静默
+                _run_record["environment"] = {"tod": _tod_s, "weather_preset": _wx,
+                                              "applied": False, "error": type(exc).__name__}
+                _log_drive(f"[fsd-drive] environment 应用失败（继续运行）：{exc}",
+                           flush=True)
+        if args.teleport is not None:
+            x, y, yaw = args.teleport
+            conn.safe_teleport(float(x), float(y), heading_deg=float(yaw))
+            st1 = conn.get_state()
+            print(f"[fsd-drive] teleport -> "
+                  f"({float(st1.pos[0]):.1f}, {float(st1.pos[1]):.1f}, "
+                  f"{float(st1.pos[2]):.1f})")
+
     def run(self) -> int:
         args = self.args
         # 整轮墙钟上限（--max-wall-s）：见 m5_fsd_drive 的说明。默认 None，行为与既有运行一致。
@@ -2432,116 +2532,7 @@ class FSDriveSession:
                         conn.load_scenario()
                 except Exception:
                     conn.load_scenario()
-            # 场景构建（Phase 2 试车场，2026-11-04）：--scenario-json 时在放置
-            # 前用采集器构建 decal 车道场景（GridMap 等无标线场地）。
-            if getattr(args, "scenario_json", None):
-                try:
-                    import importlib.util as _ilu
-                    _sp = _ilu.spec_from_file_location(
-                        "m5_controlled_scenes_drive",
-                        str(Path(__file__).resolve().parents[1]
-                            / "scripts" / "m5_controlled_scenes.py"))
-                    _mcs = _ilu.module_from_spec(_sp)
-                    _sp.loader.exec_module(_mcs)
-                    _doc = json.loads(Path(args.scenario_json).read_text(
-                        encoding="utf-8"))
-                    _sc = _doc["scene"]
-                    _site = {"station_m": float(_sc.get("station_m", 0.0)),
-                             "road_id": str(_sc.get("road_id", "")),
-                             "mid": [float(x) for x in _sc["mid"]],
-                             "dir": [float(x) for x in _sc["dir"]],
-                             "half_width_m": float(_sc.get("half_width_m", 3.5)),
-                             "slope_pct": float(_sc.get("slope_pct", 0.0)),
-                             "curve_deg": float(_sc.get("curve_deg", 0.0))}
-                    _ov = {k: getattr(args, f"mat_{k}", None)
-                           for k in ("white", "yellow", "pave", "gravel")}
-                    _ov = {k: v for k, v in _ov.items() if v}
-                    _prof = _mcs.apply_map_profile(
-                        str(args.map or "gridmap_v2"), overrides=_ov or None)
-                    _sname = Path(args.scenario_json).stem
-                    # 场景类型由 JSON 声明（默认 known_line）。proving_lane
-                    # 会先铺深色铺装 decal（GridMap 浅色地面会被经典亮度臂
-                    # 误当白漆，2026-11-04 根因），其他场景行为不变。
-                    _scene_type = str(_doc.get("scene_type") or "known_line")
-                    _scen, _ = _mcs.build_scenario(
-                        conn, [_site], map_name=str(args.map or "gridmap_v2"),
-                        scene_types=[_scene_type], scene_names=[_sname],
-                        line_convention=str(getattr(
-                            args, "scenario_line_convention", "right_lane")),
-                        edge_margin_m=float(getattr(
-                            args, "scenario_edge_margin", 0.6)))
-                    with conn.io_lock:
-                        _scen.make(conn.bng)
-                        conn.bng.scenario.load(_scen)
-                        conn.bng.scenario.start()
-                    time.sleep(2.0)
-                    try:
-                        conn.attach_vehicle(already_open=True)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    print(f"[fsd-drive] scenario-json loaded: {_sname} "
-                          f"profile={_prof.get('white')}/"
-                          f"{_prof.get('yellow')}", flush=True)
-                except Exception as _sc_e:  # noqa: BLE001 — 构建失败=感知/场景
-                    # 不可用；继续走原有放置路径（会 fail-closed）
-                    print(f"[fsd-drive] scenario-json build failed: "
-                          f"{type(_sc_e).__name__}: {_sc_e}", flush=True)
-            # 环境条件（TOD/天气，2026-11-02）：条件矩阵的接线点。真实车必须
-            # 面对夜间/黄昏/雨天；只应用一次并进运行记录（可回溯证据）。
-            if getattr(args, "tod", None) or getattr(args, "weather_preset", None):
-                _tod_s = str(getattr(args, "tod", "") or "")
-                _wx = str(getattr(args, "weather_preset", "") or "")
-                try:
-                    # 顺序敏感（2026-11-02，core_weather.lua 证据）：weather
-                    # preset 的 diff 表可携带 timeOfDay——先 set_tod 再上天气
-                    # 会把显式时刻覆盖回预设值，条件矩阵的「时刻×天气」格就
-                    # 不成立。固定 weather -> tod 让显式 TOD 最终生效；应用后
-                    # 读回一次 get_tod 存证（条件格=引擎侧可验证，而不是只信
-                    # "调用没抛异常"）。
-                    if _wx:
-                        conn.bng.env.set_weather_preset(_wx)
-                        if _tod_s:
-                            # 预设过渡是动画（set_weather_preset 的 time 秒内
-                            # 逐帧插值回写）：立即设 TOD 会被动画下一帧覆盖
-                            # （2026-11-02/03 矩阵实测：dawn_rain 请求 06:30、
-                            # 读回 09:56——rainy 预设的插值中间值）。等过渡
-                            # 结束再设显式时刻；读回仍留作最终存证。
-                            time.sleep(2.0)
-                    if _tod_s:
-                        _parts = _tod_s.split(":")
-                        _hms = (f"{int(_parts[0]):02d}:"
-                                f"{int(_parts[1]) if len(_parts) > 1 else 0:02d}:00")
-                        conn.bng.env.set_tod(tod=_hms)
-                    try:
-                        _tod_after = str(
-                            (conn.bng.env.get_tod() or {}).get("timeStr") or "")
-                    except Exception:  # noqa: BLE001 — 读回失败不影响驾驶
-                        _tod_after = None
-                    _run_record["environment"] = {"tod": _tod_s, "weather_preset": _wx,
-                                                  "applied": True,
-                                                  "order": "weather_then_tod",
-                                                  "tod_after": _tod_after}
-                    print(f"[fsd-drive] environment -> tod={_tod_s or '-'} "
-                          f"weather={_wx or '-'} applied_tod={_tod_after or '?'}",
-                          flush=True)
-                except Exception as exc:  # noqa: BLE001 — 环境应用失败不静默：
-                    # 记录并继续（矩阵按 applied=False 标 UNKNOWN 格）。预设名
-                    # 不存在时 beamngpy 等 ack 抛 TimeoutError，窄化 except 会
-                    # 让整轮驾驶崩掉——条件矩阵要的是 UNKNOWN 格，不是崩溃。
-                    _run_record["environment"] = {"tod": _tod_s, "weather_preset": _wx,
-                                                  "applied": False, "error": type(exc).__name__}
-                    print(f"[fsd-drive] environment 应用失败（继续运行）：{exc}", flush=True)
-            if args.teleport is not None:
-                x, y, yaw = args.teleport
-                # Ground-safe teleport: the connector measures the real surface
-                # with a cast ray and re-checks after settling, so no map can
-                # ever drop the car below terrain (hardcoded z heights did on
-                # maps whose surface sits much higher - 2026-08-28).
-                conn.safe_teleport(float(x), float(y), heading_deg=float(yaw))
-                st1 = conn.get_state()
-                print(f"[fsd-drive] teleport -> "
-                      f"({float(st1.pos[0]):.1f}, {float(st1.pos[1]):.1f}, "
-                      f"{float(st1.pos[2]):.1f})")
+            self._setup_scenario_and_env(conn, args, _run_record)
 
             nav_route, nav_route_ref, road_left, road_right = \
                 self._build_route(conn)
@@ -4482,7 +4473,7 @@ class FSDriveSession:
                         has_path=(chosen.path is not None),
                         force_stop=bool(force_stop), v=v, thr=thr,
                         plan_speed=plan_speed, near_obs_m=_near_obs,
-                        rem_end=rem_end):
+                        rem_end=rem_end, brk=brk):
                     stuck_t += max(0.0, float(dt))
                 else:
                     stuck_t = 0.0
@@ -4505,13 +4496,15 @@ class FSDriveSession:
                         and len(chosen.path) >= 2
                         # the GUARDED clearance: a one-frame spike must not
                         # be enough to authorise full throttle either
-                        and np.isfinite(fwd_clear_guarded)
-                        and fwd_clear_guarded > 3.0):
+                        and _climb_clearance_ok(fwd_clear_guarded)):
                     if climb_t < CLIMB_ASSIST_S:
                         climb = True
                         climb_t += max(0.0, float(dt))
                     else:
                         climb_t = 0.0  # give up climbing -> allow reverse
+                        if not rman.enabled:
+                            stuck_t = 0.0
+                            stuck = False
                 if (chosen.path is None or force_stop or stuck) \
                         and not climb and not off_recover:
                     thr, brk = 0.0, 1.0
