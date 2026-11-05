@@ -416,6 +416,20 @@ def _trim_backtrack(route):
     return r
 
 
+def _save_probe_frame(out, pos, heading, path, t) -> None:
+    """按探针 npz 格式保存一帧 live 画面（采集/诊断；失败不阻断驾驶）。"""
+    if out is None or getattr(out, "frame", None) is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez_compressed(
+            path, frame=np.asarray(out.frame, dtype=np.uint8),
+            pos=np.asarray(pos, dtype=float), heading=float(heading),
+            cam=np.array([out.cam], dtype=object), t=float(t))
+    except (OSError, ValueError, TypeError):
+        return
+
+
 def _scenario_road_reference(scenario_json, pos, *, back_m: float = 10.0,
                              ahead_m: float = 80.0):
     """试车场参考线：场景 JSON 声明的道路中线（局部窗口）。
@@ -5756,6 +5770,12 @@ class FSDriveSession:
                     "substep_commands": _sub_receipts,
                 })
                 frames += 1
+                _fdir = getattr(args, "pairing_probe_frames_dir", None)
+                if _fdir:
+                    _save_probe_frame(
+                        out, pos, heading,
+                        Path(str(_fdir)) / f"frame_d{frames:05d}.npz",
+                        time.time() - t0)
                 if frames % 4 == 1:
                     _e2e_s = (f"e2e={e2e_ms:.0f}ms "
                               if e2e_ms is not None else "")
