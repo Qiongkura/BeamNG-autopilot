@@ -418,7 +418,8 @@ def collect(args) -> int:
                   f"ground_align={_ga}", flush=True)
         cmd = [sys.executable, str(ROOT / "scripts" / "m5_fsd_drive.py"),
                "--runtime", args.runtime, "--attach",
-               "--seconds", "1", "--max-wall-s", f"{wall_s:.1f}",
+               "--seconds", f"{float(args.drive_seconds):.1f}",
+               "--max-wall-s", f"{wall_s:.1f}",
                "--seg-model", args.model,
                "--pairing-probe-out", str(jsonl),
                "--out", str(out.with_suffix(".telemetry.json"))]
@@ -532,6 +533,9 @@ def main() -> int:
     ap.add_argument("--weather-preset", default=None)
     ap.add_argument("--frames", type=int, default=40,
                     help="最多分析的 tick 数（采集时按此估算墙钟）")
+    ap.add_argument("--drive-seconds", type=float, default=1.0,
+                    help="场景模式下 drive 的持续秒数（默认 1s=只覆盖放置；"
+                         "采集扩池用 20-60s 以获得更多保存帧）")
     ap.add_argument("--goal-ahead-m", type=float, default=60.0)
     ap.add_argument("--no-goal", action=argparse.BooleanOptionalAction,
                     default=True,

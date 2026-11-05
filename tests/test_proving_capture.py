@@ -70,3 +70,11 @@ def test_proving_env_is_diagnostic_config():
     assert m.PROVING_ENV == {"BEAMNG_CV_WHITE": "0",
                              "BEAMNG_LINE_MERGE": "0",
                              "BEAMNG_PAIR_WIDTH_NEAR": "1"}
+
+
+def test_capture_cmd_has_drive_window(tmp_path, monkeypatch):
+    m = _mod()
+    monkeypatch.setattr(m, "SITES_DIR", tmp_path)
+    (tmp_path / "S1.json").write_text("{}", encoding="utf-8")
+    cmd = m.capture_cmd("S1", "noon_rain", tmp_path / "probe.json", frames=60)
+    assert cmd[cmd.index("--drive-seconds") + 1] == "20"

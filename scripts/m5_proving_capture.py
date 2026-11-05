@@ -111,6 +111,8 @@ def capture_cmd(site: str, cell: str, out: Path, *, frames: int) -> list[str]:
         "--mat-gravel", "m_dirt_road_gravels",
         "--model", MODEL,
         "--frames", str(int(frames)), "--save-frames",
+        # 探针默认只跑 1s（放置期）；采集需要放置后的行驶窗口来攒帧。
+        "--drive-seconds", "20",
         "--tod", tod,
         "--out", str(out),
     ]
@@ -143,7 +145,7 @@ def _env_evidence(run_log: Path) -> dict:
     return info
 
 
-def capture(site: str, cell: str, *, frames: int = 30) -> int:
+def capture(site: str, cell: str, *, frames: int = 60) -> int:
     if site not in SITES:
         raise SystemExit(f"未知站点 {site!r}（可选 {sorted(SITES)}）")
     tod, preset = cell_args(cell)
@@ -212,7 +214,8 @@ def main() -> int:
     g.add_argument("--capture", action="store_true")
     ap.add_argument("--site", choices=tuple(SITES), default=None)
     ap.add_argument("--cell", default=None, help="例如 dawn_rain")
-    ap.add_argument("--frames", type=int, default=30)
+    ap.add_argument("--frames", type=int, default=60,
+                    help="探针分析 tick 数（约等于保存帧数；30 帧/格用 60）")
     args = ap.parse_args()
     if args.plan:
         return plan()
