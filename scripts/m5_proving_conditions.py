@@ -45,6 +45,7 @@ PROVING_ENV = {
 PASS_TRUE_RATE = 0.80       # 双侧配对真值率
 PASS_CERT_BOTH = 0.80       # GT 左右线都命中
 MIN_TICKS = 8               # 少于此 tick 数判 UNKNOWN
+DEFAULT_CELL_TIMEOUT_S = 480.0  # 单格硬超时（防止引擎退出后探针挂死阻塞整批）
 
 
 def _cells():
@@ -92,7 +93,16 @@ def _cell_cmd(tod: str, preset: str | None, out: Path) -> list[str]:
     return cmd
 
 
-def run(preset_filter: str | None = None) -> int:
+def _text_or_empty(val) -> str:
+    if val is None:
+        return ""
+    if isinstance(val, bytes):
+        return val.decode("utf-8", errors="replace")
+    return str(val)
+
+
+def run(preset_filter: str | None = None, *,
+        cell_timeout_s: float = DEFAULT_CELL_TIMEOUT_S) -> int:
     OUT_DIR.mkdir(parents=True, exist_ok=True)
     rows = []
     for tod_name, tod, wx_name, preset in _cells():
@@ -103,17 +113,28 @@ def run(preset_filter: str | None = None) -> int:
             print(f"[skip] {out.name} 已存在")
             continue
         print(f"[run] {out.name} tod={tod} weather={preset or '-'}", flush=True)
-        proc = subprocess.run(_cell_cmd(tod, preset, out), cwd=str(ROOT),
-                              capture_output=True, text=True,
-                              encoding="utf-8", errors="replace",
-                              env=_run_env())
-        # 注意：探针自己会写 <out>.run.log（内含 drive 的 environment 读回）；
-        # runner 的 stdout 必须另存，否则会把环境证据覆盖掉（2026-11-05 踩过）。
-        (OUT_DIR / (out.stem + ".probe.log")).write_text(
-            (proc.stdout or "") + "\n--- stderr ---\n" + (proc.stderr or ""),
-            encoding="utf-8")
-        rows.append({"cell": out.stem, "rc": proc.returncode,
-                     "out": str(out)})
+        try:
+            proc = subprocess.run(_cell_cmd(tod, preset, out), cwd=str(ROOT),
+                                  capture_output=True, text=True,
+                                  encoding="utf-8", errors="replace",
+                                  env=_run_env(),
+                                  timeout=float(cell_timeout_s))
+            # 注意：探针自己会写 <out>.run.log（内含 drive 的 environment 读回）；
+            # runner 的 stdout 必须另存，否则会把环境证据覆盖掉（2026-11-05 踩过）。
+            (OUT_DIR / (out.stem + ".probe.log")).write_text(
+                (proc.stdout or "") + "\n--- stderr ---\n" + (proc.stderr or ""),
+                encoding="utf-8")
+            rows.append({"cell": out.stem, "rc": proc.returncode,
+                         "out": str(out)})
+        except subprocess.TimeoutExpired as exc:
+            (OUT_DIR / (out.stem + ".probe.log")).write_text(
+                _text_or_empty(exc.stdout)
+                + "\n--- stderr ---\n"
+                + _text_or_empty(exc.stderr)
+                + f"\n--- timeout ({float(cell_timeout_s):.1f}s) ---\n",
+                encoding="utf-8")
+            rows.append({"cell": out.stem, "rc": -9, "timeout": True,
+                         "out": str(out)})
     print(json.dumps(rows, ensure_ascii=False, indent=1))
     return 0
 
@@ -211,11 +232,14 @@ def main() -> int:
     g.add_argument("--score", action="store_true")
     ap.add_argument("--weather", choices=tuple(WEATHERS), default=None,
                     help="只跑某一档天气（省略=全部 12 格）")
+    ap.add_argument("--cell-timeout-s", type=float,
+                    default=DEFAULT_CELL_TIMEOUT_S,
+                    help="单格硬超时秒数（默认 480s）")
     args = ap.parse_args()
     if args.plan:
         return plan()
     if args.run:
-        return run(args.weather)
+        return run(args.weather, cell_timeout_s=args.cell_timeout_s)
     return score()
 
 

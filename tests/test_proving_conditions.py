@@ -71,3 +71,38 @@ def test_runner_keeps_drive_log_for_env_readback():
            / "scripts" / "m5_proving_conditions.py").read_text("utf-8")
     assert '".probe.log"' in src
     assert '".run.log").write_text' not in src
+
+
+def test_run_handles_cell_timeout_and_continues(tmp_path, monkeypatch, capsys):
+    """单格挂死触发 TimeoutExpired 时，写 .probe.log、记录 rc=-9 并继续下一格。"""
+    import json
+    import subprocess
+    from types import SimpleNamespace
+
+    m = _mod()
+    monkeypatch.setattr(m, "OUT_DIR", tmp_path)
+    calls = []
+
+    def fake_run(cmd, **kw):
+        calls.append((cmd, kw.get("timeout")))
+        if len(calls) == 1:
+            raise subprocess.TimeoutExpired(
+                cmd=cmd, timeout=kw.get("timeout", 1.0),
+                output="partial stdout", stderr="partial stderr")
+        return SimpleNamespace(returncode=0, stdout="ok out", stderr="")
+
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    assert m.run("clear", cell_timeout_s=12.5) == 0
+    assert len(calls) == 4  # dawn/noon/dusk/night × clear 全部跑完，未被第 1 格卡死
+    assert all(t == 12.5 for _, t in calls)
+
+    probe_log = (tmp_path / "gridmap_dawn_clear.probe.log").read_text("utf-8")
+    assert "partial stdout" in probe_log
+    assert "timeout (12.5s)" in probe_log
+
+    out_lines = capsys.readouterr().out
+    rows = json.loads(out_lines[out_lines.index("[\n"):])
+    assert rows[0]["cell"] == "gridmap_dawn_clear"
+    assert rows[0]["rc"] == -9 and rows[0]["timeout"] is True
+    assert rows[1]["rc"] == 0
+
