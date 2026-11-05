@@ -107,7 +107,9 @@ def run(preset_filter: str | None = None) -> int:
                               capture_output=True, text=True,
                               encoding="utf-8", errors="replace",
                               env=_run_env())
-        (OUT_DIR / (out.stem + ".run.log")).write_text(
+        # 注意：探针自己会写 <out>.run.log（内含 drive 的 environment 读回）；
+        # runner 的 stdout 必须另存，否则会把环境证据覆盖掉（2026-11-05 踩过）。
+        (OUT_DIR / (out.stem + ".probe.log")).write_text(
             (proc.stdout or "") + "\n--- stderr ---\n" + (proc.stderr or ""),
             encoding="utf-8")
         rows.append({"cell": out.stem, "rc": proc.returncode,

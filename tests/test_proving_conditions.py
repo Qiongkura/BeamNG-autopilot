@@ -63,3 +63,11 @@ def test_score_unknown_on_too_few_ticks(tmp_path):
                    encoding="utf-8")
     row = m._score_cell(_report(ticks=3, true_n=3), log)
     assert row["status"] == "UNKNOWN", row
+
+
+def test_runner_keeps_drive_log_for_env_readback():
+    """runner 的 stdout 必须写 .probe.log；.run.log 是探针保存的 drive 输出。"""
+    src = (Path(__file__).resolve().parents[1]
+           / "scripts" / "m5_proving_conditions.py").read_text("utf-8")
+    assert '".probe.log"' in src
+    assert '".run.log").write_text' not in src
