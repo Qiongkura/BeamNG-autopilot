@@ -1870,19 +1870,22 @@ class FSDriveSession:
             # 线右侧；若退化成"过自车的直线"，车道中心与参考线重合，
             # strict 的 -0.2m 门必然拒绝——这是原地/起步后 reject=side 的
             # 根因（2026-11-05 逐帧遥测）。
+            _ref_msg = None
             if getattr(args, "scenario_json", None):
                 _ref = _scenario_road_reference(
                     args.scenario_json, conn.get_state().pos)
                 if _ref is not None and len(_ref) >= 4:
                     nav_route_ref = _ref
-                    print("[fsd-drive] scenario road-centre reference: "
-                          f"{len(nav_route_ref)} pts "
-                          f"(lane keeps its own centre)")
+                    _ref_msg = ("[fsd-drive] scenario road-centre reference: "
+                                f"{len(nav_route_ref)} pts "
+                                "(lane keeps its own centre)")
                 else:
-                    print("[fsd-drive] scenario road reference failed")
-            if nav_route_ref is None:
-                print("[fsd-drive] no nav route set; falling back to "
-                      "straight-ahead reference")
+                    _ref_msg = "[fsd-drive] scenario road reference failed"
+            if nav_route_ref is None and _ref_msg is None:
+                _ref_msg = ("[fsd-drive] no nav route set; falling back to "
+                            "straight-ahead reference")
+            if _ref_msg:
+                print(_ref_msg)
 
         return nav_route, nav_route_ref, road_left, road_right
 
@@ -2979,10 +2982,7 @@ class FSDriveSession:
                 # route tail is a map prior that can cut through a corner
                 # wall when the car drifts (town runs 2026-08-21) - the
                 # local forward route is what the planner may follow.
-                # 无地图路线时用场景道路中线作参考（仅试车场；避免侧向门
-                # 拿"过自车的直线"当道路中线而必然拒绝本车道中心）。
-                _route_src = nav_route if nav_route is not None else nav_route_ref
-                route_local = local_route(pos, heading, _route_src)
+                route_local = local_route(pos, heading, nav_route if nav_route is not None else nav_route_ref)
                 # Strict FSD never even builds the map-prior lane: the
                 # route is navigation intent, not a lateral reference.
                 _strict_lane = bool(
