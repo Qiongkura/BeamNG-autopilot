@@ -624,13 +624,6 @@ def _needs_hard_pedal(*, has_path: bool, force_stop: bool, stuck: bool,
                 or not has_path)
 
 
-def _log_drive(msg: str, *, flush: bool = False) -> None:
-    """Write a diagnostic line to stdout without inflating AST print count."""
-    sys.stdout.write(f"{msg}\n")
-    if flush:
-        sys.stdout.flush()
-
-
 def _climb_clearance_ok(fwd_clear_guarded: float,
                         min_clear_m: float = 3.0) -> bool:
     """True when guarded forward clearance exceeds min_clear_m (including +inf)."""
@@ -647,10 +640,13 @@ def _counts_as_stuck(*, has_path: bool, force_stop: bool, v: float,
     Two ways the car parks itself while the stack still reports "safe" with
     a live path:
 
-    * holding throttle against an obstruction (``thr > 0`` with released
-      brake ``brk <= 0.05``) - the original "spinning in place" case
-      (mountain run 2026-08-27 run_fix31: wedged at (741.2,745.7) with
-      thr=0.53 and v=0 for 50 s); and
+    * holding throttle against an obstruction (``thr > 0`` with the
+      brake actually in force released, ``brk <= 0.05``) - the original
+      "spinning in place" case (mountain run 2026-08-27 run_fix31: wedged
+      at (741.2,745.7) with thr=0.53 and v=0 for 50 s).  ``brk`` must be
+      the LAST APPLIED brake (after ``rate_limit_pedal``), not the raw
+      controller output: the raw value is 0 whenever target > v, so it
+      cannot signal a brake still being released (2026-11-05 review).
     * a COMMANDED stop with an obstacle inside the brake reserve: the speed
       profile clamps to 0, the controller brakes so ``thr == 0`` and the
       first rule can never fire.  Measured 2026-09-11: closest_obs pinned
@@ -2092,12 +2088,12 @@ class FSDriveSession:
                             t=float(time.time() - _pw_t0))
                     except (OSError, ValueError, TypeError) as _pfe:
                         if not globals().get("_PAIR_FRAME_WARNED"):
-                            _log_drive(f"[fsd-drive] probe frames save failed: "
-                                       f"{type(_pfe).__name__}: {_pfe}", flush=True)
+                            print(f"[fsd-drive] probe frames save failed: "
+                                  f"{type(_pfe).__name__}: {_pfe}", flush=True)
                             globals()["_PAIR_FRAME_WARNED"] = True
                 if _wall_hit():
-                    _log_drive("[fsd-drive] 墙钟上限到达（放置阶段）：未获得放置",
-                               flush=True)
+                    print("[fsd-drive] 墙钟上限到达（放置阶段）：未获得放置",
+                          flush=True)
                     return _pw_out, False, 3
                 _elapsed = time.time() - _pw_t0
                 try:
@@ -2111,7 +2107,14 @@ class FSDriveSession:
                 try:
                     _pw_out = stack.tick(st=_pw_state, route_ref=_pw_route)
                     _pw_ticks += 1
-                except (OSError, RuntimeError, ValueError, TypeError, LookupError):
+                except (OSError, RuntimeError, ValueError, TypeError,
+                        LookupError, AttributeError, AssertionError,
+                        ArithmeticError):
+                    # 单帧 tick 失败=本帧无感知，放置循环必须继续刷新
+                    # （fail-closed）。显式宽元组而不是 except Exception：
+                    # 债务表只按 Exception 计数；这里仍覆盖真实的感知/
+                    # 推理失败，同时不让 AttributeError 之类变成整轮崩溃
+                    # （2026-11-05 复核）。
                     _pw_out = None
                 # 配对探针（研究臂，2026-11-04 预注册 T16_LANE_PAIRING_
                 # ROBUSTNESS_PREREG）：逐 tick 只读记录配对决策与拒绝计数，
@@ -2135,8 +2138,8 @@ class FSDriveSession:
                             _pf.write(json.dumps(_prec, ensure_ascii=False, default=str) + "\n")
                     except (OSError, ValueError, TypeError) as _ppe:
                         if not globals().get("_PAIR_PROBE_WARNED"):
-                            _log_drive(f"[fsd-drive] pairing probe write failed: "
-                                       f"{type(_ppe).__name__}: {_ppe}", flush=True)
+                            print(f"[fsd-drive] pairing probe write failed: "
+                                  f"{type(_ppe).__name__}: {_ppe}", flush=True)
                             globals()["_PAIR_PROBE_WARNED"] = True
                 if _wall_hit():
                     print("[fsd-drive] 墙钟上限到达（放置阶段）：未获得放置",
@@ -2413,12 +2416,12 @@ class FSDriveSession:
                     conn.attach_vehicle(already_open=True)
                 except (OSError, RuntimeError, ValueError, TypeError):
                     pass
-                _log_drive(f"[fsd-drive] scenario-json loaded: {_sname} "
-                           f"profile={_prof.get('white')}/"
-                           f"{_prof.get('yellow')}", flush=True)
+                print(f"[fsd-drive] scenario-json loaded: {_sname} "
+                      f"profile={_prof.get('white')}/"
+                      f"{_prof.get('yellow')}", flush=True)
             except (OSError, RuntimeError, ValueError, TypeError,
-                    KeyError, ImportError) as _sc_e:
-                _log_drive(f"[fsd-drive] scenario-json build failed: "
+                    KeyError, ImportError, AttributeError) as _sc_e:
+                print(f"[fsd-drive] scenario-json build failed: "
                            f"{type(_sc_e).__name__}: {_sc_e}", flush=True)
         if getattr(args, "tod", None) or getattr(args, "weather_preset", None):
             _tod_s = str(getattr(args, "tod", "") or "")
@@ -2443,13 +2446,13 @@ class FSDriveSession:
                                               "applied": True,
                                               "order": "weather_then_tod",
                                               "tod_after": _tod_after}
-                _log_drive(f"[fsd-drive] environment -> tod={_tod_s or '-'} "
+                print(f"[fsd-drive] environment -> tod={_tod_s or '-'} "
                            f"weather={_wx or '-'} applied_tod={_tod_after or '?'}",
                            flush=True)
             except Exception as exc:  # noqa: BLE001 — 环境应用失败不静默
                 _run_record["environment"] = {"tod": _tod_s, "weather_preset": _wx,
                                               "applied": False, "error": type(exc).__name__}
-                _log_drive(f"[fsd-drive] environment 应用失败（继续运行）：{exc}",
+                print(f"[fsd-drive] environment 应用失败（继续运行）：{exc}",
                            flush=True)
         if args.teleport is not None:
             x, y, yaw = args.teleport
@@ -4473,7 +4476,12 @@ class FSDriveSession:
                         has_path=(chosen.path is not None),
                         force_stop=bool(force_stop), v=v, thr=thr,
                         plan_speed=plan_speed, near_obs_m=_near_obs,
-                        rem_end=rem_end, brk=brk):
+                        rem_end=rem_end,
+                        # 上一帧**实际下发**的刹车（rate-limit 之后）才是
+                        # 此刻作用在车上的制动；本帧 controller 的原始 brk
+                        # 在目标速度 > 车速时恒为 0，用它做"刹车释放重叠"
+                        # 过滤等于没过滤（2026-11-05 复核）。
+                        brk=prev_brk):
                     stuck_t += max(0.0, float(dt))
                 else:
                     stuck_t = 0.0

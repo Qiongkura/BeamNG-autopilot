@@ -648,3 +648,17 @@ def test_climb_clearance_ok_accepts_infinite_clearance() -> None:
     assert not fsd_drive._climb_clearance_ok(2.5)
     assert not fsd_drive._climb_clearance_ok(float("nan"))
 
+
+
+def test_stuck_detector_receives_last_applied_brake() -> None:
+    """The stuck filter must see the brake actually in force (prev_brk).
+
+    The raw controller brake is 0 whenever target > v, so passing it made
+    ``brk <= 0.05`` always true and the brake-release overlap filter a
+    no-op (2026-11-05 review).
+    """
+    from pathlib import Path
+    src = (Path(__file__).resolve().parents[1] / "beamng_autopilot"
+           / "fsd_drive.py").read_text("utf-8")
+    assert "brk=prev_brk" in src
+    assert "_log_drive" not in src
