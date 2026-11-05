@@ -345,8 +345,8 @@
   },
   "beamng_autopilot/fsd_drive.py": {
    "except_exception": 77,
-   "lines": 5896,
-   "max_func_lines": 3427,
+   "lines": 5963,
+   "max_func_lines": 3433,
    "prints": 90,
    "silent_except": 18
   },
@@ -1003,7 +1003,7 @@
   },
   "beamng_autopilot/vision/lanes.py": {
    "except_exception": 5,
-   "lines": 1557,
+   "lines": 1587,
    "max_func_lines": 188,
    "prints": 0,
    "silent_except": 0
@@ -1163,7 +1163,7 @@
  ],
  "totals": {
   "except_exception": 331,
-  "max_func_lines": 3427,
+  "max_func_lines": 3433,
   "prints": 169,
   "silent_except": 58
  },
