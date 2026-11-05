@@ -416,6 +416,33 @@ def _trim_backtrack(route):
     return r
 
 
+def _scenario_road_reference(scenario_json, pos, *, back_m: float = 10.0,
+                             ahead_m: float = 80.0):
+    """试车场参考线：场景 JSON 声明的道路中线（局部窗口）。
+
+    只作 ``route_ref``，不设 ``nav_route``：snap 会把自车从车道中心拉回
+    道路中心。没有它时 stack 用"过自车的直线"当路线，strict 侧向门要求
+    本车道中心在参考线右侧 ≥0.2m，必然拒绝（2026-11-05 试车场 reject=side
+    根因）。返回 None 表示场景文件不可用/方向退化。
+    """
+    try:
+        doc = json.loads(Path(scenario_json).read_text(encoding="utf-8"))
+        sc = doc["scene"]
+        mid = np.asarray(sc["mid"][:2], dtype=float)
+        d = np.asarray(sc["dir"][:2], dtype=float)
+        n = float(np.linalg.norm(d))
+        if n <= 1e-9:
+            return None
+        d = d / n
+        p0 = np.asarray(pos[:2], dtype=float)
+        s0 = float((p0 - mid) @ d)
+        ss = np.arange(s0 - float(back_m), s0 + float(ahead_m), 1.0)
+        return mid[None, :] + ss[:, None] * d[None, :]
+    except (OSError, ValueError, TypeError, KeyError):
+        return None
+
+
+
 def _painted_line_lat(out, pos, heading, marks=None):
     """Painted centre-line lateral relative to the ego (left = +).
 
@@ -1837,8 +1864,25 @@ class FSDriveSession:
                 _n = _spawn_traffic(conn, nav_route, int(args.traffic))
                 print(f"[fsd-drive] traffic NPCs spawned: {_n}/{args.traffic}")
         else:
-            print("[fsd-drive] no nav route set; falling back to "
-                  "straight-ahead reference")
+            # 试车场（--scenario-json）：没有地图路线时，用场景声明的道路
+            # 中线作**参考线**（不是行驶路线：不设 nav_route，避免 snap
+            # 把自车从车道中心拉回道路中心）。侧向门要求本车道中心在参考
+            # 线右侧；若退化成"过自车的直线"，车道中心与参考线重合，
+            # strict 的 -0.2m 门必然拒绝——这是原地/起步后 reject=side 的
+            # 根因（2026-11-05 逐帧遥测）。
+            if getattr(args, "scenario_json", None):
+                _ref = _scenario_road_reference(
+                    args.scenario_json, conn.get_state().pos)
+                if _ref is not None and len(_ref) >= 4:
+                    nav_route_ref = _ref
+                    print("[fsd-drive] scenario road-centre reference: "
+                          f"{len(nav_route_ref)} pts "
+                          f"(lane keeps its own centre)")
+                else:
+                    print("[fsd-drive] scenario road reference failed")
+            if nav_route_ref is None:
+                print("[fsd-drive] no nav route set; falling back to "
+                      "straight-ahead reference")
 
         return nav_route, nav_route_ref, road_left, road_right
 
@@ -2935,7 +2979,10 @@ class FSDriveSession:
                 # route tail is a map prior that can cut through a corner
                 # wall when the car drifts (town runs 2026-08-21) - the
                 # local forward route is what the planner may follow.
-                route_local = local_route(pos, heading, nav_route)
+                # 无地图路线时用场景道路中线作参考（仅试车场；避免侧向门
+                # 拿"过自车的直线"当道路中线而必然拒绝本车道中心）。
+                _route_src = nav_route if nav_route is not None else nav_route_ref
+                route_local = local_route(pos, heading, _route_src)
                 # Strict FSD never even builds the map-prior lane: the
                 # route is navigation intent, not a lateral reference.
                 _strict_lane = bool(

@@ -662,3 +662,29 @@ def test_stuck_detector_receives_last_applied_brake() -> None:
            / "fsd_drive.py").read_text("utf-8")
     assert "brk=prev_brk" in src
     assert "_log_drive" not in src
+
+
+def test_scenario_road_reference_follows_scene_centreline(tmp_path):
+    import json
+    import numpy as np
+    scene = {"scene": {"mid": [40.0, -612.0, 100.0],
+                       "dir": [-1.0, 0.0, 0.0]}}
+    p = tmp_path / "scene.json"
+    p.write_text(json.dumps(scene), encoding="utf-8")
+    ref = fsd_drive._scenario_road_reference(
+        str(p), np.array([40.0, -610.9, 100.1]))
+    assert ref is not None and len(ref) >= 4
+    assert np.allclose(ref[:, 1], -612.0)      # 道路中线，不是自车线
+    assert ref[0, 0] > ref[-1, 0]              # 沿场景 dir（-x）向前
+
+
+def test_scenario_road_reference_degenerate_and_missing(tmp_path):
+    import json
+    import numpy as np
+    bad = tmp_path / "bad.json"
+    bad.write_text(json.dumps({"scene": {"mid": [0, 0, 0],
+                                         "dir": [0, 0, 0]}}), encoding="utf-8")
+    assert fsd_drive._scenario_road_reference(
+        str(bad), np.array([0.0, 0.0])) is None
+    assert fsd_drive._scenario_road_reference(
+        str(tmp_path / "missing.json"), np.array([0.0, 0.0])) is None
