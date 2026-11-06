@@ -47,7 +47,8 @@ def test_capture_result_requires_all_independent_evidence():
     result = m.assess_capture_result(**good)
     assert result == {"status": "EVIDENCE_READY", "reasons": [],
                       "training_qualified": False}
-    for name, bad in (("returncode", 1), ("returncode", True),
+    for name, bad in (("minimum_frames", 0), ("minimum_frames", True),
+                      ("returncode", 1), ("returncode", True),
                       ("timed_out", None), ("frame_count", 19),
                       ("frame_count", None), ("ownership_verified", None),
                       ("environment", {"tod_matches": True}),

@@ -174,6 +174,11 @@ def assess_capture_result(*, returncode, timed_out, frame_count, environment,
     or certify frame provenance; those require separate evidence.
     """
     reasons = []
+    if type(minimum_frames) is not int or minimum_frames < 20:
+        # Preregistered minimum is 20: invalid or lowered thresholds cannot
+        # make an incomplete attempt appear evidence-ready.
+        reasons.append("invalid_minimum_frames")
+        minimum_frames = 20
     if timed_out is not False:
         reasons.append("timeout_or_unknown")
     if type(returncode) is not int or returncode != 0:
