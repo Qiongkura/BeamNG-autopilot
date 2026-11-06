@@ -67,7 +67,7 @@ try {
         $(if ($debtRc -eq 0) { 'PASS' } else { 'FAIL' }),
         $(if ($idxRc -eq 0) { 'PASS' } else { 'FAIL' })) -ForegroundColor `
         $(if (($pytestRc -eq 0) -and ($offRc -eq 0) -and ($debtRc -eq 0) -and ($idxRc -eq 0)) { 'Green' } else { 'Red' })
-    exit ([int]($pytestRc -ne 0) -bor ([int]($offRc -ne 0)) -bor ([int]($debtRc -ne 0)) -bor ([int]($idxRc -ne 0))
+    exit ([int]($pytestRc -ne 0) -bor ([int]($offRc -ne 0)) -bor ([int]($debtRc -ne 0)) -bor ([int]($idxRc -ne 0)))
 }
 finally {
     $env:PYTHONUTF8 = $savedPythonUtf8
