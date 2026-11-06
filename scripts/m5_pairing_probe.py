@@ -319,6 +319,30 @@ def _site_from_scene(scene_doc: dict) -> dict:
     }
 
 
+def _apply_environment(conn, tod: str | None, weather: str | None) -> dict:
+    """应用并读回条件；失败/读回缺失都返回 invalid，不伪造成功。"""
+    rec = {"tod_requested": tod, "weather_requested": weather,
+           "tod_after": None, "weather_after": None,
+           "weather_readback": "UNKNOWN", "valid": False}
+    try:
+        if weather:
+            conn.bng.env.set_weather_preset(weather)
+        if tod:
+            parts = str(tod).split(":")
+            hms = f"{int(parts[0]):02d}:{int(parts[1]) if len(parts) > 1 else 0:02d}:00"
+            conn.bng.env.set_tod(tod=hms)
+        read = conn.bng.env.get_tod() or {}
+        rec["tod_after"] = str(read.get("timeStr") or "") or None
+        # 当前 API 没有可靠的 weather getter：requested weather 只能记录，
+        # 不能冒充独立读回。因此运动学正式采集在 weather 非空时保持 blocked。
+        rec["weather_after"] = None
+        rec["valid"] = bool((not weather) and tod and
+                            rec["tod_after"] == f"{tod}:00")
+    except (OSError, RuntimeError, ValueError, TypeError, KeyError, AttributeError) as exc:
+        rec["error"] = f"{type(exc).__name__}: {exc}"
+    return rec
+
+
 def collect(args) -> int:
     if getattr(args, "kinematic_capture", False):
         # Block before connecting: a free port / existing process is not proof
@@ -432,6 +456,14 @@ def collect(args) -> int:
                   f"ground_align={_ga}", flush=True)
         if getattr(args, "kinematic_capture", False):
             # 运动学步进采集：不启动 fsd_drive，与模型能力完全解耦。
+            _env = _apply_environment(conn, args.tod, args.weather_preset)
+            if not _env["valid"]:
+                print(f"[pairing-probe] BLOCKED: environment readback invalid {_env}",
+                      file=sys.stderr)
+                out.write_text(json.dumps({"schema": "pairing-probe-v2",
+                                           "environment": _env}, ensure_ascii=False),
+                               encoding="utf-8")
+                return 3
             _kdir = (out.with_suffix(".frames")
                      if getattr(args, "save_frames", False) else out.parent)
             _k = kinematic_capture(

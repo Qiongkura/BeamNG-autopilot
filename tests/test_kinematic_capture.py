@@ -166,3 +166,27 @@ def test_missing_camera_writes_nothing_but_does_not_raise(tmp_path,
                                  yaw_jitter_deg=0.0, settle_s=0.0)
     assert info["saved"] == 0
     assert not list(tmp_path.glob("frame_*.npz"))
+
+
+def test_environment_readback_requires_tod_and_rejects_unread_weather(monkeypatch):
+    mod = _load()
+
+    class Env:
+        def set_tod(self, tod):
+            self.tod = tod
+        def set_weather_preset(self, value):
+            self.weather = value
+        def get_tod(self):
+            return {"timeStr": "06:30:00"}
+
+    class Bng:
+        env = Env()
+
+    class Conn:
+        bng = Bng()
+
+    clear = mod._apply_environment(Conn(), "06:30", None)
+    assert clear["valid"] is True and clear["tod_after"] == "06:30:00"
+    rain = mod._apply_environment(Conn(), "06:30", "rainy")
+    assert rain["valid"] is False
+    assert rain["weather_readback"] == "UNKNOWN"
