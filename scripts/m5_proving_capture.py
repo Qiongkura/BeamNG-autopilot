@@ -14,6 +14,7 @@ RGB 帧、位姿、相机模型逐 tick 落盘；环境读回与探针汇总一�
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import subprocess
@@ -190,6 +191,57 @@ def assess_capture_result(*, returncode, timed_out, frame_count, environment,
     # prove actual frame identity, sensor freshness or training qualification.
     return {"status": "INCOMPLETE" if reasons else "EVIDENCE_READY",
             "reasons": reasons, "training_qualified": False}
+
+
+def verify_frame_manifest(frame_dir: Path, entries: list[dict]) -> dict:
+    """只读验证声明的帧文件；这不是新鲜度或采集所有权证明。
+
+    清单必须非空、文件名唯一且是目录内的普通 npz 文件，所有 SHA-256
+    必须与文件内容一致。额外或缺失文件均失败，避免旧帧混入本次统计。
+    不解压或加载不可信的 pickle，也不写任何产物。
+    """
+    root = Path(frame_dir).resolve()
+    errors = []
+    declared = set()
+    if not root.is_dir() or not isinstance(entries, list) or not entries:
+        return {"valid": False, "errors": ["missing_directory_or_entries"]}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            errors.append("invalid_entry")
+            continue
+        name, digest = entry.get("file"), entry.get("sha256")
+        if (not isinstance(name, str) or not name or Path(name).name != name
+                or not name.lower().endswith(".npz")):
+            errors.append("invalid_filename")
+            continue
+        if name in declared:
+            errors.append(f"duplicate:{name}")
+            continue
+        declared.add(name)
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)):
+            errors.append(f"invalid_digest:{name}")
+            continue
+        path = root / name
+        try:
+            if path.is_symlink() or not path.is_file() or path.resolve().parent != root:
+                errors.append(f"missing_or_unsafe:{name}")
+                continue
+            h = hashlib.sha256()
+            with path.open("rb") as stream:
+                for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                    h.update(chunk)
+            if h.hexdigest() != digest:
+                errors.append(f"digest_mismatch:{name}")
+        except OSError:
+            errors.append(f"unreadable:{name}")
+    actual = {p.name for p in root.glob("*.npz")}
+    for name in sorted(actual - declared):
+        errors.append(f"unlisted:{name}")
+    for name in sorted(declared - actual):
+        errors.append(f"missing:{name}")
+    return {"valid": not errors, "errors": errors,
+            "declared_count": len(declared), "actual_count": len(actual)}
 
 
 def _game_pids() -> set[int] | None:

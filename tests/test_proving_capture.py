@@ -60,6 +60,24 @@ def test_capture_result_requires_all_independent_evidence():
         assert result["training_qualified"] is False
 
 
+def test_frame_manifest_checks_hash_membership_and_duplicates(tmp_path):
+    import hashlib
+    m = _mod()
+    f = tmp_path / "frame_001.npz"
+    f.write_bytes(b"original")
+    entry = {"file": f.name, "sha256": hashlib.sha256(b"original").hexdigest()}
+    assert m.verify_frame_manifest(tmp_path, [entry])["valid"] is True
+    assert not m.verify_frame_manifest(tmp_path, [entry, entry])["valid"]
+    f.write_bytes(b"changed")
+    assert "digest_mismatch:frame_001.npz" in m.verify_frame_manifest(tmp_path, [entry])["errors"]
+    f.write_bytes(b"original")
+    (tmp_path / "old.npz").write_bytes(b"old")
+    assert "unlisted:old.npz" in m.verify_frame_manifest(tmp_path, [entry])["errors"]
+    assert not m.verify_frame_manifest(tmp_path, [{"file": "../outside.npz",
+                                                    "sha256": "0" * 64}])["valid"]
+    assert not m.verify_frame_manifest(tmp_path, [])["valid"]
+
+
 def test_sites_exclude_eval_geometry():
     m = _mod()
     assert set(m.SITES) == {"S1", "S2", "S3", "P"}
