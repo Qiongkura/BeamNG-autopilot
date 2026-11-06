@@ -39,6 +39,27 @@ def test_direct_capture_and_cleanup_refuse_without_touching_resources(tmp_path, 
     assert list(tmp_path.iterdir()) == []
 
 
+def test_capture_result_requires_all_independent_evidence():
+    m = _mod()
+    good = dict(returncode=0, timed_out=False, frame_count=20,
+                environment={"tod_matches": True, "weather_matches": True},
+                ownership_verified=True)
+    result = m.assess_capture_result(**good)
+    assert result == {"status": "EVIDENCE_READY", "reasons": [],
+                      "training_qualified": False}
+    for name, bad in (("returncode", 1), ("returncode", True),
+                      ("timed_out", None), ("frame_count", 19),
+                      ("frame_count", None), ("ownership_verified", None),
+                      ("environment", {"tod_matches": True}),
+                      ("environment", {"tod_matches": False,
+                                       "weather_matches": True})):
+        args = dict(good)
+        args[name] = bad
+        result = m.assess_capture_result(**args)
+        assert result["status"] == "INCOMPLETE" and result["reasons"], (name, bad)
+        assert result["training_qualified"] is False
+
+
 def test_sites_exclude_eval_geometry():
     m = _mod()
     assert set(m.SITES) == {"S1", "S2", "S3", "P"}

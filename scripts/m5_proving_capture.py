@@ -163,6 +163,35 @@ def _env_evidence(run_log: Path) -> dict:
     return info
 
 
+def assess_capture_result(*, returncode, timed_out, frame_count, environment,
+                          ownership_verified, minimum_frames=20):
+    """Classify one attempt without performing IO or authorising capture.
+
+    Missing, malformed or non-boolean evidence is UNKNOWN, not success.
+    ``weather_matches`` must come from an independent readback, never from
+    echoing the requested weather. This helper does not establish ownership
+    or certify frame provenance; those require separate evidence.
+    """
+    reasons = []
+    if timed_out is not False:
+        reasons.append("timeout_or_unknown")
+    if type(returncode) is not int or returncode != 0:
+        reasons.append("subprocess_failed_or_unknown")
+    if type(frame_count) is not int or frame_count < minimum_frames:
+        reasons.append("insufficient_or_unknown_frames")
+    if ownership_verified is not True:
+        reasons.append("ownership_unverified")
+    env = environment if isinstance(environment, dict) else {}
+    if env.get("tod_matches") is not True:
+        reasons.append("tod_mismatch_or_unknown")
+    if env.get("weather_matches") is not True:
+        reasons.append("weather_mismatch_or_unknown")
+    # Even matching environment and a successful process do not by themselves
+    # prove actual frame identity, sensor freshness or training qualification.
+    return {"status": "INCOMPLETE" if reasons else "EVIDENCE_READY",
+            "reasons": reasons, "training_qualified": False}
+
+
 def _game_pids() -> set[int] | None:
     """游戏进程集合；探测失败返回 None，绝不伪装成空集合。"""
     try:
