@@ -633,10 +633,20 @@ def kinematic_capture(conn, scene_doc: dict, out_dir: Path, *,
     import time as _time
     import numpy as _np
 
+    values = (step_m, span_m, lateral_jitter, yaw_jitter_deg, settle_s)
+    if (not all(_np.isfinite(float(v)) for v in values)
+            or float(step_m) <= 0 or float(span_m) < 4.0
+            or float(lateral_jitter) < 0 or float(yaw_jitter_deg) < 0
+            or float(settle_s) < 0 or type(frames_per_station) is not int
+            or frames_per_station <= 0):
+        raise ValueError("invalid kinematic capture parameters")
     sc = scene_doc["scene"]
     mid = _np.asarray(sc["mid"], dtype=float)
     d = _np.asarray(sc["dir"], dtype=float)[:2]
-    d = d / max(1e-9, float(_np.linalg.norm(d)))
+    if (mid.shape != (3,) or d.shape != (2,) or not _np.isfinite(mid).all()
+            or not _np.isfinite(d).all() or float(_np.linalg.norm(d)) <= 1e-9):
+        raise ValueError("invalid kinematic scene geometry")
+    d = d / float(_np.linalg.norm(d))
     left = _np.array([-d[1], d[0]])
     yaw0 = float(_np.degrees(_np.arctan2(d[1], d[0])))
 

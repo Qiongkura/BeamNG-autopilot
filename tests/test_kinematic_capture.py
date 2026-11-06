@@ -15,6 +15,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -78,6 +79,30 @@ class _FakeRing:
 def _scene(mid=(300.0, 700.0, 100.0), direction=(0.0, 1.0, 0.0)):
     return {"scene": {"mid": list(mid), "dir": list(direction),
                       "half_width_m": 3.5}}
+
+
+@pytest.mark.parametrize("overrides", [
+    {"step_m": 0}, {"step_m": -1}, {"step_m": float("nan")},
+    {"span_m": float("inf")}, {"span_m": 3}, {"settle_s": -1},
+    {"lateral_jitter": -1}, {"yaw_jitter_deg": float("inf")},
+    {"frames_per_station": 0}, {"frames_per_station": True},
+])
+def test_invalid_kinematic_parameters_fail_before_resources(tmp_path, monkeypatch, overrides):
+    mod = _load()
+    conn = _FakeConn()
+    def forbidden(*args, **kwargs):
+        pytest.fail("camera must not open for invalid input")
+    monkeypatch.setattr("beamng_autopilot_tech.providers.TechCameraRingProvider", forbidden)
+    with pytest.raises(ValueError):
+        mod.kinematic_capture(conn, _scene(), tmp_path / "new", **overrides)
+    assert not (tmp_path / "new").exists()
+    assert conn.calls == []
+
+
+def test_invalid_kinematic_direction_rejected(tmp_path):
+    with pytest.raises(ValueError, match="geometry"):
+        _load().kinematic_capture(_FakeConn(), _scene(direction=(0, 0, 0)), tmp_path / "new")
+    assert not (tmp_path / "new").exists()
 
 
 def test_kinematic_capture_walks_the_whole_span(tmp_path, monkeypatch) -> None:
