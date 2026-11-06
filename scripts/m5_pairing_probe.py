@@ -319,6 +319,31 @@ def _site_from_scene(scene_doc: dict) -> dict:
     }
 
 
+def _tod_match(requested, observed, *, tolerance_seconds=1):
+    """Compare clock readback using circular seconds; missing/invalid is UNKNOWN.
+
+    ``None`` denotes UNKNOWN, not a pass. The default one-second tolerance
+    covers second-resolution rounding, including 23:59:59 ↔ 00:00:00.
+    """
+    def seconds(value):
+        if not isinstance(value, str):
+            return None
+        parts = value.strip().split(":")
+        if len(parts) not in (2, 3) or any(not p.isdigit() for p in parts):
+            return None
+        h, m = int(parts[0]), int(parts[1])
+        s = int(parts[2]) if len(parts) == 3 else 0
+        if not (0 <= h < 24 and 0 <= m < 60 and 0 <= s < 60):
+            return None
+        return h * 3600 + m * 60 + s
+
+    a, b = seconds(requested), seconds(observed)
+    if a is None or b is None:
+        return None
+    diff = abs(a - b)
+    return min(diff, 86400 - diff) <= tolerance_seconds
+
+
 def _apply_environment(conn, tod: str | None, weather: str | None) -> dict:
     """应用并读回条件；失败/读回缺失都返回 invalid，不伪造成功。"""
     rec = {"tod_requested": tod, "weather_requested": weather,
@@ -335,7 +360,7 @@ def _apply_environment(conn, tod: str | None, weather: str | None) -> dict:
         rec["tod_after"] = str(read.get("timeStr") or "") or None
         # 无论是否指定天气预设，缺少独立天气读回都不能声称 clear/rain/fog。
         # 时刻一致性单独记录；正式环境资格必须在天气也可验证后重定义。
-        rec["tod_matches"] = bool(tod and rec["tod_after"] == f"{tod}:00")
+        rec["tod_matches"] = _tod_match(tod, rec["tod_after"])
         rec["weather_after"] = None
         rec["valid"] = False
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, AttributeError) as exc:

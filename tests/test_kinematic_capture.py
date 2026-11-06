@@ -168,6 +168,16 @@ def test_missing_camera_writes_nothing_but_does_not_raise(tmp_path,
     assert not list(tmp_path.glob("frame_*.npz"))
 
 
+def test_tod_readback_matching_and_unknown():
+    mod = _load()
+    assert mod._tod_match("06:30", "06:29:59") is True
+    assert mod._tod_match("00:00", "23:59:59") is True
+    assert mod._tod_match("06:30", "12:00:00") is False
+    assert mod._tod_match("06:30", None) is None
+    assert mod._tod_match("25:00", "00:00:00") is None
+    assert mod._tod_match("06:30", "not a time") is None
+
+
 def test_environment_readback_requires_tod_and_rejects_unread_weather(monkeypatch):
     mod = _load()
 
