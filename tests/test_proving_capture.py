@@ -23,6 +23,22 @@ def test_capture_cli_is_blocked_before_launch(monkeypatch):
     assert m.main() == 3
 
 
+def test_direct_capture_and_cleanup_refuse_without_touching_resources(tmp_path, monkeypatch):
+    import pytest
+    m = _mod()
+    monkeypatch.setattr(m, "CAP_DIR", tmp_path)
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: pytest.fail("must not start or kill a process"))
+    with pytest.raises(RuntimeError, match="BLOCKED"):
+        m.capture("S1", "noon_clear")
+    with pytest.raises(RuntimeError, match="BLOCKED"):
+        m.run_site("S1")
+    with pytest.raises(RuntimeError, match="BLOCKED"):
+        m.run_all()
+    with pytest.raises(RuntimeError, match="BLOCKED"):
+        m._kill_games()
+    assert list(tmp_path.iterdir()) == []
+
+
 def test_sites_exclude_eval_geometry():
     m = _mod()
     assert set(m.SITES) == {"S1", "S2", "S3", "P"}
