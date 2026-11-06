@@ -35,3 +35,7 @@ data/*
 rescue-*/
 .workbuddy-ai/
 /Item
+
+# 本地大体积归档（34.7 MB，2026-11-01 生成；发布走 logs/paper_release/ 的正式包）
+logs_paper_archive.tar.gz
+*.tar.gz
