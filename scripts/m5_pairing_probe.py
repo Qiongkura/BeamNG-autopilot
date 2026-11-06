@@ -425,6 +425,31 @@ def collect(args) -> int:
             print(f"[pairing-probe] scenario loaded: {scen.name} "
                   f"(lines={len(site and scene_doc['scene'].get('lines') or [])}) "
                   f"ground_align={_ga}", flush=True)
+        if getattr(args, "kinematic_capture", False):
+            # 运动学步进采集：不启动 fsd_drive，与模型能力完全解耦。
+            _kdir = (out.with_suffix(".frames")
+                     if getattr(args, "save_frames", False) else out.parent)
+            _k = kinematic_capture(
+                conn, scene_doc, _kdir,
+                step_m=float(args.kinematic_step_m),
+                span_m=float(args.kinematic_span_m),
+                lateral_jitter=float(args.kinematic_lateral_jitter),
+                yaw_jitter_deg=float(args.kinematic_yaw_jitter),
+                settle_s=float(args.kinematic_settle_s))
+            print(f"[pairing-probe] kinematic capture: {_k}", flush=True)
+            report = {
+                "schema": "pairing-probe-v2",
+                "scene": str(args.scene),
+                "map": args.map,
+                "scenario_mode": True,
+                "kinematic": _k,
+                "tod": args.tod,
+                "weather_preset": args.weather_preset,
+                "frames": int(_k.get("saved", 0)),
+            }
+            out.write_text(json.dumps(report, ensure_ascii=False, indent=1),
+                           encoding="utf-8")
+            return 0
         cmd = [sys.executable, str(ROOT / "scripts" / "m5_fsd_drive.py"),
                "--runtime", args.runtime, "--attach",
                "--seconds", f"{float(args.drive_seconds):.1f}",
@@ -524,6 +549,89 @@ def analyze(args) -> int:
     return 0
 
 
+def kinematic_capture(conn, scene_doc: dict, out_dir: Path, *,
+                      step_m: float = 1.0, span_m: float = 30.0,
+                      lateral_jitter: float = 0.25,
+                      yaw_jitter_deg: float = 2.0,
+                      settle_s: float = 0.6,
+                      frames_per_station: int = 1) -> dict:
+    """沿站点中心线逐站传送取帧（不跑 FSD 驾驶）。
+
+    与 FSD 采集的区别：这里的取帧**不依赖模型**——哪怕全黑画面、模型 0 检出，
+    也能稳定采满整条里程。位姿多样性由 step_m 与两个 jitter 保证，导出侧
+    再用"相邻入选帧位姿距离 >= 0.5 m"筛掉重复。
+    """
+    import time as _time
+    import numpy as _np
+
+    sc = scene_doc["scene"]
+    mid = _np.asarray(sc["mid"], dtype=float)
+    d = _np.asarray(sc["dir"], dtype=float)[:2]
+    d = d / max(1e-9, float(_np.linalg.norm(d)))
+    left = _np.array([-d[1], d[0]])
+    yaw0 = float(_np.degrees(_np.arctan2(d[1], d[0])))
+
+    try:
+        from beamng_autopilot_tech.providers import TechCameraRingProvider
+        ring = TechCameraRingProvider(conn, width=536, height=403,
+                                      roles=("front_main",))
+    except Exception:  # noqa: BLE001
+        ring = None
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+    rng = _np.random.default_rng(20261106)
+    saved = 0
+    stations = []
+    s_m = 4.0
+    while s_m <= float(span_m):
+        stations.append(s_m)
+        s_m += float(step_m)
+
+    for s_m in stations:
+        lat = float(rng.uniform(-lateral_jitter, lateral_jitter))
+        dyaw = float(rng.uniform(-yaw_jitter_deg, yaw_jitter_deg))
+        p = mid.copy()
+        p[:2] = mid[:2] + d * s_m + left * lat
+        heading_deg = float(yaw0 + dyaw)
+        ok = conn.safe_teleport(float(p[0]), float(p[1]),
+                                heading_deg=heading_deg, settle=6)
+        if not ok:
+            continue
+        _time.sleep(float(settle_s))
+        for _k in range(int(frames_per_station)):
+            st = conn.get_state()
+            frame = None
+            cam = None
+            if ring is not None:
+                try:
+                    snap = ring.grab_ring()
+                    if snap:
+                        role = ("front_main" if "front_main" in snap
+                                else next(iter(snap)))
+                        frame, cam = snap[role]
+                except Exception:  # noqa: BLE001
+                    frame = None
+            if frame is None or cam is None:
+                continue
+            path = out_dir / f"frame_{saved:05d}.npz"
+            _np.savez_compressed(
+                path, frame=_np.asarray(frame, dtype=_np.uint8),
+                pos=_np.asarray(st.pos, dtype=float),
+                heading=float(st.heading),
+                cam=_np.array([cam], dtype=object),
+                t=float(_time.time()))
+            saved += 1
+    if ring is not None:
+        try:
+            ring.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return {"saved": saved, "stations": len(stations),
+            "step_m": float(step_m), "span_m": float(span_m),
+            "lateral_jitter_m": float(lateral_jitter),
+            "yaw_jitter_deg": float(yaw_jitter_deg)}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -575,6 +683,19 @@ def main() -> int:
                     help="不构建贴花 Scenario（仅调试；认证线召回必然为 0）")
     ap.add_argument("--teleport", nargs=3, type=float, default=None,
                     metavar=("X", "Y", "YAW_DEG"))
+    ap.add_argument("--kinematic-capture", action="store_true",
+                    help="运动学步进采集：沿站点中心线逐站传送取帧，"
+                         "不跑 FSD 驾驶（与模型能否看见线完全解耦）")
+    ap.add_argument("--kinematic-step-m", type=float, default=1.0,
+                    help="运动学采集的纵向步长（米）")
+    ap.add_argument("--kinematic-span-m", type=float, default=30.0,
+                    help="运动学采集的纵向跨度（米）")
+    ap.add_argument("--kinematic-lateral-jitter", type=float, default=0.25,
+                    help="每站横向抖动幅度（米，正负对称）")
+    ap.add_argument("--kinematic-yaw-jitter", type=float, default=2.0,
+                    help="每站偏航抖动幅度（度，正负对称）")
+    ap.add_argument("--kinematic-settle-s", type=float, default=0.6,
+                    help="每站传送后静置时间（秒）")
     ap.add_argument("--goal", nargs=2, type=float, default=None,
                     metavar=("X", "Y"))
     args = ap.parse_args()
