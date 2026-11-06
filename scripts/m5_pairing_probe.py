@@ -349,6 +349,13 @@ def _apply_environment(conn, tod: str | None, weather: str | None) -> dict:
     rec = {"tod_requested": tod, "weather_requested": weather,
            "tod_after": None, "weather_after": None,
            "weather_readback": "UNKNOWN", "valid": False}
+    # Validate before any game-side mutation, including setting weather.
+    if _tod_match(tod, tod) is not True:
+        rec["error"] = "invalid_or_missing_requested_tod"
+        return rec
+    if weather is not None and (not isinstance(weather, str) or not weather.strip()):
+        rec["error"] = "invalid_requested_weather"
+        return rec
     try:
         if weather:
             conn.bng.env.set_weather_preset(weather)

@@ -178,6 +178,24 @@ def test_tod_readback_matching_and_unknown():
     assert mod._tod_match("06:30", "not a time") is None
 
 
+def test_invalid_environment_input_never_mutates_game():
+    mod = _load()
+    from types import SimpleNamespace
+    class Env:
+        def __init__(self):
+            self.calls = []
+        def set_weather_preset(self, value):
+            self.calls.append(("weather", value))
+        def set_tod(self, **kwargs):
+            self.calls.append(("tod", kwargs))
+    env = Env()
+    conn = SimpleNamespace(bng=SimpleNamespace(env=env))
+    for tod, weather in (("25:00", "rainy"), (None, "rainy"), ("06:30", "")):
+        result = mod._apply_environment(conn, tod, weather)
+        assert result["valid"] is False and result.get("error")
+    assert env.calls == []
+
+
 def test_environment_readback_requires_tod_and_rejects_unread_weather(monkeypatch):
     mod = _load()
 
