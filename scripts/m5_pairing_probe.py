@@ -615,6 +615,9 @@ def analyze(args) -> int:
     return 0
 
 
+_KINEMATIC_ENABLED = False  # No production bypass until ownership/environment validated.
+
+
 def kinematic_capture(conn, scene_doc: dict, out_dir: Path, *,
                       step_m: float = 1.0, span_m: float = 30.0,
                       lateral_jitter: float = 0.25,
@@ -627,6 +630,8 @@ def kinematic_capture(conn, scene_doc: dict, out_dir: Path, *,
     也能稳定采满整条里程。位姿多样性由 step_m 与两个 jitter 保证，导出侧
     再用"相邻入选帧位姿距离 >= 0.5 m"筛掉重复。
     """
+    if not _KINEMATIC_ENABLED:
+        raise RuntimeError("BLOCKED: 运动学采集的进程归属和环境尚未验证")
     import time as _time
     import numpy as _np
 

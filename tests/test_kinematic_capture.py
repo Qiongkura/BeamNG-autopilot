@@ -20,12 +20,14 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def _load():
+def _load(*, enable_for_test=False):
     spec = importlib.util.spec_from_file_location(
         "m5_pairing_probe", ROOT / "scripts" / "m5_pairing_probe.py")
     mod = importlib.util.module_from_spec(spec)
     sys.modules["m5_pairing_probe"] = mod
     spec.loader.exec_module(mod)
+    if enable_for_test:
+        mod._KINEMATIC_ENABLED = True
     return mod
 
 
@@ -51,6 +53,15 @@ def test_pairing_probe_does_not_kill_processes_by_pid_difference():
              for n in ast.walk(collect) if isinstance(n, ast.Call)
              and isinstance(n.func, (ast.Name, ast.Attribute))}
     assert not (calls & forbidden)
+
+
+def test_direct_kinematic_call_is_blocked_before_any_side_effect(tmp_path):
+    mod = _load()
+    conn = _FakeConn()
+    with pytest.raises(RuntimeError, match="BLOCKED"):
+        mod.kinematic_capture(conn, _scene(), tmp_path / "new")
+    assert conn.calls == []
+    assert not (tmp_path / "new").exists()
 
 
 class _State:
@@ -101,7 +112,7 @@ def _scene(mid=(300.0, 700.0, 100.0), direction=(0.0, 1.0, 0.0)):
     {"frames_per_station": 0}, {"frames_per_station": True},
 ])
 def test_invalid_kinematic_parameters_fail_before_resources(tmp_path, monkeypatch, overrides):
-    mod = _load()
+    mod = _load(enable_for_test=True)
     conn = _FakeConn()
     def forbidden(*args, **kwargs):
         pytest.fail("camera must not open for invalid input")
@@ -114,12 +125,12 @@ def test_invalid_kinematic_parameters_fail_before_resources(tmp_path, monkeypatc
 
 def test_invalid_kinematic_direction_rejected(tmp_path):
     with pytest.raises(ValueError, match="geometry"):
-        _load().kinematic_capture(_FakeConn(), _scene(direction=(0, 0, 0)), tmp_path / "new")
+        _load(enable_for_test=True).kinematic_capture(_FakeConn(), _scene(direction=(0, 0, 0)), tmp_path / "new")
     assert not (tmp_path / "new").exists()
 
 
 def test_kinematic_capture_walks_the_whole_span(tmp_path, monkeypatch) -> None:
-    mod = _load()
+    mod = _load(enable_for_test=True)
     conn = _FakeConn()
     ring = _FakeRing()
     monkeypatch.setattr(
@@ -137,7 +148,7 @@ def test_kinematic_capture_walks_the_whole_span(tmp_path, monkeypatch) -> None:
 
 
 def test_lateral_and_yaw_jitter_stay_in_range(tmp_path, monkeypatch) -> None:
-    mod = _load()
+    mod = _load(enable_for_test=True)
     conn = _FakeConn()
     monkeypatch.setattr(
         "beamng_autopilot_tech.providers.TechCameraRingProvider",
@@ -156,7 +167,7 @@ def test_lateral_and_yaw_jitter_stay_in_range(tmp_path, monkeypatch) -> None:
 
 def test_frames_are_written_in_the_fsd_probe_format(tmp_path,
                                                    monkeypatch) -> None:
-    mod = _load()
+    mod = _load(enable_for_test=True)
     monkeypatch.setattr(
         "beamng_autopilot_tech.providers.TechCameraRingProvider",
         lambda *a, **k: _FakeRing(), raising=False)
@@ -172,7 +183,7 @@ def test_frames_are_written_in_the_fsd_probe_format(tmp_path,
 
 def test_capture_does_not_depend_on_the_model(tmp_path, monkeypatch) -> None:
     """全黑帧（模型必然 0 检出）也必须照常采满——这正是原采集的死锁点。"""
-    mod = _load()
+    mod = _load(enable_for_test=True)
 
     class _BlackRing(_FakeRing):
         def grab_ring(self):
@@ -190,7 +201,7 @@ def test_capture_does_not_depend_on_the_model(tmp_path, monkeypatch) -> None:
 
 def test_missing_camera_writes_nothing_but_does_not_raise(tmp_path,
                                                          monkeypatch) -> None:
-    mod = _load()
+    mod = _load(enable_for_test=True)
 
     class _DeadRing(_FakeRing):
         def grab_ring(self):
@@ -207,7 +218,7 @@ def test_missing_camera_writes_nothing_but_does_not_raise(tmp_path,
 
 
 def test_tod_readback_matching_and_unknown():
-    mod = _load()
+    mod = _load(enable_for_test=True)
     assert mod._tod_match("06:30", "06:29:59") is True
     assert mod._tod_match("00:00", "23:59:59") is True
     assert mod._tod_match("06:30", "12:00:00") is False
@@ -217,7 +228,7 @@ def test_tod_readback_matching_and_unknown():
 
 
 def test_invalid_environment_input_never_mutates_game():
-    mod = _load()
+    mod = _load(enable_for_test=True)
     from types import SimpleNamespace
     class Env:
         def __init__(self):
@@ -235,7 +246,7 @@ def test_invalid_environment_input_never_mutates_game():
 
 
 def test_environment_readback_requires_tod_and_rejects_unread_weather(monkeypatch):
-    mod = _load()
+    mod = _load(enable_for_test=True)
 
     class Env:
         def set_tod(self, tod):
