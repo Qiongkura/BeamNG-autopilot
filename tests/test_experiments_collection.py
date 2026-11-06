@@ -349,7 +349,11 @@ def test_close_started_game_kills_only_the_new_pids(monkeypatch):
     # 调用顺序：先看到 {7,8,9}，杀完再看到 {7}（实现里就是这么校验的）
     seq = [{7, 8, 9}, {7}]
     monkeypatch.setattr(col, "game_pids", lambda *a, **k: seq.pop(0))
-    got = col.close_started_game({7})
+    now = __import__("time").time()
+    ticks = lambda unix: str(int((unix + 62135596800) * 1e7))
+    monkeypatch.setattr(col, "game_procs", lambda *a, **k: {
+        8: ticks(now + 1), 9: ticks(now + 1)})
+    got = col.close_started_game({7}, launched_after=now)
     assert got["closed"] is True and got["killed"] == [8, 9], got
     killed = [c[c.index("/PID") + 1] for c in calls if "/PID" in c]
     assert killed == ["8", "9"], "不能动已存在的 pid 7"
@@ -379,17 +383,19 @@ def test_close_started_game_reports_what_is_still_running(monkeypatch):
     monkeypatch.setattr(col.subprocess, "run", lambda *a, **k: R())
     seq = [{5, 6}, {6}]        # 杀前看到 5/6，杀后 6 还在
     monkeypatch.setattr(col, "game_pids", lambda *a, **k: seq.pop(0))
-    got = col.close_started_game({4})
+    monkeypatch.setattr(col, "game_procs", lambda *a, **k: {5: "t", 6: "t"})
+    got = col.close_started_game({4}, launched_after=0.0)
     assert got["closed"] is False and got["still_running"] == [6], got
     assert "GPU 仍在被占用" in got["reason"], got
 
 def test_post_cleanup_unknown_is_not_reported_as_closed(monkeypatch):
     from beamng_autopilot.experiments import collection as col
-    snapshots = [{8}, None]
+    snapshots = [{8}, None, None]
     monkeypatch.setattr(col, "game_pids", lambda *a, **k: snapshots.pop(0))
+    monkeypatch.setattr(col, "game_procs", lambda *a, **k: {8: "invalid"})
     monkeypatch.setattr(col.subprocess, "run",
                         lambda *a, **k: type("Result", (), {"returncode": 0})())
-    result = col.close_started_game(set())
+    result = col.close_started_game(set(), launched_after=0.0)
     assert result["closed"] is False and result["verification_unknown"]
 
 
@@ -400,7 +406,8 @@ def test_cleanup_waits_for_authoritative_exit_after_taskkill(monkeypatch):
     monkeypatch.setattr(col.time, "sleep", lambda *a: None)
     monkeypatch.setattr(col.subprocess, "run",
                         lambda *a, **k: type("Result", (), {"returncode": 0})())
-    result = col.close_started_game(set(), verify_timeout_s=1.0)
+    monkeypatch.setattr(col, "game_procs", lambda *a, **k: {8: "t"})
+    result = col.close_started_game(set(), launched_after=0.0, verify_timeout_s=1.0)
     assert result["closed"] and not result["still_running"]
 
 
@@ -457,7 +464,9 @@ def test_the_game_is_closed_only_with_proven_ownership(monkeypatch):
     assert got2["killed"] == [9], got2
     assert any(u["pid"] == 8 and "pid reuse" in u["why"]
                for u in got2["unverified"]), got2
-    # 不给 launched_after（旧调用）：保持原行为，不做所有权判定
+    # 不给 launched_after：当前安全契约拒绝按 PID 差集清理
     calls.clear()
     got3 = col.close_started_game({7})
-    assert sorted(got3["killed"]) == [8, 9], got3
+    assert got3["killed"] == []
+    assert "ownership unproven" in str(got3["unverified"])
+    assert calls == []
