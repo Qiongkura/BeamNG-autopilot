@@ -55,12 +55,19 @@ try {
     & $py 'scripts\m5_debt_meter.py' '--check' 2>&1 | Select-Object -Last 8
     $debtRc = $LASTEXITCODE
 
-    Write-Host ("RESULT: pytest={0} offline_validate={1} debt={2}" -f `
+    # 文档索引新鲜度：新增/改名文档后忘记重生成，索引就会指向不存在的入口。
+    # 2026-11-06 实测：索引停在 224 篇，实际已有 306 篇（82 篇无入口）。
+    Write-Host "=== 文档索引（scripts/m5_docs_index.py --check）===" -ForegroundColor Cyan
+    & $py 'scripts\m5_docs_index.py' '--check' 2>&1 | Select-Object -Last 4
+    $idxRc = $LASTEXITCODE
+
+    Write-Host ("RESULT: pytest={0} offline_validate={1} debt={2} docs_index={3}" -f `
         $(if ($pytestRc -eq 0) { 'PASS' } else { 'FAIL' }),
         $(if ($offRc -eq 0) { 'PASS' } else { 'FAIL' }),
-        $(if ($debtRc -eq 0) { 'PASS' } else { 'FAIL' })) -ForegroundColor `
-        $(if (($pytestRc -eq 0) -and ($offRc -eq 0) -and ($debtRc -eq 0)) { 'Green' } else { 'Red' })
-    exit ([int]($pytestRc -ne 0) -bor ([int]($offRc -ne 0)) -bor ([int]($debtRc -ne 0)))
+        $(if ($debtRc -eq 0) { 'PASS' } else { 'FAIL' }),
+        $(if ($idxRc -eq 0) { 'PASS' } else { 'FAIL' })) -ForegroundColor `
+        $(if (($pytestRc -eq 0) -and ($offRc -eq 0) -and ($debtRc -eq 0) -and ($idxRc -eq 0)) { 'Green' } else { 'Red' })
+    exit ([int]($pytestRc -ne 0) -bor ([int]($offRc -ne 0)) -bor ([int]($debtRc -ne 0)) -bor ([int]($idxRc -ne 0))
 }
 finally {
     $env:PYTHONUTF8 = $savedPythonUtf8
