@@ -162,7 +162,7 @@ def test_p_site_has_four_holdout_cells():
                               "dusk_clear", "night_clear"}
 
 
-def test_run_site_skips_ok_and_continues(tmp_path, monkeypatch):
+def test_run_site_does_not_trust_historical_ok_and_continues(tmp_path, monkeypatch):
     m = _mod()
     monkeypatch.setattr(m, "_CAPTURE_ENABLED", True)
     monkeypatch.setattr(m, "CAP_DIR", tmp_path)
@@ -172,7 +172,8 @@ def test_run_site_skips_ok_and_continues(tmp_path, monkeypatch):
     ok = tmp_path / "P" / "noon_clear"
     ok.mkdir(parents=True)
     (ok / "capture.json").write_text('{"status": "ok"}', encoding="utf-8")
-    m.run_site("P")
+    assert m.run_site("P") == 1
+    assert (ok / "capture.json").read_text(encoding="utf-8") == '{"status": "ok"}'
     assert called == ["noon_rain", "dusk_clear", "night_clear"]
 
 

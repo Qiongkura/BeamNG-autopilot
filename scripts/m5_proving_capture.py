@@ -354,15 +354,13 @@ def run_site(site: str, only: tuple[str, ...] | None = None) -> int:
     todo = only or (P_CELLS if site == "P" else tuple(cells()))
     failed = False
     for cell in todo:
-        man = CAP_DIR / site / cell / "capture.json"
-        if man.exists():
-            try:
-                if json.loads(man.read_text(encoding="utf-8")).get(
-                        "status") == "ok":
-                    print(f"[skip] {site}/{cell} already ok")
-                    continue
-            except (OSError, ValueError):
-                pass
+        existing = CAP_DIR / site / cell
+        if existing.exists():
+            # Legacy status=ok lacks the new evidence contract. Never infer
+            # completion, retry into it, or overwrite any historical files.
+            print(f"[FAIL] {site}/{cell}: existing attempt requires audit", flush=True)
+            failed = True
+            continue
         if not wait_engine_gone():
             # An unknown process state is not permission to attach or kill.
             print(f"[FAIL] {site}/{cell}: engine state unknown or busy", flush=True)
