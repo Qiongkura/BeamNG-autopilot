@@ -316,6 +316,13 @@ def main() -> int:
         return plan()
     if args.build_sites:
         return build_sites()
+    # The current runner cannot prove environment readback, process ownership
+    # or capture freshness.  Do not launch/attach or touch existing evidence
+    # until those contracts have been repaired and independently validated.
+    if args.run_all or args.run_site or args.capture:
+        print("[capture] BLOCKED: 环境读回、进程归属与帧来源尚未验证；"
+              "禁止批量采集，保留既有证据。", file=sys.stderr)
+        return 3
     if args.run_all:
         return run_all()
     if args.run_site:

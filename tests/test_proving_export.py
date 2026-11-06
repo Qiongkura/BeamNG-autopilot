@@ -4,6 +4,7 @@ import importlib.util
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 
 def _mod():
@@ -67,6 +68,17 @@ def test_build_masks_with_fake_camera():
                                0.0, geom)
     assert line.sum() > 0
     assert road.sum() >= line.sum()
+
+
+def test_formal_export_is_blocked_before_touching_existing_data(tmp_path, monkeypatch):
+    m = _mod()
+    monkeypatch.setattr(m, "POOL_DIR", tmp_path)
+    marker = tmp_path / "existing.npz"
+    marker.write_bytes(b"evidence")
+    with pytest.raises(RuntimeError, match="BLOCKED"):
+        m.export_cell("S1", "noon_rain")
+    assert marker.read_bytes() == b"evidence"
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["existing.npz"]
 
 
 def test_pose_repeat_thresholds_are_strict_enough_for_static_frames():

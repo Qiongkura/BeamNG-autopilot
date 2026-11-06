@@ -13,6 +13,16 @@ def _mod():
     return mod
 
 
+def test_capture_cli_is_blocked_before_launch(monkeypatch):
+    import sys
+    m = _mod()
+    monkeypatch.setattr(m, "capture", lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("blocked CLI must not launch")))
+    monkeypatch.setattr(sys, "argv", ["capture", "--capture", "--site", "S1",
+                                     "--cell", "noon_rain"])
+    assert m.main() == 3
+
+
 def test_sites_exclude_eval_geometry():
     m = _mod()
     assert set(m.SITES) == {"S1", "S2", "S3", "P"}

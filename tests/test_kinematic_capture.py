@@ -28,6 +28,17 @@ def _load():
     return mod
 
 
+def test_collect_rejects_unverified_kinematic_before_connecting(monkeypatch):
+    from types import SimpleNamespace
+    from beamng_autopilot import connector
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("blocked collection must not connect")
+
+    monkeypatch.setattr(connector, "BeamNGConnector", forbidden)
+    assert _load().collect(SimpleNamespace(kinematic_capture=True)) == 3
+
+
 class _State:
     def __init__(self, pos, heading):
         self.pos = np.asarray(pos, float)

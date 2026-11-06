@@ -200,6 +200,10 @@ def gate_frame(rgb, cam, pos, heading, geom, pts) -> dict:
 
 
 def export_cell(site: str, cell: str, *, target_frames: int = 30) -> int:
+    # Pilot is diagnostic only: actual built nodes, independent environment
+    # verification and the preregistered per-pixel colour gate are not yet
+    # wired. Refuse before touching output or existing quarantine evidence.
+    raise RuntimeError("BLOCKED: 导出资格链尚未验证；禁止生成训练池")
     src = CAP_DIR / site / cell
     manifest_path = src / "capture.json"
     if not manifest_path.is_file():

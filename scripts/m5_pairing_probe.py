@@ -320,6 +320,11 @@ def _site_from_scene(scene_doc: dict) -> dict:
 
 
 def collect(args) -> int:
+    if getattr(args, "kinematic_capture", False):
+        # Block before connecting: a free port / existing process is not proof
+        # of ownership, and environment and pose provenance are not verified.
+        print("[pairing-probe] BLOCKED: 运动学采集尚未验证环境和进程归属", file=sys.stderr)
+        return 3
     import time
 
     from beamng_autopilot import config
