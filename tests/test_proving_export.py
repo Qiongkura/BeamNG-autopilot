@@ -99,8 +99,29 @@ def test_pose_duplicate_rejects_invalid_input(pos, heading):
         _mod().find_pose_duplicate(pos, heading, [])
 
 
+def test_select_pose_candidates_audit_revisit_and_invalid():
+    m = _mod()
+    records = [
+        {"source_id": "a", "pos": [0, 0], "heading": np.pi - .005},
+        {"source_id": "b", "pos": [2, 0], "heading": 0},
+        {"source_id": "revisit", "pos": [.1, 0], "heading": -np.pi + .005},
+        {"source_id": "invalid", "pos": [np.nan, 0], "heading": 0},
+        {"source_id": "rotation", "pos": [0, 0], "heading": 0},
+    ]
+    accepted, rejected = m.select_pose_candidates(records)
+    assert [x["source_id"] for x in accepted] == ["a", "b", "rotation"]
+    assert rejected[0]["matched_source_id"] == "a"
+    assert rejected[0]["distance_m"] == pytest.approx(.1)
+    assert rejected[0]["angle_rad"] == pytest.approx(.01)
+    assert rejected[1] == {"source_id": "invalid", "reason": "invalid_pose"}
+    with pytest.raises(ValueError, match="source_id"):
+        m.select_pose_candidates([records[0], records[0]])
+
+
 def test_pose_duplicate_threshold_boundaries_and_invalid_history():
     m = _mod()
+    with pytest.raises(ValueError, match="threshold"):
+        m.select_pose_candidates([], min_xy=-1)
     accepted = [([0, 0], 0)]
     assert m.find_pose_duplicate([0.5, 0], 0, accepted) is None
     assert m.find_pose_duplicate([0, 0], 0.03, accepted) is None

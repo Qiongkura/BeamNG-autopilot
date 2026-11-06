@@ -78,6 +78,45 @@ def find_pose_duplicate(pos, heading, accepted, *, min_xy=POSE_MIN_XY_M,
     return None
 
 
+def select_pose_candidates(records, *, min_xy=POSE_MIN_XY_M,
+                           min_heading=POSE_MIN_HEADING_RAD):
+    """只对已通过其他资格门的记录执行候选去重，不读取或写入文件。
+
+    输入按调用方提供的顺序处理；重复关系不具传递性，先接受者优先。
+    每条记录包含唯一 source_id、pos 和 heading。重复项记录匹配的来源及
+    测量值；无效位姿单独拒绝，绝不加入已接受集合。调用方必须先冻结
+    顺序与规则版本并提供可追溯的完整输入；此辅助函数不构成入池资格。
+    """
+    # Validate the rule even for an empty input: no invalid threshold may
+    # accidentally produce a seemingly valid empty audit.
+    find_pose_duplicate((0.0, 0.0), 0.0, [], min_xy=min_xy,
+                        min_heading=min_heading)
+    accepted = []
+    rejected = []
+    history = []
+    identifiers = set()
+    for record in records:
+        source_id = record["source_id"]
+        if not isinstance(source_id, str) or not source_id or source_id in identifiers:
+            raise ValueError("source_id must be a unique nonempty string")
+        identifiers.add(source_id)
+        try:
+            match = find_pose_duplicate(record["pos"], record["heading"], history,
+                                        min_xy=min_xy, min_heading=min_heading)
+        except (ValueError, TypeError, KeyError, OverflowError):
+            rejected.append({"source_id": source_id, "reason": "invalid_pose"})
+            continue
+        if match is None:
+            history.append((record["pos"], record["heading"]))
+            accepted.append(record)
+        else:
+            index, distance, angle = match
+            rejected.append({"source_id": source_id, "reason": "pose_repeat",
+                             "matched_source_id": accepted[index]["source_id"],
+                             "distance_m": distance, "angle_rad": angle})
+    return accepted, rejected
+
+
 def _load_scenes_module():
     spec = importlib.util.spec_from_file_location(
         "mcs_export", str(ROOT / "scripts" / "m5_controlled_scenes.py"))
