@@ -125,6 +125,37 @@ def _load_scenes_module():
     return mod
 
 
+def validate_built_lines(record):
+    """Validate recorded built nodes without asserting rendered pixel truth.
+
+    A structurally valid record is still NOT proof that it belongs to the
+    current run or that its decals rendered. Caller must independently bind
+    the record digest to a fresh capture and check annotation/projection.
+    """
+    if not isinstance(record, dict) or not isinstance(record.get("lines"), list):
+        raise ValueError("missing built lines")
+    found = {}
+    for line in record["lines"]:
+        if not isinstance(line, dict):
+            raise ValueError("invalid line record")
+        role = line.get("role")
+        if role not in ("left", "right") or role in found:
+            raise ValueError("invalid or duplicate role")
+        try:
+            nodes = np.asarray(line["nodes"], dtype=float)
+            width = float(line["width_m"])
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise ValueError("invalid built geometry") from exc
+        if (nodes.ndim != 2 or nodes.shape[1] != 3 or nodes.shape[0] < 2
+                or not np.isfinite(nodes).all() or not np.isfinite(width)
+                or width <= 0 or not np.any(np.linalg.norm(np.diff(nodes, axis=0), axis=1) > 1e-9)):
+            raise ValueError("invalid built geometry")
+        found[role] = {"role": role, "nodes": nodes.copy(), "width_m": width}
+    if set(found) != {"left", "right"}:
+        raise ValueError("both line roles required")
+    return [found["left"], found["right"]]
+
+
 def site_geometry(site_doc: dict) -> list[dict]:
     """站点 JSON -> 两条线的 (role, center, left_rail, right_rail) 世界点。"""
     mcs = _load_scenes_module()

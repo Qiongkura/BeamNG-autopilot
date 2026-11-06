@@ -25,6 +25,35 @@ def _doc():
                       "curve_deg": 0.0}}
 
 
+def test_built_line_validation_never_claims_rendered_truth():
+    m = _mod()
+    source = {"lines": [
+        {"role": "right", "nodes": [[1, 0, 2], [1, 3, 2]], "width_m": .15},
+        {"role": "left", "nodes": [[0, 0, 2], [0, 3, 2]], "width_m": .2},
+    ]}
+    lines = m.validate_built_lines(source)
+    assert [x["role"] for x in lines] == ["left", "right"]
+    assert lines[0]["width_m"] == .2
+    lines[0]["nodes"][0, 0] = 99
+    assert source["lines"][1]["nodes"][0][0] == 0
+
+
+@pytest.mark.parametrize("record", [None, {}, {"lines": []},
+    {"lines": [{"role": "left", "nodes": [[0, 0, 0], [1, 0, 0]], "width_m": 1}]},
+    {"lines": [{"role": "left", "nodes": [[0, 0, 0], [1, 0, 0]], "width_m": 1},
+               {"role": "left", "nodes": [[0, 0, 0], [1, 0, 0]], "width_m": 1}]},
+    {"lines": [{"role": "left", "nodes": [[0, 0, 0], [0, 0, 0]], "width_m": 1},
+               {"role": "right", "nodes": [[0, 0, 0], [1, 0, 0]], "width_m": 1}]},
+    {"lines": [{"role": "left", "nodes": [[0, 0, 0], [np.nan, 0, 0]], "width_m": 1},
+               {"role": "right", "nodes": [[0, 0, 0], [1, 0, 0]], "width_m": 1}]},
+    {"lines": [{"role": "left", "nodes": [[0, 0, 0], [1, 0, 0]], "width_m": 0},
+               {"role": "right", "nodes": [[0, 0, 0], [1, 0, 0]], "width_m": 1}]},
+])
+def test_invalid_built_line_records_rejected(record):
+    with pytest.raises(ValueError):
+        _mod().validate_built_lines(record)
+
+
 def test_site_geometry_has_two_parallel_rails():
     m = _mod()
     geom = m.site_geometry(_doc())
