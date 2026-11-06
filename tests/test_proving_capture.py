@@ -79,6 +79,20 @@ def test_frame_manifest_checks_hash_membership_and_duplicates(tmp_path):
     assert not m.verify_frame_manifest(tmp_path, [])["valid"]
 
 
+def test_frame_manifest_rejects_windows_aliases_and_traversal(tmp_path):
+    import hashlib
+    m = _mod()
+    (tmp_path / "Frame.npz").write_bytes(b"data")
+    digest = hashlib.sha256(b"data").hexdigest()
+    entries = [{"file": "Frame.npz", "sha256": digest},
+               {"file": "frame.npz", "sha256": digest}]
+    result = m.verify_frame_manifest(tmp_path, entries)
+    assert not result["valid"] and "duplicate:frame.npz" in result["errors"]
+    for name in (r"..\outside.npz", "../outside.npz", "C:outside.npz"):
+        result = m.verify_frame_manifest(tmp_path, [{"file": name, "sha256": digest}])
+        assert not result["valid"] and "invalid_filename" in result["errors"]
+
+
 def test_sites_exclude_eval_geometry():
     m = _mod()
     assert set(m.SITES) == {"S1", "S2", "S3", "P"}

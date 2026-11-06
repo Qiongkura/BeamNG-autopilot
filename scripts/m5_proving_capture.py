@@ -208,6 +208,7 @@ def verify_frame_manifest(frame_dir: Path, entries: list[dict]) -> dict:
     root = Path(frame_dir).resolve()
     errors = []
     declared = set()
+    declared_folded = set()
     if not root.is_dir() or not isinstance(entries, list) or not entries:
         return {"valid": False, "errors": ["missing_directory_or_entries"]}
     for entry in entries:
@@ -216,13 +217,15 @@ def verify_frame_manifest(frame_dir: Path, entries: list[dict]) -> dict:
             continue
         name, digest = entry.get("file"), entry.get("sha256")
         if (not isinstance(name, str) or not name or Path(name).name != name
+                or "/" in name or "\\" in name or ":" in name
                 or not name.lower().endswith(".npz")):
             errors.append("invalid_filename")
             continue
-        if name in declared:
+        if name.casefold() in declared_folded:
             errors.append(f"duplicate:{name}")
             continue
         declared.add(name)
+        declared_folded.add(name.casefold())
         if (not isinstance(digest, str) or len(digest) != 64
                 or any(c not in "0123456789abcdef" for c in digest)):
             errors.append(f"invalid_digest:{name}")
