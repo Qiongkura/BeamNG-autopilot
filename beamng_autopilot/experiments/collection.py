@@ -227,32 +227,28 @@ def _ownership_unknown_cleanup() -> dict:
 
 
 def _owned_started_pids(started, images, launched_after):
-    """Return proven-owned pids and unverified evidence."""
-    procs = game_procs(images)
-    verified, unverified = [], []
-    for pid in started:
-        created = (procs or {}).get(pid)
-        cu = _created_unix(created) if created is not None else None
-        if cu is None:
-            unverified.append({"pid": pid, "why": "no usable creation time: ownership unproven"})
-        elif cu + 5.0 < float(launched_after):
-            unverified.append({"pid": pid, "why": "created before this task started (pid reuse)"})
-        else:
-            verified.append(pid)
-    return verified, unverified
+    """Legacy timestamp filter; it does NOT prove process ownership.
+
+    A user may start a game after this task begins. PID difference and creation
+    time alone cannot distinguish it from a child launched by this task.
+    Do not use this helper as an ownership authority in new collection paths.
+    """
+    # A newer PID could belong to another user-started game; even a later PID
+    # lookup followed by taskkill has a reuse race. Without an owned OS handle
+    # there is no authority to terminate any candidate.
+    return [], [{"pid": pid, "why": "ownership unproven: no owned process handle"}
+                for pid in started]
 
 
 def close_started_game(pids_before, *, images: tuple = GAME_IMAGES,
                        timeout_s: int = 30,
                        launched_after: float | None = None,
                        verify_timeout_s: float = 0.0) -> dict:
-    """结束**本次采集期间新出现**的游戏进程；已存在的会话一律不碰。
+    """核对采集期间新出现的游戏进程；无可信句柄时不结束任何进程。
 
-    实测缺陷（2026-09-25）：无人值守采集结束后游戏还在跑——采集器只关了连接，
-    进程留着。后果两条：① 它一直占 GPU，而"游戏时间"只在采集那几分钟记账，
-    后面的实验都在被污染的机器上跑；② 第 3 轮那批推理 p95（10.6–80.2 ms，
-    7.6 倍漂移）就是它在跑的时候测的。所以采集收尾必须把**自己起的**游戏关掉。
-    只杀 ``after - before`` 的差集：用户自己开着的会话不在差集里，永远不会被误杀。
+    创建时间和 PID 差集不足以证明归属：用户可能在此期间另开游戏，且
+    进程可能在检查与终止之间复用 PID。未证实对象保留并标记 unverified；
+    必须由调用方证明其启动链已结束并独立核对，不能据此声称无人控制冲突。
     """
     if pids_before is None:
         return {"closed": False, "killed": [],

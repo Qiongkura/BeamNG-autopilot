@@ -347,16 +347,16 @@ def test_close_started_game_kills_only_the_new_pids(monkeypatch):
 
     monkeypatch.setattr(sp, "run", fake_run)
     # 调用顺序：先看到 {7,8,9}，杀完再看到 {7}（实现里就是这么校验的）
-    seq = [{7, 8, 9}, {7}]
+    seq = [{7, 8, 9}, {7, 8, 9}]
     monkeypatch.setattr(col, "game_pids", lambda *a, **k: seq.pop(0))
     now = __import__("time").time()
     ticks = lambda unix: str(int((unix + 62135596800) * 1e7))
     monkeypatch.setattr(col, "game_procs", lambda *a, **k: {
         8: ticks(now + 1), 9: ticks(now + 1)})
     got = col.close_started_game({7}, launched_after=now)
-    assert got["closed"] is True and got["killed"] == [8, 9], got
-    killed = [c[c.index("/PID") + 1] for c in calls if "/PID" in c]
-    assert killed == ["8", "9"], "不能动已存在的 pid 7"
+    assert got["closed"] is False and got["killed"] == [], got
+    assert {u["pid"] for u in got["unverified"]} == {8, 9}
+    assert calls == [], "时间戳与 PID 差集不足以授权杀任何进程"
 
 
 def test_close_started_game_never_guesses(monkeypatch):
@@ -452,18 +452,15 @@ def test_the_game_is_closed_only_with_proven_ownership(monkeypatch):
     monkeypatch.setattr(col.subprocess, "run",
                         lambda cmd, **k: calls.append(list(cmd)) or R())
     got = col.close_started_game({7}, launched_after=now)
-    assert got["killed"] == [8], got
-    killed = [c[c.index("/PID") + 1] for c in calls if "/PID" in c]
-    assert killed == ["8"], killed
-    assert [u["pid"] for u in got["unverified"]] == [9], got
+    assert got["killed"] == [] and calls == [], got
+    assert {u["pid"] for u in got["unverified"]} == {8, 9}, got
     # 创建时间早于启动时刻（PID 复用）也不关
     monkeypatch.setattr(col, "game_procs", lambda *a, **k: {
         7: ticks(now - 3600), 8: ticks(now - 60), 9: ticks(now + 1)})
     calls.clear()
     got2 = col.close_started_game({7}, launched_after=now)
-    assert got2["killed"] == [9], got2
-    assert any(u["pid"] == 8 and "pid reuse" in u["why"]
-               for u in got2["unverified"]), got2
+    assert got2["killed"] == [] and calls == [], got2
+    assert {u["pid"] for u in got2["unverified"]} == {8, 9}, got2
     # 不给 launched_after：当前安全契约拒绝按 PID 差集清理
     calls.clear()
     got3 = col.close_started_game({7})
