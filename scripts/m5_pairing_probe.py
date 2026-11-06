@@ -333,11 +333,11 @@ def _apply_environment(conn, tod: str | None, weather: str | None) -> dict:
             conn.bng.env.set_tod(tod=hms)
         read = conn.bng.env.get_tod() or {}
         rec["tod_after"] = str(read.get("timeStr") or "") or None
-        # 当前 API 没有可靠的 weather getter：requested weather 只能记录，
-        # 不能冒充独立读回。因此运动学正式采集在 weather 非空时保持 blocked。
+        # 无论是否指定天气预设，缺少独立天气读回都不能声称 clear/rain/fog。
+        # 时刻一致性单独记录；正式环境资格必须在天气也可验证后重定义。
+        rec["tod_matches"] = bool(tod and rec["tod_after"] == f"{tod}:00")
         rec["weather_after"] = None
-        rec["valid"] = bool((not weather) and tod and
-                            rec["tod_after"] == f"{tod}:00")
+        rec["valid"] = False
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, AttributeError) as exc:
         rec["error"] = f"{type(exc).__name__}: {exc}"
     return rec

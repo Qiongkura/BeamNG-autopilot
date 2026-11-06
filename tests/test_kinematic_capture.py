@@ -186,7 +186,8 @@ def test_environment_readback_requires_tod_and_rejects_unread_weather(monkeypatc
         bng = Bng()
 
     clear = mod._apply_environment(Conn(), "06:30", None)
-    assert clear["valid"] is True and clear["tod_after"] == "06:30:00"
+    assert clear["valid"] is False and clear["tod_after"] == "06:30:00"
+    assert clear["tod_matches"] is True and clear["weather_readback"] == "UNKNOWN"
     rain = mod._apply_environment(Conn(), "06:30", "rainy")
     assert rain["valid"] is False
     assert rain["weather_readback"] == "UNKNOWN"
