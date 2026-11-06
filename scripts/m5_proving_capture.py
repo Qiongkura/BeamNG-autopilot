@@ -117,8 +117,15 @@ def capture_cmd(site: str, cell: str, out: Path, *, frames: int) -> list[str]:
         "--mat-gravel", "m_dirt_road_gravels",
         "--model", MODEL,
         "--frames", str(int(frames)), "--save-frames",
-        # 探针默认只跑 1s（放置期）；采集需要放置后的行驶窗口来攒帧。
-        "--drive-seconds", "20",
+        # 运动学步进采集：沿站点中心线逐站传送取帧，不跑 FSD 驾驶。
+        # 原 FSD 采集在低照度下永远出不了放置阶段（2026-11-06 实测：
+        # S1 四格 1848 帧、位移 <=0.0007 m、独立位姿 1 个），已废弃。
+        "--kinematic-capture",
+        "--kinematic-step-m", "1.0",
+        "--kinematic-span-m", "30.0",
+        "--kinematic-lateral-jitter", "0.25",
+        "--kinematic-yaw-jitter", "2.0",
+        "--kinematic-settle-s", "0.6",
         "--tod", tod,
         "--out", str(out),
     ]

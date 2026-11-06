@@ -72,12 +72,21 @@ def test_proving_env_is_diagnostic_config():
                              "BEAMNG_PAIR_WIDTH_NEAR": "1"}
 
 
-def test_capture_cmd_has_drive_window(tmp_path, monkeypatch):
+def test_capture_cmd_uses_kinematic_mode(tmp_path, monkeypatch):
+    """采集走运动学步进，不再依赖 FSD 放置/驾驶。
+
+    2026-11-06：原实现传 --drive-seconds 让 fsd_drive 开车攒帧，但模型在
+    低照度看不见线就永远出不了放置阶段（S1 四格 1848 帧、位移 <=0.0007 m）。
+    现在改为 --kinematic-capture，与模型能力完全解耦。
+    """
     m = _mod()
     monkeypatch.setattr(m, "SITES_DIR", tmp_path)
     (tmp_path / "S1.json").write_text("{}", encoding="utf-8")
     cmd = m.capture_cmd("S1", "noon_rain", tmp_path / "probe.json", frames=60)
-    assert cmd[cmd.index("--drive-seconds") + 1] == "20"
+    assert "--kinematic-capture" in cmd
+    assert "--drive-seconds" not in cmd, "FSD 驾驶窗口已废弃"
+    assert cmd[cmd.index("--kinematic-step-m") + 1] == "1.0"
+    assert cmd[cmd.index("--kinematic-span-m") + 1] == "30.0"
 
 
 def test_p_site_has_four_holdout_cells():
