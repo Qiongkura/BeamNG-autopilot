@@ -385,8 +385,6 @@ def collect(args) -> int:
 
     from beamng_autopilot import config
     from beamng_autopilot.connector import BeamNGConnector
-    from beamng_autopilot.experiments.collection import (
-        close_started_game, game_pids)
 
     scene_doc = load_scene(Path(args.scene))
     scene_name = Path(args.scene).stem
@@ -403,8 +401,6 @@ def collect(args) -> int:
         jsonl.unlink()
 
     wall_s = 90.0 + float(args.frames) * 0.8 + 30.0
-    launched_after = time.time()
-    pids_before = game_pids()
     conn = BeamNGConnector(args.map, "etk800",
                            port=config.runtime_port(args.runtime),
                            home=config.runtime_home(args.runtime))
@@ -558,10 +554,10 @@ def collect(args) -> int:
             conn.close()
         except Exception:  # noqa: BLE001
             pass
-        try:
-            close_started_game(pids_before, launched_after=launched_after)
-        except Exception:  # noqa: BLE001
-            pass
+        # No reliable process handle or job-object ownership is available.
+        # A PID appearing after launch could belong to the user; never kill it.
+        print("[pairing-probe] game process ownership unverified; no process terminated",
+              file=sys.stderr, flush=True)
 
     if not jsonl.exists():
         print("[pairing-probe] 探针 JSONL 未生成；见 "

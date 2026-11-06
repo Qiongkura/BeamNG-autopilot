@@ -40,6 +40,19 @@ def test_collect_rejects_unverified_kinematic_before_connecting(monkeypatch):
     assert _load().collect(SimpleNamespace(kinematic_capture=True)) == 3
 
 
+def test_pairing_probe_does_not_kill_processes_by_pid_difference():
+    import ast
+    source = (ROOT / "scripts" / "m5_pairing_probe.py").read_text(encoding="utf-8-sig")
+    tree = ast.parse(source)
+    collect = next(n for n in ast.walk(tree)
+                   if isinstance(n, ast.FunctionDef) and n.name == "collect")
+    forbidden = {"close_started_game", "taskkill", "kill"}
+    calls = {n.func.id if isinstance(n.func, ast.Name) else n.func.attr
+             for n in ast.walk(collect) if isinstance(n, ast.Call)
+             and isinstance(n.func, (ast.Name, ast.Attribute))}
+    assert not (calls & forbidden)
+
+
 class _State:
     def __init__(self, pos, heading):
         self.pos = np.asarray(pos, float)
