@@ -3,16 +3,17 @@
 > 生成：`.venv\Scripts\python.exe scripts\m5_docs_index.py --write`；校验：`--check`（过期返回 1）。
 > 手改本文件会被 `--check` 判为过期——要加说明请写进对应文档或生成器。
 
-共 **306** 篇：交接 5 / 其它 79 / 协议 3 / 定因 7 / 审计 3 / 报告 13 / 状态 5 / 索引 1 / 结果 94 / 计划 12 / 设计 2 / 证据 2 / 评审 8 / 预注册 72；预注册↔结果已配对 **126** 篇；**38** 篇没有被任何文档（含 README/AGENTS）引用，集中列在文末「无正文入口」。
+共 **307** 篇：交接 5 / 其它 80 / 协议 3 / 定因 7 / 审计 3 / 报告 13 / 状态 5 / 索引 1 / 结果 94 / 计划 12 / 设计 2 / 证据 2 / 评审 8 / 预注册 72；预注册↔结果已配对 **126** 篇；**38** 篇没有被任何文档（含 README/AGENTS）引用，集中列在文末「无正文入口」。
 
 「被引用」= 其它文档正文里出现该文件名（不含扩展名）的次数；0 表示没有正文入口，需要补链或归档。
 
-## T16（206）
+## T16（207）
 
 | 日期 | 类型 | 文件 | 标题 | 配对 | 被引用 |
 | --- | --- | --- | --- | --- | ---: |
+| 2026-11-06 | 其它 | [T16_PROVING_POSE_DEDUP_PROPOSAL_20261106.md](T16_PROVING_POSE_DEDUP_PROPOSAL_20261106.md) | 试车场位姿去重候选协议（提案，未冻结） |  | 0 |
 | 2026-11-06 | 定因 | [T16_PROVING_RIGHTLINE_ATTRIB_20261106.md](T16_PROVING_RIGHTLINE_ATTRIB_20261106.md) | 试车场右线投影残差诊断（2026-11-06，原归因已撤回） |  | 1 |
-| 2026-11-05 | 预注册 | [T16_PROVING_CAPTURE_PREREG_20261105.md](T16_PROVING_CAPTURE_PREREG_20261105.md) | 试车场低照度/雨天采集扩池实验（预注册，2026-11-05） |  | 0 |
+| 2026-11-05 | 预注册 | [T16_PROVING_CAPTURE_PREREG_20261105.md](T16_PROVING_CAPTURE_PREREG_20261105.md) | 试车场低照度/雨天采集扩池实验（预注册，2026-11-05） |  | 1 |
 | 2026-11-05 | 其它 | [T16_PROVING_EXPORT_PILOT_BLOCKER_20261105.md](T16_PROVING_EXPORT_PILOT_BLOCKER_20261105.md) | 试车场采集/导出 pilot：右线渲染偏移阻塞几何标签（2026-11-06 收尾） |  | 0 |
 | 2026-11-05 | 预注册 | [T16_PROVING_GROUND_CONDITIONS_PREREG_20261105.md](T16_PROVING_GROUND_CONDITIONS_PREREG_20261105.md) | T16 试车场静止条件实验（预注册，2026-11-05） | ↔ T16_PROVING_GROUND_CONDITIONS_RESULT_20261105 | 2 |
 | 2026-11-05 | 结果 | [T16_PROVING_GROUND_CONDITIONS_RESULT_20261105.md](T16_PROVING_GROUND_CONDITIONS_RESULT_20261105.md) | T16 试车场静止条件实验：完整 12 格结果（2026-11-05） | ↔ T16_PROVING_GROUND_CONDITIONS_PREREG_20261105 | 3 |
@@ -519,7 +520,7 @@
 | 2026-09-25 | 其它 | [T14_W2_W5_W3_W6_PROGRESS_20260925.md](T14_W2_W5_W3_W6_PROGRESS_20260925.md) | T14 开发方案：W2 / W5 / W3 / W6 执行报告（2026-09-25 第二批） |
 | 2026-09-24 | 其它 | [T14_NEXT_STAGE_20260924.md](T14_NEXT_STAGE_20260924.md) | 下一阶段进展（2026-09-24 起）：可信标线评价 → 真正的后台循环 |
 | 2026-09-24 | 报告 | [T14_PROGRESS_REPORT_20260924.md](T14_PROGRESS_REPORT_20260924.md) | T14 三小时计划执行 + 后续开发报告（2026-09-24） |
-| 2026-11-05 | 预注册 | [T16_PROVING_CAPTURE_PREREG_20261105.md](T16_PROVING_CAPTURE_PREREG_20261105.md) | 试车场低照度/雨天采集扩池实验（预注册，2026-11-05） |
+| 2026-11-06 | 其它 | [T16_PROVING_POSE_DEDUP_PROPOSAL_20261106.md](T16_PROVING_POSE_DEDUP_PROPOSAL_20261106.md) | 试车场位姿去重候选协议（提案，未冻结） |
 | 2026-11-05 | 其它 | [T16_PROVING_EXPORT_PILOT_BLOCKER_20261105.md](T16_PROVING_EXPORT_PILOT_BLOCKER_20261105.md) | 试车场采集/导出 pilot：右线渲染偏移阻塞几何标签（2026-11-06 收尾） |
 | 2026-11-04 | 预注册 | [T16_ENSEMBLE_DRIVE_PREREG_20261104.md](T16_ENSEMBLE_DRIVE_PREREG_20261104.md) | T16 集成接 drive 部署接线 · 预注册（2026-11-04） |
 | 2026-11-04 | 预注册 | [T16_MARKING_REPLAY_PREREG_20261104.md](T16_MARKING_REPLAY_PREREG_20261104.md) | T16 live 帧回放 + mask→marking 诊断 · 预注册（2026-11-04） |
