@@ -266,11 +266,9 @@ def close_started_game(pids_before, *, images: tuple = GAME_IMAGES,
     started, unverified = _owned_started_pids(
         started, images, launched_after) if started else ([], [])
     if not started and not unverified:
-        return {"closed": not bool(unverified), "killed": [],
-                "unverified": unverified,
-                "note": ("采集没有留下新的游戏进程"
-                         + ("（有进程无法证明归属，未动）"
-                            if unverified else ""))}
+        return {"closed": False, "killed": [], "unverified": [],
+                "verification_unknown": True,
+                "reason": "未证明启动链已结束；单次空枚举不能确认清理完成"}
     killed, failed = [], []
     for pid in started:
         try:
@@ -295,14 +293,14 @@ def close_started_game(pids_before, *, images: tuple = GAME_IMAGES,
     still = sorted(set(left) - before_set) if left is not None else []
     vanished = [u for u in unverified if left is not None and u["pid"] not in left]
     unverified = [u for u in unverified if left is None or u["pid"] in left]
-    return {"closed": left is not None and not still and not unverified,
+    return {"closed": False,
             "killed": killed, "failed": failed,
             "unverified": unverified, "still_running": still,
             "vanished_before_verification": vanished,
-            "verification_unknown": left is None,
+            "verification_unknown": left is None or not still,
             "reason": ("收尾后进程状态 UNKNOWN" if left is None else
                        f"仍在运行：{still}（GPU 仍在被占用，后续计时会被污染）"
-                       if still else "进程归属未证实" if unverified else "")}
+                       if still else "启动链结束未证明，清理状态 UNKNOWN")}
 
 
 def preflight(*, spec: CollectSpec, game_running: bool | None,
