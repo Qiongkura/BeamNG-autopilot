@@ -295,6 +295,7 @@ def run_site(site: str, only: tuple[str, ...] | None = None) -> int:
     if site not in SITES:
         raise SystemExit(f"未知站点 {site!r}（可选 {sorted(SITES)}）")
     todo = only or (P_CELLS if site == "P" else tuple(cells()))
+    failed = False
     for cell in todo:
         man = CAP_DIR / site / cell / "capture.json"
         if man.exists():
@@ -305,28 +306,35 @@ def run_site(site: str, only: tuple[str, ...] | None = None) -> int:
                     continue
             except (OSError, ValueError):
                 pass
-        wait_engine_gone()
+        if not wait_engine_gone():
+            # An unknown process state is not permission to attach or kill.
+            print(f"[FAIL] {site}/{cell}: engine state unknown or busy", flush=True)
+            failed = True
+            break
         try:
-            capture(site, cell)
-        except Exception as exc:  # noqa: BLE001 — 单格失败不阻断整站
-            d = CAP_DIR / site / cell
-            d.mkdir(parents=True, exist_ok=True)
-            (d / "capture.json").write_text(json.dumps({
-                "schema": "proving_capture_v1", "site": site, "cell": cell,
-                "status": "INCOMPLETE", "error": f"{type(exc).__name__}: {exc}",
-            }, ensure_ascii=False, indent=1), encoding="utf-8")
+            rc = capture(site, cell)
+            if rc != 0:
+                failed = True
+                print(f"[FAIL] {site}/{cell}: capture returned {rc!r}", flush=True)
+        except Exception as exc:  # noqa: BLE001 — preserve evidence and report
+            # Do not overwrite any existing capture.json: it may be the only
+            # evidence of an earlier attempt. A future implementation needs
+            # unique per-attempt directories and an atomic result manifest.
+            failed = True
             print(f"[FAIL] {site}/{cell}: {type(exc).__name__}: {exc}",
                   flush=True)
         time.sleep(1.0)
-    return 0
+    return 1 if failed else 0
 
 
 def run_all() -> int:
     if not _CAPTURE_ENABLED:
         raise RuntimeError("BLOCKED: 环境与进程归属尚未验证，禁止批量采集")
+    failed = False
     for site in ("S1", "S2", "S3", "P"):
-        run_site(site)
-    return 0
+        if run_site(site) != 0:
+            failed = True
+    return 1 if failed else 0
 
 
 def plan() -> int:

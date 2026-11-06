@@ -149,7 +149,7 @@ def test_run_site_skips_ok_and_continues(tmp_path, monkeypatch):
     monkeypatch.setattr(m, "CAP_DIR", tmp_path)
     monkeypatch.setattr(m, "wait_engine_gone", lambda *a, **k: True)
     called = []
-    monkeypatch.setattr(m, "capture", lambda site, cell, **k: called.append(cell))
+    monkeypatch.setattr(m, "capture", lambda site, cell, **k: (called.append(cell), 0)[1])
     ok = tmp_path / "P" / "noon_clear"
     ok.mkdir(parents=True)
     (ok / "capture.json").write_text('{"status": "ok"}', encoding="utf-8")
@@ -157,21 +157,38 @@ def test_run_site_skips_ok_and_continues(tmp_path, monkeypatch):
     assert called == ["noon_rain", "dusk_clear", "night_clear"]
 
 
-def test_run_site_records_failure(tmp_path, monkeypatch):
+def test_run_site_propagates_failure_without_overwriting_evidence(tmp_path, monkeypatch):
     m = _mod()
     monkeypatch.setattr(m, "_CAPTURE_ENABLED", True)
     monkeypatch.setattr(m, "CAP_DIR", tmp_path)
     monkeypatch.setattr(m, "wait_engine_gone", lambda *a, **k: True)
+    monkeypatch.setattr(m.time, "sleep", lambda _: None)
+    man = tmp_path / "P" / "noon_clear" / "capture.json"
+    man.parent.mkdir(parents=True)
+    original = b'{"status":"INCOMPLETE", "evidence":"keep"}'
+    man.write_bytes(original)
 
     def boom(site, cell, **k):
         raise RuntimeError("probe died")
 
     monkeypatch.setattr(m, "capture", boom)
-    m.run_site("P")
-    man = tmp_path / "P" / "noon_clear" / "capture.json"
-    data = __import__("json").loads(man.read_text(encoding="utf-8"))
-    assert data["status"] == "INCOMPLETE"
-    assert "probe died" in data["error"]
+    assert m.run_site("P", only=("noon_clear",)) == 1
+    assert man.read_bytes() == original
+
+
+def test_run_site_refuses_unknown_engine_and_propagates_nonzero(tmp_path, monkeypatch):
+    m = _mod()
+    monkeypatch.setattr(m, "_CAPTURE_ENABLED", True)
+    monkeypatch.setattr(m, "CAP_DIR", tmp_path)
+    monkeypatch.setattr(m.time, "sleep", lambda _: None)
+    called = []
+    monkeypatch.setattr(m, "capture", lambda *a, **k: called.append(a) or 2)
+    monkeypatch.setattr(m, "wait_engine_gone", lambda: False)
+    assert m.run_site("S1", only=("noon_clear",)) == 1
+    assert called == []
+    monkeypatch.setattr(m, "wait_engine_gone", lambda: True)
+    assert m.run_site("S1", only=("noon_clear",)) == 1
+    assert len(called) == 1
 
 
 def test_wait_engine_gone_clean(monkeypatch):
@@ -199,6 +216,7 @@ def test_run_all_covers_36_cells(monkeypatch):
     m = _mod()
     monkeypatch.setattr(m, "_CAPTURE_ENABLED", True)
     order = []
-    monkeypatch.setattr(m, "run_site", lambda site: order.append(site))
-    m.run_all()
+    monkeypatch.setattr(m, "run_site", lambda site: (order.append(site),
+                                                    1 if site == "S2" else 0)[1])
+    assert m.run_all() == 1
     assert order == ["S1", "S2", "S3", "P"]
