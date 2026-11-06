@@ -74,6 +74,21 @@ def test_attempt_directory_is_unique_and_preserves_previous(tmp_path):
         m.create_attempt_dir(tmp_path / "missing")
 
 
+def test_attempt_manifest_exclusive_create_preserves_existing(tmp_path):
+    import json
+    import pytest
+    m = _mod()
+    path = m.write_attempt_manifest(tmp_path, {"status": "INCOMPLETE"})
+    before = path.read_bytes()
+    assert json.loads(before)["status"] == "INCOMPLETE"
+    with pytest.raises(FileExistsError):
+        m.write_attempt_manifest(tmp_path, {"status": "ok"})
+    assert path.read_bytes() == before
+    with pytest.raises(ValueError):
+        m.write_attempt_manifest(tmp_path, {"bad": float("nan")})
+    assert path.read_bytes() == before
+
+
 def test_frame_manifest_checks_hash_membership_and_duplicates(tmp_path):
     import hashlib
     m = _mod()

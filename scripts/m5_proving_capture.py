@@ -212,6 +212,28 @@ def create_attempt_dir(parent: Path) -> Path:
     return Path(tempfile.mkdtemp(prefix="attempt_", dir=str(parent)))
 
 
+def write_attempt_manifest(attempt_dir: Path, manifest: dict) -> Path:
+    """Exclusively write one manifest, never replace existing evidence.
+
+    Exclusive create prevents accidental overwrite; it does not promise an
+    atomic publish under crash or disk failure. A partial file is an invalid
+    attempt and requires explicit review, never automatic reuse.
+    """
+    directory = Path(attempt_dir)
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("attempt directory must be an existing non-symlink directory")
+    if not isinstance(manifest, dict):
+        raise ValueError("manifest must be a dict")
+    payload = json.dumps(manifest, ensure_ascii=False, sort_keys=True,
+                         allow_nan=False, indent=2) + "\n"
+    path = directory / "attempt_manifest.json"
+    with path.open("x", encoding="utf-8", newline="\n") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return path
+
+
 def verify_frame_manifest(frame_dir: Path, entries: list[dict]) -> dict:
     """只读验证声明的帧文件；这不是新鲜度或采集所有权证明。
 
