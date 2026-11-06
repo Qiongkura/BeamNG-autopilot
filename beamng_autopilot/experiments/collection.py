@@ -220,6 +220,28 @@ def game_pids(images: tuple = GAME_IMAGES) -> set | None:
             if str(name).lower() in wanted}
 
 
+def _ownership_unknown_cleanup() -> dict:
+    return {"closed": False, "killed": [], "unverified": [
+        {"why": "launched_after missing: ownership unproven"}],
+        "reason": "缺少任务启动时刻，拒绝按 PID 差集清理"}
+
+
+def _owned_started_pids(started, images, launched_after):
+    """Return proven-owned pids and unverified evidence."""
+    procs = game_procs(images)
+    verified, unverified = [], []
+    for pid in started:
+        created = (procs or {}).get(pid)
+        cu = _created_unix(created) if created is not None else None
+        if cu is None:
+            unverified.append({"pid": pid, "why": "no usable creation time: ownership unproven"})
+        elif cu + 5.0 < float(launched_after):
+            unverified.append({"pid": pid, "why": "created before this task started (pid reuse)"})
+        else:
+            verified.append(pid)
+    return verified, unverified
+
+
 def close_started_game(pids_before, *, images: tuple = GAME_IMAGES,
                        timeout_s: int = 30,
                        launched_after: float | None = None,
@@ -235,6 +257,8 @@ def close_started_game(pids_before, *, images: tuple = GAME_IMAGES,
     if pids_before is None:
         return {"closed": False, "killed": [],
                 "reason": "采集前没能可靠列出游戏进程：不猜、不乱杀"}
+    if launched_after is None:
+        return _ownership_unknown_cleanup()
     after = game_pids(images)
     if after is None:
         return {"closed": False, "killed": [],
@@ -243,25 +267,8 @@ def close_started_game(pids_before, *, images: tuple = GAME_IMAGES,
     # 所有权校验（方案 G06）：新出现的 pid 还要能证明“是这次任务起的”——
     # 创建时间晚于我们启动采集的时刻。拿不到创建时间、或创建时间早于启动时刻
     # （PID 复用），一律**不关**，只报 unverified 让人看清。
-    unverified: list = []
-    if started and launched_after is not None:
-        procs = game_procs(images)
-        verified: list = []
-        for pid in started:
-            created = (procs or {}).get(pid)
-            cu = _created_unix(created) if created is not None else None
-            if cu is None:
-                unverified.append({"pid": pid,
-                                   "why": "no usable creation time: "
-                                          "ownership unproven"})
-                continue
-            if cu + 5.0 < float(launched_after):
-                unverified.append({"pid": pid,
-                                   "why": "created before this task started "
-                                          "(pid reuse)"})
-                continue
-            verified.append(pid)
-        started = verified
+    started, unverified = _owned_started_pids(
+        started, images, launched_after) if started else ([], [])
     if not started and not unverified:
         return {"closed": not bool(unverified), "killed": [],
                 "unverified": unverified,
