@@ -45,10 +45,37 @@ COLOR_MIN = 0.90
 RADIUS_PX = 6
 CHECK_MIN_M = 5.0       # 可核对距离带（近于 5m 出画/远于 25m 线宽 <2px）
 CHECK_MAX_M = 25.0
-#: 位姿去重阈值：相邻入选帧的平面距离与航向差都必须超过它才算新样本。
-#: 0.5 m / 0.02 rad 对应"同一位置换了个雨滴"的静止帧全部被拒。
+#: 历史探索阈值，仅供候选规则测试；正式导出仍阻断，协议未冻结。
 POSE_MIN_XY_M = 0.5
 POSE_MIN_HEADING_RAD = 0.02
+
+
+def find_pose_duplicate(pos, heading, accepted, *, min_xy=POSE_MIN_XY_M,
+                        min_heading=POSE_MIN_HEADING_RAD):
+    """查找全体已接受位姿中的重复项；无匹配返回 None。
+
+    返回 (索引, 平面距离, 最短角差)。距离和角差均小于阈值才重复；
+    因此原地转向达到角度阈值可作为不同姿态。此规则仅供离线验证，
+    尚未经预注册准入，不能据此解除正式导出阻断。
+    """
+    p = np.asarray(pos, dtype=float).reshape(-1)
+    h = float(heading)
+    dx = float(min_xy)
+    dh = float(min_heading)
+    if p.size < 2 or not np.isfinite(p[:2]).all() or not np.isfinite(h):
+        raise ValueError("invalid pose")
+    if not np.isfinite(dx) or not np.isfinite(dh) or dx <= 0 or dh <= 0:
+        raise ValueError("invalid pose thresholds")
+    for index, (old_pos, old_heading) in enumerate(accepted):
+        previous = np.asarray(old_pos, dtype=float).reshape(-1)
+        oh = float(old_heading)
+        if previous.size < 2 or not np.isfinite(previous[:2]).all() or not np.isfinite(oh):
+            raise ValueError("invalid accepted pose")
+        distance = float(np.linalg.norm(p[:2] - previous[:2]))
+        delta = abs(float(np.arctan2(np.sin(h - oh), np.cos(h - oh))))
+        if distance < dx and delta < dh:
+            return index, distance, delta
+    return None
 
 
 def _load_scenes_module():

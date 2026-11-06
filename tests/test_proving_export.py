@@ -81,6 +81,33 @@ def test_formal_export_is_blocked_before_touching_existing_data(tmp_path, monkey
     assert sorted(p.name for p in tmp_path.iterdir()) == ["existing.npz"]
 
 
+def test_pose_duplicate_checks_all_accepted_and_wraps_angle():
+    m = _mod()
+    accepted = [([0.0, 0.0], np.pi - 0.005), ([3.0, 0.0], 0.0)]
+    match = m.find_pose_duplicate([0.1, 0.0], -np.pi + 0.005, accepted)
+    assert match is not None and match[0] == 0  # A -> B -> A, ±π
+    assert match[1] == pytest.approx(0.1)
+    assert match[2] == pytest.approx(0.01)
+    assert m.find_pose_duplicate([1.0, 0.0], np.pi, accepted) is None
+    assert m.find_pose_duplicate([0.0, 0.0], np.pi - 0.1, accepted) is None
+
+
+@pytest.mark.parametrize("pos, heading", [([np.nan, 0], 0), ([0, np.inf], 0),
+                                           ([0, 0], np.nan), ([1], 0)])
+def test_pose_duplicate_rejects_invalid_input(pos, heading):
+    with pytest.raises(ValueError):
+        _mod().find_pose_duplicate(pos, heading, [])
+
+
+def test_pose_duplicate_threshold_boundaries_and_invalid_history():
+    m = _mod()
+    accepted = [([0, 0], 0)]
+    assert m.find_pose_duplicate([0.5, 0], 0, accepted) is None
+    assert m.find_pose_duplicate([0, 0], 0.03, accepted) is None
+    with pytest.raises(ValueError):
+        m.find_pose_duplicate([0, 0], 0, [([np.nan, 0], 0)])
+
+
 def test_pose_repeat_thresholds_are_strict_enough_for_static_frames():
     """静止帧位姿差 0、雨滴帧位姿差 0：都必须落在阈值内被拒。
 
