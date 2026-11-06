@@ -61,6 +61,19 @@ def test_capture_result_requires_all_independent_evidence():
         assert result["training_qualified"] is False
 
 
+def test_attempt_directory_is_unique_and_preserves_previous(tmp_path):
+    import pytest
+    m = _mod()
+    previous = m.create_attempt_dir(tmp_path)
+    (previous / "evidence.txt").write_text("keep", encoding="utf-8")
+    second = m.create_attempt_dir(tmp_path)
+    assert previous != second and previous.parent == second.parent == tmp_path
+    assert (previous / "evidence.txt").read_text(encoding="utf-8") == "keep"
+    assert list(second.iterdir()) == []
+    with pytest.raises(ValueError):
+        m.create_attempt_dir(tmp_path / "missing")
+
+
 def test_frame_manifest_checks_hash_membership_and_duplicates(tmp_path):
     import hashlib
     m = _mod()

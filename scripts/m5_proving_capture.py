@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import subprocess
+import tempfile
 import sys
 import time
 from pathlib import Path
@@ -196,6 +197,19 @@ def assess_capture_result(*, returncode, timed_out, frame_count, environment,
     # prove actual frame identity, sensor freshness or training qualification.
     return {"status": "INCOMPLETE" if reasons else "EVIDENCE_READY",
             "reasons": reasons, "training_qualified": False}
+
+
+def create_attempt_dir(parent: Path) -> Path:
+    """Create a unique attempt directory under an existing parent.
+
+    Never reuses, moves or deletes prior attempts. This only allocates a
+    directory; it does not establish process ownership, run identity or
+    permission to start a game. Caller must separately persist a manifest.
+    """
+    parent = Path(parent)
+    if not parent.is_dir() or parent.is_symlink():
+        raise ValueError("attempt parent must be an existing non-symlink directory")
+    return Path(tempfile.mkdtemp(prefix="attempt_", dir=str(parent)))
 
 
 def verify_frame_manifest(frame_dir: Path, entries: list[dict]) -> dict:
