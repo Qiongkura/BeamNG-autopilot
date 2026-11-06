@@ -143,6 +143,21 @@ def test_wait_engine_gone_clean(monkeypatch):
     assert m.wait_engine_gone(0.1) is True
 
 
+def test_wait_engine_unknown_or_live_is_not_gone(monkeypatch):
+    m = _mod()
+    monkeypatch.setattr(m, "_game_pids", lambda: None)
+    assert m.wait_engine_gone(0) is False
+    monkeypatch.setattr(m, "_game_pids", lambda: {123})
+    assert m.wait_engine_gone(0) is False
+
+
+def test_game_enumeration_failure_stays_unknown(monkeypatch):
+    from beamng_autopilot.experiments import collection
+    m = _mod()
+    monkeypatch.setattr(collection, "game_pids", lambda: None)
+    assert m._game_pids() is None
+
+
 def test_run_all_covers_36_cells(monkeypatch):
     m = _mod()
     monkeypatch.setattr(m, "_CAPTURE_ENABLED", True)

@@ -163,12 +163,14 @@ def _env_evidence(run_log: Path) -> dict:
     return info
 
 
-def _game_pids() -> set[int]:
+def _game_pids() -> set[int] | None:
+    """游戏进程集合；探测失败返回 None，绝不伪装成空集合。"""
     try:
         from beamng_autopilot.experiments.collection import game_pids
-        return {int(p) for p in game_pids()}
-    except Exception:  # noqa: BLE001 — 清理是 best-effort
-        return set()
+        result = game_pids()
+        return None if result is None else {int(p) for p in result}
+    except (OSError, RuntimeError, ValueError, TypeError, ImportError):
+        return None
 
 
 def _kill_games() -> None:
@@ -177,12 +179,17 @@ def _kill_games() -> None:
 
 
 def wait_engine_gone(timeout_s: float = 30.0) -> bool:
-    deadline = time.time() + float(timeout_s)
-    while time.time() < deadline:
-        if not _game_pids():
+    """只有明确读到空集合才返回 True；未知或超时返回 False。"""
+    deadline = time.monotonic() + max(0.0, float(timeout_s))
+    while True:
+        pids = _game_pids()
+        if pids is None:
+            return False
+        if not pids:
             return True
-        time.sleep(1.0)
-    return not _game_pids()
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
 
 def capture(site: str, cell: str, *, frames: int = 60) -> int:
