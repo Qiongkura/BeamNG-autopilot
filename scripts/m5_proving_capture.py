@@ -44,6 +44,11 @@ SITES = {
 TODS = {"dawn": "06:30", "noon": "12:00", "dusk": "18:30", "night": "21:30"}
 WEATHERS = {"clear": None, "rain": "rainy", "fog": "foggy_morning"}
 
+# Formal capture is disabled until ownership/environment/freshness contracts are
+# repaired. Tests may explicitly enable orchestration with monkeypatch; production
+# CLI cannot bypass this switch.
+_CAPTURE_ENABLED = False
+
 PROVING_ENV = {
     "BEAMNG_CV_WHITE": "0",
     "BEAMNG_LINE_MERGE": "0",
@@ -167,13 +172,8 @@ def _game_pids() -> set[int]:
 
 
 def _kill_games() -> None:
-    for pid in _game_pids():
-        try:
-            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
-                           capture_output=True, text=True,
-                           encoding="utf-8", errors="replace", timeout=30)
-        except (OSError, subprocess.SubprocessError):
-            pass
+    """Never kill by image name: ownership of those processes is unknown."""
+    raise RuntimeError("BLOCKED: 无法证明游戏进程归属，拒绝清理")
 
 
 def wait_engine_gone(timeout_s: float = 30.0) -> bool:
@@ -186,6 +186,9 @@ def wait_engine_gone(timeout_s: float = 30.0) -> bool:
 
 
 def capture(site: str, cell: str, *, frames: int = 60) -> int:
+    # Also guard programmatic callers; the CLI block alone is not a boundary.
+    if not _CAPTURE_ENABLED:
+        raise RuntimeError("BLOCKED: 环境与进程归属尚未验证，禁止采集")
     if site not in SITES:
         raise SystemExit(f"未知站点 {site!r}（可选 {sorted(SITES)}）")
     tod, preset = cell_args(cell)
@@ -251,6 +254,8 @@ def capture(site: str, cell: str, *, frames: int = 60) -> int:
 
 def run_site(site: str, only: tuple[str, ...] | None = None) -> int:
     """顺序采一个站点的全部条件格（P 站默认只采 4 个留出格）。"""
+    if not _CAPTURE_ENABLED:
+        raise RuntimeError("BLOCKED: 环境与进程归属尚未验证，禁止批量采集")
     if site not in SITES:
         raise SystemExit(f"未知站点 {site!r}（可选 {sorted(SITES)}）")
     todo = only or (P_CELLS if site == "P" else tuple(cells()))
@@ -281,6 +286,8 @@ def run_site(site: str, only: tuple[str, ...] | None = None) -> int:
 
 
 def run_all() -> int:
+    if not _CAPTURE_ENABLED:
+        raise RuntimeError("BLOCKED: 环境与进程归属尚未验证，禁止批量采集")
     for site in ("S1", "S2", "S3", "P"):
         run_site(site)
     return 0

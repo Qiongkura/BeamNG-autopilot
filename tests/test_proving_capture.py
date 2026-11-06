@@ -108,6 +108,7 @@ def test_p_site_has_four_holdout_cells():
 
 def test_run_site_skips_ok_and_continues(tmp_path, monkeypatch):
     m = _mod()
+    monkeypatch.setattr(m, "_CAPTURE_ENABLED", True)
     monkeypatch.setattr(m, "CAP_DIR", tmp_path)
     monkeypatch.setattr(m, "wait_engine_gone", lambda *a, **k: True)
     called = []
@@ -121,6 +122,7 @@ def test_run_site_skips_ok_and_continues(tmp_path, monkeypatch):
 
 def test_run_site_records_failure(tmp_path, monkeypatch):
     m = _mod()
+    monkeypatch.setattr(m, "_CAPTURE_ENABLED", True)
     monkeypatch.setattr(m, "CAP_DIR", tmp_path)
     monkeypatch.setattr(m, "wait_engine_gone", lambda *a, **k: True)
 
@@ -143,6 +145,7 @@ def test_wait_engine_gone_clean(monkeypatch):
 
 def test_run_all_covers_36_cells(monkeypatch):
     m = _mod()
+    monkeypatch.setattr(m, "_CAPTURE_ENABLED", True)
     order = []
     monkeypatch.setattr(m, "run_site", lambda site: order.append(site))
     m.run_all()
