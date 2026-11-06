@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -44,8 +45,36 @@ def _frames(root: Path, n: int = 6) -> Path:
     return d
 
 
+def _isolated_source(root: Path) -> Path:
+    """把源码树复制到临时目录，让训练子进程的快照与仓库写入隔离。
+
+    2026-11-06 实测的偶发失败根因：``m5_train_seg.py`` 在训练前后各做一次
+    ``source_snapshot(PROJECT_ROOT)``，哈希 ``beamng_autopilot/``、
+    ``beamng_autopilot_tech/``、``scripts/`` 下全部 .py/.json。全量 pytest
+    并行时任何测试/工具写入这些目录（哪怕是别的测试的临时产物），都会让
+    守卫判"源码变化"并 SystemExit——于是这个测试偶发变红，而单跑必过。
+
+    复制一份到 tmp 后，子进程的 PROJECT_ROOT 指向副本，仓库里的任何写入
+    都与它无关。只复制快照会哈希的三个目录（389 个文件，约 1-2 s）。
+    """
+    from beamng_autopilot.experiments.reproducibility import SOURCE_DIRS
+    dst = root / "_src"
+    for name in SOURCE_DIRS:
+        src_dir = ROOT / name
+        if not src_dir.is_dir():
+            continue
+        target = dst / name
+        if target.exists():
+            # 同一测试里会多次 _train；副本已存在就复用（源码不变，快照一致）
+            continue
+        shutil.copytree(src_dir, target,
+                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
+    return dst
+
+
 def _train(runs: Path, out: Path, *extra: str) -> None:
-    cmd = [sys.executable, str(ROOT / "scripts" / "m5_train_seg.py"),
+    src = _isolated_source(out.parent)
+    cmd = [sys.executable, str(src / "scripts" / "m5_train_seg.py"),
            "--runs", str(runs), *COMMON, "--out", str(out), *extra]
     env = dict(os.environ)
     env["BEAMNG_LOGS_DIR"] = str(out.parent / "_logs")

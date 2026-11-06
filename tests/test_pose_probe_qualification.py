@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import socket
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -220,14 +221,31 @@ def test_capture_requires_valid_artifact_source_and_pre_drive_disarm(evidence, m
         assert result["range_replay"]["validated"] is True
 
 
-def test_acquire_port_rotates_around_a_busy_port():
-    import socket
-    sock = socket.socket()
+def _occupy_port() -> tuple[socket.socket, int]:
+    """占住一个端口，且**保证** port_is_free() 判它忙。
+
+    2026-11-06 实测的偶发失败根因：原测试只 bind 不 listen，Windows 上未
+    listen 的 socket 并不真正占端口；而 ``port_is_free`` 带 SO_REUSEADDR
+    去 bind，可能仍然成功。这里同时 listen 并关掉 REUSEADDR，让"忙"这个
+    前提在任何平台上都成立。
+    """
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):      # Windows
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+    else:                                            # POSIX
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 0)
     sock.bind(("127.0.0.1", 0))
-    busy = sock.getsockname()[1]
+    sock.listen(1)
+    return sock, int(sock.getsockname()[1])
+
+
+def test_acquire_port_rotates_around_a_busy_port():
+    sock, busy = _occupy_port()
     try:
-        actual = ps.acquire_port(busy, total_wait_s=0.0, candidates=2)
-        assert actual == busy + 1
+        assert ps.port_is_free(busy) is False, "前提：占住的端口必须判忙"
+        actual = ps.acquire_port(busy, total_wait_s=0.0, candidates=4)
+        assert actual is not None and actual != busy
+        assert ps.port_is_free(actual) is True
     finally:
         sock.close()
 
