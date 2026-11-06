@@ -93,6 +93,22 @@ def test_frame_manifest_rejects_windows_aliases_and_traversal(tmp_path):
         assert not result["valid"] and "invalid_filename" in result["errors"]
 
 
+def test_frame_manifest_rejects_missing_and_malformed_digest(tmp_path):
+    import hashlib
+    m = _mod()
+    (tmp_path / "present.npz").write_bytes(b"frame")
+    good = hashlib.sha256(b"frame").hexdigest()
+    result = m.verify_frame_manifest(tmp_path, [
+        {"file": "present.npz", "sha256": good},
+        {"file": "missing.npz", "sha256": good},
+    ])
+    assert result["valid"] is False
+    assert any("missing.npz" in error for error in result["errors"])
+    result = m.verify_frame_manifest(tmp_path, [{"file": "present.npz", "sha256": "x" * 64}])
+    assert result["valid"] is False
+    assert "invalid_digest:present.npz" in result["errors"]
+
+
 def test_sites_exclude_eval_geometry():
     m = _mod()
     assert set(m.SITES) == {"S1", "S2", "S3", "P"}
