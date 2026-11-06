@@ -403,6 +403,7 @@ def collect(args) -> int:
         jsonl.unlink()
 
     wall_s = 90.0 + float(args.frames) * 0.8 + 30.0
+    launched_after = time.time()
     pids_before = game_pids()
     conn = BeamNGConnector(args.map, "etk800",
                            port=config.runtime_port(args.runtime),
@@ -558,7 +559,7 @@ def collect(args) -> int:
         except Exception:  # noqa: BLE001
             pass
         try:
-            close_started_game(pids_before)
+            close_started_game(pids_before, launched_after=launched_after)
         except Exception:  # noqa: BLE001
             pass
 
