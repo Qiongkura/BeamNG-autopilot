@@ -45,6 +45,10 @@ COLOR_MIN = 0.90
 RADIUS_PX = 6
 CHECK_MIN_M = 5.0       # 可核对距离带（近于 5m 出画/远于 25m 线宽 <2px）
 CHECK_MAX_M = 25.0
+#: 位姿去重阈值：相邻入选帧的平面距离与航向差都必须超过它才算新样本。
+#: 0.5 m / 0.02 rad 对应"同一位置换了个雨滴"的静止帧全部被拒。
+POSE_MIN_XY_M = 0.5
+POSE_MIN_HEADING_RAD = 0.02
 
 
 def _load_scenes_module():
@@ -212,6 +216,11 @@ def export_cell(site: str, cell: str, *, target_frames: int = 30) -> int:
     q_dir.mkdir(exist_ok=True)
     frames = sorted((src / "probe.frames").glob("frame_*.npz"))
     passed, rejected, seen = [], [], set()
+    # 位姿去重：SHA-1 只按像素算，仿真器光影/雨滴每帧微变，静止帧的哈希
+    # 各不相同（2026-11-06 实测：S1/noon_clear 437 帧 437 个不同哈希，
+    # 但独立位姿只有 1 个）。所以必须再按位姿距离筛，否则同一位置的
+    # 静止画面会被当成 30 个训练样本送进池子。
+    last_pose = None
     for fp in frames:
         z = np.load(fp, allow_pickle=True)
         rgb = np.asarray(z["frame"], np.uint8)
@@ -223,6 +232,14 @@ def export_cell(site: str, cell: str, *, target_frames: int = 30) -> int:
         cam = z["cam"][0]
         pos = np.asarray(z["pos"], float)
         heading = float(z["heading"])
+        if last_pose is not None:
+            d_xy = float(np.linalg.norm(pos[:2] - last_pose[:2]))
+            d_h = abs(float(heading) - float(last_pose[2]))
+            if d_xy < POSE_MIN_XY_M and d_h < POSE_MIN_HEADING_RAD:
+                rejected.append({"file": fp.name,
+                                 "reasons": [f"pose_repeat({d_xy:.2f}m,"
+                                             f"{d_h:.3f}rad)"]})
+                continue
         g = gate_frame(rgb, cam, pos, heading, geom, pts)
         if not g["ok"]:
             rejected.append({"file": fp.name, "reasons": g["reasons"]})
@@ -230,6 +247,7 @@ def export_cell(site: str, cell: str, *, target_frames: int = 30) -> int:
                                 rgb=rgb, line=g["line"], road=g["road"])
             continue
         passed.append((fp, rgb, g))
+        last_pose = (float(pos[0]), float(pos[1]), float(heading))
     # 均匀抽 target_frames 帧
     if len(passed) > target_frames:
         idx = np.linspace(0, len(passed) - 1, target_frames).round().astype(int)

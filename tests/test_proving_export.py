@@ -67,3 +67,19 @@ def test_build_masks_with_fake_camera():
                                0.0, geom)
     assert line.sum() > 0
     assert road.sum() >= line.sum()
+
+
+def test_pose_repeat_thresholds_are_strict_enough_for_static_frames():
+    """静止帧位姿差 0、雨滴帧位姿差 0：都必须落在阈值内被拒。
+
+    2026-11-06 实测：S1/noon_clear 437 帧 437 个不同 SHA-1（光影/雨滴每帧
+    微变），但独立位姿只有 1 个。只按哈希去重会把同一位置的静止画面当成
+    30 个训练样本。
+    """
+    m = _mod()
+    assert m.POSE_MIN_XY_M >= 0.5, m.POSE_MIN_XY_M
+    assert m.POSE_MIN_HEADING_RAD >= 0.02, m.POSE_MIN_HEADING_RAD
+    # 静止帧（0 m / 0 rad）必须被判为重复
+    assert 0.0 < m.POSE_MIN_XY_M and 0.0 < m.POSE_MIN_HEADING_RAD
+    # 运动学采集的默认步长 1.0 m 必须超过阈值（否则整批都被判重复）
+    assert 1.0 > m.POSE_MIN_XY_M
