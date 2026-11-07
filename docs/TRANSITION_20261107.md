@@ -29,7 +29,7 @@
 | --- | --- |
 | 仓库 | `I:\projects\beamng-autopilot`，分支 `fix/round3-hardening-20260921`，HEAD `390fe84`，与 origin 同步 |
 | Python | `.venv\Scripts\python.exe`（3.10.11；系统 Python 在 `I:\python`，别混用） |
-| BeamNG | Tech 0.38.5，home `G:\BeamNG.tech.v0.38.5.0`；RPC 端口 **64257**；**单实例**（并发=事故） |
+| BeamNG | Tech 0.38.5，home `G:\BeamNG.tech.v0.38.5.0`；RPC 端口 **47000**（2026-11-07 从 64257 迁移，见 §7）；**单实例**（并发=事故） |
 | 地图包 | `G:\BeamNG.tech.v0.38.5.0\content\levels\*.zip`（gridmap_v2 / Utah / east / west / italy） |
 | shell | 用户要求 **pwsh7**：`pwsh -NoProfile -NonInteractive -Command "..."`；UTF-8 需 `[Console]::OutputEncoding=[Text.Encoding]::UTF8` + `$env:PYTHONIOENCODING='utf-8'` |
 | 杀引擎 | `taskkill /PID <pid> /T /F`（GBK 输出，代码里必须 `errors="replace"`）；进程名 `BeamNG.tech.exe` / `BeamNG.tech.x64.exe`（一个会话 7-9 个进程，正常） |
@@ -149,19 +149,22 @@ git push origin HEAD
 
 ## 6. 当前阻塞清单（按优先级；全部有证据）
 
-### 6.1 [P0] 右线渲染偏移 ~0.8m，导出真值不可用
-- 证据：`docs/T16_PROVING_EXPORT_PILOT_BLOCKER_20261105.md`；`probe.built.json`（left 299.1/right 302.7）vs 渲染反投 right ≈303.5；左线残差 0.55px、右线 10.4px；51/51 拒。
-- 待办（A1，预注册修订案已写在同文档）：两个对照采集——①只生成左线的变体（右线位置应无橙色）；②右线节点改已知 lat（如 -2.0）看渲染是否平移。**每个 ~4 分钟**。
-- 修好后：按结论改 `m5_proving_export.py`（标签用渲染漆色组件+走廊门，或修渲染），重跑 pilot，再继续采集。
+### 6.1 [已解除] 右线渲染偏移 ~0.8m，导出真值不可用
+- A1 定论（2026-11-07，commit 7a6308c/8fe305d）：右线渲染**固定外偏 -0.85m**、渲染跟随节点；左线对齐（+0.05 ≈ 量化）；只画左线时右走廊 0/1200 命中（无幽灵线）。
+- 导出器按结论重写（beb1419）：标签=渲染漆色连通域（世界 δ 归属最近线；厚度 2×p90 折线距离）、built 绑定几何、溯源 SHA-256、stale/quarantine 保留；pilot **1/51 入池**（旧 0/51），门禁零调整。
+- 详细证据与产物见 `docs/T16_PROVING_EXPORT_PILOT_BLOCKER_20261105.md`。
 
-### 6.2 [P0] 导出器/采集状态门不可信（审查确认的缺陷）
+### 6.2 [已闭环 1/2/4/5] 导出器/采集状态门不可信（审查确认的缺陷）
 审查（2026-11-06）确认的问题，修复前**所有 `status=ok` 都要打折**：
-1. capture/probe 不传播子进程失败（probe 不查 drive 返回码；probe.json 存在即成功）；
-2. 环境门不比较请求 vs 读回时刻、天气无读回；
-3. 重试残留帧计入帧数（drive 帧名 `frame_d%05d` 固定从 1 开始）；
-4. INCOMPLETE 格被跳过无法恢复；超时部分输出丢失；
-5. 导出器不读 `probe.built.json` 而重算几何；color 口径与预注册不符；重复导出残留旧 npz；产物无溯源哈希。
-6. 修复顺序：先 1/2/4（决定数据有效性），再 5（决定标签有效性）。
+1. ~~capture/probe 不传播子进程失败~~ → attempt 编排按 rc/超时/帧清单/归属判 EVIDENCE_READY（3591c22）；
+2. ~~环境门不比较请求 vs 读回时刻、天气无读回~~ → tod 容差比对 + 引擎侧天气读回（3591c22）；
+3. ~~重试残留帧计入帧数~~ → attempt 独占目录 + 逐帧 SHA-256 清单核对（3591c22）；
+4. ~~INCOMPLETE 格被跳过无法恢复；超时部分输出丢失~~ → 自动重试/`--reclaim`，历史 attempt 全保留（3591c22/ca7fd92）；
+5. ~~导出器不读 `probe.built.json`、color 口径、无溯源~~ → 已按 A1 重写（beb1419）。
+6. 2026-11-07 深夜补修两处挂死：探针非守护线程卡退出（os._exit）、
+   编排侧管道被引擎继承导致 `subprocess.run` 超时后二次 drain 永久挂死
+   （输出落 `probe.log` + 超时 `taskkill /T /F` 整树）。S1/dusk_clear
+   实跑 EVIDENCE_READY（27/27 帧、无超时、引擎干净）。
 
 ### 6.3 [P1] strict 场景参考线安全边界
 - 场景**构建/加载失败**后代码继续运行，但 route_ref 仍可能从 JSON 生成并参与 strict 侧向门（`fsd_drive.py` `_setup_scenario_and_env` 的 except 后继续 + `_scenario_road_reference`）。
@@ -186,6 +189,9 @@ git push origin HEAD
 ## 7. 环境与代码的坑（踩过一次就别再踩）
 
 - **BeamNG 并发**：上一实例没死透就开下一个 → RPC 挂死。启动前必查进程；超时清理用 `taskkill /T /F`（GBK 输出必须 `errors="replace"`，否则 UnicodeDecodeError）。
+- **RPC 端口必须低于 49152**：64257 落进 Hyper-V/WSL/HNS 动态保留段（约 62000-64449，每次开机洗牌），保留期内引擎绑定报 WSAEACCES → tcom 起不来 → 采集全失败（表现为"启动冻结"，实际是控制台在等 GE-Lua> 而日志未刷盘）。现用 47000。
+- **探针/子进程输出绝不走管道**：引擎会继承探针的 stdout 句柄，管道模式下父进程超时后二次 drain 等 EOF 会永久挂死；一律 `stdout=文件`，超时按进程树强杀。
+- **探针报告落盘后必须 `os._exit(0)`**：beamngpy/相机非守护线程会让解释器卡在退出阶段，编排侧会把成功采集误判超时。
 - **pwsh7 输出**：中文需显式 UTF-8（见 §2）；pytest 管道缓冲会让中途看不到输出。
 - **heredoc 反斜杠**：Git Bash heredoc 里写 `\n` 会被吞，改 Python 补丁文件或 pwsh。
 - **时间**：`set_weather_preset` 是动画，会回写 TOD——固定顺序 weather→sleep(2)→tod，读回留证。
@@ -211,12 +217,13 @@ git push origin HEAD
 
 ## 10. 下一步（建议执行顺序，全部来自已预注册/已审查的结论）
 
-1. **A1 对照采集**（2×4 分钟）→ 定右线偏移根因（§6.1）。
-2. 按 A1 结论修 `m5_proving_export.py`：标签=渲染漆色组件（或修渲染）+ 走廊门；**绑定 `probe.built.json`**；color 改为标签像素口径；加溯源哈希。重跑 pilot 直至有帧入池。
-3. 修采集状态门（§6.2 的 1/2/4）：环境一致性校验、运行独立目录、失败传播。**然后重跑已完成的 4 格**（旧格按新门核验）。
-4. strict 场景参考 fail-closed（§6.3）+ 负例测试。
-5. 跑完剩余 36 格采集 → 导出 → **2 seed 混练**（v28_sslA 起步，原池:新池=1:1）→ 重跑 12 格 + 原 4 折 + P 折（晋级门见预注册 §5：12 格 ≥8 PASS、低照度 ≥5、宏平均 ≥0.534246、P 折 +0.05）。
-6. 全绿后才谈：集成默认化（需用户确认）、默认模型归位、`BEAMNG_PAIR_WIDTH_NEAR` 工程化。
+1. ~~**A1 对照采集** → 定右线偏移根因~~（✅ 2026-11-07）。
+2. ~~按 A1 结论修 `m5_proving_export.py`~~（✅ beb1419，pilot 1/51 入池）。
+3. ~~修采集状态门（§6.2 的 1/2/4）~~（✅ 3591c22/ca7fd92；深夜补修退出/管道挂死）。
+4. **重跑已完成的 4 格（旧门产物）+ 跑完剩余 36 格**（`m5_proving_capture.py --run-all --reclaim`，约 3-4 小时，无人值守；每格先查引擎集合为空）→ 导出。
+5. strict 场景参考 fail-closed（§6.3）+ 负例测试。
+6. **2 seed 混练**（v28_sslA 起步，原池:新池=1:1）→ 重跑 12 格 + 原 4 折 + P 折（晋级门见预注册 §5：12 格 ≥8 PASS、低照度 ≥5、宏平均 ≥0.534246、P 折 +0.05）。
+7. 全绿后才谈：集成默认化（需用户确认）、默认模型归位、`BEAMNG_PAIR_WIDTH_NEAR` 工程化。
 
 ## 11. 与用户的协作约定
 

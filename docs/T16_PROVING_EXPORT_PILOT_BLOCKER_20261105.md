@@ -146,3 +146,33 @@ pilot 重跑（S1/noon_rain 真实雨天帧，几何源 noon_clear 的 built.jso
 - pilot 导出：`logs/m5_seg/proving_pool/S1/noon_rain/manifest.json`
   （51 拒绝 + quarantine）
 - 导出器：`scripts/m5_proving_export.py`（实验性，A1 结论前不用于训练）
+
+### 端口根因定稿 + 采集挂死双修（2026-11-07 深夜）
+
+**"冻结"的真正根因（控制台证据）**：引擎控制台显示
+`E|GELua.TechCom|Access to the port 64257 was denied by the operating
+system` / `Could not create server socket`（启动 2.7s）——tcom RPC 服务
+绑定失败，引擎本体其实正常启动到菜单/`GE-Lua>` 提示符（控制台 308s），
+而 `beamng.log` 未刷盘，监控读到的是陈旧缓冲 → 误判"冻结"。
+64257 落在本机 Hyper-V/WSL/HNS **动态保留段**（约 62000-64449，每次
+开机随机洗牌）：绑定实测 62000 OK / 63000-64400 DENIED(WSAEACCES 10013)
+/ 64450 OK。迁移到 **47000**（低于临时端口起点 49152，永久免疫），
+22:16 起 RPC 监听恢复、27 帧采集成功。
+
+**为什么一晚失败 20+ 次却没早点发现**：所有假设（ToDesk 幽灵设备、
+GameViewer 虚拟屏、焦点、GDI 池、userpath、输入法）都指向"启动阶段
+冻结"，而真实失败点在 RPC 绑定；日志缓冲让证据迟到数分钟。教训：
+控制台缓冲比 `beamng.log` 更早、更真。
+
+**采集挂死双修（同晚）**：
+1. 探针写完报告后进程滞留 8+ 分钟（beamngpy/相机非守护线程卡解释器
+   退出）→ 报告落盘后 `conn.close()` + `os._exit(0)`；否则编排侧
+   1200s 超时会把成功采集误判 INCOMPLETE。
+2. 编排侧 `subprocess.run(capture_output=True)` 在超时后无超时地二次
+   drain 管道；引擎进程继承了探针的 stdout 句柄 → EOF 永不到来 →
+   编排器挂死 37+ 分钟。改为探针输出落 `probe.log`（文件）、超时
+   `taskkill /PID <probe> /T /F` 整树强杀（含引擎，超时态不留孤儿）。
+   回归测试：孙进程持有 stdout 不阻塞、超时整树清理。
+
+**验证**：`S1/dusk_clear` → `EVIDENCE_READY`（rc=0、无超时、27/27 帧
+清单核对、tod 18:30 读回一致、引擎 PID 清理 + 差分清扫干净）。
