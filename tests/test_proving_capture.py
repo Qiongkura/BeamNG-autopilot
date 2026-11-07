@@ -427,14 +427,26 @@ def _fake_probe_run_factory(tmp_path, *, rc=0, n_frames=25, weather="rainy",
     return fake_run, state
 
 
-def _wire_capture(tmp_path, monkeypatch, fake_run, state, engine_gone=True):
+def _wire_capture(tmp_path, monkeypatch, fake_run, state, engine_gone=True,
+                  game_pids=None):
+    """game_pids：每次 _game_pids() 调用的返回序列（最后一项重复）。
+    None = 恒空集。差分归属测试用 [set(), {leaked...}] 模拟泄漏。"""
     m = _mod()
+    seq = [set()] if game_pids is None else [set(s) for s in game_pids]
+    calls = {"n": 0}
+
+    def fake_pids():
+        idx = min(calls["n"], len(seq) - 1)
+        calls["n"] += 1
+        return set(seq[idx])
+
     monkeypatch.setattr(m, "CAP_DIR", tmp_path / "cap")
     monkeypatch.setattr(m, "SITES_DIR", tmp_path / "sites")
     (tmp_path / "sites").mkdir(parents=True, exist_ok=True)
     (tmp_path / "sites" / "S1.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(m.subprocess, "run", fake_run)
     monkeypatch.setattr(m, "wait_engine_gone", lambda *a, **k: engine_gone)
+    monkeypatch.setattr(m, "_game_pids", fake_pids)
     monkeypatch.setattr(m, "_kill_pid_tree",
                         lambda pid: state["killed_pids"].append(pid) or True)
     monkeypatch.setattr(m.time, "sleep", lambda _: None)
@@ -484,15 +496,35 @@ def test_capture_tampered_frame_manifest_is_incomplete(tmp_path, monkeypatch):
     assert summary["status"] == "INCOMPLETE"
 
 
-def test_capture_no_engine_pid_is_ownership_unverified(tmp_path, monkeypatch):
+def test_capture_no_pid_leaked_engine_is_swept_by_diff(tmp_path, monkeypatch):
+    """探针没记录 PID（连接阶段挂起）但引擎泄漏 → 差分清扫按 PID 清掉。"""
     fake_run, state = _fake_probe_run_factory(tmp_path, engine_pid=None)
-    m = _wire_capture(tmp_path, monkeypatch, fake_run, state)
-    assert m.capture("S1", "noon_rain") == 1
+    m = _wire_capture(tmp_path, monkeypatch, fake_run, state,
+                      game_pids=[set(), {999, 1000}])
+    assert m.capture("S1", "noon_rain") == 0
     attempts = list((tmp_path / "cap" / "S1" / "noon_rain").glob("attempt_*"))
     result = json.loads((attempts[0] / "attempt_result.json").read_text("utf-8"))
-    assert result["status"] == "INCOMPLETE"
-    assert "ownership_unverified" in result["reasons"]
-    assert state["killed_pids"] == []
+    assert result["status"] == "EVIDENCE_READY"
+    assert result["engine_pid"] is None
+    assert result["engine_sweep_ok"] is True
+    assert sorted(state["killed_pids"]) == [999, 1000]
+
+
+def test_capture_unknown_engine_enumeration_is_ownership_unverified(
+        tmp_path, monkeypatch):
+    """进程枚举未知（None）→ 不能建立差分基线 → 拒绝发起。"""
+    fake_run, state = _fake_probe_run_factory(tmp_path)
+    m = _mod()
+    monkeypatch.setattr(m, "CAP_DIR", tmp_path / "cap")
+    monkeypatch.setattr(m, "SITES_DIR", tmp_path / "sites")
+    (tmp_path / "sites").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "sites" / "S1.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(m, "wait_engine_gone", lambda *a, **k: True)
+    monkeypatch.setattr(m, "_game_pids", lambda: None)
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: pytest.fail(
+        "unknown enumeration must not launch a probe"))
+    assert m.capture("S1", "noon_rain") == 1
+    assert not list((tmp_path / "cap" / "S1" / "noon_rain").glob("attempt_*"))
 
 
 def test_capture_incomplete_then_reclaim_supersedes_legacy(tmp_path, monkeypatch):

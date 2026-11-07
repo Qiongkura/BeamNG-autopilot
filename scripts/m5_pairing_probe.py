@@ -430,13 +430,18 @@ def collect(args) -> int:
                            port=config.runtime_port(args.runtime),
                            home=config.runtime_home(args.runtime))
     engine_pid = None
+    out.parent.mkdir(parents=True, exist_ok=True)
+    # 启动 stub：编排侧在探针超时/崩溃/连接挂起时也知道 attempt 已启动；
+    # 引擎 PID 在 conn.open 返回后补写（归属清理另有编排侧差分清扫兜底）
+    out.write_text(json.dumps(
+        {"schema": "pairing-probe-v2", "phase": "launching",
+         "engine_pid": None, "scene": str(args.scene)},
+        ensure_ascii=False), encoding="utf-8")
     try:
         conn.open(launch=True)
         proc = getattr(conn.bng, "process", None)
         if proc is not None and getattr(proc, "pid", None):
             engine_pid = int(proc.pid)
-        # 启动 stub：编排侧在探针超时/崩溃时也能拿到引擎 PID 做归属清理
-        out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps(
             {"schema": "pairing-probe-v2", "phase": "started",
              "engine_pid": engine_pid, "scene": str(args.scene)},

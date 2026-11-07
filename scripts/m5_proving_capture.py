@@ -323,6 +323,23 @@ def _kill_pid_tree(pid: int) -> bool:
         return False
 
 
+def _engine_diff_cleanup(pre_pids: set[int] | None) -> bool:
+    """清理 attempt 期间**新出现**的引擎进程（差分归属）。
+
+    attempt 前引擎集合为空（wait_engine_gone 保证），期间出现的任何
+    BeamNG 进程都属于本次尝试——按记录 PID 逐个清理。探测未知（None）
+    时返回 False，不猜测。
+    """
+    cur = _game_pids()
+    if cur is None:
+        return False
+    new = {p for p in cur if p not in (pre_pids or set())}
+    ok = True
+    for pid in sorted(new):
+        ok = _kill_pid_tree(pid) and ok
+    return ok
+
+
 def _write_attempt_result(attempt_dir: Path, result: dict) -> Path:
     """独占写尝试结果（与启动清单不同名，互不覆盖）。"""
     directory = Path(attempt_dir)
@@ -370,6 +387,16 @@ def capture(site: str, cell: str, *, frames: int = 60,
     if legacy_summary.exists() and not reclaim:
         print(f"[audit] {site}/{cell}: 存在历史 capture.json，"
               "默认跳过（--reclaim 显式重采，历史证据保留）", flush=True)
+        return 1
+    # 差分归属基线：此刻引擎集合必须为空（wait_engine_gone 已由调用侧保证；
+    # 单格 CLI 途径这里再查一次，未知/残留直接拒绝，不建立含糊基线）
+    if not wait_engine_gone():
+        print("[FAIL] engine state unknown before attempt; refusing", flush=True)
+        return 1
+    pre_pids = _game_pids()
+    if pre_pids is None:
+        print("[FAIL] engine enumeration unknown before attempt; refusing",
+              flush=True)
         return 1
     cell_dir.mkdir(parents=True, exist_ok=True)
     attempt = create_attempt_dir(cell_dir)
@@ -421,13 +448,15 @@ def capture(site: str, cell: str, *, frames: int = 60,
     frame_count = int(fver.get("declared_count") or 0) if fver["valid"] \
         else int(fver.get("actual_count") or 0)
 
-    # 归属链：探针记录的引擎 PID → 清理 → 引擎消失
+    # 归属链：探针记录的引擎 PID → 清理；再差分清扫 attempt 期间新出现的
+    # 引擎进程（stub 早于 PID 记录的场景，如连接阶段挂起）
     cleanup_ok = None
     if engine_pid:
         cleanup_ok = _kill_pid_tree(int(engine_pid))
+    sweep_ok = _engine_diff_cleanup(pre_pids)
     engine_gone = wait_engine_gone()
-    ownership_verified = bool(engine_pid) and cleanup_ok is True \
-        and engine_gone is True
+    ownership_verified = engine_gone is True and (
+        cleanup_ok is True or sweep_ok is True)
 
     env = report.get("environment") or {}
     result = assess_capture_result(
@@ -452,6 +481,7 @@ def capture(site: str, cell: str, *, frames: int = 60,
         "frame_count": frame_count,
         "engine_pid": engine_pid,
         "engine_cleanup_ok": cleanup_ok,
+        "engine_sweep_ok": sweep_ok,
         "engine_gone": engine_gone,
         "ownership_verified": ownership_verified,
         "finished_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
