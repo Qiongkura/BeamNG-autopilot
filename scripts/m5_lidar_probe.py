@@ -12,6 +12,7 @@ import time
 import numpy as np
 
 sys.path.insert(0, ".")
+from beamng_autopilot import config
 from beamng_autopilot.connector import BeamNGConnector
 from beamng_autopilot.perception import (
     LidarClusterTracker,
@@ -30,7 +31,7 @@ from beamng_autopilot_tech.providers import (
 
 
 def main() -> None:
-    conn = BeamNGConnector(port=64257)
+    conn = BeamNGConnector(port=config.runtime_port("tech"))
     conn.open(launch=False)
     conn.attach_vehicle(already_open=True)
     from beamngpy.sensors import Lidar

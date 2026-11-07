@@ -88,8 +88,8 @@ def _truth_edge_lats(mask_offroad, cam, pos, heading, fwd, left,
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="车道真值对比探针")
-    ap.add_argument("--port", type=int, default=64257,
-                    help="Tech 实例端口（默认 64257）")
+    ap.add_argument("--port", type=int, default=None,
+                    help="Tech 实例端口（默认按运行时，Tech 47000）")
     ap.add_argument("--frames", type=int, default=30)
     ap.add_argument("--rate", type=float, default=4.0)
     ap.add_argument("--drive", action="store_true",
@@ -112,7 +112,7 @@ def main() -> None:
     from beamng_autopilot_tech.providers import (
         CAMERA_POS, CAMERA_DIR, CAMERA_UP, CAMERA_FOV_DEG)
 
-    conn = BeamNGConnector(port=args.port)
+    conn = BeamNGConnector(port=args.port or config.runtime_port("tech"))
     conn.open(launch=False)
     try:
         conn.attach_vehicle(already_open=True)

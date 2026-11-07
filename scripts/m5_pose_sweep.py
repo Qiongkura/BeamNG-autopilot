@@ -9,6 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+from beamng_autopilot import config
 from beamng_autopilot.experiments.pose_sweep import (
     PoseRequest, machine_lease, pose_matrix, run_probe,
 )
@@ -25,7 +26,8 @@ def main() -> int:
     ap.add_argument("--seconds", type=float, default=25.0)
     ap.add_argument("--max-wall-s", type=float, default=150.0)
     ap.add_argument("--speed", type=float, default=6.0)
-    ap.add_argument("--port", type=int, default=64257)
+    ap.add_argument("--port", type=int, default=None,
+                    help="comms port (default: Tech 47000)")
     ap.add_argument("--pose-contract", choices=("production_alignment", "fixed_actual_pose"),
                     default="production_alignment")
     ap.add_argument("--out", type=Path, required=True)
@@ -53,10 +55,11 @@ def main() -> int:
         print(held["reason"])
         return 5
     results = []
+    base_port = args.port or config.runtime_port("tech")
     try:
         for i, request in enumerate(requests):
             result = run_probe(request, args.out / f"pose_{i:02d}",
-                               port=args.port + i, lease=lease)
+                               port=base_port + i, lease=lease)
             results.append(result)
             print(f"pose {i}: {result['status']} {result.get('reasons', [])}", flush=True)
             if result["status"] == "blocked":

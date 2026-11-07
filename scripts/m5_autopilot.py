@@ -50,7 +50,7 @@ def main() -> None:
                     help="cruise speed in m/s")
     ap.add_argument("--port", type=int, default=None,
                     help="comms port (default: per-runtime - Steam 64256 / "
-                         "Tech 64257)")
+                         "Tech 47000)")
     ap.add_argument("--fsd", action="store_true",
                     help="use the FSD layered planner as the steering "
                          "frontend (rule path stays the fallback)")

@@ -7,7 +7,7 @@
 --segments > 1 时为多样采集：每段从路网随机节点出发（远离当前点），
 AI 沿路行驶 frames-per-seg 帧，覆盖不同路段，提升模型泛化。
 
-用法（Tech 实例需在运行，默认端口 64257）:
+用法（Tech 实例需在运行，默认端口 47000）:
     .venv\Scripts\python.exe scripts\m5_collect_seg.py --segments 4 --frames-per-seg 225
 """
 
@@ -81,7 +81,9 @@ def _teleport_to(conn, xyz, heading, lift: float = 0.6,
 
 def main() -> None:
     ap = argparse.ArgumentParser(description="分割数据采集")
-    ap.add_argument("--port", type=int, default=64257)
+    ap.add_argument("--port", type=int, default=None,
+                    help="comms port (default: per-runtime - Steam 64256 / "
+                         "Tech 47000)")
     ap.add_argument("--runtime", choices=("auto", "steam", "tech"),
                     default="tech",
                     help="game runtime: tech (default) or steam")
