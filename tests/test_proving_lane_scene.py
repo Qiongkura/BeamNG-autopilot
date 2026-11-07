@@ -38,3 +38,14 @@ def test_other_scenes_do_not_get_pavement():
     for name in ("known_line", "known_no_line", "occluded_line",
                  "slope_curve", "material_mix"):
         assert "pave_width_m" not in mod.SCENES[name], name
+
+
+def test_proving_lane_left_is_single_left_line_without_pavement():
+    """A1 对照实验①的规格：只左线，其余几何/约定与 proving_lane 一致。"""
+    mod = _load_scenes_module()
+    scene = mod.SCENES["proving_lane_left"]
+    assert [ln[2] for ln in scene["lines"]] == ["left"]
+    assert scene["lines"][0][0] == "white"
+    assert scene["lines"][0][1] == +1
+    assert "pave_width_m" not in scene
+    assert "occluder" not in scene

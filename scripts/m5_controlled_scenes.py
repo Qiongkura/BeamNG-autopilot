@@ -269,6 +269,10 @@ SCENES: dict[str, dict] = {
     # 12/12 双侧 pair。`pave_width_m` 仍保留为可选（默认不设），但默认
     # 试车场不铺装；需要时由场景规格显式打开。
     "proving_lane": {"lines": [("white", +1, "left"), ("yellow", -1, "right")]},
+    # 仅左线的试车场变体（预注册 A1 对照实验①）：几何/约定与 proving_lane
+    # 完全一致，但不生成右线——用于判定两线场景里右线位置的橙色是否真的
+    # 由右线节点生成。诊断用途，不进认证/训练池。
+    "proving_lane_left": {"lines": [("white", +1, "left")]},
     "known_no_line": {"lines": []},
     "occluded_line": {"lines": [("white", +1, "left")], "occluder": True},
     "slope_curve": {"lines": [("white", +1, "left"), ("yellow", -1, "right")]},
