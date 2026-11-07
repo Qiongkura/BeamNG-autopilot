@@ -99,11 +99,16 @@ BEAMNG_PROCESS_NAMES = {
 
 # BeamNGpy 通信：端口与运行时绑定，Steam / Tech 可同时跑。
 # - Steam 用 PORT（默认 64256，可用 BEAMNG_PORT 覆盖）
-# - Tech 用 TECH_PORT（默认 64257，可用 BEAMNG_TECH_PORT 覆盖）
+# - Tech 用 TECH_PORT（默认 47000，可用 BEAMNG_TECH_PORT 覆盖）
 # 用 config.runtime_port(mode) 取端口，不要直接用 PORT 连 Tech。
+# 2026-11-07 从 64257 迁移到 47000：64257 落在本机 Hyper-V/WSL/HNS 的
+# 动态保留段（约 62000-64449，每次开机随机洗牌），保留期内引擎绑定端口
+# 报 WSAEACCES（"Access to the port 64257 was denied"）→ RPC 服务器起不来
+# → 采集全部失败。47000 低于动态端口段起点（49152），永久免疫这类保留。
+# 诊断记录：docs/T16_PROVING_EXPORT_PILOT_BLOCKER_20261105.md。
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("BEAMNG_PORT", "64256"))
-TECH_PORT = int(os.environ.get("BEAMNG_TECH_PORT", "64257"))
+TECH_PORT = int(os.environ.get("BEAMNG_TECH_PORT", "47000"))
 
 # Road-network guards used before teleporting a freshly spawned car:
 # only reposition once the road graph is dense, and only when the car is
