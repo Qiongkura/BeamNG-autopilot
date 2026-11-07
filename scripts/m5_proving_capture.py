@@ -46,10 +46,10 @@ SITES = {
 TODS = {"dawn": "06:30", "noon": "12:00", "dusk": "18:30", "night": "21:30"}
 WEATHERS = {"clear": None, "rain": "rainy", "fog": "foggy_morning"}
 
-# Formal capture is disabled until ownership/environment/freshness contracts are
-# repaired. Tests may explicitly enable orchestration with monkeypatch; production
-# CLI cannot bypass this switch.
-_CAPTURE_ENABLED = False
+# 采集总开关（kill-switch）：门禁闭环已由 attempt 编排强制（环境读回核对、
+# 帧清单核对、按记录 PID 清理引擎、独占清单与隔离目录）。出问题时拨回
+# False 即整体停批，不影响既有证据。
+_CAPTURE_ENABLED = True
 
 PROVING_ENV = {
     "BEAMNG_CV_WHITE": "0",
@@ -303,6 +303,41 @@ def _kill_games() -> None:
     raise RuntimeError("BLOCKED: 无法证明游戏进程归属，拒绝清理")
 
 
+def _kill_pid_tree(pid: int) -> bool:
+    """按**记录归属**的 PID 清理进程树（探针报告的引擎 PID）。
+
+    与按映像名清理的本质区别：该 PID 是我们自己的子进程（探针写入
+    probe.json 的 engine_pid）——归属链条完整。GBK 输出必须
+    errors="replace"（§7）。清理失败返回 False，调用方据此判
+    ownership_unverified。
+    """
+    try:
+        proc = subprocess.run(
+            ["taskkill", "/PID", str(int(pid)), "/T", "/F"],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", timeout=60)
+        return proc.returncode == 0
+    except (OSError, ValueError, subprocess.SubprocessError) as exc:
+        print(f"[capture] pid-tree cleanup failed: {type(exc).__name__}: {exc}",
+              flush=True)
+        return False
+
+
+def _write_attempt_result(attempt_dir: Path, result: dict) -> Path:
+    """独占写尝试结果（与启动清单不同名，互不覆盖）。"""
+    directory = Path(attempt_dir)
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("attempt directory must be an existing non-symlink directory")
+    payload = json.dumps(result, ensure_ascii=False, sort_keys=True,
+                         allow_nan=False, indent=2) + "\n"
+    path = directory / "attempt_result.json"
+    with path.open("x", encoding="utf-8", newline="\n") as stream:
+        stream.write(payload)
+        stream.flush()
+        os.fsync(stream.fileno())
+    return path
+
+
 def wait_engine_gone(timeout_s: float = 30.0) -> bool:
     """只有明确读到空集合才返回 True；未知或超时返回 False。"""
     deadline = time.monotonic() + max(0.0, float(timeout_s))
@@ -317,21 +352,42 @@ def wait_engine_gone(timeout_s: float = 30.0) -> bool:
         time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
 
-def capture(site: str, cell: str, *, frames: int = 60) -> int:
-    # Also guard programmatic callers; the CLI block alone is not a boundary.
+def capture(site: str, cell: str, *, frames: int = 60,
+            reclaim: bool = False) -> int:
+    """按 attempt 流程采集一格（§6.2 门 1/2/4 闭环）。
+
+    每次尝试独立目录（隔离残留帧）、独占清单（不覆盖任何历史证据）、
+    引擎按记录 PID 清理（归属链完整）、帧清单与磁盘核对、环境读回核对
+    （tod + 引擎侧天气）。EVIDENCE_READY 才写格级 summary。
+    """
     if not _CAPTURE_ENABLED:
-        raise RuntimeError("BLOCKED: 环境与进程归属尚未验证，禁止采集")
+        raise RuntimeError("BLOCKED: 采集门禁未启用")
     if site not in SITES:
         raise SystemExit(f"未知站点 {site!r}（可选 {sorted(SITES)}）")
     tod, preset = cell_args(cell)
-    out_dir = CAP_DIR / site / cell
-    out_dir.mkdir(parents=True, exist_ok=True)
-    out = out_dir / "probe.json"
-    if out.exists():
-        print(f"[skip] {out} 已存在")
-        return 0
+    cell_dir = CAP_DIR / site / cell
+    legacy_summary = cell_dir / "capture.json"
+    if legacy_summary.exists() and not reclaim:
+        print(f"[audit] {site}/{cell}: 存在历史 capture.json，"
+              "默认跳过（--reclaim 显式重采，历史证据保留）", flush=True)
+        return 1
+    cell_dir.mkdir(parents=True, exist_ok=True)
+    attempt = create_attempt_dir(cell_dir)
+    write_attempt_manifest(attempt, {
+        "schema": "proving_attempt_v1",
+        "site": site, "cell": cell, "tod": tod,
+        "weather_preset": preset,
+        "split": SITES[site]["split"],
+        "edge_margin_m": float(SITES[site]["edge_margin_m"]),
+        "requested_frames": int(frames),
+        "reclaim": bool(reclaim),
+        "started_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                        time.gmtime()),
+    })
+    out = attempt / "probe.json"
     print(f"[capture] site={site} cell={cell} tod={tod} "
-          f"weather={preset or '-'} frames={frames}", flush=True)
+          f"weather={preset or '-'} frames={frames} attempt={attempt.name}",
+          flush=True)
     timed_out = False
     stdout = stderr = ""
     rc = -1
@@ -342,78 +398,145 @@ def capture(site: str, cell: str, *, frames: int = 60) -> int:
                               env=_run_env(), timeout=1200)
         stdout, stderr, rc = proc.stdout or "", proc.stderr or "", proc.returncode
     except subprocess.TimeoutExpired:
-        # 探针超时只杀直接子进程；引擎/采集进程树要显式清理，否则下一格
-        # 会撞上残留 RPC 端口（2026-11-05 条件批跑教训）。
         timed_out = True
         rc = -9
-        _kill_games()
-        wait_engine_gone()
-    (out_dir / "probe.log").write_text(
+    (attempt / "probe.log").write_text(
         stdout + "\n--- stderr ---\n" + stderr
         + ("\n--- timeout (1200s) ---\n" if timed_out else ""),
         encoding="utf-8")
+
     report = {}
     if out.exists():
         try:
             report = json.loads(out.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             report = {}
-    env = _env_evidence(out_dir / "probe.run.log")
-    n_frames = len(list((out_dir / "probe.frames").glob("frame_*.npz")))
-    manifest = {
-        "schema": "proving_capture_v1",
-        "site": site,
-        "cell": cell,
-        "tod": tod,
-        "weather_preset": preset,
-        "split": SITES[site]["split"],
-        "edge_margin_m": float(SITES[site]["edge_margin_m"]),
+    engine_pid = report.get("engine_pid")
+
+    # §6.2-1/3：帧清单与磁盘核对（声明缺失/多余/哈希不符都算 INVALID）
+    kin = report.get("kinematic") or {}
+    declared = kin.get("files") or []
+    frames_dir = out.with_suffix(".frames")
+    fver = verify_frame_manifest(frames_dir, declared)
+    frame_count = int(fver.get("declared_count") or 0) if fver["valid"] \
+        else int(fver.get("actual_count") or 0)
+
+    # 归属链：探针记录的引擎 PID → 清理 → 引擎消失
+    cleanup_ok = None
+    if engine_pid:
+        cleanup_ok = _kill_pid_tree(int(engine_pid))
+    engine_gone = wait_engine_gone()
+    ownership_verified = bool(engine_pid) and cleanup_ok is True \
+        and engine_gone is True
+
+    env = report.get("environment") or {}
+    result = assess_capture_result(
+        returncode=rc, timed_out=timed_out, frame_count=frame_count,
+        environment=env, ownership_verified=ownership_verified,
+        minimum_frames=20)
+    if not fver["valid"]:
+        result["reasons"].extend(f"frame_manifest:{e}"
+                                 for e in fver["errors"][:8])
+        result["status"] = "INCOMPLETE"
+
+    _write_attempt_result(attempt, {
+        "schema": "proving_attempt_result_v1",
+        "status": result["status"],
+        "reasons": result["reasons"],
+        "probe": {"returncode": rc, "timed_out": timed_out},
+        "environment": env,
+        "frame_verification": {"valid": fver["valid"],
+                               "declared": fver.get("declared_count") or 0,
+                               "actual": fver.get("actual_count") or 0,
+                               "errors": fver["errors"][:8]},
+        "frame_count": frame_count,
+        "engine_pid": engine_pid,
+        "engine_cleanup_ok": cleanup_ok,
+        "engine_gone": engine_gone,
+        "ownership_verified": ownership_verified,
+        "finished_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                         time.gmtime()),
+    })
+
+    # 格级 summary：EVIDENCE_READY 才更新（legacy 内容完整并入）；
+    # INCOMPLETE 且无 legacy 时写指针 summary，绝不覆盖历史 ok 证据。
+    new_summary = {
+        "schema": "proving_capture_v2",
+        "site": site, "cell": cell,
+        "status": ("ok" if result["status"] == "EVIDENCE_READY"
+                   else "INCOMPLETE"),
+        "attempt": attempt.name,
+        "attempt_result": result,
+        "tod": tod, "weather_preset": preset,
+        "frames_saved": frame_count,
         "env": env,
         "probe_rc": rc,
-        "timeout": timed_out,
-        "probe_summary": report.get("summary"),
-        "frames_saved": n_frames,
-        "status": ("ok" if rc == 0 and n_frames >= 20
-                   and env.get("tod_after") else "INCOMPLETE"),
     }
-    (out_dir / "capture.json").write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(json.dumps({k: manifest[k] for k in
-                      ("site", "cell", "status", "frames_saved", "env")},
-                     ensure_ascii=False))
-    return 0
+    if legacy_summary.exists():
+        if result["status"] != "EVIDENCE_READY":
+            print(f"[keep] {site}/{cell}: 尝试未过门，历史 capture.json 保留",
+                  flush=True)
+        else:
+            new_summary["legacy"] = json.loads(
+                legacy_summary.read_text(encoding="utf-8"))
+            new_summary["superseded_legacy"] = True
+            legacy_summary.write_text(
+                json.dumps(new_summary, ensure_ascii=False, indent=1),
+                encoding="utf-8")
+            print(json.dumps({k: new_summary[k] for k in
+                              ("site", "cell", "status", "frames_saved")},
+                             ensure_ascii=False), flush=True)
+    else:
+        legacy_summary.write_text(
+            json.dumps(new_summary, ensure_ascii=False, indent=1),
+            encoding="utf-8")
+        print(json.dumps({k: new_summary[k] for k in
+                          ("site", "cell", "status", "frames_saved")},
+                         ensure_ascii=False), flush=True)
+    return 0 if result["status"] == "EVIDENCE_READY" else 1
 
 
-def run_site(site: str, only: tuple[str, ...] | None = None) -> int:
-    """顺序采一个站点的全部条件格（P 站默认只采 4 个留出格）。"""
+def run_site(site: str, only: tuple[str, ...] | None = None,
+             *, reclaim: bool = False) -> int:
+    """顺序采一个站点的全部条件格（P 站默认只采 4 个留出格）。
+
+    status=ok 的格默认跳过（历史证据不信任、不覆盖）；INCOMPLETE 或
+    无 summary 的格自动重试（新 attempt 目录，§6.2-4 可恢复性）；
+    ``reclaim=True`` 时 ok 格也重采（旧证据并入新 summary）。
+    """
     if not _CAPTURE_ENABLED:
-        raise RuntimeError("BLOCKED: 环境与进程归属尚未验证，禁止批量采集")
+        raise RuntimeError("BLOCKED: 采集门禁未启用")
     if site not in SITES:
         raise SystemExit(f"未知站点 {site!r}（可选 {sorted(SITES)}）")
     todo = only or (P_CELLS if site == "P" else tuple(cells()))
     failed = False
     for cell in todo:
-        existing = CAP_DIR / site / cell
-        if existing.exists():
-            # Legacy status=ok lacks the new evidence contract. Never infer
-            # completion, retry into it, or overwrite any historical files.
-            print(f"[FAIL] {site}/{cell}: existing attempt requires audit", flush=True)
-            failed = True
-            continue
+        summary = CAP_DIR / site / cell / "capture.json"
+        if summary.exists() and not reclaim:
+            status = None
+            try:
+                status = json.loads(summary.read_text(
+                    encoding="utf-8")).get("status")
+            except (OSError, ValueError):
+                status = None
+            if status == "ok":
+                print(f"[audit] {site}/{cell}: status=ok 且未开 --reclaim，"
+                      "跳过", flush=True)
+                failed = True
+                continue
+            print(f"[retry] {site}/{cell}: status={status!r}，"
+                  "开新 attempt 重试", flush=True)
         if not wait_engine_gone():
             # An unknown process state is not permission to attach or kill.
             print(f"[FAIL] {site}/{cell}: engine state unknown or busy", flush=True)
             failed = True
             break
         try:
-            rc = capture(site, cell)
+            rc = capture(site, cell, reclaim=reclaim)
             if rc != 0:
                 failed = True
                 print(f"[FAIL] {site}/{cell}: capture returned {rc!r}", flush=True)
         except Exception as exc:  # noqa: BLE001 — preserve evidence and report
-            # Do not overwrite any existing capture.json: it may be the only
-            # evidence of an earlier attempt. A future implementation needs
-            # unique per-attempt directories and an atomic result manifest.
             failed = True
             print(f"[FAIL] {site}/{cell}: {type(exc).__name__}: {exc}",
                   flush=True)
@@ -421,12 +544,12 @@ def run_site(site: str, only: tuple[str, ...] | None = None) -> int:
     return 1 if failed else 0
 
 
-def run_all() -> int:
+def run_all(*, reclaim: bool = False) -> int:
     if not _CAPTURE_ENABLED:
-        raise RuntimeError("BLOCKED: 环境与进程归属尚未验证，禁止批量采集")
+        raise RuntimeError("BLOCKED: 采集门禁未启用")
     failed = False
     for site in ("S1", "S2", "S3", "P"):
-        if run_site(site) != 0:
+        if run_site(site, reclaim=reclaim) != 0:
             failed = True
     return 1 if failed else 0
 
@@ -456,27 +579,23 @@ def main() -> int:
     ap.add_argument("--cell", default=None, help="例如 dawn_rain")
     ap.add_argument("--frames", type=int, default=60,
                     help="探针分析 tick 数（约等于保存帧数；30 帧/格用 60）")
+    ap.add_argument("--reclaim", action="store_true",
+                    help="允许重采 status=ok 的格（旧证据并入新 summary）")
     args = ap.parse_args()
     if args.plan:
         return plan()
     if args.build_sites:
         return build_sites()
-    # The current runner cannot prove environment readback, process ownership
-    # or capture freshness.  Do not launch/attach or touch existing evidence
-    # until those contracts have been repaired and independently validated.
-    if args.run_all or args.run_site or args.capture:
-        print("[capture] BLOCKED: 环境读回、进程归属与帧来源尚未验证；"
-              "禁止批量采集，保留既有证据。", file=sys.stderr)
-        return 3
     if args.run_all:
-        return run_all()
+        return run_all(reclaim=args.reclaim)
     if args.run_site:
         if not args.site:
             raise SystemExit("--run-site 需要 --site")
-        return run_site(args.site)
+        return run_site(args.site, reclaim=args.reclaim)
     if not args.site or not args.cell:
         raise SystemExit("--capture 需要 --site 和 --cell")
-    return capture(args.site, args.cell, frames=args.frames)
+    return capture(args.site, args.cell, frames=args.frames,
+                   reclaim=args.reclaim)
 
 
 if __name__ == "__main__":

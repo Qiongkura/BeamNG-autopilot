@@ -25,6 +25,7 @@ ambiguous。研究开关默认全部 False（= 现行行为），只记录不生
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import subprocess
@@ -36,6 +37,10 @@ import numpy as np
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+
+#: 采集矩阵的"非 clear"天气预设：clear 格的天气读回不得命中其中之一
+#: （每格全新引擎实例，引擎默认预设即 clear 的证据）。
+_CLEAR_EXCLUDE_PRESETS = ("rainy", "foggy_morning")
 
 from beamng_autopilot.lane.pairing import DEFAULT_PAIRING_RESEARCH  # noqa: E402
 
@@ -345,10 +350,16 @@ def _tod_match(requested, observed, *, tolerance_seconds=1):
 
 
 def _apply_environment(conn, tod: str | None, weather: str | None) -> dict:
-    """应用并读回条件；失败/读回缺失都返回 invalid，不伪造成功。"""
+    """应用并读回条件；失败/读回缺失都返回 invalid，不伪造成功。
+
+    天气读回走**引擎侧**状态查询（core_weather.getCurrentWeatherPreset，
+    独立于请求回声）；clear 格的 matches = 引擎当前预设不是本矩阵的
+    雨/雾预设（每格全新引擎实例，默认态即 clear 证据）。
+    """
     rec = {"tod_requested": tod, "weather_requested": weather,
            "tod_after": None, "weather_after": None,
-           "weather_readback": "UNKNOWN", "valid": False}
+           "weather_readback": None, "weather_readback_error": None,
+           "tod_matches": None, "weather_matches": None, "valid": False}
     # Validate before any game-side mutation, including setting weather.
     if _tod_match(tod, tod) is not True:
         rec["error"] = "invalid_or_missing_requested_tod"
@@ -365,11 +376,25 @@ def _apply_environment(conn, tod: str | None, weather: str | None) -> dict:
             conn.bng.env.set_tod(tod=hms)
         read = conn.bng.env.get_tod() or {}
         rec["tod_after"] = str(read.get("timeStr") or "") or None
-        # 无论是否指定天气预设，缺少独立天气读回都不能声称 clear/rain/fog。
-        # 时刻一致性单独记录；正式环境资格必须在天气也可验证后重定义。
         rec["tod_matches"] = _tod_match(tod, rec["tod_after"])
-        rec["weather_after"] = None
-        rec["valid"] = False
+        # 独立天气读回（引擎 GE Lua 状态，非请求回声）。全新引擎的
+        # selectedWeatherPreset = nil（Lua tostring 后为 "nil"）→ 归一化为
+        # None；clear 格的证据恰是"无预设选中"。
+        resp = conn.bng.control.queue_lua_command(
+            "return tostring(extensions.core_weather"
+            ".getCurrentWeatherPreset())", response=True)
+        readback = str(resp) if resp is not None else ""
+        rec["weather_after"] = None if readback in ("", "nil") else readback
+        rec["weather_readback"] = rec["weather_after"]
+        if weather:
+            rec["weather_matches"] = (rec["weather_readback"] == weather)
+        else:
+            # clear：证据 = 无预设选中，或当前预设不是采集矩阵的雨/雾
+            rec["weather_matches"] = (rec["weather_readback"] is None
+                                      or rec["weather_readback"]
+                                      not in _CLEAR_EXCLUDE_PRESETS)
+        rec["valid"] = (rec["tod_matches"] is True
+                        and rec["weather_matches"] is True)
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, AttributeError) as exc:
         rec["error"] = f"{type(exc).__name__}: {exc}"
     return rec
@@ -377,10 +402,10 @@ def _apply_environment(conn, tod: str | None, weather: str | None) -> dict:
 
 def collect(args) -> int:
     if getattr(args, "kinematic_capture", False):
-        # Block before connecting: a free port / existing process is not proof
-        # of ownership, and environment and pose provenance are not verified.
-        print("[pairing-probe] BLOCKED: 运动学采集尚未验证环境和进程归属", file=sys.stderr)
-        return 3
+        # 运动学采集由编排侧（m5_proving_capture）门禁调用：引擎状态预检、
+        # 环境读回核对、帧清单核对与进程清理都在编排侧闭环；探针自身负责
+        # 环境读回（tod/天气）与逐帧清单落盘。
+        pass
     import time
 
     from beamng_autopilot import config
@@ -404,8 +429,18 @@ def collect(args) -> int:
     conn = BeamNGConnector(args.map, "etk800",
                            port=config.runtime_port(args.runtime),
                            home=config.runtime_home(args.runtime))
+    engine_pid = None
     try:
         conn.open(launch=True)
+        proc = getattr(conn.bng, "process", None)
+        if proc is not None and getattr(proc, "pid", None):
+            engine_pid = int(proc.pid)
+        # 启动 stub：编排侧在探针超时/崩溃时也能拿到引擎 PID 做归属清理
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(json.dumps(
+            {"schema": "pairing-probe-v2", "phase": "started",
+             "engine_pid": engine_pid, "scene": str(args.scene)},
+            ensure_ascii=False), encoding="utf-8")
         conn.load_scenario()
         if not args.no_scenario:
             collector = _load_collector()
@@ -485,12 +520,16 @@ def collect(args) -> int:
                   f"ground_align={_ga}", flush=True)
         if getattr(args, "kinematic_capture", False):
             # 运动学步进采集：不启动 fsd_drive，与模型能力完全解耦。
+            # 环境读回（tod 请求 vs 引擎读回 + 引擎侧天气状态）失败即失败，
+            # probe.json 照写（编排侧按 rc 与 environment 判定）。
             _env = _apply_environment(conn, args.tod, args.weather_preset)
             if not _env["valid"]:
                 print(f"[pairing-probe] BLOCKED: environment readback invalid {_env}",
                       file=sys.stderr)
                 out.write_text(json.dumps({"schema": "pairing-probe-v2",
-                                           "environment": _env}, ensure_ascii=False),
+                                           "environment": _env,
+                                           "engine_pid": engine_pid},
+                                          ensure_ascii=False),
                                encoding="utf-8")
                 return 3
             _kdir = (out.with_suffix(".frames")
@@ -509,6 +548,8 @@ def collect(args) -> int:
                 "map": args.map,
                 "scenario_mode": True,
                 "kinematic": _k,
+                "environment": _env,
+                "engine_pid": engine_pid,
                 "tod": args.tod,
                 "weather_preset": args.weather_preset,
                 "frames": int(_k.get("saved", 0)),
@@ -615,7 +656,7 @@ def analyze(args) -> int:
     return 0
 
 
-_KINEMATIC_ENABLED = False  # No production bypass until ownership/environment validated.
+_KINEMATIC_ENABLED = True  # 归属/环境/帧清单闭环由编排侧门禁（m5_proving_capture）强制
 
 
 def kinematic_capture(conn, scene_doc: dict, out_dir: Path, *,
@@ -662,6 +703,7 @@ def kinematic_capture(conn, scene_doc: dict, out_dir: Path, *,
     out_dir.mkdir(parents=True, exist_ok=True)
     rng = _np.random.default_rng(20261106)
     saved = 0
+    files: list[dict] = []   # 逐帧 SHA-256 清单（编排侧核disk对用）
     stations = []
     s_m = 4.0
     while s_m <= float(span_m):
@@ -701,6 +743,10 @@ def kinematic_capture(conn, scene_doc: dict, out_dir: Path, *,
                 heading=float(st.heading),
                 cam=_np.array([cam], dtype=object),
                 t=float(_time.time()))
+            # 逐帧 SHA-256 清单（§6.2-1/3：编排侧据此核对磁盘帧，重试残留
+            # 与部分输出都逃不过比对）
+            digest = hashlib.sha256(path.read_bytes()).hexdigest()
+            files.append({"file": path.name, "sha256": digest})
             saved += 1
     if ring is not None:
         try:
@@ -710,7 +756,8 @@ def kinematic_capture(conn, scene_doc: dict, out_dir: Path, *,
     return {"saved": saved, "stations": len(stations),
             "step_m": float(step_m), "span_m": float(span_m),
             "lateral_jitter_m": float(lateral_jitter),
-            "yaw_jitter_deg": float(yaw_jitter_deg)}
+            "yaw_jitter_deg": float(yaw_jitter_deg),
+            "files": files}
 
 
 def main() -> int:

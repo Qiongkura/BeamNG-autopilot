@@ -1,7 +1,12 @@
 # -*- coding: utf-8 -*-
-"""试车场采集 runner：站点/条件格/命令/环境证据（预注册 §2-§3）。"""
+"""试车场采集 runner：站点/条件格/命令/环境证据/attempt 门禁（预注册 §2-§3，
+§6.2 门 1/2/4 闭环：环境读回核对、帧清单核对、按记录 PID 清理引擎、
+attempt 隔离与可恢复）。"""
 import importlib.util
+import json
 from pathlib import Path
+
+import pytest
 
 
 def _mod():
@@ -13,21 +18,28 @@ def _mod():
     return mod
 
 
-def test_capture_cli_is_blocked_before_launch(monkeypatch):
+def test_capture_cli_requires_switch_and_passes_reclaim(monkeypatch):
+    """CLI 直通编排：--capture 需要 site+cell，--reclaim 透传。"""
     import sys
     m = _mod()
-    monkeypatch.setattr(m, "capture", lambda *a, **k: (_ for _ in ()).throw(
-        AssertionError("blocked CLI must not launch")))
+    seen = {}
+    monkeypatch.setattr(m, "capture", lambda *a, **k: seen.update(a=a, k=k) or 0)
     monkeypatch.setattr(sys, "argv", ["capture", "--capture", "--site", "S1",
-                                     "--cell", "noon_rain"])
-    assert m.main() == 3
+                                      "--cell", "noon_rain", "--reclaim"])
+    assert m.main() == 0
+    assert seen["a"] == ("S1", "noon_rain")
+    assert seen["k"]["reclaim"] is True
+    monkeypatch.setattr(sys, "argv", ["capture", "--capture", "--site", "S1"])
+    with pytest.raises(SystemExit):
+        m.main()
 
 
-def test_direct_capture_and_cleanup_refuse_without_touching_resources(tmp_path, monkeypatch):
-    import pytest
+def test_capture_killswitch_blocks_everything(monkeypatch, tmp_path):
     m = _mod()
     monkeypatch.setattr(m, "CAP_DIR", tmp_path)
-    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: pytest.fail("must not start or kill a process"))
+    monkeypatch.setattr(m, "_CAPTURE_ENABLED", False)
+    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: pytest.fail(
+        "kill-switch on: must not start or kill a process"))
     with pytest.raises(RuntimeError, match="BLOCKED"):
         m.capture("S1", "noon_clear")
     with pytest.raises(RuntimeError, match="BLOCKED"):
@@ -294,7 +306,260 @@ def test_run_all_covers_36_cells(monkeypatch):
     m = _mod()
     monkeypatch.setattr(m, "_CAPTURE_ENABLED", True)
     order = []
-    monkeypatch.setattr(m, "run_site", lambda site: (order.append(site),
-                                                    1 if site == "S2" else 0)[1])
+    monkeypatch.setattr(m, "run_site", lambda site, **k: (
+        order.append(site), 1 if site == "S2" else 0)[1])
     assert m.run_all() == 1
     assert order == ["S1", "S2", "S3", "P"]
+
+
+# ── 天气读回语义（§6.2-2：独立引擎侧证据，非请求回声）────────────────────
+class _FakeBng:
+    def __init__(self, tod_after="12:00:00", preset="nil"):
+        self.env = self
+        self.control = self
+        self._tod_after = tod_after
+        self._preset = preset  # 引擎侧状态：读回的唯一来源
+
+    def set_weather_preset(self, preset):
+        # 读回是引擎状态而非请求回声：set 不改变读回（过渡期语义由真机验证）
+        pass
+
+    def set_tod(self, tod):
+        pass
+
+    def get_tod(self):
+        return {"timeStr": self._tod_after}
+
+    def queue_lua_command(self, chunk, response=False):
+        assert "getCurrentWeatherPreset" in chunk
+        return self._preset
+
+
+class _FakeConn:
+    def __init__(self, bng):
+        self.bng = bng
+
+
+def _probe_mod():
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "mpp_probe", str(root / "scripts" / "m5_pairing_probe.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _apply(conn, tod, weather):
+    return _probe_mod()._apply_environment(conn, tod, weather)
+
+
+def test_weather_readback_rainy_matches_only_engine_side():
+    conn = _FakeConn(_FakeBng(tod_after="12:00:00", preset="rainy"))
+    rec = _apply(conn, "12:00", "rainy")
+    assert rec["tod_matches"] is True
+    assert rec["weather_matches"] is True and rec["valid"] is True
+
+
+def test_weather_readback_fresh_engine_fails_rainy_request():
+    """全新引擎 preset=nil（未选预设）→ 请求 rainy 不能声称匹配。"""
+    conn = _FakeConn(_FakeBng(tod_after="12:00:00", preset="nil"))
+    rec = _apply(conn, "12:00", "rainy")
+    assert rec["weather_matches"] is False and rec["valid"] is False
+
+
+def test_weather_readback_clear_passes_on_nil_and_fails_on_leftover_rain():
+    conn = _FakeConn(_FakeBng(tod_after="06:30:00", preset="nil"))
+    rec = _apply(conn, "06:30", None)
+    assert rec["weather_matches"] is True and rec["valid"] is True
+    conn = _FakeConn(_FakeBng(tod_after="06:30:00", preset="rainy"))
+    rec = _apply(conn, "06:30", None)
+    assert rec["weather_matches"] is False and rec["valid"] is False
+
+
+def test_weather_readback_tod_mismatch_blocks_even_with_weather():
+    conn = _FakeConn(_FakeBng(tod_after="18:30:00", preset="rainy"))
+    rec = _apply(conn, "12:00", "rainy")
+    assert rec["tod_matches"] is False and rec["valid"] is False
+
+
+# ── attempt 编排（§6.2 门 1/4）───────────────────────────────────────────
+class _FakeProc:
+    def __init__(self, rc=0, stdout=""):
+        self.returncode = rc
+        self.stdout = stdout
+        self.stderr = ""
+
+
+def _fake_probe_run_factory(tmp_path, *, rc=0, n_frames=25, weather="rainy",
+                            tod="12:00:00", engine_pid=4242, report=None):
+    """伪造探针子进程：在 attempt 目录里落盘 probe.json + 帧清单 + 帧。"""
+    import hashlib
+
+    state = {"killed_pids": []}
+
+    def fake_run(cmd, **kwargs):
+        out = Path(cmd[cmd.index("--out") + 1])
+        frames_dir = out.with_suffix(".frames")
+        frames_dir.mkdir(parents=True, exist_ok=True)
+        files = []
+        for i in range(n_frames):
+            f = frames_dir / f"frame_{i:05d}.npz"
+            f.write_bytes(b"frame-%04d" % i)
+            files.append({"file": f.name,
+                          "sha256": hashlib.sha256(f.read_bytes()).hexdigest()})
+        if report is None:
+            rep = {"schema": "pairing-probe-v2", "phase": "done",
+                   "engine_pid": engine_pid,
+                   "environment": {"tod_requested": tod,
+                                   "tod_after": tod,
+                                   "tod_matches": True,
+                                   "weather_requested": weather,
+                                   "weather_readback": weather,
+                                   "weather_matches": True,
+                                   "valid": True},
+                   "kinematic": {"saved": n_frames, "files": files},
+                   "frames": n_frames}
+        else:
+            rep = report
+        out.write_text(json.dumps(rep, ensure_ascii=False), encoding="utf-8")
+        return _FakeProc(rc=rc)
+
+    return fake_run, state
+
+
+def _wire_capture(tmp_path, monkeypatch, fake_run, state, engine_gone=True):
+    m = _mod()
+    monkeypatch.setattr(m, "CAP_DIR", tmp_path / "cap")
+    monkeypatch.setattr(m, "SITES_DIR", tmp_path / "sites")
+    (tmp_path / "sites").mkdir(parents=True, exist_ok=True)
+    (tmp_path / "sites" / "S1.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    monkeypatch.setattr(m, "wait_engine_gone", lambda *a, **k: engine_gone)
+    monkeypatch.setattr(m, "_kill_pid_tree",
+                        lambda pid: state["killed_pids"].append(pid) or True)
+    monkeypatch.setattr(m.time, "sleep", lambda _: None)
+    return m
+
+
+def test_capture_attempt_flow_evidence_ready(tmp_path, monkeypatch):
+    fake_run, state = _fake_probe_run_factory(tmp_path)
+    m = _wire_capture(tmp_path, monkeypatch, fake_run, state)
+    rc = m.capture("S1", "noon_rain", frames=60)
+    assert rc == 0
+    cell = tmp_path / "cap" / "S1" / "noon_rain"
+    attempts = list(p for p in cell.iterdir() if p.is_dir())
+    assert len(attempts) == 1
+    att = attempts[0]
+    result = json.loads((att / "attempt_result.json").read_text("utf-8"))
+    assert result["status"] == "EVIDENCE_READY"
+    assert result["engine_pid"] == 4242
+    assert result["frame_verification"]["valid"] is True
+    assert state["killed_pids"] == [4242]
+    summary = json.loads((cell / "capture.json").read_text("utf-8"))
+    assert summary["status"] == "ok" and summary["frames_saved"] == 25
+    assert summary["env"]["tod_matches"] is True
+
+
+def test_capture_tampered_frame_manifest_is_incomplete(tmp_path, monkeypatch):
+    """磁盘帧被篡改/缺失 → 清单核对失败 → INCOMPLETE，不入池资格。"""
+    fake_run, state = _fake_probe_run_factory(tmp_path)
+
+    def tampering_run(cmd, **kwargs):
+        rc = fake_run(cmd, **kwargs)
+        out = Path(cmd[cmd.index("--out") + 1])
+        victim = out.with_suffix(".frames") / "frame_00003.npz"
+        victim.write_bytes(b"tampered")
+        return rc
+
+    m = _wire_capture(tmp_path, monkeypatch, tampering_run, state)
+    rc = m.capture("S1", "noon_rain")
+    assert rc == 1
+    attempts = list((tmp_path / "cap" / "S1" / "noon_rain").glob("attempt_*"))
+    result = json.loads((attempts[0] / "attempt_result.json").read_text("utf-8"))
+    assert result["status"] == "INCOMPLETE"
+    assert any(e.startswith("frame_manifest:") for e in result["reasons"])
+    summary = json.loads(
+        (tmp_path / "cap" / "S1" / "noon_rain" / "capture.json")
+        .read_text("utf-8"))
+    assert summary["status"] == "INCOMPLETE"
+
+
+def test_capture_no_engine_pid_is_ownership_unverified(tmp_path, monkeypatch):
+    fake_run, state = _fake_probe_run_factory(tmp_path, engine_pid=None)
+    m = _wire_capture(tmp_path, monkeypatch, fake_run, state)
+    assert m.capture("S1", "noon_rain") == 1
+    attempts = list((tmp_path / "cap" / "S1" / "noon_rain").glob("attempt_*"))
+    result = json.loads((attempts[0] / "attempt_result.json").read_text("utf-8"))
+    assert result["status"] == "INCOMPLETE"
+    assert "ownership_unverified" in result["reasons"]
+    assert state["killed_pids"] == []
+
+
+def test_capture_incomplete_then_reclaim_supersedes_legacy(tmp_path, monkeypatch):
+    """INCOMPLETE 保留 legacy；--reclaim 后 EVIDENCE_READY 才并入并取代。"""
+    fake_fail, _ = _fake_probe_run_factory(tmp_path, rc=3, report={
+        "schema": "pairing-probe-v2", "phase": "done", "engine_pid": None,
+        "environment": {"valid": False}, "kinematic": {"saved": 0,
+                                                       "files": []},
+        "frames": 0})
+    m = _wire_capture(tmp_path, monkeypatch, fake_fail, {"killed_pids": []})
+    assert m.capture("S1", "noon_rain", reclaim=True) == 1
+    legacy = json.loads(
+        (tmp_path / "cap" / "S1" / "noon_rain" / "capture.json")
+        .read_text("utf-8"))
+    assert legacy["status"] == "INCOMPLETE"  # 未过门：legacy 保留
+
+    fake_ok, state = _fake_probe_run_factory(tmp_path)
+    m2 = _wire_capture(tmp_path, monkeypatch, fake_ok, state)
+    assert m2.capture("S1", "noon_rain", frames=60, reclaim=True) == 0
+    summary = json.loads(
+        (tmp_path / "cap" / "S1" / "noon_rain" / "capture.json")
+        .read_text("utf-8"))
+    assert summary["status"] == "ok"
+    assert summary["superseded_legacy"] is True
+    assert summary["legacy"]["status"] == "INCOMPLETE"
+    attempts = list(p for p in
+                    (tmp_path / "cap" / "S1" / "noon_rain").iterdir()
+                    if p.is_dir())
+    assert len(attempts) == 2  # 两次尝试目录都保留（§6.2-4 可恢复）
+
+
+def test_run_site_retries_incomplete_and_skips_ok(tmp_path, monkeypatch):
+    m = _mod()
+    monkeypatch.setattr(m, "_CAPTURE_ENABLED", True)
+    monkeypatch.setattr(m, "CAP_DIR", tmp_path)
+    monkeypatch.setattr(m, "wait_engine_gone", lambda *a, **k: True)
+    called = []
+    monkeypatch.setattr(m, "capture",
+                        lambda site, cell, **k: called.append(cell) or 0)
+    ok_cell = tmp_path / "P" / "noon_clear"
+    ok_cell.mkdir(parents=True)
+    (ok_cell / "capture.json").write_text('{"status": "ok"}', encoding="utf-8")
+    inc_cell = tmp_path / "P" / "noon_rain"
+    inc_cell.mkdir(parents=True)
+    (inc_cell / "capture.json").write_text('{"status": "INCOMPLETE"}',
+                                           encoding="utf-8")
+    # ok 格默认跳过（审计标记 → 批次未完成 = 1）；INCOMPLETE 自动重试
+    assert m.run_site("P") == 1
+    assert called == ["noon_rain", "dusk_clear", "night_clear"]
+    # reclaim=True 时 ok 格也重采，批次全绿
+    called.clear()
+    assert m.run_site("P", reclaim=True) == 0
+    assert called == ["noon_clear", "noon_rain", "dusk_clear", "night_clear"]
+
+
+def test_kill_pid_tree_uses_recorded_pid(tmp_path, monkeypatch):
+    """_kill_pid_tree 按记录 PID 调 taskkill；GBK 输出 errors=replace。"""
+    import subprocess as sp
+    m = _mod()
+    seen = {}
+
+    def fake_run(cmd, **k):
+        seen["cmd"] = cmd
+        seen["errors"] = k.get("errors")
+        return sp.CompletedProcess(cmd, 0, stdout="ok", stderr="")
+
+    monkeypatch.setattr(sp, "run", fake_run)
+    assert m._kill_pid_tree(4242) is True
+    assert seen["cmd"] == ["taskkill", "/PID", "4242", "/T", "/F"]
+    assert seen["errors"] == "replace"
