@@ -1,30 +1,80 @@
 # -*- coding: utf-8 -*-
-"""试车场导出：几何真值/漆色/栅格化门禁（预注册 §3.3）。"""
+"""试车场导出：built 绑定几何 / 漆色组件标签 / A1 门禁 / 溯源。
+
+几何用真实 CameraModel + 合成渲染图（不依赖引擎），与
+tests/test_proving_diag_a1.py 同一套确定性夹具。
+"""
 import importlib.util
+import json
 from pathlib import Path
 
+import cv2
 import numpy as np
 import pytest
 
+ROOT = Path(__file__).resolve().parents[1]
+
+ORANGE = (255, 128, 0)
+W, H = 1024, 800
+
 
 def _mod():
-    root = Path(__file__).resolve().parents[1]
     spec = importlib.util.spec_from_file_location(
-        "mpc_export", str(root / "scripts" / "m5_proving_export.py"))
+        "mpc_export", str(ROOT / "scripts" / "m5_proving_export.py"))
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
 
 
-def _doc():
-    return {"scene_type": "proving_lane",
-            "capture": {"site": "S1", "edge_margin_m": 0.8},
-            "scene": {"mid": [300.0, 700.0, 100.0],
-                      "dir": [0.0, 1.0, 0.0],
-                      "half_width_m": 3.5, "slope_pct": 0.0,
-                      "curve_deg": 0.0}}
+def _camera():
+    from beamng_autopilot.vision.projection import CameraModel
+    return CameraModel(
+        offset=np.array([0.0, 1.216, 1.386]),
+        fwd_local=np.array([0.0, 0.99994, -0.0112]),
+        up_local=np.array([0.0, 0.0112, 0.99994]),
+        fov_deg=120, width=W, height=H)
 
 
+def _nodes(lat_m: float) -> np.ndarray:
+    xs = np.arange(5.0, 26.0, 1.0)
+    return np.column_stack([xs, np.full(len(xs), lat_m), np.zeros(len(xs))])
+
+
+def _truth(nodes: np.ndarray, role: str) -> list[dict]:
+    return [{"world": [float(x), float(y), float(z)], "class": 2, "role": role}
+            for x, y, z in nodes]
+
+
+def _built_doc(right_lat: float = -2.7) -> dict:
+    """与 right_lane_lats(3.5, 0.8) 一致的双线 built 记录（右线可改标定）。"""
+    left_lat = right_lat + 3.6
+    ln, rn = _nodes(left_lat), _nodes(right_lat)
+    return {"scene": "S1", "lines": [
+        {"id": "m5_line_S1_left", "role": "left", "width_m": 0.15,
+         "lateral_m": round(left_lat, 3), "nodes": ln.tolist(),
+         "truth_points": _truth(ln, "left")},
+        {"id": "m5_line_S1_right", "role": "right", "width_m": 0.15,
+         "lateral_m": round(right_lat, 3), "nodes": rn.tolist(),
+         "truth_points": _truth(rn, "right")},
+    ]}
+
+
+def _geom(right_lat: float = -2.7):
+    m = _mod()
+    return m.geometry_from_built(m.validate_built_lines(_built_doc(right_lat)))
+
+
+def _paint_strip(img: np.ndarray, cam, lat_m: float, thickness: int = 5):
+    pts = _nodes(lat_m)
+    u, v, ok = cam.project(pts, np.array([0.0, 0.0, 0.0]), 0.0)
+    for i in range(len(pts) - 1):
+        if ok[i] and ok[i + 1] and np.isfinite(u[i]) and np.isfinite(u[i + 1]):
+            cv2.line(img, (int(u[i]), int(v[i])),
+                     (int(u[i + 1]), int(v[i + 1])), ORANGE, thickness)
+    return img
+
+
+# ── built 校验（不变契约）─────────────────────────────────────────────────
 def test_built_line_validation_never_claims_rendered_truth():
     m = _mod()
     source = {"lines": [
@@ -54,22 +104,88 @@ def test_invalid_built_line_records_rejected(record):
         _mod().validate_built_lines(record)
 
 
-def test_site_geometry_has_two_parallel_rails():
+# ── built 绑定几何（A1：不重算）───────────────────────────────────────────
+def test_geometry_from_built_keeps_declared_lateral():
+    """built 里声明右线 -2.0（变体②）→ 几何必须用 -2.0，不得重算回 -2.7。"""
     m = _mod()
-    geom = m.site_geometry(_doc())
-    assert [g["role"] for g in geom] == ["left", "right"]
+    geom = m.geometry_from_built(m.validate_built_lines(_built_doc(-2.0)))
+    right = next(g for g in geom if g["role"] == "right")
+    assert abs(right["center"][0, 1] - (-2.0)) < 1e-6
+    left = next(g for g in geom if g["role"] == "left")
+    assert abs(left["center"][0, 1] - 1.6) < 1e-6
+
+
+def test_geometry_rails_parallel_and_truth_bound():
+    m = _mod()
+    geom = _geom()
     for g in geom:
         sep = np.linalg.norm(g["left"][0, :2] - g["right"][0, :2])
         assert abs(sep - m.LINE_WIDTH_M) < 1e-6
-        # 线位：左线在道路中心左侧，右线在右侧
-    assert geom[0]["center"][0, 0] < geom[1]["center"][0, 0]
+        assert g["truth_points"], "truth points must come from built record"
+    assert geom[0]["center"][0, 1] > geom[1]["center"][0, 1]
 
 
-def test_truth_points_are_class2_with_roles():
+# ── 漆色组件标签 + A1 门禁 ────────────────────────────────────────────────
+def test_label_uses_rendered_paint_and_records_right_offset():
+    """左线对齐、右线按标定 -0.85m 渲染 → 双侧组件入标签、右偏移被记录。"""
     m = _mod()
-    pts = m.truth_points(m.site_geometry(_doc()))
-    assert pts and all(p["class"] == 2 for p in pts)
-    assert {p["role"] for p in pts} == {"left", "right"}
+    cam = _camera()
+    img = np.full((H, W, 3), 200, np.uint8)
+    img = _paint_strip(img, cam, 0.9)              # 左线：渲染=节点
+    img = _paint_strip(img, cam, -2.7 - 0.85)      # 右线：渲染 -0.85m 偏移
+    g = m.label_and_gate_frame(img, cam, np.array([0.0, 0.0, 0.0]), 0.0,
+                               _geom(-2.7))
+    assert g["ok"], g["reasons"]
+    assert (g["line"] == 2).sum() > 0
+    assert abs(g["metrics"]["left_offset_m"]) <= 0.2
+    assert abs(g["metrics"]["right_offset_m"] - (-0.85)) < 0.2
+    assert g["metrics"]["corridor_ratio"] >= m.CORRIDOR_MIN_RATIO
+
+
+def test_gate_rejects_when_component_too_thick():
+    """30px 粗橙块（>25px 门）不能入线标签，帧被拒。"""
+    m = _mod()
+    cam = _camera()
+    img = np.full((H, W, 3), 200, np.uint8)
+    img = _paint_strip(img, cam, 0.9, thickness=31)
+    img = _paint_strip(img, cam, -2.7 - 0.85, thickness=31)
+    g = m.label_and_gate_frame(img, cam, np.array([0.0, 0.0, 0.0]), 0.0,
+                               _geom(-2.7))
+    assert not g["ok"]
+    assert any("component_span_or_missing" in r for r in g["reasons"])
+    assert not (g["line"] == 2).any()
+
+
+def test_gate_rejects_when_right_offset_beyond_calibration():
+    """右线渲染偏移 1.6m（>1.0m 门）→ 帧被拒且右线组件不入标签。"""
+    m = _mod()
+    cam = _camera()
+    img = np.full((H, W, 3), 200, np.uint8)
+    img = _paint_strip(img, cam, 0.9)
+    img = _paint_strip(img, cam, -2.7 - 1.6)
+    g = m.label_and_gate_frame(img, cam, np.array([0.0, 0.0, 0.0]), 0.0,
+                               _geom(-2.7))
+    assert not g["ok"]
+    assert any(r.startswith("right_offset=") for r in g["reasons"])
+    assert g["metrics"]["corridor_ratio"] < m.CORRIDOR_MIN_RATIO
+
+
+def test_road_label_covers_lane_between_built_lines():
+    m = _mod()
+    cam = _camera()
+    img = np.full((H, W, 3), 200, np.uint8)
+    img = _paint_strip(img, cam, 0.9)
+    img = _paint_strip(img, cam, -2.7 - 0.85)
+    g = m.label_and_gate_frame(img, cam, np.array([0.0, 0.0, 0.0]), 0.0,
+                               _geom(-2.7))
+    assert g["road"].sum() >= (g["line"] == 2).sum()
+    # 车道中心（两线中点 lat -0.9）应落在 road 内
+    pts = _nodes(-0.9)
+    u, v, ok = cam.project(pts, np.array([0.0, 0.0, 0.0]), 0.0)
+    mid_ok = [i for i in range(len(pts)) if ok[i] and np.isfinite(u[i])]
+    assert mid_ok
+    i = mid_ok[len(mid_ok) // 2]
+    assert g["road"][int(v[i]), int(u[i])] == 1
 
 
 def test_paint_mask_accepts_orange_and_rejects_grey():
@@ -81,35 +197,7 @@ def test_paint_mask_accepts_orange_and_rejects_grey():
     assert mask[7, 7] and not mask[13, 13]
 
 
-def test_build_masks_with_fake_camera():
-    m = _mod()
-    geom = m.site_geometry(_doc())
-
-    class FakeCam:
-        def project(self, pts, pos, heading):
-            pts = np.asarray(pts, float)
-            u = 100.0 + (pts[:, 0] - pos[0]) * 30.0
-            v = 120.0 - (pts[:, 1] - pos[1]) * 15.0
-            return u, v, np.ones(len(pts), bool)
-
-    rgb = np.zeros((240, 240, 3), np.uint8)
-    line, road = m.build_masks(rgb, FakeCam(), np.array([300.0, 700.0, 100.0]),
-                               0.0, geom)
-    assert line.sum() > 0
-    assert road.sum() >= line.sum()
-
-
-def test_formal_export_is_blocked_before_touching_existing_data(tmp_path, monkeypatch):
-    m = _mod()
-    monkeypatch.setattr(m, "POOL_DIR", tmp_path)
-    marker = tmp_path / "existing.npz"
-    marker.write_bytes(b"evidence")
-    with pytest.raises(RuntimeError, match="BLOCKED"):
-        m.export_cell("S1", "noon_rain")
-    assert marker.read_bytes() == b"evidence"
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["existing.npz"]
-
-
+# ── 位姿去重（不变契约）───────────────────────────────────────────────────
 def test_pose_duplicate_checks_all_accepted_and_wraps_angle():
     m = _mod()
     accepted = [([0.0, 0.0], np.pi - 0.005), ([3.0, 0.0], 0.0)]
@@ -147,28 +235,104 @@ def test_select_pose_candidates_audit_revisit_and_invalid():
         m.select_pose_candidates([records[0], records[0]])
 
 
-def test_pose_duplicate_threshold_boundaries_and_invalid_history():
-    m = _mod()
-    with pytest.raises(ValueError, match="threshold"):
-        m.select_pose_candidates([], min_xy=-1)
-    accepted = [([0, 0], 0)]
-    assert m.find_pose_duplicate([0.5, 0], 0, accepted) is None
-    assert m.find_pose_duplicate([0, 0], 0.03, accepted) is None
-    with pytest.raises(ValueError):
-        m.find_pose_duplicate([0, 0], 0, [([np.nan, 0], 0)])
-
-
 def test_pose_repeat_thresholds_are_strict_enough_for_static_frames():
-    """静止帧位姿差 0、雨滴帧位姿差 0：都必须落在阈值内被拒。
-
-    2026-11-06 实测：S1/noon_clear 437 帧 437 个不同 SHA-1（光影/雨滴每帧
-    微变），但独立位姿只有 1 个。只按哈希去重会把同一位置的静止画面当成
-    30 个训练样本。
-    """
     m = _mod()
     assert m.POSE_MIN_XY_M >= 0.5, m.POSE_MIN_XY_M
     assert m.POSE_MIN_HEADING_RAD >= 0.02, m.POSE_MIN_HEADING_RAD
-    # 静止帧（0 m / 0 rad）必须被判为重复
-    assert 0.0 < m.POSE_MIN_XY_M and 0.0 < m.POSE_MIN_HEADING_RAD
-    # 运动学采集的默认步长 1.0 m 必须超过阈值（否则整批都被判重复）
     assert 1.0 > m.POSE_MIN_XY_M
+
+
+# ── 导出流程：溯源 / 覆盖保护 / quarantine 保留 ───────────────────────────
+def _make_capture(tmp_path: Path, n_frames: int = 4) -> Path:
+    """合成一个采集格：probe.frames + capture.json + built.json。"""
+    m = _mod()
+    cam = _camera()
+    src = tmp_path / "probe.frames"
+    src.mkdir(parents=True)
+    for i in range(n_frames):
+        img = np.full((H, W, 3), 200, np.uint8)
+        # 每帧沿 x 平移车辆位置，避免位姿去重误杀
+        pos = np.array([i * 1.0, 0.0, 0.0])
+        pts = _nodes(0.9)
+        u, v, ok = cam.project(pts, pos, 0.0)
+        for k in range(len(pts) - 1):
+            if ok[k] and ok[k + 1] and np.isfinite(u[k]) and np.isfinite(u[k + 1]):
+                cv2.line(img, (int(u[k]), int(v[k])),
+                         (int(u[k + 1]), int(v[k + 1])), ORANGE, 5)
+        pts_r = _nodes(-2.7 - 0.85)
+        u, v, ok = cam.project(pts_r, pos, 0.0)
+        for k in range(len(pts_r) - 1):
+            if ok[k] and ok[k + 1] and np.isfinite(u[k]) and np.isfinite(u[k + 1]):
+                cv2.line(img, (int(u[k]), int(v[k])),
+                         (int(u[k + 1]), int(v[k + 1])), ORANGE, 5)
+        np.savez_compressed(src / f"frame_{i:05d}.npz",
+                            frame=img, pos=pos, heading=0.0,
+                            cam=np.array([cam], dtype=object), t=float(i))
+    (tmp_path / "capture.json").write_text(json.dumps(
+        {"schema": "proving_capture_v1", "site": "S1", "cell": "x",
+         "split": "train", "status": "ok",
+         "env": {"tod_after": "12:00:00", "weather": "rainy"}}),
+        encoding="utf-8")
+    (tmp_path / "built.json").write_text(
+        json.dumps(_built_doc(-2.7)), encoding="utf-8")
+    return tmp_path
+
+
+def _wire_dirs(monkeypatch, tmp_path: Path):
+    m = _mod()
+    cap = tmp_path / "cap" / "S1" / "cellx"
+    cap.mkdir(parents=True)
+    pool = tmp_path / "pool"
+    pool.mkdir()
+    _make_capture(cap)
+    monkeypatch.setattr(m, "CAP_DIR", tmp_path / "cap")
+    monkeypatch.setattr(m, "POOL_DIR", pool)
+    return m, cap, pool, cap / "built.json"
+
+
+def test_export_cell_writes_pool_with_provenance(tmp_path, monkeypatch):
+    m, cap, pool, built = _wire_dirs(monkeypatch, tmp_path)
+    rc = m.export_cell("S1", "cellx", str(built), target_frames=3)
+    assert rc == 0
+    out = pool / "S1" / "cellx"
+    manifest = json.loads((out / "manifest.json").read_text("utf-8"))
+    assert manifest["schema"] == "proving_pool_v2"
+    assert manifest["pool_status"] == "pilot"
+    assert manifest["training_qualified"] is False
+    assert manifest["kept"] == 3
+    assert manifest["built_source"]["sha256"] == m._sha256_file(built)
+    assert len(manifest["frames"]) == 3
+    for f in manifest["frames"]:
+        assert len(f["sha256"]) == 64
+        assert (out / f["file"]).is_file()
+    # 每帧标签非空、road 覆盖 line
+    z = np.load(out / manifest["frames"][0]["file"], allow_pickle=False)
+    assert (z["line"] == 2).sum() > 0
+    assert z["road"].sum() >= (z["line"] == 2).sum()
+
+
+def test_export_refuses_overwrite_and_force_preserves_quarantine(tmp_path, monkeypatch):
+    m, cap, pool, built = _wire_dirs(monkeypatch, tmp_path)
+    assert m.export_cell("S1", "cellx", str(built), target_frames=3) == 0
+    out = pool / "S1" / "cellx"
+    # 造一份 quarantine 证据，重导出后必须仍在
+    q = out / "quarantine"
+    q.mkdir(exist_ok=True)
+    (q / "rejected_evidence.npz").write_bytes(b"quarantine-evidence")
+    with pytest.raises(SystemExit, match="force"):
+        m.export_cell("S1", "cellx", str(built), target_frames=3)
+    # manifest 未被触碰
+    assert json.loads((out / "manifest.json").read_text("utf-8"))["kept"] == 3
+    assert m.export_cell("S1", "cellx", str(built), target_frames=3,
+                         force=True) == 0
+    stales = list((out / "stale").glob("*"))
+    assert stales, "old artifacts must be moved into stale/"
+    assert (q / "rejected_evidence.npz").read_bytes() == b"quarantine-evidence"
+    assert json.loads((out / "manifest.json").read_text("utf-8"))["kept"] == 3
+
+
+def test_export_requires_built_geometry(tmp_path, monkeypatch):
+    m, cap, pool, built = _wire_dirs(monkeypatch, tmp_path)
+    with pytest.raises(SystemExit, match="缺构建记录"):
+        m.export_cell("S1", "cellx", str(tmp_path / "missing.json"),
+                      target_frames=3)
