@@ -28,6 +28,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -561,7 +562,17 @@ def collect(args) -> int:
             }
             out.write_text(json.dumps(report, ensure_ascii=False, indent=1),
                            encoding="utf-8")
-            return 0
+            # 探针写完报告后直接退出：beamngpy/相机的非守护线程实测会挂住
+            # 解释器退出（2026-11-07 两轮采集：报告落盘后进程滞留 8+ 分钟，
+            # 编排侧 1200s 超时把成功采集误判 INCOMPLETE）。此刻所有产物
+            # 已持久化，显式清理连接后强制退出。
+            try:
+                conn.close()
+            except Exception:  # noqa: BLE001
+                pass
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
         cmd = [sys.executable, str(ROOT / "scripts" / "m5_fsd_drive.py"),
                "--runtime", args.runtime, "--attach",
                "--seconds", f"{float(args.drive_seconds):.1f}",

@@ -369,6 +369,40 @@ def wait_engine_gone(timeout_s: float = 30.0) -> bool:
         time.sleep(min(1.0, max(0.0, deadline - time.monotonic())))
 
 
+def run_probe_attempt(cmd: list[str], log_path: Path,
+                      *, timeout_s: float = 1200) -> tuple[int, bool]:
+    """跑探针并把 stdout/stderr 直接落文件，返回 (returncode, timed_out)。
+
+    绝不走管道：引擎进程会继承探针的 stdout/stderr 句柄，而管道模式下
+    编排侧在超时后还会无超时地二次 drain 等 EOF——引擎不退出就永远等
+    不到（2026-11-07 实测：探针 22:17 已写完报告，编排器 22:53 仍卡在
+    二次 drain）。落文件后引擎继承与否都不影响返回；超时按探针进程树
+    强杀（含它启动的引擎，超时态不留孤儿）。
+    """
+    timed_out = False
+    rc = -1
+    with open(log_path, "w", encoding="utf-8", errors="replace") as log_f:
+        proc = subprocess.Popen(
+            cmd, cwd=str(ROOT), stdin=subprocess.DEVNULL, stdout=log_f,
+            stderr=subprocess.STDOUT, env=_run_env())
+        try:
+            rc = proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            subprocess.run(
+                ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                capture_output=True, text=True,
+                encoding="utf-8", errors="replace")
+            try:
+                rc = proc.wait(timeout=60)
+            except subprocess.TimeoutExpired:
+                rc = -9
+    if timed_out:
+        with open(log_path, "a", encoding="utf-8", errors="replace") as log_f:
+            log_f.write(f"\n--- timeout ({timeout_s:.0f}s) ---\n")
+    return rc, timed_out
+
+
 def capture(site: str, cell: str, *, frames: int = 60,
             reclaim: bool = False) -> int:
     """按 attempt 流程采集一格（§6.2 门 1/2/4 闭环）。
@@ -415,22 +449,10 @@ def capture(site: str, cell: str, *, frames: int = 60,
     print(f"[capture] site={site} cell={cell} tod={tod} "
           f"weather={preset or '-'} frames={frames} attempt={attempt.name}",
           flush=True)
-    timed_out = False
-    stdout = stderr = ""
-    rc = -1
-    try:
-        proc = subprocess.run(capture_cmd(site, cell, out, frames=frames),
-                              cwd=str(ROOT), capture_output=True, text=True,
-                              encoding="utf-8", errors="replace",
-                              env=_run_env(), timeout=1200)
-        stdout, stderr, rc = proc.stdout or "", proc.stderr or "", proc.returncode
-    except subprocess.TimeoutExpired:
-        timed_out = True
-        rc = -9
-    (attempt / "probe.log").write_text(
-        stdout + "\n--- stderr ---\n" + stderr
-        + ("\n--- timeout (1200s) ---\n" if timed_out else ""),
-        encoding="utf-8")
+    # 探针输出落文件（run_probe_attempt）：引擎继承句柄不会卡住编排侧；
+    # 超时按进程树强杀。
+    rc, timed_out = run_probe_attempt(
+        capture_cmd(site, cell, out, frames=frames), attempt / "probe.log")
 
     report = {}
     if out.exists():

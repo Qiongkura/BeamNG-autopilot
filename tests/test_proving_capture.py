@@ -444,7 +444,12 @@ def _wire_capture(tmp_path, monkeypatch, fake_run, state, engine_gone=True,
     monkeypatch.setattr(m, "SITES_DIR", tmp_path / "sites")
     (tmp_path / "sites").mkdir(parents=True, exist_ok=True)
     (tmp_path / "sites" / "S1.json").write_text("{}", encoding="utf-8")
-    monkeypatch.setattr(m.subprocess, "run", fake_run)
+    def fake_probe(cmd, log_path, *, timeout_s=1200):
+        rc = fake_run(cmd).returncode
+        Path(log_path).write_text("fake probe\n", encoding="utf-8")
+        return rc, False
+
+    monkeypatch.setattr(m, "run_probe_attempt", fake_probe)
     monkeypatch.setattr(m, "wait_engine_gone", lambda *a, **k: engine_gone)
     monkeypatch.setattr(m, "_game_pids", fake_pids)
     monkeypatch.setattr(m, "_kill_pid_tree",
@@ -521,7 +526,7 @@ def test_capture_unknown_engine_enumeration_is_ownership_unverified(
     (tmp_path / "sites" / "S1.json").write_text("{}", encoding="utf-8")
     monkeypatch.setattr(m, "wait_engine_gone", lambda *a, **k: True)
     monkeypatch.setattr(m, "_game_pids", lambda: None)
-    monkeypatch.setattr(m.subprocess, "run", lambda *a, **k: pytest.fail(
+    monkeypatch.setattr(m, "run_probe_attempt", lambda *a, **k: pytest.fail(
         "unknown enumeration must not launch a probe"))
     assert m.capture("S1", "noon_rain") == 1
     assert not list((tmp_path / "cap" / "S1" / "noon_rain").glob("attempt_*"))
@@ -595,3 +600,58 @@ def test_kill_pid_tree_uses_recorded_pid(tmp_path, monkeypatch):
     assert m._kill_pid_tree(4242) is True
     assert seen["cmd"] == ["taskkill", "/PID", "4242", "/T", "/F"]
     assert seen["errors"] == "replace"
+
+
+def test_run_probe_attempt_survives_grandchild_holding_stdout(tmp_path):
+    """回归：引擎（孙进程）继承探针 stdout 不得卡住编排侧。
+
+    2026-11-07 实测：管道模式下探针 22:17 已写完报告，引擎仍持有管道
+    写端，subprocess.run 在超时后无超时地二次 drain → 编排器 22:53
+    仍挂死。落文件 + 独立 wait 后应立刻返回。
+    """
+    import subprocess as sp
+    import sys
+    import time
+    m = _mod()
+    pidfile = tmp_path / "grandchild.pid"
+    code = (
+        "import subprocess, sys\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(10)'])\n"
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+        "print('probe done', flush=True)\n"
+    )
+    log = tmp_path / "probe.log"
+    t0 = time.monotonic()
+    rc, timed_out = m.run_probe_attempt([sys.executable, "-c", code], log,
+                                        timeout_s=30)
+    elapsed = time.monotonic() - t0
+    assert rc == 0 and timed_out is False
+    assert elapsed < 5.0, f"编排侧被孙进程句柄卡住 {elapsed:.1f}s"
+    assert "probe done" in log.read_text(encoding="utf-8")
+    # 清掉测试留下的孙进程（等它自然退出太慢）
+    sp.run(["taskkill", "/PID", pidfile.read_text().strip(), "/T", "/F"],
+           capture_output=True, text=True, errors="replace")
+
+
+def test_run_probe_attempt_timeout_kills_tree(tmp_path):
+    """超时按进程树强杀：探针 + 它启动的子进程都不留孤儿。"""
+    import subprocess as sp
+    import sys
+    m = _mod()
+    pidfile = tmp_path / "child.pid"
+    code = (
+        "import subprocess, sys, time\n"
+        "p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)'])\n"
+        f"open({str(pidfile)!r}, 'w').write(str(p.pid))\n"
+        "time.sleep(60)\n"
+    )
+    log = tmp_path / "probe.log"
+    rc, timed_out = m.run_probe_attempt([sys.executable, "-c", code], log,
+                                        timeout_s=3)
+    assert timed_out is True
+    assert rc != 0
+    assert "--- timeout (3s) ---" in log.read_text(encoding="utf-8")
+    pid = int(pidfile.read_text())
+    listing = sp.run(["tasklist", "/FI", f"PID eq {pid}"],
+                     capture_output=True, text=True, errors="replace").stdout
+    assert str(pid) not in listing
