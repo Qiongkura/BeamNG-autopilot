@@ -31,15 +31,28 @@ def _load(*, enable_for_test=False):
     return mod
 
 
-def test_collect_rejects_unverified_kinematic_before_connecting(monkeypatch):
-    from types import SimpleNamespace
-    from beamng_autopilot import connector
+def _load_capture():
+    spec = importlib.util.spec_from_file_location(
+        "mpc_capture_for_kinematic",
+        ROOT / "scripts" / "m5_proving_capture.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
-    def forbidden(*args, **kwargs):
-        raise AssertionError("blocked collection must not connect")
 
-    monkeypatch.setattr(connector, "BeamNGConnector", forbidden)
-    assert _load().collect(SimpleNamespace(kinematic_capture=True)) == 3
+def test_kinematic_eligibility_gate_is_orchestrator_side(monkeypatch, tmp_path):
+    """3591c22 起资格门从探针搬到编排侧（探针只采集与落盘）。
+
+    探针的运动学入口已解锁；"证据可用"必须由 m5_proving_capture 的
+    attempt 流程判定——kill-switch、引擎归属/清理、环境读回、帧清单
+    核对全部通过才写 EVIDENCE_READY，探针自身不提供任何旁路开关。
+    """
+    assert _load()._KINEMATIC_ENABLED is True
+    cap = _load_capture()
+    monkeypatch.setattr(cap, "_CAPTURE_ENABLED", False)
+    monkeypatch.setattr(cap, "CAP_DIR", tmp_path)
+    with pytest.raises(RuntimeError, match="BLOCKED"):
+        cap.capture("S1", "noon_clear")
 
 
 def test_pairing_probe_does_not_kill_processes_by_pid_difference():
@@ -55,13 +68,13 @@ def test_pairing_probe_does_not_kill_processes_by_pid_difference():
     assert not (calls & forbidden)
 
 
-def test_direct_kinematic_call_is_blocked_before_any_side_effect(tmp_path):
-    mod = _load()
-    conn = _FakeConn()
-    with pytest.raises(RuntimeError, match="BLOCKED"):
-        mod.kinematic_capture(conn, _scene(), tmp_path / "new")
-    assert conn.calls == []
-    assert not (tmp_path / "new").exists()
+def test_kinematic_capture_has_no_verification_bypass_parameter():
+    """资格判定不在探针：kinematic_capture 没有 verify/enabled 之类旁路
+    参数，直接调用只产出帧；是否可作证据由编排侧 attempt 闭环决定。"""
+    import inspect
+    sig = inspect.signature(_load().kinematic_capture)
+    assert not ({"enabled", "verified", "bypass", "allow"}
+                & set(sig.parameters))
 
 
 class _State:
@@ -256,15 +269,36 @@ def test_environment_readback_requires_tod_and_rejects_unread_weather(monkeypatc
         def get_tod(self):
             return {"timeStr": "06:30:00"}
 
+    class Control:
+        def __init__(self, resp=None, boom=False):
+            self.resp, self.boom = resp, boom
+        def queue_lua_command(self, *args, **kwargs):
+            if self.boom:
+                raise RuntimeError("rpc unavailable")
+            return self.resp
+
     class Bng:
-        env = Env()
+        def __init__(self, control):
+            self.env, self.control = Env(), control
 
     class Conn:
-        bng = Bng()
+        def __init__(self, control):
+            self.bng = Bng(control)
 
-    clear = mod._apply_environment(Conn(), "06:30", None)
-    assert clear["valid"] is False and clear["tod_after"] == "06:30:00"
-    assert clear["tod_matches"] is True and clear["weather_readback"] == "UNKNOWN"
-    rain = mod._apply_environment(Conn(), "06:30", "rainy")
-    assert rain["valid"] is False
-    assert rain["weather_readback"] == "UNKNOWN"
+    # 无预设 + 引擎报告 nil → clear 证据成立（全新引擎默认态即无预设）
+    clear = mod._apply_environment(Conn(Control("nil")), "06:30", None)
+    assert clear["tod_matches"] is True
+    assert clear["weather_readback"] is None
+    assert clear["weather_matches"] is True and clear["valid"] is True
+    # 无预设但引擎残留 rainy → clear 不成立
+    left = mod._apply_environment(Conn(Control("rainy")), "06:30", None)
+    assert left["weather_matches"] is False and left["valid"] is False
+    # 请求 rainy 但引擎仍 nil（未生效）→ 不成立
+    rain = mod._apply_environment(Conn(Control("nil")), "06:30", "rainy")
+    assert rain["weather_matches"] is False and rain["valid"] is False
+    # 请求 rainy 且引擎读回 rainy → 成立
+    ok = mod._apply_environment(Conn(Control("rainy")), "06:30", "rainy")
+    assert ok["weather_matches"] is True and ok["valid"] is True
+    # 读回本身失败（RPC 不可用）→ 不伪造 UNKNOWN 成功，整体 invalid
+    unread = mod._apply_environment(Conn(Control(boom=True)), "06:30", None)
+    assert unread["valid"] is False and "error" in unread
