@@ -176,3 +176,24 @@ GameViewer 虚拟屏、焦点、GDI 池、userpath、输入法）都指向"启�
 
 **验证**：`S1/dusk_clear` → `EVIDENCE_READY`（rc=0、无超时、27/27 帧
 清单核对、tod 18:30 读回一致、引擎 PID 清理 + 差分清扫干净）。
+
+### 批次首跑观察（2026-11-07 23:07–23:2x，收尾时停批）
+
+管线本身已按新门工作：**5 个 clear 格全部 EVIDENCE_READY**（S1
+dawn/noon/dusk/night_clear + S2/dawn_clear，各 27 帧、rc=0、无超时、
+引擎清理干净；S1/dawn_rain 453 帧与 noon_rain 51 帧是旧门 legacy，
+本次重采 INCOMPLETE 后 legacy 保留）。
+
+**新阻塞（天气格 9/9 全灭）**：fog/rain 格全部 rc=3、0 帧，探针日志
+`BLOCKED: environment readback invalid`，读回 `tod_after` 为
+14:22:47–14:55:09（≈当前墙钟），而请求是 06:30/12:00/18:30/22:00；
+`weather_readback` 却正确命中（rainy/foggy_morning）。**天气预设动画
+会回写 TOD，而 `_apply_environment` 当前是"设天气 → 立即设 tod →
+立即读回"，没有等待稳定**（§7 早已记录 weather→sleep(2)→tod 的顺序
+坑，代码里没落实）。修法：设天气后轮询 `getCurrentWeatherPreset`
+直到命中（有界），再设 tod 并轮询 `get_tod` 直到容差内（有界 ~5s），
+仍不匹配则维持 invalid；修完先单格验证 dawn_rain，再续跑 40 格。
+
+另：`S2/dawn_rain/attempt_vjz12tfd` 是收尾强停的 in-flight attempt
+（phase=started、无 attempt_result），按纪律原样保留；下次 `--run-all`
+会为该格开新 attempt，不影响已有证据。
