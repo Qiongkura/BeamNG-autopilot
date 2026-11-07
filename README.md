@@ -556,10 +556,13 @@ Steam 兼容路径（窗口截屏、Lua 射线、经典 CV 回退、YOLO 2D 反�
 - `BEAMNG_TECH_HOME` 指向 Tech 安装目录；Steam 仍使用 `BEAMNG_HOME`。
 - `BEAMNG_TECH_USER` 指向 Tech 用户目录，默认 `...\BeamNG.drive\0.38`，
   与 Steam 的 `0.39` 分开，避免两个版本互相污染存档/设置。
-- `BEAMNG_PORT` 可选，默认 `64256`；Tech 固定用 `64257`
+- `BEAMNG_PORT` 可选，默认 `64256`；Tech 默认用 `47000`
   （`BEAMNG_TECH_PORT` 可覆盖）。**端口与运行时绑定**：Steam 始终
-  `64256`、Tech 始终 `64257`，两套实例可并行，启动器/助手/探针按所选
+  `64256`、Tech 默认 `47000`，两套实例可并行，启动器/助手/探针按所选
   运行时自动对应端口（`config.runtime_port(mode)`），无需手动改端口。
+  Tech 端口刻意低于系统临时端口起点（49152）：Windows 上
+  Hyper-V/WSL/HNS 会动态保留 62000-64449 段，落在其中的端口会让引擎
+  绑定报 WSAEACCES（RPC 起不来，表现为"启动后无响应"）。
 - 启动/主流程入口（`launch_game.py` / `m5_launcher.py` /
   `m5_autopilot.py` / `m5_e2e_test.py` / `m5_drive_test.py`）、M1-M3
   采集标定脚本（`m1_smoke_test.py` / `m1_record_track.py` /
