@@ -126,7 +126,9 @@ def test_five_scene_classes_are_specified():
                              "slope_curve", "material_mix",
                              "structure_negative",
                              # 2026-11-04：试车场（先铺装、再画线）
-                             "proving_lane"}
+                             "proving_lane",
+                             # 2026-11-07：A1 对照①（只画左线，验右线无幽灵）
+                             "proving_lane_left"}
     assert m.SCENES["known_no_line"]["lines"] == []
     assert m.SCENES["occluded_line"].get("occluder") is True
     assert m.SCENES["material_mix"].get("gravel") is True
