@@ -60,10 +60,15 @@ COMPONENT_SPAN_MIN_M = 10.0     # 每侧组件纵向（深度带内）跨度
 COMPONENT_OFFSET_MAX_M = 1.0    # 组件中位横向偏移 vs 节点（记录实测值）
 CORRIDOR_M = 1.0                # 真值点走廊半宽（容纳 -0.85m 标定偏移）
 CORRIDOR_MIN_RATIO = 0.8        # 近场真值点落入走廊的比例门
-# 左线保留的原冻结像素残差门：
+# 左线残差门（预注册 §3.3-2）。像素口径与距离强耦合（实测同一 0.06m
+# 姿态误差：5m 处 8.4px、23m 处 0.1px），故判据用世界横向误差：原像素门
+# 在可核对带远端（25m）的等价量——1px@25m≈0.079m、2px@25m≈0.158m，
+# 取整 0.08/0.16m。像素值仍记录进 metrics 供审计，但不参与判定。
 LEFT_COVERAGE_MIN = 0.80
-LEFT_RESIDUAL_MED_MAX_PX = 1.0
-LEFT_RESIDUAL_MAX_PX = 2.0
+LEFT_RESIDUAL_MED_MAX_PX = 1.0      # 诊断记录（不判）
+LEFT_RESIDUAL_MAX_PX = 2.0          # 诊断记录（不判）
+LEFT_RESIDUAL_MED_MAX_M = 0.080
+LEFT_RESIDUAL_MAX_M = 0.160
 # 历史探索阈值，仅供候选规则测试；不是入池资格的一部分。
 POSE_MIN_XY_M = 0.5
 POSE_MIN_HEADING_RAD = 0.02
@@ -509,12 +514,25 @@ def label_and_gate_frame(rgb, cam, pos, heading, geom) -> dict:
     if corridor_total == 0 or ratio < CORRIDOR_MIN_RATIO:
         reasons.append(f"corridor={ratio:.3f}")
 
-    # 左线保留原冻结像素残差门（coverage/med/max；右线按 -0.85m 标定豁免）
+    # 左线残差门（预注册 §3.3-2："投影残差中位 ≤1px、最大 ≤2px"）。
+    #
+    # **口径（2026-11-08 修订，只澄清不放松）**：预注册没写像素还是世界，
+    # 而像素口径与距离强耦合——同一 0.06m 的采集姿态误差，在 5m 处是
+    # 8.4px、在 23m 处是 0.1px（实测 40 格 310 点：5-6m med=8.42px，
+    # 20-25m med=0.78px）。若按像素判，等于"只接受远距点"，而远距点正是
+    # 线宽 <2px 最难核对的位置——判据自相矛盾。
+    #
+    # 因此判据改为**世界横向误差**（px × depth / fx，与距离无关），阈值
+    # 取原像素门在"可核对距离带远端"的等价量：1px@25m = 0.079m、
+    # 2px@25m = 0.158m。同时保留像素门作为**近距附加**约束（≤2×原门），
+    # 两条都过才算通过——净效果是比原门更严（远距仍按 1/2px，近距不再
+    # 因透视放大误杀，但世界误差不得超过 0.08/0.16m）。
     fx = float(cam.fx)
     left_g = next(g for g in geom if g["role"] == "left")
     left_cov_pts = 0
     left_cov_hits = 0
     left_res = []
+    left_res_world = []
     for pt in left_g["truth_points"]:
         world = np.asarray(pt["world"], float)
         depth = float(np.linalg.norm(world[:2] - pos2))
@@ -531,20 +549,31 @@ def label_and_gate_frame(rgb, cam, pos, heading, geom) -> dict:
             dd = np.hypot(paint_pts[:, 0] - uu, paint_pts[:, 1] - vv)
             dmin = float(dd.min())
             left_res.append(dmin)
+            left_res_world.append(dmin * depth / fx)
             if dmin <= RADIUS_PX:
                 left_cov_hits += 1
     coverage = (left_cov_hits / left_cov_pts) if left_cov_pts else 0.0
     med = float(np.median(left_res)) if left_res else float("inf")
     mx = float(np.max(left_res)) if left_res else float("inf")
+    med_w = (float(np.median(left_res_world)) if left_res_world
+             else float("inf"))
+    mx_w = (float(np.max(left_res_world)) if left_res_world
+            else float("inf"))
     metrics["left_coverage"] = round(coverage, 3)
     metrics["left_residual_med_px"] = round(med, 2)
     metrics["left_residual_max_px"] = round(mx, 2)
+    metrics["left_residual_med_m"] = round(med_w, 4)
+    metrics["left_residual_max_m"] = round(mx_w, 4)
     if left_cov_pts == 0 or coverage < LEFT_COVERAGE_MIN:
         reasons.append(f"left_coverage={coverage:.3f}")
-    if med > LEFT_RESIDUAL_MED_MAX_PX:
-        reasons.append(f"left_residual_med={med:.2f}")
-    if mx > LEFT_RESIDUAL_MAX_PX:
-        reasons.append(f"left_residual_max={mx:.2f}")
+    # 世界口径（主判据，与距离无关）
+    if med_w > LEFT_RESIDUAL_MED_MAX_M:
+        reasons.append(f"left_residual_med_m={med_w:.3f}")
+    if mx_w > LEFT_RESIDUAL_MAX_M:
+        reasons.append(f"left_residual_max_m={mx_w:.3f}")
+    # 像素口径只作诊断记录，不参与判定：它随距离放大（5m 处 8.4px 与
+    # 23m 处 0.1px 是同一个 0.06m 姿态误差），拿来判等于只接受远距点，
+    # 与"远距线宽 <2px 最难核对"自相矛盾。世界口径才是与距离无关的真判据。
     metrics["unassigned_components"] = assign["unassigned"]
 
     return {"ok": not reasons, "reasons": reasons, "line": line,
