@@ -43,6 +43,12 @@ if str(ROOT) not in sys.path:
 #: （每格全新引擎实例，引擎默认预设即 clear 的证据）。
 _CLEAR_EXCLUDE_PRESETS = ("rainy", "foggy_morning")
 
+#: 运动学采集的落稳等待：每 0.1s 查一次位姿，连续两次位移 < 1mm 即认为
+#: 车已落稳（最多 5s）。固定 sleep 会采到悬空帧——相机抬高后地面反投影
+#: 把线的横向位置读偏（2026-11-08 实测 0.074m 悬空 → 0.23m 误读）。
+_SETTLE_POLL_S = 0.1
+_SETTLE_MAX_POLLS = 50
+
 from beamng_autopilot.lane.pairing import DEFAULT_PAIRING_RESEARCH  # noqa: E402
 
 CENTER_TOL_M = 0.75
@@ -772,10 +778,23 @@ def kinematic_capture(conn, scene_doc: dict, out_dir: Path, *,
         p[:2] = mid[:2] + d * s_m + left * lat
         heading_deg = float(yaw0 + dyaw)
         ok = conn.safe_teleport(float(p[0]), float(p[1]),
-                                heading_deg=heading_deg, settle=6)
+                                heading_deg=heading_deg, settle=8)
         if not ok:
             continue
+        # 等车真正落稳再取帧：safe_teleport 把车放在 ground+0.6m 让它自由
+        # 落下，固定 sleep 不够——2026-11-08 实测 settle=6 + 0.6s 时 ego
+        # z=100.211（悬空 0.074m），A1 用 settle=8 时 z=100.137（贴地）。
+        # 悬空让相机整体抬高，地面反投影把 0.15m 的线读成偏 0.23m。
+        # 判据：位置变化 < 1mm/次 且 与上一姿态连续两次一致。
         _time.sleep(float(settle_s))
+        prev = None
+        for _w in range(_SETTLE_MAX_POLLS):
+            st = conn.get_state()
+            cur = _np.asarray(st.pos, dtype=float)
+            if prev is not None and float(_np.linalg.norm(cur - prev)) < 1e-3:
+                break
+            prev = cur
+            _time.sleep(_SETTLE_POLL_S)
         for _k in range(int(frames_per_station)):
             st = conn.get_state()
             frame = None
