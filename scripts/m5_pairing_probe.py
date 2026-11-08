@@ -350,13 +350,53 @@ def _tod_match(requested, observed, *, tolerance_seconds=1):
     return min(diff, 86400 - diff) <= tolerance_seconds
 
 
-def _apply_environment(conn, tod: str | None, weather: str | None) -> dict:
+def _weather_readback(conn) -> str | None:
+    """引擎侧当前天气预设（非请求回声）。nil/空 → None。"""
+    resp = conn.bng.control.queue_lua_command(
+        "return tostring(extensions.core_weather"
+        ".getCurrentWeatherPreset())", response=True)
+    readback = str(resp) if resp is not None else ""
+    return None if readback in ("", "nil") else readback
+
+
+def _settle_weather(conn, weather: str | None, *, deadline_s: float,
+                    poll_s: float = 0.5) -> str | None:
+    """等天气预设动画落定，返回最后一次读回。
+
+    2026-11-07 实测：``set_weather_preset`` 是动画，动画期间会持续回写
+    TOD——设完天气立刻设 tod 再立刻读回，读到的是动画写的墙钟（14:2x）
+    而不是请求值（06:30），9/9 天气格因此判 INVALID。
+    """
+    import time as _time
+    deadline = _time.monotonic() + max(0.0, deadline_s)
+    readback = _weather_readback(conn)
+    while True:
+        if weather is None:
+            # clear：无预设选中，或当前预设不是矩阵里的雨/雾
+            done = (readback is None
+                    or readback not in _CLEAR_EXCLUDE_PRESETS)
+        else:
+            done = readback == weather
+        if done or _time.monotonic() >= deadline:
+            return readback
+        _time.sleep(poll_s)
+        readback = _weather_readback(conn)
+
+
+def _apply_environment(conn, tod: str | None, weather: str | None,
+                       *, settle_s: float = 20.0,
+                       poll_s: float = 0.5) -> dict:
     """应用并读回条件；失败/读回缺失都返回 invalid，不伪造成功。
 
     天气读回走**引擎侧**状态查询（core_weather.getCurrentWeatherPreset，
     独立于请求回声）；clear 格的 matches = 引擎当前预设不是本矩阵的
     雨/雾预设（每格全新引擎实例，默认态即 clear 证据）。
+
+    顺序（§7 的坑，2026-11-07 落成代码）：设天气 → 等预设落定 → 设 tod
+    → 轮询读回直到容差内（不匹配就重设，直到 deadline）。天气动画期间
+    设 tod 会被动画回写，所以必须等它结束再设。
     """
+    import time as _time
     rec = {"tod_requested": tod, "weather_requested": weather,
            "tod_after": None, "weather_after": None,
            "weather_readback": None, "weather_readback_error": None,
@@ -371,29 +411,28 @@ def _apply_environment(conn, tod: str | None, weather: str | None) -> dict:
     try:
         if weather:
             conn.bng.env.set_weather_preset(weather)
-        if tod:
-            parts = str(tod).split(":")
-            hms = f"{int(parts[0]):02d}:{int(parts[1]) if len(parts) > 1 else 0:02d}:00"
-            conn.bng.env.set_tod(tod=hms)
-        read = conn.bng.env.get_tod() or {}
-        rec["tod_after"] = str(read.get("timeStr") or "") or None
-        rec["tod_matches"] = _tod_match(tod, rec["tod_after"])
-        # 独立天气读回（引擎 GE Lua 状态，非请求回声）。全新引擎的
-        # selectedWeatherPreset = nil（Lua tostring 后为 "nil"）→ 归一化为
-        # None；clear 格的证据恰是"无预设选中"。
-        resp = conn.bng.control.queue_lua_command(
-            "return tostring(extensions.core_weather"
-            ".getCurrentWeatherPreset())", response=True)
-        readback = str(resp) if resp is not None else ""
-        rec["weather_after"] = None if readback in ("", "nil") else readback
-        rec["weather_readback"] = rec["weather_after"]
+        rec["weather_readback"] = _settle_weather(
+            conn, weather, deadline_s=settle_s, poll_s=poll_s)
+        rec["weather_after"] = rec["weather_readback"]
         if weather:
             rec["weather_matches"] = (rec["weather_readback"] == weather)
         else:
-            # clear：证据 = 无预设选中，或当前预设不是采集矩阵的雨/雾
             rec["weather_matches"] = (rec["weather_readback"] is None
                                       or rec["weather_readback"]
                                       not in _CLEAR_EXCLUDE_PRESETS)
+        # 天气落定后再设 tod，并轮询到容差内（动画尾巴仍可能回写）
+        parts = str(tod).split(":")
+        hms = (f"{int(parts[0]):02d}:"
+               f"{int(parts[1]) if len(parts) > 1 else 0:02d}:00")
+        deadline = _time.monotonic() + max(0.0, settle_s)
+        while True:
+            conn.bng.env.set_tod(tod=hms)
+            _time.sleep(poll_s)
+            read = conn.bng.env.get_tod() or {}
+            rec["tod_after"] = str(read.get("timeStr") or "") or None
+            rec["tod_matches"] = _tod_match(tod, rec["tod_after"])
+            if rec["tod_matches"] is True or _time.monotonic() >= deadline:
+                break
         rec["valid"] = (rec["tod_matches"] is True
                         and rec["weather_matches"] is True)
     except (OSError, RuntimeError, ValueError, TypeError, KeyError, AttributeError) as exc:

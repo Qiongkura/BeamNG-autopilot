@@ -285,20 +285,71 @@ def test_environment_readback_requires_tod_and_rejects_unread_weather(monkeypatc
         def __init__(self, control):
             self.bng = Bng(control)
 
+    fast = {"settle_s": 0.01, "poll_s": 0.001}
     # 无预设 + 引擎报告 nil → clear 证据成立（全新引擎默认态即无预设）
-    clear = mod._apply_environment(Conn(Control("nil")), "06:30", None)
+    clear = mod._apply_environment(Conn(Control("nil")), "06:30", None, **fast)
     assert clear["tod_matches"] is True
     assert clear["weather_readback"] is None
     assert clear["weather_matches"] is True and clear["valid"] is True
     # 无预设但引擎残留 rainy → clear 不成立
-    left = mod._apply_environment(Conn(Control("rainy")), "06:30", None)
+    left = mod._apply_environment(Conn(Control("rainy")), "06:30", None, **fast)
     assert left["weather_matches"] is False and left["valid"] is False
     # 请求 rainy 但引擎仍 nil（未生效）→ 不成立
-    rain = mod._apply_environment(Conn(Control("nil")), "06:30", "rainy")
+    rain = mod._apply_environment(Conn(Control("nil")), "06:30", "rainy", **fast)
     assert rain["weather_matches"] is False and rain["valid"] is False
     # 请求 rainy 且引擎读回 rainy → 成立
-    ok = mod._apply_environment(Conn(Control("rainy")), "06:30", "rainy")
+    ok = mod._apply_environment(Conn(Control("rainy")), "06:30", "rainy", **fast)
     assert ok["weather_matches"] is True and ok["valid"] is True
     # 读回本身失败（RPC 不可用）→ 不伪造 UNKNOWN 成功，整体 invalid
-    unread = mod._apply_environment(Conn(Control(boom=True)), "06:30", None)
+    unread = mod._apply_environment(Conn(Control(boom=True)), "06:30", None,
+                                    **fast)
     assert unread["valid"] is False and "error" in unread
+
+
+def test_environment_waits_for_weather_animation_before_setting_tod():
+    """回归：天气动画回写 TOD 时，等动画落定再设 tod 并轮询到容差内。
+
+    2026-11-07 实测：设完 rainy 立刻设 tod 再立刻读回，读到的是动画写的
+    墙钟（14:2x）而不是请求值（06:30）→ 9/9 天气格判 INVALID。
+    """
+    mod = _load(enable_for_test=True)
+
+    class Env:
+        def __init__(self):
+            self.weather = None
+            self.weather_polls = 0
+            self.tod = "14:22:47"
+            self.tod_sets = 0
+            self.animate = 3   # 前 3 次读回仍是动画态
+        def set_weather_preset(self, value):
+            self.weather = value
+        def get_tod(self):
+            # 动画未落定前，读回是墙钟；落定后反映最后一次 set_tod
+            return {"timeStr": self.tod if self.weather_polls >= 3
+                    else "14:22:47"}
+        def set_tod(self, tod):
+            self.tod_sets += 1
+            self.tod = tod
+
+    class Control:
+        def __init__(self, env):
+            self.env = env
+        def queue_lua_command(self, *args, **kwargs):
+            self.env.weather_polls += 1
+            # 预设需要 3 次轮询才落定（模拟动画）
+            return self.env.weather if self.env.weather_polls >= 3 else "nil"
+
+    class Conn:
+        def __init__(self, env):
+            self.bng = type("B", (), {})()
+            self.bng.env = env
+            self.bng.control = Control(env)
+
+    env = Env()
+    rec = mod._apply_environment(Conn(env), "06:30", "rainy",
+                                 settle_s=5.0, poll_s=0.001)
+    assert rec["weather_matches"] is True
+    assert rec["tod_matches"] is True and rec["valid"] is True
+    assert rec["tod_after"] == "06:30:00"
+    assert env.weather_polls >= 3          # 确实等到了动画落定
+    assert env.tod_sets >= 1
