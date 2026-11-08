@@ -355,7 +355,7 @@ def _component_scan(cam, pos, heading, line, pixels, *,
                  (px[:, 1][:, None] - vv[None, :]) ** 2
             j = np.argmin(d2, axis=1)
             dists = np.sqrt(d2[np.arange(len(px)), j])
-            depth = np.linalg.norm(shifted[:, :2] - pos2, axis=1)[j]
+            depth = np.linalg.norm(shifted[:, :2] - pos2, axis=1)
         else:
             d2 = (px[:, 0][:, None] - u[None, :]) ** 2 + \
                  (px[:, 1][:, None] - v[None, :]) ** 2
@@ -376,6 +376,9 @@ def _component_scan(cam, pos, heading, line, pixels, *,
             dists = best_d
             depth = np.linalg.norm(shifted[:, :2] - pos2, axis=1)
         med = float(np.median(dists))
+        # depth 是逐链点数组，最近点深度按 j 取（退化分支此前已误索引一次，
+        # 2026-11-08 实测 IndexError: index 105 out of bounds for size 7——
+        # 近处链点被 _project 判为 depth<=0.1 时进入退化分支即崩）
         p90 = float(np.percentile(dists, 90))
         if best is None or med < best["median_dist_px"]:
             best = {"delta_m": round(float(delta), 3),
@@ -556,6 +559,37 @@ def _sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
+def resolve_attempt_frames(src: Path) -> tuple[Path, dict | None]:
+    """定位一格的帧目录与 attempt 结果（§6.2 attempt 布局）。
+
+    3591c22 起每次采集是独立 ``attempt_*`` 目录，帧在
+    ``attempt_*/probe.frames``；旧布局 ``<cell>/probe.frames`` 仍兼容
+    （历史格）。优先取 EVIDENCE_READY 的最新 attempt——只有过了采集门
+    的 attempt 才允许导出，避免把 INCOMPLETE 的残留帧当证据。
+    """
+    attempts = sorted((p for p in src.glob("attempt_*") if p.is_dir()),
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+    for att in attempts:
+        result = att / "attempt_result.json"
+        if not result.is_file():
+            continue
+        try:
+            rec = json.loads(result.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if rec.get("status") != "EVIDENCE_READY":
+            continue
+        frames = att / "probe.frames"
+        if frames.is_dir() and any(frames.glob("frame_*.npz")):
+            return frames, rec
+    legacy = src / "probe.frames"
+    if legacy.is_dir() and any(legacy.glob("frame_*.npz")):
+        return legacy, None
+    raise SystemExit(
+        f"无可用帧 {src}：既没有 EVIDENCE_READY 的 attempt_*/probe.frames，"
+        f"也没有旧布局 probe.frames")
+
+
 def export_cell(site: str, cell: str, built_path: str, *,
                 target_frames: int = 30, force: bool = False) -> int:
     """按 A1 门禁把一个采集格导出入池（pilot 状态）。
@@ -575,9 +609,10 @@ def export_cell(site: str, cell: str, built_path: str, *,
     built_lines = validate_built_lines(built_doc)
     geom = geometry_from_built(built_lines)
 
-    frames = sorted((src / "probe.frames").glob("frame_*.npz"))
+    frames_dir, attempt_rec = resolve_attempt_frames(src)
+    frames = sorted(frames_dir.glob("frame_*.npz"))
     if not frames:
-        raise SystemExit(f"无帧文件 {src / 'probe.frames'}")
+        raise SystemExit(f"无帧文件 {frames_dir}")
 
     out_dir = POOL_DIR / site / cell
     q_dir = out_dir / "quarantine"
@@ -653,6 +688,13 @@ def export_cell(site: str, cell: str, built_path: str, *,
                            "sha256": _sha256_file(capture_path),
                            "env": cap.get("env"),
                            "env_independently_verified": False},
+        "frames_source": {"path": str(frames_dir),
+                          "attempt": attempt_rec.get("status") if attempt_rec
+                          else "legacy",
+                          "attempt_result_sha256": (
+                              _sha256_file(frames_dir.parent
+                                           / "attempt_result.json")
+                              if attempt_rec else None)},
         "source_frames": len(frames),
         "kept": len(kept), "rejected": len(rejected),
         "target_frames": target_frames,

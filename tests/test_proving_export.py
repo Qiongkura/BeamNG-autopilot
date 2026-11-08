@@ -336,3 +336,78 @@ def test_export_requires_built_geometry(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match="缺构建记录"):
         m.export_cell("S1", "cellx", str(tmp_path / "missing.json"),
                       target_frames=3)
+
+
+def test_resolve_attempt_frames_prefers_evidence_ready(tmp_path):
+    """§6.2 attempt 布局：只从 EVIDENCE_READY 的 attempt 取帧。
+
+    INCOMPLETE attempt 的残留帧不得当证据；旧布局 probe.frames 仍兼容。
+    """
+    import importlib.util
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "mpe_attempt", str(root / "scripts" / "m5_proving_export.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+
+    cell = tmp_path / "S1" / "noon_clear"
+    bad = cell / "attempt_aaa"
+    good = cell / "attempt_bbb"
+    for att in (bad, good):
+        (att / "probe.frames").mkdir(parents=True)
+        (att / "probe.frames" / "frame_00000.npz").write_bytes(b"x")
+    (bad / "attempt_result.json").write_text('{"status": "INCOMPLETE"}',
+                                             encoding="utf-8")
+    (good / "attempt_result.json").write_text('{"status": "EVIDENCE_READY"}',
+                                              encoding="utf-8")
+    import os
+    import time
+    now = time.time()
+    os.utime(bad, (now - 100, now - 100))
+    os.utime(good, (now, now))
+
+    frames, rec = m.resolve_attempt_frames(cell)
+    assert frames == good / "probe.frames"
+    assert rec["status"] == "EVIDENCE_READY"
+
+    # 只有 INCOMPLETE → 拒绝
+    import shutil
+    shutil.rmtree(good)
+    with pytest.raises(SystemExit, match="无可用帧"):
+        m.resolve_attempt_frames(cell)
+
+    # 旧布局兼容
+    legacy = cell / "probe.frames"
+    legacy.mkdir(parents=True)
+    (legacy / "frame_00000.npz").write_bytes(b"x")
+    frames, rec = m.resolve_attempt_frames(cell)
+    assert frames == legacy and rec is None
+
+
+def test_component_scan_handles_unprojectable_chain_points():
+    """回归：链点被 _project 判为无效（depth<=0.1）时不得 IndexError。
+
+    2026-11-08 实测：退化分支已按 j 索引过 depth，末尾又索引一次 →
+    index 105 out of bounds for axis 0 with size 7（近处链点不可投影）。
+    """
+    import importlib.util
+    import numpy as np
+    root = Path(__file__).resolve().parents[1]
+    spec = importlib.util.spec_from_file_location(
+        "mpe_scan", str(root / "scripts" / "m5_proving_export.py"))
+    m = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(m)
+    from beamng_autopilot.vision.projection import CameraModel
+
+    cam = CameraModel(offset=np.array([0.0, 1.216, 1.386]),
+                      fwd_local=np.array([0.0, 0.99994, -0.0112]),
+                      up_local=np.array([0.0, 0.0112, 0.99994]),
+                      fov_deg=120.0, width=1024, height=800)
+    # 链从车后 5m 延伸到车前 25m：车后点 depth<0.1 → 无效 → 退化分支
+    s = np.linspace(-5.0, 25.0, 60)
+    dense = np.column_stack([s, np.full_like(s, 0.9), np.zeros_like(s)])
+    line = {"dense": dense, "normal": np.array([0.0, 1.0])}
+    px = np.array([[500.0, 600.0], [512.0, 610.0], [520.0, 620.0]])
+    scan = m._component_scan(cam, np.array([0.0, 0.0, 1.5]), 0.0, line, px)
+    assert scan["delta_m"] is not None
+    assert scan["depths"] is not None and len(scan["depths"]) == len(px)
